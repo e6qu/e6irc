@@ -129,6 +129,17 @@ Done:
   command-flood token bucket ([limits].command_burst, PING/PONG + oper
   exempt, closes on Excess Flood) — both opt-in/off by default.
   (DESIGN §9, §12, §15)
+- **Brokered SSO (Shauth/Ory Hydra)**: any configured OIDC provider works
+  as an external SSO source. Beyond code+PKCE login, e6irc now does
+  **silent `prompt=none`** re-auth (`GET …/oidc/{provider}/sso`) so an
+  existing provider SSO session logs the user in with no prompt — and
+  `login_required` bounces to `/?sso=none` with no redirect loop — and
+  **RP-initiated logout** (`GET /api/v1/auth/logout`) that clears the local
+  session then redirects to the provider's `end_session_endpoint` with
+  `id_token_hint` + `post_logout_redirect_uri`, ending the upstream SSO
+  session too (the id token + provider are stored per session, migration
+  0019). Provider config gains optional `scopes` + `end_session_endpoint`.
+  Verified end-to-end against dockerized dex + PostgreSQL.
 
 ## Phase 5 — History + multiplexer + local always-on ✅ (2026-07-19)
 Multiplexer core: network drivers are **always-on** (broadcast events,

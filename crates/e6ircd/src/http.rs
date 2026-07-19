@@ -25,6 +25,9 @@ pub struct PendingAuth {
     /// When set, the callback links the resulting identity to this account
     /// instead of logging in / auto-provisioning.
     link_account: Option<String>,
+    /// A silent (`prompt=none`) SSO probe: on `login_required` the callback
+    /// bounces to `/?sso=none` instead of returning an error.
+    silent: bool,
 }
 
 pub struct AppState {
@@ -113,10 +116,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/auth/app-passwords", post(create_app_password))
         .route("/api/v1/auth/oidc/{provider}/start", get(oidc_start))
+        .route("/api/v1/auth/oidc/{provider}/sso", get(oidc_sso_start))
         .route("/api/v1/auth/oidc/{provider}/link", get(oidc_link_start))
         .route("/api/v1/auth/oidc/{provider}/callback", get(oidc_callback))
         .route("/api/v1/me/identities", get(me_identities))
-        .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/auth/logout", post(logout).get(logout_sso))
         .route("/api/v1/auth/device/start", post(device_start))
         .route("/api/v1/auth/device/token", post(device_token))
         .route("/api/v1/auth/device/approve", post(device_approve))
@@ -532,7 +536,21 @@ async fn oidc_start(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
 ) -> Response {
-    oidc_authorize(&state, &provider_name, None).await
+    oidc_authorize(&state, &provider_name, None, false).await
+}
+
+/// Silently check for an existing SSO session at the provider
+/// (`prompt=none`). If the browser already has a session with the identity
+/// provider (e.g. Shauth), the provider returns a code with no prompt and
+/// the callback logs the user in; otherwise it returns `login_required` and
+/// the callback bounces to `/?sso=none` so the app can offer interactive
+/// login. This is how e6irc "recognizes" the cross-origin SSO cookie
+/// without a second explicit login.
+async fn oidc_sso_start(
+    State(state): State<Arc<AppState>>,
+    Path(provider_name): Path<String>,
+) -> Response {
+    oidc_authorize(&state, &provider_name, None, true).await
 }
 
 /// Begin an OIDC flow that *links* the resulting identity to the
@@ -548,14 +566,17 @@ async fn oidc_link_start(
         Ok(a) => a,
         Err(response) => return response,
     };
-    oidc_authorize(&state, &provider_name, Some(account)).await
+    oidc_authorize(&state, &provider_name, Some(account), false).await
 }
 
-/// Shared authorization-request builder for both login and link flows.
+/// Shared authorization-request builder for login, link, and silent-SSO
+/// flows. `silent` adds `prompt=none` so the provider returns without any
+/// UI (used for the SSO-session probe).
 async fn oidc_authorize(
     state: &AppState,
     provider_name: &str,
     link_account: Option<String>,
+    silent: bool,
 ) -> Response {
     use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge, Scope};
     let Some(provider) = state
@@ -574,16 +595,27 @@ async fn oidc_authorize(
         }
     };
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let (auth_url, csrf, nonce) = client
+    let mut request = client
         .authorize_url(
             openidconnect::core::CoreAuthenticationFlow::AuthorizationCode,
             CsrfToken::new_random,
             Nonce::new_random,
         )
-        .add_scope(Scope::new("profile".into()))
-        .add_scope(Scope::new("email".into()))
-        .set_pkce_challenge(pkce_challenge)
-        .url();
+        .set_pkce_challenge(pkce_challenge);
+    // `openid` is implied by the flow; add the provider's other scopes
+    // (defaulting to profile + email).
+    let scopes = if provider.scopes.is_empty() {
+        vec!["profile".to_string(), "email".to_string()]
+    } else {
+        provider.scopes.clone()
+    };
+    for scope in scopes {
+        request = request.add_scope(Scope::new(scope));
+    }
+    if silent {
+        request = request.add_extra_param("prompt", "none");
+    }
+    let (auth_url, csrf, nonce) = request.url();
     let mut pending = state.pending_auth.lock().expect("poisoned");
     pending.retain(|_, p| p.started.elapsed() < Duration::from_secs(600));
     pending.insert(
@@ -594,6 +626,7 @@ async fn oidc_authorize(
             nonce,
             started: Instant::now(),
             link_account,
+            silent,
         },
     );
     Redirect::temporary(auth_url.as_str()).into_response()
@@ -613,6 +646,17 @@ async fn oidc_callback(
 ) -> Response {
     use openidconnect::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
     if let Some(err) = query.error {
+        // A silent SSO probe (`prompt=none`) with no upstream session comes
+        // back as `login_required`; that is expected — clear the pending
+        // entry and bounce to interactive login rather than erroring.
+        let was_silent = query
+            .state
+            .as_ref()
+            .and_then(|s| state.pending_auth.lock().expect("poisoned").remove(s))
+            .is_some_and(|p| p.silent);
+        if was_silent {
+            return Redirect::to("/?sso=none").into_response();
+        }
         return problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(&err));
     }
     let (Some(code), Some(csrf_state)) = (query.code, query.state) else {
@@ -721,17 +765,23 @@ async fn oidc_callback(
                 );
             }
         };
-    let token = match crate::db::create_web_session(&pool, &account).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("oidc: session creation failed: {e}");
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Session storage failed",
-                None,
-            );
-        }
-    };
+    // Record the id token + provider so logout can end the provider's SSO
+    // session (RP-initiated logout), not just the local e6irc session.
+    let id_token_raw = id_token.to_string();
+    let token =
+        match crate::db::create_oidc_web_session(&pool, &account, &id_token_raw, &pending.provider)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("oidc: session creation failed: {e}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session storage failed",
+                    None,
+                );
+            }
+        };
     let secure = if state.secure_cookies { "; Secure" } else { "" };
     (
         StatusCode::SEE_OTHER,
@@ -1208,6 +1258,74 @@ async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::HeaderM
         .into_response()
 }
 
+/// RP-initiated (front-channel) logout: clear the local session, then
+/// navigate the browser to the identity provider's end-session endpoint so
+/// the provider's SSO session is ended too — not just the local one. This
+/// is a GET so the logout link is a top-level browser navigation (the
+/// provider requires that, not a cross-origin fetch). When the session has
+/// no upstream SSO (password/PAT) or the provider has no configured
+/// end-session endpoint, it degrades to a plain local logout.
+async fn logout_sso(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let clear = "e6irc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string();
+    let Some(pool) = &state.pool else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No database configured",
+            None,
+        );
+    };
+    let Some(token) = session_token(&headers) else {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/".to_string())]).into_response();
+    };
+    let (id_token, provider) = match crate::db::session_logout_hint(pool, &token).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("http: logout hint lookup failed: {e}");
+            (None, None)
+        }
+    };
+    if let Err(e) = crate::db::delete_web_session(pool, &token).await {
+        eprintln!("http: logout failed: {e}");
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database unavailable",
+            None,
+        );
+    }
+    // Build the provider's RP-initiated logout URL, if we have an id token
+    // hint, the provider exposes an end-session endpoint, and we know our
+    // own public URL to return to.
+    let end_session = provider
+        .as_deref()
+        .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name))
+        .and_then(|p| p.end_session_endpoint.clone());
+    let location = match (id_token, end_session) {
+        (Some(hint), Some(endpoint)) => match openidconnect::url::Url::parse(&endpoint) {
+            Ok(mut url) => {
+                url.query_pairs_mut().append_pair("id_token_hint", &hint);
+                if let Some(public) = &state.public_url {
+                    url.query_pairs_mut()
+                        .append_pair("post_logout_redirect_uri", public.trim_end_matches('/'));
+                }
+                url.to_string()
+            }
+            Err(e) => {
+                eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
+                "/".to_string()
+            }
+        },
+        _ => "/".to_string(),
+    };
+    (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, location), (header::SET_COOKIE, clear)],
+    )
+        .into_response()
+}
+
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -1270,6 +1388,21 @@ async fn openapi() -> Response {
             "/api/v1/me": {
                 "get": { "summary": "The authenticated account", "security": bearer,
                     "responses": ok_json }
+            },
+            "/api/v1/auth/oidc/{provider}/sso": {
+                "get": { "summary": "Silently probe for an existing SSO session (prompt=none)",
+                    "description": "Redirects to the provider with prompt=none. If the browser already has an SSO session the callback logs you in with no prompt; otherwise it bounces to /?sso=none.",
+                    "parameters": [{ "name": "provider", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "responses": { "307": { "description": "redirect into the provider" },
+                        "404": { "description": "unknown provider" } } }
+            },
+            "/api/v1/auth/logout": {
+                "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
+                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Degrades to a local logout for password/PAT sessions.",
+                    "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" } } },
+                "post": { "summary": "Local logout: clear the e6irc session only",
+                    "responses": { "204": { "description": "session cleared" } } }
             },
             "/api/v1/auth/oidc/{provider}/link": {
                 "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",

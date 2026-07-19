@@ -44,6 +44,8 @@ async fn full_oidc_login_provisions_account_and_session() {
             issuer_url: dex_url,
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
+            scopes: vec![],
+            end_session_endpoint: None,
         }],
         ..Config::default()
     };
@@ -263,6 +265,8 @@ async fn oidc_identity_link_flow_and_conflict() {
             issuer_url: dex_url,
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
+            scopes: vec![],
+            end_session_endpoint: None,
         }],
         ..Config::default()
     };
@@ -348,4 +352,160 @@ async fn oidc_identity_link_flow_and_conflict() {
 
     // bob tries to link the *same* dex identity → 409 conflict.
     assert_eq!(run_link(&base, &bob_session).await, 409);
+}
+
+/// prompt=none silent SSO: once the browser holds a provider session, a
+/// silent probe logs in with no interactive UI; without a provider session
+/// it bounces to /?sso=none instead of prompting (no redirect loop). Uses
+/// fixed port 18082.
+#[tokio::test]
+#[ignore = "needs PostgreSQL + dex; see module docs"]
+async fn oidc_silent_sso_reuses_provider_session() {
+    let db_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
+    let pool = e6ircd::db::connect_and_migrate(&db_url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    drop(pool);
+
+    let http_addr: std::net::SocketAddr = "127.0.0.1:18082".parse().unwrap();
+    let config = Config {
+        server_name: "irc.silent.example".into(),
+        network_name: "SilentNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: http_addr,
+            public_url: Some(format!("http://{http_addr}")),
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url: db_url }),
+        oidc_providers: vec![OidcProviderConfig {
+            name: "dex".into(),
+            issuer_url: dex_url,
+            client_id: "e6irc-test".into(),
+            client_secret: "e6irc-test-secret".into(),
+            scopes: vec![],
+            end_session_endpoint: None,
+        }],
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let base = format!("http://{}", running.http_addr.expect("http"));
+
+    // Follow a start endpoint's redirect chain through dex back to our
+    // callback; return the callback's (status, location).
+    async fn drive(client: &reqwest::Client, base: &str, start_path: &str) -> (u16, String) {
+        let resp = client
+            .get(format!("{base}{start_path}"))
+            .send()
+            .await
+            .expect("start");
+        assert_eq!(resp.status(), 307, "start not a redirect");
+        let mut location = resp
+            .headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        for _ in 0..10 {
+            if location.starts_with(base) {
+                break;
+            }
+            let resp = client.get(&location).send().await.expect("dex hop");
+            assert!(
+                resp.status().is_redirection(),
+                "dex answered {} at {location}",
+                resp.status()
+            );
+            let next = resp.headers().get("location").unwrap().to_str().unwrap();
+            location = if next.starts_with("http") {
+                next.to_string()
+            } else {
+                let origin = location.split('/').take(3).collect::<Vec<_>>().join("/");
+                format!("{origin}{next}")
+            };
+        }
+        assert!(
+            location.starts_with(base),
+            "never returned to callback: {location}"
+        );
+        let resp = client.get(&location).send().await.expect("callback");
+        let status = resp.status().as_u16();
+        let loc = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        (status, loc)
+    }
+
+    // A client that first logs in interactively holds dex's SSO session; a
+    // subsequent silent probe then logs in with NO interactive prompt (303
+    // home, not /?sso=none).
+    let member = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let (status, _) = drive(&member, &base, "/api/v1/auth/oidc/dex/start").await;
+    assert_eq!(status, 303, "interactive login should succeed");
+    let (status, loc) = drive(&member, &base, "/api/v1/auth/oidc/dex/sso").await;
+    assert_eq!(status, 303, "silent probe with a session should log in");
+    assert!(
+        !loc.contains("sso=none"),
+        "silent probe wrongly reported no session: {loc:?}"
+    );
+
+    // The no-session branch: dex's mock connector always approves (even for
+    // prompt=none), so drive the login_required path directly — register a
+    // silent pending via /sso, then deliver the error a real provider (Hydra)
+    // returns on prompt=none with no session. It must land on /?sso=none,
+    // never a 401 and never a re-prompt loop.
+    let anon = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let probe = anon
+        .get(format!("{base}/api/v1/auth/oidc/dex/sso"))
+        .send()
+        .await
+        .expect("probe");
+    assert_eq!(probe.status(), 307);
+    let auth_url = probe.headers().get("location").unwrap().to_str().unwrap();
+    let state = auth_url
+        .split_once("state=")
+        .and_then(|(_, rest)| rest.split('&').next())
+        .expect("state param");
+    let cb = anon
+        .get(format!(
+            "{base}/api/v1/auth/oidc/dex/callback?error=login_required&state={state}"
+        ))
+        .send()
+        .await
+        .expect("callback");
+    assert_eq!(
+        cb.status().as_u16(),
+        303,
+        "login_required should redirect, not error"
+    );
+    assert!(
+        cb.headers()
+            .get("location")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("sso=none"),
+        "expected /?sso=none on login_required"
+    );
 }

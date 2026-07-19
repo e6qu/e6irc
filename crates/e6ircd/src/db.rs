@@ -1408,18 +1408,41 @@ fn token_hash(token: &str) -> Vec<u8> {
 /// Mint a web session for an account: opaque 32-byte token returned to
 /// the caller; only its SHA-256 is stored. 14-day expiry.
 pub async fn create_web_session(pool: &PgPool, account: &str) -> Result<String, DbError> {
+    create_web_session_full(pool, account, None, None).await
+}
+
+/// Like [`create_web_session`], but records the OIDC `id_token` and the
+/// `provider` it came from so logout can end the upstream SSO session
+/// (RP-initiated logout).
+pub async fn create_oidc_web_session(
+    pool: &PgPool,
+    account: &str,
+    id_token: &str,
+    provider: &str,
+) -> Result<String, DbError> {
+    create_web_session_full(pool, account, Some(id_token), Some(provider)).await
+}
+
+async fn create_web_session_full(
+    pool: &PgPool,
+    account: &str,
+    id_token: Option<&str>,
+    provider: Option<&str>,
+) -> Result<String, DbError> {
     use argon2::password_hash::rand_core::RngCore;
     let mut bytes = [0u8; 32];
     argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
     let token = e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-");
     let folded = CaseMapping::Rfc1459.casefold(account);
     let inserted = sqlx::query(
-        "INSERT INTO web_sessions (token_hash, account_id, expires_at)
-         SELECT $1, a.id, now() + interval '14 days'
+        "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider)
+         SELECT $1, a.id, now() + interval '14 days', $3, $4
          FROM accounts a WHERE a.name_folded = $2",
     )
     .bind(token_hash(&token))
     .bind(&folded)
+    .bind(id_token)
+    .bind(provider)
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
@@ -1427,6 +1450,24 @@ pub async fn create_web_session(pool: &PgPool, account: &str) -> Result<String, 
         return Err(DbError::BadCredentials);
     }
     Ok(token)
+}
+
+/// The OIDC `(id_token, provider)` recorded with a session, for RP-initiated
+/// logout. `(None, None)` for a password/PAT session or an unknown/expired
+/// token — logout stays local in that case.
+pub async fn session_logout_hint(
+    pool: &PgPool,
+    token: &str,
+) -> Result<(Option<String>, Option<String>), DbError> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT id_token, oidc_provider FROM web_sessions
+         WHERE token_hash = $1 AND expires_at > now()",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(row.unwrap_or((None, None)))
 }
 
 /// Resolve a session token to its account name, if valid and unexpired.
