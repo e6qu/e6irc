@@ -10,17 +10,25 @@
 //! hands its socket to [`attach`], which replays the detached buffer and
 //! relays live traffic both ways.
 
+#[cfg(feature = "discord")]
+mod discord;
 mod irc_driver;
 mod local_driver;
 #[cfg(feature = "matrix")]
 mod matrix;
 mod serve;
+#[cfg(feature = "slack")]
+mod slack;
 
+#[cfg(feature = "discord")]
+pub use discord::{DiscordConfig, DiscordDriver};
 pub use irc_driver::{IrcNetwork, NetworkConfig};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDriver};
 pub use serve::{Registry, bnc_serve};
+#[cfg(feature = "slack")]
+pub use slack::{SlackConfig, SlackDriver};
 
 /// Build a driver config from a stored network row, decrypting its
 /// sealed upstream SASL password with the master key. Fails loudly if a

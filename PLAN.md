@@ -3,12 +3,15 @@
 Phases are sequential PRs/PR-groups; each phase ends with DESIGN.md/PLAN.md/
 BUGS.md updated in the same PR. Details in DESIGN.md (section refs below).
 
-Status (2026-07-19): Phases 0–10 ✅ complete. Phase 13 (scale) — the load
-harness is complete and gives real multi-channel baselines; the 100k run
-itself is environment-blocked (needs a tuned Linux host, not code). Phases
-11–12 (Discord/Slack bridges) ⛔ blocked on real third-party credentials —
-neither platform is self-hostable, so the only faithful oracle is the live
-API and mocking it would be a hollow green. Legend: ✅ done · 🔶 partial ·
+Status (2026-07-19): Phases 0–10 ✅ complete. Phases 11–12 (Discord/Slack
+bridges) 🔶 code-complete behind feature flags with offline-unit-tested
+mapping logic; live verification is gated on real credentials (neither
+platform is self-hostable, so the gateway path can only be checked against
+the live API). Phase 13 (scale) — the load harness is complete with real
+multi-channel baselines; the 100k run is environment-blocked (needs a tuned
+Linux host). See **Known remaining scope** below for documented-but-unbuilt
+surface (fuller services, admin API, CHATHISTORY subcommands) that the
+completed-phase markers do not cover. Legend: ✅ done · 🔶 partial ·
 ⛔ blocked (reason).
 
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
@@ -299,22 +302,37 @@ Done:
   Live integration test vs. a pinned Conduit homeserver
   (vendor/tests/external-oracles/conduit/): both directions verified.
   Unit tests for the mapping/urlencode.
-## Phase 11 — Discord bridge ⛔ blocked (credentials)
-The bridge is a `NetworkDriver` (Phase 9 SPI), the same shape as the
-Matrix driver. It cannot be genuinely built or tested here: Discord is
-not self-hostable (no open-source server to run in CI), so the only
-faithful oracle is the live Discord API, which needs a real bot token +
-a guild the bot is in. Mocking the protocol would produce a hollow green
-(false confidence) with no evidence the real gateway behaves as coded.
-Unblock: a Discord application/bot token + a test guild — then the driver
-follows the Matrix pattern (gateway connect, channel⇄channel mapping,
-message relay both ways) with a live-gated integration test. (DESIGN §10.5)
+## Phase 11 — Discord bridge 🔶 code-complete; live-verification-gated (2026-07-19)
+`discord` NetworkDriver (behind the `discord` feature): connects to the
+Discord gateway (WebSocket), IDENTIFYs with a bot token, keeps the
+heartbeat, and bridges `MESSAGE_CREATE` events ⇄ IRC PRIVMSG (each
+configured channel id → `#name` via a one-time REST lookup; author
+username ⇄ nick; the bot's own messages dropped). The reverse direction
+posts via the REST API. Config: `kind=discord` [[network]]
+(`sasl_password` = bot token, `autojoin` = channel ids, `addr` = optional
+API base). The pure parse/map/route logic is unit-tested offline.
 
-## Phase 12 — Slack bridge ⛔ blocked (credentials)
-Same situation as Phase 11: Slack is not self-hostable; the faithful
-oracle is the live Slack API (Socket Mode / Events API), needing a real
-workspace + app token. Unblock: a Slack workspace + app (bot + app
-tokens). Driver then follows the same SPI. (DESIGN §10.5)
+**Not verified against live Discord.** There is no self-hostable Discord
+server (Spacebar, the only reimplementation, SIGSEGVs on its current
+image — tested 2026-07-19), so the gateway/REST path can only be verified
+against the live API, which needs a real bot token + a guild. That live
+integration test is the remaining step; it is gated on credentials, not
+run in CI. (DESIGN §10.5)
+
+## Phase 12 — Slack bridge 🔶 code-complete; live-verification-gated (2026-07-19)
+`slack` NetworkDriver (behind the `slack` feature): opens a Socket Mode
+WebSocket with the app-level token, ACKs each event envelope, and bridges
+channel `message` events ⇄ IRC PRIVMSG (channel id → `#name` via
+`conversations.info`; `user` ⇄ nick; bot messages dropped to avoid echo
+loops). The reverse direction posts via `chat.postMessage`. Config:
+`kind=slack` [[network]] (`sasl_account` = bot token, `sasl_password` =
+app-level token, `autojoin` = channel ids). Parse/map/route unit-tested
+offline.
+
+**Not verified against live Slack.** Slack is not self-hostable; the
+faithful oracle is the live Web/Socket-Mode API, needing a real workspace
++ app. That live integration test is the remaining step, gated on
+credentials. (DESIGN §10.5)
 
 ## Phase 13 — Scale hardening 🔶 harness complete; 100k run environment-blocked (2026-07-19)
 Done:
@@ -342,3 +360,44 @@ Remaining (environment-blocked, not code-blocked):
   already shows at scale is the single core worker (N=1 of the sharded
   design) serializing every channel's fan-out — core sharding is the open
   hardening item. (DESIGN §7.3, §17)
+
+## Known remaining scope (audit 2026-07-19)
+
+A completeness audit against DESIGN.md surfaced documented-but-unbuilt
+surface that the ✅ phase markers above do **not** cover. Recorded here
+honestly rather than left implied. All of it fails loudly today (returns
+an error / 404 / `FAIL`), so none of it is a silent no-op — it is simply
+not built yet. Ranked by value:
+
+1. **ChanServ founder ownership + topic retention** (DESIGN §7.6, §8).
+   `ChanServ REGISTER` persists a `channels` row (founder id), but that
+   record is never read back: a returning founder is not re-opped (JOIN
+   grants `+o` only to the first joiner), and a registered channel's topic
+   is not persisted or restored. Registration is therefore inert beyond
+   the DB row. Needs an in-memory founder map (boot-loaded like BNC
+   networks, updated on the `ChannelRegistered` reply), a founder check in
+   `join_one`, and topic persist/restore. Phase 2's "founder ownership"
+   line over-claimed this; it is the core of the deferred fuller ChanServ
+   surface (migration 0002 says as much).
+2. **Fuller NickServ/ChanServ command surface** (DESIGN §7.6). Only
+   REGISTER/IDENTIFY/HELP (NickServ) and REGISTER/HELP (ChanServ) exist;
+   GHOST, ACCESS/FLAGS, OP, DROP, SET, founder/successor are absent
+   (return "Invalid command."). This is an Atheme-equivalent services
+   subsystem — substantial.
+3. **CHATHISTORY `AROUND` / `BETWEEN` / `TARGETS`** (DESIGN §11.2). Only
+   LATEST/BEFORE/AFTER are handled; other subcommands return `FAIL …
+   INVALID_PARAMS`. `TARGETS` in particular is what bouncer/multi-buffer
+   clients use to enumerate active buffers — the highest-value of the
+   three and the most bounded to add.
+4. **REST `/api/v1` surface vs DESIGN §12.** No `channels` resource;
+   `admin` has only `GET /accounts` (no global bans, server stats, audit
+   query); `networks` has list/create/delete only (no enable/disable,
+   status, buffers, read-marker get/set); `me/tokens` is create-only; no
+   OIDC identity linking. All 404 via the loud fallback.
+5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
+   §8). No kline/dline/xline equivalents, no SETHOST, no `audit_log`
+   table. Implemented oper commands are OPER/KILL/WALLOPS only.
+
+Items 2, 4, 5 are each a major subsystem (services / admin tooling / oper
+bans + audit) and are genuinely future phases, not tack-on fixes. Items 1
+and 3 are bounded and are the natural next increments.
