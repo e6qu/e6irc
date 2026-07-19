@@ -116,7 +116,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/device/token", post(device_token))
         .route("/api/v1/auth/device/approve", post(device_approve))
         .route("/api/v1/me", get(me))
-        .route("/api/v1/me/tokens", post(create_api_token))
+        .route(
+            "/api/v1/me/tokens",
+            get(me_tokens_list).post(create_api_token),
+        )
+        .route(
+            "/api/v1/me/tokens/{id}",
+            axum::routing::delete(me_tokens_revoke),
+        )
         .route("/api/v1/me/credentials", get(list_credentials))
         .route(
             "/api/v1/me/credentials/{id}",
@@ -1222,8 +1229,16 @@ async fn openapi() -> Response {
                         "404": { "description": "no such pending code" } } }
             },
             "/api/v1/me/tokens": {
+                "get": { "summary": "List your personal access tokens (never the token)",
+                    "security": bearer, "responses": ok_json },
                 "post": { "summary": "Mint a personal access token (shown once)",
                     "security": bearer, "responses": ok_json }
+            },
+            "/api/v1/me/tokens/{id}": {
+                "delete": { "summary": "Revoke one of your personal access tokens",
+                    "security": bearer,
+                    "responses": { "204": { "description": "revoked" },
+                        "404": { "description": "no such token" } } }
             },
             "/api/v1/me/credentials": {
                 "get": { "summary": "List the account's credentials", "security": bearer,
@@ -1701,6 +1716,70 @@ async fn list_credentials(
         }
         Err(e) => {
             eprintln!("http: credential list failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
+/// List the authenticated account's personal access tokens (never the
+/// token itself).
+async fn me_tokens_list(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::list_api_tokens(pool, &account).await {
+        Ok(rows) => {
+            let tokens: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(id, label, created_at, expires_at)| {
+                    serde_json::json!({
+                        "id": id, "label": label,
+                        "created_at": created_at, "expires_at": expires_at,
+                    })
+                })
+                .collect();
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "tokens": tokens }).to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("http: token list failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
+/// Revoke one of the authenticated account's PATs by id.
+async fn me_tokens_revoke(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::delete_api_token(pool, &account, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => problem(StatusCode::NOT_FOUND, "No such token", None),
+        Err(e) => {
+            eprintln!("http: token revoke failed: {e}");
             problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",
