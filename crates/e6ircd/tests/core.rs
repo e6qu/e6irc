@@ -2761,3 +2761,44 @@ fn oper_kline_bans_disconnects_and_refuses() {
         "non-oper was allowed to KLINE"
     );
 }
+
+#[test]
+fn oper_actions_are_audited() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let audits = |s: &mut TestServer| -> Vec<(String, String)> {
+        s.db_requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                e6ircd::core::DbRequest::AuditLog { action, target, .. } => Some((action, target)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(
+        audits(&mut s)
+            .iter()
+            .any(|(a, t)| a == "OPER" && t == "god"),
+        "OPER not audited"
+    );
+
+    s.line(op, "KLINE baddie@* :spam");
+    s.drain(op);
+    assert!(
+        audits(&mut s)
+            .iter()
+            .any(|(a, t)| a == "KLINE" && t == "baddie@*"),
+        "KLINE not audited"
+    );
+
+    s.line(op, "UNKLINE baddie@*");
+    s.drain(op);
+    assert!(
+        audits(&mut s)
+            .iter()
+            .any(|(a, t)| a == "UNKLINE" && t == "baddie@*"),
+        "UNKLINE not audited"
+    );
+}

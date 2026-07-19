@@ -3797,6 +3797,7 @@ fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     state.sessions.get_mut(&conn).expect("registered").oper = true;
     let nick = state.sessions[&conn].nick.clone().expect("registered");
+    record_audit(state, conn, "OPER", name, "");
     state.numeric(
         conn,
         RPL_YOUREOPER,
@@ -3853,6 +3854,29 @@ fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
     state.close(victim, &reason);
+    record_audit(state, conn, "KILL", target, comment);
+}
+
+/// Record a privileged oper action in the audit log (best-effort; only
+/// when a database is configured to hold it).
+fn record_audit(state: &mut ServerState, conn: ConnId, action: &str, target: &str, detail: &str) {
+    if !state.config.sasl_enabled {
+        return;
+    }
+    let actor = state
+        .sessions
+        .get(&conn)
+        .and_then(|s| s.nick.clone())
+        .unwrap_or_default();
+    let request = super::DbRequest::AuditLog {
+        actor,
+        action: action.to_string(),
+        target: target.to_string(),
+        detail: detail.to_string(),
+    };
+    if state.db_tx.try_push(request).is_err() {
+        eprintln!("audit: db queue full or closed; {action} action not recorded");
+    }
 }
 
 /// Normalise a K-line target: a bare host/nick becomes `*@target`.
@@ -3934,6 +3958,7 @@ fn cmd_kline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.send(victim, &format!("ERROR :Closing Link: (K-Lined: {reason})"));
         state.close(victim, &format!("K-Lined: {reason}"));
     }
+    record_audit(state, conn, "KLINE", &mask, &reason);
     state.send(
         conn,
         &format!(":{server} NOTICE {nick} :Added K-Line for {mask}"),
@@ -3977,6 +4002,9 @@ fn cmd_unkline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     } else {
         format!("No K-Line found for {mask}")
     };
+    if removed {
+        record_audit(state, conn, "UNKLINE", &mask, "");
+    }
     state.send(conn, &format!(":{server} NOTICE {nick} :{msg}"));
 }
 

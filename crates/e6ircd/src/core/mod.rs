@@ -142,6 +142,13 @@ pub enum DbRequest {
     },
     /// Remove a server ban by mask (oper UNKLINE). Fire-and-forget.
     RemoveKline { mask: String },
+    /// Record a privileged (oper) action in the audit log. Fire-and-forget.
+    AuditLog {
+        actor: String,
+        action: String,
+        target: String,
+        detail: String,
+    },
     /// Append one chat message to history. Fire-and-forget: no reply.
     LogMessage {
         msgid: String,

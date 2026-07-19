@@ -410,8 +410,10 @@ not built yet. Ranked by value:
    UNKLINE**: a `server_bans` table (migration 0012, boot-loaded into a hot
    list) whose `user@host` glob is refused at registration (465 + closing
    ERROR) and disconnects matching sessions; KLINE lists/adds, UNKLINE
-   removes. **Still absent:** dline/xline, SETHOST, and the `audit_log`
-   table (oper actions are not yet recorded).
+   removes. The **audit_log** table (migration 0013) now records every OPER/KILL/
+   KLINE/UNKLINE action (actor, action, target, detail, time);
+   db::list_audit_log exposes it for the admin API. **Still absent:**
+   dline/xline and SETHOST.
 
 Items 1 and 3 are fully done; item 2 is nearly done (only SET's
 lower-value channel-option flags remain); item 5 has its core (KLINE) with
