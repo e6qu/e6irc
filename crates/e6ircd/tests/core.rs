@@ -2542,6 +2542,86 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
     );
 }
 
+#[test]
+fn chanserv_set_mlock_enforces_modes() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg"); // op; channel created with default +nt
+    s.drain(boss);
+    s.db_requests();
+
+    // A bad lock char is rejected loudly, not stored.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg MLOCK +k");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|l| l.contains("not a lockable mode")),
+        "bad mlock char not rejected"
+    );
+    assert!(
+        s.db_requests()
+            .into_iter()
+            .all(|r| !matches!(r, e6ircd::core::DbRequest::SetChannelMlock { .. })),
+        "rejected mlock was persisted"
+    );
+
+    // Lock +m-t: m forced on, t forced off — applied to the live channel now.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg MLOCK +m-t");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("MLOCK") && l.contains("+m-t")),
+        "no MLOCK confirmation: {out:#?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
+        "lock not applied on set: {out:#?}"
+    );
+    assert!(
+        s.db_requests().into_iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelMlock { channel, mlock: Some(spec) }
+            if channel == "#reg" && spec == "+m-t")),
+        "mlock not persisted"
+    );
+
+    // Changing a locked mode the wrong way is refused (no MODE echo).
+    s.line(boss, "MODE #reg -m");
+    assert!(
+        !s.drain(boss).iter().any(|l| l.contains(" MODE ")),
+        "locked -m was allowed"
+    );
+    s.line(boss, "MODE #reg +t");
+    assert!(
+        !s.drain(boss).iter().any(|l| l.contains(" MODE ")),
+        "locked +t was allowed"
+    );
+
+    // A mixed change applies only the unlocked part (+C), not the locked -m.
+    s.line(boss, "MODE #reg -m+C");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|l| l.contains(" MODE #reg ") && l.contains("+C") && !l.contains("-m")),
+        "mixed change wrong: {out:#?}"
+    );
+
+    // Recreate: the last member parts (channel empties) then rejoins → the
+    // lock is re-applied so its modes survive the channel going empty.
+    s.line(boss, "PART #reg");
+    s.drain(boss);
+    s.line(boss, "JOIN #reg");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
+        "lock not re-applied on recreate: {out:#?}"
+    );
+}
+
 // NickServ GHOST + ChanServ DROP (DESIGN §7.6).
 
 #[test]

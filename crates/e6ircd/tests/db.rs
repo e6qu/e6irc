@@ -1100,6 +1100,56 @@ async fn channel_keeptopic_persist_and_load() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_mlock_persist_and_load() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "boss", "pw")
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#c', '#c', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+
+    // No lock by default.
+    assert!(
+        db::list_channel_mlock(&pool)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+
+    // Set → loads back with the same spec.
+    db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()))
+        .await
+        .expect("set");
+    assert_eq!(
+        db::list_channel_mlock(&pool).await.expect("list"),
+        vec![("#c".to_string(), "+nt-i".to_string())]
+    );
+
+    // Clear → it no longer loads.
+    db::set_channel_mlock(&pool, "#c", None)
+        .await
+        .expect("clear");
+    assert!(
+        db::list_channel_mlock(&pool)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_access_persist_and_load() {
     let pool = db::connect_and_migrate(&test_db_url())
         .await

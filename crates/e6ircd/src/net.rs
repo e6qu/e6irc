@@ -204,6 +204,11 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?,
         );
+        core.preload_mlock(
+            crate::db::list_channel_mlock(pool)
+                .await
+                .map_err(io::Error::other)?,
+        );
         core.preload_access(
             crate::db::list_channel_access(pool)
                 .await

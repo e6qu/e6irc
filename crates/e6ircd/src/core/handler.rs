@@ -1279,11 +1279,89 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                 ),
             );
         }
+        "MLOCK" => {
+            let spec = args.get(2).copied().unwrap_or("");
+            // Clear the lock on empty / OFF / "-".
+            if spec.is_empty() || spec.eq_ignore_ascii_case("OFF") || spec == "-" {
+                state.channel_mlock.remove(&key);
+                let request = super::DbRequest::SetChannelMlock {
+                    channel: key.as_str().to_string(),
+                    mlock: None,
+                };
+                if state.db_tx.try_push(request).is_err() {
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        "Services are temporarily unavailable. Try again later.",
+                    );
+                    return;
+                }
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!("MLOCK for \x02{channel}\x02 cleared."),
+                );
+                return;
+            }
+            let parsed = match super::state::MlockModes::parse(spec) {
+                Ok(m) if !m.is_empty() => m,
+                Ok(_) => {
+                    state.service_notice(conn, "ChanServ", "MLOCK lists no lockable modes.");
+                    return;
+                }
+                Err(bad) => {
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!("\x02{bad}\x02 is not a lockable mode. Lockable: i m n s t C."),
+                    );
+                    return;
+                }
+            };
+            let canonical = parsed.render();
+            state.channel_mlock.insert(key.clone(), parsed);
+            let request = super::DbRequest::SetChannelMlock {
+                channel: key.as_str().to_string(),
+                mlock: Some(canonical.clone()),
+            };
+            if state.db_tx.try_push(request).is_err() {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Services are temporarily unavailable. Try again later.",
+                );
+                return;
+            }
+            // Enforce immediately on the live channel.
+            apply_mlock(state, &key);
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("MLOCK for \x02{channel}\x02 set to \x02{canonical}\x02."),
+            );
+        }
+        "GUARD" => {
+            // GUARD keeps ChanServ in the channel so it is never destroyed
+            // and its modes/topic survive. e6irc keeps a registered
+            // channel's founder, access, retained topic, and mode lock in
+            // persistent state regardless of membership, so that guarantee
+            // already holds — there is nothing for an in-channel presence to
+            // protect. Answered explicitly rather than silently accepted.
+            state.service_notice(
+                conn,
+                "ChanServ",
+                "GUARD is unnecessary here: a registered channel keeps its founder, \
+                 access, topic, and mode lock across empty periods without ChanServ \
+                 holding it open.",
+            );
+        }
         other => {
             state.service_notice(
                 conn,
                 "ChanServ",
-                &format!("Unknown SET option \x02{other}\x02. Available: FOUNDER, KEEPTOPIC."),
+                &format!(
+                    "Unknown SET option \x02{other}\x02. Available: FOUNDER, KEEPTOPIC, MLOCK."
+                ),
             );
         }
     }
@@ -1516,10 +1594,11 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     let user_prefix = state.sessions[&conn].prefix();
     let casemap = state.casemap;
     // A registered channel being (re)created restores its retained topic.
-    let restored_topic = if state.channels.contains_key(&key) {
-        None
-    } else {
+    let newly_created = !state.channels.contains_key(&key);
+    let restored_topic = if newly_created {
         state.registered_topics.get(&key).cloned()
+    } else {
+        None
     };
     let chan = state
         .channels
@@ -1662,6 +1741,12 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
         );
     }
     send_names(state, conn, &key);
+
+    // A registered channel with a mode lock enforces it the moment it is
+    // (re)created, so its locked modes survive the channel going empty.
+    if newly_created {
+        apply_mlock(state, &key);
+    }
 }
 
 fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -2267,6 +2352,75 @@ fn cmd_mode(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 }
 
+/// Read a boolean channel mode by its mode char (`None` for non-boolean).
+fn chan_bool_mode(modes: &super::state::ChanModes, c: char) -> Option<bool> {
+    Some(match c {
+        'i' => modes.invite_only,
+        'm' => modes.moderated,
+        'n' => modes.no_external,
+        's' => modes.secret,
+        't' => modes.topic_ops_only,
+        'C' => modes.no_ctcp,
+        _ => return None,
+    })
+}
+
+/// Set a boolean channel mode by its mode char.
+fn set_chan_bool_mode(modes: &mut super::state::ChanModes, c: char, v: bool) {
+    match c {
+        'i' => modes.invite_only = v,
+        'm' => modes.moderated = v,
+        'n' => modes.no_external = v,
+        's' => modes.secret = v,
+        't' => modes.topic_ops_only = v,
+        'C' => modes.no_ctcp = v,
+        _ => {}
+    }
+}
+
+/// Enforce `key`'s mode lock on the live channel: change only the modes
+/// that differ from the lock and broadcast the resulting MODE from ChanServ.
+/// A no-op when the channel has no lock or is already compliant.
+fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
+    let Some(m) = state.channel_mlock.get(key).cloned() else {
+        return;
+    };
+    let Some(chan) = state.channels.get(key) else {
+        return;
+    };
+    let on_changes: String =
+        m.on.chars()
+            .filter(|&c| chan_bool_mode(&chan.modes, c) == Some(false))
+            .collect();
+    let off_changes: String = m
+        .off
+        .chars()
+        .filter(|&c| chan_bool_mode(&chan.modes, c) == Some(true))
+        .collect();
+    if on_changes.is_empty() && off_changes.is_empty() {
+        return;
+    }
+    let display = chan.name.clone();
+    let chan = state.channels.get_mut(key).expect("checked");
+    for c in on_changes.chars() {
+        set_chan_bool_mode(&mut chan.modes, c, true);
+    }
+    for c in off_changes.chars() {
+        set_chan_bool_mode(&mut chan.modes, c, false);
+    }
+    let mut spec = String::new();
+    if !on_changes.is_empty() {
+        spec.push('+');
+        spec.push_str(&on_changes);
+    }
+    if !off_changes.is_empty() {
+        spec.push('-');
+        spec.push_str(&off_changes);
+    }
+    let line = format!(":ChanServ MODE {display} {spec}");
+    state.broadcast_channel(key, &line, None);
+}
+
 fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
     let self_nick = state.sessions[&conn].nick.clone().expect("registered");
     if state.nick_key(target) != state.nick_key(&self_nick) {
@@ -2422,6 +2576,12 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
             '+' => adding = true,
             '-' => adding = false,
             'i' | 'm' | 'n' | 's' | 't' | 'C' => {
+                // A ChanServ mode lock forbids changing a locked mode the
+                // wrong way; such a change is refused (not echoed), leaving
+                // the locked state in place.
+                if state.mlock_conflict(&key, c, adding) {
+                    continue;
+                }
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let field = match c {
                     'i' => &mut chan.modes.invite_only,
