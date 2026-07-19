@@ -202,6 +202,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "KILL" => cmd_kill(state, conn, p),
         "KLINE" => cmd_kline(state, conn, p),
         "UNKLINE" => cmd_unkline(state, conn, p),
+        "SETHOST" => cmd_sethost(state, conn, p),
         "WALLOPS" => cmd_wallops(state, conn, p),
         _ => state.numeric(
             conn,
@@ -4006,6 +4007,66 @@ fn cmd_unkline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         record_audit(state, conn, "UNKLINE", &mask, "");
     }
     state.send(conn, &format!(":{server} NOTICE {nick} :{msg}"));
+}
+
+/// SETHOST <nick> <host> — oper-only. Change a user's displayed host
+/// (cloak) and announce it via CHGHOST to capable peers. This is the
+/// host-change trigger the chghost cap needs.
+fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !state.sessions[&conn].oper {
+        state.numeric(
+            conn,
+            ERR_NOPRIVILEGES,
+            &[],
+            Some("Permission Denied- You're not an IRC operator"),
+        );
+        return;
+    }
+    let (Some(&nick), Some(&newhost)) = (p.first(), p.get(1)) else {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["SETHOST"],
+            Some("Not enough parameters"),
+        );
+        return;
+    };
+    let server = state.config.server_name.clone();
+    let oper_nick = state.sessions[&conn].nick.clone().expect("registered");
+    // A host must be a single non-empty token without user/prefix chars.
+    if newhost.is_empty() || newhost.contains([' ', '@', '!', '\0']) {
+        state.send(
+            conn,
+            &format!(":{server} NOTICE {oper_nick} :Invalid host: {newhost}"),
+        );
+        return;
+    }
+    let nk = state.nick_key(nick);
+    let Some(&target) = state.nicks.get(&nk) else {
+        state.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
+        return;
+    };
+    let (user, old_prefix) = {
+        let s = &state.sessions[&target];
+        (s.user.clone().unwrap_or_default(), s.prefix())
+    };
+    state.sessions.get_mut(&target).expect("checked").host = newhost.to_string();
+
+    // Announce with the old prefix so clients can match, to every
+    // chghost-capable peer (including the target).
+    let chghost = format!(":{old_prefix} CHGHOST {user} {newhost}");
+    let mut recipients = state.channel_peers(target);
+    recipients.push(target);
+    for peer in recipients {
+        if state.sessions.get(&peer).is_some_and(|s| s.caps.chghost) {
+            state.send_timed(peer, &chghost);
+        }
+    }
+    record_audit(state, conn, "SETHOST", nick, newhost);
+    state.send(
+        conn,
+        &format!(":{server} NOTICE {oper_nick} :Set host of {nick} to {newhost}"),
+    );
 }
 
 // ---- WALLOPS ------------------------------------------------------------
