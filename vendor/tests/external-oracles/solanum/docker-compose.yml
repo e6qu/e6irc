@@ -1,0 +1,10 @@
+# Pinned Solanum (+ Atheme, once services scenarios land) for the
+# differential harness. Solanum has no official image; built from the
+# pinned source ref below.
+services:
+  solanum:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:16697:6667"

@@ -1,0 +1,22 @@
+[package]
+name = "e6irc-load"
+description = "Load-test harness: many concurrent clients, connect + fan-out throughput"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "e6irc-load"
+path = "src/main.rs"
+
+[dependencies]
+e6irc-client = { path = "../e6irc-client" }
+# rt-multi-thread to actually spread thousands of connections across cores.
+tokio = { version = "1.53.0", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "sync",
+] }

@@ -1,0 +1,46 @@
+# cargo-deny configuration. Licenses must be AGPL-3.0-or-later compatible.
+
+[licenses]
+allow = [
+    "AGPL-3.0-or-later", # our own crates
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    # webpki-roots ships the Mozilla CA bundle under this permissive
+    # data license (no copyleft); AGPL-compatible. Data, not code.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Transitive minor/patch version duplication is unavoidable across a
+# large tree (sqlx + openidconnect + argon2 pull differing versions of
+# shared low-level crates); surface it as a warning rather than a hard
+# fail. The hard bans below are the load-bearing policy.
+multiple-versions = "warn"
+# OpenSSL is banned by design: rustls is the single TLS stack (DESIGN §5).
+deny = [
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin timing attack in `rsa`): pulled by
+    # openidconnect solely for RS256 ID-token *signature verification*
+    # (public-key ops); e6ircd never performs RSA decryption, so the
+    # decryption-timing sidechannel is not on any exercised path. No
+    # fixed `rsa` release exists. Revisit when one ships.
+    "RUSTSEC-2023-0071",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

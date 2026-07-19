@@ -1,0 +1,5 @@
+# Whitelisted differential-harness divergences. Every entry needs a
+# reason; empty today. Format:
+#   [[allow]]
+#   pattern = "regex matched against normalized transcript lines"
+#   reason = "why this divergence is acceptable"

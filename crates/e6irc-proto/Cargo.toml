@@ -1,0 +1,8 @@
+[package]
+name = "e6irc-proto"
+description = "IRC message model, parser/serializer, casemapping, numerics, ISUPPORT (no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

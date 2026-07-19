@@ -1,0 +1,40 @@
+[package]
+name = "e6irc-cli"
+description = "Scripting-oriented CLI client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+e6irc-client = { path = "../e6irc-client" }
+e6irc-proto = { path = "../e6irc-proto" }
+# tokio for the async client; clap 4.6.2 (>24h) for the CLI surface.
+tokio = { version = "1.53.0", default-features = false, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+] }
+clap = { version = "4.6.2", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+
+[[bin]]
+name = "e6irc"
+path = "src/main.rs"
+
+[dev-dependencies]
+e6ircd = { path = "../e6ircd" }
+rustls = { version = "0.23.42", default-features = false, features = ["aws_lc_rs", "tls12", "std"] }
+rustls-pki-types = { version = "1.15.0", default-features = false, features = ["std"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "postgres",
+] }

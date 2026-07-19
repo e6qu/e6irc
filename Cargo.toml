@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+# The fuzz crate is its own workspace: nightly-only, built via cargo-fuzz.
+exclude = ["fuzz"]
+members = [
+    "crates/e6irc-proto",
+    "crates/e6irc-queue",
+    "crates/e6ircd",
+    "crates/e6irc-client",
+    "crates/e6irc-cli",
+    "crates/e6irc-tui",
+    "crates/e6irc-load",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+# Client binaries build with this profile: a CLI/TUI gains nothing from
+# unwinding, abort is smaller. e6ircd keeps the default unwind so a panic
+# in one connection task cannot take down the whole process.
+[profile.release-client]
+inherits = "release"
+panic = "abort"

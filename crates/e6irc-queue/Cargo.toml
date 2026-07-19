@@ -1,0 +1,17 @@
+[package]
+name = "e6irc-queue"
+description = "Custom bounded MPSC queue: the sole inter-subsystem communication primitive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+# Model checker for the concurrency core (DESIGN §7.3, §17.1). Compiled
+# in only under RUSTFLAGS="--cfg loom" (model-check runs), never in
+# normal builds. 0.7.2 published 2024-04-23 — satisfies the 24h cooldown.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"

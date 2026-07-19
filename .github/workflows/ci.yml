@@ -1,0 +1,239 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      # embed-web (pulled in by --all-features) embeds web/dist, so build
+      # the frontend first. Node is preinstalled on the runners.
+      - run: npm install -g pnpm && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
+      # deferred-work markers or unmessaged panics.
+      - run: tools/check-noops.sh
+
+  deny:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
+
+  # Full OS/arch matrix (DESIGN §1): no cell is a second-class port.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      # --all-features includes embed-web, which embeds web/dist.
+      - run: npm install -g pnpm && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - run: cargo test --workspace --all-features --target ${{ matrix.target }}
+
+  db-tests:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: e6irc_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      # single-threaded: the tests share one database and TRUNCATE it
+      - run: cargo test -p e6ircd --test db -- --ignored --test-threads=1
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+      - name: Start dex (mock connector)
+        run: |
+          sed 's/127.0.0.1:15556/127.0.0.1:15556/' tools/dex-config.yaml > /tmp/dex.yaml
+          docker run -d --name dex -p 15556:5556 \
+            -v /tmp/dex.yaml:/etc/dex/config.yaml \
+            ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
+            sleep 1
+          done
+      - run: cargo test -p e6ircd --test oidc -- --ignored --test-threads=1
+        # covers the dex OIDC flow and the PAT bearer-auth test
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+          E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
+      - run: cargo test -p e6irc-cli --test e2e -- --include-ignored --test-threads=1
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+
+  # Protocol conformance against the pinned irctest suite (vendored
+  # hookup in vendor/tests/irctest/) with the standard irctest marker
+  # filter. Grow the file list as surface lands; removing a file needs a
+  # written reason.
+  irctest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build -p e6ircd
+      - name: Check out pinned irctest
+        run: |
+          git clone https://github.com/progval/irctest ../irctest
+          git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Run irctest green list
+        working-directory: ../irctest
+        run: |
+          pip install -r requirements.txt pytest-timeout
+          PATH="$GITHUB_WORKSPACE/target/debug:$PATH" \
+          PYTHONPATH="$GITHUB_WORKSPACE/vendor/tests/irctest" \
+          pytest --controller=e6ircd_controller --timeout=15 \
+            -m 'not implementation-specific and not deprecated and not strict and not services' \
+            irctest/server_tests/connection_registration.py \
+            irctest/server_tests/pingpong.py \
+            irctest/server_tests/utf8.py \
+            irctest/server_tests/join.py \
+            irctest/server_tests/part.py \
+            irctest/server_tests/quit.py \
+            irctest/server_tests/topic.py \
+            irctest/server_tests/names.py \
+            irctest/server_tests/lusers.py \
+            irctest/server_tests/kick.py \
+            irctest/server_tests/invite.py \
+            irctest/server_tests/away.py \
+            irctest/server_tests/list.py \
+            irctest/server_tests/away_notify.py \
+            irctest/server_tests/extended_join.py \
+            irctest/server_tests/multi_prefix.py \
+            irctest/server_tests/setname.py \
+            irctest/server_tests/account_tag.py \
+            irctest/server_tests/message_tags.py \
+            irctest/server_tests/echo_message.py \
+            irctest/server_tests/monitor.py \
+            irctest/server_tests/whowas.py \
+            irctest/server_tests/time.py \
+            irctest/server_tests/names.py \
+            irctest/server_tests/chmodes/key.py \
+            irctest/server_tests/chmodes/moderated.py \
+            irctest/server_tests/chmodes/limit.py \
+            irctest/server_tests/chmodes/ban.py \
+            irctest/server_tests/chmodes/invite_exception.py \
+            irctest/server_tests/chmodes/no_external.py \
+            irctest/server_tests/chmodes/operator.py \
+            irctest/server_tests/chmodes/secret.py \
+            irctest/server_tests/chmodes/modeis.py \
+            irctest/server_tests/chmodes/no_ctcp.py \
+            irctest/server_tests/kill.py \
+            irctest/server_tests/wallops.py \
+            irctest/server_tests/bot_mode.py \
+            irctest/server_tests/oper.py \
+            irctest/server_tests/info.py \
+            irctest/server_tests/who.py \
+            irctest/server_tests/whois.py \
+            irctest/server_tests/labeled_responses.py \
+            irctest/server_tests/messages.py \
+            irctest/server_tests/statusmsg.py
+
+  # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
+  # Conduit v0.9.0 needs a config file, so it is started with docker run
+  # (after checkout) mounting the repo's vendored config.
+  matrix-bridge:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - name: Start Conduit
+        run: |
+          docker run -d --name conduit -p 16167:6167 \
+            -e CONDUIT_CONFIG=/etc/conduit.toml \
+            -v "$PWD/vendor/tests/external-oracles/conduit/conduit.toml:/etc/conduit.toml:ro" \
+            matrixconduit/matrix-conduit:v0.9.0
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:16167/_matrix/client/versions >/dev/null && break
+            sleep 1
+          done
+      - run: cargo test -p e6ircd --features matrix --test matrix -- --ignored
+        env:
+          E6IRC_TEST_MATRIX_URL: http://127.0.0.1:16167
+
+  loom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo test -p e6irc-queue --release
+        env:
+          RUSTFLAGS: --cfg loom -Dwarnings
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz each target briefly
+        working-directory: fuzz
+        run: |
+          for target in parse_message tag_escaping isupport_token; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
+
+  # Informational only — no threshold (DESIGN §6).
+  size-report:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build --release --workspace
+      - name: Report stripped binary sizes
+        run: |
+          {
+            echo '### Binary sizes (release, stripped)'
+            echo '| binary | size |'
+            echo '|---|---|'
+            for bin in e6ircd e6irc e6irc-tui; do
+              if [ -f "target/release/$bin" ]; then
+                echo "| $bin | $(du -h "target/release/$bin" | cut -f1) |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

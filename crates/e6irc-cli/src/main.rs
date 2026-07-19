@@ -1,0 +1,328 @@
+//! e6irc — a scripting-oriented IRC CLI. Non-interactive subcommands
+//! that connect, do one job, and exit with a clear status.
+
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use e6irc_client::Connection;
+
+#[derive(Parser)]
+#[command(name = "e6irc", about = "Scripting-oriented IRC client", version)]
+struct Cli {
+    /// Server address (host:port).
+    #[arg(long, short, default_value = "127.0.0.1:6667", global = true)]
+    server: String,
+    /// Nickname to register with.
+    #[arg(long, short, default_value = "e6irc", global = true)]
+    nick: String,
+    /// SASL account (enables SASL PLAIN when set with --password).
+    #[arg(long, global = true)]
+    account: Option<String>,
+    /// SASL password.
+    #[arg(long, global = true)]
+    password: Option<String>,
+    /// Connect over TLS (validating against the public CA set).
+    #[arg(long, global = true)]
+    tls: bool,
+    /// TLS server name (defaults to the host part of --server).
+    #[arg(long, global = true)]
+    tls_name: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Send one PRIVMSG to a target and exit.
+    Send { target: String, message: String },
+    /// Follow messages sent to a channel/nick, printing one per line.
+    Tail {
+        target: String,
+        /// Stop after N messages (0 = forever).
+        #[arg(long, default_value_t = 0)]
+        count: usize,
+    },
+    /// Send raw lines read from stdin, then exit.
+    Raw,
+    /// Print the most recent history of a channel via CHATHISTORY.
+    History {
+        target: String,
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+    },
+    /// Make one authenticated REST API request and print the response
+    /// body. Plain HTTP only — front the API with a TLS-terminating proxy
+    /// for remote use. Exit status is nonzero on a non-2xx response.
+    Api {
+        /// HTTP method (GET, POST, DELETE, …).
+        method: String,
+        /// Request path, e.g. /api/v1/me/networks.
+        path: String,
+        /// API base URL (http://host:port).
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        base: String,
+        /// Bearer token; falls back to the E6IRC_API_TOKEN env var.
+        #[arg(long)]
+        token: Option<String>,
+        /// JSON request body (for POST/PUT).
+        #[arg(long)]
+        body: Option<String>,
+    },
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("e6irc: runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(cli)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("e6irc: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(cli: Cli) -> std::io::Result<()> {
+    // The `api` command speaks HTTP, not IRC — handle it before the IRC
+    // connection is opened.
+    if let Command::Api {
+        method,
+        path,
+        base,
+        token,
+        body,
+    } = &cli.command
+    {
+        return run_api(method, path, base, token.clone(), body.clone()).await;
+    }
+
+    let mut conn = if cli.tls {
+        let name = cli.tls_name.clone().unwrap_or_else(|| {
+            cli.server
+                .rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| cli.server.clone())
+        });
+        Connection::connect_tls(&cli.server, &name, e6irc_client::webpki_root_store()).await?
+    } else {
+        Connection::connect(&cli.server).await?
+    };
+    match (&cli.account, &cli.password) {
+        (Some(account), Some(password)) => {
+            conn.register_sasl(&cli.nick, "e6irc-cli", account, password)
+                .await?;
+        }
+        _ => {
+            conn.register(&cli.nick, "e6irc-cli").await?;
+        }
+    }
+    match cli.command {
+        Command::Send { target, message } => {
+            // Channels are +n by default, so join before speaking and
+            // wait for the join to be confirmed.
+            if target.starts_with('#') {
+                conn.send_line(&format!("JOIN {target}")).await?;
+                while let Some(msg) = conn.next_message().await? {
+                    if msg.command == "366" {
+                        break; // end of NAMES = joined
+                    }
+                    if msg.command == "PING" {
+                        let token = msg.params.first().cloned().unwrap_or_default();
+                        conn.send_line(&format!("PONG :{token}")).await?;
+                    }
+                }
+            }
+            conn.send_line(&format!("PRIVMSG {target} :{message}"))
+                .await?;
+            conn.send_line("QUIT :done").await?;
+            // drain until the server closes so the message is flushed
+            while conn.next_message().await?.is_some() {}
+        }
+        Command::Tail { target, count } => {
+            if target.starts_with('#') {
+                conn.send_line(&format!("JOIN {target}")).await?;
+            }
+            let mut seen = 0;
+            while let Some(msg) = conn.next_message().await? {
+                if msg.command == "PING" {
+                    let token = msg.params.first().cloned().unwrap_or_default();
+                    conn.send_line(&format!("PONG :{token}")).await?;
+                    continue;
+                }
+                if msg.command == "PRIVMSG"
+                    && msg.params.first().map(String::as_str) == Some(&target)
+                {
+                    let from = msg.source.as_deref().unwrap_or("?");
+                    let text = msg.params.get(1).map(String::as_str).unwrap_or("");
+                    println!("{from}\t{text}");
+                    seen += 1;
+                    if count != 0 && seen >= count {
+                        break;
+                    }
+                }
+            }
+        }
+        Command::History { target, count } => {
+            // History playback needs batch + chathistory; the plain
+            // register() above didn't negotiate them, so do it here.
+            conn.send_line("CAP LS 302").await?;
+            conn.send_line("CAP REQ :batch draft/chathistory server-time")
+                .await?;
+            // wait for ACK, then request. (register already sent 001;
+            // caps requested post-registration are ACKed immediately.)
+            loop {
+                let Some(m) = conn.next_message().await? else {
+                    break;
+                };
+                if m.command == "CAP" && m.params.get(1).map(String::as_str) == Some("ACK") {
+                    break;
+                }
+            }
+            // CHATHISTORY requires channel membership.
+            conn.send_line(&format!("JOIN {target}")).await?;
+            loop {
+                let Some(m) = conn.next_message().await? else {
+                    break;
+                };
+                if m.command == "366" {
+                    break;
+                }
+                if m.command == "PING" {
+                    let token = m.params.first().cloned().unwrap_or_default();
+                    conn.send_line(&format!("PONG :{token}")).await?;
+                }
+            }
+            conn.send_line(&format!("CHATHISTORY LATEST {target} * {count}"))
+                .await?;
+            let mut in_batch = false;
+            while let Some(m) = conn.next_message().await? {
+                match m.command.as_str() {
+                    "PING" => {
+                        let token = m.params.first().cloned().unwrap_or_default();
+                        conn.send_line(&format!("PONG :{token}")).await?;
+                    }
+                    "BATCH" => {
+                        let opened = m
+                            .params
+                            .first()
+                            .map(|p| p.starts_with('+'))
+                            .unwrap_or(false);
+                        in_batch = opened;
+                        if !opened {
+                            break; // batch closed
+                        }
+                    }
+                    "PRIVMSG" | "NOTICE" if in_batch => {
+                        let from = m
+                            .source
+                            .as_deref()
+                            .and_then(|s| s.split('!').next())
+                            .unwrap_or("?");
+                        let text = m.params.get(1).map(String::as_str).unwrap_or("");
+                        println!("{from}\t{text}");
+                    }
+                    "FAIL" => {
+                        return Err(std::io::Error::other(format!(
+                            "CHATHISTORY failed: {}",
+                            m.params.join(" ")
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            conn.send_line("QUIT :done").await?;
+            while conn.next_message().await?.is_some() {}
+        }
+        Command::Raw => {
+            use std::io::BufRead;
+            for line in std::io::stdin().lock().lines() {
+                conn.send_line(&line?).await?;
+            }
+            conn.send_line("QUIT :done").await?;
+            while conn.next_message().await?.is_some() {}
+        }
+        Command::Api { .. } => unreachable!("handled before the IRC connect"),
+    }
+    Ok(())
+}
+
+/// Minimal HTTP/1.1 client for one request/response over a `Connection:
+/// close` socket. Plain HTTP only; TLS termination belongs to a proxy.
+async fn run_api(
+    method: &str,
+    path: &str,
+    base: &str,
+    token: Option<String>,
+    body: Option<String>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let authority = base.strip_prefix("http://").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "api base must start with http:// (use a TLS-terminating proxy for https)",
+        )
+    })?;
+    let authority = authority.trim_end_matches('/');
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    let addr = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+
+    let token = token.or_else(|| std::env::var("E6IRC_API_TOKEN").ok());
+    let body = body.unwrap_or_default();
+
+    let mut req = format!(
+        "{} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
+        method.to_ascii_uppercase()
+    );
+    if let Some(t) = &token {
+        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
+    }
+    if !body.is_empty() {
+        req.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    req.push_str("\r\n");
+    req.push_str(&body);
+
+    let mut stream = TcpStream::connect(&addr).await?;
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+
+    let text = String::from_utf8_lossy(&buf);
+    let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    print!("{resp_body}");
+    if !resp_body.ends_with('\n') {
+        println!();
+    }
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "API request failed: HTTP {status}"
+        )))
+    }
+}
