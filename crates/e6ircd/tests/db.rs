@@ -1398,3 +1398,39 @@ async fn oidc_identity_link_list_and_conflict() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn oidc_web_session_records_logout_hint() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+
+    // A plain session carries no logout hint.
+    let plain = db::create_web_session(&pool, "alice").await.expect("plain");
+    assert_eq!(
+        db::session_logout_hint(&pool, &plain).await.expect("hint"),
+        (None, None)
+    );
+
+    // An OIDC session records the id token + provider for RP-initiated logout.
+    let sso = db::create_oidc_web_session(&pool, "alice", "the.id.token", "shauth")
+        .await
+        .expect("sso");
+    assert_eq!(
+        db::session_logout_hint(&pool, &sso).await.expect("hint"),
+        (Some("the.id.token".to_string()), Some("shauth".to_string()))
+    );
+    // Both resolve to the account.
+    assert_eq!(
+        db::session_account(&pool, &sso).await.expect("acct"),
+        Some("alice".to_string())
+    );
+}

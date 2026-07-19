@@ -1036,3 +1036,89 @@ async fn me_read_markers_list() {
         "{body}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn rp_initiated_logout_redirects_to_provider() {
+    use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    let session = e6ircd::db::create_oidc_web_session(&pool, "alice", "the.id.token", "shauth")
+        .await
+        .expect("sso session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.logout.example".into(),
+        network_name: "LogoutNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("https://e6irc.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        oidc_providers: vec![OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "x".repeat(32),
+            scopes: vec![],
+            end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
+        }],
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // A GET logout on an OIDC session redirects to the provider's end-session
+    // endpoint with an id_token_hint and post_logout_redirect_uri.
+    let req = format!(
+        "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, _) = request(http, &req).await;
+    assert_eq!(status, 303, "{headers}");
+    let location = headers
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("location: ")
+                .or_else(|| l.strip_prefix("Location: "))
+        })
+        .expect("location header")
+        .trim();
+    assert!(
+        location.starts_with("https://auth.example/oauth2/sessions/logout?"),
+        "not RP-initiated: {location}"
+    );
+    assert!(
+        location.contains("id_token_hint=the.id.token"),
+        "{location}"
+    );
+    assert!(
+        location.contains("post_logout_redirect_uri=https"),
+        "{location}"
+    );
+
+    // The local session is gone: the same cookie no longer authenticates.
+    let me = format!(
+        "GET /api/v1/me HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, _) = request(http, &me).await;
+    assert_eq!(status, 401, "session survived logout");
+}

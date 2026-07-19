@@ -200,6 +200,18 @@ pub struct OidcProviderConfig {
     pub issuer_url: String,
     pub client_id: String,
     pub client_secret: String,
+    /// OAuth scopes to request in addition to `openid`. Defaults to
+    /// `profile` + `email`; providers like Shauth also accept
+    /// `offline_access`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// RP-initiated logout (OIDC end-session) endpoint. When set, e6irc's
+    /// logout redirects the browser here with `id_token_hint` and
+    /// `post_logout_redirect_uri` so the identity provider's SSO session is
+    /// ended too — not just the local e6irc session. Shauth/Hydra expose
+    /// this at `<issuer>/oauth2/sessions/logout`.
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -624,6 +636,8 @@ mod tests {
                 issuer_url: "https://issuer.example".into(),
                 client_id: "cid".into(),
                 client_secret: key.seal("oidcsecret"),
+                scopes: vec![],
+                end_session_endpoint: None,
             }],
             secrets: Some(SecretsConfig {
                 key_file: path.clone(),
