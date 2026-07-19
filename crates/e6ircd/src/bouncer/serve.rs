@@ -24,8 +24,29 @@ type NetworkKey = (Option<String>, String);
 /// upstream lines are persisted and its recent backlog is restored on
 /// start.
 pub struct Registry {
-    networks: Mutex<HashMap<NetworkKey, Arc<NetworkHandle>>>,
+    networks: Mutex<HashMap<NetworkKey, Slot>>,
     pool: Option<PgPool>,
+}
+
+/// A registered network: its driver handle plus the persistence task that
+/// mirrors upstream lines to the database. The persistence task holds a
+/// strong handle, so it must be aborted when the network is removed or
+/// replaced — otherwise it pins the driver's command channel and the
+/// driver never stops.
+struct Slot {
+    handle: Arc<NetworkHandle>,
+    persistence: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Slot {
+    /// Stop the persistence task so it releases its handle; combined with
+    /// dropping `handle`, this lets the driver observe its command channel
+    /// close and exit.
+    fn stop(self) {
+        if let Some(task) = self.persistence {
+            task.abort();
+        }
+    }
 }
 
 /// How many recent lines to restore into a network's buffer at start.
@@ -130,23 +151,40 @@ impl Registry {
     /// With a database, restore recent backlog and persist new lines.
     pub fn add(&self, owner: Option<String>, name: String, driver: Box<dyn super::NetworkDriver>) {
         let handle = Arc::new(driver.start());
-        if let Some(pool) = self.pool.clone() {
-            spawn_persistence(pool, owner.clone(), name.clone(), handle.clone());
-        }
-        self.networks
+        let persistence = self
+            .pool
+            .clone()
+            .map(|pool| spawn_persistence(pool, owner.clone(), name.clone(), handle.clone()));
+        let slot = Slot {
+            handle,
+            persistence,
+        };
+        // Replacing a key must stop the old driver, not leak it.
+        if let Some(old) = self
+            .networks
             .lock()
             .expect("registry poisoned")
-            .insert((owner, name), handle);
+            .insert((owner, name), slot)
+        {
+            old.stop();
+        }
     }
 
     /// Remove `owner`'s network `name`, stopping its driver. Returns
     /// whether a network was removed.
     pub fn remove(&self, owner: Option<&str>, name: &str) -> bool {
-        self.networks
+        let removed = self
+            .networks
             .lock()
             .expect("registry poisoned")
-            .remove(&(owner.map(str::to_string), name.to_string()))
-            .is_some()
+            .remove(&(owner.map(str::to_string), name.to_string()));
+        match removed {
+            Some(slot) => {
+                slot.stop();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Resolve a network the authenticated `account` may attach to: its
@@ -157,7 +195,7 @@ impl Registry {
         networks
             .get(&(Some(account.to_string()), name.to_string()))
             .or_else(|| networks.get(&(None, name.to_string())))
-            .cloned()
+            .map(|slot| slot.handle.clone())
     }
 }
 
@@ -169,7 +207,7 @@ fn spawn_persistence(
     owner: Option<String>,
     network: String,
     handle: Arc<NetworkHandle>,
-) {
+) -> tokio::task::JoinHandle<()> {
     use super::DriverEvent;
     let owner_key = owner.unwrap_or_else(|| "*".to_string());
     tokio::spawn(async move {
@@ -193,7 +231,7 @@ fn spawn_persistence(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    })
 }
 
 /// Outcome of the BNC registration handshake.

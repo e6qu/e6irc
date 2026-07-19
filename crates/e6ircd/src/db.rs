@@ -942,6 +942,9 @@ pub struct BncNetworkRow {
     pub autojoin: Vec<String>,
     pub sasl_account: Option<String>,
     pub sasl_password_sealed: Option<String>,
+    /// Whether an always-on driver runs for this network. A disabled
+    /// network keeps its config/buffers but is skipped at boot.
+    pub enabled: bool,
 }
 
 fn bnc_row(row: &sqlx::postgres::PgRow) -> BncNetworkRow {
@@ -952,6 +955,7 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> BncNetworkRow {
         tls: row.get("tls"),
         nick: row.get("nick"),
         realname: row.get("realname"),
+        enabled: row.get("enabled"),
         autojoin: row.get("autojoin"),
         sasl_account: row.get("sasl_account"),
         sasl_password_sealed: row.get("sasl_password_sealed"),
@@ -1004,7 +1008,7 @@ pub async fn list_bnc_networks(
     let folded = CaseMapping::Rfc1459.casefold(account);
     let rows = sqlx::query(
         "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
-                n.sasl_account, n.sasl_password_sealed
+                n.sasl_account, n.sasl_password_sealed, n.enabled
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE a.name_folded = $1 ORDER BY n.name",
     )
@@ -1015,14 +1019,62 @@ pub async fn list_bnc_networks(
     Ok(rows.iter().map(bnc_row).collect())
 }
 
-/// Every network across all accounts, paired with its owner's display
-/// name — used to start always-on drivers at boot.
+/// One network owned by `account`, by name — used to rebuild a driver
+/// when a paused network is re-enabled. `None` if the caller owns no
+/// network of that name.
+pub async fn get_bnc_network(
+    pool: &PgPool,
+    account: &str,
+    name: &str,
+) -> Result<Option<BncNetworkRow>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let row = sqlx::query(
+        "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
+                n.sasl_account, n.sasl_password_sealed, n.enabled
+         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         WHERE a.name_folded = $1 AND n.name = $2",
+    )
+    .bind(&folded)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(row.as_ref().map(bnc_row))
+}
+
+/// Enable or disable `account`'s network `name`. Returns whether a row
+/// matched (false ⇒ no such network for that owner).
+pub async fn set_bnc_network_enabled(
+    pool: &PgPool,
+    account: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let done = sqlx::query(
+        "UPDATE bnc_networks n SET enabled = $3
+         FROM accounts a
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND n.name = $2",
+    )
+    .bind(&folded)
+    .bind(name)
+    .bind(enabled)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Every *enabled* network across all accounts, paired with its owner's
+/// display name — used to start always-on drivers at boot. Disabled
+/// networks are intentionally skipped: they run no driver.
 pub async fn list_all_bnc_networks(pool: &PgPool) -> Result<Vec<(String, BncNetworkRow)>, DbError> {
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.realname,
-                n.autojoin, n.sasl_account, n.sasl_password_sealed
-         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id",
+                n.autojoin, n.sasl_account, n.sasl_password_sealed, n.enabled
+         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         WHERE n.enabled",
     )
     .fetch_all(pool)
     .await

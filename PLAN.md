@@ -402,14 +402,20 @@ not built yet. Ranked by value:
    (`query_history_around_and_between`, `query_targets`).
 4. **REST `/api/v1` surface vs DESIGN §12** — partial. `admin` now has
    `GET /accounts`, `/channels` (registered channels + founders),
-   `/klines` (server bans), `/audit` (oper audit log, `?limit`), and
-   `/stats` (account/channel/ban counts) — all admin-gated (401/403/200
-   tested) and in the OpenAPI spec. `GET /me/networks` now reports a live
+   `/bans` (K/D/X-lines with kind), `/audit` (oper audit log, `?limit`),
+   and `/stats` (account/channel/ban counts) — all admin-gated (401/403/200
+   tested) and in the OpenAPI spec. `GET /me/networks` reports a live
    `connected` tri-state per network (true/false from the always-on
-   driver's handle, or null when no handle is live) — PG-gated coverage
-   asserts it flips true once the upstream attaches. `me/tokens` list/delete
-   are implemented (migration 0014 gives PATs an id). **Still absent:**
-   `networks` enable/disable/buffers/read-marker; OIDC identity linking.
+   driver's handle, or null when no handle is live) and an `enabled` flag;
+   **`PATCH /me/networks/{name}` `{enabled}`** pauses/resumes a network —
+   persisting the flag (migration 0016), stopping or rebuilding its driver
+   (skipped at boot while disabled), rolling the flag back if a stored
+   secret can't be opened. Fixing this surfaced and repaired a latent bug:
+   the buffer-persistence task held a strong driver handle, so `remove`
+   never actually stopped a driver (delete leaked it too) — the registry
+   now aborts that task on remove/replace. `me/tokens` list/delete are
+   implemented (migration 0014 gives PATs an id). **Still absent:**
+   `networks` buffers/read-marker REST reads; OIDC identity linking.
    Remaining endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — done. Oper commands are OPER/KILL/WALLOPS plus the full server-ban

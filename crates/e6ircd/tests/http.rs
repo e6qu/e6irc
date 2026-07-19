@@ -221,6 +221,40 @@ async fn bnc_network_management_lifecycle() {
     let (_, _, body) = request(http, &list_req).await;
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["networks"][0]["connected"], true, "{body}");
+    assert_eq!(v["networks"][0]["enabled"], true, "{body}");
+
+    // disable it: the flag flips and the driver stops (no live handle, so
+    // `connected` is null), while the config row survives.
+    let patch = |enabled: bool| {
+        let body = format!(r#"{{"enabled":{enabled}}}"#);
+        format!(
+            "PATCH /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let (status, _, body) = request(http, &patch(false)).await;
+    assert_eq!(status, 200, "disable: {body}");
+    let (_, _, body) = request(http, &list_req).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["networks"][0]["enabled"], false, "{body}");
+    assert!(v["networks"][0]["connected"].is_null(), "{body}");
+
+    // re-enable it: the driver restarts and reconnects to the still-live
+    // upstream, so `connected` returns to true.
+    let (status, _, body) = request(http, &patch(true)).await;
+    assert_eq!(status, 200, "enable: {body}");
+    let mut reconnected = false;
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (_, _, body) = request(http, &list_req).await;
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["networks"][0]["enabled"], true, "{body}");
+        if v["networks"][0]["connected"] == true {
+            reconnected = true;
+            break;
+        }
+    }
+    assert!(reconnected, "re-enabled driver never reconnected");
 
     // delete it
     let del_req = format!(
@@ -396,6 +430,7 @@ async fn account_page_lists_networks_for_a_session() {
             autojoin: vec![],
             sasl_account: None,
             sasl_password_sealed: None,
+            enabled: true,
         },
     )
     .await

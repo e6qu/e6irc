@@ -841,6 +841,7 @@ async fn bnc_networks_crud() {
         autojoin: vec!["#rust".into(), "#e6irc".into()],
         sasl_account: Some("alice".into()),
         sasl_password_sealed: Some("enc:v1:abc".into()),
+        enabled: true,
     };
     db::create_bnc_network(&pool, "alice", &libera)
         .await
