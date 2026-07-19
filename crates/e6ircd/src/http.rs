@@ -135,7 +135,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/me/networks/{name}",
-            axum::routing::delete(delete_network),
+            axum::routing::delete(delete_network).patch(patch_network),
         )
         .route("/api/v1/history", get(history))
         .route("/api/v1/admin/accounts", get(admin_accounts))
@@ -1275,6 +1275,16 @@ async fn openapi() -> Response {
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
             "/api/v1/me/networks/{name}": {
+                "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
+                    "security": bearer,
+                    "parameters": [{ "name": "name", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "required": ["enabled"],
+                            "properties": { "enabled": { "type": "boolean" } } } } } },
+                    "responses": { "200": { "description": "new enabled state" },
+                        "404": { "description": "no such network" },
+                        "409": { "description": "cannot start (stored secret, no master key)" } } },
                 "delete": { "summary": "Delete a BNC network and stop its driver",
                     "security": bearer,
                     "parameters": [{ "name": "name", "in": "path", "required": true,
@@ -1867,6 +1877,7 @@ async fn list_networks(
                         "autojoin": n.autojoin,
                         "sasl_account": n.sasl_account,
                         "has_sasl_password": n.sasl_password_sealed.is_some(),
+                        "enabled": n.enabled,
                         "connected": connected,
                     })
                 })
@@ -1985,6 +1996,7 @@ async fn create_network_core(
         autojoin: req.autojoin.clone(),
         sasl_account: upstream.as_ref().map(|(a, _)| a.clone()),
         sasl_password_sealed: sealed,
+        enabled: true,
     };
     let pool = state.pool.as_ref().expect("caller checked the pool");
     match crate::db::create_bnc_network(pool, account, &row).await {
@@ -2022,6 +2034,96 @@ async fn create_network_core(
         )),
     );
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct PatchNetwork {
+    enabled: bool,
+}
+
+/// Enable or disable one of the caller's networks: persist the flag and
+/// start (enable) or stop (disable) its always-on driver. Config and
+/// buffers are untouched — a disabled network can be re-enabled later.
+async fn patch_network(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+    body: Result<axum::Json<PatchNetwork>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    let Some(registry) = &state.bnc_registry else {
+        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+    };
+    let axum::Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON",
+                Some(&e.to_string()),
+            );
+        }
+    };
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+
+    // Persist the flag first; a miss means the caller owns no such network.
+    match crate::db::set_bnc_network_enabled(pool, &account, &name, req.enabled).await {
+        Ok(true) => {}
+        Ok(false) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+        Err(e) => {
+            eprintln!("http: network enable/disable failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    }
+
+    if req.enabled {
+        // Rebuild the driver from the persisted row and (re)start it.
+        let row = match crate::db::get_bnc_network(pool, &account, &name).await {
+            Ok(Some(row)) => row,
+            // We just updated it; a miss here means a concurrent delete.
+            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+            Err(e) => {
+                eprintln!("http: network reload failed: {e}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                );
+            }
+        };
+        let cfg = match crate::bouncer::network_config_from_row(&row, state.secret_key.as_deref()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // Can't start it — undo the enable so the flag matches reality.
+                if let Err(re) =
+                    crate::db::set_bnc_network_enabled(pool, &account, &name, false).await
+                {
+                    eprintln!("http: failed to roll back enable after start error: {re}");
+                }
+                return problem(StatusCode::CONFLICT, "Cannot start network", Some(&e));
+            }
+        };
+        registry.add(
+            Some(account.clone()),
+            name.clone(),
+            Box::new(crate::bouncer::IrcDriver::new(cfg)),
+        );
+    } else {
+        registry.remove(Some(&account), &name);
+    }
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "name": name, "enabled": req.enabled }).to_string(),
+    )
+        .into_response()
 }
 
 /// Delete one of the caller's networks and stop its driver.
