@@ -2068,21 +2068,28 @@ fn cmd_message(
                 body: text.to_string(),
             },
         );
-        let log = super::DbRequest::LogMessage {
-            msgid,
-            target: key.as_str().to_string(),
-            sender_prefix: prefix.clone(),
-            sender_account,
-            kind: if loud { "privmsg" } else { "notice" },
-            body: text.to_string(),
-            ts,
-        };
-        if state.db_tx.try_push(log).is_err() {
-            eprintln!("history: log queue full or closed; message not persisted");
-            // Delivered but not persisted: mark the channel's history
-            // incomplete so CHATHISTORY does not imply a gap-free record.
-            if let Some(chan) = state.channels.get_mut(&key) {
-                chan.history_complete = false;
+        // Persist to the history table only when a database is configured
+        // (same db-present proxy the other DB writes use). Without one the
+        // hot ring is the entire record, so there is nothing to enqueue —
+        // and enqueuing anyway would fail on every message, flooding stderr
+        // and starving the core worker under load.
+        if state.config.sasl_enabled {
+            let log = super::DbRequest::LogMessage {
+                msgid,
+                target: key.as_str().to_string(),
+                sender_prefix: prefix.clone(),
+                sender_account,
+                kind: if loud { "privmsg" } else { "notice" },
+                body: text.to_string(),
+                ts,
+            };
+            if state.db_tx.try_push(log).is_err() {
+                eprintln!("history: log queue full or closed; message not persisted");
+                // Delivered but not persisted: mark the channel's history
+                // incomplete so CHATHISTORY does not imply a gap-free record.
+                if let Some(chan) = state.channels.get_mut(&key) {
+                    chan.history_complete = false;
+                }
             }
         }
     } else {
