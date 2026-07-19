@@ -2596,3 +2596,45 @@ fn chanserv_flags_auto_ops_on_join() {
         "non-founder was allowed to set flags"
     );
 }
+
+#[test]
+fn chanserv_op_grants_op_to_member() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+
+    let alice = s.register(2, "alice");
+    s.line(alice, "JOIN #chan");
+    s.drain(alice);
+    s.drain(boss);
+
+    // Founder ops alice via ChanServ.
+    s.line(boss, "PRIVMSG ChanServ :OP #chan alice");
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("Opped")),
+        "no op confirmation"
+    );
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.contains("MODE #chan +o alice")),
+        "no +o broadcast to channel"
+    );
+
+    // Someone without op access cannot use OP.
+    let mallory = s.register(3, "mallory");
+    identify(&mut s, mallory, "mallory");
+    s.line(mallory, "JOIN #chan");
+    s.drain(mallory);
+    s.line(mallory, "PRIVMSG ChanServ :OP #chan mallory");
+    assert!(
+        s.drain(mallory)
+            .iter()
+            .any(|l| l.contains("do not have op access")),
+        "op without access was allowed"
+    );
+}
