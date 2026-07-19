@@ -2701,3 +2701,63 @@ fn chanserv_set_founder_transfers_ownership() {
         "failed transfer not reported"
     );
 }
+
+// Oper K-lines (DESIGN §7.6/§15): ban a user@host, disconnect matches,
+// refuse matching registrations.
+
+#[test]
+fn oper_kline_bans_disconnects_and_refuses() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let victim = s.register(2, "baddie"); // user=baddie, host=host2.example
+    s.drain(victim);
+
+    // K-line every host for user "baddie".
+    s.line(op, "KLINE baddie@* :spamming");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added K-Line")),
+        "no kline confirmation"
+    );
+    // The matching online session is disconnected.
+    assert!(
+        s.drain(victim).iter().any(|l| l.starts_with("ERROR :")),
+        "matching session not disconnected"
+    );
+
+    // A fresh registration matching the ban is refused (465 + ERROR, no
+    // welcome).
+    let newcomer = s.connect(3);
+    s.line(newcomer, "NICK baddie");
+    s.line(newcomer, "USER baddie 0 * :B");
+    let out = s.drain(newcomer);
+    assert!(out.iter().any(|l| l.contains(" 465 ")), "not 465: {out:#?}");
+    assert!(out.iter().any(|l| l.starts_with("ERROR :")), "not closed");
+    assert!(
+        !out.iter().any(|l| l.contains(" 001 ")),
+        "banned user welcomed"
+    );
+
+    // UNKLINE lifts it; a matching registration then succeeds.
+    s.line(op, "UNKLINE baddie@*");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Removed K-Line")),
+        "no unkline confirmation"
+    );
+    let ok = s.connect(4);
+    s.line(ok, "NICK baddie");
+    s.line(ok, "USER baddie 0 * :B");
+    assert!(
+        s.drain(ok).iter().any(|l| l.contains(" 001 ")),
+        "not welcomed after unkline"
+    );
+
+    // A non-oper cannot KLINE.
+    let plain = s.register(5, "plain");
+    s.line(plain, "KLINE x@y :no");
+    assert!(
+        s.drain(plain).iter().any(|l| l.contains(" 481 ")),
+        "non-oper was allowed to KLINE"
+    );
+}

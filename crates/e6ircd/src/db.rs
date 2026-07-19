@@ -328,6 +328,22 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::AddKline {
+            mask,
+            reason,
+            set_by,
+        } => {
+            if let Err(e) = add_kline(pool, &mask, &reason, &set_by).await {
+                eprintln!("db: kline persistence failed: {e}");
+            }
+            true
+        }
+        DbRequest::RemoveKline { mask } => {
+            if let Err(e) = remove_kline(pool, &mask).await {
+                eprintln!("db: kline removal failed: {e}");
+            }
+            true
+        }
         DbRequest::LogMessage { .. } => unreachable!("batched by the caller"),
     }
 }
@@ -602,6 +618,46 @@ pub async fn set_channel_founder(pool: &PgPool, channel: &str, new_founder_folde
             false
         }
     }
+}
+
+/// Persist a server ban (KLINE). Upserts on the mask so re-K-lining an
+/// existing mask refreshes its reason/setter.
+pub async fn add_kline(
+    pool: &PgPool,
+    mask: &str,
+    reason: &str,
+    set_by: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO server_bans (mask, reason, set_by) VALUES ($1, $2, $3)
+         ON CONFLICT (mask) DO UPDATE SET reason = EXCLUDED.reason, set_by = EXCLUDED.set_by",
+    )
+    .bind(mask)
+    .bind(reason)
+    .bind(set_by)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// Remove a server ban by mask (UNKLINE).
+pub async fn remove_kline(pool: &PgPool, mask: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM server_bans WHERE mask = $1")
+        .bind(mask)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// Every server ban as `(mask, reason, set_by)` — boot-loaded into the
+/// hot K-line list.
+pub async fn list_klines(pool: &PgPool) -> Result<Vec<(String, String, String)>, DbError> {
+    sqlx::query_as("SELECT mask, reason, set_by FROM server_bans ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)
 }
 
 /// Unregister a channel by its casefolded name (ChanServ DROP).

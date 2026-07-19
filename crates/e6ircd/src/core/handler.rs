@@ -200,6 +200,8 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "INFO" => cmd_info(state, conn),
         "OPER" => cmd_oper(state, conn, p),
         "KILL" => cmd_kill(state, conn, p),
+        "KLINE" => cmd_kline(state, conn, p),
+        "UNKLINE" => cmd_unkline(state, conn, p),
         "WALLOPS" => cmd_wallops(state, conn, p),
         _ => state.numeric(
             conn,
@@ -1236,6 +1238,30 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
             || session.nick.is_none()
             || session.user.is_none()
         {
+            return;
+        }
+    }
+    // K-line enforcement: refuse a banned user@host before completing.
+    {
+        let session = &state.sessions[&conn];
+        let subject = format!(
+            "{}@{}",
+            session.user.as_deref().unwrap_or("*"),
+            session.host
+        );
+        if let Some(reason) = state.kline_match(&subject) {
+            let host = state.sessions[&conn].host.clone();
+            state.numeric(
+                conn,
+                ERR_YOUREBANNEDCREEP,
+                &[],
+                Some(&format!("You are banned from this server: {reason}")),
+            );
+            state.send(
+                conn,
+                &format!("ERROR :Closing Link: {host} (K-Lined: {reason})"),
+            );
+            state.close(conn, &format!("K-Lined: {reason}"));
             return;
         }
     }
@@ -3827,6 +3853,131 @@ fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
     state.close(victim, &reason);
+}
+
+/// Normalise a K-line target: a bare host/nick becomes `*@target`.
+fn kline_mask(arg: &str) -> String {
+    if arg.contains('@') {
+        arg.to_string()
+    } else {
+        format!("*@{arg}")
+    }
+}
+
+/// KLINE [<user@host> [reason]] — oper-only. With no argument, list the
+/// current server bans; otherwise add one (persisted, matching users
+/// disconnected).
+fn cmd_kline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !state.sessions[&conn].oper {
+        state.numeric(
+            conn,
+            ERR_NOPRIVILEGES,
+            &[],
+            Some("Permission Denied- You're not an IRC operator"),
+        );
+        return;
+    }
+    let server = state.config.server_name.clone();
+    let nick = state.sessions[&conn].nick.clone().expect("registered");
+    let Some(&mask_arg) = p.first() else {
+        // List current K-lines.
+        let lines: Vec<String> = state
+            .klines
+            .iter()
+            .map(|k| {
+                format!(
+                    ":{server} NOTICE {nick} :K-Line {} (by {}) :{}",
+                    k.mask, k.set_by, k.reason
+                )
+            })
+            .collect();
+        for line in lines {
+            state.send(conn, &line);
+        }
+        state.send(
+            conn,
+            &format!(":{server} NOTICE {nick} :End of K-Line list."),
+        );
+        return;
+    };
+    let mask = kline_mask(mask_arg);
+    let reason = p.get(1).copied().unwrap_or("No reason").to_string();
+    // Replace any existing ban on the same mask.
+    state.klines.retain(|k| k.mask != mask);
+    state.klines.push(super::state::Kline {
+        mask: mask.clone(),
+        reason: reason.clone(),
+        set_by: nick.clone(),
+    });
+    if state.config.sasl_enabled {
+        let request = super::DbRequest::AddKline {
+            mask: mask.clone(),
+            reason: reason.clone(),
+            set_by: nick.clone(),
+        };
+        if state.db_tx.try_push(request).is_err() {
+            eprintln!("kline: db queue full or closed; K-Line for {mask} not persisted");
+        }
+    }
+    // Disconnect any matching registered sessions.
+    let casemap = state.casemap;
+    let victims: Vec<ConnId> = state
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.registered)
+        .filter_map(|(&c, s)| {
+            let subject = format!("{}@{}", s.user.as_deref().unwrap_or("*"), s.host);
+            e6irc_proto::mask::matches(casemap, &mask, &subject).then_some(c)
+        })
+        .collect();
+    for victim in victims {
+        state.send(victim, &format!("ERROR :Closing Link: (K-Lined: {reason})"));
+        state.close(victim, &format!("K-Lined: {reason}"));
+    }
+    state.send(
+        conn,
+        &format!(":{server} NOTICE {nick} :Added K-Line for {mask}"),
+    );
+}
+
+/// UNKLINE <user@host> — oper-only. Remove a server ban.
+fn cmd_unkline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !state.sessions[&conn].oper {
+        state.numeric(
+            conn,
+            ERR_NOPRIVILEGES,
+            &[],
+            Some("Permission Denied- You're not an IRC operator"),
+        );
+        return;
+    }
+    let Some(&mask_arg) = p.first() else {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["UNKLINE"],
+            Some("Not enough parameters"),
+        );
+        return;
+    };
+    let mask = kline_mask(mask_arg);
+    let before = state.klines.len();
+    state.klines.retain(|k| k.mask != mask);
+    let removed = state.klines.len() < before;
+    if removed && state.config.sasl_enabled {
+        let request = super::DbRequest::RemoveKline { mask: mask.clone() };
+        if state.db_tx.try_push(request).is_err() {
+            eprintln!("unkline: db queue full or closed; removal of {mask} not persisted");
+        }
+    }
+    let server = state.config.server_name.clone();
+    let nick = state.sessions[&conn].nick.clone().expect("registered");
+    let msg = if removed {
+        format!("Removed K-Line for {mask}")
+    } else {
+        format!("No K-Line found for {mask}")
+    };
+    state.send(conn, &format!(":{server} NOTICE {nick} :{msg}"));
 }
 
 // ---- WALLOPS ------------------------------------------------------------

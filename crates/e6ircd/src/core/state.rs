@@ -235,6 +235,14 @@ pub(crate) struct Topic {
     pub set_at: u64,
 }
 
+/// A server ban (oper K-line): a `user@host` glob mask with its reason.
+#[derive(Clone)]
+pub struct Kline {
+    pub mask: String,
+    pub reason: String,
+    pub set_by: String,
+}
+
 pub(crate) struct Channel {
     /// Display name (creator's casing).
     pub name: String,
@@ -309,6 +317,9 @@ pub(crate) struct ServerState {
     /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
     /// auto-op / auto-voice on join.
     pub channel_access: HashMap<ChanKey, HashMap<String, String>>,
+    /// Server bans (oper K-lines): a `user@host` glob refused at
+    /// registration. Boot-loaded and kept in sync on KLINE/UNKLINE.
+    pub klines: Vec<Kline>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
     /// Channels holding a hot history ring, most-recently-active first.
@@ -352,6 +363,7 @@ impl ServerState {
             registered_founders: HashMap::new(),
             registered_topics: HashMap::new(),
             channel_access: HashMap::new(),
+            klines: Vec::new(),
             whowas: std::collections::VecDeque::new(),
             hot_channels: std::collections::VecDeque::new(),
             capture: None,
@@ -498,6 +510,26 @@ impl ServerState {
             Some(flags) => (flags.contains('o'), flags.contains('v')),
             None => (false, false),
         }
+    }
+
+    /// Load persisted server bans as `(mask, reason, set_by)` rows.
+    pub fn preload_klines(&mut self, rows: Vec<(String, String, String)>) {
+        self.klines = rows
+            .into_iter()
+            .map(|(mask, reason, set_by)| Kline {
+                mask,
+                reason,
+                set_by,
+            })
+            .collect();
+    }
+
+    /// The reason of the first K-line whose mask matches `user@host`, if any.
+    pub fn kline_match(&self, subject: &str) -> Option<String> {
+        self.klines
+            .iter()
+            .find(|k| e6irc_proto::mask::matches(self.casemap, &k.mask, subject))
+            .map(|k| k.reason.clone())
     }
 
     /// Key a nick for lookup/storage.
