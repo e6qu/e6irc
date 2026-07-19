@@ -402,10 +402,11 @@ not built yet. Ranked by value:
    (`query_history_around_and_between`, `query_targets`).
 4. **REST `/api/v1` surface vs DESIGN §12** — partial. `admin` now has
    `GET /accounts`, `/channels` (registered channels + founders),
-   `/klines` (server bans), and `/audit` (oper audit log, `?limit`), all
-   admin-gated (401/403/200 tested) and in the OpenAPI spec. **Still
-   absent:** server stats; `networks` enable/disable/status/buffers/
-   read-marker; `me/tokens` list/delete; OIDC identity linking. Remaining
+   `/klines` (server bans), `/audit` (oper audit log, `?limit`), and
+   `/stats` (account/channel/ban counts) — all admin-gated (401/403/200
+   tested) and in the OpenAPI spec. **Still absent:** `networks`
+   enable/disable/status/buffers/read-marker; `me/tokens` list/delete
+   (needs an id column on `api_tokens`); OIDC identity linking. Remaining
    endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — partial. Oper commands are now OPER/KILL/WALLOPS plus **KLINE /

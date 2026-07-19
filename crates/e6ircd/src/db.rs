@@ -860,6 +860,19 @@ pub async fn poll_device_grant(pool: &PgPool, device_code: &str) -> Result<Devic
     })
 }
 
+/// Aggregate server counts for the admin API: `(accounts, registered
+/// channels, server bans)`.
+pub async fn server_stats(pool: &PgPool) -> Result<(i64, i64, i64), DbError> {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM accounts),
+                (SELECT count(*) FROM channels),
+                (SELECT count(*) FROM server_bans)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
 /// Every account's display name, ordered — for the admin API.
 pub async fn list_accounts(pool: &PgPool) -> Result<Vec<String>, DbError> {
     sqlx::query_scalar("SELECT name FROM accounts ORDER BY name")
