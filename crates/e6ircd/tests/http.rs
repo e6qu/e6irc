@@ -734,3 +734,80 @@ async fn device_authorization_grant_flow() {
     assert_eq!(status, 400);
     assert!(body.contains("invalid_grant"), "{body}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn me_tokens_list_and_revoke() {
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let auth_token = e6ircd::db::issue_api_token(&pool, "alice", "auth")
+        .await
+        .expect("t");
+    let _extra = e6ircd::db::issue_api_token(&pool, "alice", "todelete")
+        .await
+        .expect("t2");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.tok.example".into(),
+        network_name: "TokNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let auth = |method: &str, path: &str| {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {auth_token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // List shows both tokens.
+    let (status, _, body) = request(http, &auth("GET", "/api/v1/me/tokens")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let tokens = v["tokens"].as_array().expect("array");
+    assert_eq!(tokens.len(), 2, "{body}");
+    let del_id = tokens
+        .iter()
+        .find(|t| t["label"] == "todelete")
+        .and_then(|t| t["id"].as_i64())
+        .expect("todelete id");
+
+    // Revoke the other token → 204, then the list has one left.
+    let (status, _, _) = request(
+        http,
+        &auth("DELETE", &format!("/api/v1/me/tokens/{del_id}")),
+    )
+    .await;
+    assert_eq!(status, 204);
+    let (_, _, body) = request(http, &auth("GET", "/api/v1/me/tokens")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["tokens"].as_array().unwrap().len(), 1, "{body}");
+
+    // Revoking an unknown id → 404.
+    let (status, _, _) = request(http, &auth("DELETE", "/api/v1/me/tokens/999999")).await;
+    assert_eq!(status, 404);
+}

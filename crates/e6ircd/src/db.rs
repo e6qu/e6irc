@@ -1284,6 +1284,43 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
     .map_err(DbError::Query)
 }
 
+/// List an account's PATs as `(id, label, created_at RFC3339, expires_at
+/// RFC3339|null)` — never the token or its hash.
+pub async fn list_api_tokens(
+    pool: &PgPool,
+    account: &str,
+) -> Result<Vec<(i64, String, String, Option<String>)>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    sqlx::query_as(
+        "SELECT t.id, t.label,
+                to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                to_char(t.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         FROM api_tokens t JOIN accounts a ON a.id = t.account_id
+         WHERE a.name_folded = $1
+         ORDER BY t.id",
+    )
+    .bind(&folded)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Revoke one of `account`'s PATs by id. Returns whether a row was deleted
+/// (false = not found / not owned).
+pub async fn delete_api_token(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let result = sqlx::query(
+        "DELETE FROM api_tokens t USING accounts a
+         WHERE t.account_id = a.id AND a.name_folded = $1 AND t.id = $2",
+    )
+    .bind(&folded)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(result.rows_affected() > 0)
+}
+
 // ---- credential management ----------------------------------------------
 
 /// (id, kind, label, created_at RFC3339, last_used RFC3339|null).

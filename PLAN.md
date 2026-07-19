@@ -405,8 +405,9 @@ not built yet. Ranked by value:
    `/klines` (server bans), `/audit` (oper audit log, `?limit`), and
    `/stats` (account/channel/ban counts) — all admin-gated (401/403/200
    tested) and in the OpenAPI spec. **Still absent:** `networks`
-   enable/disable/status/buffers/read-marker; `me/tokens` list/delete
-   (needs an id column on `api_tokens`); OIDC identity linking. Remaining
+   enable/disable/status/buffers/read-marker; `me/tokens` list/delete are now
+   implemented (migration 0014 gives PATs an id); only OIDC identity
+   linking remains. Remaining
    endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — partial. Oper commands are now OPER/KILL/WALLOPS plus **KLINE /
