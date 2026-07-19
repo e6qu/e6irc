@@ -2622,6 +2622,67 @@ fn chanserv_set_mlock_enforces_modes() {
     );
 }
 
+#[test]
+fn history_logmessage_gated_on_database() {
+    // A channel message enqueues a LogMessage to persist history only when
+    // a database is present. Without one, every enqueue would fail (no db
+    // worker drains the queue) and log per-message, flooding stderr and
+    // starving the core worker — so it must be skipped entirely.
+    fn logs_a_message(sasl_enabled: bool) -> bool {
+        let (db_tx, mut db_rx) = queue(Config {
+            name: "d",
+            capacity: 64,
+            policy: Policy::Fifo,
+        });
+        let mut core = Core::new(
+            CoreConfig {
+                server_name: "irc.test.example".into(),
+                network_name: "T".into(),
+                motd: vec![],
+                nicklen: 16,
+                sasl_enabled,
+                opers: vec![],
+                max_hot_channels: 8,
+                clock: || 1_000_000,
+                command_burst: None,
+            },
+            db_tx,
+        );
+        let conn = ConnId(1);
+        let (tx, _rx) = queue(Config {
+            name: "s",
+            capacity: 512,
+            policy: Policy::Fifo,
+        });
+        core.handle(Input::Open {
+            conn,
+            tx,
+            host: "h".into(),
+        });
+        for line in ["NICK a", "USER a 0 * :A", "JOIN #c", "PRIVMSG #c :hello"] {
+            core.handle(Input::Line {
+                conn,
+                line: line.as_bytes().to_vec(),
+            });
+        }
+        let mut saw = false;
+        while let Some(env) = db_rx.try_pop() {
+            if matches!(env.payload, e6ircd::core::DbRequest::LogMessage { .. }) {
+                saw = true;
+            }
+        }
+        saw
+    }
+    assert!(
+        logs_a_message(true),
+        "history not persisted when a database is present"
+    );
+    assert!(
+        !logs_a_message(false),
+        "history enqueued despite no database (stderr-flood risk)"
+    );
+}
+
 // NickServ GHOST + ChanServ DROP (DESIGN §7.6).
 
 #[test]
