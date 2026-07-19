@@ -400,7 +400,7 @@ not built yet. Ranked by value:
    (`db::query_history`/`query_targets`) past the ring. Covered by core
    ring tests (AROUND, BETWEEN, TARGETS) and PG-gated tests
    (`query_history_around_and_between`, `query_targets`).
-4. **REST `/api/v1` surface vs DESIGN §12** — partial. `admin` now has
+4. **REST `/api/v1` surface vs DESIGN §12** — done. `admin` now has
    `GET /accounts`, `/channels` (registered channels + founders),
    `/bans` (K/D/X-lines with kind), `/audit` (oper audit log, `?limit`),
    and `/stats` (account/channel/ban counts) — all admin-gated (401/403/200
@@ -419,8 +419,13 @@ not built yet. Ranked by value:
    backlog (oldest-first, owner-scoped), working even while the network is
    paused, and `GET /me/read-markers` lists the account's per-target
    `draft/read-marker` positions (ISO-8601 UTC, millisecond precision).
-   **Still absent:** OIDC identity linking is the last piece of this item.
-   Remaining endpoints 404 via the loud fallback.
+   **OIDC identity linking** closes the item: `GET /auth/oidc/{provider}/link`
+   (authenticated) runs the OIDC flow through the shared callback and
+   attaches the resulting `(issuer, subject)` to the caller's account —
+   globally unique, so an identity owned elsewhere is a hard 409, never a
+   silent move — and `GET /me/identities` lists linked identities. Verified
+   end-to-end against dockerized dex (link → listed → second account's
+   conflict). Remaining endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — done. Oper commands are OPER/KILL/WALLOPS plus the full server-ban
    surface **KLINE/DLINE/XLINE** and their removals. One `server_bans` table
@@ -437,11 +442,9 @@ not built yet. Ranked by value:
    implemented and, like every oper action, audit-logged. The admin API's
    `GET /api/v1/admin/bans` lists all kinds with their `kind` field.
 
-Items 1, 3, and 5 are fully done; item 2 is nearly done (only SET's
-lower-value channel-option flags remain); item 4 (the REST admin/self
-surface) is largely built — admin reads (accounts/channels/bans/audit/
-stats), self-service PAT list/revoke, and live network status all land —
-with only OIDC identity linking and the networks enable/disable/buffers
-endpoints outstanding. Beyond these, the two external blockers remain: the
-bridges' live verification (real Discord/Slack credentials — no
-self-hostable oracle) and the 100k load run (a tuned Linux host).
+Items 1, 3, 4, and 5 are fully done; item 2 is nearly done — only SET's
+lower-value channel-option flags (mlock, guard, keeptopic) remain, and
+they are the last outstanding code surface in the audit. Beyond that, the
+two external blockers remain: the bridges' live verification (real
+Discord/Slack credentials — no self-hostable oracle) and the 100k load
+run (a tuned Linux host).

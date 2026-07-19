@@ -1239,3 +1239,62 @@ async fn audit_log_records_and_lists() {
     );
     assert_eq!(&list[1].1, &"OPER".to_string());
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn oidc_identity_link_list_and_conflict() {
+    use e6ircd::db::LinkOutcome;
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    db::create_account(&pool, "bob", "pw").await.expect("bob");
+
+    // First link attaches; a repeat for the same account is idempotent.
+    assert_eq!(
+        db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-1")
+            .await
+            .expect("link"),
+        LinkOutcome::Linked
+    );
+    assert_eq!(
+        db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-1")
+            .await
+            .expect("relink"),
+        LinkOutcome::AlreadyYours
+    );
+    // The same identity cannot be claimed by another account.
+    assert_eq!(
+        db::link_oidc_identity(&pool, "bob", "https://idp.example", "sub-1")
+            .await
+            .expect("steal"),
+        LinkOutcome::Conflict
+    );
+
+    // A second identity for alice; listing is issuer/subject-ordered.
+    db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-0")
+        .await
+        .expect("link2");
+    assert_eq!(
+        db::list_oidc_identities(&pool, "alice")
+            .await
+            .expect("list"),
+        vec![
+            ("https://idp.example".to_string(), "sub-0".to_string()),
+            ("https://idp.example".to_string(), "sub-1".to_string()),
+        ]
+    );
+    // bob got nothing.
+    assert!(
+        db::list_oidc_identities(&pool, "bob")
+            .await
+            .expect("list")
+            .is_empty()
+    );
+}
