@@ -948,3 +948,84 @@ async fn network_buffer_read() {
     let (status, _, _) = request(http, &auth("/api/v1/me/networks/nope/buffer")).await;
     assert_eq!(status, 404);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn me_read_markers_list() {
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("token");
+    for (target, ts) in [
+        ("#rust", "2026-01-02T03:04:05.678Z"),
+        ("#e6irc", "2026-02-03T04:05:06.001Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO read_markers (account_id, target, marker_ts)
+             SELECT id, $1, $2::timestamptz FROM accounts WHERE name_folded = 'alice'",
+        )
+        .bind(target)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("seed marker");
+    }
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.rm.example".into(),
+        network_name: "RmNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Unauthenticated → 401.
+    let unauth = "GET /api/v1/me/read-markers HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    let (status, _, _) = request(http, unauth).await;
+    assert_eq!(status, 401);
+
+    let auth = format!(
+        "GET /api/v1/me/read-markers HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &auth).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let markers = v["markers"].as_array().expect("array");
+    assert_eq!(markers.len(), 2, "{body}");
+    // Ordered by target: "#e6irc" precedes "#rust".
+    assert_eq!(markers[0]["target"], "#e6irc", "{body}");
+    assert_eq!(
+        markers[0]["timestamp"], "2026-02-03T04:05:06.001Z",
+        "{body}"
+    );
+    assert_eq!(markers[1]["target"], "#rust", "{body}");
+    assert_eq!(
+        markers[1]["timestamp"], "2026-01-02T03:04:05.678Z",
+        "{body}"
+    );
+}
