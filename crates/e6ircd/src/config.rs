@@ -146,6 +146,15 @@ pub enum NetworkKind {
     /// build feature). `addr` = homeserver URL, `nick` = login user,
     /// `sasl_password` = password, `autojoin` = room aliases.
     Matrix,
+    /// A Discord bot session bridged as a network (requires the `discord`
+    /// build feature). `sasl_password` = bot token, `autojoin` = channel
+    /// ids to bridge, `addr` = optional API base (defaults to Discord).
+    Discord,
+    /// A Slack workspace bridged as a network (requires the `slack` build
+    /// feature). `sasl_account` = bot token (xoxb-), `sasl_password` =
+    /// app-level token (xapp-), `autojoin` = channel ids, `addr` =
+    /// optional Web-API base (defaults to Slack).
+    Slack,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -407,6 +416,19 @@ impl Config {
                 NetworkKind::Matrix if n.sasl_password.is_none() => {
                     return Err(ConfigError::Invalid(format!(
                         "network '{}' (kind=matrix) requires sasl_password (login password)",
+                        n.name
+                    )));
+                }
+                NetworkKind::Discord if n.sasl_password.is_none() => {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind=discord) requires sasl_password (bot token)",
+                        n.name
+                    )));
+                }
+                NetworkKind::Slack if n.sasl_account.is_none() || n.sasl_password.is_none() => {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind=slack) requires sasl_account (bot token) and \
+                         sasl_password (app-level token)",
                         n.name
                     )));
                 }

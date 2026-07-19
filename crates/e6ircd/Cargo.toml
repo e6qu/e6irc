@@ -15,6 +15,13 @@ embed-web = ["dep:rust-embed"]
 # Matrix bridge: presents a Matrix homeserver as a BNC network. Its HTTP
 # client lives entirely behind this flag (DESIGN §10.5). Off by default.
 matrix = ["dep:reqwest"]
+# Discord bridge: presents a Discord bot session as a BNC network over the
+# gateway WebSocket + REST API. HTTP/WS deps live behind this flag. Off by
+# default. (DESIGN §10.5)
+discord = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
+# Slack bridge: presents a Slack workspace as a BNC network over Socket
+# Mode (WebSocket) + the Web API. Off by default. (DESIGN §10.5)
+slack = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
 e6irc-proto = { path = "../e6irc-proto" }
@@ -95,7 +102,8 @@ aws-lc-rs = { version = "1.17.3", default-features = false, features = [
 # for the `embed-web` feature. Optional so non-web builds don't pull it.
 rust-embed = { version = "8.12.0", optional = true, default-features = false }
 
-# reqwest 0.12.28: HTTP client for the (optional) matrix bridge. Held on
+# reqwest 0.12.28: HTTP client for the optional bridges (matrix, discord,
+# slack — REST/Web-API calls). Held on
 # the 0.12 line deliberately: openidconnect 4 -> oauth2 5 (both latest)
 # still pull reqwest 0.12, so 0.12.28 is already in the tree; adopting
 # 0.13 would fork the HTTP/TLS stack into two reqwest versions (DESIGN §1).
@@ -112,6 +120,16 @@ askama = { version = "0.16.0", default-features = false, features = [
     "derive",
     "std",
 ] }
+
+# tokio-tungstenite / futures-util: WebSocket client + Stream/Sink for the
+# optional discord/slack gateway drivers (wss:// gateways). Optional and
+# behind those features; rustls TLS to keep the single TLS stack. Also
+# dev-deps below (plaintext, for the ws-irc test); cargo unions features.
+tokio-tungstenite = { version = "0.30.0", optional = true, default-features = false, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
+] }
+futures-util = { version = "0.3", optional = true, default-features = false }
 
 [dev-dependencies]
 # reqwest 0.12 line matches openidconnect's transitive pick; dev-only,

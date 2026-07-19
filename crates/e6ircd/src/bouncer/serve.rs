@@ -78,6 +78,47 @@ impl Registry {
                         continue;
                     }
                 }
+                NetworkKind::Discord => {
+                    #[cfg(feature = "discord")]
+                    {
+                        Box::new(super::DiscordDriver::new(super::DiscordConfig {
+                            token: e.sasl_password.clone().unwrap_or_default(),
+                            api_base: e.addr.clone(),
+                            channels: e.autojoin.clone(),
+                            buffer_cap: e.buffer_cap,
+                        }))
+                    }
+                    #[cfg(not(feature = "discord"))]
+                    {
+                        eprintln!(
+                            "network '{}' is kind=discord but this binary was built \
+                             without the `discord` feature; skipping",
+                            e.name
+                        );
+                        continue;
+                    }
+                }
+                NetworkKind::Slack => {
+                    #[cfg(feature = "slack")]
+                    {
+                        Box::new(super::SlackDriver::new(super::SlackConfig {
+                            bot_token: e.sasl_account.clone().unwrap_or_default(),
+                            app_token: e.sasl_password.clone().unwrap_or_default(),
+                            api_base: e.addr.clone(),
+                            channels: e.autojoin.clone(),
+                            buffer_cap: e.buffer_cap,
+                        }))
+                    }
+                    #[cfg(not(feature = "slack"))]
+                    {
+                        eprintln!(
+                            "network '{}' is kind=slack but this binary was built \
+                             without the `slack` feature; skipping",
+                            e.name
+                        );
+                        continue;
+                    }
+                }
             };
             registry.add(e.owner.clone(), e.name.clone(), driver);
         }

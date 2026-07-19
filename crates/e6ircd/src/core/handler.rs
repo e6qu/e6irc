@@ -1489,6 +1489,11 @@ fn cmd_message(
         };
         if state.db_tx.try_push(log).is_err() {
             eprintln!("history: log queue full or closed; message not persisted");
+            // Delivered but not persisted: mark the channel's history
+            // incomplete so CHATHISTORY does not imply a gap-free record.
+            if let Some(chan) = state.channels.get_mut(&key) {
+                chan.history_complete = false;
+            }
         }
     } else {
         let key = state.nick_key(target);
@@ -3037,7 +3042,12 @@ fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             target: key.as_str().to_string(),
             marker_ms: new_ms,
         };
-        let _ = state.db_tx.try_push(persist);
+        if state.db_tx.try_push(persist).is_err() {
+            eprintln!(
+                "history: db queue full or closed; read marker for {} not persisted",
+                key.as_str()
+            );
+        }
     }
     let current = *state
         .read_markers

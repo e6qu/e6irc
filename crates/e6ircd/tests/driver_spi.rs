@@ -33,10 +33,21 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     let handle: NetworkHandle = driver.start();
     let mut events = handle.subscribe();
 
-    assert!(
-        wait_for(&mut events, |e| matches!(e, DriverEvent::Connected)).await,
-        "{kind}: never reported Connected"
-    );
+    // Connection state is read from the sticky flag, not the live event:
+    // the `Connected` event may fire before this task subscribes (a
+    // broadcast receiver never sees a message sent before it existed),
+    // which is exactly the race that made this test flaky on loaded CI.
+    let connected = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if handle.is_connected() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(connected, "{kind}: never reported Connected");
 
     assert!(handle.send("hello world"), "{kind}: send failed");
     assert!(
@@ -72,8 +83,20 @@ async fn attach_relays_over_the_loopback_driver() {
     let handle = Box::new(LoopbackDriver::new(100)).start();
 
     // Pre-attach line lands in the buffer and must replay on attach.
+    // Poll for it rather than sleeping a fixed interval (a fixed sleep is
+    // a latent flake on a slow runner).
     handle.send("earlier");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let buffered = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if handle.buffer_snapshot().iter().any(|l| l == "earlier") {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(buffered, "pre-attach line never reached the buffer");
 
     let (client, server) = tokio::io::duplex(4096);
     let handle = std::sync::Arc::new(handle);

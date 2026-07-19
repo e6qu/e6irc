@@ -10,17 +10,25 @@
 //! hands its socket to [`attach`], which replays the detached buffer and
 //! relays live traffic both ways.
 
+#[cfg(feature = "discord")]
+mod discord;
 mod irc_driver;
 mod local_driver;
 #[cfg(feature = "matrix")]
 mod matrix;
 mod serve;
+#[cfg(feature = "slack")]
+mod slack;
 
+#[cfg(feature = "discord")]
+pub use discord::{DiscordConfig, DiscordDriver};
 pub use irc_driver::{IrcNetwork, NetworkConfig};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDriver};
 pub use serve::{Registry, bnc_serve};
+#[cfg(feature = "slack")]
+pub use slack::{SlackConfig, SlackDriver};
 
 /// Build a driver config from a stored network row, decrypting its
 /// sealed upstream SASL password with the master key. Fails loudly if a
@@ -70,6 +78,11 @@ pub struct NetworkHandle {
     commands: mpsc::UnboundedSender<String>,
     /// Detached buffer of recent upstream lines (newest last).
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
+    /// Sticky connection state: set on Connected, cleared on Disconnected.
+    /// A live `Connected` event is broadcast-only and missed by a client
+    /// that subscribes just after it fires; this flag lets any observer
+    /// read the current state regardless of subscribe timing.
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Bounded ring of recent upstream lines, for playback on attach.
@@ -126,6 +139,12 @@ impl NetworkHandle {
         self.events.subscribe()
     }
 
+    /// The current upstream connection state. Unlike the `Connected` event
+    /// this is not lost to subscribe timing — safe to poll after `start`.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Build a handle and the driver-side endpoints. A driver spawns a
     /// task that reads commands, records lines to the buffer, and
     /// broadcasts events through the returned [`DriverEnds`].
@@ -133,15 +152,18 @@ impl NetworkHandle {
         let (events, _) = tokio::sync::broadcast::channel(1024);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
+        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
             buffer: buffer.clone(),
+            connected: connected.clone(),
         };
         let ends = DriverEnds {
             events,
             commands: command_rx,
             buffer,
+            connected,
         };
         (handle, ends)
     }
@@ -154,6 +176,7 @@ pub struct DriverEnds {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
     commands: mpsc::UnboundedReceiver<String>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
+    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DriverEnds {
@@ -166,8 +189,20 @@ impl DriverEnds {
         let _ = self.events.send(DriverEvent::Line(line));
     }
 
-    /// Broadcast a non-line event (Connected/Disconnected).
+    /// Broadcast a non-line event (Connected/Disconnected), updating the
+    /// sticky connection state so late subscribers can still read it.
     pub fn emit(&self, event: DriverEvent) {
+        match event {
+            DriverEvent::Connected => {
+                self.connected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            DriverEvent::Disconnected => {
+                self.connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            DriverEvent::Line(_) => {}
+        }
         let _ = self.events.send(event);
     }
 
