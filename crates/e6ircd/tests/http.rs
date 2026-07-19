@@ -217,6 +217,11 @@ async fn bnc_network_management_lifecycle() {
     assert!(confirmed.starts_with("alice/work"), "{confirmed}");
     drop(client);
 
+    // the live driver reached the upstream, so the listing reports it up
+    let (_, _, body) = request(http, &list_req).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["networks"][0]["connected"], true, "{body}");
+
     // delete it
     let del_req = format!(
         "DELETE /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
