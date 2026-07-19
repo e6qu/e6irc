@@ -1252,8 +1252,9 @@ async fn openapi() -> Response {
                         "404": { "description": "no such credential" } } }
             },
             "/api/v1/me/networks": {
-                "get": { "summary": "List the account's BNC networks", "security": bearer,
-                    "responses": ok_json },
+                "get": { "summary": "List the account's BNC networks with live upstream status",
+                    "description": "Each network includes `connected`: true/false when the always-on driver holds a live handle, or null when no handle is live (e.g. not yet started).",
+                    "security": bearer, "responses": ok_json },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "security": bearer,
                     "requestBody": { "required": true, "content": { "application/json": {
@@ -1843,15 +1844,18 @@ async fn list_networks(
         Ok(a) => a,
         Err(response) => return response,
     };
-    if state.bnc_registry.is_none() {
+    let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    }
+    };
     let pool = state.pool.as_ref().expect("authenticate checked the pool");
     match crate::db::list_bnc_networks(pool, &account).await {
         Ok(rows) => {
             let nets: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|n| {
+                    // Live upstream state from the always-on driver, if the
+                    // registry is holding a handle for this network.
+                    let connected = registry.get(&account, &n.name).map(|h| h.is_connected());
                     serde_json::json!({
                         "name": n.name,
                         "addr": n.addr,
@@ -1861,6 +1865,7 @@ async fn list_networks(
                         "autojoin": n.autojoin,
                         "sasl_account": n.sasl_account,
                         "has_sasl_password": n.sasl_password_sealed.is_some(),
+                        "connected": connected,
                     })
                 })
                 .collect();

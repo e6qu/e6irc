@@ -404,11 +404,13 @@ not built yet. Ranked by value:
    `GET /accounts`, `/channels` (registered channels + founders),
    `/klines` (server bans), `/audit` (oper audit log, `?limit`), and
    `/stats` (account/channel/ban counts) — all admin-gated (401/403/200
-   tested) and in the OpenAPI spec. **Still absent:** `networks`
-   enable/disable/status/buffers/read-marker; `me/tokens` list/delete are now
-   implemented (migration 0014 gives PATs an id); only OIDC identity
-   linking remains. Remaining
-   endpoints 404 via the loud fallback.
+   tested) and in the OpenAPI spec. `GET /me/networks` now reports a live
+   `connected` tri-state per network (true/false from the always-on
+   driver's handle, or null when no handle is live) — PG-gated coverage
+   asserts it flips true once the upstream attaches. `me/tokens` list/delete
+   are implemented (migration 0014 gives PATs an id). **Still absent:**
+   `networks` enable/disable/buffers/read-marker; OIDC identity linking.
+   Remaining endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — partial. Oper commands are now OPER/KILL/WALLOPS plus **KLINE /
    UNKLINE**: a `server_bans` table (migration 0012, boot-loaded into a hot
