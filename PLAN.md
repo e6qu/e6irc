@@ -383,11 +383,15 @@ not built yet. Ranked by value:
    GHOST, ACCESS/FLAGS, OP, DROP, SET, founder/successor are absent
    (return "Invalid command."). This is an Atheme-equivalent services
    subsystem — substantial.
-3. **CHATHISTORY `AROUND` / `BETWEEN` / `TARGETS`** (DESIGN §11.2). Only
-   LATEST/BEFORE/AFTER are handled; other subcommands return `FAIL …
-   INVALID_PARAMS`. `TARGETS` in particular is what bouncer/multi-buffer
-   clients use to enumerate active buffers — the highest-value of the
-   three and the most bounded to add.
+3. **CHATHISTORY `TARGETS`** — ✅ DONE (2026-07-19). `CHATHISTORY TARGETS
+   timestamp=<a> timestamp=<b> <limit>` enumerates the requester's channels
+   with a message in the window, newest-first, as a
+   `draft/chathistory-targets` batch; PostgreSQL is authoritative
+   (`db::query_targets`), the hot ring answers without a database. Covered
+   by a core test (dispatch → request → batch) and a PG-gated
+   `query_targets` test. **`AROUND` / `BETWEEN` still remain** (DESIGN
+   §11.2) — both return `FAIL INVALID_PARAMS` today; each is a bounded
+   addition to the same ring+PG paging the other subcommands use.
 4. **REST `/api/v1` surface vs DESIGN §12.** No `channels` resource;
    `admin` has only `GET /accounts` (no global bans, server stats, audit
    query); `networks` has list/create/delete only (no enable/disable,

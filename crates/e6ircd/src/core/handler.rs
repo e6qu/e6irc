@@ -2640,6 +2640,12 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // TARGETS enumerates buffers, not a single channel — handle it before
+    // the channel-target parsing below.
+    if p.first().is_some_and(|s| s.eq_ignore_ascii_case("TARGETS")) {
+        chathistory_targets(state, conn, p);
+        return;
+    }
     let (Some(&sub), Some(&target)) = (p.first(), p.get(1)) else {
         chathistory_fail(state, conn, "NEED_MORE_PARAMS", "Missing parameters");
         return;
@@ -2760,6 +2766,112 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         })
         .collect();
     history_page(state, conn, &display, &batch_ref, rows);
+}
+
+/// CHATHISTORY TARGETS: enumerate the requester's buffers with activity in
+/// a `timestamp=<a> timestamp=<b> <limit>` window (DESIGN §11.2). A
+/// bouncer/multi-buffer client uses this to find which channels have
+/// backlog on reconnect. Targets are the channels the requester is on;
+/// the authoritative source is PostgreSQL, with the hot ring answering
+/// when no database is configured.
+fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    let parse = |i: usize| {
+        p.get(i)
+            .and_then(|s| s.strip_prefix("timestamp="))
+            .and_then(e6irc_proto::time::parse_server_time_seconds)
+    };
+    let (Some(a), Some(b)) = (parse(1), parse(2)) else {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            "Expected two timestamp= bounds",
+        );
+        return;
+    };
+    let (min_ts, max_ts) = if a <= b { (a, b) } else { (b, a) };
+    let limit = p
+        .get(3)
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 500);
+
+    // Visible targets are the channels the requester is on.
+    let keys: Vec<super::state::ChanKey> = state.sessions[&conn].channels.iter().cloned().collect();
+    let batch_ref = state.next_msgid();
+    if keys.is_empty() {
+        targets_page(state, conn, &batch_ref, Vec::new());
+        return;
+    }
+
+    if state.config.sasl_enabled {
+        let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
+        let request = super::DbRequest::QueryTargets {
+            conn,
+            channels,
+            min_ts,
+            max_ts,
+            limit,
+            batch_ref,
+        };
+        if state.db_tx.try_push(request).is_err() {
+            chathistory_fail(
+                state,
+                conn,
+                "MESSAGE_ERROR",
+                "History temporarily unavailable",
+            );
+        }
+        return;
+    }
+
+    // No database: enumerate from the hot rings.
+    let mut targets: Vec<(String, u64)> = Vec::new();
+    for key in keys {
+        if let Some(chan) = state.channels.get(&key)
+            && let Some(latest) = chan
+                .history
+                .iter()
+                .filter(|e| e.ts >= min_ts && e.ts <= max_ts)
+                .map(|e| e.ts)
+                .max()
+        {
+            targets.push((chan.name.clone(), latest));
+        }
+    }
+    targets.sort_by_key(|t| std::cmp::Reverse(t.1));
+    targets.truncate(limit);
+    targets_page(state, conn, &batch_ref, targets);
+}
+
+/// Emit a `draft/chathistory-targets` batch: one `CHATHISTORY TARGETS
+/// <target> <time>` line per buffer, newest-first.
+pub(crate) fn targets_page(
+    state: &mut ServerState,
+    conn: ConnId,
+    batch_ref: &str,
+    targets: Vec<(String, u64)>,
+) {
+    let server = state.config.server_name.clone();
+    state.send(
+        conn,
+        &format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
+    );
+    for (target, ts) in targets {
+        // Prefer the channel's display name while it is still in memory.
+        let key = state.chan_key(&target);
+        let display = state
+            .channels
+            .get(&key)
+            .map(|c| c.name.clone())
+            .unwrap_or(target);
+        let time = e6irc_proto::time::server_time(ts * 1000);
+        state.send(
+            conn,
+            &format!("@batch={batch_ref} :{server} CHATHISTORY TARGETS {display} {time}"),
+        );
+    }
+    state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
 }
 
 /// A ring-missing reference needs PostgreSQL when the ring is full

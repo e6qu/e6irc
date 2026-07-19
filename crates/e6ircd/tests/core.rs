@@ -2268,3 +2268,70 @@ fn registration_records_founder_for_later_rejoin() {
         .expect("353");
     assert!(names.contains("@boss"), "founder not re-opped: {names}");
 }
+
+// CHATHISTORY TARGETS: enumerate the buffers a client has (DESIGN §11.2).
+
+#[test]
+fn chathistory_targets_enumerates_buffers() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(alice, "JOIN #a");
+    s.line(alice, "JOIN #b");
+    s.drain(alice);
+
+    // TARGETS with two timestamp bounds becomes a QueryTargets DB request
+    // over the client's channels.
+    s.line(
+        alice,
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z \
+         timestamp=1971-01-01T00:00:00.000Z 10",
+    );
+    let batch_ref = s
+        .db_requests()
+        .into_iter()
+        .find_map(|r| match r {
+            e6ircd::core::DbRequest::QueryTargets {
+                channels,
+                limit,
+                batch_ref,
+                ..
+            } => {
+                assert!(
+                    channels.contains(&"#a".to_string()) && channels.contains(&"#b".to_string()),
+                    "channels: {channels:?}"
+                );
+                assert_eq!(limit, 10);
+                Some(batch_ref)
+            }
+            _ => None,
+        })
+        .expect("QueryTargets request");
+
+    // The DB answers with the active buffers; the core frames the batch.
+    s.core.handle(Input::TargetsPage {
+        conn: alice,
+        batch_ref: batch_ref.clone(),
+        targets: vec![("#a".into(), 1_000_000), ("#b".into(), 999_999)],
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.contains(&format!(
+            ":irc.test.example BATCH +{batch_ref} draft/chathistory-targets"
+        )),
+        "no batch open: {out:#?}"
+    );
+    assert!(
+        out.contains(&format!(
+            "@batch={batch_ref} :irc.test.example CHATHISTORY TARGETS #a 1970-01-12T13:46:40.000Z"
+        )),
+        "no #a target line: {out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("CHATHISTORY TARGETS #b")),
+        "no #b target line: {out:#?}"
+    );
+    assert!(
+        out.contains(&format!(":irc.test.example BATCH -{batch_ref}")),
+        "no batch close: {out:#?}"
+    );
+}

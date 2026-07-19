@@ -263,6 +263,24 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                 .await
                 .is_ok()
         }
+        DbRequest::QueryTargets {
+            conn,
+            channels,
+            min_ts,
+            max_ts,
+            limit,
+            batch_ref,
+        } => {
+            let targets = query_targets(pool, &channels, min_ts, max_ts, limit).await;
+            core_tx
+                .push(Input::TargetsPage {
+                    conn,
+                    batch_ref,
+                    targets,
+                })
+                .await
+                .is_ok()
+        }
         DbRequest::SetReadMarker {
             account,
             target,
@@ -368,6 +386,41 @@ pub async fn query_history(
             },
         )
         .collect()
+}
+
+/// CHATHISTORY TARGETS: among `channels` (casefolded), the buffers with a
+/// message in `[min_ts, max_ts]`, each with its most recent message time,
+/// most-recent first. Empty on a query error (logged loudly).
+pub async fn query_targets(
+    pool: &PgPool,
+    channels: &[String],
+    min_ts: u64,
+    max_ts: u64,
+    limit: usize,
+) -> Vec<(String, u64)> {
+    let rows: Result<Vec<(String, i64)>, sqlx::Error> = sqlx::query_as(
+        "SELECT target, EXTRACT(EPOCH FROM MAX(ts))::bigint AS latest
+         FROM messages
+         WHERE target = ANY($1)
+           AND ts >= to_timestamp($2::double precision)
+           AND ts <= to_timestamp($3::double precision)
+         GROUP BY target
+         ORDER BY latest DESC
+         LIMIT $4",
+    )
+    .bind(channels)
+    .bind(min_ts as f64)
+    .bind(max_ts as f64)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => rows.into_iter().map(|(t, ts)| (t, ts as u64)).collect(),
+        Err(e) => {
+            eprintln!("db: targets query failed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) -> DbReply {
