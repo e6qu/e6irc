@@ -667,6 +667,19 @@ pub async fn list_all_bnc_networks(pool: &PgPool) -> Result<Vec<(String, BncNetw
         .collect())
 }
 
+/// Every registered channel with its founder, as `(name_folded,
+/// founder_name_folded)` — boot-loaded into the core's hot ownership map.
+pub async fn list_registered_channels(pool: &PgPool) -> Result<Vec<(String, String)>, DbError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.name_folded, a.name_folded
+         FROM channels c JOIN accounts a ON a.id = c.founder_account_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(rows)
+}
+
 /// Delete `account`'s network `name`. Returns whether a row was removed.
 pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);

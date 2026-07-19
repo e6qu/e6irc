@@ -167,7 +167,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
         None => None,
     };
 
-    let core = Core::new(
+    let mut core = Core::new(
         CoreConfig {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -185,6 +185,15 @@ pub async fn start(config: Config) -> io::Result<Running> {
         },
         db_tx,
     );
+    // Seed registered-channel ownership so a founder is re-opped on join
+    // after a restart, not only within the run that registered it.
+    if let Some(pool) = &pool {
+        core.preload_founders(
+            crate::db::list_registered_channels(pool)
+                .await
+                .map_err(io::Error::other)?,
+        );
+    }
     tokio::spawn(core_worker(core, core_rx));
 
     // BNC listener: clients attach to always-on upstream networks.

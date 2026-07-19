@@ -634,6 +634,11 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: super::DbRe
             );
         }
         super::DbReply::ChannelRegistered { channel } => {
+            // Record ownership in the hot copy so the founder is re-opped
+            // on future joins without waiting for a restart.
+            if let Some(account) = state.sessions.get(&conn).and_then(|s| s.account.clone()) {
+                state.set_founder(&channel, &account);
+            }
             state.service_notice(
                 conn,
                 "ChanServ",
@@ -1052,6 +1057,12 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     }
     // Admission checks, Solanum order.
     let was_invited = state.sessions[&conn].invited.contains(&key);
+    // A registered channel's founder is opped on join, even when not the
+    // first to arrive.
+    let account = state.sessions[&conn].account.clone();
+    let is_founder = account
+        .as_deref()
+        .is_some_and(|a| state.is_founder(&key, a));
     let chan = state.channels.get_mut(&key).expect("just inserted");
     if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
         state.numeric(
@@ -1097,7 +1108,7 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     chan.members.insert(
         conn,
         MemberModes {
-            op: first,
+            op: first || is_founder,
             voice: false,
         },
     );

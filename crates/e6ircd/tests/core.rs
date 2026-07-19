@@ -2175,3 +2175,96 @@ fn hot_history_ring_is_lru_evicted() {
         "#c still hot: {out:#?}"
     );
 }
+
+// ChanServ founder ownership: a registered channel's founder is opped on
+// join even when not the first to arrive (DESIGN §7.6).
+
+#[test]
+fn preloaded_founder_is_opped_on_join() {
+    let mut s = TestServer::new();
+    // Boot-loaded ownership (name_folded, founder_folded).
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+
+    // A non-founder arrives first and is opped as the first joiner.
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #chan");
+    let names = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(
+        names.ends_with(":@alice"),
+        "first joiner not opped: {names}"
+    );
+
+    // The founder identifies and joins second, yet is opped.
+    let bob = s.register(2, "bob");
+    identify(&mut s, bob, "boss");
+    s.line(bob, "JOIN #chan");
+    let names = s
+        .drain(bob)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.contains("@bob"), "founder not opped on join: {names}");
+
+    // A third, non-founder user is not opped.
+    let carol = s.register(3, "carol");
+    s.line(carol, "JOIN #chan");
+    let names = s
+        .drain(carol)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(
+        names.contains("carol") && !names.contains("@carol"),
+        "non-founder wrongly opped: {names}"
+    );
+}
+
+#[test]
+fn registration_records_founder_for_later_rejoin() {
+    let mut s = TestServer::new();
+
+    // Boss registers and joins #room (opped as first), then registers it.
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #room");
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :REGISTER #room");
+    s.db_requests();
+    // The DB confirms registration; the core records ownership in its hot
+    // map so a later rejoin re-ops the founder.
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelRegistered {
+            channel: "#room".to_string(),
+        },
+    });
+    s.drain(boss);
+
+    // Boss leaves; the channel empties and is dropped.
+    s.line(boss, "PART #room");
+    s.drain(boss);
+
+    // Someone else recreates it and is opped as the first joiner.
+    let dave = s.register(2, "dave");
+    s.line(dave, "JOIN #room");
+    let names = s
+        .drain(dave)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.ends_with(":@dave"), "recreator not opped: {names}");
+
+    // The founder rejoins and is re-opped despite not being first.
+    s.line(boss, "JOIN #room");
+    let names = s
+        .drain(boss)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.contains("@boss"), "founder not re-opped: {names}");
+}

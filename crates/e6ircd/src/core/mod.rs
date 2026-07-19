@@ -153,6 +153,12 @@ impl Core {
         }
     }
 
+    /// Seed the hot channel-ownership map from persisted rows before the
+    /// worker loop starts (see [`ServerState::preload_founders`]).
+    pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
+        self.state.preload_founders(rows);
+    }
+
     /// Process one event. All state transitions happen here, on one
     /// thread, in queue order.
     pub fn handle(&mut self, input: Input) {
