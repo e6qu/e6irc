@@ -88,6 +88,8 @@ pub(crate) struct Caps {
     pub chathistory: bool,
     pub read_marker: bool,
     pub labeled_response: bool,
+    /// chghost: receive CHGHOST when a user's host changes (SETHOST).
+    pub chghost: bool,
     /// Not in [`CAP_NAMES`]: advertised conditionally (`sasl_enabled`).
     pub sasl: bool,
 }
@@ -113,6 +115,7 @@ pub(crate) const CAP_NAMES: &[(&str, CapAccessor)] = &[
     ("draft/chathistory", |c| &mut c.chathistory),
     ("draft/read-marker", |c| &mut c.read_marker),
     ("labeled-response", |c| &mut c.labeled_response),
+    ("chghost", |c| &mut c.chghost),
 ];
 
 pub(crate) struct Session {

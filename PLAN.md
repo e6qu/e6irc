@@ -94,9 +94,9 @@ goal):
   network's policy, not the interop contract. Our common channel modes
   (+i/+m/+n/+s/+t/+C/+k/+l/+b/+q/+e/+I) are irctest-green and
   live-verified against Libera/OFTC/Ergo.
-- chghost cap: no host-change trigger exists in an independent daemon
-  without a cloaking/vhost service, so there is nothing to advertise it
-  for. It lands with that trigger if one is ever added. (DESIGN §7.7, §17)
+- chghost cap: ✅ now advertised. The oper SETHOST command (§5 below) is
+  the host-change trigger it needed — changing a user's host broadcasts
+  CHGHOST to chghost-capable peers. (DESIGN §7.7, §17)
 
 ## Phase 4 — HTTP layer: OIDC + REST API ✅ (2026-07-19)
 Done:
@@ -416,7 +416,9 @@ not built yet. Ranked by value:
    removes. The **audit_log** table (migration 0013) now records every OPER/KILL/
    KLINE/UNKLINE action (actor, action, target, detail, time);
    db::list_audit_log exposes it for the admin API. **Still absent:**
-   dline/xline and SETHOST.
+   dline/xline. **SETHOST** is now implemented (oper host-cloak that
+   also drives the chghost cap), and every oper action (incl. SETHOST) is
+   audit-logged.
 
 Items 1 and 3 are fully done; item 2 is nearly done (only SET's
 lower-value channel-option flags remain); item 5 has its core (KLINE) with

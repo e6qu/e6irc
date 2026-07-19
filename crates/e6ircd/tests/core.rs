@@ -2802,3 +2802,53 @@ fn oper_actions_are_audited() {
         "UNKLINE not audited"
     );
 }
+
+// Oper SETHOST + chghost (DESIGN §7.6/§7.7): cloak a user's host and
+// announce it to chghost-capable peers.
+
+#[test]
+fn oper_sethost_changes_host_and_chghosts() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let obs = register_with_caps(&mut s, 2, "obs", "chghost");
+    let target = s.register(3, "user");
+    for c in [obs, target] {
+        s.line(c, "JOIN #room");
+        s.drain(c);
+    }
+    s.drain(obs);
+    s.drain(op);
+
+    s.line(op, "SETHOST user cloak.example");
+    assert!(
+        s.drain(op)
+            .iter()
+            .any(|l| l.contains("Set host of user to cloak.example")),
+        "no oper confirmation"
+    );
+    // The chghost-capable observer is told, with the OLD prefix.
+    assert!(
+        s.drain(obs)
+            .iter()
+            .any(|l| l.contains("@host3.example CHGHOST user cloak.example")),
+        "no CHGHOST"
+    );
+    // The host actually changed: the target's next message shows it.
+    s.line(target, "PRIVMSG #room :hi");
+    assert!(
+        s.drain(obs)
+            .iter()
+            .any(|l| l.contains("@cloak.example PRIVMSG #room :hi")),
+        "new host not applied"
+    );
+
+    // A non-oper cannot SETHOST.
+    let plain = s.register(4, "plain");
+    s.line(plain, "SETHOST user x.y");
+    assert!(
+        s.drain(plain).iter().any(|l| l.contains(" 481 ")),
+        "non-oper allowed to SETHOST"
+    );
+}
