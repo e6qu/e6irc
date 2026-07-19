@@ -80,6 +80,15 @@ pub enum DbRequest {
         /// Casefolded channel name.
         channel: String,
     },
+    /// Transfer a registered channel's founder (ChanServ SET FOUNDER).
+    /// Answered with `FounderChanged` or `FounderChangeFailed`.
+    SetChannelFounder {
+        conn: ConnId,
+        /// Channel name as typed (for the reply notice).
+        channel: String,
+        /// New founder account, casefolded.
+        new_founder: String,
+    },
     /// Page history from PostgreSQL when the request reaches past the
     /// in-memory ring. Answered with [`Input::HistoryPage`].
     QueryHistory {
@@ -193,6 +202,16 @@ pub enum DbReply {
         channel: String,
     },
     ChannelExists,
+    /// A founder transfer succeeded: `channel` as typed, `account`
+    /// casefolded (updates the hot ownership map).
+    FounderChanged {
+        channel: String,
+        account: String,
+    },
+    /// A founder transfer failed — the target account or channel is gone.
+    FounderChangeFailed {
+        channel: String,
+    },
     /// The database is unreachable or errored; the client gets a loud
     /// failure, never a silent hang.
     Unavailable,

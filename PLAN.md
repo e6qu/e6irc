@@ -387,9 +387,10 @@ not built yet. Ranked by value:
    per-account access flags in the `channel_access` table (migration 0011),
    boot-loaded into a hot map, driving **auto-op/auto-voice on join**.
    ChanServ **OP** (op yourself or a
-   member you have op access over) is also implemented. **Still absent:**
-   ChanServ SET (channel options: mlock, guard, keeptopic…) and
-   founder/successor transfer — the remaining Atheme-equivalent surface.
+   member you have op access over) is also implemented. ChanServ **SET FOUNDER**
+   (ownership transfer, verified against the DB) is also implemented.
+   **Still absent:** SET's channel-option flags (mlock, guard, keeptopic…)
+   — the remaining lower-value Atheme-equivalent surface.
 3. **CHATHISTORY subcommands** — ✅ DONE (2026-07-19). The full draft
    surface is now implemented (DESIGN §11.2): `LATEST`/`BEFORE`/`AFTER`,
    plus `TARGETS` (buffer enumeration, `draft/chathistory-targets` batch),

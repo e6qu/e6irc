@@ -1087,3 +1087,44 @@ async fn channel_access_persist_and_load() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_founder_transfer() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "boss", "pw").await.expect("boss");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#c', '#c', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    assert_eq!(
+        db::list_registered_channels(&pool).await.expect("list"),
+        vec![("#c".to_string(), "boss".to_string())]
+    );
+
+    // Transfer to an existing account succeeds and moves ownership.
+    assert!(db::set_channel_founder(&pool, "#c", "alice").await);
+    assert_eq!(
+        db::list_registered_channels(&pool).await.expect("list"),
+        vec![("#c".to_string(), "alice".to_string())]
+    );
+
+    // Transfer to a nonexistent account fails and leaves ownership intact.
+    assert!(!db::set_channel_founder(&pool, "#c", "nobody").await);
+    assert_eq!(
+        db::list_registered_channels(&pool).await.expect("list"),
+        vec![("#c".to_string(), "alice".to_string())]
+    );
+}

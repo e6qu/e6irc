@@ -648,6 +648,22 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: super::DbRe
         super::DbReply::ChannelExists => {
             state.service_notice(conn, "ChanServ", "That channel is already registered.");
         }
+        super::DbReply::FounderChanged { channel, account } => {
+            // Update the hot ownership map so the new founder is re-opped.
+            state.set_founder(&channel, &account);
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("Founder of \x02{channel}\x02 transferred to \x02{account}\x02."),
+            );
+        }
+        super::DbReply::FounderChangeFailed { channel } => {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("Could not transfer \x02{channel}\x02 — no such account."),
+            );
+        }
     }
 }
 
@@ -899,6 +915,7 @@ fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
         }
         "FLAGS" => chanserv_flags(state, conn, args),
         "OP" => chanserv_op(state, conn, args),
+        "SET" => chanserv_set(state, conn, args),
         "HELP" => {
             for line in [
                 "***** ChanServ Help *****",
@@ -906,6 +923,7 @@ fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
                 "DROP <#channel> - Unregister a channel you founded",
                 "FLAGS <#channel> [account [+/-ov]] - List or set channel access",
                 "OP <#channel> [nick] - Op yourself or a nick (needs op access)",
+                "SET <#channel> FOUNDER <account> - Transfer channel ownership",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "ChanServ", line);
@@ -1147,6 +1165,67 @@ fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) {
         "ChanServ",
         &format!("Opped \x02{target_nick}\x02 on \x02{channel}\x02."),
     );
+}
+
+/// ChanServ SET: founder-only channel options. Currently FOUNDER (transfer
+/// ownership to another account, verified against the DB).
+fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    let (Some(&channel), Some(&option)) = (args.first(), args.get(1)) else {
+        state.service_notice(conn, "ChanServ", "Syntax: SET <#channel> <option> <value>");
+        return;
+    };
+    let Some(account) = state.sessions[&conn].account.clone() else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "You must identify to services before using SET.",
+        );
+        return;
+    };
+    let key = state.chan_key(channel);
+    if !state.is_registered(&key) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{channel}\x02 is not registered."),
+        );
+        return;
+    }
+    if !state.is_founder(&key, &account) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("You are not the founder of \x02{channel}\x02."),
+        );
+        return;
+    }
+    match option.to_ascii_uppercase().as_str() {
+        "FOUNDER" => {
+            let Some(&new) = args.get(2) else {
+                state.service_notice(conn, "ChanServ", "Syntax: SET <#channel> FOUNDER <account>");
+                return;
+            };
+            let request = super::DbRequest::SetChannelFounder {
+                conn,
+                channel: channel.to_string(),
+                new_founder: state.casemap.casefold(new),
+            };
+            if state.db_tx.try_push(request).is_err() {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Services are temporarily unavailable. Try again later.",
+                );
+            }
+        }
+        other => {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("Unknown SET option \x02{other}\x02. Available: FOUNDER."),
+            );
+        }
+    }
 }
 
 fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
