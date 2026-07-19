@@ -303,6 +303,16 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::SetChannelAccess {
+            channel,
+            account,
+            flags,
+        } => {
+            if let Err(e) = set_channel_access(pool, &channel, &account, flags).await {
+                eprintln!("db: channel access persistence failed: {e}");
+            }
+            true
+        }
         DbRequest::LogMessage { .. } => unreachable!("batched by the caller"),
     }
 }
@@ -509,6 +519,52 @@ pub async fn query_targets(
             Vec::new()
         }
     }
+}
+
+/// Upsert (or remove, when `flags` is `None`) one channel access entry by
+/// casefolded channel + account names.
+pub async fn set_channel_access(
+    pool: &PgPool,
+    channel_folded: &str,
+    account_folded: &str,
+    flags: Option<String>,
+) -> Result<(), DbError> {
+    match flags {
+        Some(flags) => sqlx::query(
+            "INSERT INTO channel_access (channel_id, account_id, flags)
+             SELECT c.id, a.id, $3 FROM channels c, accounts a
+             WHERE c.name_folded = $1 AND a.name_folded = $2
+             ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
+        )
+        .bind(channel_folded)
+        .bind(account_folded)
+        .bind(flags),
+        None => sqlx::query(
+            "DELETE FROM channel_access ca USING channels c, accounts a
+             WHERE ca.channel_id = c.id AND ca.account_id = a.id
+               AND c.name_folded = $1 AND a.name_folded = $2",
+        )
+        .bind(channel_folded)
+        .bind(account_folded),
+    }
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// Every channel access entry, as `(channel_folded, account_folded,
+/// flags)` — boot-loaded into the hot access map.
+pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, String)>, DbError> {
+    sqlx::query_as(
+        "SELECT c.name_folded, a.name_folded, ca.flags
+         FROM channel_access ca
+         JOIN channels c ON c.id = ca.channel_id
+         JOIN accounts a ON a.id = ca.account_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
 }
 
 /// Unregister a channel by its casefolded name (ChanServ DROP).

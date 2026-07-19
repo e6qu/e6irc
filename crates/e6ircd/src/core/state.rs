@@ -305,6 +305,10 @@ pub(crate) struct ServerState {
     /// on TOPIC; restored when a registered channel is recreated so its
     /// topic survives the channel going empty.
     pub registered_topics: HashMap<ChanKey, Topic>,
+    /// Per-channel access: channel → (folded account → flag chars, e.g.
+    /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
+    /// auto-op / auto-voice on join.
+    pub channel_access: HashMap<ChanKey, HashMap<String, String>>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
     /// Channels holding a hot history ring, most-recently-active first.
@@ -347,6 +351,7 @@ impl ServerState {
             read_markers: HashMap::new(),
             registered_founders: HashMap::new(),
             registered_topics: HashMap::new(),
+            channel_access: HashMap::new(),
             whowas: std::collections::VecDeque::new(),
             hot_channels: std::collections::VecDeque::new(),
             capture: None,
@@ -472,6 +477,27 @@ impl ServerState {
                 )
             })
             .collect();
+    }
+
+    /// Load persisted channel access as `(name_folded, account_folded,
+    /// flags)` rows into the hot access map.
+    pub fn preload_access(&mut self, rows: Vec<(String, String, String)>) {
+        self.channel_access.clear();
+        for (name_folded, account, flags) in rows {
+            self.channel_access
+                .entry(ChanKey(name_folded))
+                .or_default()
+                .insert(account, flags);
+        }
+    }
+
+    /// The `(auto_op, auto_voice)` flags `account` holds on channel `key`.
+    pub fn access_modes(&self, key: &ChanKey, account: &str) -> (bool, bool) {
+        let folded = self.casemap.casefold(account);
+        match self.channel_access.get(key).and_then(|m| m.get(&folded)) {
+            Some(flags) => (flags.contains('o'), flags.contains('v')),
+            None => (false, false),
+        }
     }
 
     /// Key a nick for lookup/storage.

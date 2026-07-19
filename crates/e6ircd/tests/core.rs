@@ -2543,3 +2543,56 @@ fn chanserv_drop_unregisters_channel() {
         "channel still registered after drop"
     );
 }
+
+// ChanServ FLAGS / access (DESIGN §7.6): founder grants per-account flags
+// that auto-op / auto-voice on join.
+
+#[test]
+fn chanserv_flags_auto_ops_on_join() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.db_requests();
+
+    // Founder grants +o access to "alice"; it persists.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("are now +o")),
+        "no flags confirmation"
+    );
+    let persisted = s.db_requests().into_iter().any(|r| {
+        matches!(r,
+            e6ircd::core::DbRequest::SetChannelAccess { channel, account, flags: Some(f) }
+            if channel == "#chan" && account == "alice" && f == "o")
+    });
+    assert!(persisted, "SetChannelAccess not queued");
+
+    // alice joins and is auto-opped, though neither first nor founder.
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #chan");
+    let names = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.contains("@alice"), "alice not auto-opped: {names}");
+
+    // FLAGS with no account lists the entries.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan");
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("alice +o")),
+        "access entry not listed"
+    );
+
+    // A non-founder may not modify access.
+    s.line(alice, "PRIVMSG ChanServ :FLAGS #chan bob +o");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("not the founder")),
+        "non-founder was allowed to set flags"
+    );
+}

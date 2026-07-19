@@ -1046,3 +1046,44 @@ async fn channel_topic_persist_and_load() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_access_persist_and_load() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "boss", "pw").await.expect("boss");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#c', '#c', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+
+    db::set_channel_access(&pool, "#c", "alice", Some("ov".into()))
+        .await
+        .expect("set");
+    assert_eq!(
+        db::list_channel_access(&pool).await.expect("list"),
+        vec![("#c".to_string(), "alice".to_string(), "ov".to_string())]
+    );
+
+    db::set_channel_access(&pool, "#c", "alice", None)
+        .await
+        .expect("clear");
+    assert!(
+        db::list_channel_access(&pool)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+}
