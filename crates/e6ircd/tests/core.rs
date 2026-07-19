@@ -2421,3 +2421,62 @@ fn chathistory_between_msgids() {
     assert!(inner[0].ends_with(":m3"), "{inner:#?}");
     assert!(inner[1].ends_with(":m4"), "{inner:#?}");
 }
+
+// ChanServ topic retention: a registered channel keeps its topic across an
+// empty→recreate cycle (DESIGN §7.6, §8).
+
+#[test]
+fn registered_channel_topic_restored_on_recreate() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    s.core.preload_topics(vec![(
+        "#room".to_string(),
+        "the topic".to_string(),
+        "boss!b@h".to_string(),
+        1_000_000,
+    )]);
+
+    // alice recreates the channel; the retained topic is restored and
+    // shown in her JOIN reply (RPL_TOPIC 332).
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #room");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains(" 332 ") && l.ends_with(":the topic")),
+        "restored topic not shown on join: {out:#?}"
+    );
+}
+
+#[test]
+fn registered_channel_topic_persisted_on_set() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    s.line(boss, "JOIN #reg"); // first joiner → op
+    s.drain(boss);
+    s.db_requests();
+
+    s.line(boss, "TOPIC #reg :new topic");
+    s.drain(boss);
+    let persisted = s.db_requests().into_iter().any(|r| {
+        matches!(r,
+            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
+            if channel == "#reg" && text == "new topic")
+    });
+    assert!(persisted, "SetChannelTopic not queued");
+
+    // An unregistered channel does not persist its topic.
+    s.line(boss, "JOIN #plain");
+    s.drain(boss);
+    s.db_requests();
+    s.line(boss, "TOPIC #plain :whatever");
+    s.drain(boss);
+    let leaked = s
+        .db_requests()
+        .into_iter()
+        .any(|r| matches!(r, e6ircd::core::DbRequest::SetChannelTopic { .. }));
+    assert!(!leaked, "unregistered channel wrongly persisted its topic");
+}

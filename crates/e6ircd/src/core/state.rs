@@ -228,6 +228,7 @@ pub(crate) struct HistoryEntry {
 /// Ring capacity per channel; older entries live only in PostgreSQL.
 pub(crate) const HISTORY_RING_CAP: usize = 500;
 
+#[derive(Clone)]
 pub(crate) struct Topic {
     pub text: String,
     pub set_by: String,
@@ -300,6 +301,10 @@ pub(crate) struct ServerState {
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
     pub registered_founders: HashMap<ChanKey, String>,
+    /// Registered channels → retained topic. Boot-loaded and kept in sync
+    /// on TOPIC; restored when a registered channel is recreated so its
+    /// topic survives the channel going empty.
+    pub registered_topics: HashMap<ChanKey, Topic>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
     /// Channels holding a hot history ring, most-recently-active first.
@@ -341,6 +346,7 @@ impl ServerState {
             monitors: HashMap::new(),
             read_markers: HashMap::new(),
             registered_founders: HashMap::new(),
+            registered_topics: HashMap::new(),
             whowas: std::collections::VecDeque::new(),
             hot_channels: std::collections::VecDeque::new(),
             capture: None,
@@ -443,6 +449,29 @@ impl ServerState {
         self.registered_founders
             .get(key)
             .is_some_and(|f| *f == self.casemap.casefold(account))
+    }
+
+    /// Whether channel `key` is registered (ownership recorded).
+    pub fn is_registered(&self, key: &ChanKey) -> bool {
+        self.registered_founders.contains_key(key)
+    }
+
+    /// Load persisted channel topics as `(name_folded, text, setter,
+    /// set_at_secs)` rows into the hot retained-topic map.
+    pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
+        self.registered_topics = rows
+            .into_iter()
+            .map(|(name_folded, text, set_by, set_at)| {
+                (
+                    ChanKey(name_folded),
+                    Topic {
+                        text,
+                        set_by,
+                        set_at,
+                    },
+                )
+            })
+            .collect();
     }
 
     /// Key a nick for lookup/storage.

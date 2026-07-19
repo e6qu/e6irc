@@ -291,6 +291,12 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::SetChannelTopic { channel, topic } => {
+            if let Err(e) = set_channel_topic(pool, &channel, topic).await {
+                eprintln!("db: channel topic persistence failed: {e}");
+            }
+            true
+        }
         DbRequest::LogMessage { .. } => unreachable!("batched by the caller"),
     }
 }
@@ -312,6 +318,37 @@ async fn set_read_marker(
     .bind(target)
     .bind(marker_ms as i64)
     .bind(&folded)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// Persist (or clear, when `topic` is `None`) a registered channel's
+/// retained topic on its `channels` row.
+pub async fn set_channel_topic(
+    pool: &PgPool,
+    channel_folded: &str,
+    topic: Option<(String, String, u64)>,
+) -> Result<(), DbError> {
+    match topic {
+        Some((text, setter, set_at)) => sqlx::query(
+            "UPDATE channels
+             SET topic = $2, topic_setter = $3,
+                 topic_set_at = to_timestamp($4::double precision)
+             WHERE name_folded = $1",
+        )
+        .bind(channel_folded)
+        .bind(text)
+        .bind(setter)
+        .bind(set_at as f64),
+        None => sqlx::query(
+            "UPDATE channels
+             SET topic = NULL, topic_setter = NULL, topic_set_at = NULL
+             WHERE name_folded = $1",
+        )
+        .bind(channel_folded),
+    }
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
@@ -776,6 +813,26 @@ pub async fn list_registered_channels(pool: &PgPool) -> Result<Vec<(String, Stri
     .await
     .map_err(DbError::Query)?;
     Ok(rows)
+}
+
+/// Every registered channel that has a retained topic, as `(name_folded,
+/// text, setter, set_at_secs)` — boot-loaded into the hot topic map.
+pub async fn list_channel_topics(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, String, u64)>, DbError> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT name_folded, topic, topic_setter,
+                EXTRACT(EPOCH FROM topic_set_at)::bigint
+         FROM channels
+         WHERE topic IS NOT NULL AND topic_setter IS NOT NULL AND topic_set_at IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(rows
+        .into_iter()
+        .map(|(n, t, s, ts)| (n, t, s, ts as u64))
+        .collect())
 }
 
 /// Delete `account`'s network `name`. Returns whether a row was removed.

@@ -1032,12 +1032,18 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     let now = (state.config.clock)();
     let user_prefix = state.sessions[&conn].prefix();
     let casemap = state.casemap;
+    // A registered channel being (re)created restores its retained topic.
+    let restored_topic = if state.channels.contains_key(&key) {
+        None
+    } else {
+        state.registered_topics.get(&key).cloned()
+    };
     let chan = state
         .channels
         .entry(key.clone())
         .or_insert_with(|| Channel {
             name: name.to_string(),
-            topic: None,
+            topic: restored_topic,
             members: std::collections::HashMap::new(),
             modes: super::state::ChanModes {
                 no_external: true,
@@ -1714,18 +1720,42 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
     }
     let new_text = p.get(1).copied().unwrap_or("");
     let prefix = state.sessions[&conn].prefix();
-    let chan = state.channels.get_mut(&key).expect("checked");
-    if new_text.is_empty() {
-        chan.topic = None;
+    let now = (state.config.clock)();
+    let new_topic = if new_text.is_empty() {
+        None
     } else {
-        chan.topic = Some(Topic {
+        Some(Topic {
             text: new_text.to_string(),
             set_by: prefix.clone(),
-            set_at: (state.config.clock)(),
-        });
-    }
+            set_at: now,
+        })
+    };
+    state.channels.get_mut(&key).expect("checked").topic = new_topic.clone();
     let line = format!(":{prefix} TOPIC {display} :{new_text}");
     state.broadcast_channel(&key, &line, None);
+
+    // A registered channel retains its topic across an empty→recreate
+    // cycle: keep the hot copy in sync and persist it.
+    if state.is_registered(&key) {
+        match &new_topic {
+            Some(t) => {
+                state.registered_topics.insert(key.clone(), t.clone());
+            }
+            None => {
+                state.registered_topics.remove(&key);
+            }
+        }
+        let request = super::DbRequest::SetChannelTopic {
+            channel: key.as_str().to_string(),
+            topic: new_topic.map(|t| (t.text, t.set_by, t.set_at)),
+        };
+        if state.db_tx.try_push(request).is_err() {
+            eprintln!(
+                "topic: db queue full or closed; retained topic for {} not persisted",
+                key.as_str()
+            );
+        }
+    }
 }
 
 // ---- MODE ---------------------------------------------------------------

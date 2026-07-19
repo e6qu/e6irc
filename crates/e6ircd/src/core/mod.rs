@@ -103,6 +103,13 @@ pub enum DbRequest {
         target: String,
         marker_ms: u64,
     },
+    /// Persist a registered channel's retained topic (fire-and-forget).
+    /// `topic` is `(text, setter, set_at_secs)`; `None` clears it.
+    SetChannelTopic {
+        /// Casefolded channel name.
+        channel: String,
+        topic: Option<(String, String, u64)>,
+    },
     /// Append one chat message to history. Fire-and-forget: no reply.
     LogMessage {
         msgid: String,
@@ -197,6 +204,12 @@ impl Core {
     /// worker loop starts (see [`ServerState::preload_founders`]).
     pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
         self.state.preload_founders(rows);
+    }
+
+    /// Seed the retained-topic map from persisted rows before the worker
+    /// loop starts (see [`ServerState::preload_topics`]).
+    pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
+        self.state.preload_topics(rows);
     }
 
     /// Process one event. All state transitions happen here, on one

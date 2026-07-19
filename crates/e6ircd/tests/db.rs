@@ -964,8 +964,7 @@ async fn query_history_around_and_between() {
         .expect("insert");
     }
 
-    // AROUND 3000, limit 4 → 2 older (1000,2000) + 3000 + 1 newer (4000),
-    // oldest-first.
+    // AROUND 3000, limit 4 → 2 older (1000,2000) + 3000 + 1 newer (4000).
     let around = db::query_history(
         &pool,
         "#h",
@@ -994,5 +993,56 @@ async fn query_history_around_and_between() {
     assert_eq!(
         between.iter().map(|r| r.ts).collect::<Vec<_>>(),
         vec![3000, 4000]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_topic_persist_and_load() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "boss", "pw")
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#c', '#c', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+
+    // Set → it loads back with the same fields.
+    db::set_channel_topic(
+        &pool,
+        "#c",
+        Some(("hi there".into(), "boss!b@h".into(), 1000)),
+    )
+    .await
+    .expect("set");
+    assert_eq!(
+        db::list_channel_topics(&pool).await.expect("list"),
+        vec![(
+            "#c".to_string(),
+            "hi there".to_string(),
+            "boss!b@h".to_string(),
+            1000
+        )]
+    );
+
+    // Clear → it no longer loads.
+    db::set_channel_topic(&pool, "#c", None)
+        .await
+        .expect("clear");
+    assert!(
+        db::list_channel_topics(&pool)
+            .await
+            .expect("list")
+            .is_empty()
     );
 }
