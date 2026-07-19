@@ -898,12 +898,14 @@ fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
             );
         }
         "FLAGS" => chanserv_flags(state, conn, args),
+        "OP" => chanserv_op(state, conn, args),
         "HELP" => {
             for line in [
                 "***** ChanServ Help *****",
                 "REGISTER <#channel> - Register a channel you operate",
                 "DROP <#channel> - Unregister a channel you founded",
                 "FLAGS <#channel> [account [+/-ov]] - List or set channel access",
+                "OP <#channel> [nick] - Op yourself or a nick (needs op access)",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "ChanServ", line);
@@ -1054,6 +1056,97 @@ fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {
             &format!("Flags for \x02{target}\x02 on \x02{channel}\x02 are now +{new_flags}."),
         );
     }
+}
+
+/// ChanServ OP: op yourself (or a named nick) on a registered channel you
+/// have op access to (founder or the `o` access flag). The target must be
+/// online and on the channel.
+fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    let Some(&channel) = args.first() else {
+        state.service_notice(conn, "ChanServ", "Syntax: OP <#channel> [nick]");
+        return;
+    };
+    let Some(account) = state.sessions[&conn].account.clone() else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "You must identify to services before using OP.",
+        );
+        return;
+    };
+    let key = state.chan_key(channel);
+    if !state.is_registered(&key) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{channel}\x02 is not registered."),
+        );
+        return;
+    }
+    if !(state.is_founder(&key, &account) || state.access_modes(&key, &account).0) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("You do not have op access on \x02{channel}\x02."),
+        );
+        return;
+    }
+
+    // Target: the named nick, or the requester's own nick.
+    let target_nick = match args.get(1) {
+        Some(&n) => n.to_string(),
+        None => state.sessions[&conn].nick.clone().expect("registered"),
+    };
+    let nk = state.nick_key(&target_nick);
+    let Some(&target_conn) = state.nicks.get(&nk) else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{target_nick}\x02 is not online."),
+        );
+        return;
+    };
+    match state
+        .channels
+        .get(&key)
+        .and_then(|c| c.members.get(&target_conn))
+        .map(|m| m.op)
+    {
+        None => {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("\x02{target_nick}\x02 is not on \x02{channel}\x02."),
+            );
+            return;
+        }
+        Some(true) => {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("\x02{target_nick}\x02 is already opped."),
+            );
+            return;
+        }
+        Some(false) => {}
+    }
+    if let Some(chan) = state.channels.get_mut(&key)
+        && let Some(member) = chan.members.get_mut(&target_conn)
+    {
+        member.op = true;
+    }
+    let display = state.channels[&key].name.clone();
+    let server = state.config.server_name.clone();
+    state.broadcast_channel(
+        &key,
+        &format!(":{server} MODE {display} +o {target_nick}"),
+        None,
+    );
+    state.service_notice(
+        conn,
+        "ChanServ",
+        &format!("Opped \x02{target_nick}\x02 on \x02{channel}\x02."),
+    );
 }
 
 fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
