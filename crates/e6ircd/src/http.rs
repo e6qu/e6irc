@@ -137,6 +137,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/me/networks/{name}",
             axum::routing::delete(delete_network).patch(patch_network),
         )
+        .route("/api/v1/me/networks/{name}/buffer", get(network_buffer))
         .route("/api/v1/history", get(history))
         .route("/api/v1/admin/accounts", get(admin_accounts))
         .route("/api/v1/admin/channels", get(admin_channels))
@@ -1292,6 +1293,17 @@ async fn openapi() -> Response {
                     "responses": { "204": { "description": "deleted" },
                         "404": { "description": "no such network" } } }
             },
+            "/api/v1/me/networks/{name}/buffer": {
+                "get": { "summary": "Recent buffered upstream lines for a network (oldest-first)",
+                    "security": bearer,
+                    "parameters": [
+                        { "name": "name", "in": "path", "required": true,
+                            "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "required": false,
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }],
+                    "responses": { "200": { "description": "buffered lines" },
+                        "404": { "description": "no such network" } } }
+            },
             "/api/v1/history": {
                 "get": { "summary": "Paged message history for the account", "security": bearer,
                     "responses": ok_json }
@@ -2034,6 +2046,60 @@ async fn create_network_core(
         )),
     );
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct BufferQuery {
+    limit: Option<usize>,
+}
+
+/// Recent upstream lines the bouncer buffered for one of the caller's
+/// networks, oldest-first — the same backlog attach playback replays.
+/// Served from the persisted buffer, so it works whether or not the
+/// network's driver is currently running.
+async fn network_buffer(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(name): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<BufferQuery>,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    if state.bnc_registry.is_none() {
+        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+    }
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    // The network must belong to the caller — no cross-account reads.
+    match crate::db::get_bnc_network(pool, &account, &name).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+        Err(e) => {
+            eprintln!("http: network buffer lookup failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    }
+    let limit = params.limit.unwrap_or(200).clamp(1, 1000) as i64;
+    match crate::db::recent_bnc_lines(pool, &account, &name, limit).await {
+        Ok(lines) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "lines": lines }).to_string(),
+        )
+            .into_response(),
+        Err(e) => {
+            eprintln!("http: network buffer read failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
