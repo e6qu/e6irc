@@ -369,16 +369,15 @@ honestly rather than left implied. All of it fails loudly today (returns
 an error / 404 / `FAIL`), so none of it is a silent no-op — it is simply
 not built yet. Ranked by value:
 
-1. **ChanServ founder ownership + topic retention** (DESIGN §7.6, §8).
-   `ChanServ REGISTER` persists a `channels` row (founder id), but that
-   record is never read back: a returning founder is not re-opped (JOIN
-   grants `+o` only to the first joiner), and a registered channel's topic
-   is not persisted or restored. Registration is therefore inert beyond
-   the DB row. Needs an in-memory founder map (boot-loaded like BNC
-   networks, updated on the `ChannelRegistered` reply), a founder check in
-   `join_one`, and topic persist/restore. Phase 2's "founder ownership"
-   line over-claimed this; it is the core of the deferred fuller ChanServ
-   surface (migration 0002 says as much).
+1. **ChanServ founder ownership** — ✅ DONE (2026-07-19). The core now
+   keeps a hot channel-ownership map (`registered_founders`), boot-loaded
+   from the `channels` table and updated on the `ChannelRegistered` reply;
+   `join_one` re-ops the registered founder even when they are not the
+   first to arrive. Covered by two core tests (preload path + register-
+   then-rejoin path). **Topic retention still remains** (DESIGN §7.6, §8):
+   a registered channel's topic is not yet persisted or restored across an
+   empty→recreate cycle — that needs a topic column + persist-on-TOPIC +
+   restore-on-create (bounded, mirrors the founder-map preload).
 2. **Fuller NickServ/ChanServ command surface** (DESIGN §7.6). Only
    REGISTER/IDENTIFY/HELP (NickServ) and REGISTER/HELP (ChanServ) exist;
    GHOST, ACCESS/FLAGS, OP, DROP, SET, founder/successor are absent

@@ -296,6 +296,10 @@ pub(crate) struct ServerState {
     /// Read markers: (account, target) → epoch millis. Mirrors the
     /// PostgreSQL table; this is the hot copy the core serves.
     pub read_markers: HashMap<(String, ChanKey), u64>,
+    /// Registered channels → founder account (both casefolded). The hot
+    /// copy of the `channels` table's ownership, boot-loaded and updated
+    /// on registration; a founder rejoining their channel is re-opped.
+    pub registered_founders: HashMap<ChanKey, String>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
     /// Channels holding a hot history ring, most-recently-active first.
@@ -336,6 +340,7 @@ impl ServerState {
             msgid_counter: 0,
             monitors: HashMap::new(),
             read_markers: HashMap::new(),
+            registered_founders: HashMap::new(),
             whowas: std::collections::VecDeque::new(),
             hot_channels: std::collections::VecDeque::new(),
             capture: None,
@@ -415,6 +420,29 @@ impl ServerState {
     /// Key a channel name for lookup/storage.
     pub fn chan_key(&self, name: &str) -> ChanKey {
         ChanKey(self.casemap.casefold(name))
+    }
+
+    /// Load persisted channel ownership as `(name_folded, founder_folded)`
+    /// rows (both already casefolded, so they key directly).
+    pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
+        self.registered_founders = rows
+            .into_iter()
+            .map(|(name_folded, founder)| (ChanKey(name_folded), founder))
+            .collect();
+    }
+
+    /// Record a channel's founder (called when registration succeeds).
+    pub fn set_founder(&mut self, channel: &str, founder_account: &str) {
+        let key = self.chan_key(channel);
+        let founder = self.casemap.casefold(founder_account);
+        self.registered_founders.insert(key, founder);
+    }
+
+    /// Whether `account` is the registered founder of channel `key`.
+    pub fn is_founder(&self, key: &ChanKey, account: &str) -> bool {
+        self.registered_founders
+            .get(key)
+            .is_some_and(|f| *f == self.casemap.casefold(account))
     }
 
     /// Key a nick for lookup/storage.
