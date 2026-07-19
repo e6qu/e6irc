@@ -453,6 +453,20 @@ async fn admin_accounts_endpoint_is_gated() {
     let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "t")
         .await
         .expect("tok");
+    // Seed data for the other admin read endpoints.
+    e6ircd::db::add_kline(&pool, "spammer@*", "spam", "alice")
+        .await
+        .expect("kline");
+    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
+        .await
+        .expect("audit");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
     drop(pool);
 
     let config = Config {
@@ -502,6 +516,31 @@ async fn admin_accounts_endpoint_is_gated() {
         names.contains(&"alice") && names.contains(&"bob"),
         "{names:?}"
     );
+
+    // The other admin read endpoints are gated the same way and return
+    // their seeded data.
+    for (path, key) in [
+        ("/api/v1/admin/channels", "channels"),
+        ("/api/v1/admin/klines", "klines"),
+        ("/api/v1/admin/audit", "audit"),
+    ] {
+        let auth = |token: &str| {
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let (status, _, _) = request(http, &get(path)).await;
+        assert_eq!(status, 401, "{path} unauthenticated");
+        let (status, _, _) = request(http, &auth(&bob_token)).await;
+        assert_eq!(status, 403, "{path} non-admin");
+        let (status, _, body) = request(http, &auth(&alice_token)).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert!(
+            v[key].as_array().is_some_and(|a| !a.is_empty()),
+            "{path} empty: {body}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

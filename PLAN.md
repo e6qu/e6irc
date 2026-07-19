@@ -400,11 +400,13 @@ not built yet. Ranked by value:
    (`db::query_history`/`query_targets`) past the ring. Covered by core
    ring tests (AROUND, BETWEEN, TARGETS) and PG-gated tests
    (`query_history_around_and_between`, `query_targets`).
-4. **REST `/api/v1` surface vs DESIGN §12.** No `channels` resource;
-   `admin` has only `GET /accounts` (no global bans, server stats, audit
-   query); `networks` has list/create/delete only (no enable/disable,
-   status, buffers, read-marker get/set); `me/tokens` is create-only; no
-   OIDC identity linking. All 404 via the loud fallback.
+4. **REST `/api/v1` surface vs DESIGN §12** — partial. `admin` now has
+   `GET /accounts`, `/channels` (registered channels + founders),
+   `/klines` (server bans), and `/audit` (oper audit log, `?limit`), all
+   admin-gated (401/403/200 tested) and in the OpenAPI spec. **Still
+   absent:** server stats; `networks` enable/disable/status/buffers/
+   read-marker; `me/tokens` list/delete; OIDC identity linking. Remaining
+   endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — partial. Oper commands are now OPER/KILL/WALLOPS plus **KLINE /
    UNKLINE**: a `server_bans` table (migration 0012, boot-loaded into a hot

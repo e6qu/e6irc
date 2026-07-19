@@ -132,6 +132,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/history", get(history))
         .route("/api/v1/admin/accounts", get(admin_accounts))
+        .route("/api/v1/admin/channels", get(admin_channels))
+        .route("/api/v1/admin/klines", get(admin_klines))
+        .route("/api/v1/admin/audit", get(admin_audit))
         .route("/ws/irc", get(ws_irc))
         .route("/ws/ui", get(ws_ui));
     // With the `embed-web` feature the built web client (web/dist) is
@@ -940,6 +943,97 @@ async fn admin_accounts(
     }
 }
 
+fn admin_json(body: serde_json::Value) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response {
+    eprintln!("http: admin {what} failed: {e}");
+    problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database unavailable",
+        None,
+    )
+}
+
+/// List every registered channel with its founder (admin only).
+async fn admin_channels(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::list_registered_channels(pool).await {
+        Ok(rows) => admin_json(serde_json::json!({
+            "channels": rows
+                .into_iter()
+                .map(|(name, founder)| serde_json::json!({ "name": name, "founder": founder }))
+                .collect::<Vec<_>>(),
+        })),
+        Err(e) => admin_db_error("channel list", e),
+    }
+}
+
+/// List every server ban / K-line (admin only).
+async fn admin_klines(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::list_klines(pool).await {
+        Ok(rows) => admin_json(serde_json::json!({
+            "klines": rows
+                .into_iter()
+                .map(|(mask, reason, set_by)| {
+                    serde_json::json!({ "mask": mask, "reason": reason, "set_by": set_by })
+                })
+                .collect::<Vec<_>>(),
+        })),
+        Err(e) => admin_db_error("kline list", e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+/// Query the oper audit log, newest-first (admin only).
+async fn admin_audit(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<AuditQuery>,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
+    match crate::db::list_audit_log(pool, limit).await {
+        Ok(rows) => admin_json(serde_json::json!({
+            "audit": rows
+                .into_iter()
+                .map(|(actor, action, target, detail, at)| {
+                    serde_json::json!({
+                        "actor": actor, "action": action, "target": target,
+                        "detail": detail, "at": at,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })),
+        Err(e) => admin_db_error("audit log", e),
+    }
+}
+
 async fn me(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Response {
     match authenticate(&state, &headers).await {
         Ok(account) => (
@@ -1155,6 +1249,26 @@ async fn openapi() -> Response {
             "/api/v1/admin/accounts": {
                 "get": { "summary": "List all accounts (admin only)", "security": bearer,
                     "responses": { "200": { "description": "account names" },
+                        "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/channels": {
+                "get": { "summary": "List registered channels + founders (admin only)",
+                    "security": bearer,
+                    "responses": { "200": { "description": "channels" },
+                        "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/klines": {
+                "get": { "summary": "List server bans / K-lines (admin only)",
+                    "security": bearer,
+                    "responses": { "200": { "description": "klines" },
+                        "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/audit": {
+                "get": { "summary": "Query the oper audit log, newest-first (admin only)",
+                    "security": bearer,
+                    "parameters": [ { "name": "limit", "in": "query",
+                        "schema": { "type": "integer" } } ],
+                    "responses": { "200": { "description": "audit entries" },
                         "403": { "description": "not an admin account" } } }
             }
         }
