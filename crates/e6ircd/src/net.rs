@@ -185,11 +185,17 @@ pub async fn start(config: Config) -> io::Result<Running> {
         },
         db_tx,
     );
-    // Seed registered-channel ownership so a founder is re-opped on join
-    // after a restart, not only within the run that registered it.
+    // Seed registered-channel ownership and retained topics so a founder
+    // is re-opped and the topic restored on join after a restart, not only
+    // within the run that registered them.
     if let Some(pool) = &pool {
         core.preload_founders(
             crate::db::list_registered_channels(pool)
+                .await
+                .map_err(io::Error::other)?,
+        );
+        core.preload_topics(
+            crate::db::list_channel_topics(pool)
                 .await
                 .map_err(io::Error::other)?,
         );
