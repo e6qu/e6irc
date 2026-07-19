@@ -4,7 +4,9 @@ use e6irc_proto::message::Message;
 use e6irc_proto::numerics::*;
 
 use super::ConnId;
-use super::state::{CAP_NAMES, ChanKey, Channel, MemberModes, ServerState, Topic};
+use super::state::{
+    BanKind, CAP_NAMES, ChanKey, Channel, MemberModes, ServerBan, ServerState, Topic,
+};
 
 pub(crate) fn overlong(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
@@ -200,8 +202,12 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "INFO" => cmd_info(state, conn),
         "OPER" => cmd_oper(state, conn, p),
         "KILL" => cmd_kill(state, conn, p),
-        "KLINE" => cmd_kline(state, conn, p),
-        "UNKLINE" => cmd_unkline(state, conn, p),
+        "KLINE" => cmd_add_ban(state, conn, BanKind::Kline, p),
+        "UNKLINE" => cmd_remove_ban(state, conn, BanKind::Kline, p),
+        "DLINE" => cmd_add_ban(state, conn, BanKind::Dline, p),
+        "UNDLINE" => cmd_remove_ban(state, conn, BanKind::Dline, p),
+        "XLINE" => cmd_add_ban(state, conn, BanKind::Xline, p),
+        "UNXLINE" => cmd_remove_ban(state, conn, BanKind::Xline, p),
         "SETHOST" => cmd_sethost(state, conn, p),
         "WALLOPS" => cmd_wallops(state, conn, p),
         _ => state.numeric(
@@ -1242,16 +1248,15 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
             return;
         }
     }
-    // K-line enforcement: refuse a banned user@host before completing.
+    // Server-ban enforcement: refuse a banned session (K/D/X-line) before
+    // completing registration.
     {
         let session = &state.sessions[&conn];
-        let subject = format!(
-            "{}@{}",
-            session.user.as_deref().unwrap_or("*"),
-            session.host
-        );
-        if let Some(reason) = state.kline_match(&subject) {
-            let host = state.sessions[&conn].host.clone();
+        let user = session.user.as_deref().unwrap_or("*");
+        let host = session.host.clone();
+        let realname = session.realname.as_deref().unwrap_or("");
+        if let Some((kind, reason)) = state.ban_match(user, &host, realname) {
+            let label = kind.label();
             state.numeric(
                 conn,
                 ERR_YOUREBANNEDCREEP,
@@ -1260,9 +1265,9 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
             );
             state.send(
                 conn,
-                &format!("ERROR :Closing Link: {host} (K-Lined: {reason})"),
+                &format!("ERROR :Closing Link: {host} ({label}d: {reason})"),
             );
-            state.close(conn, &format!("K-Lined: {reason}"));
+            state.close(conn, &format!("{label}d: {reason}"));
             return;
         }
     }
@@ -3881,18 +3886,20 @@ fn record_audit(state: &mut ServerState, conn: ConnId, action: &str, target: &st
 }
 
 /// Normalise a K-line target: a bare host/nick becomes `*@target`.
-fn kline_mask(arg: &str) -> String {
-    if arg.contains('@') {
-        arg.to_string()
-    } else {
-        format!("*@{arg}")
+/// Normalize a ban `arg` into a mask for `kind`. A KLINE `user@host` with a
+/// bare token becomes `*@host`; DLINE (host/IP) and XLINE (realname) masks
+/// are used verbatim.
+fn ban_mask(kind: BanKind, arg: &str) -> String {
+    match kind {
+        BanKind::Kline if !arg.contains('@') => format!("*@{arg}"),
+        _ => arg.to_string(),
     }
 }
 
-/// KLINE [<user@host> [reason]] — oper-only. With no argument, list the
-/// current server bans; otherwise add one (persisted, matching users
-/// disconnected).
-fn cmd_kline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+/// KLINE/DLINE/XLINE [<mask> [reason]] — oper-only. With no argument, list
+/// the current bans of this kind; otherwise add one (persisted; matching
+/// registered sessions are disconnected).
+fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, p: &[&str]) {
     if !state.sessions[&conn].oper {
         state.numeric(
             conn,
@@ -3902,17 +3909,20 @@ fn cmd_kline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    let label = kind.label();
+    let command = kind.as_str().to_uppercase();
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn].nick.clone().expect("registered");
     let Some(&mask_arg) = p.first() else {
-        // List current K-lines.
+        // List current bans of this kind.
         let lines: Vec<String> = state
-            .klines
+            .server_bans
             .iter()
-            .map(|k| {
+            .filter(|b| b.kind == kind)
+            .map(|b| {
                 format!(
-                    ":{server} NOTICE {nick} :K-Line {} (by {}) :{}",
-                    k.mask, k.set_by, k.reason
+                    ":{server} NOTICE {nick} :{label} {} (by {}) :{}",
+                    b.mask, b.set_by, b.reason
                 )
             })
             .collect();
@@ -3921,27 +3931,31 @@ fn cmd_kline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         state.send(
             conn,
-            &format!(":{server} NOTICE {nick} :End of K-Line list."),
+            &format!(":{server} NOTICE {nick} :End of {label} list."),
         );
         return;
     };
-    let mask = kline_mask(mask_arg);
+    let mask = ban_mask(kind, mask_arg);
     let reason = p.get(1).copied().unwrap_or("No reason").to_string();
-    // Replace any existing ban on the same mask.
-    state.klines.retain(|k| k.mask != mask);
-    state.klines.push(super::state::Kline {
+    // Replace any existing ban of this kind on the same mask.
+    state
+        .server_bans
+        .retain(|b| !(b.kind == kind && b.mask == mask));
+    state.server_bans.push(ServerBan {
         mask: mask.clone(),
         reason: reason.clone(),
         set_by: nick.clone(),
+        kind,
     });
     if state.config.sasl_enabled {
-        let request = super::DbRequest::AddKline {
+        let request = super::DbRequest::AddServerBan {
             mask: mask.clone(),
             reason: reason.clone(),
             set_by: nick.clone(),
+            kind: kind.as_str().to_string(),
         };
         if state.db_tx.try_push(request).is_err() {
-            eprintln!("kline: db queue full or closed; K-Line for {mask} not persisted");
+            eprintln!("{command}: db queue full or closed; {label} for {mask} not persisted");
         }
     }
     // Disconnect any matching registered sessions.
@@ -3951,23 +3965,32 @@ fn cmd_kline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .iter()
         .filter(|(_, s)| s.registered)
         .filter_map(|(&c, s)| {
-            let subject = format!("{}@{}", s.user.as_deref().unwrap_or("*"), s.host);
+            let subject = ServerState::ban_subject(
+                kind,
+                s.user.as_deref().unwrap_or("*"),
+                &s.host,
+                s.realname.as_deref().unwrap_or(""),
+            );
             e6irc_proto::mask::matches(casemap, &mask, &subject).then_some(c)
         })
         .collect();
     for victim in victims {
-        state.send(victim, &format!("ERROR :Closing Link: (K-Lined: {reason})"));
-        state.close(victim, &format!("K-Lined: {reason}"));
+        state.send(
+            victim,
+            &format!("ERROR :Closing Link: ({label}d: {reason})"),
+        );
+        state.close(victim, &format!("{label}d: {reason}"));
     }
-    record_audit(state, conn, "KLINE", &mask, &reason);
+    record_audit(state, conn, &command, &mask, &reason);
     state.send(
         conn,
-        &format!(":{server} NOTICE {nick} :Added K-Line for {mask}"),
+        &format!(":{server} NOTICE {nick} :Added {label} for {mask}"),
     );
 }
 
-/// UNKLINE <user@host> — oper-only. Remove a server ban.
-fn cmd_unkline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+/// UNKLINE/UNDLINE/UNXLINE <mask> — oper-only. Remove a server ban of the
+/// given kind.
+fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, p: &[&str]) {
     if !state.sessions[&conn].oper {
         state.numeric(
             conn,
@@ -3977,34 +4000,41 @@ fn cmd_unkline(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    let label = kind.label();
+    let un = format!("UN{}", kind.as_str().to_uppercase());
     let Some(&mask_arg) = p.first() else {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
-            &["UNKLINE"],
+            &[&un],
             Some("Not enough parameters"),
         );
         return;
     };
-    let mask = kline_mask(mask_arg);
-    let before = state.klines.len();
-    state.klines.retain(|k| k.mask != mask);
-    let removed = state.klines.len() < before;
+    let mask = ban_mask(kind, mask_arg);
+    let before = state.server_bans.len();
+    state
+        .server_bans
+        .retain(|b| !(b.kind == kind && b.mask == mask));
+    let removed = state.server_bans.len() < before;
     if removed && state.config.sasl_enabled {
-        let request = super::DbRequest::RemoveKline { mask: mask.clone() };
+        let request = super::DbRequest::RemoveServerBan {
+            mask: mask.clone(),
+            kind: kind.as_str().to_string(),
+        };
         if state.db_tx.try_push(request).is_err() {
-            eprintln!("unkline: db queue full or closed; removal of {mask} not persisted");
+            eprintln!("{un}: db queue full or closed; removal of {mask} not persisted");
         }
     }
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn].nick.clone().expect("registered");
     let msg = if removed {
-        format!("Removed K-Line for {mask}")
+        format!("Removed {label} for {mask}")
     } else {
-        format!("No K-Line found for {mask}")
+        format!("No {label} found for {mask}")
     };
     if removed {
-        record_audit(state, conn, "UNKLINE", &mask, "");
+        record_audit(state, conn, &un, &mask, "");
     }
     state.send(conn, &format!(":{server} NOTICE {nick} :{msg}"));
 }

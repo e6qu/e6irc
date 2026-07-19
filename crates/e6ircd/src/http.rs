@@ -140,7 +140,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/history", get(history))
         .route("/api/v1/admin/accounts", get(admin_accounts))
         .route("/api/v1/admin/channels", get(admin_channels))
-        .route("/api/v1/admin/klines", get(admin_klines))
+        .route("/api/v1/admin/bans", get(admin_server_bans))
         .route("/api/v1/admin/audit", get(admin_audit))
         .route("/api/v1/admin/stats", get(admin_stats))
         .route("/ws/irc", get(ws_irc))
@@ -978,12 +978,12 @@ async fn admin_stats(
     }
     let pool = state.pool.as_ref().expect("authenticate checked the pool");
     match crate::db::server_stats(pool).await {
-        Ok((accounts, channels, klines)) => admin_json(serde_json::json!({
+        Ok((accounts, channels, server_bans)) => admin_json(serde_json::json!({
             "server": state.server_name,
             "network": state.network_name,
             "accounts": accounts,
             "registered_channels": channels,
-            "klines": klines,
+            "server_bans": server_bans,
         })),
         Err(e) => admin_db_error("server stats", e),
     }
@@ -1010,7 +1010,7 @@ async fn admin_channels(
 }
 
 /// List every server ban / K-line (admin only).
-async fn admin_klines(
+async fn admin_server_bans(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
@@ -1018,16 +1018,18 @@ async fn admin_klines(
         return response;
     }
     let pool = state.pool.as_ref().expect("authenticate checked the pool");
-    match crate::db::list_klines(pool).await {
+    match crate::db::list_server_bans(pool).await {
         Ok(rows) => admin_json(serde_json::json!({
-            "klines": rows
+            "bans": rows
                 .into_iter()
-                .map(|(mask, reason, set_by)| {
-                    serde_json::json!({ "mask": mask, "reason": reason, "set_by": set_by })
+                .map(|(mask, reason, set_by, kind)| {
+                    serde_json::json!({
+                        "mask": mask, "reason": reason, "set_by": set_by, "kind": kind,
+                    })
                 })
                 .collect::<Vec<_>>(),
         })),
-        Err(e) => admin_db_error("kline list", e),
+        Err(e) => admin_db_error("server-ban list", e),
     }
 }
 
@@ -1295,10 +1297,10 @@ async fn openapi() -> Response {
                     "responses": { "200": { "description": "channels" },
                         "403": { "description": "not an admin account" } } }
             },
-            "/api/v1/admin/klines": {
-                "get": { "summary": "List server bans / K-lines (admin only)",
+            "/api/v1/admin/bans": {
+                "get": { "summary": "List server bans — K/D/X-lines with kind (admin only)",
                     "security": bearer,
-                    "responses": { "200": { "description": "klines" },
+                    "responses": { "200": { "description": "server bans" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/audit": {

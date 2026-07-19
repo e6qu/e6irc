@@ -238,12 +238,58 @@ pub(crate) struct Topic {
     pub set_at: u64,
 }
 
-/// A server ban (oper K-line): a `user@host` glob mask with its reason.
+/// Which part of a connecting session a [`ServerBan`] mask is tested
+/// against. The kind is the only thing that differs between a K/D/X-line —
+/// the storage, matching, and enforcement are otherwise identical.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BanKind {
+    /// `user@host` glob (KLINE).
+    Kline,
+    /// bare host / IP glob (DLINE).
+    Dline,
+    /// realname (gecos) glob (XLINE).
+    Xline,
+}
+
+impl BanKind {
+    /// The wire/DB token for this kind.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BanKind::Kline => "kline",
+            BanKind::Dline => "dline",
+            BanKind::Xline => "xline",
+        }
+    }
+
+    /// Parse a DB/wire token. `None` for anything unrecognized — callers
+    /// surface the bad value rather than silently defaulting.
+    pub fn from_token(s: &str) -> Option<Self> {
+        match s {
+            "kline" => Some(BanKind::Kline),
+            "dline" => Some(BanKind::Dline),
+            "xline" => Some(BanKind::Xline),
+            _ => None,
+        }
+    }
+
+    /// Human label used in NOTICE/ERROR lines ("K-Line", "D-Line", …).
+    pub fn label(self) -> &'static str {
+        match self {
+            BanKind::Kline => "K-Line",
+            BanKind::Dline => "D-Line",
+            BanKind::Xline => "X-Line",
+        }
+    }
+}
+
+/// A server ban: a glob `mask` and its `reason`, tested against the
+/// session field named by `kind`.
 #[derive(Clone)]
-pub struct Kline {
+pub struct ServerBan {
     pub mask: String,
     pub reason: String,
     pub set_by: String,
+    pub kind: BanKind,
 }
 
 pub(crate) struct Channel {
@@ -320,9 +366,9 @@ pub(crate) struct ServerState {
     /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
     /// auto-op / auto-voice on join.
     pub channel_access: HashMap<ChanKey, HashMap<String, String>>,
-    /// Server bans (oper K-lines): a `user@host` glob refused at
-    /// registration. Boot-loaded and kept in sync on KLINE/UNKLINE.
-    pub klines: Vec<Kline>,
+    /// Server bans (oper K/D/X-lines) refused at registration. Boot-loaded
+    /// and kept in sync on KLINE/DLINE/XLINE and their removals.
+    pub server_bans: Vec<ServerBan>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
     /// Channels holding a hot history ring, most-recently-active first.
@@ -366,7 +412,7 @@ impl ServerState {
             registered_founders: HashMap::new(),
             registered_topics: HashMap::new(),
             channel_access: HashMap::new(),
-            klines: Vec::new(),
+            server_bans: Vec::new(),
             whowas: std::collections::VecDeque::new(),
             hot_channels: std::collections::VecDeque::new(),
             capture: None,
@@ -515,24 +561,50 @@ impl ServerState {
         }
     }
 
-    /// Load persisted server bans as `(mask, reason, set_by)` rows.
-    pub fn preload_klines(&mut self, rows: Vec<(String, String, String)>) {
-        self.klines = rows
+    /// Load persisted server bans as `(mask, reason, set_by, kind)` rows.
+    /// A row whose kind token is unrecognized is skipped loudly — bans are
+    /// security-critical, so a corrupt kind must not silently become a
+    /// default that bans (or fails to ban) the wrong sessions.
+    pub fn preload_server_bans(&mut self, rows: Vec<(String, String, String, String)>) {
+        self.server_bans = rows
             .into_iter()
-            .map(|(mask, reason, set_by)| Kline {
-                mask,
-                reason,
-                set_by,
-            })
+            .filter_map(
+                |(mask, reason, set_by, kind)| match BanKind::from_token(&kind) {
+                    Some(kind) => Some(ServerBan {
+                        mask,
+                        reason,
+                        set_by,
+                        kind,
+                    }),
+                    None => {
+                        eprintln!(
+                            "server ban: dropping row with unknown kind {kind:?} (mask {mask:?})"
+                        );
+                        None
+                    }
+                },
+            )
             .collect();
     }
 
-    /// The reason of the first K-line whose mask matches `user@host`, if any.
-    pub fn kline_match(&self, subject: &str) -> Option<String> {
-        self.klines
-            .iter()
-            .find(|k| e6irc_proto::mask::matches(self.casemap, &k.mask, subject))
-            .map(|k| k.reason.clone())
+    /// The subject a ban of `kind` is tested against, from a session's
+    /// `user` / `host` / `realname`.
+    pub fn ban_subject(kind: BanKind, user: &str, host: &str, realname: &str) -> String {
+        match kind {
+            BanKind::Kline => format!("{user}@{host}"),
+            BanKind::Dline => host.to_string(),
+            BanKind::Xline => realname.to_string(),
+        }
+    }
+
+    /// The `(kind, reason)` of the first server ban matching a session's
+    /// `user` / `host` / `realname`, if any.
+    pub fn ban_match(&self, user: &str, host: &str, realname: &str) -> Option<(BanKind, String)> {
+        self.server_bans.iter().find_map(|b| {
+            let subject = Self::ban_subject(b.kind, user, host, realname);
+            e6irc_proto::mask::matches(self.casemap, &b.mask, &subject)
+                .then(|| (b.kind, b.reason.clone()))
+        })
     }
 
     /// Key a nick for lookup/storage.

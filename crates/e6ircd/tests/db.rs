@@ -1131,7 +1131,7 @@ async fn channel_founder_transfer() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn klines_persist_and_load() {
+async fn server_bans_persist_and_load() {
     let pool = db::connect_and_migrate(&test_db_url())
         .await
         .expect("connect");
@@ -1140,45 +1140,76 @@ async fn klines_persist_and_load() {
         .await
         .expect("clean");
 
-    db::add_kline(&pool, "baddie@*", "spam", "god")
+    db::add_server_ban(&pool, "baddie@*", "spam", "god", "kline")
         .await
         .expect("add1");
-    db::add_kline(&pool, "*@evil.host", "bad", "god")
+    db::add_server_ban(&pool, "203.0.113.0", "netblock", "god", "dline")
         .await
         .expect("add2");
-    let mut list = db::list_klines(&pool).await.expect("list");
+    // Same textual mask as the K-line but a different kind coexists.
+    db::add_server_ban(&pool, "baddie@*", "gecos", "god", "xline")
+        .await
+        .expect("add3");
+    let mut list = db::list_server_bans(&pool).await.expect("list");
     list.sort();
     assert_eq!(
         list,
         vec![
             (
-                "*@evil.host".to_string(),
-                "bad".to_string(),
-                "god".to_string()
+                "203.0.113.0".to_string(),
+                "netblock".to_string(),
+                "god".to_string(),
+                "dline".to_string(),
+            ),
+            (
+                "baddie@*".to_string(),
+                "gecos".to_string(),
+                "god".to_string(),
+                "xline".to_string(),
             ),
             (
                 "baddie@*".to_string(),
                 "spam".to_string(),
-                "god".to_string()
+                "god".to_string(),
+                "kline".to_string(),
             ),
         ]
     );
 
-    // Re-K-lining the same mask upserts (new reason/setter, no duplicate).
-    db::add_kline(&pool, "baddie@*", "spam again", "root")
+    // Re-banning the same (mask, kind) upserts (new reason/setter, no dup).
+    db::add_server_ban(&pool, "baddie@*", "spam again", "root", "kline")
         .await
         .expect("upsert");
-    let list = db::list_klines(&pool).await.expect("list");
-    assert_eq!(list.iter().filter(|(m, ..)| m == "baddie@*").count(), 1);
-
-    db::remove_kline(&pool, "baddie@*").await.expect("remove");
+    let list = db::list_server_bans(&pool).await.expect("list");
     assert_eq!(
-        db::list_klines(&pool).await.expect("list"),
-        vec![(
-            "*@evil.host".to_string(),
-            "bad".to_string(),
-            "god".to_string()
-        )]
+        list.iter()
+            .filter(|(m, _, _, k)| m == "baddie@*" && k == "kline")
+            .count(),
+        1
+    );
+
+    // Removal is scoped to the kind — the X-line on the same mask survives.
+    db::remove_server_ban(&pool, "baddie@*", "kline")
+        .await
+        .expect("remove");
+    let mut list = db::list_server_bans(&pool).await.expect("list");
+    list.sort();
+    assert_eq!(
+        list,
+        vec![
+            (
+                "203.0.113.0".to_string(),
+                "netblock".to_string(),
+                "god".to_string(),
+                "dline".to_string(),
+            ),
+            (
+                "baddie@*".to_string(),
+                "gecos".to_string(),
+                "god".to_string(),
+                "xline".to_string(),
+            ),
+        ]
     );
 }
 

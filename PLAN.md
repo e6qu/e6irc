@@ -412,21 +412,26 @@ not built yet. Ranked by value:
    `networks` enable/disable/buffers/read-marker; OIDC identity linking.
    Remaining endpoints 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
-   §8) — partial. Oper commands are now OPER/KILL/WALLOPS plus **KLINE /
-   UNKLINE**: a `server_bans` table (migration 0012, boot-loaded into a hot
-   list) whose `user@host` glob is refused at registration (465 + closing
-   ERROR) and disconnects matching sessions; KLINE lists/adds, UNKLINE
-   removes. The **audit_log** table (migration 0013) now records every OPER/KILL/
-   KLINE/UNKLINE action (actor, action, target, detail, time);
-   db::list_audit_log exposes it for the admin API. **Still absent:**
-   dline/xline. **SETHOST** is now implemented (oper host-cloak that
-   also drives the chghost cap), and every oper action (incl. SETHOST) is
-   audit-logged.
+   §8) — done. Oper commands are OPER/KILL/WALLOPS plus the full server-ban
+   surface **KLINE/DLINE/XLINE** and their removals. One `server_bans` table
+   (migrations 0012+0015, boot-loaded into a hot list) carries a `kind`
+   discriminant; the kind selects which session field the glob is tested
+   against — kline=`user@host`, dline=host/IP, xline=realname (gecos) — so
+   the three bans are one code path differing only by data, not three
+   copies. A match is refused at registration (465 + closing ERROR) and
+   disconnects matching online sessions; each command lists/adds, each
+   UN* removes (scoped to its kind). The **audit_log** table (migration
+   0013) records every OPER/KILL/K·D·X-LINE/UN* action (actor, action,
+   target, detail, time); db::list_audit_log exposes it and the admin API
+   serves it. **SETHOST** (oper host-cloak driving the chghost cap) is
+   implemented and, like every oper action, audit-logged. The admin API's
+   `GET /api/v1/admin/bans` lists all kinds with their `kind` field.
 
-Items 1 and 3 are fully done; item 2 is nearly done (only SET's
-lower-value channel-option flags remain); item 5 has its core (KLINE) with
-the fuller ban surface + audit log remaining. **Item 4 (the REST admin
-surface) is the last large code subsystem not yet started.** Beyond these,
-the two external blockers remain: the bridges' live verification (real
-Discord/Slack credentials — no self-hostable oracle) and the 100k load run
-(a tuned Linux host).
+Items 1, 3, and 5 are fully done; item 2 is nearly done (only SET's
+lower-value channel-option flags remain); item 4 (the REST admin/self
+surface) is largely built — admin reads (accounts/channels/bans/audit/
+stats), self-service PAT list/revoke, and live network status all land —
+with only OIDC identity linking and the networks enable/disable/buffers
+endpoints outstanding. Beyond these, the two external blockers remain: the
+bridges' live verification (real Discord/Slack credentials — no
+self-hostable oracle) and the 100k load run (a tuned Linux host).

@@ -204,8 +204,8 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?,
         );
-        core.preload_klines(
-            crate::db::list_klines(pool)
+        core.preload_server_bans(
+            crate::db::list_server_bans(pool)
                 .await
                 .map_err(io::Error::other)?,
         );

@@ -459,7 +459,7 @@ async fn admin_accounts_endpoint_is_gated() {
         .await
         .expect("tok");
     // Seed data for the other admin read endpoints.
-    e6ircd::db::add_kline(&pool, "spammer@*", "spam", "alice")
+    e6ircd::db::add_server_ban(&pool, "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
     e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
@@ -526,7 +526,7 @@ async fn admin_accounts_endpoint_is_gated() {
     // their seeded data.
     for (path, key) in [
         ("/api/v1/admin/channels", "channels"),
-        ("/api/v1/admin/klines", "klines"),
+        ("/api/v1/admin/bans", "bans"),
         ("/api/v1/admin/audit", "audit"),
     ] {
         let auth = |token: &str| {
@@ -547,7 +547,7 @@ async fn admin_accounts_endpoint_is_gated() {
         );
     }
 
-    // Stats reflects the seeded data (2 accounts, 1 channel, 1 kline).
+    // Stats reflects the seeded data (2 accounts, 1 channel, 1 server ban).
     let stats_auth = format!(
         "GET /api/v1/admin/stats HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
     );
@@ -558,7 +558,7 @@ async fn admin_accounts_endpoint_is_gated() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["accounts"], 2, "{body}");
     assert_eq!(v["registered_channels"], 1, "{body}");
-    assert_eq!(v["klines"], 1, "{body}");
+    assert_eq!(v["server_bans"], 1, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
