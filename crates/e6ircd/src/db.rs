@@ -324,6 +324,12 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::SetChannelMlock { channel, mlock } => {
+            if let Err(e) = set_channel_mlock(pool, &channel, mlock).await {
+                eprintln!("db: channel mlock persistence failed: {e}");
+            }
+            true
+        }
         DbRequest::SetChannelAccess {
             channel,
             account,
@@ -1236,6 +1242,31 @@ pub async fn set_channel_keeptopic(
 /// exceptions boot-loaded into the hot set (default is on).
 pub async fn list_keeptopic_off(pool: &PgPool) -> Result<Vec<String>, DbError> {
     sqlx::query_scalar("SELECT name_folded FROM channels WHERE NOT keeptopic")
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)
+}
+
+/// Persist a registered channel's mode lock on its `channels` row (`None`
+/// clears it).
+pub async fn set_channel_mlock(
+    pool: &PgPool,
+    channel_folded: &str,
+    mlock: Option<String>,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE channels SET mlock = $2 WHERE name_folded = $1")
+        .bind(channel_folded)
+        .bind(mlock)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// Registered channels with a mode lock, as `(name_folded, spec)` —
+/// boot-loaded into the hot lock map.
+pub async fn list_channel_mlock(pool: &PgPool) -> Result<Vec<(String, String)>, DbError> {
+    sqlx::query_as("SELECT name_folded, mlock FROM channels WHERE mlock IS NOT NULL")
         .fetch_all(pool)
         .await
         .map_err(DbError::Query)

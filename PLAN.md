@@ -9,9 +9,10 @@ mapping logic; live verification is gated on real credentials (neither
 platform is self-hostable, so the gateway path can only be checked against
 the live API). Phase 13 (scale) — the load harness is complete with real
 multi-channel baselines; the 100k run is environment-blocked (needs a tuned
-Linux host). See **Known remaining scope** below for documented-but-unbuilt
-surface (fuller services, admin API, CHATHISTORY subcommands) that the
-completed-phase markers do not cover. Legend: ✅ done · 🔶 partial ·
+Linux host). The **Known remaining scope** audit below (fuller services,
+admin/self REST API, CHATHISTORY subcommands, oper server-bans, ChanServ
+SET options) is now fully built and tested — the only open work is the two
+environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
 ⛔ blocked (reason).
 
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
@@ -387,13 +388,18 @@ not built yet. Ranked by value:
    per-account access flags in the `channel_access` table (migration 0011),
    boot-loaded into a hot map, driving **auto-op/auto-voice on join**.
    ChanServ **OP** (op yourself or a
-   member you have op access over) is also implemented. ChanServ **SET FOUNDER**
-   (ownership transfer, verified against the DB) and **SET KEEPTOPIC**
-   (on/off toggle of topic retention, migration 0017; off drops the
-   retained topic so it is no longer persisted or restored) are implemented.
-   **Still absent:** SET's remaining channel-option flags (mlock, guard) —
-   the last lower-value Atheme-equivalent surface. Unknown SET options are
-   rejected loudly, never accepted-and-ignored.
+   member you have op access over) is also implemented. ChanServ **SET** now
+   covers **FOUNDER** (ownership transfer, verified against the DB),
+   **KEEPTOPIC** (on/off toggle of topic retention, migration 0017; off drops
+   the retained topic so it is no longer persisted or restored), and
+   **MLOCK** (boolean mode lock `+nt-i`, migration 0018; boot-loaded into a
+   hot map, applied when a registered channel is (re)created, and enforced
+   on MODE so a locked mode can't be changed the wrong way). **GUARD** is
+   answered explicitly as unnecessary — a registered channel already retains
+   its founder, access, topic, and mode lock across empty periods in
+   persistent state, so ChanServ need not hold it open; it is declined with
+   that reason, never silently accepted. This completes the ChanServ SET
+   surface; unknown options are still rejected loudly.
 3. **CHATHISTORY subcommands** — ✅ DONE (2026-07-19). The full draft
    surface is now implemented (DESIGN §11.2): `LATEST`/`BEFORE`/`AFTER`,
    plus `TARGETS` (buffer enumeration, `draft/chathistory-targets` batch),
@@ -445,9 +451,13 @@ not built yet. Ranked by value:
    implemented and, like every oper action, audit-logged. The admin API's
    `GET /api/v1/admin/bans` lists all kinds with their `kind` field.
 
-Items 1, 3, 4, and 5 are fully done; item 2 is all but complete — only
-SET's two remaining lower-value channel-option flags (mlock, guard) are
-left, the last outstanding code surface in the audit. Beyond that, the
-two external blockers remain: the bridges' live verification (real
-Discord/Slack credentials — no self-hostable oracle) and the 100k load
-run (a tuned Linux host).
+All five audit items (1–5) are now fully addressed in code: fuller
+services, the CHATHISTORY subcommands, the REST admin/self surface, the
+oper server-ban + audit surface, and the ChanServ SET options (FOUNDER,
+KEEPTOPIC, MLOCK, with GUARD declined for a documented reason). What
+remains is not code but two **environment-blocked** verifications: the
+Discord/Slack bridges' live check (needs real credentials — neither
+platform is self-hostable, so the gateway path can only be exercised
+against the live API) and the 100k-connection load run (needs a tuned
+Linux host). Both are outside what can be closed from this repository
+alone.

@@ -217,6 +217,64 @@ impl ChanModes {
     }
 }
 
+/// A ChanServ mode lock: boolean channel modes forced on (`on`) or off
+/// (`off`). Attempts to change a locked mode the wrong way are refused, and
+/// the lock is (re)applied when the channel is created.
+#[derive(Clone, Default)]
+pub(crate) struct MlockModes {
+    pub on: String,
+    pub off: String,
+}
+
+impl MlockModes {
+    /// Boolean channel modes that MLOCK can lock (args-carrying modes like
+    /// `k`/`l` and list modes are deliberately out of scope).
+    pub const LOCKABLE: &'static [char] = &['i', 'm', 'n', 's', 't', 'C'];
+
+    /// Parse a spec like `+nt-i`. `Err(bad_char)` for any character that is
+    /// neither a sign nor a lockable boolean mode. A mode named twice keeps
+    /// its last sign.
+    pub fn parse(spec: &str) -> Result<MlockModes, char> {
+        let mut m = MlockModes::default();
+        let mut adding = true;
+        for c in spec.chars() {
+            match c {
+                '+' => adding = true,
+                '-' => adding = false,
+                c if Self::LOCKABLE.contains(&c) => {
+                    m.on.retain(|x| x != c);
+                    m.off.retain(|x| x != c);
+                    if adding {
+                        m.on.push(c);
+                    } else {
+                        m.off.push(c);
+                    }
+                }
+                other => return Err(other),
+            }
+        }
+        Ok(m)
+    }
+
+    /// Canonical `+on-off` rendering (empty when nothing is locked).
+    pub fn render(&self) -> String {
+        let mut s = String::new();
+        if !self.on.is_empty() {
+            s.push('+');
+            s.push_str(&self.on);
+        }
+        if !self.off.is_empty() {
+            s.push('-');
+            s.push_str(&self.off);
+        }
+        s
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.on.is_empty() && self.off.is_empty()
+    }
+}
+
 /// One line of channel history in the hot ring.
 #[derive(Clone)]
 pub(crate) struct HistoryEntry {
@@ -366,6 +424,9 @@ pub(crate) struct ServerState {
     /// retention is on by default (absence ⇒ on), so only the exceptions
     /// live here; boot-loaded and updated on `SET KEEPTOPIC`.
     pub keeptopic_off: HashSet<ChanKey>,
+    /// Registered channels with a ChanServ mode lock. Boot-loaded and
+    /// updated on `SET MLOCK`; enforced on MODE and on channel creation.
+    pub channel_mlock: HashMap<ChanKey, MlockModes>,
     /// Per-channel access: channel → (folded account → flag chars, e.g.
     /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
     /// auto-op / auto-voice on join.
@@ -416,6 +477,7 @@ impl ServerState {
             registered_founders: HashMap::new(),
             registered_topics: HashMap::new(),
             keeptopic_off: HashSet::new(),
+            channel_mlock: HashMap::new(),
             channel_access: HashMap::new(),
             server_bans: Vec::new(),
             whowas: std::collections::VecDeque::new(),
@@ -553,6 +615,32 @@ impl ServerState {
     /// Whether `key` retains its topic across empty→recreate (default on).
     pub fn keeptopic(&self, key: &ChanKey) -> bool {
         !self.keeptopic_off.contains(key)
+    }
+
+    /// Load persisted mode locks as `(name_folded, spec)`. A row whose spec
+    /// won't parse (unlockable char) is dropped loudly rather than silently
+    /// enforcing a partial lock.
+    pub fn preload_mlock(&mut self, rows: Vec<(String, String)>) {
+        self.channel_mlock = rows
+            .into_iter()
+            .filter_map(|(name, spec)| match MlockModes::parse(&spec) {
+                Ok(m) if !m.is_empty() => Some((ChanKey(name), m)),
+                Ok(_) => None,
+                Err(bad) => {
+                    eprintln!("mlock: dropping {name:?} with unlockable char {bad:?}");
+                    None
+                }
+            })
+            .collect();
+    }
+
+    /// Whether setting boolean mode `c` to `adding` would violate `key`'s
+    /// mode lock (locked-off mode set on, or locked-on mode set off).
+    pub fn mlock_conflict(&self, key: &ChanKey, c: char, adding: bool) -> bool {
+        match self.channel_mlock.get(key) {
+            Some(m) => (adding && m.off.contains(c)) || (!adding && m.on.contains(c)),
+            None => false,
+        }
     }
 
     /// Load persisted channel access as `(name_folded, account_folded,

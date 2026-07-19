@@ -131,6 +131,13 @@ pub enum DbRequest {
         channel: String,
         keeptopic: bool,
     },
+    /// Persist a registered channel's mode lock (fire-and-forget). `mlock`
+    /// is the canonical spec string; `None` clears the lock.
+    SetChannelMlock {
+        /// Casefolded channel name.
+        channel: String,
+        mlock: Option<String>,
+    },
     /// Persist one channel access entry (fire-and-forget). `flags: None`
     /// removes the entry.
     SetChannelAccess {
@@ -271,6 +278,11 @@ impl Core {
     /// Seed the KEEPTOPIC-off set from persisted folded channel names.
     pub fn preload_keeptopic_off(&mut self, names: Vec<String>) {
         self.state.preload_keeptopic_off(names);
+    }
+
+    /// Seed the mode-lock map from persisted `(name_folded, spec)` rows.
+    pub fn preload_mlock(&mut self, rows: Vec<(String, String)>) {
+        self.state.preload_mlock(rows);
     }
 
     /// Seed the channel-access map from persisted rows before the worker
