@@ -896,3 +896,45 @@ async fn bnc_networks_crud() {
     // bob's copy survives alice's delete
     assert_eq!(db::list_bnc_networks(&pool, "bob").await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn query_targets_enumerates_active_buffers() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+
+    for (target, ts) in [("#a", 1000_i64), ("#a", 2000), ("#b", 1500), ("#c", 3000)] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, $2, 'x!x@h', NULL, 'privmsg', 'hi',
+                     to_timestamp($3::double precision))",
+        )
+        .bind(format!("m-{target}-{ts}"))
+        .bind(target)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+
+    // Visible targets #a and #b; window [1200,2500] excludes #a@1000 but
+    // keeps #a@2000 and #b@1500; #c is not a member so never appears.
+    // Result is newest-first by each target's latest in-window message.
+    let targets = db::query_targets(&pool, &["#a".into(), "#b".into()], 1200, 2500, 10).await;
+    assert_eq!(
+        targets,
+        vec![("#a".to_string(), 2000), ("#b".to_string(), 1500)]
+    );
+
+    // A window that excludes everything yields nothing.
+    assert!(
+        db::query_targets(&pool, &["#a".into()], 5000, 6000, 10)
+            .await
+            .is_empty()
+    );
+}

@@ -42,6 +42,13 @@ pub enum Input {
         batch_ref: String,
         rows: Vec<HistoryRow>,
     },
+    /// Resolved CHATHISTORY TARGETS from PostgreSQL: `(target, latest ts)`
+    /// pairs for the buffers with activity in the requested window.
+    TargetsPage {
+        conn: ConnId,
+        batch_ref: String,
+        targets: Vec<(String, u64)>,
+    },
 }
 
 /// Work the core asks the DB worker to do. The worker answers by
@@ -76,6 +83,18 @@ pub enum DbRequest {
         display: String,
         batch_ref: String,
         query: HistoryQuery,
+    },
+    /// Enumerate the buffers (among `channels`, the requester's memberships)
+    /// with messages in `[min_ts, max_ts]`. Answered with
+    /// [`Input::TargetsPage`].
+    QueryTargets {
+        conn: ConnId,
+        /// Casefolded channel targets the requester may see.
+        channels: Vec<String>,
+        min_ts: u64,
+        max_ts: u64,
+        limit: usize,
+        batch_ref: String,
     },
     /// Persist a read marker (fire-and-forget).
     SetReadMarker {
@@ -174,6 +193,11 @@ impl Core {
                 batch_ref,
                 rows,
             } => handler::history_page(&mut self.state, conn, &display, &batch_ref, rows),
+            Input::TargetsPage {
+                conn,
+                batch_ref,
+                targets,
+            } => handler::targets_page(&mut self.state, conn, &batch_ref, targets),
         }
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
