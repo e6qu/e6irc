@@ -2659,8 +2659,16 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         chathistory_fail(state, conn, "INVALID_TARGET", "You are not on that channel");
         return;
     }
-    let limit: usize = p.get(3).and_then(|l| l.parse().ok()).unwrap_or(50).min(500);
+    // BETWEEN takes two selectors then the limit; the others take one
+    // selector then the limit.
+    let is_between = sub.eq_ignore_ascii_case("BETWEEN");
+    let limit: usize = p
+        .get(if is_between { 4 } else { 3 })
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50)
+        .min(500);
     let selector = p.get(2).copied().unwrap_or("*");
+    let selector2 = p.get(3).copied().unwrap_or("*");
     let history: std::collections::VecDeque<super::state::HistoryEntry> =
         state.channels[&key].history.clone();
 
@@ -2709,6 +2717,39 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 ),
                 None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
             },
+            "AROUND" => match position(selector) {
+                Some(pos) => {
+                    let before = limit / 2;
+                    let start = pos.saturating_sub(before);
+                    let end = (pos + (limit - before)).min(history.len());
+                    // Only the older half can reach past the ring's start.
+                    let covered = complete || start > 0;
+                    (
+                        history.iter().take(end).skip(start).cloned().collect(),
+                        covered,
+                    )
+                }
+                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            },
+            "BETWEEN" => match (position(selector), position(selector2)) {
+                // Both endpoints in the ring: the span between them is
+                // contiguous and fully in memory.
+                (Some(a), Some(b)) => {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    (
+                        history
+                            .iter()
+                            .take(hi)
+                            .skip(lo + 1)
+                            .take(limit)
+                            .cloned()
+                            .collect(),
+                        true,
+                    )
+                }
+                // An endpoint missing from the ring: only PG can resolve it.
+                _ => (Vec::new(), complete),
+            },
             other => {
                 chathistory_fail(
                     state,
@@ -2732,6 +2773,20 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 before_ts: selector_ts(&history, selector).unwrap_or(u64::MAX),
                 limit,
             },
+            "AROUND" => super::HistoryQuery::Around {
+                around_ts: selector_ts(&history, selector).unwrap_or(0),
+                limit,
+            },
+            "BETWEEN" => {
+                let a = selector_ts(&history, selector).unwrap_or(0);
+                let b = selector_ts(&history, selector2).unwrap_or(u64::MAX);
+                let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
+                super::HistoryQuery::Between {
+                    after_ts,
+                    before_ts,
+                    limit,
+                }
+            }
             _ => super::HistoryQuery::After {
                 after_ts: selector_ts(&history, selector).unwrap_or(0),
                 limit,

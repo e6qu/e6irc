@@ -2335,3 +2335,89 @@ fn chathistory_targets_enumerates_buffers() {
         "no batch close: {out:#?}"
     );
 }
+
+#[test]
+fn chathistory_around_msgid() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #ha");
+        s.drain(c);
+    }
+    s.drain(alice);
+    for i in 1..=5 {
+        s.line(alice, &format!("PRIVMSG #ha :m{i}"));
+    }
+    let live = s.drain(bob);
+    let msgid = |body: &str| -> String {
+        live.iter()
+            .find(|l| l.ends_with(&format!(":{body}")))
+            .and_then(|l| {
+                l.trim_start_matches('@')
+                    .split([';', ' '])
+                    .find_map(|t| t.strip_prefix("msgid="))
+            })
+            .expect("msgid")
+            .to_string()
+    };
+
+    // AROUND m3, limit 4 → 2 older (m1,m2) + m3 + 1 newer (m4).
+    s.line(
+        bob,
+        &format!("CHATHISTORY AROUND #ha msgid={} 4", msgid("m3")),
+    );
+    let out = s.drain(bob);
+    let inner: Vec<_> = out[1..out.len() - 1].to_vec();
+    assert_eq!(inner.len(), 4, "{out:#?}");
+    for (i, body) in ["m1", "m2", "m3", "m4"].iter().enumerate() {
+        assert!(
+            inner[i].ends_with(&format!(":{body}")),
+            "{}: {}",
+            i,
+            inner[i]
+        );
+    }
+}
+
+#[test]
+fn chathistory_between_msgids() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #hb2");
+        s.drain(c);
+    }
+    s.drain(alice);
+    for i in 1..=5 {
+        s.line(alice, &format!("PRIVMSG #hb2 :m{i}"));
+    }
+    let live = s.drain(bob);
+    let msgid = |body: &str| -> String {
+        live.iter()
+            .find(|l| l.ends_with(&format!(":{body}")))
+            .and_then(|l| {
+                l.trim_start_matches('@')
+                    .split([';', ' '])
+                    .find_map(|t| t.strip_prefix("msgid="))
+            })
+            .expect("msgid")
+            .to_string()
+    };
+
+    // BETWEEN m2 and m5 (exclusive) → m3, m4.
+    s.line(
+        bob,
+        &format!(
+            "CHATHISTORY BETWEEN #hb2 msgid={} msgid={} 10",
+            msgid("m2"),
+            msgid("m5")
+        ),
+    );
+    let out = s.drain(bob);
+    let inner: Vec<_> = out[1..out.len() - 1].to_vec();
+    assert_eq!(inner.len(), 2, "{out:#?}");
+    assert!(inner[0].ends_with(":m3"), "{inner:#?}");
+    assert!(inner[1].ends_with(":m4"), "{inner:#?}");
+}

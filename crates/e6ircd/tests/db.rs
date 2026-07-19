@@ -938,3 +938,61 @@ async fn query_targets_enumerates_active_buffers() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn query_history_around_and_between() {
+    use e6ircd::core::HistoryQuery;
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    for ts in [1000_i64, 2000, 3000, 4000, 5000] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, '#h', 'x!x@h', NULL, 'privmsg', $2,
+                     to_timestamp($3::double precision))",
+        )
+        .bind(format!("m{ts}"))
+        .bind(format!("b{ts}"))
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+
+    // AROUND 3000, limit 4 → 2 older (1000,2000) + 3000 + 1 newer (4000),
+    // oldest-first.
+    let around = db::query_history(
+        &pool,
+        "#h",
+        HistoryQuery::Around {
+            around_ts: 3000,
+            limit: 4,
+        },
+    )
+    .await;
+    assert_eq!(
+        around.iter().map(|r| r.ts).collect::<Vec<_>>(),
+        vec![1000, 2000, 3000, 4000]
+    );
+
+    // BETWEEN (2000, 5000) exclusive → 3000, 4000.
+    let between = db::query_history(
+        &pool,
+        "#h",
+        HistoryQuery::Between {
+            after_ts: 2000,
+            before_ts: 5000,
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(
+        between.iter().map(|r| r.ts).collect::<Vec<_>>(),
+        vec![3000, 4000]
+    );
+}
