@@ -121,9 +121,30 @@ pub enum DbRequest {
 /// A resolved CHATHISTORY window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryQuery {
-    Latest { limit: usize },
-    Before { before_ts: u64, limit: usize },
-    After { after_ts: u64, limit: usize },
+    Latest {
+        limit: usize,
+    },
+    Before {
+        before_ts: u64,
+        limit: usize,
+    },
+    After {
+        after_ts: u64,
+        limit: usize,
+    },
+    /// Up to `limit` messages centred on `around_ts` (about half older,
+    /// half newer), oldest-first.
+    Around {
+        around_ts: u64,
+        limit: usize,
+    },
+    /// Up to `limit` messages strictly between the two timestamps,
+    /// oldest-first.
+    Between {
+        after_ts: u64,
+        before_ts: u64,
+        limit: usize,
+    },
 }
 
 /// One rendered history row, newest-last, as the DB returns it.

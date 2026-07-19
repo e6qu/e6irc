@@ -363,6 +363,48 @@ pub async fn query_history(
             .fetch_all(pool)
             .await
         }
+        HistoryQuery::Around { around_ts, limit } => {
+            // Half older than the point, half at/after it, then oldest-first.
+            let before = (limit / 2) as i64;
+            let after = (limit - limit / 2) as i64;
+            sqlx::query_as(
+                "SELECT msgid, e, sender_prefix, kind, body FROM (
+                     (SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint AS e, sender_prefix,
+                             kind, body, ts, id
+                      FROM messages WHERE target = $1 AND ts < to_timestamp($2)
+                      ORDER BY ts DESC, id DESC LIMIT $3)
+                     UNION ALL
+                     (SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint AS e, sender_prefix,
+                             kind, body, ts, id
+                      FROM messages WHERE target = $1 AND ts >= to_timestamp($2)
+                      ORDER BY ts ASC, id ASC LIMIT $4)
+                 ) w ORDER BY ts ASC, id ASC",
+            )
+            .bind(target)
+            .bind(around_ts as i64)
+            .bind(before)
+            .bind(after)
+            .fetch_all(pool)
+            .await
+        }
+        HistoryQuery::Between {
+            after_ts,
+            before_ts,
+            limit,
+        } => {
+            sqlx::query_as(
+                "SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint, sender_prefix, kind, body
+                 FROM messages
+                 WHERE target = $1 AND ts > to_timestamp($2) AND ts < to_timestamp($3)
+                 ORDER BY ts ASC, id ASC LIMIT $4",
+            )
+            .bind(target)
+            .bind(after_ts as i64)
+            .bind(before_ts as i64)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+        }
     };
     let mut rows = match rows {
         Ok(r) => r,
@@ -371,8 +413,11 @@ pub async fn query_history(
             return Vec::new();
         }
     };
-    // LATEST/BEFORE selected newest-first; present oldest-first.
-    if !matches!(query, HistoryQuery::After { .. }) {
+    // LATEST/BEFORE selected newest-first; the rest are already oldest-first.
+    if matches!(
+        query,
+        HistoryQuery::Latest { .. } | HistoryQuery::Before { .. }
+    ) {
         rows.reverse();
     }
     rows.into_iter()
