@@ -885,21 +885,25 @@ fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
                 );
                 return;
             }
-            // Drop the hot registration too: no more founder-op or topic
-            // retention for this channel.
+            // Drop the hot registration too: no more founder-op, topic
+            // retention, or access for this channel. (The DB row's
+            // channel_access cascades on the row delete.)
             state.registered_founders.remove(&key);
             state.registered_topics.remove(&key);
+            state.channel_access.remove(&key);
             state.service_notice(
                 conn,
                 "ChanServ",
                 &format!("\x02{channel}\x02 has been dropped."),
             );
         }
+        "FLAGS" => chanserv_flags(state, conn, args),
         "HELP" => {
             for line in [
                 "***** ChanServ Help *****",
                 "REGISTER <#channel> - Register a channel you operate",
                 "DROP <#channel> - Unregister a channel you founded",
+                "FLAGS <#channel> [account [+/-ov]] - List or set channel access",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "ChanServ", line);
@@ -912,6 +916,143 @@ fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
                 "Invalid command. Use \x02/msg ChanServ HELP\x02 for a command listing.",
             );
         }
+    }
+}
+
+/// Apply a `+ov`/`-o`-style change string to a current flag set, keeping
+/// only the recognised flags (`o` auto-op, `v` auto-voice), sorted.
+fn apply_flag_changes(current: &str, changes: &str) -> String {
+    let mut flags: std::collections::BTreeSet<char> =
+        current.chars().filter(|c| matches!(c, 'o' | 'v')).collect();
+    let mut adding = true;
+    for c in changes.chars() {
+        match c {
+            '+' => adding = true,
+            '-' => adding = false,
+            'o' | 'v' => {
+                if adding {
+                    flags.insert(c);
+                } else {
+                    flags.remove(&c);
+                }
+            }
+            _ => {}
+        }
+    }
+    flags.into_iter().collect()
+}
+
+/// ChanServ FLAGS: list a registered channel's access entries, or (founder
+/// only) modify one account's flags. Auto-op/voice apply on the account's
+/// next join.
+fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {
+    let Some(&channel) = args.first() else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "Syntax: FLAGS <#channel> [account [+/-flags]]",
+        );
+        return;
+    };
+    let Some(account) = state.sessions[&conn].account.clone() else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "You must identify to services before using FLAGS.",
+        );
+        return;
+    };
+    let key = state.chan_key(channel);
+    if !state.is_registered(&key) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{channel}\x02 is not registered."),
+        );
+        return;
+    }
+    if !state.is_founder(&key, &account) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("You are not the founder of \x02{channel}\x02."),
+        );
+        return;
+    }
+
+    // LIST when no account is given.
+    if args.len() == 1 {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("Access list for \x02{channel}\x02:"),
+        );
+        let mut entries: Vec<(String, String)> = state
+            .channel_access
+            .get(&key)
+            .map(|m| m.iter().map(|(a, f)| (a.clone(), f.clone())).collect())
+            .unwrap_or_default();
+        entries.sort();
+        for (acct, flags) in &entries {
+            state.service_notice(conn, "ChanServ", &format!("{acct} +{flags}"));
+        }
+        state.service_notice(conn, "ChanServ", "End of access list.");
+        return;
+    }
+
+    // MODIFY: FLAGS <#channel> <account> <changes>.
+    let target = args[1];
+    let Some(&changes) = args.get(2) else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "Syntax: FLAGS <#channel> <account> <+/-ov>",
+        );
+        return;
+    };
+    let target_folded = state.casemap.casefold(target);
+    let current = state
+        .channel_access
+        .get(&key)
+        .and_then(|m| m.get(&target_folded))
+        .cloned()
+        .unwrap_or_default();
+    let new_flags = apply_flag_changes(&current, changes);
+
+    // Update the hot map, then persist.
+    {
+        let entry = state.channel_access.entry(key.clone()).or_default();
+        if new_flags.is_empty() {
+            entry.remove(&target_folded);
+        } else {
+            entry.insert(target_folded.clone(), new_flags.clone());
+        }
+    }
+    let request = super::DbRequest::SetChannelAccess {
+        channel: key.as_str().to_string(),
+        account: target_folded,
+        flags: (!new_flags.is_empty()).then(|| new_flags.clone()),
+    };
+    if state.db_tx.try_push(request).is_err() {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "Services are temporarily unavailable. Try again later.",
+        );
+        return;
+    }
+    if new_flags.is_empty() {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("Cleared flags for \x02{target}\x02 on \x02{channel}\x02."),
+        );
+    } else {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("Flags for \x02{target}\x02 on \x02{channel}\x02 are now +{new_flags}."),
+        );
     }
 }
 
@@ -1155,6 +1296,11 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     let is_founder = account
         .as_deref()
         .is_some_and(|a| state.is_founder(&key, a));
+    // ChanServ access flags grant auto-op / auto-voice on join.
+    let (access_op, access_voice) = account
+        .as_deref()
+        .map(|a| state.access_modes(&key, a))
+        .unwrap_or((false, false));
     let chan = state.channels.get_mut(&key).expect("just inserted");
     if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
         state.numeric(
@@ -1200,8 +1346,8 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     chan.members.insert(
         conn,
         MemberModes {
-            op: first || is_founder,
-            voice: false,
+            op: first || is_founder || access_op,
+            voice: access_voice,
         },
     );
     let display = chan.name.clone();

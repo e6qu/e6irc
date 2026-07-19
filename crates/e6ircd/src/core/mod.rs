@@ -116,6 +116,15 @@ pub enum DbRequest {
         channel: String,
         topic: Option<(String, String, u64)>,
     },
+    /// Persist one channel access entry (fire-and-forget). `flags: None`
+    /// removes the entry.
+    SetChannelAccess {
+        /// Casefolded channel name.
+        channel: String,
+        /// Casefolded account name.
+        account: String,
+        flags: Option<String>,
+    },
     /// Append one chat message to history. Fire-and-forget: no reply.
     LogMessage {
         msgid: String,
@@ -216,6 +225,12 @@ impl Core {
     /// loop starts (see [`ServerState::preload_topics`]).
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
         self.state.preload_topics(rows);
+    }
+
+    /// Seed the channel-access map from persisted rows before the worker
+    /// loop starts (see [`ServerState::preload_access`]).
+    pub fn preload_access(&mut self, rows: Vec<(String, String, String)>) {
+        self.state.preload_access(rows);
     }
 
     /// Process one event. All state transitions happen here, on one

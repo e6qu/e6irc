@@ -199,6 +199,11 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?,
         );
+        core.preload_access(
+            crate::db::list_channel_access(pool)
+                .await
+                .map_err(io::Error::other)?,
+        );
     }
     tokio::spawn(core_worker(core, core_rx));
 
