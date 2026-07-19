@@ -135,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/admin/channels", get(admin_channels))
         .route("/api/v1/admin/klines", get(admin_klines))
         .route("/api/v1/admin/audit", get(admin_audit))
+        .route("/api/v1/admin/stats", get(admin_stats))
         .route("/ws/irc", get(ws_irc))
         .route("/ws/ui", get(ws_ui));
     // With the `embed-web` feature the built web client (web/dist) is
@@ -960,6 +961,27 @@ fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response {
     )
 }
 
+/// Aggregate server counts (admin only).
+async fn admin_stats(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::server_stats(pool).await {
+        Ok((accounts, channels, klines)) => admin_json(serde_json::json!({
+            "server": state.server_name,
+            "network": state.network_name,
+            "accounts": accounts,
+            "registered_channels": channels,
+            "klines": klines,
+        })),
+        Err(e) => admin_db_error("server stats", e),
+    }
+}
+
 /// List every registered channel with its founder (admin only).
 async fn admin_channels(
     State(state): State<Arc<AppState>>,
@@ -1269,6 +1291,12 @@ async fn openapi() -> Response {
                     "parameters": [ { "name": "limit", "in": "query",
                         "schema": { "type": "integer" } } ],
                     "responses": { "200": { "description": "audit entries" },
+                        "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/stats": {
+                "get": { "summary": "Aggregate server counts (admin only)",
+                    "security": bearer,
+                    "responses": { "200": { "description": "counts" },
                         "403": { "description": "not an admin account" } } }
             }
         }
