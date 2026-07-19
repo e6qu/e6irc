@@ -134,14 +134,15 @@ pub enum DbRequest {
         account: String,
         flags: Option<String>,
     },
-    /// Persist a server ban (oper KLINE). Fire-and-forget.
-    AddKline {
+    /// Persist a server ban (oper KLINE/DLINE/XLINE). Fire-and-forget.
+    AddServerBan {
         mask: String,
         reason: String,
         set_by: String,
+        kind: String,
     },
-    /// Remove a server ban by mask (oper UNKLINE). Fire-and-forget.
-    RemoveKline { mask: String },
+    /// Remove a server ban by (mask, kind) (oper UN*LINE). Fire-and-forget.
+    RemoveServerBan { mask: String, kind: String },
     /// Record a privileged (oper) action in the audit log. Fire-and-forget.
     AuditLog {
         actor: String,
@@ -268,9 +269,9 @@ impl Core {
     }
 
     /// Seed server bans from persisted rows before the worker loop starts
-    /// (see [`ServerState::preload_klines`]).
-    pub fn preload_klines(&mut self, rows: Vec<(String, String, String)>) {
-        self.state.preload_klines(rows);
+    /// (see [`ServerState::preload_server_bans`]).
+    pub fn preload_server_bans(&mut self, rows: Vec<(String, String, String, String)>) {
+        self.state.preload_server_bans(rows);
     }
 
     /// Process one event. All state transitions happen here, on one

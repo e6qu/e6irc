@@ -2762,6 +2762,83 @@ fn oper_kline_bans_disconnects_and_refuses() {
     );
 }
 
+// D-lines ban by host/IP; X-lines ban by realname (gecos). Same machinery
+// as K-lines, differing only in the session field the mask tests against.
+
+#[test]
+fn oper_dline_bans_by_host() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+
+    s.line(op, "DLINE host7.example :bad netblock");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added D-Line")),
+        "no dline confirmation"
+    );
+
+    // A registration from the banned host is refused (465 + D-Lined ERROR).
+    let banned = s.connect(7); // host7.example
+    s.line(banned, "NICK joe");
+    s.line(banned, "USER joe 0 * :Joe");
+    let out = s.drain(banned);
+    assert!(out.iter().any(|l| l.contains(" 465 ")), "not 465: {out:#?}");
+    assert!(
+        out.iter().any(|l| l.contains("D-Lined")),
+        "not D-Lined: {out:#?}"
+    );
+
+    // A different host is unaffected.
+    let ok = s.connect(8); // host8.example
+    s.line(ok, "NICK ann");
+    s.line(ok, "USER ann 0 * :Ann");
+    assert!(
+        s.drain(ok).iter().any(|l| l.contains(" 001 ")),
+        "clean host refused"
+    );
+
+    s.line(op, "UNDLINE host7.example");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Removed D-Line")),
+        "no undline confirmation"
+    );
+}
+
+#[test]
+fn oper_xline_bans_by_realname() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+
+    s.line(op, "XLINE *spambot* :no bots");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added X-Line")),
+        "no xline confirmation"
+    );
+
+    // A registration whose realname matches the gecos glob is refused.
+    let banned = s.connect(2);
+    s.line(banned, "NICK sam");
+    s.line(banned, "USER sam 0 * :evil spambot v2");
+    let out = s.drain(banned);
+    assert!(out.iter().any(|l| l.contains(" 465 ")), "not 465: {out:#?}");
+    assert!(
+        out.iter().any(|l| l.contains("X-Lined")),
+        "not X-Lined: {out:#?}"
+    );
+
+    // A different realname on the same server is fine.
+    let ok = s.connect(3);
+    s.line(ok, "NICK amy");
+    s.line(ok, "USER amy 0 * :just a person");
+    assert!(
+        s.drain(ok).iter().any(|l| l.contains(" 001 ")),
+        "clean gecos refused"
+    );
+}
+
 #[test]
 fn oper_actions_are_audited() {
     let mut s = TestServer::new();
