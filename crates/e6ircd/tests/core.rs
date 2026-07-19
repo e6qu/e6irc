@@ -2638,3 +2638,66 @@ fn chanserv_op_grants_op_to_member() {
         "op without access was allowed"
     );
 }
+
+#[test]
+fn chanserv_set_founder_transfers_ownership() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+
+    // Founder transfers to "alice"; the request is queued.
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER alice");
+    let queued = s.db_requests().into_iter().any(|r| {
+        matches!(r,
+            e6ircd::core::DbRequest::SetChannelFounder { channel, new_founder, .. }
+            if channel == "#room" && new_founder == "alice")
+    });
+    assert!(queued, "SetChannelFounder not queued");
+
+    // The DB confirms; ownership moves in the hot map.
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::FounderChanged {
+            channel: "#room".to_string(),
+            account: "alice".to_string(),
+        },
+    });
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("transferred to")),
+        "no transfer confirmation"
+    );
+
+    // The old founder can no longer SET; the new founder is opped on join.
+    s.line(boss, "PRIVMSG ChanServ :SET #room FOUNDER boss");
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("not the founder")),
+        "old founder still had control"
+    );
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "alice");
+    let carol = s.register(3, "carol");
+    s.line(carol, "JOIN #room");
+    s.drain(carol);
+    s.line(alice, "JOIN #room");
+    let names = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(names.contains("@alice"), "new founder not opped: {names}");
+
+    // A failed transfer (no such account) is reported, not silently dropped.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::FounderChangeFailed {
+            channel: "#room".to_string(),
+        },
+    });
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("no such account")),
+        "failed transfer not reported"
+    );
+}

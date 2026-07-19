@@ -251,6 +251,21 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::SetChannelFounder {
+            conn,
+            channel,
+            new_founder,
+        } => {
+            let reply = if set_channel_founder(pool, &channel, &new_founder).await {
+                DbReply::FounderChanged {
+                    channel,
+                    account: new_founder,
+                }
+            } else {
+                DbReply::FounderChangeFailed { channel }
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+        }
         DbRequest::QueryHistory {
             conn,
             target,
@@ -565,6 +580,28 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)
+}
+
+/// Transfer a channel's founder to `new_founder_folded`. Returns whether
+/// a row was updated (false = no such channel or account).
+pub async fn set_channel_founder(pool: &PgPool, channel: &str, new_founder_folded: &str) -> bool {
+    let channel_folded = CaseMapping::Rfc1459.casefold(channel);
+    let res = sqlx::query(
+        "UPDATE channels SET founder_account_id = a.id
+         FROM accounts a
+         WHERE channels.name_folded = $1 AND a.name_folded = $2",
+    )
+    .bind(&channel_folded)
+    .bind(new_founder_folded)
+    .execute(pool)
+    .await;
+    match res {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => {
+            eprintln!("db: founder transfer failed: {e}");
+            false
+        }
+    }
 }
 
 /// Unregister a channel by its casefolded name (ChanServ DROP).
