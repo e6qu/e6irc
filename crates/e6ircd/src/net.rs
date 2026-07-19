@@ -199,6 +199,11 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?,
         );
+        core.preload_keeptopic_off(
+            crate::db::list_keeptopic_off(pool)
+                .await
+                .map_err(io::Error::other)?,
+        );
         core.preload_access(
             crate::db::list_channel_access(pool)
                 .await

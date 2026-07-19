@@ -2481,6 +2481,67 @@ fn registered_channel_topic_persisted_on_set() {
     assert!(!leaked, "unregistered channel wrongly persisted its topic");
 }
 
+#[test]
+fn chanserv_set_keeptopic_off_stops_topic_retention() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    s.core.preload_topics(vec![(
+        "#reg".to_string(),
+        "old topic".to_string(),
+        "boss!b@h".to_string(),
+        1_000_000,
+    )]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg");
+    s.drain(boss);
+    s.db_requests();
+
+    // Turn KEEPTOPIC off: it persists the flag and clears the retained topic.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC OFF");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|l| l.contains("KEEPTOPIC") && l.to_ascii_uppercase().contains("OFF")),
+        "no KEEPTOPIC OFF confirmation"
+    );
+    let reqs = s.db_requests();
+    assert!(
+        reqs.iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelKeeptopic { channel, keeptopic: false } if channel == "#reg")),
+        "KEEPTOPIC flag not persisted"
+    );
+    assert!(
+        reqs.iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: None } if channel == "#reg")),
+        "retained topic not cleared on KEEPTOPIC OFF"
+    );
+
+    // With KEEPTOPIC off, a new topic is NOT persisted for retention.
+    s.line(boss, "TOPIC #reg :while off");
+    s.drain(boss);
+    assert!(
+        !s.db_requests()
+            .into_iter()
+            .any(|r| matches!(r, e6ircd::core::DbRequest::SetChannelTopic { .. })),
+        "topic wrongly persisted while KEEPTOPIC is off"
+    );
+
+    // Turning it back on resumes persistence.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC ON");
+    s.drain(boss);
+    s.db_requests();
+    s.line(boss, "TOPIC #reg :back on");
+    s.drain(boss);
+    assert!(
+        s.db_requests().into_iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
+            if channel == "#reg" && text == "back on")),
+        "topic not persisted after KEEPTOPIC ON"
+    );
+}
+
 // NickServ GHOST + ChanServ DROP (DESIGN §7.6).
 
 #[test]
