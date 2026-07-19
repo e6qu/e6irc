@@ -212,3 +212,140 @@ async fn pat_bearer_auth_works() {
         .expect("me");
     assert_eq!(resp.status(), 401);
 }
+
+/// Link a fresh OIDC identity to an existing password account, then prove
+/// a *second* account can't claim the same identity. Uses a distinct fixed
+/// port (18081) so it stays independent of the login flow above.
+#[tokio::test]
+#[ignore = "needs PostgreSQL + dex; see module docs"]
+async fn oidc_identity_link_flow_and_conflict() {
+    let db_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
+
+    let pool = e6ircd::db::connect_and_migrate(&db_url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("s1");
+    let bob_session = e6ircd::db::create_web_session(&pool, "bob")
+        .await
+        .expect("s2");
+    drop(pool);
+
+    let http_addr: std::net::SocketAddr = "127.0.0.1:18081".parse().unwrap();
+    let config = Config {
+        server_name: "irc.link.example".into(),
+        network_name: "LinkNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: http_addr,
+            public_url: Some(format!("http://{http_addr}")),
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url: db_url }),
+        oidc_providers: vec![OidcProviderConfig {
+            name: "dex".into(),
+            issuer_url: dex_url,
+            client_id: "e6irc-test".into(),
+            client_secret: "e6irc-test-secret".into(),
+        }],
+        ..Config::default()
+    };
+    let running = net::start(config)
+        .await
+        .unwrap_or_else(|e| panic!("start failed: {e}"));
+    let base = format!("http://{}", running.http_addr.expect("http"));
+
+    // Drive one link flow as `session_account`, following dex's auto-approve
+    // hops back to our callback. Returns the callback's HTTP status.
+    async fn run_link(base: &str, session: &str) -> reqwest::StatusCode {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .cookie_store(true)
+            .build()
+            .expect("client");
+        let cookie = format!("e6irc_session={session}");
+        let resp = client
+            .get(format!("{base}/api/v1/auth/oidc/dex/link"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .expect("link start");
+        assert_eq!(resp.status(), 307, "link start not a redirect");
+        let mut location = resp
+            .headers()
+            .get("location")
+            .expect("location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        for _ in 0..10 {
+            if location.starts_with(base) {
+                break;
+            }
+            let resp = client.get(&location).send().await.expect("dex hop");
+            assert!(
+                resp.status().is_redirection(),
+                "dex answered {} at {location}",
+                resp.status()
+            );
+            let next = resp
+                .headers()
+                .get("location")
+                .expect("location")
+                .to_str()
+                .unwrap();
+            location = if next.starts_with("http") {
+                next.to_string()
+            } else {
+                let origin = location.split('/').take(3).collect::<Vec<_>>().join("/");
+                format!("{origin}{next}")
+            };
+        }
+        assert!(
+            location.starts_with(base),
+            "never returned to callback: {location}"
+        );
+        // The callback carries no auth of its own — the pending state does.
+        client
+            .get(&location)
+            .send()
+            .await
+            .expect("callback")
+            .status()
+    }
+
+    // alice links the mock identity: callback redirects home.
+    assert_eq!(run_link(&base, &alice_session).await, 303);
+    // it now shows up on her account.
+    let ids: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/me/identities"))
+        .header("cookie", format!("e6irc_session={alice_session}"))
+        .send()
+        .await
+        .expect("identities")
+        .json()
+        .await
+        .expect("json");
+    let list = ids["identities"].as_array().expect("array");
+    assert_eq!(list.len(), 1, "{ids}");
+    assert!(list[0]["issuer"].as_str().unwrap().contains("dex"), "{ids}");
+
+    // bob tries to link the *same* dex identity → 409 conflict.
+    assert_eq!(run_link(&base, &bob_session).await, 409);
+}

@@ -863,6 +863,13 @@ async fn network_buffer_read() {
         .execute(&pool)
         .await
         .expect("clean");
+    // bnc_buffer is keyed by (owner, network) text, not an accounts FK, so
+    // TRUNCATE accounts CASCADE does not clear it — wipe it explicitly or a
+    // prior test's buffered lines under the same key leak into this read.
+    sqlx::query("TRUNCATE bnc_buffer")
+        .execute(&pool)
+        .await
+        .expect("clean buffer");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");

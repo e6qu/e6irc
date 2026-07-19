@@ -402,6 +402,80 @@ async fn set_read_marker(
     Ok(())
 }
 
+/// Outcome of linking an OIDC identity to an account.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// The identity was newly attached to the account.
+    Linked,
+    /// The identity was already attached to this same account.
+    AlreadyYours,
+    /// The identity belongs to a different account — refused.
+    Conflict,
+}
+
+/// Every OIDC identity linked to `account` as `(issuer, subject)`, ordered
+/// for stable listing.
+pub async fn list_oidc_identities(
+    pool: &PgPool,
+    account: &str,
+) -> Result<Vec<(String, String)>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    sqlx::query_as(
+        "SELECT o.issuer, o.subject
+         FROM oidc_identities o JOIN accounts a ON a.id = o.account_id
+         WHERE a.name_folded = $1 ORDER BY o.issuer, o.subject",
+    )
+    .bind(&folded)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Attach an OIDC `(issuer, subject)` to `account`. Because the pair is
+/// globally unique, an identity already owned by another account is a hard
+/// [`LinkOutcome::Conflict`], never a silent move.
+pub async fn link_oidc_identity(
+    pool: &PgPool,
+    account: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<LinkOutcome, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let account_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
+        .bind(&folded)
+        .fetch_optional(pool)
+        .await
+        .map_err(DbError::Query)?
+        .ok_or(DbError::BadCredentials)?;
+    let inserted: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
+         ON CONFLICT (issuer, subject) DO NOTHING RETURNING id",
+    )
+    .bind(account_id)
+    .bind(issuer)
+    .bind(subject)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    if inserted.is_some() {
+        return Ok(LinkOutcome::Linked);
+    }
+    // The pair already exists; whose is it?
+    let owner: i64 = sqlx::query_scalar(
+        "SELECT account_id FROM oidc_identities WHERE issuer = $1 AND subject = $2",
+    )
+    .bind(issuer)
+    .bind(subject)
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)?;
+    if owner == account_id {
+        Ok(LinkOutcome::AlreadyYours)
+    } else {
+        Ok(LinkOutcome::Conflict)
+    }
+}
+
 /// Persist (or clear, when `topic` is `None`) a registered channel's
 /// retained topic on its `channels` row.
 pub async fn set_channel_topic(

@@ -22,6 +22,9 @@ pub struct PendingAuth {
     pkce_verifier: String,
     nonce: openidconnect::Nonce,
     started: Instant,
+    /// When set, the callback links the resulting identity to this account
+    /// instead of logging in / auto-provisioning.
+    link_account: Option<String>,
 }
 
 pub struct AppState {
@@ -110,7 +113,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/auth/app-passwords", post(create_app_password))
         .route("/api/v1/auth/oidc/{provider}/start", get(oidc_start))
+        .route("/api/v1/auth/oidc/{provider}/link", get(oidc_link_start))
         .route("/api/v1/auth/oidc/{provider}/callback", get(oidc_callback))
+        .route("/api/v1/me/identities", get(me_identities))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/device/start", post(device_start))
         .route("/api/v1/auth/device/token", post(device_token))
@@ -527,6 +532,31 @@ async fn oidc_start(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
 ) -> Response {
+    oidc_authorize(&state, &provider_name, None).await
+}
+
+/// Begin an OIDC flow that *links* the resulting identity to the
+/// authenticated caller's account rather than logging in. The account is
+/// remembered in the pending-auth entry; the shared callback attaches the
+/// identity when the provider returns.
+async fn oidc_link_start(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(provider_name): Path<String>,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    oidc_authorize(&state, &provider_name, Some(account)).await
+}
+
+/// Shared authorization-request builder for both login and link flows.
+async fn oidc_authorize(
+    state: &AppState,
+    provider_name: &str,
+    link_account: Option<String>,
+) -> Response {
     use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge, Scope};
     let Some(provider) = state
         .oidc_providers
@@ -536,7 +566,7 @@ async fn oidc_start(
     else {
         return problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None);
     };
-    let client = match discover_client(&state, &provider).await {
+    let client = match discover_client(state, &provider).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("oidc: {e}");
@@ -563,6 +593,7 @@ async fn oidc_start(
             pkce_verifier: pkce_verifier.secret().clone(),
             nonce,
             started: Instant::now(),
+            link_account,
         },
     );
     Redirect::temporary(auth_url.as_str()).into_response()
@@ -647,6 +678,28 @@ async fn oidc_callback(
     };
     let issuer = claims.issuer().as_str();
     let subject = claims.subject().as_str();
+    // Link flow: attach this identity to the account that started it,
+    // rather than logging in / provisioning a new account.
+    if let Some(account) = &pending.link_account {
+        return match crate::db::link_oidc_identity(&pool, account, issuer, subject).await {
+            Ok(crate::db::LinkOutcome::Linked | crate::db::LinkOutcome::AlreadyYours) => {
+                Redirect::to("/?linked=1").into_response()
+            }
+            Ok(crate::db::LinkOutcome::Conflict) => problem(
+                StatusCode::CONFLICT,
+                "Identity already linked to another account",
+                None,
+            ),
+            Err(e) => {
+                eprintln!("oidc: identity link failed: {e}");
+                problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Account storage failed",
+                    None,
+                )
+            }
+        };
+    }
     let preferred = claims
         .preferred_username()
         .map(|u| u.as_str().to_string())
@@ -1218,6 +1271,19 @@ async fn openapi() -> Response {
                 "get": { "summary": "The authenticated account", "security": bearer,
                     "responses": ok_json }
             },
+            "/api/v1/auth/oidc/{provider}/link": {
+                "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
+                    "security": bearer,
+                    "parameters": [{ "name": "provider", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "responses": { "307": { "description": "redirect into the provider" },
+                        "404": { "description": "unknown provider" },
+                        "409": { "description": "identity already linked to another account (on return)" } } }
+            },
+            "/api/v1/me/identities": {
+                "get": { "summary": "List OIDC identities linked to your account",
+                    "security": bearer, "responses": ok_json }
+            },
             "/api/v1/auth/device/start": {
                 "post": { "summary": "Begin an RFC 8628 device authorization grant",
                     "responses": { "200": { "description": "device_code, user_code, verification_uri" } } }
@@ -1757,6 +1823,42 @@ async fn list_credentials(
 
 /// List the authenticated account's personal access tokens (never the
 /// token itself).
+/// List the OIDC identities linked to the caller's account. New ones are
+/// added via `GET /api/v1/auth/oidc/{provider}/link`.
+async fn me_identities(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::list_oidc_identities(pool, &account).await {
+        Ok(rows) => {
+            let identities: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(
+                    |(issuer, subject)| serde_json::json!({ "issuer": issuer, "subject": subject }),
+                )
+                .collect();
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "identities": identities }).to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("http: identity list failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
 /// List the caller's IRCv3 read markers (`draft/read-marker`): the last
 /// point they have read in each target, mirrored from MARKREAD.
 async fn me_read_markers(

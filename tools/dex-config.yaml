@@ -12,8 +12,10 @@ staticClients:
     secret: e6irc-test-secret
     name: e6irc test
     redirectURIs:
-      # dex matches exactly; the test binds this fixed port
+      # dex matches exactly; each test binds one of these fixed ports
+      # (login flow -> 18080, identity-link flow -> 18081).
       - http://127.0.0.1:18080/api/v1/auth/oidc/dex/callback
+      - http://127.0.0.1:18081/api/v1/auth/oidc/dex/callback
 connectors:
   - type: mockCallback
     id: mock
