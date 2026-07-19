@@ -245,6 +245,12 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             let reply = handle_register_channel(pool, &channel, &founder_account).await;
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
+        DbRequest::DropChannel { channel } => {
+            if let Err(e) = drop_channel(pool, &channel).await {
+                eprintln!("db: channel drop failed: {e}");
+            }
+            true
+        }
         DbRequest::QueryHistory {
             conn,
             target,
@@ -503,6 +509,16 @@ pub async fn query_targets(
             Vec::new()
         }
     }
+}
+
+/// Unregister a channel by its casefolded name (ChanServ DROP).
+pub async fn drop_channel(pool: &PgPool, channel_folded: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM channels WHERE name_folded = $1")
+        .bind(channel_folded)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(())
 }
 
 async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) -> DbReply {

@@ -74,6 +74,12 @@ pub enum DbRequest {
         channel: String,
         founder_account: String,
     },
+    /// Unregister a channel (ChanServ DROP). Fire-and-forget: the core
+    /// already removed it from its hot maps.
+    DropChannel {
+        /// Casefolded channel name.
+        channel: String,
+    },
     /// Page history from PostgreSQL when the request reaches past the
     /// in-memory ring. Answered with [`Input::HistoryPage`].
     QueryHistory {

@@ -379,11 +379,14 @@ not built yet. Ranked by value:
    going empty; TOPIC on a registered channel persists the change
    (`SetChannelTopic`). Covered by four core tests + PG-gated
    `channel_topic_persist_and_load`.
-2. **Fuller NickServ/ChanServ command surface** (DESIGN §7.6). Only
-   REGISTER/IDENTIFY/HELP (NickServ) and REGISTER/HELP (ChanServ) exist;
-   GHOST, ACCESS/FLAGS, OP, DROP, SET, founder/successor are absent
-   (return "Invalid command."). This is an Atheme-equivalent services
-   subsystem — substantial.
+2. **Fuller NickServ/ChanServ command surface** (DESIGN §7.6) — partial.
+   NickServ REGISTER/IDENTIFY/**GHOST**/HELP and ChanServ REGISTER/**DROP**
+   /HELP are implemented (GHOST disconnects a stale session on a nick you
+   own; DROP unregisters a channel you founded, clearing the hot
+   founder/topic maps + the `channels` row). **Still absent:** ChanServ
+   ACCESS/FLAGS (per-account access — needs a `channel_access` table), OP,
+   SET, founder/successor transfer. Those are the substantial,
+   Atheme-equivalent remainder.
 3. **CHATHISTORY subcommands** — ✅ DONE (2026-07-19). The full draft
    surface is now implemented (DESIGN §11.2): `LATEST`/`BEFORE`/`AFTER`,
    plus `TARGETS` (buffer enumeration, `draft/chathistory-targets` batch),

@@ -747,11 +747,52 @@ fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
                 );
             }
         }
+        "GHOST" => {
+            // GHOST <nick>: disconnect a lingering session holding a nick
+            // you own, so you can reclaim it. An account owns the nick of
+            // the same name (nick registration model).
+            let Some(&nick) = args.first() else {
+                state.service_notice(conn, "NickServ", "Syntax: GHOST <nick>");
+                return;
+            };
+            let Some(account) = state.sessions[&conn].account.clone() else {
+                state.service_notice(
+                    conn,
+                    "NickServ",
+                    "You must identify to services before using GHOST.",
+                );
+                return;
+            };
+            if state.casemap.casefold(&account) != state.casemap.casefold(nick) {
+                state.service_notice(conn, "NickServ", &format!("You do not own \x02{nick}\x02."));
+                return;
+            }
+            let key = state.nick_key(nick);
+            let Some(&victim) = state.nicks.get(&key) else {
+                state.service_notice(conn, "NickServ", &format!("\x02{nick}\x02 is not online."));
+                return;
+            };
+            if victim == conn {
+                state.service_notice(conn, "NickServ", "You cannot ghost yourself.");
+                return;
+            }
+            let by = state.sessions[&conn].nick.clone().unwrap_or_default();
+            let server = state.config.server_name.clone();
+            let reason = format!("GHOST command used by {by}");
+            state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
+            state.close(victim, &reason);
+            state.service_notice(
+                conn,
+                "NickServ",
+                &format!("\x02{nick}\x02 has been ghosted."),
+            );
+        }
         "HELP" => {
             for line in [
                 "***** NickServ Help *****",
                 "REGISTER <password> [email] - Register your current nick",
                 "IDENTIFY [account] <password> - Log in to your account",
+                "GHOST <nick> - Disconnect a lingering session on your nick",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "NickServ", line);
@@ -810,10 +851,55 @@ fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
                 );
             }
         }
+        "DROP" => {
+            // DROP <#channel>: the founder unregisters their channel.
+            let Some(&channel) = args.first() else {
+                state.service_notice(conn, "ChanServ", "Syntax: DROP <#channel>");
+                return;
+            };
+            let Some(account) = state.sessions[&conn].account.clone() else {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "You must identify to services before dropping a channel.",
+                );
+                return;
+            };
+            let key = state.chan_key(channel);
+            if !state.is_founder(&key, &account) {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!("You are not the founder of \x02{channel}\x02."),
+                );
+                return;
+            }
+            let request = super::DbRequest::DropChannel {
+                channel: key.as_str().to_string(),
+            };
+            if state.db_tx.try_push(request).is_err() {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Services are temporarily unavailable. Try again later.",
+                );
+                return;
+            }
+            // Drop the hot registration too: no more founder-op or topic
+            // retention for this channel.
+            state.registered_founders.remove(&key);
+            state.registered_topics.remove(&key);
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("\x02{channel}\x02 has been dropped."),
+            );
+        }
         "HELP" => {
             for line in [
                 "***** ChanServ Help *****",
                 "REGISTER <#channel> - Register a channel you operate",
+                "DROP <#channel> - Unregister a channel you founded",
                 "***** End of Help *****",
             ] {
                 state.service_notice(conn, "ChanServ", line);

@@ -2480,3 +2480,66 @@ fn registered_channel_topic_persisted_on_set() {
         .any(|r| matches!(r, e6ircd::core::DbRequest::SetChannelTopic { .. }));
     assert!(!leaked, "unregistered channel wrongly persisted its topic");
 }
+
+// NickServ GHOST + ChanServ DROP (DESIGN §7.6).
+
+#[test]
+fn nickserv_ghost_disconnects_stale_session() {
+    let mut s = TestServer::new();
+    let ghost = s.register(1, "alice");
+    identify(&mut s, ghost, "alice");
+
+    // A second session, identified to the same account under a different
+    // nick, ghosts the stale one.
+    let user = s.register(2, "alice2");
+    identify(&mut s, user, "alice");
+    s.line(user, "PRIVMSG NickServ :GHOST alice");
+    let out = s.drain(user);
+    assert!(
+        out.iter().any(|l| l.contains("has been ghosted")),
+        "no ghost confirmation: {out:#?}"
+    );
+    // The stale session was sent a closing ERROR.
+    let ghost_out = s.drain(ghost);
+    assert!(
+        ghost_out.iter().any(|l| l.starts_with("ERROR :")),
+        "ghost not disconnected: {ghost_out:#?}"
+    );
+
+    // You cannot ghost a nick you do not own.
+    let mallory = s.register(3, "mallory");
+    identify(&mut s, mallory, "mallory");
+    s.line(mallory, "PRIVMSG NickServ :GHOST alice2");
+    assert!(
+        s.drain(mallory).iter().any(|l| l.contains("do not own")),
+        "ghost of un-owned nick should be refused"
+    );
+}
+
+#[test]
+fn chanserv_drop_unregisters_channel() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+
+    s.line(boss, "PRIVMSG ChanServ :DROP #room");
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|l| l.contains("has been dropped")),
+        "no drop confirmation: {out:#?}"
+    );
+    let dropped = s.db_requests().into_iter().any(
+        |r| matches!(r, e6ircd::core::DbRequest::DropChannel { channel } if channel == "#room"),
+    );
+    assert!(dropped, "DropChannel not queued");
+
+    // Registration is gone from the hot map: a second DROP is refused.
+    s.line(boss, "PRIVMSG ChanServ :DROP #room");
+    assert!(
+        s.drain(boss).iter().any(|l| l.contains("not the founder")),
+        "channel still registered after drop"
+    );
+}
