@@ -1128,3 +1128,56 @@ async fn channel_founder_transfer() {
         vec![("#c".to_string(), "alice".to_string())]
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn klines_persist_and_load() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE server_bans")
+        .execute(&pool)
+        .await
+        .expect("clean");
+
+    db::add_kline(&pool, "baddie@*", "spam", "god")
+        .await
+        .expect("add1");
+    db::add_kline(&pool, "*@evil.host", "bad", "god")
+        .await
+        .expect("add2");
+    let mut list = db::list_klines(&pool).await.expect("list");
+    list.sort();
+    assert_eq!(
+        list,
+        vec![
+            (
+                "*@evil.host".to_string(),
+                "bad".to_string(),
+                "god".to_string()
+            ),
+            (
+                "baddie@*".to_string(),
+                "spam".to_string(),
+                "god".to_string()
+            ),
+        ]
+    );
+
+    // Re-K-lining the same mask upserts (new reason/setter, no duplicate).
+    db::add_kline(&pool, "baddie@*", "spam again", "root")
+        .await
+        .expect("upsert");
+    let list = db::list_klines(&pool).await.expect("list");
+    assert_eq!(list.iter().filter(|(m, ..)| m == "baddie@*").count(), 1);
+
+    db::remove_kline(&pool, "baddie@*").await.expect("remove");
+    assert_eq!(
+        db::list_klines(&pool).await.expect("list"),
+        vec![(
+            "*@evil.host".to_string(),
+            "bad".to_string(),
+            "god".to_string()
+        )]
+    );
+}

@@ -406,9 +406,17 @@ not built yet. Ranked by value:
    status, buffers, read-marker get/set); `me/tokens` is create-only; no
    OIDC identity linking. All 404 via the loud fallback.
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
-   §8). No kline/dline/xline equivalents, no SETHOST, no `audit_log`
-   table. Implemented oper commands are OPER/KILL/WALLOPS only.
+   §8) — partial. Oper commands are now OPER/KILL/WALLOPS plus **KLINE /
+   UNKLINE**: a `server_bans` table (migration 0012, boot-loaded into a hot
+   list) whose `user@host` glob is refused at registration (465 + closing
+   ERROR) and disconnects matching sessions; KLINE lists/adds, UNKLINE
+   removes. **Still absent:** dline/xline, SETHOST, and the `audit_log`
+   table (oper actions are not yet recorded).
 
-Items 2, 4, 5 are each a major subsystem (services / admin tooling / oper
-bans + audit) and are genuinely future phases, not tack-on fixes. Items 1
-and 3 are bounded and are the natural next increments.
+Items 1 and 3 are fully done; item 2 is nearly done (only SET's
+lower-value channel-option flags remain); item 5 has its core (KLINE) with
+the fuller ban surface + audit log remaining. **Item 4 (the REST admin
+surface) is the last large code subsystem not yet started.** Beyond these,
+the two external blockers remain: the bridges' live verification (real
+Discord/Slack credentials — no self-hostable oracle) and the 100k load run
+(a tuned Linux host).

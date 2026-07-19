@@ -134,6 +134,14 @@ pub enum DbRequest {
         account: String,
         flags: Option<String>,
     },
+    /// Persist a server ban (oper KLINE). Fire-and-forget.
+    AddKline {
+        mask: String,
+        reason: String,
+        set_by: String,
+    },
+    /// Remove a server ban by mask (oper UNKLINE). Fire-and-forget.
+    RemoveKline { mask: String },
     /// Append one chat message to history. Fire-and-forget: no reply.
     LogMessage {
         msgid: String,
@@ -250,6 +258,12 @@ impl Core {
     /// loop starts (see [`ServerState::preload_access`]).
     pub fn preload_access(&mut self, rows: Vec<(String, String, String)>) {
         self.state.preload_access(rows);
+    }
+
+    /// Seed server bans from persisted rows before the worker loop starts
+    /// (see [`ServerState::preload_klines`]).
+    pub fn preload_klines(&mut self, rows: Vec<(String, String, String)>) {
+        self.state.preload_klines(rows);
     }
 
     /// Process one event. All state transitions happen here, on one
