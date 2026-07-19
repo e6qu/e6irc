@@ -1,0 +1,32 @@
+[package]
+name = "e6irc-client"
+description = "IRC client library: connection, TLS, SASL, chathistory (shared by CLI and TUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+e6irc-proto = { path = "../e6irc-proto" }
+# tokio 1.53.0 (>24h): shared async connection for CLI and TUI.
+tokio = { version = "1.53.0", default-features = false, features = [
+    "rt",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+] }
+rustls = { version = "0.23.42", default-features = false, features = [
+    "aws_lc_rs",
+    "tls12",
+    "std",
+] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "aws_lc_rs",
+    "tls12",
+] }
+rustls-pki-types = { version = "1.15.0", default-features = false, features = [
+    "std",
+] }
+# 1.0.8 (2026-06-17): the newest release older than 24h — 1.0.9 dropped
+# within the day and is deliberately not adopted yet.
+webpki-roots = { version = "1.0.8", default-features = false }

@@ -1,0 +1,23 @@
+{# The networks table body — swapped in by htmx after add/delete. #}
+{% if networks.is_empty() %}
+  <tbody id="networks"><tr><td colspan="5" class="empty">No networks yet.</td></tr></tbody>
+{% else %}
+  <tbody id="networks">
+    {% for n in networks %}
+      <tr>
+        <td><code>{{ n.name }}</code></td>
+        <td><code>{{ n.addr }}</code></td>
+        <td>{% if n.tls %}yes{% else %}no{% endif %}</td>
+        <td><code>{{ n.nick }}</code></td>
+        <td>
+          <button
+            hx-delete="/account/networks/{{ n.name }}"
+            hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
+            hx-target="#networks"
+            hx-swap="outerHTML"
+          >Remove</button>
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+{% endif %}

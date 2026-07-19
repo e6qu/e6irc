@@ -1,0 +1,134 @@
+[package]
+name = "e6ircd"
+description = "Monolithic IRC server: IRCv3 daemon, REST API, web backend, OIDC, BNC host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Embed the built web client (web/dist) into the binary and serve it at
+# `/`. Off by default: deployments that host assets on S3/CDN leave it
+# off and serve only the API + WebSocket paths. (DESIGN §13.3)
+# Requires `pnpm build` in web/ first so web/dist exists.
+embed-web = ["dep:rust-embed"]
+# Matrix bridge: presents a Matrix homeserver as a BNC network. Its HTTP
+# client lives entirely behind this flag (DESIGN §10.5). Off by default.
+matrix = ["dep:reqwest"]
+
+[dependencies]
+e6irc-proto = { path = "../e6irc-proto" }
+e6irc-queue = { path = "../e6irc-queue" }
+e6irc-client = { path = "../e6irc-client" }
+# Publish dates verified against crates.io for the 24h cooldown:
+# bytes 1.12.1 (2026-07-08), tokio 1.53.0 (2026-07-17, 34h),
+# rustls 0.23.42 (2026-07-13), tokio-rustls 0.26.4 (2025-09-26),
+# serde 1.0.228 (2025-09-27), toml 1.1.3 (2026-07-14).
+bytes = { version = "1.12.1", default-features = false }
+tokio = { version = "1.53.0", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+] }
+rustls = { version = "0.23.42", default-features = false, features = [
+    "aws_lc_rs",
+    "tls12",
+    "std",
+] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "aws_lc_rs",
+    "tls12",
+] }
+# rustls-pki-types 1.15.0 (2026-06-30)
+rustls-pki-types = { version = "1.15.0", default-features = false, features = [
+    "std",
+    "alloc",
+] }
+serde = { version = "1.0.228", default-features = false, features = [
+    "std",
+    "derive",
+] }
+toml = { version = "1.1.3", default-features = false, features = [
+    "parse",
+    "serde",
+] }
+# sqlx 0.9.0 (2026-05-21); rustls TLS keeps the single-TLS-stack rule.
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-aws-lc-rs",
+    "postgres",
+    "migrate",
+    "macros",
+] }
+# argon2 0.5.3 (2024-03) — the 0.6 line is still RC, excluded by policy.
+argon2 = { version = "0.5.3", features = ["std"] }
+# axum 0.8.9 (2026-04-14), serde_json 1.0.150 (2026-05-21),
+# http 1.4.2 (2026-06-08) — verified against crates.io, >24h old.
+axum = { version = "0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "form",
+    "query",
+    "tokio",
+    "ws",
+] }
+serde_json = { version = "1.0.150", default-features = false, features = [
+    "std",
+] }
+http = { version = "1.4.2", default-features = false, features = ["std"] }
+# openidconnect 4.0.1 (2025-07-06): certified-flow OIDC RP (code+PKCE).
+# reqwest is its HTTP client, rustls-only to keep the single TLS stack.
+openidconnect = { version = "4.0.1", default-features = false, features = [
+    "reqwest",
+    "rustls-tls",
+] }
+
+# aws-lc-rs already in-tree via rustls; used directly for SHA-256 of
+# web session tokens. Version follows the rustls-selected one.
+aws-lc-rs = { version = "1.17.3", default-features = false, features = [
+    "aws-lc-sys",
+] }
+
+# rust-embed 8.12.0 (2026-07-08, >24h): bakes web/dist into the binary
+# for the `embed-web` feature. Optional so non-web builds don't pull it.
+rust-embed = { version = "8.12.0", optional = true, default-features = false }
+
+# reqwest 0.12.28: HTTP client for the (optional) matrix bridge. Held on
+# the 0.12 line deliberately: openidconnect 4 -> oauth2 5 (both latest)
+# still pull reqwest 0.12, so 0.12.28 is already in the tree; adopting
+# 0.13 would fork the HTTP/TLS stack into two reqwest versions (DESIGN §1).
+# It moves to 0.13 when the oauth2/openidconnect chain does. rustls only
+# (no openssl, per cargo-deny).
+reqwest = { version = "0.12.28", optional = true, default-features = false, features = [
+    "rustls-tls",
+    "json",
+] }
+
+# askama 0.16.0 (2026-04-29, >24h): compile-time HTML templates for the
+# server-rendered web pages (login, user section) and htmx fragments.
+askama = { version = "0.16.0", default-features = false, features = [
+    "derive",
+    "std",
+] }
+
+[dev-dependencies]
+# reqwest 0.12 line matches openidconnect's transitive pick; dev-only,
+# used to drive the OIDC dance in integration tests.
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "cookies",
+    "json",
+] }
+# rcgen 0.14.8 (2026-05-11): self-signed certs for TLS e2e tests only.
+rcgen = { version = "0.14.8", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }
+# tokio-tungstenite 0.30.0 (2026-07-11, >24h): ws client for the ws-irc
+# e2e test; futures-util is dev-only here (Stream/Sink for the client).
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
+    "connect",
+] }
+futures-util = { version = "0.3", default-features = false }

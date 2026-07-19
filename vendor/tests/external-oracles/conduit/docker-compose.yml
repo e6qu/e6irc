@@ -1,0 +1,12 @@
+# Conduit: a lightweight single-binary Matrix homeserver, used as the
+# live target for the `matrix` bridge's integration test. Not part of the
+# e6irc build or default CI — a developer/test oracle only.
+services:
+  conduit:
+    image: matrixconduit/matrix-conduit:v0.9.0
+    environment:
+      CONDUIT_CONFIG: "/etc/conduit.toml"
+    volumes:
+      - "./conduit.toml:/etc/conduit.toml:ro"
+    ports:
+      - "127.0.0.1:16167:6167"

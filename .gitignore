@@ -1,0 +1,17 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+node_modules/
+/web/dist
+.DS_Store
+
+# Web client build artifacts (built by `pnpm build` in web/; CI rebuilds
+# before `cargo build --features embed-web`).
+web/node_modules/
+web/dist/
+
+# Python bytecode (irctest controller, harnesses)
+__pycache__/
+*.pyc
+web/public/htmx.min.js

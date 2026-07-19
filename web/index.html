@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>e6irc</title>
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <main id="app">
+      <header id="topbar">
+        <span id="brand">e6irc</span>
+        <span id="status" class="status status-connecting">connecting…</span>
+      </header>
+
+      <!-- The live socket. main.js fills ws-connect from the URL and lets
+           the htmx ws extension apply the server's hx-swap-oob fragments. -->
+      <section id="chat" hx-ext="ws">
+        <ol id="buffer" aria-live="polite"></ol>
+
+        <!-- Composer: htmx serializes the form and sends it over the
+             socket; the server turns {target, message} into a PRIVMSG. -->
+        <form id="composer" ws-send autocomplete="off">
+          <input type="hidden" name="target" id="target" value="" />
+          <input
+            type="text"
+            name="message"
+            id="message"
+            placeholder="message… (/raw to send a literal IRC line)"
+            autocomplete="off"
+            autofocus
+          />
+          <button type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

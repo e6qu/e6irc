@@ -1,0 +1,33 @@
+[package]
+name = "e6irc-tui"
+description = "Terminal UI client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+e6irc-client = { path = "../e6irc-client" }
+e6irc-proto = { path = "../e6irc-proto" }
+# ratatui 0.30.2 (2026-06-19), crossterm 0.29.0 — verified >24h.
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "crossterm",
+] }
+crossterm = { version = "0.29.0", default-features = false, features = [
+    "events",
+] }
+tokio = { version = "1.53.0", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "macros",
+] }
+clap = { version = "4.6.2", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }

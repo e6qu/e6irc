@@ -1,0 +1,20 @@
+# dex configuration for OIDC integration tests: mock connector
+# auto-approves, so the flow is fully scriptable.
+issuer: http://127.0.0.1:15556/dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  skipApprovalScreen: true
+staticClients:
+  - id: e6irc-test
+    secret: e6irc-test-secret
+    name: e6irc test
+    redirectURIs:
+      # dex matches exactly; the test binds this fixed port
+      - http://127.0.0.1:18080/api/v1/auth/oidc/dex/callback
+connectors:
+  - type: mockCallback
+    id: mock
+    name: Mock

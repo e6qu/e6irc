@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>e6irc — {{ account }}</title>
+    <script src="/htmx.min.js" defer></script>
+    <style>
+      :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2f6feb; }
+      @media (prefers-color-scheme: dark) { :root { --border: #262b33; --muted: #9aa3b1; } }
+      body { margin: 0; font: 15px/1.6 system-ui, sans-serif; background: #f6f7f9; color: #16181d; }
+      @media (prefers-color-scheme: dark) { body { background: #0f1115; color: #e6e8ec; } }
+      header { display: flex; align-items: center; justify-content: space-between;
+        padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--border); }
+      header .who { font-weight: 600; }
+      main { max-width: 46rem; margin: 0 auto; padding: 1.5rem 1.25rem; }
+      h2 { font-size: 1.15rem; margin: 1.75rem 0 0.5rem; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--border); }
+      th { color: var(--muted); font-weight: 600; font-size: 0.82rem; }
+      .empty { color: var(--muted); }
+      a { color: var(--accent); }
+      code { font-family: ui-monospace, Menlo, monospace; }
+      form.add { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0; }
+      form.add input[type=text] { padding: 0.4rem 0.6rem; border: 1px solid var(--border);
+        border-radius: 0.4rem; background: transparent; color: inherit; }
+      form.add label { display: flex; align-items: center; gap: 0.3rem; color: var(--muted); }
+      button { padding: 0.4rem 0.9rem; border: 1px solid var(--border); border-radius: 0.4rem;
+        background: transparent; color: inherit; cursor: pointer; }
+      form.add button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="who">{{ account }}</span>
+      <a href="#" data-logout>Sign out</a>
+    </header>
+    <main>
+      <h2>Networks</h2>
+      <form
+        class="add"
+        hx-post="/account/networks"
+        hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
+        hx-target="#networks"
+        hx-swap="outerHTML"
+      >
+        <input type="text" name="name" placeholder="name" required />
+        <input type="text" name="addr" placeholder="host:port" required />
+        <input type="text" name="nick" placeholder="nick" required />
+        <input type="text" name="autojoin" placeholder="#chan,#chan2" />
+        <label><input type="checkbox" name="tls" /> TLS</label>
+        <button type="submit">Add</button>
+      </form>
+      <table>
+        <thead><tr><th>Name</th><th>Upstream</th><th>TLS</th><th>Nick</th><th></th></tr></thead>
+        {% include "network_rows.html" %}
+      </table>
+
+      <h2>Credentials</h2>
+      {% if credentials.is_empty() %}
+        <p class="empty">No credentials.</p>
+      {% else %}
+        <table>
+          <thead><tr><th>Kind</th><th>Label</th><th>Created</th></tr></thead>
+          <tbody>
+            {% for c in credentials %}
+              <tr><td>{{ c.kind }}</td><td>{{ c.label }}</td><td>{{ c.created }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% endif %}
+    </main>
+    <script type="module">
+      document.querySelector("[data-logout]")?.addEventListener("click", async (e) => {
+        e.preventDefault();
+        await fetch("/api/v1/auth/logout", { method: "POST" });
+        window.location.href = "/login";
+      });
+    </script>
+  </body>
+</html>

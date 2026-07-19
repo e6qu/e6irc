@@ -1,0 +1,43 @@
+[package]
+name = "e6irc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# 0.4.13 published 2026-06-04 — satisfies the 24h cooldown. Default
+# features stay ON: the `link_libfuzzer` default feature links the
+# libFuzzer runtime that provides `main` — disabling it breaks the link
+# with "undefined symbol: main".
+libfuzzer-sys = { version = "0.4.13" }
+e6irc-proto = { path = "../crates/e6irc-proto" }
+
+[[bin]]
+name = "parse_message"
+path = "fuzz_targets/parse_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tag_escaping"
+path = "fuzz_targets/tag_escaping.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "isupport_token"
+path = "fuzz_targets/isupport_token.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+[workspace]
