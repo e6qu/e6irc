@@ -124,6 +124,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/me/tokens/{id}",
             axum::routing::delete(me_tokens_revoke),
         )
+        .route("/api/v1/me/read-markers", get(me_read_markers))
         .route("/api/v1/me/credentials", get(list_credentials))
         .route(
             "/api/v1/me/credentials/{id}",
@@ -1242,6 +1243,10 @@ async fn openapi() -> Response {
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such token" } } }
             },
+            "/api/v1/me/read-markers": {
+                "get": { "summary": "List your read markers (draft/read-marker) per target",
+                    "security": bearer, "responses": ok_json }
+            },
             "/api/v1/me/credentials": {
                 "get": { "summary": "List the account's credentials", "security": bearer,
                     "responses": ok_json }
@@ -1740,6 +1745,42 @@ async fn list_credentials(
 
 /// List the authenticated account's personal access tokens (never the
 /// token itself).
+/// List the caller's IRCv3 read markers (`draft/read-marker`): the last
+/// point they have read in each target, mirrored from MARKREAD.
+async fn me_read_markers(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let account = match authenticate(&state, &headers).await {
+        Ok(a) => a,
+        Err(response) => return response,
+    };
+    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    match crate::db::list_read_markers(pool, &account).await {
+        Ok(rows) => {
+            let markers: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(target, timestamp)| {
+                    serde_json::json!({ "target": target, "timestamp": timestamp })
+                })
+                .collect();
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({ "markers": markers }).to_string(),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            eprintln!("http: read-marker list failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
 async fn me_tokens_list(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

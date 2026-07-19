@@ -414,9 +414,19 @@ not built yet. Ranked by value:
    the buffer-persistence task held a strong driver handle, so `remove`
    never actually stopped a driver (delete leaked it too) — the registry
    now aborts that task on remove/replace. `me/tokens` list/delete are
+<<<<<<< Updated upstream
    implemented (migration 0014 gives PATs an id). **Still absent:**
    `networks` buffers/read-marker REST reads; OIDC identity linking.
    Remaining endpoints 404 via the loud fallback.
+=======
+   implemented (migration 0014 gives PATs an id).
+   `GET /me/networks/{name}/buffer?limit=N` serves a network's persisted
+   backlog (oldest-first, owner-scoped), working even while the network is
+   paused, and `GET /me/read-markers` lists the account's per-target
+   `draft/read-marker` positions. **Still absent:** OIDC identity linking
+   is the last piece of this item. Remaining endpoints 404 via the loud
+   fallback.
+>>>>>>> Stashed changes
 5. **Oper network protections + audit logging** (DESIGN §7.6, §12, §15,
    §8) — done. Oper commands are OPER/KILL/WALLOPS plus the full server-ban
    surface **KLINE/DLINE/XLINE** and their removals. One `server_bans` table

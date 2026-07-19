@@ -851,3 +851,184 @@ async fn me_tokens_list_and_revoke() {
     let (status, _, _) = request(http, &auth("DELETE", "/api/v1/me/tokens/999999")).await;
     assert_eq!(status, 404);
 }
+<<<<<<< Updated upstream
+=======
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn network_buffer_read() {
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("token");
+    // A network the caller owns, disabled so boot starts no driver — the
+    // buffer read is pure DB and must work for a paused network too.
+    e6ircd::db::create_bnc_network(
+        &pool,
+        "alice",
+        &e6ircd::db::BncNetworkRow {
+            name: "work".into(),
+            addr: "127.0.0.1:1".into(),
+            tls: false,
+            nick: "alice_".into(),
+            realname: None,
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: None,
+            enabled: false,
+        },
+    )
+    .await
+    .expect("create");
+    for line in [
+        ":srv 001 alice :hi",
+        ":a!u@h PRIVMSG #x :one",
+        ":a!u@h PRIVMSG #x :two",
+    ] {
+        e6ircd::db::persist_bnc_line(&pool, "alice", "work", line)
+            .await
+            .expect("seed");
+    }
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.buf.example".into(),
+        network_name: "BufNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let auth = |path: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Full buffer, oldest-first.
+    let (status, _, body) = request(http, &auth("/api/v1/me/networks/work/buffer")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let lines = v["lines"].as_array().expect("array");
+    assert_eq!(lines.len(), 3, "{body}");
+    assert_eq!(lines[0], ":srv 001 alice :hi", "{body}");
+    assert_eq!(lines[2], ":a!u@h PRIVMSG #x :two", "{body}");
+
+    // limit returns the most recent N (still oldest-first within that slice).
+    let (_, _, body) = request(http, &auth("/api/v1/me/networks/work/buffer?limit=1")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(v["lines"][0], ":a!u@h PRIVMSG #x :two", "{body}");
+
+    // A network the caller doesn't own → 404.
+    let (status, _, _) = request(http, &auth("/api/v1/me/networks/nope/buffer")).await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn me_read_markers_list() {
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("token");
+    for (target, ts) in [
+        ("#rust", "2026-01-02T03:04:05.678Z"),
+        ("#e6irc", "2026-02-03T04:05:06.001Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO read_markers (account_id, target, marker_ts)
+             SELECT id, $1, $2::timestamptz FROM accounts WHERE name_folded = 'alice'",
+        )
+        .bind(target)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("seed marker");
+    }
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.rm.example".into(),
+        network_name: "RmNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Unauthenticated → 401.
+    let unauth = "GET /api/v1/me/read-markers HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    let (status, _, _) = request(http, unauth).await;
+    assert_eq!(status, 401);
+
+    let auth = format!(
+        "GET /api/v1/me/read-markers HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &auth).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let markers = v["markers"].as_array().expect("array");
+    assert_eq!(markers.len(), 2, "{body}");
+    // Ordered by target: "#e6irc" precedes "#rust".
+    assert_eq!(markers[0]["target"], "#e6irc", "{body}");
+    assert_eq!(
+        markers[0]["timestamp"], "2026-02-03T04:05:06.001Z",
+        "{body}"
+    );
+    assert_eq!(markers[1]["target"], "#rust", "{body}");
+    assert_eq!(
+        markers[1]["timestamp"], "2026-01-02T03:04:05.678Z",
+        "{body}"
+    );
+}
+>>>>>>> Stashed changes

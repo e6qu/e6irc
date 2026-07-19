@@ -360,6 +360,25 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
     }
 }
 
+/// Every read marker for `account` as `(target, iso8601-with-millis UTC)`,
+/// ordered by target — for the self-service REST read.
+pub async fn list_read_markers(
+    pool: &PgPool,
+    account: &str,
+) -> Result<Vec<(String, String)>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    sqlx::query_as(
+        "SELECT r.target,
+                to_char(r.marker_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+         FROM read_markers r JOIN accounts a ON a.id = r.account_id
+         WHERE a.name_folded = $1 ORDER BY r.target",
+    )
+    .bind(&folded)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
 async fn set_read_marker(
     pool: &PgPool,
     account: &str,
