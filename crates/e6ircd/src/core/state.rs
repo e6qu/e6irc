@@ -362,6 +362,10 @@ pub(crate) struct ServerState {
     /// on TOPIC; restored when a registered channel is recreated so its
     /// topic survives the channel going empty.
     pub registered_topics: HashMap<ChanKey, Topic>,
+    /// Registered channels whose ChanServ KEEPTOPIC option is OFF. Topic
+    /// retention is on by default (absence ⇒ on), so only the exceptions
+    /// live here; boot-loaded and updated on `SET KEEPTOPIC`.
+    pub keeptopic_off: HashSet<ChanKey>,
     /// Per-channel access: channel → (folded account → flag chars, e.g.
     /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
     /// auto-op / auto-voice on join.
@@ -411,6 +415,7 @@ impl ServerState {
             read_markers: HashMap::new(),
             registered_founders: HashMap::new(),
             registered_topics: HashMap::new(),
+            keeptopic_off: HashSet::new(),
             channel_access: HashMap::new(),
             server_bans: Vec::new(),
             whowas: std::collections::VecDeque::new(),
@@ -538,6 +543,16 @@ impl ServerState {
                 )
             })
             .collect();
+    }
+
+    /// Load the registered channels whose KEEPTOPIC is OFF (by folded name).
+    pub fn preload_keeptopic_off(&mut self, names: Vec<String>) {
+        self.keeptopic_off = names.into_iter().map(ChanKey).collect();
+    }
+
+    /// Whether `key` retains its topic across empty→recreate (default on).
+    pub fn keeptopic(&self, key: &ChanKey) -> bool {
+        !self.keeptopic_off.contains(key)
     }
 
     /// Load persisted channel access as `(name_folded, account_folded,

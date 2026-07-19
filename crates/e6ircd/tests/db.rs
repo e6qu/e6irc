@@ -1050,6 +1050,56 @@ async fn channel_topic_persist_and_load() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_keeptopic_persist_and_load() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "boss", "pw")
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#c', '#c', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+
+    // Default is on, so nothing is listed as an exception.
+    assert!(
+        db::list_keeptopic_off(&pool)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+
+    // Turn it off → it appears in the off-list.
+    db::set_channel_keeptopic(&pool, "#c", false)
+        .await
+        .expect("off");
+    assert_eq!(
+        db::list_keeptopic_off(&pool).await.expect("list"),
+        vec!["#c".to_string()]
+    );
+
+    // Back on → the exception clears.
+    db::set_channel_keeptopic(&pool, "#c", true)
+        .await
+        .expect("on");
+    assert!(
+        db::list_keeptopic_off(&pool)
+            .await
+            .expect("list")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_access_persist_and_load() {
     let pool = db::connect_and_migrate(&test_db_url())
         .await

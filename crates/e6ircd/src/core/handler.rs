@@ -1227,11 +1227,63 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                 );
             }
         }
+        "KEEPTOPIC" => {
+            let on = match args.get(2).map(|v| v.to_ascii_uppercase()) {
+                Some(v) if v == "ON" => true,
+                Some(v) if v == "OFF" => false,
+                _ => {
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        "Syntax: SET <#channel> KEEPTOPIC <ON|OFF>",
+                    );
+                    return;
+                }
+            };
+            if on {
+                state.keeptopic_off.remove(&key);
+            } else {
+                state.keeptopic_off.insert(key.clone());
+                // Drop any retained topic so it can't be restored later.
+                if state.registered_topics.remove(&key).is_some() {
+                    let clear = super::DbRequest::SetChannelTopic {
+                        channel: key.as_str().to_string(),
+                        topic: None,
+                    };
+                    if state.db_tx.try_push(clear).is_err() {
+                        eprintln!(
+                            "chanserv: db queue full; cleared topic for {} not persisted",
+                            key.as_str()
+                        );
+                    }
+                }
+            }
+            let request = super::DbRequest::SetChannelKeeptopic {
+                channel: key.as_str().to_string(),
+                keeptopic: on,
+            };
+            if state.db_tx.try_push(request).is_err() {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Services are temporarily unavailable. Try again later.",
+                );
+                return;
+            }
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!(
+                    "KEEPTOPIC for \x02{channel}\x02 is now \x02{}\x02.",
+                    if on { "ON" } else { "OFF" }
+                ),
+            );
+        }
         other => {
             state.service_notice(
                 conn,
                 "ChanServ",
-                &format!("Unknown SET option \x02{other}\x02. Available: FOUNDER."),
+                &format!("Unknown SET option \x02{other}\x02. Available: FOUNDER, KEEPTOPIC."),
             );
         }
     }
@@ -2171,8 +2223,10 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
     state.broadcast_channel(&key, &line, None);
 
     // A registered channel retains its topic across an empty→recreate
-    // cycle: keep the hot copy in sync and persist it.
-    if state.is_registered(&key) {
+    // cycle: keep the hot copy in sync and persist it — unless its
+    // ChanServ KEEPTOPIC option is OFF, in which case the topic lives only
+    // as long as the channel does.
+    if state.is_registered(&key) && state.keeptopic(&key) {
         match &new_topic {
             Some(t) => {
                 state.registered_topics.insert(key.clone(), t.clone());

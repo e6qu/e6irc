@@ -125,6 +125,12 @@ pub enum DbRequest {
         channel: String,
         topic: Option<(String, String, u64)>,
     },
+    /// Persist a registered channel's KEEPTOPIC option (fire-and-forget).
+    SetChannelKeeptopic {
+        /// Casefolded channel name.
+        channel: String,
+        keeptopic: bool,
+    },
     /// Persist one channel access entry (fire-and-forget). `flags: None`
     /// removes the entry.
     SetChannelAccess {
@@ -260,6 +266,11 @@ impl Core {
     /// loop starts (see [`ServerState::preload_topics`]).
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
         self.state.preload_topics(rows);
+    }
+
+    /// Seed the KEEPTOPIC-off set from persisted folded channel names.
+    pub fn preload_keeptopic_off(&mut self, names: Vec<String>) {
+        self.state.preload_keeptopic_off(names);
     }
 
     /// Seed the channel-access map from persisted rows before the worker

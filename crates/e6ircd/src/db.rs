@@ -318,6 +318,12 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::SetChannelKeeptopic { channel, keeptopic } => {
+            if let Err(e) = set_channel_keeptopic(pool, &channel, keeptopic).await {
+                eprintln!("db: channel keeptopic persistence failed: {e}");
+            }
+            true
+        }
         DbRequest::SetChannelAccess {
             channel,
             account,
@@ -1209,6 +1215,30 @@ pub async fn list_channel_topics(
         .into_iter()
         .map(|(n, t, s, ts)| (n, t, s, ts as u64))
         .collect())
+}
+
+/// Persist a registered channel's KEEPTOPIC option on its `channels` row.
+pub async fn set_channel_keeptopic(
+    pool: &PgPool,
+    channel_folded: &str,
+    keeptopic: bool,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE channels SET keeptopic = $2 WHERE name_folded = $1")
+        .bind(channel_folded)
+        .bind(keeptopic)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// The folded names of registered channels whose KEEPTOPIC is OFF — the
+/// exceptions boot-loaded into the hot set (default is on).
+pub async fn list_keeptopic_off(pool: &PgPool) -> Result<Vec<String>, DbError> {
+    sqlx::query_scalar("SELECT name_folded FROM channels WHERE NOT keeptopic")
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)
 }
 
 /// Delete `account`'s network `name`. Returns whether a row was removed.
