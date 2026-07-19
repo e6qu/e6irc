@@ -139,6 +139,12 @@ Done:
   `id_token_hint` + `post_logout_redirect_uri`, ending the upstream SSO
   session too (the id token + provider are stored per session, migration
   0019). Provider config gains optional `scopes` + `end_session_endpoint`.
+  Migration 0020 retained issuer/subject/session-ID correlation and consumed
+  logout token IDs. Signed OpenID Connect back-channel logout at
+  `POST /api/v1/auth/oidc/backchannel-logout` and front-channel logout at
+  `GET /api/v1/auth/oidc/frontchannel-logout?iss=…&sid=…` revoked the matching
+  durable sessions, including sessions on other devices, while rejecting
+  signature, claim, audience, issuer, time-window, and replay failures.
   Verified end-to-end against dockerized dex + PostgreSQL.
 
 ## Phase 5 — History + multiplexer + local always-on ✅ (2026-07-19)

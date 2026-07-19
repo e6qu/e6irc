@@ -6,9 +6,10 @@
 //   network  — the BNC network to attach to (required for chat)
 //   channel  — the channel the composer targets (optional)
 
-import htmx from "htmx.org";
-import "htmx-ext-ws";
 import "./style.css";
+
+const htmx = window.htmx;
+if (!htmx) throw new Error("the vendored htmx runtime did not load");
 
 const params = new URLSearchParams(window.location.search);
 const network = params.get("network");

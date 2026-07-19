@@ -1421,9 +1421,17 @@ async fn oidc_web_session_records_logout_hint() {
     );
 
     // An OIDC session records the id token + provider for RP-initiated logout.
-    let sso = db::create_oidc_web_session(&pool, "alice", "the.id.token", "shauth")
-        .await
-        .expect("sso");
+    let sso = db::create_oidc_web_session(
+        &pool,
+        "alice",
+        "the.id.token",
+        "shauth",
+        "https://auth.example",
+        "alice-subject",
+        Some("alice-session"),
+    )
+    .await
+    .expect("sso");
     assert_eq!(
         db::session_logout_hint(&pool, &sso).await.expect("hint"),
         (Some("the.id.token".to_string()), Some("shauth".to_string()))
@@ -1432,5 +1440,91 @@ async fn oidc_web_session_records_logout_hint() {
     assert_eq!(
         db::session_account(&pool, &sso).await.expect("acct"),
         Some("alice".to_string())
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    let first = db::create_oidc_web_session(
+        &pool,
+        "alice",
+        "first.id.token",
+        "shauth",
+        "https://auth.example",
+        "alice-subject",
+        Some("first-session"),
+    )
+    .await
+    .expect("first session");
+    let second = db::create_oidc_web_session(
+        &pool,
+        "alice",
+        "second.id.token",
+        "shauth",
+        "https://auth.example",
+        "alice-subject",
+        Some("second-session"),
+    )
+    .await
+    .expect("second session");
+
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_secs() as i64
+        + 600;
+    assert_eq!(
+        db::consume_oidc_backchannel_logout(
+            &pool,
+            "https://auth.example",
+            Some("alice-subject"),
+            Some("first-session"),
+            "logout-token-1",
+            expires,
+        )
+        .await
+        .expect("consume logout"),
+        1
+    );
+    assert_eq!(
+        db::session_account(&pool, &first).await.expect("first"),
+        None
+    );
+    assert_eq!(
+        db::session_account(&pool, &second).await.expect("second"),
+        Some("alice".to_string())
+    );
+    assert!(matches!(
+        db::consume_oidc_backchannel_logout(
+            &pool,
+            "https://auth.example",
+            Some("alice-subject"),
+            Some("first-session"),
+            "logout-token-1",
+            expires,
+        )
+        .await,
+        Err(db::DbError::ReplayedLogoutToken)
+    ));
+    assert_eq!(
+        db::revoke_oidc_frontchannel_sessions(&pool, "https://auth.example", "second-session")
+            .await
+            .expect("front-channel logout"),
+        1
+    );
+    assert_eq!(
+        db::session_account(&pool, &second).await.expect("second"),
+        None
     );
 }

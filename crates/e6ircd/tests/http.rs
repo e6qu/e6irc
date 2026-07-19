@@ -374,6 +374,8 @@ async fn openapi_spec_is_served() {
         "{body}"
     );
     assert!(v["paths"]["/healthz"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
+    assert!(v["paths"]["/api/v1/auth/oidc/frontchannel-logout"]["get"].is_object());
     assert!(v["components"]["securitySchemes"]["bearer"].is_object());
 }
 
@@ -1052,9 +1054,17 @@ async fn rp_initiated_logout_redirects_to_provider() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_oidc_web_session(&pool, "alice", "the.id.token", "shauth")
-        .await
-        .expect("sso session");
+    let session = e6ircd::db::create_oidc_web_session(
+        &pool,
+        "alice",
+        "the.id.token",
+        "shauth",
+        "https://auth.example",
+        "alice-subject",
+        Some("alice-session"),
+    )
+    .await
+    .expect("sso session");
     drop(pool);
 
     let config = Config {
@@ -1110,6 +1120,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         location.contains("id_token_hint=the.id.token"),
         "{location}"
     );
+    assert!(location.contains("client_id=e6irc"), "{location}");
     assert!(
         location.contains("post_logout_redirect_uri=https"),
         "{location}"

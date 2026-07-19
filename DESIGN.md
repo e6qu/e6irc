@@ -514,6 +514,15 @@ kind of account the OIDC first-login path creates.
   `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing fragment/API
   routes require the custom header htmx always sends (`HX-Request`) plus
   origin check; plain-form POSTs carry a per-session token.
+- Coordinated logout: the session retained its OIDC issuer, subject, session
+  ID, provider, and ID token. `GET /api/v1/auth/logout` performed
+  RP-initiated logout through the provider `end_session_endpoint` with the ID
+  token, client ID, and registered post-logout URI. The provider called
+  `POST /api/v1/auth/oidc/backchannel-logout` with a signed logout token, or
+  loaded `GET /api/v1/auth/oidc/frontchannel-logout?iss=…&sid=…`; both paths
+  revoked the correlated durable sessions. Back-channel token signatures,
+  issuer, audience, event, time, `sid`/`sub`, and `jti` were verified, and
+  consumed token IDs were retained until expiry to reject replay.
 
 ### 9.3 IRC client authentication
 

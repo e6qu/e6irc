@@ -26,6 +26,7 @@ pub enum DbError {
     DuplicateNetwork(String),
     /// Unknown account or wrong password (indistinguishable on purpose).
     BadCredentials,
+    ReplayedLogoutToken,
 }
 
 impl std::fmt::Display for DbError {
@@ -38,6 +39,7 @@ impl std::fmt::Display for DbError {
             Self::DuplicateAccount(n) => write!(f, "account already exists: {n}"),
             Self::DuplicateNetwork(n) => write!(f, "network already exists: {n}"),
             Self::BadCredentials => write!(f, "invalid account or password"),
+            Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
         }
     }
 }
@@ -1408,7 +1410,7 @@ fn token_hash(token: &str) -> Vec<u8> {
 /// Mint a web session for an account: opaque 32-byte token returned to
 /// the caller; only its SHA-256 is stored. 14-day expiry.
 pub async fn create_web_session(pool: &PgPool, account: &str) -> Result<String, DbError> {
-    create_web_session_full(pool, account, None, None).await
+    create_web_session_full(pool, account, None, None, None, None, None).await
 }
 
 /// Like [`create_web_session`], but records the OIDC `id_token` and the
@@ -1419,8 +1421,20 @@ pub async fn create_oidc_web_session(
     account: &str,
     id_token: &str,
     provider: &str,
+    issuer: &str,
+    subject: &str,
+    sid: Option<&str>,
 ) -> Result<String, DbError> {
-    create_web_session_full(pool, account, Some(id_token), Some(provider)).await
+    create_web_session_full(
+        pool,
+        account,
+        Some(id_token),
+        Some(provider),
+        Some(issuer),
+        Some(subject),
+        sid,
+    )
+    .await
 }
 
 async fn create_web_session_full(
@@ -1428,6 +1442,9 @@ async fn create_web_session_full(
     account: &str,
     id_token: Option<&str>,
     provider: Option<&str>,
+    issuer: Option<&str>,
+    subject: Option<&str>,
+    sid: Option<&str>,
 ) -> Result<String, DbError> {
     use argon2::password_hash::rand_core::RngCore;
     let mut bytes = [0u8; 32];
@@ -1435,14 +1452,18 @@ async fn create_web_session_full(
     let token = e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-");
     let folded = CaseMapping::Rfc1459.casefold(account);
     let inserted = sqlx::query(
-        "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider)
-         SELECT $1, a.id, now() + interval '14 days', $3, $4
+        "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider,
+                                   oidc_issuer, oidc_subject, oidc_sid)
+         SELECT $1, a.id, now() + interval '14 days', $3, $4, $5, $6, $7
          FROM accounts a WHERE a.name_folded = $2",
     )
     .bind(token_hash(&token))
     .bind(&folded)
     .bind(id_token)
     .bind(provider)
+    .bind(issuer)
+    .bind(subject)
+    .bind(sid)
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
@@ -1450,6 +1471,74 @@ async fn create_web_session_full(
         return Err(DbError::BadCredentials);
     }
     Ok(token)
+}
+
+/// Atomically consumes a signed back-channel logout token and revokes only
+/// the sessions correlated by its issuer plus `sid`/`sub` claims.
+pub async fn consume_oidc_backchannel_logout(
+    pool: &PgPool,
+    issuer: &str,
+    subject: Option<&str>,
+    sid: Option<&str>,
+    jti: &str,
+    expires_at: i64,
+) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM oidc_logout_tokens WHERE expires_at <= now()")
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+    let inserted = sqlx::query(
+        "INSERT INTO oidc_logout_tokens (issuer, jti, expires_at)
+         VALUES ($1, $2, to_timestamp($3)) ON CONFLICT DO NOTHING",
+    )
+    .bind(issuer)
+    .bind(jti)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    if inserted.rows_affected() != 1 {
+        return Err(DbError::ReplayedLogoutToken);
+    }
+    let deleted = match sid {
+        Some(sid) => sqlx::query(
+            "DELETE FROM web_sessions
+                 WHERE oidc_issuer = $1 AND oidc_sid = $2
+                   AND ($3::text IS NULL OR oidc_subject = $3)",
+        )
+        .bind(issuer)
+        .bind(sid)
+        .bind(subject)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?,
+        None => {
+            sqlx::query("DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_subject = $2")
+                .bind(issuer)
+                .bind(subject.expect("validated logout token has sid or sub"))
+                .execute(&mut *tx)
+                .await
+                .map_err(DbError::Query)?
+        }
+    };
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(deleted.rows_affected())
+}
+
+/// Revoke sessions named by a verified front-channel issuer/session pair.
+pub async fn revoke_oidc_frontchannel_sessions(
+    pool: &PgPool,
+    issuer: &str,
+    sid: &str,
+) -> Result<u64, DbError> {
+    let deleted = sqlx::query("DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_sid = $2")
+        .bind(issuer)
+        .bind(sid)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(deleted.rows_affected())
 }
 
 /// The OIDC `(id_token, provider)` recorded with a session, for RP-initiated
