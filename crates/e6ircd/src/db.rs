@@ -344,6 +344,17 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             true
         }
+        DbRequest::AuditLog {
+            actor,
+            action,
+            target,
+            detail,
+        } => {
+            if let Err(e) = insert_audit_log(pool, &actor, &action, &target, &detail).await {
+                eprintln!("db: audit log write failed: {e}");
+            }
+            true
+        }
         DbRequest::LogMessage { .. } => unreachable!("batched by the caller"),
     }
 }
@@ -649,6 +660,42 @@ pub async fn remove_kline(pool: &PgPool, mask: &str) -> Result<(), DbError> {
         .await
         .map_err(DbError::Query)?;
     Ok(())
+}
+
+/// Record one privileged action in the audit trail.
+pub async fn insert_audit_log(
+    pool: &PgPool,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) -> Result<(), DbError> {
+    sqlx::query("INSERT INTO audit_log (actor, action, target, detail) VALUES ($1, $2, $3, $4)")
+        .bind(actor)
+        .bind(action)
+        .bind(target)
+        .bind(detail)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// The most recent `limit` audit entries as `(actor, action, target,
+/// detail, created_at RFC3339)`, newest first — for the admin API.
+pub async fn list_audit_log(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(String, String, String, String, String)>, DbError> {
+    sqlx::query_as(
+        "SELECT actor, action, target, detail,
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         FROM audit_log ORDER BY id DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
 }
 
 /// Every server ban as `(mask, reason, set_by)` — boot-loaded into the

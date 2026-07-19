@@ -1181,3 +1181,29 @@ async fn klines_persist_and_load() {
         )]
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn audit_log_records_and_lists() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE audit_log")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::insert_audit_log(&pool, "god", "OPER", "god", "")
+        .await
+        .expect("a1");
+    db::insert_audit_log(&pool, "god", "KLINE", "baddie@*", "spam")
+        .await
+        .expect("a2");
+    let list = db::list_audit_log(&pool, 10).await.expect("list");
+    // newest-first
+    assert_eq!(list.len(), 2);
+    assert_eq!(
+        (&list[0].1, &list[0].2),
+        (&"KLINE".to_string(), &"baddie@*".to_string())
+    );
+    assert_eq!(&list[1].1, &"OPER".to_string());
+}
