@@ -64,6 +64,24 @@ hanging or silently dropping. Boy-scout: `route_command` collapsed to one
 auth-endpoint rate limiting (needs trusted-proxy config), `__Host-` cookie
 prefix, `logout_sso` GET-CSRF, and IRC-driver message-tag propagation.
 
+Fourth hardening sweep (2026-07-20): aimed at the least-audited surface (the
+web client, migrations, the persistence layer). Persistence: three tables
+grew without bound — `device_grants` (unauthenticated `/device/start` floods),
+`bnc_buffer` (per upstream line, also orphaned on network delete), and
+`web_sessions` (expired rows) — all now pruned/capped, with a supporting
+index migration. Fidelity: `MAXLIST=bqeI:100` is now enforced as a *combined*
+total (was per-list ≈400); a labeled-response wrapping a CHATHISTORY batch no
+longer emits a double `batch` tag; MONITOR reports the subset accepted before
+the cap. Web/HTTP: the clickjacking/MIME/referrer headers the auth pages set
+are now also on the app and account pages; OpenAPI documents the OIDC
+`/start` and `/callback` routes; the status fragment takes an enum; and
+`logout_sso` (GET) now requires the session CSRF token — clearing that
+deferred item. Still deferred: auth-endpoint rate limiting (trusted-proxy
+config), `__Host-` cookie prefix, IRC-driver message-tag propagation (a
+3-part change touching the shared client), and the CHATHISTORY whole-second
+pagination gap (needs millisecond ts). The XSS/injection surface of the web
+client and the SQL/index/constraint layer were audited and found sound.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

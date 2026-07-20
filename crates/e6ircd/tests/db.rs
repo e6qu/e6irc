@@ -1627,3 +1627,36 @@ async fn history_read_authorization_is_scoped() {
             .unwrap()
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn device_grants_are_pruned_on_create() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE device_grants")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    // An already-expired grant, as a never-approved /device/start flood leaves.
+    sqlx::query(
+        "INSERT INTO device_grants (device_code, user_code, expires_at)
+         VALUES ('dead', 'DEADDEAD', now() - interval '1 minute')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert expired");
+    // Creating a new grant prunes expired ones (unauthenticated growth guard).
+    db::create_device_grant(&pool).await.expect("create");
+    let expired: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM device_grants WHERE device_code = 'dead'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(expired, 0, "expired grant must be pruned on create");
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM device_grants")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(total, 1, "only the fresh grant should remain");
+}

@@ -209,11 +209,13 @@ mod web {
                 } else {
                     "no-cache"
                 };
-                (
+                let mut response = (
                     [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, cache)],
                     file.data.into_owned(),
                 )
-                    .into_response()
+                    .into_response();
+                security_headers(response.headers_mut());
+                response
             }
             None => problem(StatusCode::NOT_FOUND, "Not Found", None),
         }
@@ -547,7 +549,11 @@ mod pages {
 
     fn render<T: Template>(t: T) -> Response {
         match t.render() {
-            Ok(html) => Html(html).into_response(),
+            Ok(html) => {
+                let mut response = Html(html).into_response();
+                security_headers(response.headers_mut());
+                response
+            }
             Err(e) => {
                 eprintln!("template render error: {e}");
                 problem(StatusCode::INTERNAL_SERVER_ERROR, "Template error", None)
@@ -1381,6 +1387,29 @@ fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
+/// Frame/MIME/referrer protections for every HTML/app response. Uses only
+/// `frame-ancestors 'none'` (not a resource-restricting CSP), so it stops
+/// clickjacking without breaking the htmx app's script/style/WebSocket loads.
+/// The auth pages layer a stricter `default-src 'none'` CSP on top.
+fn security_headers(headers: &mut axum::http::HeaderMap) {
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        "DENY".parse().expect("static header"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "frame-ancestors 'none'".parse().expect("static header"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        "nosniff".parse().expect("static header"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        "no-referrer".parse().expect("static header"),
+    );
+}
+
 fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|part| {
@@ -1806,9 +1835,16 @@ async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::HeaderM
 /// returns directly to this application. An OIDC session whose provider is
 /// not configured for coordinated logout fails loudly instead of leaving the
 /// upstream SSO session active.
+#[derive(Deserialize)]
+struct LogoutQuery {
+    #[serde(default)]
+    csrf: Option<String>,
+}
+
 async fn logout_sso(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    Query(query): Query<LogoutQuery>,
 ) -> Response {
     let clear = "e6irc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string();
     let Some(pool) = &state.pool else {
@@ -1828,6 +1864,16 @@ async fn logout_sso(
         )
             .into_response();
     };
+    // Bind this destructive GET to the session's CSRF token, so a cross-site
+    // top-level navigation can't force-logout the victim. RP-initiated OIDC
+    // logout must stay a GET navigation, so the token rides the query string.
+    if !query
+        .csrf
+        .as_deref()
+        .is_some_and(|c| state.csrf_valid(&token, c))
+    {
+        return problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None);
+    }
     let (id_token, provider) = match crate::db::session_logout_hint(pool, &token).await {
         Ok(v) => v,
         Err(e) => {
@@ -1971,6 +2017,25 @@ async fn openapi() -> Response {
             "/api/v1/me": {
                 "get": { "summary": "The authenticated account", "security": bearer,
                     "responses": ok_json }
+            },
+            "/api/v1/auth/oidc/{provider}/start": {
+                "get": { "summary": "Begin interactive OIDC login (redirects to the provider)",
+                    "description": "Redirects the browser to the provider's authorization endpoint (code flow + PKCE) and sets a state-binding cookie the callback requires.",
+                    "parameters": [{ "name": "provider", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "responses": { "307": { "description": "redirect into the provider" },
+                        "404": { "description": "unknown provider" } } }
+            },
+            "/api/v1/auth/oidc/{provider}/callback": {
+                "get": { "summary": "OIDC redirect-back: exchange the code and establish the session",
+                    "description": "Verifies the state-binding cookie, exchanges the authorization code (with PKCE) for tokens, validates the ID token, provisions or logs into the account, and sets the session cookie.",
+                    "parameters": [
+                        { "name": "provider", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "code", "in": "query", "required": false, "schema": { "type": "string" } },
+                        { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } }
+                    ],
+                    "responses": { "303": { "description": "logged in; session cookie set" },
+                        "401": { "description": "state/code/token validation failed" } } }
             },
             "/api/v1/auth/oidc/{provider}/sso": {
                 "get": { "summary": "Silently probe for an existing SSO session (prompt=none)",
@@ -2470,10 +2535,10 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
                     }
                 }
                 Ok(DriverEvent::Connected) => {
-                    let _ = socket.send(WsMessage::text(render_status_fragment("connected"))).await;
+                    let _ = socket.send(WsMessage::text(render_status_fragment(ConnStatus::Connected))).await;
                 }
                 Ok(DriverEvent::Disconnected) => {
-                    let _ = socket.send(WsMessage::text(render_status_fragment("disconnected"))).await;
+                    let _ = socket.send(WsMessage::text(render_status_fragment(ConnStatus::Disconnected))).await;
                 }
                 Err(RecvError::Lagged(_)) => {}      // slow client: skip the gap
                 Err(RecvError::Closed) => break,      // driver gone
@@ -2564,11 +2629,27 @@ fn render_line_fragment(line: &str) -> String {
 }
 
 /// A connection-status change as an OOB swap of the status element.
-fn render_status_fragment(status: &str) -> String {
-    format!(
-        "<div id=\"status\" hx-swap-oob=\"true\" class=\"status status-{status}\">{}</div>",
-        html_escape(status)
-    )
+/// Connection state shown in the web UI's status fragment. An enum (not a
+/// free `&str`) so the value interpolated into the `class` attribute is
+/// closed and can never carry untrusted text.
+#[derive(Clone, Copy)]
+enum ConnStatus {
+    Connected,
+    Disconnected,
+}
+
+impl ConnStatus {
+    fn label(self) -> &'static str {
+        match self {
+            ConnStatus::Connected => "connected",
+            ConnStatus::Disconnected => "disconnected",
+        }
+    }
+}
+
+fn render_status_fragment(status: ConnStatus) -> String {
+    let s = status.label();
+    format!("<div id=\"status\" hx-swap-oob=\"true\" class=\"status status-{s}\">{s}</div>")
 }
 
 // ---- credential management ----------------------------------------------
