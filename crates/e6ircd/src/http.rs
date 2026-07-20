@@ -633,14 +633,57 @@ async fn discover_client(
     .set_redirect_uri(redirect))
 }
 
+/// TTL for a cached OIDC discovery document (and its JWKS). Bounds outbound
+/// fetches so an unauthenticated flood of login/logout requests can't amplify
+/// into one IdP round-trip each.
+const DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+
+#[allow(clippy::type_complexity)]
+fn discovery_cache() -> &'static std::sync::Mutex<
+    HashMap<
+        String,
+        (
+            std::time::Instant,
+            openidconnect::core::CoreProviderMetadata,
+        ),
+    >,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            HashMap<
+                String,
+                (
+                    std::time::Instant,
+                    openidconnect::core::CoreProviderMetadata,
+                ),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 async fn discover_metadata(
     provider: &OidcProviderConfig,
 ) -> Result<openidconnect::core::CoreProviderMetadata, String> {
     use openidconnect::IssuerUrl;
-    let issuer = IssuerUrl::new(provider.issuer_url.clone()).map_err(|e| e.to_string())?;
-    openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
-        .await
-        .map_err(|e| format!("discovery failed: {e}"))
+    let key = provider.issuer_url.clone();
+    // Serve a fresh cached document (which already carries the JWKS) without
+    // an outbound fetch.
+    if let Some((at, meta)) = discovery_cache().lock().expect("poisoned").get(&key)
+        && at.elapsed() < DISCOVERY_TTL
+    {
+        return Ok(meta.clone());
+    }
+    let issuer = IssuerUrl::new(key.clone()).map_err(|e| e.to_string())?;
+    let meta =
+        openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
+            .await
+            .map_err(|e| format!("discovery failed: {e}"))?;
+    discovery_cache()
+        .lock()
+        .expect("poisoned")
+        .insert(key, (std::time::Instant::now(), meta.clone()));
+    Ok(meta)
 }
 
 async fn oidc_start(
@@ -783,6 +826,29 @@ struct CallbackQuery {
     error: Option<String>,
 }
 
+/// Reduce a provider-supplied username to a safe nick-like account name:
+/// keep ASCII letters/digits and the RFC1459 "special" nick characters, drop
+/// everything else (spaces, control chars, tag/line separators). Falls back to
+/// `user` if nothing survives, and bounds the length.
+fn sanitize_account_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '`'
+                )
+        })
+        .take(32)
+        .collect();
+    if cleaned.is_empty() {
+        "user".to_string()
+    } else {
+        cleaned
+    }
+}
+
 async fn oidc_callback(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
@@ -916,6 +982,10 @@ async fn oidc_callback(
                 .and_then(|e| e.as_str().split('@').next().map(str::to_string))
         })
         .unwrap_or_else(|| "user".to_string());
+    // The provider-supplied name is echoed into IRC numerics/tags (WHOISACCOUNT,
+    // extended-join, account= tag); strip anything that isn't a safe nick-like
+    // character so a spaced/control-laden username can't split a line.
+    let preferred = sanitize_account_name(&preferred);
     let account =
         match crate::db::find_or_create_oidc_account(&pool, issuer, subject, &preferred).await {
             Ok(a) => a,
@@ -1298,6 +1368,17 @@ async fn authenticate(
         };
     }
     Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None))
+}
+
+/// Whether two URLs share an origin (scheme + host + port).
+fn same_origin(a: &str, b: &str) -> bool {
+    match (
+        openidconnect::url::Url::parse(a),
+        openidconnect::url::Url::parse(b),
+    ) {
+        (Ok(x), Ok(y)) => x.origin() == y.origin(),
+        _ => false,
+    }
 }
 
 fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
@@ -2331,6 +2412,23 @@ async fn ws_ui(
     Query(params): Query<UiParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // Reject a cross-origin WebSocket upgrade when a public_url is configured.
+    // SameSite=Lax already blocks the classic cross-site hijack (a Lax cookie
+    // isn't sent on a cross-site WS handshake); an explicit Origin allowlist
+    // also closes the same-site-subdomain gap. A missing Origin (a non-browser
+    // client) is allowed — it carries no ambient cookie authority.
+    if let Some(public) = state.public_url.as_deref()
+        && let Some(origin) = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        && !same_origin(origin, public)
+    {
+        return problem(
+            StatusCode::FORBIDDEN,
+            "Cross-origin WebSocket rejected",
+            None,
+        );
+    }
     let account = match authenticate(&state, &headers).await {
         Ok(a) => a,
         Err(response) => return response,

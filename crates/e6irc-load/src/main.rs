@@ -231,24 +231,33 @@ async fn client(
     run_start: Instant,
 ) -> std::io::Result<()> {
     let channel = args.channel_of(id);
-    let mut conn = connect(&args).await?;
-    conn.register(&format!("load{id}"), "load").await?;
-    conn.send_line(&format!("JOIN {channel}")).await?;
-    // Wait for end-of-names (366) so we know the join completed.
-    loop {
-        match conn.next_message().await? {
-            Some(m) if m.command == "366" => break,
-            Some(_) => {}
-            None => return Err(std::io::Error::other("closed before join")),
+    // Setup phase. A failure here must NOT bypass the barrier: if a client
+    // returned early with `?`, the remaining clients would block on the
+    // barrier forever (the exact at-capacity scenario the harness measures).
+    let setup = async {
+        let mut conn = connect(&args).await?;
+        conn.register(&format!("load{id}"), "load").await?;
+        conn.send_line(&format!("JOIN {channel}")).await?;
+        // Wait for end-of-names (366) so we know the join completed.
+        loop {
+            match conn.next_message().await? {
+                Some(m) if m.command == "366" => break,
+                Some(_) => {}
+                None => return Err(std::io::Error::other("closed before join")),
+            }
         }
+        metrics
+            .connect_max_ms
+            .fetch_max(run_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        Ok::<_, std::io::Error>(conn)
     }
-    metrics
-        .connect_max_ms
-        .fetch_max(run_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    .await;
 
-    // Everyone is joined before the senders burst, so no message is lost
-    // to a not-yet-joined receiver.
+    // Everyone reaches the barrier exactly once — even a client that failed
+    // setup releases its slot so the survivors are never wedged. Then propagate
+    // any setup error (counted as a failure by the caller).
     ready.wait().await;
+    let mut conn = setup?;
     let fanout_start = Instant::now();
 
     // The channel index doubles as this channel's sender id (ids

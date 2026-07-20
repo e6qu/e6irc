@@ -363,6 +363,17 @@ impl Config {
         if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 {
             return Err(ConfigError::Invalid("limits must be nonzero".into()));
         }
+        if self.max_hot_channels == 0 {
+            return Err(ConfigError::Invalid(
+                "max_hot_channels must be nonzero (0 retains no channel history)".into(),
+            ));
+        }
+        if self.limits.command_burst == Some(0) {
+            return Err(ConfigError::Invalid(
+                "limits.command_burst must be nonzero when set (0 flood-kills every command)"
+                    .into(),
+            ));
+        }
         if !self.oidc_providers.is_empty() {
             if self.database.is_none() {
                 return Err(ConfigError::Invalid(
@@ -666,6 +677,41 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("both shared and owned"), "{err}");
+    }
+
+    #[test]
+    fn zero_command_burst_is_rejected() {
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            limits: LimitsConfig {
+                command_burst: Some(0),
+                ..LimitsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "command_burst=0 flood-kills every command and must be rejected"
+        );
+    }
+
+    #[test]
+    fn zero_max_hot_channels_is_rejected() {
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            max_hot_channels: 0,
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "max_hot_channels=0 retains no history and must be rejected"
+        );
     }
 
     fn oidc_config(name: &str, issuer: &str, end_session: Option<&str>) -> Config {

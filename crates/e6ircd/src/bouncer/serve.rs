@@ -266,9 +266,19 @@ where
 {
     let (mut read, mut write) = tokio::io::split(stream);
 
-    let (account, network) = match handshake(&mut read, &mut write, pool, server_name).await? {
-        Registered::Ok { account, network } => (account, network),
-        Registered::Closed => return Ok(()),
+    // Bound the pre-attach handshake: a client that connects and never
+    // completes registration (sends nothing, or authenticates but never ends
+    // CAP negotiation) must not hold a task + socket indefinitely.
+    let (account, network) = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        handshake(&mut read, &mut write, pool, server_name),
+    )
+    .await
+    {
+        Ok(Ok(Registered::Ok { account, network })) => (account, network),
+        Ok(Ok(Registered::Closed)) => return Ok(()),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Ok(()), // handshake timed out
     };
 
     let Some(handle) = registry.get(&account, &network) else {

@@ -267,21 +267,14 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
     Ok((next, messages))
 }
 
-/// Relay a downstream IRC command upstream. Only channel PRIVMSGs to a
-/// bridged room are meaningful; others are dropped.
 /// Deliver a downstream PRIVMSG to Matrix. Returns `Some(target)` when a
 /// PRIVMSG could not be delivered because no bridged room maps to it, so the
 /// caller can surface the loss rather than dropping it silently.
 async fn handle_command(s: &mut Session, line: &str) -> Option<String> {
-    let msg = e6irc_proto::message::Message::parse(line).ok()?;
-    if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
-        return None;
-    }
-    let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
-        return None;
-    };
-    let Some(room_id) = s.channel_to_room.get(*target).cloned() else {
-        return Some(target.to_string()); // PRIVMSG to a non-bridged channel: lost
+    let (room_id, text) = match super::route_privmsg(line, &s.channel_to_room) {
+        super::RouteResult::Deliver(room_id, text) => (room_id, text),
+        super::RouteResult::Unmapped(target) => return Some(target),
+        super::RouteResult::Ignore => return None,
     };
     s.txn += 1;
     let txn = s.txn;
@@ -298,7 +291,7 @@ async fn handle_command(s: &mut Session, line: &str) -> Option<String> {
         .send()
         .await;
     if let Err(e) = send {
-        eprintln!("matrix: send to {target} failed: {e}");
+        eprintln!("matrix: send to room {room_id} failed: {e}");
     }
     None
 }

@@ -239,14 +239,21 @@ pub async fn start(config: Config) -> io::Result<Running> {
         let listener = TcpListener::bind(bnc.addr).await?;
         bnc_addr = Some(listener.local_addr()?);
         let server_name = config.server_name.clone();
+        // Same per-IP cap the IRC listeners apply, so an unauthenticated peer
+        // can't open unbounded BNC connections.
+        let bnc_limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
-                    Ok((stream, _peer)) => {
+                    Ok((stream, peer)) => {
+                        let Some(guard) = bnc_limiter.try_acquire(peer.ip()) else {
+                            continue; // at the per-IP cap: drop the connection
+                        };
                         let registry = registry.clone();
                         let server_name = server_name.clone();
                         let pool = pool.clone();
                         tokio::spawn(async move {
+                            let _guard = guard; // released when the connection ends
                             let _ = stream.set_nodelay(true);
                             let _ =
                                 crate::bouncer::bnc_serve(stream, registry, &pool, &server_name)

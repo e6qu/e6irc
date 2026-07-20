@@ -46,6 +46,24 @@ unmappable bridge commands are surfaced instead of silently dropped. Deferred
 limiting, `__Host-` cookie prefix, `/ws/ui` Origin check, and IRC-driver
 message-tag propagation for bouncer backlog.
 
+Third hardening sweep (2026-07-20): a pass over the less-trodden surface
+(services, CHATHISTORY, config, client crates, load harness). CHATHISTORY now
+FAILs INVALID_MSGREFTYPE / INVALID_PARAMS instead of returning empty batches
+or silently defaulting the limit; TOPICLEN/KICKLEN/AWAYLEN and WHOX/KICK:1 are
+advertised and the length limits enforced. A labeled-response `label` is now
+re-escaped before echo (it could inject a newline into the client's own
+stream); OIDC-provisioned account names are sanitized; config rejects
+`command_burst=0` / `max_hot_channels=0`. Implemented two of the deferred
+items: an OIDC discovery/JWKS TTL cache and a `/ws/ui` Origin check. Bouncer/
+clients: the BNC listener gained the per-IP cap + handshake timeout the IRC
+listener has, the IRC driver gained the connect/register timeout its Matrix
+sibling had, the load harness no longer deadlocks on a pre-barrier client
+failure, and the CLI/TUI surface JOIN-refusal / disconnected-send instead of
+hanging or silently dropping. Boy-scout: `route_command` collapsed to one
+`route_privmsg` choke point across all three bridges. Still deferred:
+auth-endpoint rate limiting (needs trusted-proxy config), `__Host-` cookie
+prefix, `logout_sso` GET-CSRF, and IRC-driver message-tag propagation.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

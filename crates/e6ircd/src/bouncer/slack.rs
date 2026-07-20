@@ -178,7 +178,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 }
             }
             cmd = ends.next_command() => match cmd {
-                Some(line) => match route_command(&line, &channel_to_id) {
+                Some(line) => match super::route_privmsg(&line, &channel_to_id) {
                     super::RouteResult::Deliver(id, text) => {
                         if let Err(e) =
                             post_message(&http, &base, &config.bot_token, &id, &text).await
@@ -259,25 +259,6 @@ fn parse_envelope(text: &str) -> Envelope {
 /// Render a Slack message as an IRC PRIVMSG line.
 fn render_privmsg(user: &str, channel: &str, text: &str) -> String {
     format!(":{user}!{user}@slack PRIVMSG {channel} :{text}")
-}
-
-/// A downstream IRC line → (channel id, text) if it is a PRIVMSG to a
-/// bridged channel; else `None`.
-fn route_command(line: &str, channel_to_id: &HashMap<String, String>) -> super::RouteResult {
-    use super::RouteResult;
-    let Ok(msg) = e6irc_proto::message::Message::parse(line) else {
-        return RouteResult::Ignore;
-    };
-    if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
-        return RouteResult::Ignore;
-    }
-    let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
-        return RouteResult::Ignore;
-    };
-    match channel_to_id.get(*target) {
-        Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
-        None => RouteResult::Unmapped(target.to_string()),
-    }
 }
 
 /// A Slack Web API response's `ok` field is the error contract: `false`
@@ -414,14 +395,14 @@ mod tests {
         );
         let mut map = HashMap::new();
         map.insert("#general".to_string(), "C1".to_string());
-        use crate::bouncer::RouteResult;
+        use crate::bouncer::{RouteResult, route_privmsg};
         assert_eq!(
-            route_command("PRIVMSG #general :hello", &map),
+            route_privmsg("PRIVMSG #general :hello", &map),
             RouteResult::Deliver("C1".to_string(), "hello".to_string())
         );
         // A PRIVMSG to a non-bridged channel is surfaced, not silently dropped.
         assert_eq!(
-            route_command("PRIVMSG #nope :x", &map),
+            route_privmsg("PRIVMSG #nope :x", &map),
             RouteResult::Unmapped("#nope".to_string())
         );
     }
