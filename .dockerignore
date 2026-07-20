@@ -1,0 +1,7 @@
+.git
+.github
+target
+web/dist
+web/node_modules
+vendor
+tools/load

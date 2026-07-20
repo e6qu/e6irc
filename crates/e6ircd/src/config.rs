@@ -370,11 +370,59 @@ impl Config {
                 ));
             }
             match &self.http {
-                Some(h) if h.public_url.is_some() => {}
+                Some(h)
+                    if h.public_url.as_deref().is_some_and(|value| {
+                        openidconnect::url::Url::parse(value).is_ok_and(|url| {
+                            matches!(url.scheme(), "http" | "https") && url.has_host()
+                        })
+                    }) => {}
                 _ => {
                     return Err(ConfigError::Invalid(
-                        "[[oidc]] requires [http] with public_url for redirect URIs".into(),
+                        "[[oidc]] requires [http] with an absolute HTTP(S) public_url for redirect URIs".into(),
                     ));
+                }
+            }
+            let mut provider_names = std::collections::HashSet::new();
+            for provider in &self.oidc_providers {
+                if provider.name.is_empty()
+                    || !provider
+                        .name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                {
+                    return Err(ConfigError::Invalid(
+                        "[[oidc]].name must contain only ASCII letters, digits, '-' or '_'".into(),
+                    ));
+                }
+                if !provider_names.insert(provider.name.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate OIDC provider name '{}'",
+                        provider.name
+                    )));
+                }
+                if provider.client_id.is_empty() || provider.client_secret.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "OIDC provider '{}' requires client_id and client_secret",
+                        provider.name
+                    )));
+                }
+                for (field, value) in [
+                    ("issuer_url", Some(provider.issuer_url.as_str())),
+                    (
+                        "end_session_endpoint",
+                        provider.end_session_endpoint.as_deref(),
+                    ),
+                ] {
+                    let Some(value) = value else { continue };
+                    let valid = openidconnect::url::Url::parse(value).is_ok_and(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.has_host()
+                    });
+                    if !valid {
+                        return Err(ConfigError::Invalid(format!(
+                            "OIDC provider '{}' has an invalid {field}",
+                            provider.name
+                        )));
+                    }
                 }
             }
         }
@@ -618,6 +666,63 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("both shared and owned"), "{err}");
+    }
+
+    fn oidc_config(name: &str, issuer: &str, end_session: Option<&str>) -> Config {
+        Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            http: Some(HttpConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                public_url: Some("https://chat.example".into()),
+                secure_cookies: true,
+                admin_accounts: vec![],
+            }),
+            database: Some(DatabaseConfig {
+                url: "postgres://db.example/e6irc".into(),
+            }),
+            oidc_providers: vec![OidcProviderConfig {
+                name: name.into(),
+                issuer_url: issuer.into(),
+                client_id: "e6irc".into(),
+                client_secret: "secret".into(),
+                scopes: vec![],
+                end_session_endpoint: end_session.map(str::to_string),
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn oidc_coordinates_are_validated_at_startup() {
+        oidc_config(
+            "shauth",
+            "https://auth.example",
+            Some("https://auth.example/oauth2/sessions/logout"),
+        )
+        .validate()
+        .expect("valid coordinates");
+
+        for (name, issuer, end_session) in [
+            (
+                "bad/name",
+                "https://auth.example",
+                Some("https://auth.example/logout"),
+            ),
+            ("shauth", "not a URL", Some("https://auth.example/logout")),
+            (
+                "shauth",
+                "https://auth.example",
+                Some("javascript:alert(1)"),
+            ),
+        ] {
+            assert!(
+                oidc_config(name, issuer, end_session).validate().is_err(),
+                "accepted invalid OIDC coordinates: {name} {issuer} {end_session:?}"
+            );
+        }
     }
 
     #[test]

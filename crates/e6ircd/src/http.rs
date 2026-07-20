@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -119,6 +119,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/oidc/{provider}/sso", get(oidc_sso_start))
         .route("/api/v1/auth/oidc/{provider}/link", get(oidc_link_start))
         .route("/api/v1/auth/oidc/{provider}/callback", get(oidc_callback))
+        .route(
+            "/api/v1/auth/oidc/backchannel-logout",
+            post(oidc_backchannel_logout),
+        )
+        .route(
+            "/api/v1/auth/oidc/frontchannel-logout",
+            get(oidc_frontchannel_logout),
+        )
         .route("/api/v1/me/identities", get(me_identities))
         .route("/api/v1/auth/logout", post(logout).get(logout_sso))
         .route("/api/v1/auth/device/start", post(device_start))
@@ -164,6 +172,7 @@ pub fn router(state: AppState) -> Router {
     let router = router
         .route("/", get(web::index))
         .route("/htmx.min.js", get(web::htmx))
+        .route("/ws.min.js", get(web::htmx_ws))
         .route("/assets/{*path}", get(web::asset));
     router
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
@@ -177,6 +186,11 @@ pub fn router(state: AppState) -> Router {
 #[cfg(feature = "embed-web")]
 mod web {
     use super::*;
+
+    #[derive(Default, Deserialize)]
+    pub struct EntryQuery {
+        sso: Option<String>,
+    }
 
     #[derive(rust_embed::Embed)]
     #[folder = "../../web/dist"]
@@ -216,8 +230,29 @@ mod web {
         }
     }
 
-    pub async fn index() -> Response {
-        serve("index.html")
+    /// The application entry point is an authentication boundary, not a
+    /// public static file. An existing local session renders the client. A
+    /// browser with only an upstream SSO session is sent through a silent
+    /// OpenID Connect authorization request, while a completed silent probe
+    /// without an upstream session lands on the interactive login page.
+    pub async fn index(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Query(query): Query<EntryQuery>,
+    ) -> Response {
+        match authenticate(&state, &headers).await {
+            Ok(_) => serve("index.html"),
+            Err(response) if response.status() != StatusCode::UNAUTHORIZED => response,
+            Err(_) if query.sso.as_deref() == Some("none") => {
+                Redirect::to("/login").into_response()
+            }
+            Err(_) if state.oidc_providers.len() == 1 => Redirect::temporary(&format!(
+                "/api/v1/auth/oidc/{}/sso",
+                state.oidc_providers[0].name
+            ))
+            .into_response(),
+            Err(_) => Redirect::to("/login").into_response(),
+        }
     }
 
     pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
@@ -228,6 +263,10 @@ mod web {
     /// server-rendered askama pages, which aren't part of the Vite bundle.
     pub async fn htmx() -> Response {
         serve("htmx.min.js")
+    }
+
+    pub async fn htmx_ws() -> Response {
+        serve("ws.min.js")
     }
 }
 
@@ -508,12 +547,8 @@ async fn discover_client(
     state: &AppState,
     provider: &OidcProviderConfig,
 ) -> Result<OidcClient, String> {
-    use openidconnect::{ClientId, ClientSecret, IssuerUrl, RedirectUrl};
-    let issuer = IssuerUrl::new(provider.issuer_url.clone()).map_err(|e| e.to_string())?;
-    let metadata =
-        openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
-            .await
-            .map_err(|e| format!("discovery failed: {e}"))?;
+    use openidconnect::{ClientId, ClientSecret, RedirectUrl};
+    let metadata = discover_metadata(provider).await?;
     let public_url = state
         .public_url
         .as_deref()
@@ -530,6 +565,16 @@ async fn discover_client(
         Some(ClientSecret::new(provider.client_secret.clone())),
     )
     .set_redirect_uri(redirect))
+}
+
+async fn discover_metadata(
+    provider: &OidcProviderConfig,
+) -> Result<openidconnect::core::CoreProviderMetadata, String> {
+    use openidconnect::IssuerUrl;
+    let issuer = IssuerUrl::new(provider.issuer_url.clone()).map_err(|e| e.to_string())?;
+    openidconnect::core::CoreProviderMetadata::discover_async(issuer, &oidc_http_client())
+        .await
+        .map_err(|e| format!("discovery failed: {e}"))
 }
 
 async fn oidc_start(
@@ -722,6 +767,9 @@ async fn oidc_callback(
     };
     let issuer = claims.issuer().as_str();
     let subject = claims.subject().as_str();
+    let sid = jwt_string_claim(&id_token.to_string(), "sid")
+        .ok()
+        .flatten();
     // Link flow: attach this identity to the account that started it,
     // rather than logging in / provisioning a new account.
     if let Some(account) = &pending.link_account {
@@ -768,20 +816,27 @@ async fn oidc_callback(
     // Record the id token + provider so logout can end the provider's SSO
     // session (RP-initiated logout), not just the local e6irc session.
     let id_token_raw = id_token.to_string();
-    let token =
-        match crate::db::create_oidc_web_session(&pool, &account, &id_token_raw, &pending.provider)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("oidc: session creation failed: {e}");
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Session storage failed",
-                    None,
-                );
-            }
-        };
+    let token = match crate::db::create_oidc_web_session(
+        &pool,
+        &account,
+        &id_token_raw,
+        &pending.provider,
+        issuer,
+        subject,
+        sid.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("oidc: session creation failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            );
+        }
+    };
     let secure = if state.secure_cookies { "; Secure" } else { "" };
     (
         StatusCode::SEE_OTHER,
@@ -794,6 +849,275 @@ async fn oidc_callback(
                 ),
             ),
         ],
+    )
+        .into_response()
+}
+
+const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/backchannel-logout";
+
+#[derive(Deserialize)]
+struct BackchannelLogoutForm {
+    logout_token: String,
+}
+
+#[derive(Deserialize)]
+struct FrontchannelLogoutQuery {
+    iss: String,
+    sid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AudienceClaim {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl AudienceClaim {
+    fn contains(&self, expected: &str) -> bool {
+        match self {
+            Self::One(value) => value == expected,
+            Self::Many(values) => values.iter().any(|value| value == expected),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BackchannelLogoutClaims {
+    iss: String,
+    aud: AudienceClaim,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    sid: Option<String>,
+    iat: i64,
+    #[serde(default)]
+    exp: Option<i64>,
+    jti: String,
+    events: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    nonce: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogoutTokenHeader {
+    alg: openidconnect::core::CoreJwsSigningAlgorithm,
+    #[serde(default)]
+    kid: Option<String>,
+    #[serde(default)]
+    typ: Option<String>,
+}
+
+fn base64url_decode(segment: &str) -> Result<Vec<u8>, String> {
+    if segment.is_empty()
+        || segment.contains('=')
+        || !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("invalid base64url segment".into());
+    }
+    let mut standard = segment.replace('-', "+").replace('_', "/");
+    standard.extend(std::iter::repeat_n('=', (4 - standard.len() % 4) % 4));
+    e6irc_proto::base64::decode(&standard).ok_or_else(|| "invalid base64url segment".into())
+}
+
+fn jwt_string_claim(raw: &str, name: &str) -> Result<Option<String>, String> {
+    let segments: Vec<&str> = raw.split('.').collect();
+    if segments.len() != 3 {
+        return Err("JWT must have three segments".into());
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&base64url_decode(segments[1])?)
+        .map_err(|_| "JWT payload is not JSON")?;
+    Ok(payload
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
+fn verify_logout_token_with_metadata(
+    raw: &str,
+    provider: &OidcProviderConfig,
+    supported_algorithms: &[openidconnect::core::CoreJwsSigningAlgorithm],
+    keys: &[openidconnect::core::CoreJsonWebKey],
+    now: i64,
+) -> Result<BackchannelLogoutClaims, String> {
+    use openidconnect::JsonWebKey;
+
+    let segments: Vec<&str> = raw.split('.').collect();
+    if segments.len() != 3 {
+        return Err("logout token must have three segments".into());
+    }
+    let header: LogoutTokenHeader = serde_json::from_slice(&base64url_decode(segments[0])?)
+        .map_err(|_| "logout token header is invalid")?;
+    if header.typ.as_deref().is_some_and(|typ| typ != "logout+jwt") {
+        return Err("logout token type is invalid".into());
+    }
+    if !supported_algorithms.contains(&header.alg) {
+        return Err("logout token signing algorithm is not supported by the provider".into());
+    }
+    let signature = base64url_decode(segments[2])?;
+    let signing_input = format!("{}.{}", segments[0], segments[1]);
+    let valid_keys = keys
+        .iter()
+        .filter(|key| {
+            header
+                .kid
+                .as_deref()
+                .is_none_or(|kid| key.key_id().is_some_and(|key_id| key_id.as_str() == kid))
+        })
+        .filter(|key| {
+            key.verify_signature(&header.alg, signing_input.as_bytes(), &signature)
+                .is_ok()
+        })
+        .count();
+    if valid_keys != 1 {
+        return Err("logout token signature is invalid or ambiguous".into());
+    }
+    let claims: BackchannelLogoutClaims = serde_json::from_slice(&base64url_decode(segments[1])?)
+        .map_err(|_| "logout token claims are invalid")?;
+    let subject = claims
+        .sub
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let sid = claims
+        .sid
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    if claims.iss != provider.issuer_url
+        || !claims.aud.contains(&provider.client_id)
+        || claims.jti.trim().is_empty()
+        || claims.nonce.is_some()
+        || (subject.is_none() && sid.is_none())
+        || claims.iat < now - 600
+        || claims.iat > now + 60
+        || claims.exp.is_some_and(|exp| exp <= now)
+        || claims.events.len() != 1
+        || claims.events.get(BACKCHANNEL_LOGOUT_EVENT) != Some(&serde_json::json!({}))
+    {
+        return Err("logout token claims are invalid".into());
+    }
+    Ok(claims)
+}
+
+async fn oidc_backchannel_logout(
+    State(state): State<Arc<AppState>>,
+    form: Result<Form<BackchannelLogoutForm>, axum::extract::rejection::FormRejection>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No database configured",
+            None,
+        );
+    };
+    let Form(form) = match form {
+        Ok(value) => value,
+        Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
+    };
+    let unverified_issuer = match jwt_string_claim(form.logout_token.trim(), "iss") {
+        Ok(Some(value)) => value,
+        _ => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
+    };
+    let Some(provider) = state
+        .oidc_providers
+        .iter()
+        .find(|provider| provider.issuer_url == unverified_issuer)
+    else {
+        return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None);
+    };
+    let metadata = match discover_metadata(provider).await {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("oidc: logout metadata discovery failed: {error}");
+            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before Unix epoch")
+        .as_secs() as i64;
+    let claims = match verify_logout_token_with_metadata(
+        form.logout_token.trim(),
+        provider,
+        metadata.id_token_signing_alg_values_supported(),
+        metadata.jwks().keys(),
+        now,
+    ) {
+        Ok(value) => value,
+        Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
+    };
+    let expires_at = claims.exp.unwrap_or(claims.iat + 600);
+    match crate::db::consume_oidc_backchannel_logout(
+        pool,
+        &claims.iss,
+        claims.sub.as_deref(),
+        claims.sid.as_deref(),
+        &claims.jti,
+        expires_at,
+    )
+    .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(crate::db::DbError::ReplayedLogoutToken) => {
+            problem(StatusCode::BAD_REQUEST, "Invalid logout token", None)
+        }
+        Err(error) => {
+            eprintln!("oidc: back-channel session revocation failed: {error}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            )
+        }
+    }
+}
+
+async fn oidc_frontchannel_logout(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FrontchannelLogoutQuery>,
+) -> Response {
+    let Some(pool) = &state.pool else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No database configured",
+            None,
+        );
+    };
+    if query.sid.trim().is_empty()
+        || !state
+            .oidc_providers
+            .iter()
+            .any(|provider| provider.issuer_url == query.iss)
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid front-channel logout",
+            None,
+        );
+    }
+    if let Err(error) =
+        crate::db::revoke_oidc_frontchannel_sessions(pool, &query.iss, &query.sid).await
+    {
+        eprintln!("oidc: front-channel session revocation failed: {error}");
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session storage failed",
+            None,
+        );
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                header::SET_COOKIE,
+                "e6irc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+            ),
+        ],
+        "",
     )
         .into_response()
 }
@@ -1262,9 +1586,10 @@ async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::HeaderM
 /// navigate the browser to the identity provider's end-session endpoint so
 /// the provider's SSO session is ended too — not just the local one. This
 /// is a GET so the logout link is a top-level browser navigation (the
-/// provider requires that, not a cross-origin fetch). When the session has
-/// no upstream SSO (password/PAT) or the provider has no configured
-/// end-session endpoint, it degrades to a plain local logout.
+/// provider requires that, not a cross-origin fetch). A local-account session
+/// returns directly to this application. An OIDC session whose provider is
+/// not configured for coordinated logout fails loudly instead of leaving the
+/// upstream SSO session active.
 async fn logout_sso(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1284,7 +1609,63 @@ async fn logout_sso(
         Ok(v) => v,
         Err(e) => {
             eprintln!("http: logout hint lookup failed: {e}");
-            (None, None)
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            );
+        }
+    };
+    let provider_config = provider
+        .as_deref()
+        .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name));
+    let location = match (id_token, provider, provider_config) {
+        (Some(hint), Some(_), Some(provider)) => {
+            let Some(endpoint) = provider.end_session_endpoint.as_deref() else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "OIDC provider does not support coordinated logout",
+                    None,
+                );
+            };
+            let Some(public) = state.public_url.as_deref() else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Public application URL is not configured",
+                    None,
+                );
+            };
+            let mut url = match openidconnect::url::Url::parse(endpoint) {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "OIDC logout endpoint is invalid",
+                        None,
+                    );
+                }
+            };
+            url.query_pairs_mut()
+                .append_pair("id_token_hint", &hint)
+                .append_pair("client_id", &provider.client_id)
+                .append_pair("post_logout_redirect_uri", public.trim_end_matches('/'));
+            url.to_string()
+        }
+        (Some(_), _, _) | (None, Some(_), _) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OIDC session metadata is incomplete",
+                None,
+            );
+        }
+        (None, None, None) => "/".to_string(),
+        (None, None, Some(_)) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OIDC session metadata is inconsistent",
+                None,
+            );
         }
     };
     if let Err(e) = crate::db::delete_web_session(pool, &token).await {
@@ -1295,30 +1676,6 @@ async fn logout_sso(
             None,
         );
     }
-    // Build the provider's RP-initiated logout URL, if we have an id token
-    // hint, the provider exposes an end-session endpoint, and we know our
-    // own public URL to return to.
-    let end_session = provider
-        .as_deref()
-        .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name))
-        .and_then(|p| p.end_session_endpoint.clone());
-    let location = match (id_token, end_session) {
-        (Some(hint), Some(endpoint)) => match openidconnect::url::Url::parse(&endpoint) {
-            Ok(mut url) => {
-                url.query_pairs_mut().append_pair("id_token_hint", &hint);
-                if let Some(public) = &state.public_url {
-                    url.query_pairs_mut()
-                        .append_pair("post_logout_redirect_uri", public.trim_end_matches('/'));
-                }
-                url.to_string()
-            }
-            Err(e) => {
-                eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
-                "/".to_string()
-            }
-        },
-        _ => "/".to_string(),
-    };
     (
         StatusCode::SEE_OTHER,
         [(header::LOCATION, location), (header::SET_COOKIE, clear)],
@@ -1399,10 +1756,45 @@ async fn openapi() -> Response {
             },
             "/api/v1/auth/logout": {
                 "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
-                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Degrades to a local logout for password/PAT sessions.",
+                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed.",
                     "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" } } },
                 "post": { "summary": "Local logout: clear the e6irc session only",
                     "responses": { "204": { "description": "session cleared" } } }
+            },
+            "/api/v1/auth/oidc/backchannel-logout": {
+                "post": {
+                    "summary": "OIDC Back-Channel Logout 1.0 receiver",
+                    "description": "Verifies a signed logout_token against the configured issuer's discovery document and JWKS, rejects replayed tokens, and revokes every local session correlated by sid or sub.",
+                    "requestBody": { "required": true, "content": {
+                        "application/x-www-form-urlencoded": { "schema": {
+                            "type": "object", "required": ["logout_token"],
+                            "properties": { "logout_token": { "type": "string" } }
+                        } }
+                    } },
+                    "responses": {
+                        "200": { "description": "correlated sessions revoked" },
+                        "400": { "description": "invalid or replayed logout token" },
+                        "502": { "description": "OIDC provider discovery or JWKS failed" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/auth/oidc/frontchannel-logout": {
+                "get": {
+                    "summary": "OIDC Front-Channel Logout 1.0 receiver",
+                    "description": "Revokes local sessions correlated by the exact configured issuer and sid, clears the browser session cookie, and returns a non-cacheable response.",
+                    "parameters": [
+                        { "name": "iss", "in": "query", "required": true,
+                            "schema": { "type": "string", "format": "uri" } },
+                        { "name": "sid", "in": "query", "required": true,
+                            "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "correlated sessions revoked" },
+                        "400": { "description": "missing or invalid issuer/session identifier" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
             },
             "/api/v1/auth/oidc/{provider}/link": {
                 "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
@@ -2545,5 +2937,112 @@ mod composer_tests {
         assert_eq!(slash_to_irc("/raw WHOIS bob", "#c"), "WHOIS bob");
         // unknown slash-command passes through (server answers 421)
         assert_eq!(slash_to_irc("/frobnicate x", "#c"), "FROBNICATE x");
+    }
+}
+
+#[cfg(test)]
+mod logout_tests {
+    use super::*;
+    use openidconnect::core::{CoreJwsSigningAlgorithm, CoreRsaPrivateSigningKey};
+    use openidconnect::{JsonWebKeyId, PrivateSigningKey};
+
+    const TEST_RSA_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAvKIZ7REtlhJ+LVEBmTVqJ2wlJ1e+l0KGylITuLiHF185w4Bm
+ulmkCtBoH6W7NqbXt3sgM6lKV1B50Za8JSz+m6cgMhO3fUmlxrhbVKh4s3N3oDz6
+ERlRH6gDIfpLg4Tzow5gMNt2hFmFpWvntlEcqFX91BR6ZAV7zXV42V3pNtQhkBCA
+7yKIOJFVd69gGwfQGXRTdUl8F8wX6JRrIrEfMpSz0bovUVlPCy6zqzU8v2mnEF5j
+7PK/56b/CSci5ZQJD4e2XkAAR1DQJ/LX6kiKf4jT2l84VNsFp+0bxTt87IcGp/7m
+Xq/MIFBqe1ww1Sso4lYWNS4TpBpH6aEv8kj6VQIDAQABAoIBABNy/kvWddYPpZFc
+FRdcLcwPRzxpfGYBrr6tHEnzQsCK6byJ4G2t4O9ZgibjMmyl4r+REyaoeZkLm+fb
+jB4kJ8NaRcRMCqMBJTXaW9ZcgYd1LBwqNVlufBIQw3PtJ/yRSIKjMJFRC4UFavV9
+rPg8IEGODjwf+WeXNibeyh1VZL6pjtCW+SA5eo8HViYyu3qCwYycEXkb/BxGVhNe
+lZgHkyMQItzZdVppWJCEtnOUmapsyzXta9cSlw/TduPDlSdaBYXrFS/Lrf5EKlXB
+wechrH4KsZ/31wKw0fBtwt6XhQ6WBEH1pXUmgAaea5icacAAAQ1E0FCbuF4h2Vfd
+7hq5HFkCgYEA4YsgmuBNjx/Waws2qfdjyUB6LDmyMobdV+Se+ZHr8ppY428VNHdG
+tLOFzA3hblx94wJoS8RWnugqGkwy1kj+eKbPApm19vtefTR8L5pnenphCt/FJKHt
+ZIFaPh26+8fNeraks951l03hbNsh9e5+wRRPc/dTSMNXuvtkiUsfEE0CgYEA1hsD
+ZsGNMr0b0cTCEc2EycDUkWZAV4bICXoDN16Vt3UwXbKi7SlIfG/qLqD4y+nXXnT3
+XORkBAm014HrsWX5ulmtUr0g09okjlbN96hKeTqOm9eMxUQQQtq4SP+Kvy0weW1h
+/F7e+0Km006Qw+W55m9w6HvaPnsbDSUfTOzr1ikCgYEAqCIF6U6ioroyJlQSqPux
+2HoHWWadT4s3/+h/Fj7QbGbhMpJBdX4hKF3XtPj3/0RV19+YjjrL8+PQVxBMqW96
+u8hl82NQwdA7bQyuMvJgh24pX2jW1usbQ9wlwL57AGy+4ea7uxZwBJ3bGUH1/BaR
+SS/x1todrNVqVgpHtQ1aF9UCgYBSaJlZjrwTQHiZt/resVUf9qmawVmYltcd1qmw
+QSatM10HY3+UeyRcSRNBGVJJ4lq0D586UOoyJ65EmMwoPtDtKiEtTIB7KmaRptWm
+Mk9f8+r6DvAu6XC82sS9zCYSSYlz42copTd8TH47rOzJif2QtWonAazSCb4yxAwV
+JsfraQKBgFoNm/o5GId1sqDOqGofHzsv4ESXfxFN/fPfFeaetTDWDdxy6VZOJJGY
+MwLJVyUtP7cOpP2iOixMg3DXCB8r2cs+ueh39qeHuPqaKh35teG07+RniASGsgNH
+ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
+-----END RSA PRIVATE KEY-----"#;
+
+    fn base64url(data: &[u8]) -> String {
+        e6irc_proto::base64::encode(data)
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string()
+    }
+
+    fn logout_token(payload: serde_json::Value) -> (String, openidconnect::core::CoreJsonWebKey) {
+        let key = CoreRsaPrivateSigningKey::from_pem(
+            TEST_RSA_KEY,
+            Some(JsonWebKeyId::new("logout-key".into())),
+        )
+        .expect("test RSA key");
+        let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
+        let header = base64url(br#"{"alg":"RS256","kid":"logout-key","typ":"logout+jwt"}"#);
+        let payload = base64url(&serde_json::to_vec(&payload).expect("payload"));
+        let input = format!("{header}.{payload}");
+        let signature = key.sign(&algorithm, input.as_bytes()).expect("sign");
+        (
+            format!("{input}.{}", base64url(&signature)),
+            key.as_verification_key(),
+        )
+    }
+
+    #[test]
+    fn verifies_signed_backchannel_logout_contract() {
+        let now = 1_800_000_000;
+        let (raw, key) = logout_token(serde_json::json!({
+            "iss": "https://auth.example",
+            "aud": ["e6irc", "another-audience"],
+            "sub": "subject-1",
+            "sid": "session-1",
+            "iat": now,
+            "exp": now + 600,
+            "jti": "logout-1",
+            "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
+        }));
+        let provider = OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "secret".into(),
+            scopes: vec![],
+            end_session_endpoint: None,
+        };
+        let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
+        let claims = verify_logout_token_with_metadata(
+            &raw,
+            &provider,
+            std::slice::from_ref(&algorithm),
+            std::slice::from_ref(&key),
+            now,
+        )
+        .expect("valid logout token");
+        assert_eq!(claims.sid.as_deref(), Some("session-1"));
+
+        let mut tampered = raw.into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        assert!(
+            verify_logout_token_with_metadata(
+                std::str::from_utf8(&tampered).expect("ASCII JWT"),
+                &provider,
+                std::slice::from_ref(&algorithm),
+                std::slice::from_ref(&key),
+                now,
+            )
+            .is_err()
+        );
     }
 }

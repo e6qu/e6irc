@@ -12,7 +12,8 @@
 #            E6IRC_ADMIN_ACCOUNTS (comma-separated)
 #            Shauth OIDC (all required together to enable SSO):
 #              E6IRC_OIDC_ISSUER  E6IRC_OIDC_CLIENT_ID  E6IRC_OIDC_CLIENT_SECRET
-#              E6IRC_OIDC_NAME (default shauth)  E6IRC_OIDC_END_SESSION
+#              E6IRC_OIDC_END_SESSION
+#              E6IRC_OIDC_NAME (default shauth)
 set -eu
 
 # Fail loudly on missing required config rather than starting half-configured.
@@ -50,14 +51,13 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
   if [ -n "${E6IRC_OIDC_ISSUER:-}" ]; then
     : "${E6IRC_OIDC_CLIENT_ID:?E6IRC_OIDC_CLIENT_ID is required when E6IRC_OIDC_ISSUER is set}"
     : "${E6IRC_OIDC_CLIENT_SECRET:?E6IRC_OIDC_CLIENT_SECRET is required when E6IRC_OIDC_ISSUER is set}"
+    : "${E6IRC_OIDC_END_SESSION:?E6IRC_OIDC_END_SESSION is required when E6IRC_OIDC_ISSUER is set}"
     printf '\n[[oidc]]\n'
     printf 'name = "%s"\n' "$(toml "${E6IRC_OIDC_NAME:-shauth}")"
     printf 'issuer_url = "%s"\n' "$(toml "$E6IRC_OIDC_ISSUER")"
     printf 'client_id = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_ID")"
     printf 'client_secret = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_SECRET")"
-    if [ -n "${E6IRC_OIDC_END_SESSION:-}" ]; then
-      printf 'end_session_endpoint = "%s"\n' "$(toml "$E6IRC_OIDC_END_SESSION")"
-    fi
+    printf 'end_session_endpoint = "%s"\n' "$(toml "$E6IRC_OIDC_END_SESSION")"
   fi
 } > "$CONFIG"
 

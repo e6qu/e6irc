@@ -10,6 +10,8 @@ node_modules/
 # before `cargo build --features embed-web`).
 web/node_modules/
 web/dist/
+web/public/htmx.min.js
+web/public/ws.min.js
 
 # Python bytecode (irctest controller, harnesses)
 __pycache__/

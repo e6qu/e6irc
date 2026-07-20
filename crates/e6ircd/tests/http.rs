@@ -334,19 +334,15 @@ async fn web_shell_is_served_at_root_when_embedded() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
     let (status, head, body) = request(http, &get("/")).await;
+    assert_eq!(status, 503);
+    assert!(head.to_lowercase().contains("problem+json"), "{head}");
+    assert!(body.contains("No database configured"), "{body}");
+
+    // Public runtime assets remain available so the login and account pages
+    // can use the same vendored client code without opening the application.
+    let (status, head, _) = request(http, &get("/htmx.min.js")).await;
     assert_eq!(status, 200);
-    assert!(head.to_lowercase().contains("text/html"), "{head}");
-    // The built Vite index references a hashed asset bundle.
-    assert!(body.contains("<title>e6irc</title>"), "{body}");
-    let asset = body
-        .split("/assets/")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("index should reference a built asset");
-    // That hashed asset is served with an immutable cache header.
-    let (status, head, _) = request(http, &get(&format!("/assets/{asset}"))).await;
-    assert_eq!(status, 200, "asset /assets/{asset}");
-    assert!(head.to_lowercase().contains("immutable"), "{head}");
+    assert!(head.to_lowercase().contains("javascript"), "{head}");
 }
 
 #[cfg(not(feature = "embed-web"))]
@@ -374,6 +370,8 @@ async fn openapi_spec_is_served() {
         "{body}"
     );
     assert!(v["paths"]["/healthz"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
+    assert!(v["paths"]["/api/v1/auth/oidc/frontchannel-logout"]["get"].is_object());
     assert!(v["components"]["securitySchemes"]["bearer"].is_object());
 }
 
@@ -481,6 +479,10 @@ async fn admin_accounts_endpoint_is_gated() {
         .execute(&pool)
         .await
         .expect("clean");
+    sqlx::query("TRUNCATE server_bans, audit_log RESTART IDENTITY")
+        .execute(&pool)
+        .await
+        .expect("clean operator state");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -1052,9 +1054,17 @@ async fn rp_initiated_logout_redirects_to_provider() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_oidc_web_session(&pool, "alice", "the.id.token", "shauth")
-        .await
-        .expect("sso session");
+    let session = e6ircd::db::create_oidc_web_session(
+        &pool,
+        "alice",
+        "the.id.token",
+        "shauth",
+        "https://auth.example",
+        "alice-subject",
+        Some("alice-session"),
+    )
+    .await
+    .expect("sso session");
     drop(pool);
 
     let config = Config {
@@ -1110,6 +1120,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         location.contains("id_token_hint=the.id.token"),
         "{location}"
     );
+    assert!(location.contains("client_id=e6irc"), "{location}");
     assert!(
         location.contains("post_logout_redirect_uri=https"),
         "{location}"
@@ -1121,4 +1132,148 @@ async fn rp_initiated_logout_redirects_to_provider() {
     );
     let (status, _, _) = request(http, &me).await;
     assert_eq!(status, 401, "session survived logout");
+}
+
+#[cfg(feature = "embed-web")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn application_entry_is_fail_closed_and_uses_silent_sso() {
+    use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.entry.example".into(),
+        network_name: "EntryNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("https://chat.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        oidc_providers: vec![OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "x".repeat(32),
+            scopes: vec![],
+            end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
+        }],
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let (status, headers, _) = request(http, &get("/")).await;
+    assert_eq!(status, 307, "{headers}");
+    assert!(
+        headers.contains("/api/v1/auth/oidc/shauth/sso"),
+        "{headers}"
+    );
+
+    let (status, headers, _) = request(http, &get("/?sso=none")).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(headers.contains("location: /login") || headers.contains("Location: /login"));
+
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, body) = request(http, &req).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(body.contains("id=\"account-name\""), "{body}");
+    assert!(body.contains("href=\"/api/v1/auth/logout\""), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn oidc_logout_without_end_session_configuration_fails_closed() {
+    use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
+    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    let session = e6ircd::db::create_oidc_web_session(
+        &pool,
+        "alice",
+        "the.id.token",
+        "shauth",
+        "https://auth.example",
+        "alice-subject",
+        Some("alice-session"),
+    )
+    .await
+    .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.fail-closed.example".into(),
+        network_name: "FailClosedNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("https://chat.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        oidc_providers: vec![OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "x".repeat(32),
+            scopes: vec![],
+            end_session_endpoint: None,
+        }],
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let logout = format!(
+        "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &logout).await;
+    assert_eq!(status, 503, "{body}");
+
+    let me = format!(
+        "GET /api/v1/me HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, _) = request(http, &me).await;
+    assert_eq!(
+        status, 200,
+        "logout failure must preserve the local session"
+    );
 }

@@ -3,11 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.15.1",
   "description": "e6irc web client (HTMX + Vite)",
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
-    "build": "mkdir -p public && cp node_modules/htmx.org/dist/htmx.min.js public/ && vite build",
+    "build": "mkdir -p public && cp node_modules/htmx.org/dist/htmx.min.js public/ && cp node_modules/htmx-ext-ws/dist/ws.min.js public/ && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -4,6 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>e6irc</title>
+    <script src="/htmx.min.js"></script>
+    <script>htmx.config.allowEval = false;</script>
+    <script src="/ws.min.js"></script>
     <script type="module" src="/src/main.js"></script>
   </head>
   <body>
@@ -11,6 +14,12 @@
       <header id="topbar">
         <span id="brand">e6irc</span>
         <span id="status" class="status status-connecting">connecting…</span>
+        <nav id="user-nav" aria-label="User">
+          <a id="account-link" href="/account" aria-label="Open my account">
+            <span id="account-name" aria-live="polite">signed in</span>
+          </a>
+          <a id="logout-link" href="/api/v1/auth/logout">Sign out</a>
+        </nav>
       </header>
 
       <!-- The live socket. main.js fills ws-connect from the URL and lets

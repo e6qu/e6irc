@@ -6,9 +6,10 @@
 //   network  — the BNC network to attach to (required for chat)
 //   channel  — the channel the composer targets (optional)
 
-import htmx from "htmx.org";
-import "htmx-ext-ws";
 import "./style.css";
+
+const htmx = window.htmx;
+if (!htmx) throw new Error("the vendored htmx runtime did not load");
 
 const params = new URLSearchParams(window.location.search);
 const network = params.get("network");
@@ -18,6 +19,19 @@ const chat = document.getElementById("chat");
 const target = document.getElementById("target");
 const buffer = document.getElementById("buffer");
 const status = document.getElementById("status");
+const accountName = document.getElementById("account-name");
+
+const identityResponse = await fetch("/api/v1/me", {
+  headers: { Accept: "application/json" },
+});
+if (!identityResponse.ok) {
+  throw new Error(`identity request failed with HTTP ${identityResponse.status}`);
+}
+const identity = await identityResponse.json();
+if (typeof identity.account !== "string" || identity.account.length === 0) {
+  throw new Error("identity response did not contain an account name");
+}
+accountName.textContent = identity.account;
 
 target.value = channel;
 

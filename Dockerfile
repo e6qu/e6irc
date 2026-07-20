@@ -1,13 +1,22 @@
 # syntax=docker/dockerfile:1
 # e6irc server image. Config is rendered at start from environment by
 # deploy/docker-entrypoint.sh (the deployment injects DATABASE_URL and the
-# Shauth OIDC client secret from AWS Secrets Manager). Built without the
-# embed-web feature: the REST API, WebSocket, and SSO endpoints are served
-# directly; web assets, when present, are hosted separately.
+# Shauth OIDC client secret from AWS Secrets Manager). The frontend is built
+# and embedded in the server binary, so startup performs no build work and
+# the authenticated application entry point is always served by this image.
+FROM node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d AS web-build
+WORKDIR /src/web
+RUN npm install --global pnpm@11.15.1
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p e6ircd
+COPY --from=web-build /src/web/dist ./web/dist
+RUN cargo build --release -p e6ircd --features embed-web
 
 FROM debian:bookworm-slim
 RUN apt-get update \
