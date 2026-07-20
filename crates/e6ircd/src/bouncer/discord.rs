@@ -79,10 +79,17 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
     // later messages. Only a dropped handle stops the driver.
     let mut backoff = Duration::from_millis(200);
     loop {
+        let started = tokio::time::Instant::now();
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
                 ends.emit(DriverEvent::Disconnected);
+                // A session that lasted a while clearly connected; reset the
+                // backoff so a flapping-but-reachable upstream reconnects
+                // promptly instead of escalating toward the 30s cap forever.
+                if started.elapsed() >= Duration::from_secs(10) {
+                    backoff = Duration::from_millis(200);
+                }
                 let jitter = Duration::from_millis((backoff.as_millis() as u64) % 97);
                 tokio::time::sleep(backoff + jitter).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -93,7 +100,17 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
 
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Dropped;
-    let http = reqwest::Client::new();
+    // Bound REST calls so a hung request can't stall the gateway loop.
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("discord: http client build failed: {e}");
+            return Dropped;
+        }
+    };
     let base = api_base(config);
 
     // Resolve each configured channel id to its #name once.
@@ -211,13 +228,19 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 }
             }
             cmd = ends.next_command() => match cmd {
-                Some(line) => {
-                    if let Some((id, text)) = route_command(&line, &channel_to_id)
-                        && let Err(e) = send_message(&http, &base, &config.token, &id, &text).await
-                    {
-                        eprintln!("discord: send to {id} failed: {e}");
+                Some(line) => match route_command(&line, &channel_to_id) {
+                    super::RouteResult::Deliver(id, text) => {
+                        if let Err(e) = send_message(&http, &base, &config.token, &id, &text).await {
+                            eprintln!("discord: send to {id} failed: {e}");
+                        }
                     }
-                }
+                    super::RouteResult::Unmapped(target) => {
+                        ends.emit_line(format!(
+                            ":*bnc* NOTICE {target} :not delivered: no bridged Discord channel for {target}"
+                        ));
+                    }
+                    super::RouteResult::Ignore => {}
+                },
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -282,15 +305,21 @@ fn render_privmsg(author: &str, channel: &str, content: &str) -> String {
 
 /// A downstream IRC line → (channel id, text) if it is a PRIVMSG to a
 /// bridged channel; else `None`.
-fn route_command(line: &str, channel_to_id: &HashMap<String, String>) -> Option<(String, String)> {
-    let msg = e6irc_proto::message::Message::parse(line).ok()?;
+fn route_command(line: &str, channel_to_id: &HashMap<String, String>) -> super::RouteResult {
+    use super::RouteResult;
+    let Ok(msg) = e6irc_proto::message::Message::parse(line) else {
+        return RouteResult::Ignore;
+    };
     if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
-        return None;
+        return RouteResult::Ignore;
     }
-    let target = msg.params.first()?;
-    let text = msg.params.get(1)?;
-    let id = channel_to_id.get(*target)?;
-    Some((id.clone(), text.to_string()))
+    let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
+        return RouteResult::Ignore;
+    };
+    match channel_to_id.get(*target) {
+        Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
+        None => RouteResult::Unmapped(target.to_string()),
+    }
 }
 
 async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {
@@ -411,12 +440,18 @@ mod tests {
         );
         let mut map = HashMap::new();
         map.insert("#general".to_string(), "42".to_string());
+        use crate::bouncer::RouteResult;
         assert_eq!(
             route_command("PRIVMSG #general :hello", &map),
-            Some(("42".to_string(), "hello".to_string()))
+            RouteResult::Deliver("42".to_string(), "hello".to_string())
         );
-        assert_eq!(route_command("PRIVMSG #other :x", &map), None);
-        assert_eq!(route_command("JOIN #general", &map), None);
+        // A PRIVMSG to a non-bridged channel is surfaced, not silently dropped.
+        assert_eq!(
+            route_command("PRIVMSG #other :x", &map),
+            RouteResult::Unmapped("#other".to_string())
+        );
+        // A non-message command is ignored quietly.
+        assert_eq!(route_command("JOIN #general", &map), RouteResult::Ignore);
     }
 
     #[test]

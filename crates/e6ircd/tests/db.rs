@@ -1528,3 +1528,64 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         None
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn history_read_authorization_is_scoped() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    db::create_account(&pool, "bob", "pw").await.expect("bob");
+    db::create_account(&pool, "carol", "pw")
+        .await
+        .expect("carol");
+    // Register #chan with alice as founder.
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#chan', '#chan', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("register channel");
+
+    // Founder may read.
+    assert!(
+        db::account_may_read_channel(&pool, "#chan", "alice")
+            .await
+            .unwrap()
+    );
+    // An unrelated account may NOT read another channel's history (IDOR guard).
+    assert!(
+        !db::account_may_read_channel(&pool, "#chan", "bob")
+            .await
+            .unwrap()
+    );
+    // Granting access lets them read.
+    db::set_channel_access(&pool, "#chan", "bob", Some("v".into()))
+        .await
+        .expect("grant");
+    assert!(
+        db::account_may_read_channel(&pool, "#chan", "bob")
+            .await
+            .unwrap()
+    );
+    // An unregistered channel exposes nothing via this path.
+    assert!(
+        !db::account_may_read_channel(&pool, "#unreg", "alice")
+            .await
+            .unwrap()
+    );
+    // A third account with no relationship stays denied.
+    assert!(
+        !db::account_may_read_channel(&pool, "#chan", "carol")
+            .await
+            .unwrap()
+    );
+}

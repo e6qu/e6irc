@@ -536,9 +536,13 @@ type OidcClient = openidconnect::core::CoreClient<
 >;
 
 fn oidc_http_client() -> openidconnect::reqwest::Client {
-    // No redirect following: token endpoints must answer directly.
+    // No redirect following: token endpoints must answer directly. Timeouts
+    // bound each outbound call so an unresponsive IdP (reached from
+    // unauthenticated login/discovery/back-channel paths) can't pin a task.
     openidconnect::reqwest::ClientBuilder::new()
         .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("reqwest client")
 }
@@ -617,6 +621,10 @@ async fn oidc_link_start(
 /// Shared authorization-request builder for login, link, and silent-SSO
 /// flows. `silent` adds `prompt=none` so the provider returns without any
 /// UI (used for the SSO-session probe).
+/// Cap on in-flight OIDC login flows, bounding the `pending_auth` map against
+/// an unauthenticated flood of login initiations.
+const MAX_PENDING_AUTH: usize = 4096;
+
 async fn oidc_authorize(
     state: &AppState,
     provider_name: &str,
@@ -663,6 +671,15 @@ async fn oidc_authorize(
     let (auth_url, csrf, nonce) = request.url();
     let mut pending = state.pending_auth.lock().expect("poisoned");
     pending.retain(|_, p| p.started.elapsed() < Duration::from_secs(600));
+    // Bound the map so an unauthenticated flood of /start (each entry lives up
+    // to 10 minutes) cannot grow it without limit.
+    if pending.len() >= MAX_PENDING_AUTH {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many pending logins; retry shortly",
+            None,
+        );
+    }
     pending.insert(
         csrf.secret().clone(),
         PendingAuth {
@@ -2079,10 +2096,35 @@ async fn history(
     headers: axum::http::HeaderMap,
     Query(params): Query<HistoryParams>,
 ) -> Response {
-    if let Err(response) = authenticate(&state, &headers).await {
-        return response;
-    }
+    let account = match authenticate(&state, &headers).await {
+        Ok(account) => account,
+        Err(response) => return response,
+    };
     let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    // Authorize the target: without a view of live membership this endpoint
+    // must fail closed, so restrict it to channels the account has a
+    // registered relationship with (founder or access). Otherwise any account
+    // could read any channel's history, including secret (+s) ones.
+    let target_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&params.target);
+    let account_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
+    match crate::db::account_may_read_channel(pool, &target_folded, &account_folded).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return problem(
+                StatusCode::FORBIDDEN,
+                "Not authorized to read this target's history",
+                None,
+            );
+        }
+        Err(e) => {
+            eprintln!("http: history authorization query failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    }
     let limit = params.limit.unwrap_or(50).min(500);
     let query = match (&params.before, &params.after) {
         (Some(ts), _) => match e6irc_proto::time::parse_server_time_seconds(ts) {
@@ -2095,8 +2137,7 @@ async fn history(
         },
         (None, None) => crate::core::HistoryQuery::Latest { limit },
     };
-    let target = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&params.target);
-    let rows = crate::db::query_history(pool, &target, query).await;
+    let rows = crate::db::query_history(pool, &target_folded, query).await;
     let messages: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {
@@ -2674,6 +2715,12 @@ async fn create_network(
 
 /// The one create path: validate, seal the upstream secret, persist, and
 /// start the driver. Used by both the JSON API and the account form.
+/// Cap on BNC networks per account. Each network spawns an always-on driver
+/// (which dials a caller-supplied address on a reconnect loop) plus a
+/// persistence task, so an unbounded count is task/socket exhaustion and an
+/// outbound-connection amplifier toward a third party.
+const MAX_NETWORKS_PER_ACCOUNT: usize = 32;
+
 async fn create_network_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -2735,6 +2782,25 @@ async fn create_network_core(
         enabled: true,
     };
     let pool = state.pool.as_ref().expect("caller checked the pool");
+    // Bound networks per account before spawning anything.
+    match crate::db::list_bnc_networks(pool, account).await {
+        Ok(existing) if existing.len() >= MAX_NETWORKS_PER_ACCOUNT => {
+            return Err(problem(
+                StatusCode::CONFLICT,
+                "Network limit reached",
+                Some("this account has reached its maximum number of networks"),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("http: network count query failed: {e}");
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    }
     match crate::db::create_bnc_network(pool, account, &row).await {
         Ok(_) => {}
         Err(crate::db::DbError::DuplicateNetwork(_)) => {

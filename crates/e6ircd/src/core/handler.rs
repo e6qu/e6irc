@@ -142,7 +142,6 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
     let server = state.config.server_name.clone();
     let command = msg.command.to_ascii_uppercase();
     let p = &msg.params;
-    let _ = &server;
 
     // Command-flood throttle (opt-in). Keepalive is exempt; a depleted
     // bucket closes the link loudly (Excess Flood), never silently drops.
@@ -190,7 +189,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "KICK" => cmd_kick(state, conn, p),
         "INVITE" => cmd_invite(state, conn, p),
         "AWAY" => cmd_away(state, conn, p),
-        "LIST" => cmd_list(state, conn),
+        "LIST" => cmd_list(state, conn, p),
         "USERHOST" => cmd_userhost(state, conn, p),
         "CHATHISTORY" => cmd_chathistory(state, conn, p),
         "MONITOR" => cmd_monitor(state, conn, p),
@@ -1478,8 +1477,11 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
         &[
             &server,
             &format!("e6ircd-{}", version()),
-            "io",
-            "imnstkl",
+            // Must match what the server actually implements (RPL_UMODEIS /
+            // CHANMODES): user modes +i/+o/+w/+B, channel modes +imnstkl and
+            // +C (no-CTCP), prefix modes +o/+v.
+            "iowB",
+            "imnstklC",
             "ov",
         ],
         None,
@@ -1529,15 +1531,43 @@ fn version() -> &'static str {
 
 fn send_lusers(state: &mut ServerState, conn: ConnId) {
     let users = state.sessions.values().filter(|s| s.registered).count();
+    let invisible = state
+        .sessions
+        .values()
+        .filter(|s| s.registered && s.invisible)
+        .count();
+    let visible = users - invisible;
+    let opers = state
+        .sessions
+        .values()
+        .filter(|s| s.registered && s.oper)
+        .count();
+    let unknown = state.sessions.values().filter(|s| !s.registered).count();
     let channels = state.channels.len();
     state.numeric(
         conn,
         RPL_LUSERCLIENT,
         &[],
         Some(&format!(
-            "There are {users} users and 0 invisible on 1 servers"
+            "There are {visible} users and {invisible} invisible on 1 servers"
         )),
     );
+    if opers > 0 {
+        state.numeric(
+            conn,
+            RPL_LUSEROP,
+            &[&opers.to_string()],
+            Some("operator(s) online"),
+        );
+    }
+    if unknown > 0 {
+        state.numeric(
+            conn,
+            RPL_LUSERUNKNOWN,
+            &[&unknown.to_string()],
+            Some("unknown connection(s)"),
+        );
+    }
     if channels > 0 {
         state.numeric(
             conn,
@@ -1628,6 +1658,9 @@ const TARGMAX: usize = 4;
 /// Cap on stored read markers per account. Markers persist across parts, so
 /// without a cap a client could seed the marker map without bound.
 const MAX_READ_MARKERS_PER_ACCOUNT: usize = 256;
+
+/// Cap on a session's pending-invite set, bounding INVITE-driven growth.
+const INVITE_LIMIT: usize = 100;
 
 fn valid_channel_name(name: &str) -> bool {
     name.starts_with('#')
@@ -1978,19 +2011,22 @@ fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 }
 
+/// One message delivery: the payload plus its sender/tag context. Bundled
+/// into a struct (rather than a row of same-typed `&str`/`bool` parameters)
+/// so the fields cannot be transposed at a call site.
+struct Delivery<'a> {
+    sender_account: Option<&'a str>,
+    sender_is_bot: bool,
+    msgid: &'a str,
+    client_tags: &'a str,
+    body: &'a str,
+    /// True to bypass labeled-response capture (echo/fan-out already labeled).
+    bypass_capture: bool,
+}
+
 /// Deliver a message line to recipients, applying per-recipient
 /// `server-time` and `account-tag` variants.
-#[allow(clippy::too_many_arguments)]
-fn deliver_message(
-    state: &mut ServerState,
-    recipients: &[ConnId],
-    sender_account: Option<&str>,
-    sender_is_bot: bool,
-    msgid: &str,
-    client_tags: &str,
-    body: &str,
-    bypass_capture: bool,
-) {
+fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d: &Delivery) {
     let time = state.time_tag();
     for &recipient in recipients {
         let Some(session) = state.sessions.get(&recipient) else {
@@ -1999,29 +2035,29 @@ fn deliver_message(
         let caps = session.caps;
         let mut tags: Vec<String> = Vec::new();
         if caps.message_tags {
-            tags.push(format!("msgid={msgid}"));
+            tags.push(format!("msgid={}", d.msgid));
         }
         if caps.server_time {
             tags.push(format!("time={time}"));
         }
         if caps.account_tag
-            && let Some(account) = sender_account
+            && let Some(account) = d.sender_account
         {
             tags.push(format!("account={account}"));
         }
-        if caps.message_tags && sender_is_bot {
+        if caps.message_tags && d.sender_is_bot {
             tags.push("bot".to_string());
         }
-        if caps.message_tags && !client_tags.is_empty() {
-            tags.push(client_tags.to_string());
+        if caps.message_tags && !d.client_tags.is_empty() {
+            tags.push(d.client_tags.to_string());
         }
         let line = if tags.is_empty() {
-            body.to_string()
+            d.body.to_string()
         } else {
-            format!("@{} {body}", tags.join(";"))
+            format!("@{} {}", tags.join(";"), d.body)
         };
         let bytes = bytes::Bytes::from(format!("{line}\r\n"));
-        if bypass_capture {
+        if d.bypass_capture {
             state.send_bytes_uncaptured(recipient, bytes);
         } else {
             state.send_bytes(recipient, bytes);
@@ -2084,7 +2120,9 @@ fn cmd_message(
     let mut seen = std::collections::HashSet::new();
     let mut delivered = 0usize;
     for target in targets.split(',').filter(|t| !t.is_empty()) {
-        if !seen.insert(target) {
+        // Dedup on the casefolded target so `#a,#A` (or `nick,NICK`) collapse
+        // to one delivery rather than two.
+        if !seen.insert(state.casemap.casefold(target)) {
             continue;
         }
         if delivered >= TARGMAX {
@@ -2195,23 +2233,27 @@ fn deliver_one_message(
         deliver_message(
             state,
             &recipients,
-            sender_account.as_deref(),
-            sender_is_bot,
-            &msgid,
-            client_tags,
-            &line,
-            true,
+            &Delivery {
+                sender_account: sender_account.as_deref(),
+                sender_is_bot,
+                msgid: &msgid,
+                client_tags,
+                body: &line,
+                bypass_capture: true,
+            },
         );
         if state.sessions[&conn].caps.echo_message {
             deliver_message(
                 state,
                 &[conn],
-                sender_account.as_deref(),
-                sender_is_bot,
-                &msgid,
-                client_tags,
-                &line,
-                false,
+                &Delivery {
+                    sender_account: sender_account.as_deref(),
+                    sender_is_bot,
+                    msgid: &msgid,
+                    client_tags,
+                    body: &line,
+                    bypass_capture: false,
+                },
             );
         }
         // A STATUSMSG (@#/+#) reached only ops/voiced members. It must not
@@ -2274,23 +2316,27 @@ fn deliver_one_message(
         deliver_message(
             state,
             &[peer],
-            sender_account.as_deref(),
-            sender_is_bot,
-            &msgid,
-            client_tags,
-            &line,
-            true,
+            &Delivery {
+                sender_account: sender_account.as_deref(),
+                sender_is_bot,
+                msgid: &msgid,
+                client_tags,
+                body: &line,
+                bypass_capture: true,
+            },
         );
         if state.sessions[&conn].caps.echo_message {
             deliver_message(
                 state,
                 &[conn],
-                sender_account.as_deref(),
-                sender_is_bot,
-                &msgid,
-                client_tags,
-                &line,
-                false,
+                &Delivery {
+                    sender_account: sender_account.as_deref(),
+                    sender_is_bot,
+                    msgid: &msgid,
+                    client_tags,
+                    body: &line,
+                    bypass_capture: false,
+                },
             );
         }
         // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free).
@@ -2353,8 +2399,15 @@ fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) 
             return;
         };
         let member = chan.members.get(&conn);
+        // Same gate as PRIVMSG (incl. ban/quiet), so a banned or quieted member
+        // can't relay TAGMSG (typing/reaction tags) it couldn't relay as text.
         let may_speak = match member {
-            Some(m) => !chan.modes.moderated || m.op || m.voice,
+            Some(m) if m.op || m.voice => true,
+            Some(_) => {
+                !chan.modes.moderated
+                    && !chan.is_banned(state.casemap, &prefix)
+                    && !chan.is_quieted(state.casemap, &prefix)
+            }
             None => !chan.modes.no_external,
         };
         if !may_speak {
@@ -3398,6 +3451,29 @@ fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let invitee_nick = state.sessions[&invitee].nick.clone().expect("registered");
+    // Bound the invitee's pending-invite set — INVITE would otherwise grow it
+    // without limit (invites to since-destroyed channels linger). Drop stale
+    // entries first; if still at the cap, evict an arbitrary old invite so the
+    // set stays bounded while the new one still lands (invites are low-value
+    // and the invitee can be re-invited).
+    if state.sessions[&invitee].invited.len() >= INVITE_LIMIT {
+        let stale: Vec<ChanKey> = state.sessions[&invitee]
+            .invited
+            .iter()
+            .filter(|k| !state.channels.contains_key(*k))
+            .cloned()
+            .collect();
+        let invited = &mut state.sessions.get_mut(&invitee).expect("checked").invited;
+        for k in &stale {
+            invited.remove(k);
+        }
+        while invited.len() >= INVITE_LIMIT {
+            let Some(victim) = invited.iter().next().cloned() else {
+                break;
+            };
+            invited.remove(&victim);
+        }
+    }
     state
         .sessions
         .get_mut(&invitee)
@@ -3461,11 +3537,26 @@ fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 }
 
-fn cmd_list(state: &mut ServerState, conn: ConnId) {
+fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    // A non-empty first argument is a comma-separated channel list; when
+    // present LIST reports only those channels (Modern IRC `LIST <channels>`)
+    // instead of enumerating every channel.
+    let filter: Option<std::collections::HashSet<ChanKey>> =
+        p.first().filter(|s| !s.is_empty()).map(|s| {
+            s.split(',')
+                .filter(|t| !t.is_empty())
+                .map(|t| state.chan_key(t))
+                .collect()
+        });
     state.numeric(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
     let rows: Vec<(String, usize, String)> = state
         .channels
-        .values()
+        .iter()
+        .filter(|(k, _)| match &filter {
+            Some(f) => f.contains(*k),
+            None => true,
+        })
+        .map(|(_, c)| c)
         .filter(|c| !c.modes.secret || c.members.contains_key(&conn))
         .map(|c| {
             (
@@ -3497,9 +3588,13 @@ fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         if let Some(peer) = state.registered_peer(&key) {
             let s = &state.sessions[&peer];
             let away_marker = if s.away.is_some() { "-" } else { "+" };
+            // `*` after the nick marks an IRC operator (Modern RPL_USERHOST),
+            // matching the oper flag WHO/WHOIS already surface.
+            let oper_marker = if s.oper { "*" } else { "" };
             entries.push(format!(
-                "{}={}{}@{}",
+                "{}{}={}{}@{}",
                 s.nick.as_deref().expect("registered"),
+                oper_marker,
                 away_marker,
                 s.user.as_deref().expect("registered"),
                 s.host,

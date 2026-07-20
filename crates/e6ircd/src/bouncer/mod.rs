@@ -72,6 +72,19 @@ pub(crate) enum SessionOutcome {
     Dropped,
 }
 
+/// Classification of a downstream client command by a bridge, so a message
+/// that can't be delivered upstream is surfaced rather than silently dropped.
+#[cfg(any(feature = "discord", feature = "slack"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RouteResult {
+    /// A PRIVMSG mapped to `(upstream_id, text)`; deliver it.
+    Deliver(String, String),
+    /// A PRIVMSG to `target` that maps to no bridged channel — surface loss.
+    Unmapped(String),
+    /// Not a deliverable message command (control/other) — ignore quietly.
+    Ignore,
+}
+
 /// An event a driver emits upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {

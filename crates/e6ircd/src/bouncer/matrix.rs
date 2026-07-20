@@ -66,10 +66,17 @@ async fn run(config: MatrixConfig, mut ends: DriverEnds) {
     // upstream message). Only a dropped handle stops the driver.
     let mut backoff = std::time::Duration::from_millis(200);
     loop {
+        let started = tokio::time::Instant::now();
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
                 ends.emit(DriverEvent::Disconnected);
+                // A session that lasted a while clearly connected; reset the
+                // backoff so a flapping-but-reachable upstream reconnects
+                // promptly instead of escalating toward the 30s cap forever.
+                if started.elapsed() >= std::time::Duration::from_secs(10) {
+                    backoff = std::time::Duration::from_millis(200);
+                }
                 let jitter = std::time::Duration::from_millis((backoff.as_millis() as u64) % 97);
                 tokio::time::sleep(backoff + jitter).await;
                 backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
@@ -119,7 +126,13 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
                 }
             },
             cmd = ends.next_command() => match cmd {
-                Some(line) => handle_command(&mut session, &line).await,
+                Some(line) => {
+                    if let Some(target) = handle_command(&mut session, &line).await {
+                        ends.emit_line(format!(
+                            ":*bnc* NOTICE {target} :not delivered: no bridged Matrix room for {target}"
+                        ));
+                    }
+                }
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -128,7 +141,13 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
 
 /// Log in and join the configured rooms.
 async fn connect(config: &MatrixConfig) -> Result<Session, String> {
-    let http = reqwest::Client::new();
+    // A timeout longer than the /sync long-poll (20s) so a black-holed
+    // connection fails the request — otherwise the future never resolves,
+    // `session_once` never returns, and the reconnect loop never runs.
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
     let base = config.homeserver.trim_end_matches('/').to_string();
 
     let login: serde_json::Value = http
@@ -250,18 +269,19 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
 
 /// Relay a downstream IRC command upstream. Only channel PRIVMSGs to a
 /// bridged room are meaningful; others are dropped.
-async fn handle_command(s: &mut Session, line: &str) {
-    let Ok(msg) = e6irc_proto::message::Message::parse(line) else {
-        return;
-    };
+/// Deliver a downstream PRIVMSG to Matrix. Returns `Some(target)` when a
+/// PRIVMSG could not be delivered because no bridged room maps to it, so the
+/// caller can surface the loss rather than dropping it silently.
+async fn handle_command(s: &mut Session, line: &str) -> Option<String> {
+    let msg = e6irc_proto::message::Message::parse(line).ok()?;
     if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
-        return;
+        return None;
     }
     let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
-        return;
+        return None;
     };
     let Some(room_id) = s.channel_to_room.get(*target).cloned() else {
-        return; // not a bridged channel
+        return Some(target.to_string()); // PRIVMSG to a non-bridged channel: lost
     };
     s.txn += 1;
     let txn = s.txn;
@@ -280,6 +300,7 @@ async fn handle_command(s: &mut Session, line: &str) {
     if let Err(e) = send {
         eprintln!("matrix: send to {target} failed: {e}");
     }
+    None
 }
 
 /// `#name:server` → IRC channel `#name`.

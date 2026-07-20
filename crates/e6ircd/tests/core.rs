@@ -3393,3 +3393,119 @@ fn markread_rejects_non_channel_target() {
         "a non-channel MARKREAD target must fail loudly: {out:#?}"
     );
 }
+
+// ---- sweep 2: fidelity + bug regressions --------------------------------
+
+#[test]
+fn list_filters_to_named_channel() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "alice");
+    s.line(a, "JOIN #a");
+    s.line(a, "JOIN #b");
+    s.drain(a);
+    s.line(a, "LIST #a");
+    let out = s.drain(a);
+    let listed: Vec<_> = out
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some("322"))
+        .collect();
+    assert_eq!(listed.len(), 1, "LIST #a must list only #a: {out:#?}");
+    assert!(listed[0].contains("#a"));
+    assert!(
+        !out.iter()
+            .any(|l| l.split(' ').nth(1) == Some("322") && l.contains("#b")),
+        "LIST #a must not include #b: {out:#?}"
+    );
+}
+
+#[test]
+fn userhost_marks_operator() {
+    let mut s = TestServer::new();
+    let god = s.register(1, "god");
+    s.line(god, "OPER god letmein");
+    s.drain(god);
+    s.line(god, "USERHOST god");
+    let out = s.drain(god);
+    let line = out
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("302"))
+        .expect("302");
+    assert!(
+        line.contains("god*="),
+        "USERHOST must mark an oper with *: {line}"
+    );
+}
+
+#[test]
+fn tagmsg_blocked_for_banned_member() {
+    let mut s = TestServer::new();
+    let op = register_with_caps(&mut s, 1, "op", "message-tags");
+    s.line(op, "JOIN #c");
+    s.drain(op);
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags");
+    s.line(bob, "JOIN #c");
+    s.drain(bob);
+    s.line(op, "MODE #c +b bob!*@*");
+    s.drain(op);
+    s.drain(bob);
+    // Banned (still a member) — TAGMSG must be refused like PRIVMSG.
+    s.line(bob, "@+typing=active TAGMSG #c");
+    let out = s.drain(bob);
+    assert!(
+        has_numeric(&out, "404"),
+        "a banned member's TAGMSG must be ERR_CANNOTSENDTOCHAN: {out:#?}"
+    );
+}
+
+#[test]
+fn multi_target_dedups_casefolded() {
+    let mut s = TestServer::new();
+    let sender = s.register(1, "sender");
+    let bob = s.register(2, "bob");
+    s.line(sender, "PRIVMSG bob,BOB :hi");
+    let got: Vec<_> = s
+        .drain(bob)
+        .into_iter()
+        .filter(|l| l.contains("PRIVMSG bob :hi"))
+        .collect();
+    assert_eq!(
+        got.len(),
+        1,
+        "case-folded duplicate targets must deliver exactly once: {got:#?}"
+    );
+}
+
+#[test]
+fn myinfo_reflects_implemented_modes() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Alice");
+    let burst = s.drain(c);
+    let myinfo = burst
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("004"))
+        .expect("004 MYINFO");
+    assert!(
+        myinfo.contains("iowB") && myinfo.contains('C'),
+        "MYINFO must advertise the umodes/chanmodes actually implemented: {myinfo}"
+    );
+}
+
+#[test]
+fn lusers_reports_real_invisible_count() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "alice");
+    s.line(a, "MODE alice +i");
+    s.drain(a);
+    s.line(a, "LUSERS");
+    let out = s.drain(a);
+    let client = out
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("251"))
+        .expect("251 RPL_LUSERCLIENT");
+    assert!(
+        client.contains("1 invisible") && !client.contains("0 invisible"),
+        "LUSERS must count invisible users: {client}"
+    );
+}

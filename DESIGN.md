@@ -707,7 +707,7 @@ same artifact:
    e6ircd); a true cross-origin split is supported (CORS allowlist +
    `SameSite=None` cookies) but documented as second choice.
 
-### 13.4 IRC-over-WebSocket (feature `ws-irc`, default on)
+### 13.4 IRC-over-WebSocket (always compiled)
 
 Separately from the HTMX UI socket, expose the IRCv3 WebSocket text
 encoding at `/ws/irc` so existing web IRC clients (e.g. gamja) can connect
@@ -739,9 +739,10 @@ target.
 
 ## 15. Security
 
-- Passwords/app passwords: argon2id (m=64 MiB, t=3, p=4 initial params),
-  constant-time verification; app passwords are 32 random bytes,
-  base32-shown once.
+- Passwords/app passwords: argon2id via a single `hasher()` choke point
+  (argon2 0.5.3 defaults — v19, m≈19 MiB, t=2, p=1 — meeting the OWASP
+  minimum), constant-time verification; app passwords are 32 random bytes,
+  base64-shown once.
 - Upstream BNC secrets (SASL passwords, bridge tokens) sealable at rest
   under a **server master key** provided via `[secrets].key_file` or the
   `E6IRC_SECRET_KEY` env var (32 bytes, base64). Sealed values are
