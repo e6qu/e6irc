@@ -3174,3 +3174,33 @@ fn unregistered_nick_holder_is_not_resolvable_and_never_panics() {
         "registered holder should WHOIS normally"
     );
 }
+
+#[test]
+fn statusmsg_is_not_stored_in_history() {
+    // A STATUSMSG (@#/+#) reaches only ops/voiced; it must not enter the
+    // shared history ring or the messages table, or CHATHISTORY would leak it
+    // to members excluded from the live delivery.
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #room"); // first joiner → op
+    s.drain(op);
+    s.db_requests();
+
+    s.line(op, "PRIVMSG @#room :ops only");
+    s.drain(op);
+    assert!(
+        !s.db_requests()
+            .into_iter()
+            .any(|r| matches!(r, e6ircd::core::DbRequest::LogMessage { .. })),
+        "STATUSMSG must not be written to history"
+    );
+
+    // A normal channel message IS persisted.
+    s.line(op, "PRIVMSG #room :normal");
+    s.drain(op);
+    assert!(
+        s.db_requests().into_iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::LogMessage { body, .. } if body == "normal")),
+        "a normal channel message must be persisted"
+    );
+}
