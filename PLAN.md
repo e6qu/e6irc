@@ -1,7 +1,8 @@
 # e6irc — Plan
 
 Phases are sequential PRs/PR-groups; each phase ends with DESIGN.md/PLAN.md/
-BUGS.md updated in the same PR. Details in DESIGN.md (section refs below).
+BUGS.md updated in the same PR. Details in DESIGN.md (section refs below);
+term definitions in [`docs/terminology.md`](docs/terminology.md).
 
 Status (2026-07-19): Phases 0–10 ✅ complete. Phases 11–12 (Discord/Slack
 bridges) 🔶 code-complete behind feature flags with offline-unit-tested

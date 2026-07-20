@@ -63,7 +63,9 @@ cargo build --release -p e6irc-cli
 
 Optional features: `embed-web` (bake the built web client into the
 binary) and `matrix` (the Matrix bridge). See `DESIGN.md` for the full
-architecture and `PLAN.md` for the phase-by-phase status.
+architecture, `PLAN.md` for the phase-by-phase status, and
+[`docs/terminology.md`](docs/terminology.md) for a glossary of the IRC,
+OpenID Connect, and deployment vocabulary used throughout.
 
 ## Development
 
