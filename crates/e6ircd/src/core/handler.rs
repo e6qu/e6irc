@@ -99,6 +99,17 @@ fn frame_labeled(state: &mut ServerState, conn: ConnId, label: &str, lines: Vec<
             let tagged = inject_tag(&lines[0], &format!("label={label}"));
             state.send_bytes(conn, tagged);
         }
+        _ if is_self_contained_batch(&lines) => {
+            // The captured reply is already one batch (e.g. CHATHISTORY). Label
+            // its opening BATCH line rather than nesting it in another batch —
+            // a message must never carry two `batch` tags.
+            let mut it = lines.into_iter();
+            let open = it.next().expect("len >= 2");
+            state.send_bytes(conn, inject_tag(&open, &format!("label={label}")));
+            for line in it {
+                state.send_bytes(conn, line);
+            }
+        }
         _ => {
             let batch_ref = state.next_msgid();
             state.send(
@@ -112,6 +123,31 @@ fn frame_labeled(state: &mut ServerState, conn: ConnId, label: &str, lines: Vec<
             state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
         }
     }
+}
+
+/// Whether `lines` is a single self-contained batch: the first line opens a
+/// `BATCH +ref` and the last closes the same `BATCH -ref`.
+fn is_self_contained_batch(lines: &[bytes::Bytes]) -> bool {
+    let Some(first) = lines.first() else {
+        return false;
+    };
+    let Some(last) = lines.last() else {
+        return false;
+    };
+    let first = String::from_utf8_lossy(first);
+    let last = String::from_utf8_lossy(last);
+    match (batch_ref_after(&first, '+'), batch_ref_after(&last, '-')) {
+        (Some(open), Some(close)) => open == close,
+        _ => false,
+    }
+}
+
+/// The batch reference following `BATCH <sign>` in a serialized line, if any.
+fn batch_ref_after(line: &str, sign: char) -> Option<&str> {
+    let marker = if sign == '+' { "BATCH +" } else { "BATCH -" };
+    let rest = &line[line.find(marker)? + marker.len()..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    Some(&rest[..end])
 }
 
 /// Spend one command-flood token. Returns `true` if the command may
@@ -2920,9 +2956,11 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                 let Some(&mask) = args.next() else {
                     continue; // handled above for the query form
                 };
-                // Bound each list: without a cap a single opped client could
+                // Bound the lists: without a cap a single opped client could
                 // stream distinct masks until the core worker OOMs (and every
-                // JOIN/PRIVMSG re-scans the whole list). Reject once full.
+                // JOIN/PRIVMSG re-scans them). `MAXLIST=bqeI:100` advertises a
+                // *combined* total across the four grouped modes (Libera
+                // semantics), so cap on their sum, not per list.
                 let chan_ref = state.channels.get(&key).expect("checked");
                 let list_ref = match c {
                     'b' => &chan_ref.bans,
@@ -2932,7 +2970,11 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                     _ => unreachable!("outer arm matched only these list-mode chars"),
                 };
                 let is_new = !list_ref.iter().any(|b| b == mask);
-                let at_cap = list_ref.len() >= MAXLIST;
+                let combined = chan_ref.bans.len()
+                    + chan_ref.quiets.len()
+                    + chan_ref.ban_exceptions.len()
+                    + chan_ref.invite_exceptions.len();
+                let at_cap = combined >= MAXLIST;
                 if adding && is_new && at_cap {
                     state.numeric(
                         conn,
@@ -4116,6 +4158,9 @@ fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                         &[&MONITOR_LIMIT.to_string(), nick],
                         Some("Monitor list is full."),
                     );
+                    // Still report the nicks accepted before the cap — the spec
+                    // requires an online/offline reply for every added target.
+                    monitor_status(state, conn, &added);
                     return;
                 }
                 state

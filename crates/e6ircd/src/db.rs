@@ -123,7 +123,7 @@ pub async fn issue_app_password(
     OsRng.fill_bytes(&mut secret_bytes);
     let secret = e6irc_proto::base64::encode(&secret_bytes);
     let hash = hash_password(secret.clone()).await?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO account_credentials (account_id, kind, argon2_hash, label)
          SELECT a.id, 'app_password', $1, $2 FROM accounts a WHERE a.name_folded = $3",
     )
@@ -133,6 +133,12 @@ pub async fn issue_app_password(
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
+    // Guard the SELECT-INSERT like its siblings (issue_api_token,
+    // create_web_session_full): if the account row was gone, insert nothing and
+    // reject rather than hand back an app password that was never stored.
+    if inserted.rows_affected() == 0 {
+        return Err(DbError::BadCredentials);
+    }
     Ok(secret)
 }
 
@@ -950,6 +956,13 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
         .iter()
         .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
         .collect();
+    // Prune expired grants on write: `/device/start` is unauthenticated and a
+    // grant is otherwise only removed when it is approved and polled, so a
+    // flood of never-approved starts would grow the table without bound.
+    sqlx::query("DELETE FROM device_grants WHERE expires_at <= now()")
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)
          VALUES ($1, $2, now() + interval '10 minutes')",
@@ -1350,23 +1363,59 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
+    // bnc_buffer has no FK to bnc_networks (owner/network are plain text), so
+    // its rows would otherwise be orphaned forever on delete. The persistence
+    // task keys the buffer by the raw (unfolded) account name it was started
+    // with, so match on that, not the folded form.
+    sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1 AND network = $2")
+        .bind(account)
+        .bind(name)
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
     Ok(res.rows_affected() > 0)
 }
 
 /// Append one upstream line to a network's persisted buffer.
+/// Rows to retain per (owner, network) in `bnc_buffer`. Only the newest are
+/// ever replayed (see `PRELOAD_LIMIT`); the rest are dead weight.
+const BNC_BUFFER_CAP: i64 = 5000;
+
 pub async fn persist_bnc_line(
     pool: &PgPool,
     owner: &str,
     network: &str,
     line: &str,
 ) -> Result<(), DbError> {
-    sqlx::query("INSERT INTO bnc_buffer (owner, network, line) VALUES ($1, $2, $3)")
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO bnc_buffer (owner, network, line) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(owner)
+    .bind(network)
+    .bind(line)
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)?;
+    // Amortized trim (~0.1% of inserts): keep only the newest BNC_BUFFER_CAP
+    // lines per network so an always-on network can't grow the table forever.
+    if id % 1000 == 0 {
+        sqlx::query(
+            "DELETE FROM bnc_buffer
+             WHERE owner = $1 AND network = $2 AND id < (
+                 SELECT min(id) FROM (
+                     SELECT id FROM bnc_buffer
+                     WHERE owner = $1 AND network = $2
+                     ORDER BY id DESC LIMIT $3
+                 ) keep
+             )",
+        )
         .bind(owner)
         .bind(network)
-        .bind(line)
+        .bind(BNC_BUFFER_CAP)
         .execute(pool)
         .await
         .map_err(DbError::Query)?;
+    }
     Ok(())
 }
 
@@ -1515,6 +1564,12 @@ async fn create_web_session_full(
     argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
     let token = e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-");
     let folded = CaseMapping::Rfc1459.casefold(account);
+    // Prune expired sessions on write: lookups already filter on `expires_at`,
+    // but nothing else deletes them, so every login otherwise leaks a dead row.
+    sqlx::query("DELETE FROM web_sessions WHERE expires_at <= now()")
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
     let inserted = sqlx::query(
         "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider,
                                    oidc_issuer, oidc_subject, oidc_sid)

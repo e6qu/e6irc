@@ -3612,3 +3612,80 @@ fn isupport_advertises_whox_and_length_limits() {
         );
     }
 }
+
+// ---- sweep 4: combined MAXLIST, labeled batch, MONITOR subset ------------
+
+#[test]
+fn maxlist_is_a_combined_cap() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "op");
+    s.line(a, "JOIN #c");
+    s.drain(a);
+    // 50 bans + 50 quiets = 100 combined (the advertised bqeI:100 total).
+    for i in 0..50 {
+        s.line(a, &format!("MODE #c +b b{i}!*@*"));
+        if i % 20 == 0 {
+            s.drain(a);
+        }
+    }
+    for i in 0..50 {
+        s.line(a, &format!("MODE #c +q q{i}!*@*"));
+        if i % 20 == 0 {
+            s.drain(a);
+        }
+    }
+    s.drain(a);
+    // A 101st entry on a THIRD list must be refused — proving the cap is a
+    // combined total, not per-list.
+    s.line(a, "MODE #c +e over!*@*");
+    let out = s.drain(a);
+    assert!(
+        has_numeric(&out, "478"),
+        "combined MAXLIST must reject past 100 total: {out:#?}"
+    );
+}
+
+#[test]
+fn labeled_chathistory_has_single_batch_tag() {
+    let mut s = TestServer::new();
+    let a = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "labeled-response batch draft/chathistory message-tags server-time",
+    );
+    s.line(a, "JOIN #h");
+    s.drain(a);
+    s.line(a, "PRIVMSG #h :hello");
+    s.drain(a);
+    s.line(a, "@label=42 CHATHISTORY LATEST #h * 10");
+    let out = s.drain(a);
+    let content = out
+        .iter()
+        .find(|l| l.contains("PRIVMSG #h :hello"))
+        .expect("history content line");
+    assert_eq!(
+        content.matches("batch=").count(),
+        1,
+        "content line must carry exactly one batch tag, not two: {content}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.contains("label=42") && l.contains("BATCH +")),
+        "the label must ride the batch's opening line: {out:#?}"
+    );
+}
+
+#[test]
+fn monitor_reports_subset_before_limit() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "watcher");
+    let nicks: Vec<String> = (0..101).map(|i| format!("n{i}")).collect();
+    s.line(a, &format!("MONITOR + {}", nicks.join(",")));
+    let out = s.drain(a);
+    assert!(has_numeric(&out, "734"), "should hit MONLISTFULL: {out:#?}");
+    assert!(
+        has_numeric(&out, "731"),
+        "the nicks accepted before the cap must still get RPL_MONOFFLINE: {out:#?}"
+    );
+}
