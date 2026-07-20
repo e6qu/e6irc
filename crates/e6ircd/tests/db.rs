@@ -721,7 +721,11 @@ PING x
         .send()
         .await
         .expect("hist");
-    assert_eq!(forbidden.status(), 403, "unrelated account must be forbidden");
+    assert_eq!(
+        forbidden.status(),
+        403,
+        "unrelated account must be forbidden"
+    );
 }
 
 #[tokio::test]
