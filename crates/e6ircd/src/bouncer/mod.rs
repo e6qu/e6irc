@@ -329,11 +329,25 @@ where
                 Ok(n) => {
                     framing.feed(&read_buf[..n], &mut parsed);
                     for event in parsed.drain(..) {
-                        if let LineEvent::Line(line) = event
-                            && let Ok(text) = String::from_utf8(line)
-                            && commands.send(text).is_err()
-                        {
-                            return Ok(()); // driver gone
+                        match event {
+                            LineEvent::Line(line) => {
+                                if let Ok(text) = String::from_utf8(line)
+                                    && commands.send(text).is_err()
+                                {
+                                    return Ok(()); // driver gone
+                                }
+                            }
+                            // The framing contract forbids silently dropping an
+                            // over-long line; tell the client its line was not
+                            // relayed rather than swallowing it.
+                            LineEvent::TooLong => {
+                                write
+                                    .write_all(
+                                        b":*bnc* NOTICE * :input line too long; not sent upstream\r\n",
+                                    )
+                                    .await?;
+                                write.flush().await?;
+                            }
                         }
                     }
                 }

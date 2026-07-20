@@ -2057,6 +2057,12 @@ fn cmd_message(
                 false,
             );
         }
+        // A STATUSMSG (@#/+#) reached only ops/voiced members. It must not
+        // enter the shared history ring or the messages table, or CHATHISTORY
+        // would replay it to members who were excluded from the live delivery.
+        if status_prefix != 0 {
+            return;
+        }
         let ts = (state.config.clock)();
         state.push_channel_history(
             &key,
