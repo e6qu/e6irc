@@ -108,6 +108,33 @@ schema was corrected to the real migrations (no `tags` column, `bnc_buffer`
 shape, `read_markers`, partitions marked as planned), and stale "once X lands"
 comments were removed now that OIDC and the `local` driver have landed.
 
+Sixth hardening sweep (2026-07-21): added dead-code and copy-paste detection
+to CI and the local checklist, then a fresh fidelity/bug pass. Tooling:
+`tools/check-dead-code.sh` compiles only the shipped artifacts (`--lib --bins`,
+no `--all-targets`) with `-D warnings`, so code kept alive solely by tests is
+caught as dead — test coverage can no longer mask it; `tools/check-duplication.sh`
+runs jscpd over the crate sources with a ratchet threshold. Both are wired into
+the `lint` job. Boy-scout de-duplication reduced production copy-paste from
+3.75% to 2.3%: the client's three SASL registration paths now share `recv`/
+`negotiate_sasl_cap`/`await_authenticate_challenge`/`finish_sasl_then_welcome`
+helpers, and every always-on bridge driver's reconnect backoff is one shared
+`Backoff` type. Bug fixes: (HIGH) a re-created channel (dropped when it emptied)
+was marked history-complete, hiding all PostgreSQL-persisted history from
+CHATHISTORY — a fresh ring is now complete only when no database backs it;
+(HIGH) channel MODE applied earlier modes then `return`ed on a later arg-less
+mode, silently mutating state without a broadcast — it now `break`s so the
+applied modes are announced; (MEDIUM) the read-marker mirror is seeded from
+PostgreSQL at boot (it started empty after a restart, so MARKREAD reported `*`
+and a stale set could move a marker backwards); (MEDIUM) a labeled CHATHISTORY
+that falls back to PostgreSQL now carries the label onto its deferred batch and
+no longer ACKs the command as empty; (MEDIUM) the `/ws/ui` render socket now
+subscribes before snapshotting the buffer (it dropped live lines in the gap)
+and surfaces a lagged gap instead of swallowing it; IRC-over-WebSocket now
+enforces the same per-IP connection cap as the raw listeners; the web composer
+path is framed like every other client→upstream path (no CRLF injection);
+CHATHISTORY replays a canonical uppercase verb from both ring and DB; and
+RPL_WHOISCHANNELS is split across 512-byte lines like RPL_NAMREPLY.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

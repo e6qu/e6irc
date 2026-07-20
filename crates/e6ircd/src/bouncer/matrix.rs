@@ -64,22 +64,14 @@ async fn run(config: MatrixConfig, mut ends: DriverEnds) {
     // Always-on: a transient failure reconnects with backoff rather than
     // permanently killing the network (which would silently drop every later
     // upstream message). Only a dropped handle stops the driver.
-    let mut backoff = std::time::Duration::from_millis(200);
+    let mut backoff = super::Backoff::new();
     loop {
         let started = tokio::time::Instant::now();
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
                 ends.emit(DriverEvent::Disconnected);
-                // A session that lasted a while clearly connected; reset the
-                // backoff so a flapping-but-reachable upstream reconnects
-                // promptly instead of escalating toward the 30s cap forever.
-                if started.elapsed() >= std::time::Duration::from_secs(10) {
-                    backoff = std::time::Duration::from_millis(200);
-                }
-                let jitter = std::time::Duration::from_millis((backoff.as_millis() as u64) % 97);
-                tokio::time::sleep(backoff + jitter).await;
-                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                backoff.wait(started.elapsed()).await;
             }
         }
     }

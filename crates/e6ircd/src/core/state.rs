@@ -459,6 +459,14 @@ pub(crate) struct ServerState {
 pub(crate) struct Capture {
     pub conn: ConnId,
     pub lines: Vec<Bytes>,
+    /// The escaped `label` value, so a command whose response is produced
+    /// asynchronously (CHATHISTORY falling back to PostgreSQL) can carry the
+    /// label into that deferred reply instead of losing it.
+    pub label: Option<String>,
+    /// Set by a handler that defers its response to an async path; tells the
+    /// labeled-response framer not to ACK the command as empty — the deferred
+    /// reply will emit the labeled batch itself.
+    pub deferred: bool,
 }
 
 /// A historical nick record for WHOWAS.
@@ -664,6 +672,17 @@ impl ServerState {
                 .entry(ChanKey(name_folded))
                 .or_default()
                 .insert(account, flags);
+        }
+    }
+
+    /// Seed the read-marker mirror from persisted `(account, target, millis)`
+    /// rows at boot. The stored target is already the casefolded `ChanKey`
+    /// string (it was written from `ChanKey::as_str`), so it is wrapped
+    /// directly — matching the key MARKREAD builds at runtime.
+    pub fn preload_read_markers(&mut self, rows: Vec<(String, String, u64)>) {
+        self.read_markers.clear();
+        for (account, target, ms) in rows {
+            self.read_markers.insert((account, ChanKey(target)), ms);
         }
     }
 

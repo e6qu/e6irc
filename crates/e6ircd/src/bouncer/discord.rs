@@ -77,22 +77,14 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
     // Always-on: reconnect (from scratch) with backoff on any gateway drop,
     // rather than dying on the first disconnect and silently dropping all
     // later messages. Only a dropped handle stops the driver.
-    let mut backoff = Duration::from_millis(200);
+    let mut backoff = super::Backoff::new();
     loop {
         let started = tokio::time::Instant::now();
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
                 ends.emit(DriverEvent::Disconnected);
-                // A session that lasted a while clearly connected; reset the
-                // backoff so a flapping-but-reachable upstream reconnects
-                // promptly instead of escalating toward the 30s cap forever.
-                if started.elapsed() >= Duration::from_secs(10) {
-                    backoff = Duration::from_millis(200);
-                }
-                let jitter = Duration::from_millis((backoff.as_millis() as u64) % 97);
-                tokio::time::sleep(backoff + jitter).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff.wait(started.elapsed()).await;
             }
         }
     }

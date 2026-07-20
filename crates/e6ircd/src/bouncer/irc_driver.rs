@@ -54,7 +54,7 @@ impl IrcNetwork {
 }
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
-    let mut backoff = Duration::from_millis(200);
+    let mut backoff = super::Backoff::new();
     loop {
         let started = tokio::time::Instant::now();
         match connect_once(&config, &mut ends).await {
@@ -62,16 +62,7 @@ async fn run(config: NetworkConfig, mut ends: DriverEnds) {
             ConnectionOutcome::Stopped => return,
             ConnectionOutcome::Dropped => {
                 ends.emit(DriverEvent::Disconnected);
-                // A session that lasted a while clearly connected; reset the
-                // backoff so a flapping-but-reachable upstream reconnects
-                // promptly instead of escalating toward the 30s cap forever.
-                if started.elapsed() >= Duration::from_secs(10) {
-                    backoff = Duration::from_millis(200);
-                }
-                // Backoff with a coarse deterministic jitter (no RNG).
-                let jitter = Duration::from_millis((backoff.as_millis() as u64) % 97);
-                tokio::time::sleep(backoff + jitter).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                backoff.wait(started.elapsed()).await;
             }
         }
     }
