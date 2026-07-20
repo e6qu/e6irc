@@ -326,6 +326,73 @@ async fn app_password_issued_over_http_works_for_sasl() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn auth_endpoint_rate_limit_returns_429_after_burst() {
+    use e6ircd::config::{HttpConfig, LimitsConfig};
+    use tokio::io::AsyncReadExt;
+
+    let url = test_db_url();
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "rluser", "mainpass")
+        .await
+        .expect("create");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.rl.example".into(),
+        network_name: "RlNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        limits: LimitsConfig {
+            // Two requests per client IP, then the bucket is empty.
+            auth_rate_burst: Some(2),
+            ..LimitsConfig::default()
+        },
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http_addr = running.http_addr.expect("http");
+
+    // The rate check runs before credential validation, so a valid body isn't
+    // needed to exercise it — the same client IP is throttled regardless.
+    let body = r#"{"account":"rluser","password":"mainpass","label":"c"}"#;
+    let req = format!(
+        "POST /api/v1/auth/app-passwords HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let post = async |req: &str| -> String {
+        let mut http = TcpStream::connect(http_addr).await.expect("c");
+        http.write_all(req.as_bytes()).await.expect("w");
+        let mut resp = Vec::new();
+        http.read_to_end(&mut resp).await.expect("r");
+        String::from_utf8_lossy(&resp).to_string()
+    };
+
+    // First two succeed (201), the third from the same IP is 429.
+    assert!(post(&req).await.starts_with("HTTP/1.1 201"), "1st");
+    assert!(post(&req).await.starts_with("HTTP/1.1 201"), "2nd");
+    let third = post(&req).await;
+    assert!(
+        third.starts_with("HTTP/1.1 429"),
+        "3rd should be limited: {third}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_messages_are_persisted() {
     let url = test_db_url();
     let pool = db::connect_and_migrate(&url).await.expect("connect");
@@ -1024,6 +1091,80 @@ async fn query_history_around_and_between() {
     assert_eq!(
         between.iter().map(|r| r.ts).collect::<Vec<_>>(),
         vec![3000, 4000]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn query_history_msgid_paginates_within_a_single_second() {
+    use e6ircd::core::HistoryQuery;
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    // Five messages that all share the SAME whole second. Timestamp-only
+    // paging cannot separate them; composite `(ts, id)` paging must, ordering
+    // them by the monotonically-increasing insertion id.
+    for tag in ["a", "b", "c", "d", "e"] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, '#s', 'x!x@h', NULL, 'privmsg', $1,
+                     to_timestamp(3000::double precision))",
+        )
+        .bind(tag)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+
+    // BEFORE msgid=c → the same-second messages inserted before c.
+    let before = db::query_history(
+        &pool,
+        "#s",
+        HistoryQuery::BeforeMsgid {
+            msgid: "c".into(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(
+        before.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"],
+        "BEFORE must page by (ts,id), not skip the whole second"
+    );
+
+    // AFTER msgid=c → the same-second messages inserted after c.
+    let after = db::query_history(
+        &pool,
+        "#s",
+        HistoryQuery::AfterMsgid {
+            msgid: "c".into(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(
+        after.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+        vec!["d", "e"]
+    );
+
+    // BETWEEN (a, e) exclusive → the interior of the same second.
+    let between = db::query_history(
+        &pool,
+        "#s",
+        HistoryQuery::BetweenMsgid {
+            after_msgid: "a".into(),
+            before_msgid: "e".into(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(
+        between.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+        vec!["b", "c", "d"]
     );
 }
 

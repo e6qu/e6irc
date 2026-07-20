@@ -80,7 +80,14 @@ async fn driver_registers_relays_and_buffers() {
     })
     .await
     .expect("timeout waiting for relayed message");
-    assert!(got.starts_with(":speaker!"), "{got}");
+    // The driver negotiated server-time upstream, so the relayed line now
+    // carries IRCv3 tags; the source prefix follows the tag section, and the
+    // backlog preserves the timestamp.
+    assert!(got.starts_with('@') && got.contains(" :speaker!"), "{got}");
+    assert!(
+        got.contains("time="),
+        "backlog must keep server-time: {got}"
+    );
 
     // ...and it's in the detached buffer for later playback
     let buffer = handle.buffer_snapshot();

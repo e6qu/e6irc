@@ -82,6 +82,32 @@ config), `__Host-` cookie prefix, IRC-driver message-tag propagation (a
 pagination gap (needs millisecond ts). The XSS/injection surface of the web
 client and the SQL/index/constraint layer were audited and found sound.
 
+Fifth hardening sweep (2026-07-20): closed every remaining deferred item from
+the four prior sweeps, plus a fresh pass. (1) IRC-driver message-tag
+propagation: the `irc` driver renders upstream tags into buffered/live lines,
+and `attach` filters each tag family against the attaching client's negotiated
+caps (`server-time`/`message-tags`/`account-tag`) so no un-negotiated tag
+reaches a client; the shared client crate requests those caps. (2) CHATHISTORY
+same-second pagination: rather than widen the clock, the DB fallback now pages
+on the composite `(ts, id)` key relative to the pivot row, so messages sharing
+a whole second are ordered definitively by the unique id (new `*Msgid`
+`HistoryQuery` variants + query arms). (3) `__Host-` cookie prefix: session and
+OIDC-state cookies use `__Host-` when secure, threaded through every read/set/
+clear site so the name is consistent (a mismatch would silently fail to clear).
+(4) Auth-endpoint rate limiting: a token-bucket per client IP on
+`create_app_password`/`oidc_start`/`oidc_sso_start`, with a `trusted_proxies`
+CIDR list + rightmost-untrusted `X-Forwarded-For` resolution so a direct client
+cannot spoof its IP (off unless `auth_rate_burst` is set). Fresh findings:
+WHOIS `RPL_WHOISIDLE` (317) and WHOX `l` now report real idle/signon times
+(tracked per session); ban/quiet/except/invite masks are canonicalized to
+`nick!user@host` before storage so `+b nick` and `+b nick!*@*` can't desync;
+several bridge state mutations were reordered to try_push before mutating hot
+state; and the Matrix/Discord own-echo suppression now fails loud on a missing
+self-id instead of silently looping our own posts back. Docs: DESIGN §8 storage
+schema was corrected to the real migrations (no `tags` column, `bnc_buffer`
+shape, `read_markers`, partitions marked as planned), and stale "once X lands"
+comments were removed now that OIDC and the `local` driver have landed.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

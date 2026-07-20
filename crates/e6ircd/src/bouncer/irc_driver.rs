@@ -161,6 +161,23 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
 /// Reconstruct a wire line from an owned message for the buffer/attach.
 fn render(m: &e6irc_client::OwnedMessage) -> String {
     let mut out = String::new();
+    // Carry the IRCv3 message tags (server-time/msgid/account) so bouncer
+    // backlog keeps timestamps. `attach` strips tags an attaching client did
+    // not negotiate, so it is safe to store the fully-tagged line here.
+    if !m.tags.is_empty() {
+        out.push('@');
+        for (i, (k, v)) in m.tags.iter().enumerate() {
+            if i > 0 {
+                out.push(';');
+            }
+            out.push_str(k);
+            if let Some(v) = v {
+                out.push('=');
+                out.push_str(&e6irc_proto::message::escape_tag_value(v));
+            }
+        }
+        out.push(' ');
+    }
     if let Some(src) = &m.source {
         out.push(':');
         out.push_str(src);

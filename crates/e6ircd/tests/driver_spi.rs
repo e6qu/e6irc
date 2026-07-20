@@ -101,7 +101,7 @@ async fn attach_relays_over_the_loopback_driver() {
     let (client, server) = tokio::io::duplex(4096);
     let handle = std::sync::Arc::new(handle);
     let attach_handle = handle.clone();
-    tokio::spawn(async move { attach(server, &attach_handle).await });
+    tokio::spawn(async move { attach(server, &attach_handle, Default::default()).await });
 
     let (r, mut w) = tokio::io::split(client);
     let mut lines = BufReader::new(r).lines();

@@ -60,7 +60,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
     let handle = std::sync::Arc::new(handle);
     let attach_handle = handle.clone();
     let attach_task = tokio::spawn(async move {
-        let _ = attach(server_side, &attach_handle).await;
+        let _ = attach(server_side, &attach_handle, Default::default()).await;
     });
 
     let (cr, mut cw) = tokio::io::split(client_side);
@@ -140,7 +140,7 @@ async fn two_clients_attach_to_one_always_on_network() {
     let (c2, s2) = tokio::io::duplex(64 * 1024);
     for (h, s) in [(handle.clone(), s1), (handle.clone(), s2)] {
         tokio::spawn(async move {
-            let _ = attach(s, &h).await;
+            let _ = attach(s, &h, Default::default()).await;
         });
     }
     // small delay so both attaches subscribe before the live message

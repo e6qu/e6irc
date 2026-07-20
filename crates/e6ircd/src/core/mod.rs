@@ -205,6 +205,27 @@ pub enum HistoryQuery {
         before_ts: u64,
         limit: usize,
     },
+    /// Msgid-pivoted variants. Because the wall clock is second-granular,
+    /// paging by timestamp alone skips messages that share the pivot's whole
+    /// second; these page on the composite `(ts, id)` relative to the pivot
+    /// row, so same-second messages are ordered definitively by the unique id.
+    BeforeMsgid {
+        msgid: String,
+        limit: usize,
+    },
+    AfterMsgid {
+        msgid: String,
+        limit: usize,
+    },
+    AroundMsgid {
+        msgid: String,
+        limit: usize,
+    },
+    BetweenMsgid {
+        after_msgid: String,
+        before_msgid: String,
+        limit: usize,
+    },
 }
 
 /// One rendered history row, newest-last, as the DB returns it.

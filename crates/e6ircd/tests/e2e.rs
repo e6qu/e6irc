@@ -91,6 +91,35 @@ async fn two_clients_join_and_message() {
 }
 
 #[tokio::test]
+async fn whois_reports_idle_and_signon() {
+    let running = net::start(test_config()).await.expect("start");
+    let addr = running.addrs[0];
+
+    let mut alice = Client::connect(addr).await;
+    alice.register("alice").await;
+    let mut bob = Client::connect(addr).await;
+    bob.register("bob").await;
+
+    // WHOIS bob must include RPL_WHOISIDLE (317) with an idle count and a
+    // signon timestamp, terminated by RPL_ENDOFWHOIS (318).
+    alice.send("WHOIS bob").await;
+    let idle = alice.expect(" 317 ").await;
+    assert!(idle.contains(" 317 alice bob "), "{idle}");
+    // Params after the nick are: <idle> <signon> :seconds idle, signon time
+    let tail = idle.split(" 317 alice bob ").nth(1).expect("317 params");
+    let mut fields = tail.split_whitespace();
+    let idle_secs: u64 = fields.next().unwrap().parse().expect("idle is an integer");
+    let signon: u64 = fields
+        .next()
+        .unwrap()
+        .parse()
+        .expect("signon is an integer");
+    assert!(idle_secs < 5, "idle should be near-zero, got {idle_secs}");
+    assert!(signon > 0, "signon must be a real timestamp, got {signon}");
+    alice.expect(" 318 ").await;
+}
+
+#[tokio::test]
 async fn quit_closes_the_socket() {
     let running = net::start(test_config()).await.expect("start");
     let mut c = Client::connect(running.addrs[0]).await;
@@ -195,6 +224,7 @@ async fn per_ip_connection_limit_refuses_excess() {
         limits: LimitsConfig {
             max_connections_per_ip: Some(2),
             command_burst: None,
+            ..LimitsConfig::default()
         },
         ..Config::default()
     };
@@ -247,6 +277,7 @@ async fn command_flood_throttle_closes_excess() {
         limits: LimitsConfig {
             max_connections_per_ip: None,
             command_burst: Some(5),
+            ..LimitsConfig::default()
         },
         ..Config::default()
     };

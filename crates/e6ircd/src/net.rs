@@ -133,6 +133,16 @@ pub async fn start(config: Config) -> io::Result<Running> {
         Some(http_config) => {
             let listener = TcpListener::bind(http_config.addr).await?;
             let bound = listener.local_addr()?;
+            let trusted_proxies = config
+                .limits
+                .trusted_proxies
+                .iter()
+                .map(|s| {
+                    s.parse::<ipnet::IpNet>().map_err(|e| {
+                        io::Error::other(format!("invalid trusted_proxies CIDR {s:?}: {e}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let router = crate::http::router(crate::http::AppState {
                 server_name: config.server_name.clone(),
                 network_name: config.network_name.clone(),
@@ -159,9 +169,15 @@ pub async fn start(config: Config) -> io::Result<Running> {
                         .expect("system RNG for CSRF key");
                     k
                 },
+                trusted_proxies,
+                auth_rate_burst: config.limits.auth_rate_burst,
+                auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, router).await {
+                // `ConnectInfo<SocketAddr>` so handlers can see the socket peer
+                // (for rate limiting / X-Forwarded-For client-IP resolution).
+                let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                if let Err(e) = axum::serve(listener, service).await {
                     eprintln!("http server exited: {e}");
                 }
             });

@@ -194,6 +194,14 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         return;
     }
 
+    // Track activity for WHOIS idle / WHOX `l` (keepalive doesn't count).
+    if command != "PING"
+        && command != "PONG"
+        && let Some(session) = state.sessions.get_mut(&conn)
+    {
+        session.last_active = (state.config.clock)();
+    }
+
     // Commands legal before registration.
     match command.as_str() {
         "CAP" => return cmd_cap(state, conn, p),
@@ -1128,18 +1136,12 @@ fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {
         .unwrap_or_default();
     let new_flags = apply_flag_changes(&current, changes);
 
-    // Update the hot map, then persist.
-    {
-        let entry = state.channel_access.entry(key.clone()).or_default();
-        if new_flags.is_empty() {
-            entry.remove(&target_folded);
-        } else {
-            entry.insert(target_folded.clone(), new_flags.clone());
-        }
-    }
+    // Persist first, then update the hot map only on success — so a DB outage
+    // can't leave the running server diverged from storage while telling the
+    // founder the change failed (it would otherwise be live but unpersisted).
     let request = super::DbRequest::SetChannelAccess {
         channel: key.as_str().to_string(),
-        account: target_folded,
+        account: target_folded.clone(),
         flags: (!new_flags.is_empty()).then(|| new_flags.clone()),
     };
     if state.db_tx.try_push(request).is_err() {
@@ -1149,6 +1151,14 @@ fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {
             "Services are temporarily unavailable. Try again later.",
         );
         return;
+    }
+    {
+        let entry = state.channel_access.entry(key.clone()).or_default();
+        if new_flags.is_empty() {
+            entry.remove(&target_folded);
+        } else {
+            entry.insert(target_folded.clone(), new_flags.clone());
+        }
     }
     if new_flags.is_empty() {
         state.service_notice(
@@ -1320,6 +1330,19 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                     return;
                 }
             };
+            // Persist first, mutate hot state only on success (no divergence).
+            let request = super::DbRequest::SetChannelKeeptopic {
+                channel: key.as_str().to_string(),
+                keeptopic: on,
+            };
+            if state.db_tx.try_push(request).is_err() {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Services are temporarily unavailable. Try again later.",
+                );
+                return;
+            }
             if on {
                 state.keeptopic_off.remove(&key);
             } else {
@@ -1338,18 +1361,6 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                     }
                 }
             }
-            let request = super::DbRequest::SetChannelKeeptopic {
-                channel: key.as_str().to_string(),
-                keeptopic: on,
-            };
-            if state.db_tx.try_push(request).is_err() {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-                return;
-            }
             state.service_notice(
                 conn,
                 "ChanServ",
@@ -1363,7 +1374,6 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
             let spec = args.get(2).copied().unwrap_or("");
             // Clear the lock on empty / OFF / "-".
             if spec.is_empty() || spec.eq_ignore_ascii_case("OFF") || spec == "-" {
-                state.channel_mlock.remove(&key);
                 let request = super::DbRequest::SetChannelMlock {
                     channel: key.as_str().to_string(),
                     mlock: None,
@@ -1376,6 +1386,7 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                     );
                     return;
                 }
+                state.channel_mlock.remove(&key);
                 state.service_notice(
                     conn,
                     "ChanServ",
@@ -1399,7 +1410,6 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                 }
             };
             let canonical = parsed.render();
-            state.channel_mlock.insert(key.clone(), parsed);
             let request = super::DbRequest::SetChannelMlock {
                 channel: key.as_str().to_string(),
                 mlock: Some(canonical.clone()),
@@ -1412,7 +1422,8 @@ fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str]) {
                 );
                 return;
             }
-            // Enforce immediately on the live channel.
+            // Persisted: record it and enforce immediately on the live channel.
+            state.channel_mlock.insert(key.clone(), parsed);
             apply_mlock(state, &key);
             state.service_notice(
                 conn,
@@ -1481,7 +1492,13 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
             return;
         }
     }
-    state.sessions.get_mut(&conn).expect("checked").registered = true;
+    let now = (state.config.clock)();
+    {
+        let session = state.sessions.get_mut(&conn).expect("checked");
+        session.registered = true;
+        session.signon = now;
+        session.last_active = now;
+    }
     let registered_now = state.sessions.values().filter(|s| s.registered).count();
     state.max_users = state.max_users.max(registered_now);
     let prefix = state.sessions[&conn].prefix();
@@ -1712,6 +1729,32 @@ const INVITE_LIMIT: usize = 100;
 const TOPICLEN: usize = 390;
 const KICKLEN: usize = 390;
 const AWAYLEN: usize = 390;
+
+/// Canonicalize a channel list-mode (+b/+q/+e/+I) mask to `nick!user@host`,
+/// filling missing components with `*` (Solanum's `clean_ban_mask`). Without
+/// this a bare `nick` is stored verbatim and never matches `nick!user@host`,
+/// so the ban is silently ineffective.
+fn normalize_ban_mask(mask: &str) -> String {
+    fn star(s: &str) -> &str {
+        if s.is_empty() { "*" } else { s }
+    }
+    match (mask.contains('!'), mask.contains('@')) {
+        (true, true) => {
+            let (nick, rest) = mask.split_once('!').unwrap();
+            let (user, host) = rest.split_once('@').unwrap();
+            format!("{}!{}@{}", star(nick), star(user), star(host))
+        }
+        (true, false) => {
+            let (nick, user) = mask.split_once('!').unwrap();
+            format!("{}!{}@*", star(nick), star(user))
+        }
+        (false, true) => {
+            let (user, host) = mask.split_once('@').unwrap();
+            format!("*!{}@{}", star(user), star(host))
+        }
+        (false, false) => format!("{}!*@*", star(mask)),
+    }
+}
 
 /// Truncate `s` to at most `max` bytes on a UTF-8 char boundary.
 fn truncate_chars(s: &str, max: usize) -> &str {
@@ -2362,7 +2405,7 @@ fn deliver_one_message(
         }
     } else {
         let key = state.nick_key(target);
-        let Some(&peer) = state.nicks.get(&key) else {
+        let Some(peer) = state.registered_peer(&key) else {
             if loud {
                 state.numeric(
                     conn,
@@ -2489,7 +2532,7 @@ fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) 
             .collect()
     } else {
         let key = state.nick_key(target);
-        let Some(&peer) = state.nicks.get(&key) else {
+        let Some(peer) = state.registered_peer(&key) else {
             state.numeric(
                 conn,
                 ERR_NOSUCHNICK,
@@ -2953,9 +2996,14 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                 }
             }
             'b' | 'q' | 'e' | 'I' => {
-                let Some(&mask) = args.next() else {
+                let Some(&raw_mask) = args.next() else {
                     continue; // handled above for the query form
                 };
+                // Canonicalize to nick!user@host so a bare `+b nick` actually
+                // matches `nick!user@host` (Solanum clean_ban_mask); otherwise
+                // banning by nick — a very common op — silently never applies.
+                let norm = normalize_ban_mask(raw_mask);
+                let mask = norm.as_str();
                 // Bound the lists: without a cap a single opped client could
                 // stream distinct masks until the core worker OOMs (and every
                 // JOIN/PRIVMSG re-scans them). `MAXLIST=bqeI:100` advertises a
@@ -3101,6 +3149,7 @@ struct WhoxRow<'a> {
     flags: &'a str,
     account: Option<&'a str>,
     realname: &'a str,
+    idle_secs: u64,
 }
 
 fn send_whox_row(state: &mut ServerState, conn: ConnId, req: &WhoxRequest, row: &WhoxRow) {
@@ -3120,7 +3169,7 @@ fn send_whox_row(state: &mut ServerState, conn: ConnId, req: &WhoxRequest, row: 
             'n' => middle.push(row.nick.to_string()),
             'f' => middle.push(row.flags.to_string()),
             'd' => middle.push("0".into()), // hop count: single server
-            'l' => middle.push("0".into()), // idle: not tracked yet
+            'l' => middle.push(row.idle_secs.to_string()), // idle seconds
             'a' => middle.push(row.account.unwrap_or("0").to_string()),
             'o' => middle.push("n/a".into()), // oplevel unused (charybdis)
             'r' => trailing = Some(row.realname.to_string()),
@@ -3140,6 +3189,11 @@ fn who_flags(session: &super::state::Session, sigil: &str) -> String {
     format!("{here}{star}{bot}{sigil}")
 }
 
+/// One channel-WHO row, materialized so the `Session` borrow is released
+/// before the reply is sent: (user, host, nick, flags, realname, account,
+/// idle seconds).
+type WhoRowData = (String, String, String, String, String, Option<String>, u64);
+
 fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&mask) = p.first() else {
         state.numeric(conn, RPL_ENDOFWHO, &["*"], Some("End of /WHO list"));
@@ -3148,6 +3202,7 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let whox = p.get(1).and_then(|arg| parse_whox(arg));
     let requester_multi_prefix = state.sessions[&conn].caps.multi_prefix;
     let server = state.config.server_name.clone();
+    let now = (state.config.clock)();
     if mask.starts_with('#') {
         let key = state.chan_key(mask);
         if let Some(chan) = state.channels.get(&key) {
@@ -3155,7 +3210,7 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             // A +s channel's membership is hidden from non-members: emit no
             // rows, letting the terminating RPL_ENDOFWHO stand alone.
             let hidden = chan.modes.secret && !chan.members.contains_key(&conn);
-            let rows: Vec<(String, String, String, String, String, Option<String>)> = if hidden {
+            let rows: Vec<WhoRowData> = if hidden {
                 Vec::new()
             } else {
                 chan.members
@@ -3175,11 +3230,12 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             who_flags(s, sigil),
                             s.realname.clone().expect("registered"),
                             s.account.clone(),
+                            now.saturating_sub(s.last_active),
                         )
                     })
                     .collect()
             };
-            for (user, host, nick, flags, realname, account) in rows {
+            for (user, host, nick, flags, realname, account, idle_secs) in rows {
                 match &whox {
                     Some(req) => send_whox_row(
                         state,
@@ -3194,6 +3250,7 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             flags: &flags,
                             account: account.as_deref(),
                             realname: &realname,
+                            idle_secs,
                         },
                     ),
                     None => state.numeric(
@@ -3238,13 +3295,14 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             .collect();
         for peer in targets {
             let s = &state.sessions[&peer];
-            let (user, host, nick, realname, account, flags) = (
+            let (user, host, nick, realname, account, flags, idle_secs) = (
                 s.user.clone().expect("registered"),
                 s.host.clone(),
                 s.nick.clone().expect("registered"),
                 s.realname.clone().expect("registered"),
                 s.account.clone(),
                 who_flags(s, ""),
+                now.saturating_sub(s.last_active),
             );
             match &whox {
                 Some(req) => send_whox_row(
@@ -3260,6 +3318,7 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                         flags: &flags,
                         account: account.as_deref(),
                         realname: &realname,
+                        idle_secs,
                     },
                 ),
                 None => state.numeric(
@@ -3337,6 +3396,18 @@ fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 );
             }
             state.numeric(conn, RPL_WHOISSERVER, &[&nick, &server], Some(&network));
+            {
+                let s = &state.sessions[&peer];
+                let now = (state.config.clock)();
+                let idle = now.saturating_sub(s.last_active);
+                let signon = s.signon;
+                state.numeric(
+                    conn,
+                    RPL_WHOISIDLE,
+                    &[&nick, &idle.to_string(), &signon.to_string()],
+                    Some("seconds idle, signon time"),
+                );
+            }
             if let Some(away) = state.sessions[&peer].away.clone() {
                 state.numeric(conn, RPL_AWAY, &[&nick], Some(&away));
             }
@@ -3509,7 +3580,7 @@ fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let who_key = state.nick_key(who);
-    let Some(&invitee) = state.nicks.get(&who_key) else {
+    let Some(invitee) = state.registered_peer(&who_key) else {
         state.numeric(conn, ERR_NOSUCHNICK, &[who], Some("No such nick/channel"));
         return;
     };
@@ -3695,9 +3766,11 @@ fn chathistory_fail(state: &mut ServerState, conn: ConnId, code: &str, detail: &
     );
 }
 
-/// Serve history from the channel's hot ring. Entries older than the
-/// ring live only in PostgreSQL; the DB fallback is tracked in PLAN.md
-/// and requests beyond the ring return what the ring holds.
+/// Serve history from the channel's hot ring, falling back to PostgreSQL
+/// for windows the ring no longer fully covers. The ring answers directly
+/// while it holds the channel's entire history; once it has overflowed or
+/// been evicted, a request that reaches older than the ring is resolved
+/// against the `messages` table by composite `(ts, id)` position.
 fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let caps = state.sessions[&conn].caps;
     if !caps.batch || !caps.chathistory {
@@ -3863,29 +3936,49 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Ring miss with a database available: page from PostgreSQL instead,
     // preserving one code path for rendering (history_page).
     if !covered && state.config.sasl_enabled {
+        // A msgid selector pages on the composite (ts, id) via a msgid pivot
+        // (so same-second messages aren't skipped); a timestamp selector uses
+        // the second-granular ts bound.
+        let msgid_of = |sel: &str| sel.strip_prefix("msgid=").map(str::to_string);
         let query = match sub.to_ascii_uppercase().as_str() {
             "LATEST" => super::HistoryQuery::Latest { limit },
-            "BEFORE" => super::HistoryQuery::Before {
-                before_ts: selector_ts(&history, selector).unwrap_or(u64::MAX),
-                limit,
-            },
-            "AROUND" => super::HistoryQuery::Around {
-                around_ts: selector_ts(&history, selector).unwrap_or(0),
-                limit,
-            },
-            "BETWEEN" => {
-                let a = selector_ts(&history, selector).unwrap_or(0);
-                let b = selector_ts(&history, selector2).unwrap_or(u64::MAX);
-                let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
-                super::HistoryQuery::Between {
-                    after_ts,
-                    before_ts,
+            "BEFORE" => match msgid_of(selector) {
+                Some(msgid) => super::HistoryQuery::BeforeMsgid { msgid, limit },
+                None => super::HistoryQuery::Before {
+                    before_ts: selector_ts(&history, selector).unwrap_or(u64::MAX),
                     limit,
+                },
+            },
+            "AROUND" => match msgid_of(selector) {
+                Some(msgid) => super::HistoryQuery::AroundMsgid { msgid, limit },
+                None => super::HistoryQuery::Around {
+                    around_ts: selector_ts(&history, selector).unwrap_or(0),
+                    limit,
+                },
+            },
+            "BETWEEN" => match (msgid_of(selector), msgid_of(selector2)) {
+                (Some(after_msgid), Some(before_msgid)) => super::HistoryQuery::BetweenMsgid {
+                    after_msgid,
+                    before_msgid,
+                    limit,
+                },
+                _ => {
+                    let a = selector_ts(&history, selector).unwrap_or(0);
+                    let b = selector_ts(&history, selector2).unwrap_or(u64::MAX);
+                    let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
+                    super::HistoryQuery::Between {
+                        after_ts,
+                        before_ts,
+                        limit,
+                    }
                 }
-            }
-            _ => super::HistoryQuery::After {
-                after_ts: selector_ts(&history, selector).unwrap_or(0),
-                limit,
+            },
+            _ => match msgid_of(selector) {
+                Some(msgid) => super::HistoryQuery::AfterMsgid { msgid, limit },
+                None => super::HistoryQuery::After {
+                    after_ts: selector_ts(&history, selector).unwrap_or(0),
+                    limit,
+                },
             },
         };
         let request = super::DbRequest::QueryHistory {
@@ -4796,5 +4889,26 @@ fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .collect();
     for recipient in recipients {
         state.send_timed(recipient, &line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ban_mask_canonicalizes_to_nick_user_host() {
+        // A bare token is a nick; the missing user/host default to wildcards.
+        assert_eq!(normalize_ban_mask("alice"), "alice!*@*");
+        // host-only (`@host`) fills nick and user with wildcards.
+        assert_eq!(normalize_ban_mask("@evil.example"), "*!*@evil.example");
+        // user-only (`nick!user`) fills the host with a wildcard.
+        assert_eq!(normalize_ban_mask("alice!bob"), "alice!bob@*");
+        // A fully-qualified mask is preserved.
+        assert_eq!(normalize_ban_mask("nick!user@host"), "nick!user@host");
+        // Empty components in a full mask become wildcards, not empties —
+        // otherwise `!@` would match nothing and silently no-op the ban.
+        assert_eq!(normalize_ban_mask("!@"), "*!*@*");
+        assert_eq!(normalize_ban_mask("nick!@host"), "nick!*@host");
     }
 }

@@ -163,6 +163,15 @@ impl Connection {
                 _ => {}
             }
         }
+        // Best-effort: request the message-tag caps so the bouncer receives
+        // server-time/msgid/account and can preserve them in backlog. Each is
+        // requested separately (an atomic multi-cap REQ would lose all on one
+        // NAK); a NAK just means that cap isn't enabled. The ACK/NAK replies
+        // are ignored by the loops below — the server enables the ACKed caps
+        // regardless.
+        for cap in ["server-time", "message-tags", "account-tag"] {
+            self.send_line(&format!("CAP REQ :{cap}")).await?;
+        }
         self.send_line("AUTHENTICATE PLAIN").await?;
         loop {
             let Some(msg) = self.next_message().await? else {
@@ -339,9 +348,17 @@ impl Connection {
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
     pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
+        // Negotiate message-tag caps (best-effort) so an IRC upstream sends
+        // server-time/msgid/account for backlog preservation, then register.
+        // ACK/NAK replies are ignored below; the server enables the ACKed caps.
+        self.send_line("CAP LS 302").await?;
+        for cap in ["server-time", "message-tags", "account-tag"] {
+            self.send_line(&format!("CAP REQ :{cap}")).await?;
+        }
         self.send_line(&format!("NICK {nick}")).await?;
         self.send_line(&format!("USER {nick} 0 * :{realname}"))
             .await?;
+        self.send_line("CAP END").await?;
         while let Some(msg) = self.next_message().await? {
             match msg.command.as_str() {
                 "001" => {
@@ -360,6 +377,15 @@ impl Connection {
                         io::ErrorKind::AlreadyExists,
                         "nickname in use",
                     ));
+                }
+                // Registration-refusal numerics: return an error rather than
+                // block forever on a server that reports the failure but does
+                // not immediately close the socket.
+                "432" | "451" | "464" | "465" => {
+                    return Err(io::Error::other(format!(
+                        "registration refused ({})",
+                        msg.command
+                    )));
                 }
                 _ => {}
             }

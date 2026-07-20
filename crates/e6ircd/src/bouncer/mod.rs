@@ -108,6 +108,46 @@ pub(crate) fn route_privmsg(
     }
 }
 
+/// Which IRCv3 message-tag families an attaching client negotiated. Buffered
+/// upstream lines are stored fully tagged (server-time/msgid/account); these
+/// gate which tags each client is actually sent, since a tag a client didn't
+/// negotiate must not appear in its stream.
+#[derive(Default, Clone, Copy)]
+pub struct AttachCaps {
+    pub server_time: bool,
+    pub message_tags: bool,
+    pub account_tag: bool,
+}
+
+/// Strip from a serialized line any message tags the recipient did not
+/// negotiate. `time=` needs server-time, `account=` needs account-tag, and
+/// everything else (msgid, client-only tags) needs message-tags. A line with
+/// no tag section is returned unchanged.
+pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
+    let Some(rest) = line.strip_prefix('@') else {
+        return line.to_string();
+    };
+    let Some((tags, body)) = rest.split_once(' ') else {
+        return line.to_string();
+    };
+    let kept: Vec<&str> = tags
+        .split(';')
+        .filter(|t| {
+            let key = t.split('=').next().unwrap_or(t);
+            match key {
+                "time" => caps.server_time,
+                "account" => caps.account_tag,
+                _ => caps.message_tags,
+            }
+        })
+        .collect();
+    if kept.is_empty() {
+        body.to_string()
+    } else {
+        format!("@{} {}", kept.join(";"), body)
+    }
+}
+
 /// An event a driver emits upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
@@ -354,9 +394,9 @@ impl NetworkDriver for LoopbackDriver {
 /// Attach a downstream client stream to a running network: replay the
 /// detached buffer, then bidirectionally relay driver events to the
 /// client and client lines to the upstream. Returns when either side
-/// closes. This is the session multiplexer's core operation — the same
-/// function will serve the `local` driver once that lands.
-pub async fn attach<S>(stream: S, handle: &NetworkHandle) -> std::io::Result<()>
+/// closes. This is the session multiplexer's core operation, serving
+/// every driver kind (`irc`, `local`, and the bridges) uniformly.
+pub async fn attach<S>(stream: S, handle: &NetworkHandle, caps: AttachCaps) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -372,9 +412,10 @@ where
     let commands = handle.commands.clone();
     let mut events = handle.events.subscribe();
 
-    // Playback: everything buffered while detached, in order.
+    // Playback: everything buffered while detached, in order, with tags the
+    // client didn't negotiate stripped.
     for line in handle.buffer_snapshot() {
-        write.write_all(line.as_bytes()).await?;
+        write.write_all(filter_tags(&line, caps).as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
     write.flush().await?;
@@ -387,7 +428,7 @@ where
             // Upstream -> client.
             ev = events.recv() => match ev {
                 Ok(DriverEvent::Line(line)) => {
-                    write.write_all(line.as_bytes()).await?;
+                    write.write_all(filter_tags(&line, caps).as_bytes()).await?;
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
                 }
@@ -474,6 +515,54 @@ mod tests {
         // A clean line is returned unchanged (fast path).
         let clean = ":a!a@irc PRIVMSG #c :hello there".to_string();
         assert_eq!(sanitize_upstream_line(clean.clone()), clean);
+    }
+
+    #[test]
+    fn filter_tags_gates_each_family_by_negotiated_cap() {
+        let line = "@time=2020-01-01T00:00:00.000Z;account=alice;msgid=abc :n!u@h PRIVMSG #c :hi";
+        // No caps: every tag is stripped, the tag section disappears entirely.
+        let none = filter_tags(line, AttachCaps::default());
+        assert_eq!(none, ":n!u@h PRIVMSG #c :hi");
+        // server-time only keeps `time=`, drops account/msgid.
+        let st = filter_tags(
+            line,
+            AttachCaps {
+                server_time: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(st, "@time=2020-01-01T00:00:00.000Z :n!u@h PRIVMSG #c :hi");
+        // account-tag only keeps `account=`.
+        let at = filter_tags(
+            line,
+            AttachCaps {
+                account_tag: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(at, "@account=alice :n!u@h PRIVMSG #c :hi");
+        // message-tags gates everything else (msgid) but not time/account.
+        let mt = filter_tags(
+            line,
+            AttachCaps {
+                message_tags: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(mt, "@msgid=abc :n!u@h PRIVMSG #c :hi");
+        // All three: full line preserved in original tag order.
+        let all = filter_tags(
+            line,
+            AttachCaps {
+                server_time: true,
+                message_tags: true,
+                account_tag: true,
+            },
+        );
+        assert_eq!(all, line);
+        // A line without a tag section is returned unchanged.
+        let bare = ":n!u@h PRIVMSG #c :hi";
+        assert_eq!(filter_tags(bare, AttachCaps::default()), bare);
     }
 
     #[test]

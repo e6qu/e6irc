@@ -481,14 +481,21 @@ Principal tables (columns abridged):
 - `api_tokens` (hashed PATs, scopes, expiry)
 - `channels` (registered channels: founder, flags, topic retention, mlock)
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS
-- `messages` — history log, **native range partitions by month**; columns
-  (id/msgid, target, sender-account, sender-mask, kind, body, tags, ts).
-  Retention policy drops whole partitions (config: per-server default,
-  per-channel override)
-- `bnc_networks` (account_id, name, driver, host/port/tls, sasl creds
-  **encrypted** with the server master key (§15), enabled, state)
-- `bnc_buffers` (network_id, buffer name, last_seen msgid per device/client)
-- `bridge_state` (driver-specific cursors/tokens, encrypted where secret)
+- `messages` — append-only history log; columns (id, msgid, target,
+  sender_prefix, sender_account, kind, body, ts), indexed `(target, ts)`
+  btree + BRIN on `ts`. Native monthly range partitions and
+  partition-drop retention are a planned scale-hardening step — the write
+  path and queries are already partition-shaped (append-only, time-bounded
+  scans). Server-time and account-tag are reconstructed from `ts` and
+  `sender_account`, so no separate tags column is stored.
+- `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
+  sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
+  server master key (§15), enabled)
+- `bnc_buffer` (id, owner, network, line, created_at) — persisted
+  detached-buffer lines replayed on attach after a restart; `owner` is `*`
+  for a shared/server-level network
+- `read_markers` (account_id, target, marker_ts) — per-account read
+  position, the source for `draft/read-marker`
 - `audit_log` (oper/admin actions, API mutations)
 
 Write path for messages: producers push to an in-process MPSC; a writer pool

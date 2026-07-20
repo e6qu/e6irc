@@ -134,19 +134,36 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             return Dropped;
         }
     };
-    let (ws, _) = match tokio_tungstenite::connect_async(&ws_url).await {
-        Ok(x) => x,
-        Err(e) => {
+    // Bound the WS handshake so a black-holed socket can't wedge the driver.
+    let (ws, _) = match tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio_tungstenite::connect_async(&ws_url),
+    )
+    .await
+    {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
             eprintln!("slack: socket connect failed: {e}");
+            return Dropped;
+        }
+        Err(_) => {
+            eprintln!("slack: socket connect timed out");
             return Dropped;
         }
     };
     let (mut write, mut read) = ws.split();
     ends.emit(DriverEvent::Connected);
 
+    // Slack sends pings and disconnect envelopes regularly; no data for well
+    // over a minute means the socket is black-holed — reconnect, don't hang.
+    let read_timeout = Duration::from_secs(90);
     loop {
         tokio::select! {
-            frame = read.next() => {
+            frame = tokio::time::timeout(read_timeout, read.next()) => {
+                let Ok(frame) = frame else {
+                    eprintln!("slack: socket idle past timeout; reconnecting");
+                    return Dropped;
+                };
                 let text = match frame {
                     Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
                     Some(Ok(Ws::Ping(p))) => {
@@ -184,6 +201,11 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                             post_message(&http, &base, &config.bot_token, &id, &text).await
                         {
                             eprintln!("slack: chat.postMessage to {id} failed: {e}");
+                            // Surface the loss to the client, like the unmapped
+                            // path — a delivery failure isn't a silent drop.
+                            ends.emit_line(format!(
+                                ":*bnc* NOTICE * :message not delivered to Slack channel {id}"
+                            ));
                         }
                     }
                     super::RouteResult::Unmapped(target) => {

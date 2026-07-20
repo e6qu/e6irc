@@ -85,6 +85,17 @@ pub struct LimitsConfig {
     /// (PING/PONG exempt) and refill one per second.
     #[serde(default)]
     pub command_burst: Option<usize>,
+    /// CIDRs of trusted reverse proxies (e.g. the load balancer). When a
+    /// request's socket peer matches one of these, its client IP is taken
+    /// from `X-Forwarded-For`; otherwise the socket peer IP is used. Parsing
+    /// is validated at startup — an invalid CIDR is a hard error.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// Token-bucket size for the auth endpoints (credential issue + OIDC login
+    /// start), per client IP; the bucket refills to full over 60 seconds.
+    /// `None` disables auth rate limiting.
+    #[serde(default)]
+    pub auth_rate_burst: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -373,6 +384,18 @@ impl Config {
                 "limits.command_burst must be nonzero when set (0 flood-kills every command)"
                     .into(),
             ));
+        }
+        if self.limits.auth_rate_burst == Some(0) {
+            return Err(ConfigError::Invalid(
+                "limits.auth_rate_burst must be nonzero when set".into(),
+            ));
+        }
+        for cidr in &self.limits.trusted_proxies {
+            if cidr.parse::<ipnet::IpNet>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "limits.trusted_proxies: invalid CIDR '{cidr}'"
+                )));
+            }
         }
         if !self.oidc_providers.is_empty() {
             if self.database.is_none() {

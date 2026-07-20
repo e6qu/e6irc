@@ -157,6 +157,10 @@ pub(crate) struct Session {
     /// tokens remaining and the clock-second of the last refill.
     pub flood_tokens: u32,
     pub flood_last_sec: u64,
+    /// Wall-clock second of the last non-keepalive command (for WHOIS idle /
+    /// WHOX `l`), and of connection open (WHOIS signon).
+    pub last_active: u64,
+    pub signon: u64,
 }
 
 impl Session {
@@ -764,6 +768,8 @@ impl ServerState {
                 monitoring: HashMap::new(),
                 flood_tokens: 0,
                 flood_last_sec: 0,
+                last_active: 0,
+                signon: 0,
             },
         );
         assert!(prev.is_none(), "duplicate ConnId {conn:?} from acceptor");
