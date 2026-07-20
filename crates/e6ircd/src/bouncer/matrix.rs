@@ -61,12 +61,29 @@ struct Session {
 }
 
 async fn run(config: MatrixConfig, mut ends: DriverEnds) {
-    let mut session = match connect(&config).await {
+    // Always-on: a transient failure reconnects with backoff rather than
+    // permanently killing the network (which would silently drop every later
+    // upstream message). Only a dropped handle stops the driver.
+    let mut backoff = std::time::Duration::from_millis(200);
+    loop {
+        match session_once(&config, &mut ends).await {
+            super::SessionOutcome::Stopped => return,
+            super::SessionOutcome::Dropped => {
+                ends.emit(DriverEvent::Disconnected);
+                let jitter = std::time::Duration::from_millis((backoff.as_millis() as u64) % 97);
+                tokio::time::sleep(backoff + jitter).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+    let mut session = match connect(config).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("matrix: connect failed: {e}");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return super::SessionOutcome::Dropped;
         }
     };
     ends.emit(DriverEvent::Connected);
@@ -76,8 +93,7 @@ async fn run(config: MatrixConfig, mut ends: DriverEnds) {
         Ok((next, _)) => next,
         Err(e) => {
             eprintln!("matrix: initial sync failed: {e}");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return super::SessionOutcome::Dropped;
         }
     };
 
@@ -99,13 +115,12 @@ async fn run(config: MatrixConfig, mut ends: DriverEnds) {
                 }
                 Err(e) => {
                     eprintln!("matrix: sync error: {e}");
-                    ends.emit(DriverEvent::Disconnected);
-                    return;
+                    return super::SessionOutcome::Dropped;
                 }
             },
             cmd = ends.next_command() => match cmd {
                 Some(line) => handle_command(&mut session, &line).await,
-                None => return, // every handle dropped
+                None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
     }

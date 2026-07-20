@@ -674,7 +674,27 @@ async fn oidc_authorize(
             silent,
         },
     );
-    Redirect::temporary(auth_url.as_str()).into_response()
+    drop(pending);
+    // Bind the flow to this browser: an HttpOnly cookie equal to the OAuth
+    // `state`. The callback requires it, so a login response captured by an
+    // attacker cannot be replayed into a victim's browser to plant the
+    // attacker's session (login CSRF / session fixation). SameSite=Lax still
+    // rides the top-level redirect back from the provider.
+    let secure = if state.secure_cookies { "; Secure" } else { "" };
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [
+            (header::LOCATION, auth_url.to_string()),
+            (
+                header::SET_COOKIE,
+                format!(
+                    "e6irc_oidc_state={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600{secure}",
+                    csrf.secret()
+                ),
+            ),
+        ],
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -687,6 +707,7 @@ struct CallbackQuery {
 async fn oidc_callback(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
     use openidconnect::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
@@ -721,6 +742,21 @@ async fn oidc_callback(
     };
     if pending.provider != provider_name || pending.started.elapsed() > Duration::from_secs(600) {
         return problem(StatusCode::UNAUTHORIZED, "Login state mismatch", None);
+    }
+    // Require the browser to present the binding cookie set at authorize time,
+    // constant-time-equal to the returned `state`. Without this, an attacker
+    // who completed their own login could feed the resulting callback URL to a
+    // victim and plant the attacker's session in the victim's browser.
+    let bound = cookie_value(&headers, "e6irc_oidc_state").is_some_and(|c| {
+        aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), csrf_state.as_bytes())
+            .is_ok()
+    });
+    if !bound {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "Login state not bound to this browser",
+            None,
+        );
     }
     let Some(pool) = state.pool.clone() else {
         return problem(
@@ -1185,13 +1221,18 @@ async fn authenticate(
     Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None))
 }
 
-fn session_token(headers: &axum::http::HeaderMap) -> Option<String> {
+fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|part| {
         part.trim()
-            .strip_prefix("e6irc_session=")
+            .strip_prefix(name)?
+            .strip_prefix('=')
             .map(str::to_string)
     })
+}
+
+fn session_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    cookie_value(headers, "e6irc_session")
 }
 
 // ---- device authorization grant (RFC 8628) ------------------------------

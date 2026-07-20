@@ -3204,3 +3204,192 @@ fn statusmsg_is_not_stored_in_history() {
         "a normal channel message must be persisted"
     );
 }
+
+// ---- sweep: DoS caps + fidelity regressions -----------------------------
+
+#[test]
+fn join_zero_parts_all_channels() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "alice");
+    s.line(a, "JOIN #a");
+    s.line(a, "JOIN #b");
+    s.drain(a);
+    s.line(a, "JOIN 0");
+    let out = s.drain(a);
+    let parts: Vec<_> = out.iter().filter(|l| l.contains(" PART ")).collect();
+    assert_eq!(parts.len(), 2, "JOIN 0 must PART every channel: {out:#?}");
+    assert!(out.iter().any(|l| l.contains("PART #a")));
+    assert!(out.iter().any(|l| l.contains("PART #b")));
+}
+
+#[test]
+fn channel_ban_list_is_capped() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "alice");
+    s.line(a, "JOIN #c"); // first in → auto-op
+    s.drain(a);
+    for i in 0..100 {
+        s.line(a, &format!("MODE #c +b nick{i}!*@*"));
+        if i % 20 == 0 {
+            s.drain(a);
+        }
+    }
+    s.drain(a);
+    s.line(a, "MODE #c +b overflow!*@*");
+    let out = s.drain(a);
+    assert!(
+        has_numeric(&out, "478"),
+        "the 101st ban must be ERR_BANLISTFULL: {out:#?}"
+    );
+}
+
+#[test]
+fn channels_per_session_is_capped() {
+    let mut s = TestServer::new();
+    let a = s.register(1, "alice");
+    for i in 0..250 {
+        s.line(a, &format!("JOIN #ch{i}"));
+        if i % 10 == 0 {
+            s.drain(a);
+        }
+    }
+    s.drain(a);
+    s.line(a, "JOIN #onemore");
+    let out = s.drain(a);
+    assert!(
+        has_numeric(&out, "405"),
+        "the 251st channel must be ERR_TOOMANYCHANNELS: {out:#?}"
+    );
+}
+
+#[test]
+fn multi_target_message_delivers_and_caps() {
+    let mut s = TestServer::new();
+    let sender = s.register(1, "sender");
+    let b = s.register(2, "bob");
+    let c = s.register(3, "carol");
+    let d = s.register(4, "dave");
+    let e = s.register(5, "erin");
+    let f = s.register(6, "frank");
+    s.line(sender, "PRIVMSG bob,carol,dave,erin,frank :hi");
+    assert!(s.drain(b).iter().any(|l| l.contains("PRIVMSG bob :hi")));
+    assert!(s.drain(c).iter().any(|l| l.contains("PRIVMSG carol :hi")));
+    assert!(s.drain(d).iter().any(|l| l.contains("PRIVMSG dave :hi")));
+    assert!(s.drain(e).iter().any(|l| l.contains("PRIVMSG erin :hi")));
+    assert!(
+        s.drain(f).is_empty(),
+        "the 5th target is over TARGMAX and must not receive"
+    );
+    let out = s.drain(sender);
+    assert!(
+        has_numeric(&out, "407"),
+        "over-cap must yield ERR_TOOMANYTARGETS: {out:#?}"
+    );
+}
+
+#[test]
+fn channel_key_hidden_from_non_members() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #k");
+    s.drain(op);
+    s.line(op, "MODE #k +k sekrit");
+    s.drain(op);
+    // A member sees the real key.
+    s.line(op, "MODE #k");
+    let out = s.drain(op);
+    let line = out
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("324"))
+        .expect("324");
+    assert!(line.contains("sekrit"), "member should see key: {line}");
+    // A non-member sees `*`, never the value.
+    let bob = s.register(2, "bob");
+    s.line(bob, "MODE #k");
+    let out = s.drain(bob);
+    let line = out
+        .iter()
+        .find(|l| l.split(' ').nth(1) == Some("324"))
+        .expect("324");
+    assert!(
+        line.contains('*') && !line.contains("sekrit"),
+        "non-member must not see key value: {line}"
+    );
+}
+
+#[test]
+fn whois_hides_secret_channel_from_non_member() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #sec");
+    s.line(alice, "MODE #sec +s");
+    s.drain(alice);
+    let bob = s.register(2, "bob");
+    s.line(bob, "WHOIS alice");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains("#sec")),
+        "WHOIS must not leak a +s channel to a non-member: {out:#?}"
+    );
+    // Alice shares it, so her own WHOIS still lists it.
+    s.line(alice, "WHOIS alice");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("#sec")),
+        "a member's WHOIS still shows the shared secret channel: {out:#?}"
+    );
+}
+
+#[test]
+fn names_and_who_hide_secret_channel_from_non_member() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #sec");
+    s.line(alice, "MODE #sec +s");
+    s.drain(alice);
+    let bob = s.register(2, "bob");
+    s.line(bob, "NAMES #sec");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains("alice")),
+        "NAMES must hide +s membership: {out:#?}"
+    );
+    assert!(has_numeric(&out, "366"), "NAMES still ends (366): {out:#?}");
+    s.line(bob, "WHO #sec");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.split(' ').nth(1) == Some("352")),
+        "WHO must hide +s members: {out:#?}"
+    );
+    assert!(has_numeric(&out, "315"), "WHO still ends (315): {out:#?}");
+}
+
+#[test]
+fn exception_list_query_requires_op() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #x");
+    s.drain(op);
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #x"); // second in → not op
+    s.drain(bob);
+    s.line(bob, "MODE #x +e");
+    let out = s.drain(bob);
+    assert!(
+        has_numeric(&out, "482"),
+        "a non-op +e list query must be ERR_CHANOPRIVSNEEDED: {out:#?}"
+    );
+}
+
+#[test]
+fn markread_rejects_non_channel_target() {
+    let mut s = TestServer::new();
+    let a = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, a, "alice");
+    s.line(a, "MARKREAD notachannel timestamp=2026-07-18T12:00:00.000Z");
+    let out = s.drain(a);
+    assert!(
+        out.iter().any(|l| l.contains("FAIL MARKREAD")),
+        "a non-channel MARKREAD target must fail loudly: {out:#?}"
+    );
+}

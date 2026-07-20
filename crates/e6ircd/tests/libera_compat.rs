@@ -24,6 +24,12 @@ fn reference() -> String {
 /// Tokens where divergence is deliberate and documented — additions
 /// need a reason in the comment.
 const WHITELIST: &[&str] = &[
+    // TARGMAX is enforcement-specific: we advertise limits only for the
+    // commands we actually bound (PRIVMSG/NOTICE at 4, matching Libera's
+    // values for those), whereas Libera also lists NAMES/LIST/KICK/WHOIS/
+    // ACCEPT/MONITOR. Advertising limits we do not enforce would be a false
+    // claim, so the token legitimately differs.
+    "TARGMAX",
     // Libera: eIbq,k,flj,CFLMPQRSTcgimnprstuz. We implement eIbq,k,l,
     // imnst so far; the missing type-C (f forward, j join-throttle) and
     // type-D flags are rejected loudly with 472 until implemented, so

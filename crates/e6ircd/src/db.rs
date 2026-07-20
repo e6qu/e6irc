@@ -994,6 +994,22 @@ pub async fn list_accounts(pool: &PgPool) -> Result<Vec<String>, DbError> {
         .map_err(DbError::Query)
 }
 
+/// A fixed argon2id hash used only to spend a verification's worth of CPU on
+/// the no-such-account path of [`verify_credentials`], so that account
+/// existence is not a timing oracle. Computed once with the same parameters
+/// as real hashes; the password it encodes is irrelevant and never matches.
+fn dummy_verify_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let salt =
+            SaltString::from_b64("YWJjZGVmZ2hpamtsbW5vcA").expect("static salt is valid B64");
+        Argon2::default()
+            .hash_password(b"e6irc/no-such-account", &salt)
+            .expect("dummy hash computes")
+            .to_string()
+    })
+}
+
 /// Verify `password` against `account`'s stored credentials (account
 /// password or app password — both are argon2id rows under the same
 /// account). Returns the account's canonical display name on success and
@@ -1015,6 +1031,19 @@ pub async fn verify_credentials(
     .await
     .map_err(DbError::Query)?;
     if rows.is_empty() {
+        // No such account. Still spend one argon2 verification against a
+        // fixed throwaway hash, so response time does not reveal whether the
+        // account exists — the "no existence oracle" invariant above holds
+        // only if the empty case costs the same as a real rejection.
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || {
+            let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
+            // Always fails (the password never matches); we run it only to
+            // spend the argon2 time, so the result is deliberately discarded.
+            let _ = Argon2::default().verify_password(password.as_bytes(), &parsed);
+        })
+        .await
+        .expect("verification task panicked");
         return Ok(None);
     }
     let display_name = rows[0].0.clone();

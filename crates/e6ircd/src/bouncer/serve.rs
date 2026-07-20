@@ -56,7 +56,11 @@ impl Registry {
     /// Start a driver per configured (server-level) network. `pool`, when
     /// present, enables buffer persistence and backlog restore; `core`
     /// (the in-process handles) is required for any `local` network.
-    pub fn start(entries: &[NetworkEntry], pool: Option<PgPool>, core: super::CoreHandles) -> Self {
+    pub fn start(
+        entries: &[NetworkEntry],
+        pool: Option<PgPool>,
+        core: super::CoreHandles,
+    ) -> Result<Self, String> {
         use crate::config::NetworkKind;
         let registry = Self {
             networks: Mutex::new(HashMap::new()),
@@ -91,12 +95,11 @@ impl Registry {
                     }
                     #[cfg(not(feature = "matrix"))]
                     {
-                        eprintln!(
+                        return Err(format!(
                             "network '{}' is kind=matrix but this binary was built \
-                             without the `matrix` feature; skipping",
+                             without the `matrix` feature",
                             e.name
-                        );
-                        continue;
+                        ));
                     }
                 }
                 NetworkKind::Discord => {
@@ -111,12 +114,11 @@ impl Registry {
                     }
                     #[cfg(not(feature = "discord"))]
                     {
-                        eprintln!(
+                        return Err(format!(
                             "network '{}' is kind=discord but this binary was built \
-                             without the `discord` feature; skipping",
+                             without the `discord` feature",
                             e.name
-                        );
-                        continue;
+                        ));
                     }
                 }
                 NetworkKind::Slack => {
@@ -132,18 +134,17 @@ impl Registry {
                     }
                     #[cfg(not(feature = "slack"))]
                     {
-                        eprintln!(
+                        return Err(format!(
                             "network '{}' is kind=slack but this binary was built \
-                             without the `slack` feature; skipping",
+                             without the `slack` feature",
                             e.name
-                        );
-                        continue;
+                        ));
                     }
                 }
             };
             registry.add(e.owner.clone(), e.name.clone(), driver);
         }
-        registry
+        Ok(registry)
     }
 
     /// Start a driver for `(owner, name)` and register it, replacing any
@@ -227,7 +228,15 @@ fn spawn_persistence(
                     }
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // A persistence lag means upstream lines were never written:
+                // the stored backlog now has a gap. Surface it rather than
+                // dropping it silently.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!(
+                        "bnc: persistence lagged for {owner_key}/{network}; {n} upstream \
+                         line(s) missing from stored backlog"
+                    );
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -462,8 +471,14 @@ async fn verify_plain(pool: &PgPool, payload: &str) -> Option<String> {
     let _authzid = parts.next()?;
     let authcid = std::str::from_utf8(parts.next()?).ok()?;
     let passwd = std::str::from_utf8(parts.next()?).ok()?;
-    crate::db::verify_credentials(pool, authcid, passwd)
-        .await
-        .ok()
-        .flatten()
+    // A DB failure is not an auth rejection (verify_credentials' contract):
+    // fail closed, but surface the error instead of silently masking it as a
+    // bad password.
+    match crate::db::verify_credentials(pool, authcid, passwd).await {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("bnc: credential check failed (database error): {e}");
+            None
+        }
+    }
 }

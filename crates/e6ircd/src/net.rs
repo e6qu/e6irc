@@ -98,15 +98,18 @@ pub async fn start(config: Config) -> io::Result<Running> {
     // them). Server-level [[network]]s start first, then each account's
     // persisted networks are loaded and started.
     let bnc_registry = if config.bnc.is_some() {
-        let reg = Arc::new(crate::bouncer::Registry::start(
-            &config.networks,
-            pool.clone(),
-            crate::bouncer::CoreHandles {
-                core_tx: core_tx.clone(),
-                next_conn: next_conn.clone(),
-                sendq: config.sendq,
-            },
-        ));
+        let reg = Arc::new(
+            crate::bouncer::Registry::start(
+                &config.networks,
+                pool.clone(),
+                crate::bouncer::CoreHandles {
+                    core_tx: core_tx.clone(),
+                    next_conn: next_conn.clone(),
+                    sendq: config.sendq,
+                },
+            )
+            .map_err(io::Error::other)?,
+        );
         if let Some(pool) = &pool {
             for (owner, row) in crate::db::list_all_bnc_networks(pool)
                 .await

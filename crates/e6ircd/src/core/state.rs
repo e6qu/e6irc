@@ -131,6 +131,9 @@ pub(crate) struct Session {
     /// Services account this connection is authenticated to.
     pub account: Option<String>,
     pub sasl: SaslState,
+    /// Accumulates 400-byte AUTHENTICATE continuation chunks (SASL spec)
+    /// until a short line completes the payload.
+    pub sasl_buf: String,
     /// A NickServ IDENTIFY is awaiting its DB verdict.
     pub pending_identify: bool,
     /// Away message, when set.
@@ -188,8 +191,11 @@ pub(crate) struct ChanModes {
 }
 
 impl ChanModes {
-    /// `+nt`-style string with key/limit args appended.
-    pub fn to_string_with_args(&self) -> String {
+    /// `+nt`-style string with key/limit args appended. `reveal_key` gates
+    /// the `+k` argument: only channel members may see the key, so that
+    /// `MODE #chan` from an outsider cannot disclose it and bypass `+k`.
+    /// The limit is not secret and is always shown.
+    pub fn to_string_with_args(&self, reveal_key: bool) -> String {
         let mut modes = String::from("+");
         let mut args = String::new();
         for (set, c) in [
@@ -205,9 +211,11 @@ impl ChanModes {
             }
         }
         if let Some(k) = &self.key {
+            // Members see the key; outsiders see `*` (Solanum behaviour) so
+            // MODE #chan reveals that +k is set without disclosing the value.
             modes.push('k');
             args.push(' ');
-            args.push_str(k);
+            args.push_str(if reveal_key { k } else { "*" });
         }
         if let Some(l) = self.limit {
             modes.push('l');
@@ -744,6 +752,7 @@ impl ServerState {
                 caps: Caps::default(),
                 account: None,
                 sasl: SaslState::default(),
+                sasl_buf: String::new(),
                 pending_identify: false,
                 away: None,
                 oper: false,
