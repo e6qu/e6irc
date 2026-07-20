@@ -187,6 +187,11 @@ pub fn router(state: AppState) -> Router {
 mod web {
     use super::*;
 
+    #[derive(Default, Deserialize)]
+    pub struct EntryQuery {
+        sso: Option<String>,
+    }
+
     #[derive(rust_embed::Embed)]
     #[folder = "../../web/dist"]
     struct Dist;
@@ -225,8 +230,29 @@ mod web {
         }
     }
 
-    pub async fn index() -> Response {
-        serve("index.html")
+    /// The application entry point is an authentication boundary, not a
+    /// public static file. An existing local session renders the client. A
+    /// browser with only an upstream SSO session is sent through a silent
+    /// OpenID Connect authorization request, while a completed silent probe
+    /// without an upstream session lands on the interactive login page.
+    pub async fn index(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Query(query): Query<EntryQuery>,
+    ) -> Response {
+        match authenticate(&state, &headers).await {
+            Ok(_) => serve("index.html"),
+            Err(response) if response.status() != StatusCode::UNAUTHORIZED => response,
+            Err(_) if query.sso.as_deref() == Some("none") => {
+                Redirect::to("/login").into_response()
+            }
+            Err(_) if state.oidc_providers.len() == 1 => Redirect::temporary(&format!(
+                "/api/v1/auth/oidc/{}/sso",
+                state.oidc_providers[0].name
+            ))
+            .into_response(),
+            Err(_) => Redirect::to("/login").into_response(),
+        }
     }
 
     pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
@@ -1560,9 +1586,10 @@ async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::HeaderM
 /// navigate the browser to the identity provider's end-session endpoint so
 /// the provider's SSO session is ended too — not just the local one. This
 /// is a GET so the logout link is a top-level browser navigation (the
-/// provider requires that, not a cross-origin fetch). When the session has
-/// no upstream SSO (password/PAT) or the provider has no configured
-/// end-session endpoint, it degrades to a plain local logout.
+/// provider requires that, not a cross-origin fetch). A local-account session
+/// returns directly to this application. An OIDC session whose provider is
+/// not configured for coordinated logout fails loudly instead of leaving the
+/// upstream SSO session active.
 async fn logout_sso(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1582,7 +1609,63 @@ async fn logout_sso(
         Ok(v) => v,
         Err(e) => {
             eprintln!("http: logout hint lookup failed: {e}");
-            (None, None)
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session storage failed",
+                None,
+            );
+        }
+    };
+    let provider_config = provider
+        .as_deref()
+        .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name));
+    let location = match (id_token, provider, provider_config) {
+        (Some(hint), Some(_), Some(provider)) => {
+            let Some(endpoint) = provider.end_session_endpoint.as_deref() else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "OIDC provider does not support coordinated logout",
+                    None,
+                );
+            };
+            let Some(public) = state.public_url.as_deref() else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Public application URL is not configured",
+                    None,
+                );
+            };
+            let mut url = match openidconnect::url::Url::parse(endpoint) {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "OIDC logout endpoint is invalid",
+                        None,
+                    );
+                }
+            };
+            url.query_pairs_mut()
+                .append_pair("id_token_hint", &hint)
+                .append_pair("client_id", &provider.client_id)
+                .append_pair("post_logout_redirect_uri", public.trim_end_matches('/'));
+            url.to_string()
+        }
+        (Some(_), _, _) | (None, Some(_), _) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OIDC session metadata is incomplete",
+                None,
+            );
+        }
+        (None, None, None) => "/".to_string(),
+        (None, None, Some(_)) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OIDC session metadata is inconsistent",
+                None,
+            );
         }
     };
     if let Err(e) = crate::db::delete_web_session(pool, &token).await {
@@ -1593,37 +1676,6 @@ async fn logout_sso(
             None,
         );
     }
-    // Build the provider's RP-initiated logout URL, if we have an id token
-    // hint, the provider exposes an end-session endpoint, and we know our
-    // own public URL to return to.
-    let end_session = provider
-        .as_deref()
-        .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name))
-        .and_then(|p| p.end_session_endpoint.clone());
-    let provider_config = provider
-        .as_deref()
-        .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name));
-    let location = match (id_token, end_session, provider_config) {
-        (Some(hint), Some(endpoint), Some(provider)) => {
-            match openidconnect::url::Url::parse(&endpoint) {
-                Ok(mut url) => {
-                    url.query_pairs_mut().append_pair("id_token_hint", &hint);
-                    url.query_pairs_mut()
-                        .append_pair("client_id", &provider.client_id);
-                    if let Some(public) = &state.public_url {
-                        url.query_pairs_mut()
-                            .append_pair("post_logout_redirect_uri", public.trim_end_matches('/'));
-                    }
-                    url.to_string()
-                }
-                Err(e) => {
-                    eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
-                    "/".to_string()
-                }
-            }
-        }
-        _ => "/".to_string(),
-    };
     (
         StatusCode::SEE_OTHER,
         [(header::LOCATION, location), (header::SET_COOKIE, clear)],
@@ -1704,7 +1756,7 @@ async fn openapi() -> Response {
             },
             "/api/v1/auth/logout": {
                 "get": { "summary": "RP-initiated logout: end the local and provider SSO sessions",
-                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Degrades to a local logout for password/PAT sessions.",
+                    "description": "Clears the e6irc session, then redirects the browser to the OIDC provider's end-session endpoint (id_token_hint + post_logout_redirect_uri) so the provider's SSO session is ended too. Local-account sessions return directly to e6irc; incomplete OIDC logout configuration fails closed.",
                     "responses": { "303": { "description": "redirect to the provider (or /) after clearing the session" } } },
                 "post": { "summary": "Local logout: clear the e6irc session only",
                     "responses": { "204": { "description": "session cleared" } } }

@@ -514,6 +514,12 @@ kind of account the OIDC first-login path creates.
   `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing fragment/API
   routes require the custom header htmx always sends (`HX-Request`) plus
   origin check; plain-form POSTs carry a per-session token.
+- The embedded application entry point was an authentication boundary. A
+  valid local session rendered the client; otherwise a single configured
+  provider was probed with `prompt=none`, allowing an existing Shauth session
+  to enter without another prompt. A negative silent probe landed on the
+  interactive login page without a redirect loop. The application shell
+  exposed the authenticated account and a top-level logout navigation.
 - Coordinated logout: the session retained its OIDC issuer, subject, session
   ID, provider, and ID token. `GET /api/v1/auth/logout` performed
   RP-initiated logout through the provider `end_session_endpoint` with the ID
@@ -523,6 +529,10 @@ kind of account the OIDC first-login path creates.
   revoked the correlated durable sessions. Back-channel token signatures,
   issuer, audience, event, time, `sid`/`sub`, and `jti` were verified, and
   consumed token IDs were retained until expiry to reject replay.
+  RP-initiated logout returned through the application's registered public
+  URL. Missing provider metadata, a malformed end-session endpoint, or a
+  storage failure preserved the local session and failed loudly rather than
+  producing a partial logout.
 
 ### 9.3 IRC client authentication
 
@@ -829,6 +839,12 @@ Layers, bottom to top:
   docker image** (linux/amd64 and linux/arm64 manifest; scratch/distroless
   — the binary is static-friendly apart from libc, musl target evaluated
   in CI on both architectures).
+- The production container built and embedded the Vite client before the Rust
+  release build; no build step ran at startup. Each merge to `main` published
+  one immutable 12-character commit-SHA manifest plus direct `-amd64` and
+  `-arm64` image manifests to GitHub Container Registry. Mutable `latest` and
+  branch tags were not published, the manifest shape was verified after push,
+  and only the newest 20 release groups were retained.
 
 ---
 

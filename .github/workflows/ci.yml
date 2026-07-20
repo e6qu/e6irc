@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       # embed-web (pulled in by --all-features) embeds web/dist, so build
       # the frontend first. Node is preinstalled on the runners.
-      - run: npm install -g pnpm && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
       # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
@@ -56,7 +56,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2.9.1
       # --all-features includes embed-web, which embeds web/dist.
-      - run: npm install -g pnpm && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo test --workspace --all-features --target ${{ matrix.target }}
 
   db-tests:
@@ -78,6 +78,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
+      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       # single-threaded: the tests share one database and TRUNCATE it
       - run: cargo test -p e6ircd --test db -- --ignored --test-threads=1
         env:
@@ -88,7 +89,7 @@ jobs:
           docker run -d --name dex -p 15556:5556 \
             -v /tmp/dex.yaml:/etc/dex/config.yaml \
             ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
             sleep 1
           done
@@ -97,9 +98,26 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
+      - run: cargo test -p e6ircd --features embed-web --test http -- --ignored --test-threads=1
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - run: cargo test -p e6irc-cli --test e2e -- --include-ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+
+  production-container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build --tag e6irc:ci .
+      - name: Verify the fully baked web client
+        run: |
+          container_id="$(docker create e6irc:ci)"
+          trap 'docker rm "$container_id" >/dev/null' EXIT
+          docker cp "$container_id:/usr/local/bin/e6ircd" /tmp/e6ircd
+          strings /tmp/e6ircd | grep -F "Open my account"
+      - run: tools/test-prune-ghcr-versions.sh
 
   # Protocol conformance against the pinned irctest suite (vendored
   # hookup in vendor/tests/irctest/) with the standard irctest marker
@@ -189,7 +207,7 @@ jobs:
             -e CONDUIT_CONFIG=/etc/conduit.toml \
             -v "$PWD/vendor/tests/external-oracles/conduit/conduit.toml:/etc/conduit.toml:ro" \
             matrixconduit/matrix-conduit:v0.9.0
-          for i in $(seq 1 40); do
+          for _ in $(seq 1 40); do
             curl -sf http://127.0.0.1:16167/_matrix/client/versions >/dev/null && break
             sleep 1
           done

@@ -23,10 +23,12 @@ environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
   casemapping, numerics/ISUPPORT tables, fuzz targets. (DESIGN §7.1)
 - `e6irc-queue`: custom bounded MPSC queue — seq-numbered envelopes,
   try_push/async pop, adaptive FIFO/LIFO, loom verification. (DESIGN §7.3)
-- Deferred into later phases: release-artifact publishing workflow (with
-  Phase 13's benchmarks once binaries do something), CAP/SASL state
-  machines (Phase 2, where SASL lands), queue step-scheduler/trace hooks
-  (Phase 1, with the first real workers that need stepping).
+- Release publishing completed with native amd64/arm64 container builds,
+  immutable 12-character commit-SHA tags, direct architecture manifests, an
+  exact two-platform generic manifest, and retention of the newest 20 release
+  groups. CAP/SASL state machines landed in Phase 2. Queue step-scheduler and
+  trace hooks remained planned for the deterministic simulation work that used
+  them.
 
 ## Phase 1 — Core ircd ✅ (2026-07-18)
 - Listeners (plain+TLS via rustls), connection lifecycle, bounded SendQ
@@ -145,6 +147,12 @@ Done:
   `GET /api/v1/auth/oidc/frontchannel-logout?iss=…&sid=…` revoked the matching
   durable sessions, including sessions on other devices, while rejecting
   signature, claim, audience, issuer, time-window, and replay failures.
+  The application root itself became fail-closed: unauthenticated direct and
+  catalog entry used a silent Shauth probe, a valid upstream session entered
+  without another prompt, and a negative probe reached interactive login
+  without looping. User-facing logout used top-level RP-initiated navigation,
+  returned through the e6irc public URL, and refused incomplete provider or
+  storage state without deleting the local session.
   Verified end-to-end against dockerized dex + PostgreSQL.
 
 ## Phase 5 — History + multiplexer + local always-on ✅ (2026-07-19)
@@ -267,6 +275,10 @@ Done (this phase's remaining, now landed):
   main.js + style.css, theme-aware) that connects `/ws/ui`, applies the
   server's OOB fragments, and sends the composer form. `pnpm build` →
   web/dist, embedded by rust-embed under `embed-web`.
+- The production container built the pinned pnpm/Vite frontend and compiled
+  e6ircd with `embed-web`, so the deployable image contained the complete UI
+  and performed no build work at startup. The chat shell exposed the signed-in
+  account, account section, and global Sign out navigation in both themes.
 - askama server-rendered pages (DESIGN §13.1): `/login` (OIDC provider
   buttons) and `/account` (cookie-authed user section listing the
   account's networks + credentials; redirects to /login when
