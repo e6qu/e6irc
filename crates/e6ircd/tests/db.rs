@@ -608,7 +608,24 @@ async fn history_rest_endpoint() {
     db::create_account(&pool, "web", "pw")
         .await
         .expect("create");
+    // The REST history read authorizes the target against a registered
+    // relationship (an account can't read arbitrary channels' history), so
+    // make `web` the founder of #web to exercise an authorized read.
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#web', '#web', id FROM accounts WHERE name_folded = 'web'",
+    )
+    .execute(&pool)
+    .await
+    .expect("register #web");
     let session = db::create_web_session(&pool, "web").await.expect("session");
+    // A second account with no relationship to #web must be refused (IDOR).
+    db::create_account(&pool, "other", "pw")
+        .await
+        .expect("create other");
+    let other_session = db::create_web_session(&pool, "other")
+        .await
+        .expect("other session");
     drop(pool);
 
     let config = Config {
@@ -696,6 +713,15 @@ PING x
     assert_eq!(messages[0]["body"], "rest one");
     assert_eq!(messages[1]["body"], "rest two");
     assert!(messages[0]["msgid"].as_str().is_some());
+
+    // An account with no relationship to #web is refused (IDOR guard).
+    let forbidden = client
+        .get(format!("{base}/api/v1/history?target=%23web"))
+        .header("cookie", format!("e6irc_session={other_session}"))
+        .send()
+        .await
+        .expect("hist");
+    assert_eq!(forbidden.status(), 403, "unrelated account must be forbidden");
 }
 
 #[tokio::test]
