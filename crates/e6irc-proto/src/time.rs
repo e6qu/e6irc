@@ -41,7 +41,16 @@ pub fn parse_server_time_seconds(text: &str) -> Option<u64> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // The `server-time` format has a 4-digit year. Bounding it here is not
+    // cosmetic: it keeps the returned seconds small enough that callers'
+    // `secs * 1000` (millis) cannot overflow u64 — an unbounded year let a
+    // client trigger that overflow (panic in debug, marker corruption in
+    // release) via MARKREAD.
+    if date_parts.next().is_some()
+        || !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
     let time = time.split_once('.').map_or(time, |(t, _)| t);
@@ -109,5 +118,18 @@ mod tests {
         ] {
             assert_eq!(parse_server_time_seconds(bad), None, "{bad}");
         }
+    }
+    #[test]
+    fn rejects_out_of_range_year_to_prevent_millis_overflow() {
+        // A giant year previously returned a huge `secs` whose `* 1000`
+        // overflowed u64 downstream (MARKREAD). It is now rejected.
+        assert_eq!(parse_server_time_seconds("585000000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_server_time_seconds("-5-01-01T00:00:00Z"), None);
+        // The largest valid year still parses and its millis fit in u64.
+        let secs = parse_server_time_seconds("9999-12-31T23:59:59Z").expect("valid");
+        assert!(secs.checked_mul(1000).is_some());
+        // A normal timestamp still round-trips.
+        let secs = parse_server_time_seconds("2021-01-02T03:04:05.678Z").expect("valid");
+        assert_eq!(server_time(secs * 1000), "2021-01-02T03:04:05.000Z");
     }
 }

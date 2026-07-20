@@ -3131,3 +3131,46 @@ fn oper_sethost_changes_host_and_chghosts() {
         "non-oper allowed to SETHOST"
     );
 }
+
+#[test]
+fn unregistered_nick_holder_is_not_resolvable_and_never_panics() {
+    // Regression: a session that has sent only NICK (no USER) reserves the
+    // nick but is not a registered user. Resolving it for WHOIS/USERHOST/
+    // MONITOR/SETHOST must not build a prefix from its absent user/realname
+    // (that panicked the shared core worker → whole-server DoS).
+    let mut s = TestServer::new();
+    let squatter = s.connect(1);
+    s.line(squatter, "NICK ghosty"); // holds the nick, still unregistered
+    let alice = s.register(2, "alice");
+    s.drain(alice);
+
+    // WHOIS: not a user → ERR_NOSUCHNICK, and crucially no panic.
+    s.line(alice, "WHOIS ghosty");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" 401 ")),
+        "WHOIS of an unregistered holder should be ERR_NOSUCHNICK"
+    );
+    // USERHOST: no panic, no entry for the unregistered holder.
+    s.line(alice, "USERHOST ghosty");
+    let out = s.drain(alice);
+    assert!(
+        !out.iter().any(|l| l.contains("ghosty=")),
+        "unregistered holder must not appear in USERHOST: {out:#?}"
+    );
+    // MONITOR: the unregistered holder is reported offline (not online), no panic.
+    s.line(alice, "MONITOR + ghosty");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains(" 731 ")) && !out.iter().any(|l| l.contains(" 730 ")),
+        "unregistered holder should be MONITOR-offline: {out:#?}"
+    );
+
+    // Sanity: once it registers, it becomes resolvable.
+    s.line(squatter, "USER g 0 * :Ghosty");
+    s.drain(squatter);
+    s.line(alice, "WHOIS ghosty");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" 311 ")),
+        "registered holder should WHOIS normally"
+    );
+}
