@@ -138,18 +138,30 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         }
     };
     let url = format!("{}/?v=10&encoding=json", gateway.trim_end_matches('/'));
-    let (ws, _) = match tokio_tungstenite::connect_async(&url).await {
-        Ok(x) => x,
-        Err(e) => {
+    // Bound the WS handshake so a black-holed gateway (accepts the connection
+    // then goes silent) can't wedge the driver — the same guard irc_driver and
+    // matrix already have.
+    let (ws, _) = match tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    {
+        Ok(Ok(x)) => x,
+        Ok(Err(e)) => {
             eprintln!("discord: gateway connect failed: {e}");
+            return Dropped;
+        }
+        Err(_) => {
+            eprintln!("discord: gateway connect timed out");
             return Dropped;
         }
     };
     let (mut write, mut read) = ws.split();
 
     // First frame must be HELLO, carrying the heartbeat interval.
-    let hb_interval = match read.next().await {
-        Some(Ok(Ws::Text(t))) => match parse_frame(t.as_str()).event {
+    let hb_interval = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
+        Ok(Some(Ok(Ws::Text(t)))) => match parse_frame(t.as_str()).event {
             Event::Hello(ms) => ms,
             _ => {
                 eprintln!("discord: first gateway frame was not HELLO");
@@ -179,6 +191,9 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seq: Option<u64> = None;
     let mut our_id = String::new();
+    // A healthy gateway sends heartbeat ACKs each interval, so no data for well
+    // past two intervals means it's black-holed — reconnect instead of hanging.
+    let read_timeout = Duration::from_millis(hb_interval.saturating_mul(2).max(60_000));
 
     loop {
         tokio::select! {
@@ -188,7 +203,11 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     return Dropped;
                 }
             }
-            frame = read.next() => {
+            frame = tokio::time::timeout(read_timeout, read.next()) => {
+                let Ok(frame) = frame else {
+                    eprintln!("discord: gateway idle past timeout; reconnecting");
+                    return Dropped;
+                };
                 let text = match frame {
                     Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
                     Some(Ok(Ws::Ping(p))) => {
@@ -207,7 +226,17 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     last_seq = Some(s);
                 }
                 match frame.event {
-                    Event::Ready(id) => our_id = id,
+                    Event::Ready(id) => {
+                        // Own-echo suppression keys on this id; an empty one
+                        // would loop our own posts back. A READY without a user
+                        // id is a broken session — drop it and reconnect rather
+                        // than run with echo suppression silently disabled.
+                        if id.is_empty() {
+                            eprintln!("discord: READY without user id");
+                            return Dropped;
+                        }
+                        our_id = id;
+                    }
                     Event::HeartbeatRequest => {
                         let hb = serde_json::json!({ "op": 1, "d": last_seq });
                         if write.send(Ws::text(hb.to_string())).await.is_err() {
@@ -232,6 +261,11 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     super::RouteResult::Deliver(id, text) => {
                         if let Err(e) = send_message(&http, &base, &config.token, &id, &text).await {
                             eprintln!("discord: send to {id} failed: {e}");
+                            // Surface the loss to the client, like the unmapped
+                            // path — a delivery failure isn't a silent drop.
+                            ends.emit_line(format!(
+                                ":*bnc* NOTICE * :message not delivered to Discord channel {id}"
+                            ));
                         }
                     }
                     super::RouteResult::Unmapped(target) => {

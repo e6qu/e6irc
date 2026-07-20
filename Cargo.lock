@@ -901,6 +901,7 @@ dependencies = [
  "e6irc-queue",
  "futures-util",
  "http",
+ "ipnet",
  "openidconnect",
  "rcgen",
  "reqwest",

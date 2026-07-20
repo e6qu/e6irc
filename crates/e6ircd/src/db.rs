@@ -545,6 +545,15 @@ pub async fn query_history(
     query: crate::core::HistoryQuery,
 ) -> Vec<crate::core::HistoryRow> {
     use crate::core::HistoryQuery;
+    // LATEST/BEFORE (and its msgid pivot) select newest-first and get reversed
+    // below; the rest are already oldest-first. Computed before the match
+    // consumes `query`.
+    let newest_first = matches!(
+        query,
+        HistoryQuery::Latest { .. }
+            | HistoryQuery::Before { .. }
+            | HistoryQuery::BeforeMsgid { .. }
+    );
     // Each branch selects a window, then we return it oldest-first.
     let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = match query {
         HistoryQuery::Latest { limit } => {
@@ -623,6 +632,80 @@ pub async fn query_history(
             .fetch_all(pool)
             .await
         }
+        // Msgid pivots: page on the composite (ts, id) relative to the pivot
+        // row so messages sharing the pivot's whole second are not skipped. An
+        // unknown msgid makes the subquery NULL, yielding an empty result.
+        HistoryQuery::BeforeMsgid { msgid, limit } => {
+            sqlx::query_as(
+                "SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint, sender_prefix, kind, body
+                 FROM messages
+                 WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2)
+                 ORDER BY ts DESC, id DESC LIMIT $3",
+            )
+            .bind(target)
+            .bind(&msgid)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+        }
+        HistoryQuery::AfterMsgid { msgid, limit } => {
+            sqlx::query_as(
+                "SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint, sender_prefix, kind, body
+                 FROM messages
+                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2)
+                 ORDER BY ts ASC, id ASC LIMIT $3",
+            )
+            .bind(target)
+            .bind(&msgid)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+        }
+        HistoryQuery::AroundMsgid { msgid, limit } => {
+            let before = (limit / 2) as i64;
+            let after = (limit - limit / 2) as i64;
+            sqlx::query_as(
+                "SELECT msgid, e, sender_prefix, kind, body FROM (
+                     (SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint AS e, sender_prefix,
+                             kind, body, ts, id
+                      FROM messages
+                      WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2)
+                      ORDER BY ts DESC, id DESC LIMIT $3)
+                     UNION ALL
+                     (SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint AS e, sender_prefix,
+                             kind, body, ts, id
+                      FROM messages
+                      WHERE target = $1 AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $2)
+                      ORDER BY ts ASC, id ASC LIMIT $4)
+                 ) w ORDER BY ts ASC, id ASC",
+            )
+            .bind(target)
+            .bind(&msgid)
+            .bind(before)
+            .bind(after)
+            .fetch_all(pool)
+            .await
+        }
+        HistoryQuery::BetweenMsgid {
+            after_msgid,
+            before_msgid,
+            limit,
+        } => {
+            sqlx::query_as(
+                "SELECT msgid, EXTRACT(EPOCH FROM ts)::bigint, sender_prefix, kind, body
+                 FROM messages
+                 WHERE target = $1
+                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2)
+                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3)
+                 ORDER BY ts ASC, id ASC LIMIT $4",
+            )
+            .bind(target)
+            .bind(&after_msgid)
+            .bind(&before_msgid)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+        }
     };
     let mut rows = match rows {
         Ok(r) => r,
@@ -631,11 +714,7 @@ pub async fn query_history(
             return Vec::new();
         }
     };
-    // LATEST/BEFORE selected newest-first; the rest are already oldest-first.
-    if matches!(
-        query,
-        HistoryQuery::Latest { .. } | HistoryQuery::Before { .. }
-    ) {
+    if newest_first {
         rows.reverse();
     }
     rows.into_iter()

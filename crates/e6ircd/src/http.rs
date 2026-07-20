@@ -59,6 +59,14 @@ pub struct AppState {
     /// Per-startup key for deriving CSRF tokens for cookie-authenticated
     /// form posts from the server-rendered pages.
     pub csrf_key: [u8; 32],
+    /// Trusted reverse-proxy CIDRs; when the socket peer matches one, the
+    /// client IP is taken from `X-Forwarded-For` (see [`client_ip`]).
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// Token-bucket size for the auth endpoints per client IP; `None` disables
+    /// auth rate limiting. The bucket refills to full over 60 seconds.
+    pub auth_rate_burst: Option<usize>,
+    /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
+    pub auth_buckets: Mutex<HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
 }
 
 impl AppState {
@@ -401,7 +409,7 @@ mod pages {
         let Ok(account) = authenticate(&state, &headers).await else {
             return Redirect::to("/login").into_response();
         };
-        let csrf = session_token(&headers)
+        let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         let pool = state.pool.as_ref().expect("authenticate checked the pool");
@@ -443,7 +451,7 @@ mod pages {
         headers: &axum::http::HeaderMap,
     ) -> Result<String, Response> {
         let account = authenticate(state, headers).await?;
-        let session = session_token(headers)
+        let session = session_token(headers, state.secure_cookies)
             .ok_or_else(|| problem(StatusCode::UNAUTHORIZED, "Session required", None))?;
         let token = headers
             .get("x-csrf-token")
@@ -537,7 +545,7 @@ mod pages {
         headers: &axum::http::HeaderMap,
         account: &str,
     ) -> Response {
-        let csrf = session_token(headers)
+        let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         let pool = state.pool.as_ref().expect("checked");
@@ -694,8 +702,18 @@ async fn discover_metadata(
 
 async fn oidc_start(
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Path(provider_name): Path<String>,
 ) -> Response {
+    // Rate-limit login starts per client IP: each forces an outbound discovery
+    // fetch and grows pending_auth, so an unauthenticated flood is throttled.
+    if !auth_rate_ok(
+        &state,
+        client_ip(peer.ip(), &headers, &state.trusted_proxies),
+    ) {
+        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
+    }
     oidc_authorize(&state, &provider_name, None, false).await
 }
 
@@ -708,8 +726,16 @@ async fn oidc_start(
 /// without a second explicit login.
 async fn oidc_sso_start(
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Path(provider_name): Path<String>,
 ) -> Response {
+    if !auth_rate_ok(
+        &state,
+        client_ip(peer.ip(), &headers, &state.trusted_proxies),
+    ) {
+        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
+    }
     oidc_authorize(&state, &provider_name, None, true).await
 }
 
@@ -816,7 +842,8 @@ async fn oidc_authorize(
             (
                 header::SET_COOKIE,
                 format!(
-                    "e6irc_oidc_state={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600{secure}",
+                    "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600{secure}",
+                    oidc_state_cookie_name(state.secure_cookies),
                     csrf.secret()
                 ),
             ),
@@ -898,10 +925,11 @@ async fn oidc_callback(
     // constant-time-equal to the returned `state`. Without this, an attacker
     // who completed their own login could feed the resulting callback URL to a
     // victim and plant the attacker's session in the victim's browser.
-    let bound = cookie_value(&headers, "e6irc_oidc_state").is_some_and(|c| {
-        aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), csrf_state.as_bytes())
-            .is_ok()
-    });
+    let bound =
+        cookie_value(&headers, oidc_state_cookie_name(state.secure_cookies)).is_some_and(|c| {
+            aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), csrf_state.as_bytes())
+                .is_ok()
+        });
     if !bound {
         return problem(
             StatusCode::UNAUTHORIZED,
@@ -1036,7 +1064,8 @@ async fn oidc_callback(
             (
                 header::SET_COOKIE,
                 format!(
-                    "e6irc_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{secure}"
+                    "{}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{secure}",
+                    session_cookie_name(state.secure_cookies)
                 ),
             ),
         ],
@@ -1317,10 +1346,10 @@ async fn oidc_frontchannel_logout(
     (
         StatusCode::OK,
         [
-            (header::CACHE_CONTROL, "no-store"),
+            (header::CACHE_CONTROL, "no-store".to_string()),
             (
                 header::SET_COOKIE,
-                "e6irc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+                clear_session_cookie(state.secure_cookies),
             ),
         ],
         "",
@@ -1359,7 +1388,7 @@ async fn authenticate(
             }
         };
     }
-    if let Some(token) = session_token(headers) {
+    if let Some(token) = session_token(headers, state.secure_cookies) {
         return match crate::db::session_account(pool, &token).await {
             Ok(Some(account)) => Ok(account),
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
@@ -1374,6 +1403,58 @@ async fn authenticate(
         };
     }
     Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None))
+}
+
+/// Resolve the real client IP: if the socket peer is a trusted proxy, take the
+/// rightmost non-trusted `X-Forwarded-For` entry (the client the proxy chain
+/// received from); otherwise the peer is the client. XFF is only consulted for
+/// trusted peers so a direct client cannot spoof its IP with the header.
+fn client_ip(
+    peer: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+    trusted: &[ipnet::IpNet],
+) -> std::net::IpAddr {
+    if !trusted.iter().any(|net| net.contains(&peer)) {
+        return peer;
+    }
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for part in xff.rsplit(',') {
+            if let Ok(ip) = part.trim().parse::<std::net::IpAddr>()
+                && !trusted.iter().any(|net| net.contains(&ip))
+            {
+                return ip;
+            }
+        }
+    }
+    peer
+}
+
+/// Spend one token from `ip`'s auth bucket. Returns `false` (rate-limited) when
+/// the bucket is empty; always `true` when `auth_rate_burst` is unset. The
+/// bucket refills to full over 60s; fully-refilled entries are pruned so the
+/// map can't grow without bound.
+fn auth_rate_ok(state: &AppState, ip: std::net::IpAddr) -> bool {
+    let Some(burst) = state.auth_rate_burst else {
+        return true;
+    };
+    let burst = burst as f64;
+    let refill_per_sec = burst / 60.0;
+    let now = std::time::Instant::now();
+    let mut buckets = state.auth_buckets.lock().expect("poisoned");
+    if buckets.len() > 4096 {
+        buckets.retain(|_, (tokens, last)| {
+            *tokens + now.duration_since(*last).as_secs_f64() * refill_per_sec < burst
+        });
+    }
+    let entry = buckets.entry(ip).or_insert((burst, now));
+    entry.0 = (entry.0 + now.duration_since(entry.1).as_secs_f64() * refill_per_sec).min(burst);
+    entry.1 = now;
+    if entry.0 >= 1.0 {
+        entry.0 -= 1.0;
+        true
+    } else {
+        false
+    }
 }
 
 /// Whether two URLs share an origin (scheme + host + port).
@@ -1420,8 +1501,41 @@ fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     })
 }
 
-fn session_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    cookie_value(headers, "e6irc_session")
+/// Session/state cookie names. When cookies are Secure (production), the
+/// `__Host-` prefix is used: the browser then enforces Secure + Path=/ + no
+/// Domain, so a related-subdomain or on-path attacker over plain HTTP can't
+/// plant a `Domain`-scoped cookie of the same name (fixation). The prefix
+/// requires Secure, so dev-mode (`secure_cookies=false`) keeps the bare name.
+/// The read side must pick the SAME name as the setter — reading both would
+/// reopen the very fixation vector the prefix closes.
+fn session_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        "__Host-e6irc_session"
+    } else {
+        "e6irc_session"
+    }
+}
+
+fn oidc_state_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        "__Host-e6irc_oidc_state"
+    } else {
+        "e6irc_oidc_state"
+    }
+}
+
+/// The `Set-Cookie` value that clears the session cookie. Must use the same
+/// name (and Secure flag) as the setter, or the browser won't delete it.
+fn clear_session_cookie(secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
+    format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{sec}",
+        session_cookie_name(secure)
+    )
+}
+
+fn session_token(headers: &axum::http::HeaderMap, secure: bool) -> Option<String> {
+    cookie_value(headers, session_cookie_name(secure))
 }
 
 // ---- device authorization grant (RFC 8628) ------------------------------
@@ -1807,7 +1921,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::HeaderM
             None,
         );
     };
-    if let Some(token) = session_token(&headers)
+    if let Some(token) = session_token(&headers, state.secure_cookies)
         && let Err(e) = crate::db::delete_web_session(pool, &token).await
     {
         eprintln!("http: logout failed: {e}");
@@ -1821,7 +1935,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: axum::http::HeaderM
         StatusCode::NO_CONTENT,
         [(
             header::SET_COOKIE,
-            "e6irc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string(),
+            clear_session_cookie(state.secure_cookies),
         )],
     )
         .into_response()
@@ -1846,7 +1960,7 @@ async fn logout_sso(
     headers: axum::http::HeaderMap,
     Query(query): Query<LogoutQuery>,
 ) -> Response {
-    let clear = "e6irc_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0".to_string();
+    let clear = clear_session_cookie(state.secure_cookies);
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1854,7 +1968,7 @@ async fn logout_sso(
             None,
         );
     };
-    let Some(token) = session_token(&headers) else {
+    let Some(token) = session_token(&headers, state.secure_cookies) else {
         return (
             StatusCode::SEE_OTHER,
             [
@@ -2243,12 +2357,26 @@ struct AppPasswordRequest {
 }
 
 /// Exchange an account's password for a fresh app password (shown once;
-/// only its hash is stored). The web session flow will supersede this
-/// as the primary path once OIDC lands.
+/// only its hash is stored). This is the password-based path; the OIDC
+/// web session flow is the primary way accounts authenticate.
 async fn create_app_password(
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     body: Result<axum::Json<AppPasswordRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // Rate-limit per client IP: this verifies a password, so it's an online
+    // brute-force target throttled only by argon2 cost without this.
+    if !auth_rate_ok(
+        &state,
+        client_ip(peer.ip(), &headers, &state.trusted_proxies),
+    ) {
+        return problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            Some("Auth rate limit exceeded; retry shortly."),
+        );
+    }
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2622,6 +2750,12 @@ fn html_escape(s: &str) -> String {
 
 /// One upstream line as an out-of-band append into the buffer element.
 fn render_line_fragment(line: &str) -> String {
+    // Drop any IRCv3 tag prefix: the buffer stores fully-tagged lines, but the
+    // web view renders the message text, not the tags.
+    let line = line
+        .strip_prefix('@')
+        .and_then(|rest| rest.split_once(' '))
+        .map_or(line, |(_, body)| body);
     format!(
         "<div hx-swap-oob=\"beforeend:#buffer\"><div class=\"line\">{}</div></div>",
         html_escape(line)
@@ -3310,6 +3444,93 @@ mod composer_tests {
         assert_eq!(slash_to_irc("/raw WHOIS bob", "#c"), "WHOIS bob");
         // unknown slash-command passes through (server answers 421)
         assert_eq!(slash_to_irc("/frobnicate x", "#c"), "FROBNICATE x");
+    }
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::{clear_session_cookie, oidc_state_cookie_name, session_cookie_name};
+
+    #[test]
+    fn secure_cookies_use_host_prefix() {
+        // The `__Host-` prefix is what pins the cookie to the exact host with
+        // Secure+Path=/ and no Domain — dropping it would reopen fixation.
+        assert_eq!(session_cookie_name(true), "__Host-e6irc_session");
+        assert_eq!(oidc_state_cookie_name(true), "__Host-e6irc_oidc_state");
+        // Plain-HTTP dev (no TLS) can't use `__Host-` (it requires Secure).
+        assert_eq!(session_cookie_name(false), "e6irc_session");
+        assert_eq!(oidc_state_cookie_name(false), "e6irc_oidc_state");
+    }
+
+    #[test]
+    fn clear_matches_setter_name_and_flags() {
+        // A `__Host-` cookie is only cleared by a Set-Cookie that repeats the
+        // name, Secure, and Path=/ — otherwise the browser keeps the session.
+        let secure = clear_session_cookie(true);
+        assert!(secure.starts_with("__Host-e6irc_session="), "{secure}");
+        assert!(secure.contains("; Secure"), "{secure}");
+        assert!(secure.contains("; Path=/"), "{secure}");
+        assert!(secure.contains("; Max-Age=0"), "{secure}");
+        // The `__Host-` prefix forbids a Domain attribute.
+        assert!(!secure.contains("Domain"), "{secure}");
+        // Insecure variant drops Secure but keeps the same name it set.
+        let insecure = clear_session_cookie(false);
+        assert!(insecure.starts_with("e6irc_session="), "{insecure}");
+        assert!(!insecure.contains("Secure"), "{insecure}");
+    }
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::client_ip;
+
+    fn xff(value: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-forwarded-for", value.parse().unwrap());
+        h
+    }
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+    fn net(s: &str) -> ipnet::IpNet {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_forwarded_header() {
+        // A direct (untrusted) client can spoof X-Forwarded-For; we must use
+        // the real socket peer, never the header, or rate limits are bypassed.
+        let trusted = [net("10.0.0.0/8")];
+        let got = client_ip(ip("203.0.113.7"), &xff("1.2.3.4"), &trusted);
+        assert_eq!(got, ip("203.0.113.7"));
+    }
+
+    #[test]
+    fn trusted_proxy_uses_rightmost_untrusted_forwarded_entry() {
+        // Behind a trusted proxy, the client is the rightmost XFF entry that
+        // isn't itself a trusted hop — a client-appended left entry can't
+        // impersonate someone else.
+        let trusted = [net("10.0.0.0/8")];
+        let got = client_ip(
+            ip("10.0.0.1"),
+            &xff("9.9.9.9, 203.0.113.7, 10.0.0.2"),
+            &trusted,
+        );
+        assert_eq!(got, ip("203.0.113.7"));
+    }
+
+    #[test]
+    fn trusted_proxy_without_header_falls_back_to_peer() {
+        let trusted = [net("10.0.0.0/8")];
+        let got = client_ip(ip("10.0.0.1"), &axum::http::HeaderMap::new(), &trusted);
+        assert_eq!(got, ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn all_forwarded_entries_trusted_falls_back_to_peer() {
+        let trusted = [net("10.0.0.0/8")];
+        let got = client_ip(ip("10.0.0.1"), &xff("10.0.0.9, 10.0.0.8"), &trusted);
+        assert_eq!(got, ip("10.0.0.1"));
     }
 }
 

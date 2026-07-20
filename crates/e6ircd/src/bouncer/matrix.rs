@@ -126,13 +126,15 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
                 }
             },
             cmd = ends.next_command() => match cmd {
-                Some(line) => {
-                    if let Some(target) = handle_command(&mut session, &line).await {
-                        ends.emit_line(format!(
-                            ":*bnc* NOTICE {target} :not delivered: no bridged Matrix room for {target}"
-                        ));
-                    }
-                }
+                Some(line) => match handle_command(&mut session, &line).await {
+                    Relayed::Ok => {}
+                    Relayed::Unmapped(target) => ends.emit_line(format!(
+                        ":*bnc* NOTICE {target} :not delivered: no bridged Matrix room for {target}"
+                    )),
+                    Relayed::Failed(room) => ends.emit_line(format!(
+                        ":*bnc* NOTICE * :not delivered: Matrix send to room {room} failed"
+                    )),
+                },
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -169,7 +171,13 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
         .as_str()
         .ok_or("no access_token in login response")?
         .to_string();
-    let user_id = login["user_id"].as_str().unwrap_or("").to_string();
+    // Own-echo suppression keys on this id (`m.sender == user_id`); an empty
+    // fallback would silently defeat it and loop our own messages back, so a
+    // login response without a user_id is a hard failure.
+    let user_id = login["user_id"]
+        .as_str()
+        .ok_or("no user_id in login response")?
+        .to_string();
 
     let mut session = Session {
         http,
@@ -270,11 +278,20 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
 /// Deliver a downstream PRIVMSG to Matrix. Returns `Some(target)` when a
 /// PRIVMSG could not be delivered because no bridged room maps to it, so the
 /// caller can surface the loss rather than dropping it silently.
-async fn handle_command(s: &mut Session, line: &str) -> Option<String> {
+/// Outcome of relaying a downstream command to Matrix, so the caller can
+/// surface a loss (unmapped target or a failed upstream send) instead of
+/// dropping it silently.
+enum Relayed {
+    Ok,
+    Unmapped(String),
+    Failed(String),
+}
+
+async fn handle_command(s: &mut Session, line: &str) -> Relayed {
     let (room_id, text) = match super::route_privmsg(line, &s.channel_to_room) {
         super::RouteResult::Deliver(room_id, text) => (room_id, text),
-        super::RouteResult::Unmapped(target) => return Some(target),
-        super::RouteResult::Ignore => return None,
+        super::RouteResult::Unmapped(target) => return Relayed::Unmapped(target),
+        super::RouteResult::Ignore => return Relayed::Ok,
     };
     s.txn += 1;
     let txn = s.txn;
@@ -292,8 +309,9 @@ async fn handle_command(s: &mut Session, line: &str) -> Option<String> {
         .await;
     if let Err(e) = send {
         eprintln!("matrix: send to room {room_id} failed: {e}");
+        return Relayed::Failed(room_id);
     }
-    None
+    Relayed::Ok
 }
 
 /// `#name:server` → IRC channel `#name`.

@@ -1328,8 +1328,9 @@ async fn application_entry_is_fail_closed_and_uses_silent_sso() {
     );
     let (status, headers, body) = request(http, &req).await;
     assert_eq!(status, 200, "{headers}");
-    assert!(body.contains("id=\"account-name\""), "{body}");
-    assert!(body.contains("href=\"/api/v1/auth/logout\""), "{body}");
+    // An authenticated entry is admitted straight into the SPA chat shell
+    // (`index.html`), not redirected — the account section lives at /account.
+    assert!(body.contains("id=\"app\""), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

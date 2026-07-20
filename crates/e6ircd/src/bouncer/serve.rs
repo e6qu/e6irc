@@ -245,8 +245,13 @@ fn spawn_persistence(
 
 /// Outcome of the BNC registration handshake.
 enum Registered {
-    /// Client authenticated as `account` and selected `network`.
-    Ok { account: String, network: String },
+    /// Client authenticated as `account` and selected `network`, negotiating
+    /// `caps` (which message tags it may receive on attach).
+    Ok {
+        account: String,
+        network: String,
+        caps: super::AttachCaps,
+    },
     /// The client hung up or violated the handshake; the loop returns.
     Closed,
 }
@@ -269,13 +274,17 @@ where
     // Bound the pre-attach handshake: a client that connects and never
     // completes registration (sends nothing, or authenticates but never ends
     // CAP negotiation) must not hold a task + socket indefinitely.
-    let (account, network) = match tokio::time::timeout(
+    let (account, network, caps) = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
         handshake(&mut read, &mut write, pool, server_name),
     )
     .await
     {
-        Ok(Ok(Registered::Ok { account, network })) => (account, network),
+        Ok(Ok(Registered::Ok {
+            account,
+            network,
+            caps,
+        })) => (account, network, caps),
         Ok(Ok(Registered::Closed)) => return Ok(()),
         Ok(Err(e)) => return Err(e),
         Err(_) => return Ok(()), // handshake timed out
@@ -303,7 +312,7 @@ where
     write.flush().await?;
 
     let joined = read.unsplit(write);
-    attach(joined, &handle).await
+    attach(joined, &handle, caps).await
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful
@@ -328,6 +337,7 @@ where
     let mut cap_open = false;
     let mut awaiting_payload = false;
     let mut account: Option<String> = None;
+    let mut caps = super::AttachCaps::default();
 
     loop {
         // Registration is complete only once the client has a nick, has
@@ -353,7 +363,7 @@ where
                 "USER" => have_user = true,
                 "CAP" => {
                     cap_open = true;
-                    handle_cap(write, server_name, &msg, &mut cap_open).await?;
+                    handle_cap(write, server_name, &msg, &mut cap_open, &mut caps).await?;
                 }
                 "AUTHENTICATE" => {
                     let arg = msg.params.first().copied().unwrap_or("");
@@ -421,6 +431,7 @@ where
     Ok(Registered::Ok {
         account,
         network: network.to_string(),
+        caps,
     })
 }
 
@@ -431,10 +442,14 @@ async fn handle_cap<W>(
     server_name: &str,
     msg: &Message<'_>,
     cap_open: &mut bool,
+    caps: &mut super::AttachCaps,
 ) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    // `server-time`/`message-tags`/`account-tag` gate which tags a client is
+    // sent from the (fully-tagged) backlog; `sasl` authenticates the attach.
+    let known = |c: &str| matches!(c, "sasl" | "server-time" | "message-tags" | "account-tag");
     match msg
         .params
         .first()
@@ -443,17 +458,29 @@ where
     {
         Some("LS") | Some("LIST") => {
             write
-                .write_all(format!(":{server_name} CAP * LS :sasl\r\n").as_bytes())
+                .write_all(
+                    format!(
+                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag\r\n"
+                    )
+                    .as_bytes(),
+                )
                 .await?;
         }
         Some("REQ") => {
             let req = msg.params.get(1).copied().unwrap_or("");
-            // ACK sasl (the only cap we offer); NAK anything else.
-            let verb = if req.split_whitespace().all(|c| c == "sasl") && !req.is_empty() {
-                "ACK"
-            } else {
-                "NAK"
-            };
+            // REQ is atomic: ACK only when every requested cap is known.
+            let all_known = !req.is_empty() && req.split_whitespace().all(known);
+            if all_known {
+                for c in req.split_whitespace() {
+                    match c {
+                        "server-time" => caps.server_time = true,
+                        "message-tags" => caps.message_tags = true,
+                        "account-tag" => caps.account_tag = true,
+                        _ => {}
+                    }
+                }
+            }
+            let verb = if all_known { "ACK" } else { "NAK" };
             write
                 .write_all(format!(":{server_name} CAP * {verb} :{req}\r\n").as_bytes())
                 .await?;

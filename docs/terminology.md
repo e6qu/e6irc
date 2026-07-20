@@ -252,7 +252,7 @@ bridged Matrix/Discord/Slack workspace), each run by an always-on **driver**.
 **Gateway** — the persistent WebSocket a Discord or Slack bridge holds to its
 platform for real-time events.
 
-**IRC-over-WebSocket** — the browser transport (`/ws`) that carries the IRC
+**IRC-over-WebSocket** — the browser transport (`/ws/irc`) that carries the IRC
 protocol over a WebSocket, so a web client speaks IRC without a raw TCP port.
 
 ---
