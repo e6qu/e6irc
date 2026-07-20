@@ -2960,7 +2960,7 @@ fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let key = state.nick_key(target);
-    match state.nicks.get(&key).copied() {
+    match state.registered_peer(&key) {
         Some(peer) => {
             let s = &state.sessions[&peer];
             let (nick, user, host, realname) = (
@@ -3288,7 +3288,7 @@ fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let mut entries = Vec::new();
     for &nick in p.iter().take(5) {
         let key = state.nick_key(nick);
-        if let Some(&peer) = state.nicks.get(&key) {
+        if let Some(peer) = state.registered_peer(&key) {
             let s = &state.sessions[&peer];
             let away_marker = if s.away.is_some() { "-" } else { "+" };
             entries.push(format!(
@@ -3678,9 +3678,8 @@ pub(crate) fn monitor_notify(state: &mut ServerState, nick: &str, online: bool) 
     let watchers: Vec<ConnId> = watchers.iter().copied().collect();
     let subject = if online {
         state
-            .nicks
-            .get(&key)
-            .map(|c| state.sessions[c].prefix())
+            .registered_peer(&key)
+            .map(|c| state.sessions[&c].prefix())
             .unwrap_or_else(|| nick.to_string())
     } else {
         nick.to_string()
@@ -3703,8 +3702,8 @@ fn monitor_status(
     let mut online = Vec::new();
     let mut offline = Vec::new();
     for (key, shown) in targets {
-        match state.nicks.get(key) {
-            Some(c) => online.push(state.sessions[c].prefix()),
+        match state.registered_peer(key) {
+            Some(c) => online.push(state.sessions[&c].prefix()),
             None => offline.push(shown.clone()),
         }
     }
@@ -4293,7 +4292,7 @@ fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let nk = state.nick_key(nick);
-    let Some(&target) = state.nicks.get(&nk) else {
+    let Some(target) = state.registered_peer(&nk) else {
         state.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
         return;
     };

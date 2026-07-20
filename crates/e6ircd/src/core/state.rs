@@ -715,6 +715,21 @@ impl ServerState {
         NickKey(self.casemap.casefold(nick))
     }
 
+    /// Resolve a nick to the connection that owns it, but only once that
+    /// session is fully registered. A pre-registration session reserves its
+    /// nick (so the nick collides for others) yet has no `user`/`realname`
+    /// and is not a user, so it resolves to `None` here. Every user-facing
+    /// lookup (WHOIS/USERHOST/MONITOR/SETHOST) goes through this instead of
+    /// `nicks` directly, which keeps `Session::prefix()`'s "registered"
+    /// expectations honest — an unregistered holder can never be prefix-built
+    /// (that would panic the shared core worker and take down the server).
+    pub fn registered_peer(&self, key: &NickKey) -> Option<ConnId> {
+        self.nicks
+            .get(key)
+            .copied()
+            .filter(|c| self.sessions.get(c).is_some_and(|s| s.registered))
+    }
+
     pub fn open(&mut self, conn: ConnId, tx: Sender<Output>, host: String) {
         let prev = self.sessions.insert(
             conn,
