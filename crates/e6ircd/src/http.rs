@@ -896,6 +896,8 @@ struct BackchannelLogoutClaims {
     jti: String,
     events: HashMap<String, serde_json::Value>,
     #[serde(default)]
+    azp: Option<String>,
+    #[serde(default)]
     nonce: Option<serde_json::Value>,
 }
 
@@ -974,30 +976,43 @@ fn verify_logout_token_with_metadata(
     if valid_keys != 1 {
         return Err("logout token signature is invalid or ambiguous".into());
     }
-    let claims: BackchannelLogoutClaims = serde_json::from_slice(&base64url_decode(segments[1])?)
-        .map_err(|_| "logout token claims are invalid")?;
-    let subject = claims
-        .sub
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-    let sid = claims
-        .sid
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
+    let mut claims: BackchannelLogoutClaims =
+        serde_json::from_slice(&base64url_decode(segments[1])?)
+            .map_err(|_| "logout token claims are invalid")?;
+    // A whitespace-only / empty sid or sub cannot identify a session. Login
+    // stores these values verbatim, so a real value is compared as-is (do
+    // NOT trim — that would stop it matching what was stored); only a blank
+    // one is dropped to `None` so it never reaches revocation as `Some("")`,
+    // which would over-constrain the query and silently revoke nothing.
+    let has_subject = claims.sub.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let has_sid = claims.sid.as_deref().is_some_and(|v| !v.trim().is_empty());
     if claims.iss != provider.issuer_url
         || !claims.aud.contains(&provider.client_id)
+        // If `azp` (authorized party) is present it must name this client —
+        // this rejects a multi-audience token authorized to a different RP
+        // that merely also lists our client_id.
+        || claims.azp.as_deref().is_some_and(|azp| azp != provider.client_id)
         || claims.jti.trim().is_empty()
         || claims.nonce.is_some()
-        || (subject.is_none() && sid.is_none())
+        || (!has_subject && !has_sid)
         || claims.iat < now - 600
         || claims.iat > now + 60
         || claims.exp.is_some_and(|exp| exp <= now)
         || claims.events.len() != 1
-        || claims.events.get(BACKCHANNEL_LOGOUT_EVENT) != Some(&serde_json::json!({}))
+        // The backchannel-logout event's value is a JSON object that MAY
+        // carry data — require it present and an object, not exactly empty.
+        || !claims
+            .events
+            .get(BACKCHANNEL_LOGOUT_EVENT)
+            .is_some_and(serde_json::Value::is_object)
     {
         return Err("logout token claims are invalid".into());
+    }
+    if !has_subject {
+        claims.sub = None;
+    }
+    if !has_sid {
+        claims.sid = None;
     }
     Ok(claims)
 }
@@ -3044,5 +3059,77 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn backchannel_logout_normalizes_and_validates_claims() {
+        let now = 1_800_000_000;
+        let provider = OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "secret".into(),
+            scopes: vec![],
+            end_session_endpoint: None,
+        };
+        let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
+        let verify = |payload: serde_json::Value| {
+            let (raw, key) = logout_token(payload);
+            verify_logout_token_with_metadata(
+                &raw,
+                &provider,
+                std::slice::from_ref(&algorithm),
+                std::slice::from_ref(&key),
+                now,
+            )
+        };
+        let base = |extra: serde_json::Value| {
+            let mut v = serde_json::json!({
+                "iss": "https://auth.example", "aud": "e6irc",
+                "sid": "session-1", "iat": now, "jti": "j-1",
+                "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
+            });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+
+        // A1: an empty-string sub is dropped to None so revocation is not
+        // over-constrained (Some("") would silently match no session).
+        let claims = verify(base(serde_json::json!({"sub": ""}))).expect("empty sub ok with a sid");
+        assert_eq!(claims.sub, None, "empty sub must normalize to None");
+        assert_eq!(claims.sid.as_deref(), Some("session-1"));
+        // A real value is passed through verbatim (must match what login stored).
+        let claims = verify(base(serde_json::json!({"sub": "subject-1"}))).expect("ok");
+        assert_eq!(claims.sub.as_deref(), Some("subject-1"));
+
+        // A2: the backchannel-logout event MAY carry data — a non-empty object
+        // is accepted, not just an exactly-empty one.
+        assert!(
+            verify(base(
+                serde_json::json!({"events": { BACKCHANNEL_LOGOUT_EVENT: { "reason": "admin" } }})
+            ))
+            .is_ok(),
+            "non-empty event object must be accepted"
+        );
+
+        // A7: a present azp must name this client.
+        assert!(
+            verify(base(serde_json::json!({"azp": "someone-else"}))).is_err(),
+            "mismatched azp must be rejected"
+        );
+        assert!(
+            verify(base(serde_json::json!({"azp": "e6irc"}))).is_ok(),
+            "matching azp must be accepted"
+        );
+
+        // Blank sid AND blank sub → no identifier → rejected.
+        let mut no_id = base(serde_json::json!({"sub": "  "}));
+        no_id
+            .as_object_mut()
+            .unwrap()
+            .insert("sid".into(), serde_json::json!("  "));
+        assert!(verify(no_id).is_err(), "blank sid and sub must be rejected");
     }
 }
