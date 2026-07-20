@@ -8,6 +8,9 @@ License: **AGPL-3.0-or-later**. All compiled-in dependencies must be
 AGPL-compatible (permissive licenses are fine; license compliance is enforced
 in CI with `cargo-deny`).
 
+Unfamiliar term? See [`docs/terminology.md`](docs/terminology.md) — the
+glossary of IRC, OpenID Connect, and deployment vocabulary used here.
+
 ---
 
 ## 1. Goals
@@ -869,3 +872,4 @@ Layers, bottom to top:
 - soju (BNC prior art): https://soju.im · ZNC: https://znc.in
 - SASL OAUTHBEARER: RFC 7628 · OAuth device grant: RFC 8628
 - htmx WebSocket extension: https://htmx.org/extensions/ws/
+- Terminology glossary: [`docs/terminology.md`](docs/terminology.md)

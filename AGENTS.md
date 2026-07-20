@@ -8,6 +8,10 @@ silent fallbacks, provenance required, make bug classes unrepresentable,
 a paragraph justifying a line means the code is wrong). Read them. This
 file adds the rule that governs *scope*.
 
+Unsure what a term means? `docs/terminology.md` is the project glossary —
+and the convention it sets is binding here: prefer the spelled-out term,
+and do not introduce a new abbreviation without defining it there.
+
 ---
 
 ## The Boy-Scout Rule — HARD RULE
