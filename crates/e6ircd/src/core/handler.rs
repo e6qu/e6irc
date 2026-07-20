@@ -449,6 +449,10 @@ fn sasl_fail(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_SASLFAIL, &[], Some("SASL authentication failed"));
 }
 
+/// Upper bound on a reassembled SASL response (across 400-byte continuation
+/// chunks). Generous for a bearer JWT, but bounds client-driven buffering.
+const SASL_MAX: usize = 8192;
+
 fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     use super::state::SaslState;
     if !state.config.sasl_enabled || !state.sessions[&conn].caps.sasl {
@@ -465,7 +469,9 @@ fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     if arg == "*" {
-        state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Idle;
+        let session = state.sessions.get_mut(&conn).expect("checked");
+        session.sasl = SaslState::Idle;
+        session.sasl_buf.clear();
         state.numeric(
             conn,
             ERR_SASLABORTED,
@@ -474,7 +480,15 @@ fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // A line longer than 400 bytes is malformed; the client must chunk the
+    // base64 response at 400 bytes (SASL spec).
     if arg.len() > 400 {
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .sasl_buf
+            .clear();
         state.numeric(conn, ERR_SASLTOOLONG, &[], Some("SASL message too long"));
         return;
     }
@@ -496,54 +510,81 @@ fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 sasl_fail(state, conn);
             }
         }
-        SaslState::PlainPending => {
-            // payload: base64(authzid \0 authcid \0 password)
-            let parsed = e6irc_proto::base64::decode(arg).and_then(|raw| {
-                let mut parts = raw.split(|&b| b == 0);
-                let _authzid = parts.next()?;
-                let authcid = String::from_utf8(parts.next()?.to_vec()).ok()?;
-                let password = String::from_utf8(parts.next()?.to_vec()).ok()?;
-                if parts.next().is_some() || authcid.is_empty() || password.is_empty() {
-                    return None;
+        mechanism @ (SaslState::PlainPending | SaslState::BearerPending) => {
+            // Accumulate 400-byte continuation chunks. A full 400-byte line
+            // means "more follows"; a shorter line (or "+", the empty final
+            // chunk) completes the payload. SASL_MAX bounds the buffer so a
+            // client cannot grow it without end.
+            let piece = if arg == "+" { "" } else { arg };
+            let over = {
+                let session = state.sessions.get_mut(&conn).expect("checked");
+                if session.sasl_buf.len() + piece.len() > SASL_MAX {
+                    true
+                } else {
+                    session.sasl_buf.push_str(piece);
+                    false
                 }
-                Some((authcid, password))
-            });
-            let Some((account, password)) = parsed else {
-                sasl_fail(state, conn);
+            };
+            if over {
+                let session = state.sessions.get_mut(&conn).expect("checked");
+                session.sasl_buf.clear();
+                session.sasl = SaslState::Idle;
+                state.numeric(conn, ERR_SASLTOOLONG, &[], Some("SASL message too long"));
                 return;
-            };
-            state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
-            let request = super::DbRequest::VerifyPassword {
-                conn,
-                account,
-                password,
-            };
-            if state.db_tx.try_push(request).is_err() {
-                // DB worker unreachable: fail loudly, never hang.
-                sasl_fail(state, conn);
             }
-        }
-        SaslState::BearerPending => {
-            // RFC 7628: gs2-header then \x01-separated key=value fields;
-            // the credential is the `auth=Bearer <token>` field.
-            let token = e6irc_proto::base64::decode(arg).and_then(|raw| {
-                raw.split(|&b| b == 0x01).find_map(|field| {
-                    std::str::from_utf8(field)
-                        .ok()
-                        .and_then(|s| s.strip_prefix("auth=Bearer "))
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string)
-                })
-            });
-            let Some(token) = token else {
-                sasl_fail(state, conn);
-                return;
-            };
-            state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
-            let request = super::DbRequest::VerifyToken { conn, token };
-            if state.db_tx.try_push(request).is_err() {
-                // DB worker unreachable: fail loudly, never hang.
-                sasl_fail(state, conn);
+            if arg.len() == 400 {
+                return; // more chunks to come
+            }
+            let payload =
+                std::mem::take(&mut state.sessions.get_mut(&conn).expect("checked").sasl_buf);
+            if mechanism == SaslState::PlainPending {
+                // payload: base64(authzid \0 authcid \0 password)
+                let parsed = e6irc_proto::base64::decode(&payload).and_then(|raw| {
+                    let mut parts = raw.split(|&b| b == 0);
+                    let _authzid = parts.next()?;
+                    let authcid = String::from_utf8(parts.next()?.to_vec()).ok()?;
+                    let password = String::from_utf8(parts.next()?.to_vec()).ok()?;
+                    if parts.next().is_some() || authcid.is_empty() || password.is_empty() {
+                        return None;
+                    }
+                    Some((authcid, password))
+                });
+                let Some((account, password)) = parsed else {
+                    sasl_fail(state, conn);
+                    return;
+                };
+                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
+                let request = super::DbRequest::VerifyPassword {
+                    conn,
+                    account,
+                    password,
+                };
+                if state.db_tx.try_push(request).is_err() {
+                    // DB worker unreachable: fail loudly, never hang.
+                    sasl_fail(state, conn);
+                }
+            } else {
+                // RFC 7628: gs2-header then \x01-separated key=value fields;
+                // the credential is the `auth=Bearer <token>` field.
+                let token = e6irc_proto::base64::decode(&payload).and_then(|raw| {
+                    raw.split(|&b| b == 0x01).find_map(|field| {
+                        std::str::from_utf8(field)
+                            .ok()
+                            .and_then(|s| s.strip_prefix("auth=Bearer "))
+                            .filter(|t| !t.is_empty())
+                            .map(str::to_string)
+                    })
+                });
+                let Some(token) = token else {
+                    sasl_fail(state, conn);
+                    return;
+                };
+                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
+                let request = super::DbRequest::VerifyToken { conn, token };
+                if state.db_tx.try_push(request).is_err() {
+                    // DB worker unreachable: fail loudly, never hang.
+                    sasl_fail(state, conn);
+                }
             }
         }
         SaslState::Verifying => {
@@ -1459,10 +1500,20 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
             "EXCEPTS",
             "INVEX",
             "UTF8ONLY",
+            &format!("NETWORK={}", state.config.network_name),
+        ],
+        Some("are supported by this server"),
+    );
+    state.numeric(
+        conn,
+        RPL_ISUPPORT,
+        &[
             "MONITOR=100",
             "CHATHISTORY=500",
             "MSGREFTYPES=msgid,timestamp",
-            &format!("NETWORK={}", state.config.network_name),
+            &format!("MAXLIST=bqeI:{MAXLIST}"),
+            &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
+            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX}"),
         ],
         Some("are supported by this server"),
     );
@@ -1561,6 +1612,23 @@ fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 // ---- channels -----------------------------------------------------------
 
+/// Cap on each channel list mode (+b/+q/+e/+I). Bounds channel memory and the
+/// per-message match cost; a client that hits it gets ERR_BANLISTFULL.
+/// Advertised as `MAXLIST`.
+const MAXLIST: usize = 100;
+
+/// Cap on channels a single session may be joined to. Bounds `Channel`
+/// allocation driven by one connection; hitting it yields ERR_TOOMANYCHANNELS.
+/// Advertised as `CHANLIMIT` (matches Libera's `#:250`).
+const MAX_CHANNELS_PER_SESSION: usize = 250;
+
+/// Max targets accepted in one PRIVMSG/NOTICE. Advertised as `TARGMAX`.
+const TARGMAX: usize = 4;
+
+/// Cap on stored read markers per account. Markers persist across parts, so
+/// without a cap a client could seed the marker map without bound.
+const MAX_READ_MARKERS_PER_ACCOUNT: usize = 256;
+
 fn valid_channel_name(name: &str) -> bool {
     name.starts_with('#')
         && name.len() > 1
@@ -1578,6 +1646,19 @@ fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
+    // Modern IRC: "JOIN 0" is a special form meaning "part every channel".
+    if targets == "0" {
+        let names: Vec<String> = state.sessions[&conn]
+            .channels
+            .iter()
+            .filter_map(|k| state.channels.get(k).map(|c| c.name.clone()))
+            .collect();
+        if !names.is_empty() {
+            let joined = names.join(",");
+            cmd_part(state, conn, &[joined.as_str()]);
+        }
+        return;
+    }
     let keys: Vec<&str> = p.get(1).map(|k| k.split(',').collect()).unwrap_or_default();
     for (i, target) in targets.split(',').filter(|t| !t.is_empty()).enumerate() {
         join_one(state, conn, target, keys.get(i).copied());
@@ -1590,6 +1671,19 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
         return;
     }
     let key = state.chan_key(name);
+    // Bound channels per session so one connection can't allocate unbounded
+    // Channel state. A rejoin of a channel already held is exempt.
+    if !state.sessions[&conn].channels.contains(&key)
+        && state.sessions[&conn].channels.len() >= MAX_CHANNELS_PER_SESSION
+    {
+        state.numeric(
+            conn,
+            ERR_TOOMANYCHANNELS,
+            &[name],
+            Some("You have joined too many channels"),
+        );
+        return;
+    }
     let now = (state.config.clock)();
     let user_prefix = state.sessions[&conn].prefix();
     let casemap = state.casemap;
@@ -1801,6 +1895,17 @@ fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
         return;
     };
     let display = chan.name.clone();
+    // A +s (secret) channel hides its membership from non-members: they get
+    // only the terminating numeric, never the member list.
+    if chan.modes.secret && !chan.members.contains_key(&conn) {
+        state.numeric(
+            conn,
+            RPL_ENDOFNAMES,
+            &[&display],
+            Some("End of /NAMES list"),
+        );
+        return;
+    }
     let requester_caps = state.sessions[&conn].caps;
     let mut names: Vec<String> = chan
         .members
@@ -1827,12 +1932,28 @@ fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
     } else {
         "="
     };
-    state.numeric(
-        conn,
-        RPL_NAMREPLY,
-        &[symbol, &display],
-        Some(&names.join(" ")),
-    );
+    // Split the member list across as many RPL_NAMREPLY lines as needed so no
+    // single 353 exceeds the 512-byte wire limit on a large channel. The
+    // budget subtracts the fixed framing (prefix, numeric, requester nick,
+    // symbol, channel, " :" and CRLF) from 512.
+    let requester_nick = state.sessions[&conn].nick.clone().unwrap_or_default();
+    let overhead =
+        1 + state.config.server_name.len() + 5 + requester_nick.len() + 4 + display.len() + 4;
+    let budget = 512usize.saturating_sub(overhead).max(1);
+    let mut line = String::new();
+    for name in &names {
+        if !line.is_empty() && line.len() + 1 + name.len() > budget {
+            state.numeric(conn, RPL_NAMREPLY, &[symbol, &display], Some(&line));
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(name);
+    }
+    if !line.is_empty() {
+        state.numeric(conn, RPL_NAMREPLY, &[symbol, &display], Some(&line));
+    }
     state.numeric(
         conn,
         RPL_ENDOFNAMES,
@@ -1939,7 +2060,7 @@ fn cmd_message(
     // Per Modern IRC, NOTICE must never trigger automatic replies —
     // including error numerics. The silence below is spec-mandated.
     let loud = kind == "PRIVMSG";
-    let Some(&target) = p.first() else {
+    let Some(&targets) = p.first() else {
         if loud {
             state.numeric(
                 conn,
@@ -1957,6 +2078,42 @@ fn cmd_message(
         }
         return;
     }
+    // A comma-separated target list delivers to each recipient, deduped and
+    // bounded by TARGMAX (advertised in ISUPPORT). Past the cap the message
+    // is refused loudly rather than silently truncated.
+    let mut seen = std::collections::HashSet::new();
+    let mut delivered = 0usize;
+    for target in targets.split(',').filter(|t| !t.is_empty()) {
+        if !seen.insert(target) {
+            continue;
+        }
+        if delivered >= TARGMAX {
+            if loud {
+                state.numeric(
+                    conn,
+                    ERR_TOOMANYTARGETS,
+                    &[target],
+                    Some("Too many targets; message not delivered"),
+                );
+            }
+            break;
+        }
+        delivered += 1;
+        deliver_one_message(state, conn, target, text, kind, &client_tags, loud);
+    }
+}
+
+/// Deliver a PRIVMSG/NOTICE to a single already-split `target`. `loud` is
+/// false for NOTICE (which must never trigger error numerics or auto-replies).
+fn deliver_one_message(
+    state: &mut ServerState,
+    conn: ConnId,
+    target: &str,
+    text: &str,
+    kind: &'static str,
+    client_tags: &str,
+    loud: bool,
+) {
     // Services pseudo-clients intercept before the nick table. NOTICE
     // to services is dropped without reply (spec: NOTICE never triggers
     // automatic responses).
@@ -2041,7 +2198,7 @@ fn cmd_message(
             sender_account.as_deref(),
             sender_is_bot,
             &msgid,
-            &client_tags,
+            client_tags,
             &line,
             true,
         );
@@ -2052,7 +2209,7 @@ fn cmd_message(
                 sender_account.as_deref(),
                 sender_is_bot,
                 &msgid,
-                &client_tags,
+                client_tags,
                 &line,
                 false,
             );
@@ -2120,7 +2277,7 @@ fn cmd_message(
             sender_account.as_deref(),
             sender_is_bot,
             &msgid,
-            &client_tags,
+            client_tags,
             &line,
             true,
         );
@@ -2131,7 +2288,7 @@ fn cmd_message(
                 sender_account.as_deref(),
                 sender_is_bot,
                 &msgid,
-                &client_tags,
+                client_tags,
                 &line,
                 false,
             );
@@ -2509,16 +2666,20 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
         return;
     };
     let display = chan.name.clone();
+    let is_member = chan.members.contains_key(&conn);
+    let is_op = chan.members.get(&conn).is_some_and(|m| m.op);
 
     if rest.is_empty() {
-        let modes = chan.modes.to_string_with_args();
+        let modes = chan.modes.to_string_with_args(is_member);
         let created = chan.created_at.to_string();
         state.numeric(conn, RPL_CHANNELMODEIS, &[&display, &modes], None);
         state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
         return;
     }
 
-    // A lone "+b"/"+q"/"+e"/"+I" is a list query (no op needed).
+    // A lone "+b"/"+q" is a public list query; "+e"/"+I" list viewing is a
+    // chanop privilege (matching Solanum), so a non-op falls through to the
+    // ERR_CHANOPRIVSNEEDED gate below rather than reading the exception lists.
     if rest.len() == 1 {
         let chan = &state.channels[&key];
         let query = match rest[0] {
@@ -2536,14 +2697,14 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                 Some("q"),
                 "End of Channel Quiet List",
             )),
-            "+e" | "e" => Some((
+            "+e" | "e" if is_op => Some((
                 chan.ban_exceptions.clone(),
                 RPL_EXCEPTLIST,
                 RPL_ENDOFEXCEPTLIST,
                 None,
                 "End of Channel Exception List",
             )),
-            "+I" | "I" => Some((
+            "+I" | "I" if is_op => Some((
                 chan.invite_exceptions.clone(),
                 RPL_INVITELIST,
                 RPL_ENDOFINVITELIST,
@@ -2679,6 +2840,28 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                 let Some(&mask) = args.next() else {
                     continue; // handled above for the query form
                 };
+                // Bound each list: without a cap a single opped client could
+                // stream distinct masks until the core worker OOMs (and every
+                // JOIN/PRIVMSG re-scans the whole list). Reject once full.
+                let chan_ref = state.channels.get(&key).expect("checked");
+                let list_ref = match c {
+                    'b' => &chan_ref.bans,
+                    'q' => &chan_ref.quiets,
+                    'e' => &chan_ref.ban_exceptions,
+                    'I' => &chan_ref.invite_exceptions,
+                    _ => unreachable!("outer arm matched only these list-mode chars"),
+                };
+                let is_new = !list_ref.iter().any(|b| b == mask);
+                let at_cap = list_ref.len() >= MAXLIST;
+                if adding && is_new && at_cap {
+                    state.numeric(
+                        conn,
+                        ERR_BANLISTFULL,
+                        &[&display, mask],
+                        Some("Channel list is full"),
+                    );
+                    continue;
+                }
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let list = match c {
                     'b' => &mut chan.bans,
@@ -2688,7 +2871,7 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                     _ => unreachable!("outer arm matched only these list-mode chars"),
                 };
                 if adding {
-                    if !list.iter().any(|b| b == mask) {
+                    if is_new {
                         list.push(mask.to_string());
                     }
                 } else {
@@ -2784,20 +2967,21 @@ fn parse_whox(arg: &str) -> Option<WhoxRequest> {
 
 /// Emit one 354 row with fields in the fixed WHOX order:
 /// t, c, u, i, h, s, n, f, d, l, a, o, r.
-#[allow(clippy::too_many_arguments)]
-fn send_whox_row(
-    state: &mut ServerState,
-    conn: ConnId,
-    req: &WhoxRequest,
-    channel: &str,
-    user: &str,
-    host: &str,
-    server: &str,
-    nick: &str,
-    flags: &str,
-    account: Option<&str>,
-    realname: &str,
-) {
+/// The fields of one WHOX reply row. Bundled into a struct (rather than a
+/// row of same-typed `&str` parameters) so the fields cannot be transposed
+/// at a call site.
+struct WhoxRow<'a> {
+    channel: &'a str,
+    user: &'a str,
+    host: &'a str,
+    server: &'a str,
+    nick: &'a str,
+    flags: &'a str,
+    account: Option<&'a str>,
+    realname: &'a str,
+}
+
+fn send_whox_row(state: &mut ServerState, conn: ConnId, req: &WhoxRequest, row: &WhoxRow) {
     let mut middle: Vec<String> = Vec::new();
     let mut trailing = None;
     for f in "tcuihsnfdlaor".chars() {
@@ -2806,18 +2990,18 @@ fn send_whox_row(
         }
         match f {
             't' => middle.push(req.token.clone().unwrap_or_else(|| "0".into())),
-            'c' => middle.push(channel.to_string()),
-            'u' => middle.push(user.to_string()),
+            'c' => middle.push(row.channel.to_string()),
+            'u' => middle.push(row.user.to_string()),
             'i' => middle.push("255.255.255.255".into()), // IPs are not exposed
-            'h' => middle.push(host.to_string()),
-            's' => middle.push(server.to_string()),
-            'n' => middle.push(nick.to_string()),
-            'f' => middle.push(flags.to_string()),
+            'h' => middle.push(row.host.to_string()),
+            's' => middle.push(row.server.to_string()),
+            'n' => middle.push(row.nick.to_string()),
+            'f' => middle.push(row.flags.to_string()),
             'd' => middle.push("0".into()), // hop count: single server
             'l' => middle.push("0".into()), // idle: not tracked yet
-            'a' => middle.push(account.unwrap_or("0").to_string()),
+            'a' => middle.push(row.account.unwrap_or("0").to_string()),
             'o' => middle.push("n/a".into()), // oplevel unused (charybdis)
-            'r' => trailing = Some(realname.to_string()),
+            'r' => trailing = Some(row.realname.to_string()),
             _ => {} // unknown field chars are ignored per WHOX practice
         }
     }
@@ -2846,41 +3030,49 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let key = state.chan_key(mask);
         if let Some(chan) = state.channels.get(&key) {
             let display = chan.name.clone();
-            let rows: Vec<(String, String, String, String, String, Option<String>)> = chan
-                .members
-                .iter()
-                .map(|(m, modes)| {
-                    let s = &state.sessions[m];
-                    let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
-                        (true, true, true) => "@+",
-                        (true, _, _) => "@",
-                        (false, true, _) => "+",
-                        _ => "",
-                    };
-                    (
-                        s.user.clone().expect("registered"),
-                        s.host.clone(),
-                        s.nick.clone().expect("registered"),
-                        who_flags(s, sigil),
-                        s.realname.clone().expect("registered"),
-                        s.account.clone(),
-                    )
-                })
-                .collect();
+            // A +s channel's membership is hidden from non-members: emit no
+            // rows, letting the terminating RPL_ENDOFWHO stand alone.
+            let hidden = chan.modes.secret && !chan.members.contains_key(&conn);
+            let rows: Vec<(String, String, String, String, String, Option<String>)> = if hidden {
+                Vec::new()
+            } else {
+                chan.members
+                    .iter()
+                    .map(|(m, modes)| {
+                        let s = &state.sessions[m];
+                        let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
+                            (true, true, true) => "@+",
+                            (true, _, _) => "@",
+                            (false, true, _) => "+",
+                            _ => "",
+                        };
+                        (
+                            s.user.clone().expect("registered"),
+                            s.host.clone(),
+                            s.nick.clone().expect("registered"),
+                            who_flags(s, sigil),
+                            s.realname.clone().expect("registered"),
+                            s.account.clone(),
+                        )
+                    })
+                    .collect()
+            };
             for (user, host, nick, flags, realname, account) in rows {
                 match &whox {
                     Some(req) => send_whox_row(
                         state,
                         conn,
                         req,
-                        &display,
-                        &user,
-                        &host,
-                        &server,
-                        &nick,
-                        &flags,
-                        account.as_deref(),
-                        &realname,
+                        &WhoxRow {
+                            channel: &display,
+                            user: &user,
+                            host: &host,
+                            server: &server,
+                            nick: &nick,
+                            flags: &flags,
+                            account: account.as_deref(),
+                            realname: &realname,
+                        },
                     ),
                     None => state.numeric(
                         conn,
@@ -2937,14 +3129,16 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     state,
                     conn,
                     req,
-                    "*",
-                    &user,
-                    &host,
-                    &server,
-                    &nick,
-                    &flags,
-                    account.as_deref(),
-                    &realname,
+                    &WhoxRow {
+                        channel: "*",
+                        user: &user,
+                        host: &host,
+                        server: &server,
+                        nick: &nick,
+                        flags: &flags,
+                        account: account.as_deref(),
+                        realname: &realname,
+                    },
                 ),
                 None => state.numeric(
                     conn,
@@ -2981,6 +3175,12 @@ fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .filter_map(|k| {
                     let chan = state.channels.get(k)?;
                     let modes = chan.members.get(&peer)?;
+                    // A +s (secret) channel is disclosed only to a requester
+                    // who also shares it, so WHOIS can't enumerate hidden
+                    // channels a target is in.
+                    if chan.modes.secret && !chan.members.contains_key(&conn) {
+                        return None;
+                    }
                     let sigil = if modes.op {
                         "@"
                     } else if modes.voice {
@@ -3900,6 +4100,40 @@ fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let new_ms = secs * 1000;
+    // The set form is the only path that grows the marker map, so bound it
+    // here: the target must be a real channel name, and an account may retain
+    // only so many markers (they outlive membership, so a membership gate
+    // would not bound the persistent map).
+    if !valid_channel_name(target) {
+        markread_fail(
+            state,
+            conn,
+            target,
+            "INVALID_PARAMS",
+            "Target must be a channel",
+        );
+        return;
+    }
+    let is_new = !state
+        .read_markers
+        .contains_key(&(account.clone(), key.clone()));
+    if is_new
+        && state
+            .read_markers
+            .keys()
+            .filter(|(a, _)| a == &account)
+            .count()
+            >= MAX_READ_MARKERS_PER_ACCOUNT
+    {
+        markread_fail(
+            state,
+            conn,
+            target,
+            "INVALID_PARAMS",
+            "Too many read markers",
+        );
+        return;
+    }
     let slot = state
         .read_markers
         .entry((account.clone(), key.clone()))

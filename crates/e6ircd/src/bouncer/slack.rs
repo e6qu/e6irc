@@ -16,6 +16,7 @@
 //! tokens. This module is NOT verified against live Slack in CI.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Ws;
@@ -69,8 +70,28 @@ fn api_base(config: &SlackConfig) -> String {
 }
 
 async fn run(config: SlackConfig, mut ends: DriverEnds) {
+    // Always-on: reconnect (from scratch) with backoff on any socket drop —
+    // including Slack's routine `disconnect` envelope, which expects a
+    // reconnect — rather than dying and silently dropping all later messages.
+    // Only a dropped handle stops the driver.
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match session_once(&config, &mut ends).await {
+            super::SessionOutcome::Stopped => return,
+            super::SessionOutcome::Dropped => {
+                ends.emit(DriverEvent::Disconnected);
+                let jitter = Duration::from_millis((backoff.as_millis() as u64) % 97);
+                tokio::time::sleep(backoff + jitter).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+    use super::SessionOutcome::Dropped;
     let http = reqwest::Client::new();
-    let base = api_base(&config);
+    let base = api_base(config);
 
     // Resolve each configured channel id to its #name once.
     let mut id_to_channel: HashMap<String, String> = HashMap::new();
@@ -84,8 +105,7 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
             }
             Err(e) => {
                 eprintln!("slack: channel {id} lookup failed: {e}");
-                ends.emit(DriverEvent::Disconnected);
-                return;
+                return Dropped;
             }
         }
     }
@@ -94,16 +114,14 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("slack: apps.connections.open failed: {e}");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return Dropped;
         }
     };
     let (ws, _) = match tokio_tungstenite::connect_async(&ws_url).await {
         Ok(x) => x,
         Err(e) => {
             eprintln!("slack: socket connect failed: {e}");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return Dropped;
         }
     };
     let (mut write, mut read) = ws.split();
@@ -118,11 +136,11 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
                         let _ = write.send(Ws::Pong(p)).await;
                         continue;
                     }
-                    Some(Ok(Ws::Close(_))) | None => break,
+                    Some(Ok(Ws::Close(_))) | None => return Dropped,
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => {
                         eprintln!("slack: socket read error: {e}");
-                        break;
+                        return Dropped;
                     }
                 };
                 let envelope = parse_envelope(&text);
@@ -130,11 +148,11 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
                 if let Some(ack_id) = &envelope.ack {
                     let ack = serde_json::json!({ "envelope_id": ack_id });
                     if write.send(Ws::text(ack.to_string())).await.is_err() {
-                        break;
+                        return Dropped;
                     }
                 }
                 if envelope.disconnect {
-                    break; // Slack asked us to reconnect; stop cleanly.
+                    return Dropped; // Slack asked us to reconnect.
                 }
                 if let Some(m) = envelope.message
                     && let Some(channel) = id_to_channel.get(&m.channel)
@@ -151,11 +169,10 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
                         eprintln!("slack: chat.postMessage to {id} failed: {e}");
                     }
                 }
-                None => break, // every handle dropped
+                None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
     }
-    ends.emit(DriverEvent::Disconnected);
 }
 
 /// One bridged Slack message.

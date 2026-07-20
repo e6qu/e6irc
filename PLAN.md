@@ -16,6 +16,20 @@ SET options) is now fully built and tested — the only open work is the two
 environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
 ⛔ blocked (reason).
 
+Hardening sweep (2026-07-20): closed several bug classes across the tree —
+client-triggerable memory-growth DoS on the single core worker (unbounded
+`+b/+q/+e/+I` lists → MAXLIST/478, unbounded channel joins → CHANLIMIT/405,
+unbounded read markers → per-account cap), secret-channel (`+s`) membership
+and `+k` key disclosure via WHOIS/NAMES/WHO/MODE, `JOIN 0` and multi-target
+PRIVMSG/NOTICE (TARGMAX) fidelity gaps, SASL 400-byte continuation for long
+OAUTHBEARER tokens, an OIDC login-CSRF/session-fixation hole (state now
+browser-bound) and a credential-verify timing oracle, and a set of silent
+no-op/fallback violations in the bouncer (non-UTF-8 relay drop, slow-client
+and persistence lag, feature-absent network config, DB-error masking). CR/LF
+injection from bridge content is neutralized at the emit choke point, and the
+three bridges now reconnect with backoff instead of dying on the first
+disconnect (compile-verified; runtime still gated on live credentials).
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

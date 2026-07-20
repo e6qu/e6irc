@@ -74,8 +74,27 @@ fn api_base(config: &DiscordConfig) -> String {
 }
 
 async fn run(config: DiscordConfig, mut ends: DriverEnds) {
+    // Always-on: reconnect (from scratch) with backoff on any gateway drop,
+    // rather than dying on the first disconnect and silently dropping all
+    // later messages. Only a dropped handle stops the driver.
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match session_once(&config, &mut ends).await {
+            super::SessionOutcome::Stopped => return,
+            super::SessionOutcome::Dropped => {
+                ends.emit(DriverEvent::Disconnected);
+                let jitter = Duration::from_millis((backoff.as_millis() as u64) % 97);
+                tokio::time::sleep(backoff + jitter).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
+async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+    use super::SessionOutcome::Dropped;
     let http = reqwest::Client::new();
-    let base = api_base(&config);
+    let base = api_base(config);
 
     // Resolve each configured channel id to its #name once.
     let mut id_to_channel: HashMap<String, String> = HashMap::new();
@@ -89,8 +108,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
             }
             Err(e) => {
                 eprintln!("discord: channel {id} lookup failed: {e}");
-                ends.emit(DriverEvent::Disconnected);
-                return;
+                return Dropped;
             }
         }
     }
@@ -99,8 +117,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
         Ok(u) => u,
         Err(e) => {
             eprintln!("discord: gateway discovery failed: {e}");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return Dropped;
         }
     };
     let url = format!("{}/?v=10&encoding=json", gateway.trim_end_matches('/'));
@@ -108,8 +125,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("discord: gateway connect failed: {e}");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return Dropped;
         }
     };
     let (mut write, mut read) = ws.split();
@@ -120,14 +136,12 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
             Event::Hello(ms) => ms,
             _ => {
                 eprintln!("discord: first gateway frame was not HELLO");
-                ends.emit(DriverEvent::Disconnected);
-                return;
+                return Dropped;
             }
         },
         _ => {
             eprintln!("discord: no HELLO from gateway");
-            ends.emit(DriverEvent::Disconnected);
-            return;
+            return Dropped;
         }
     };
 
@@ -140,8 +154,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
         }
     });
     if write.send(Ws::text(identify.to_string())).await.is_err() {
-        ends.emit(DriverEvent::Disconnected);
-        return;
+        return Dropped;
     }
     ends.emit(DriverEvent::Connected);
 
@@ -155,7 +168,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
             _ = heartbeat.tick() => {
                 let hb = serde_json::json!({ "op": 1, "d": last_seq });
                 if write.send(Ws::text(hb.to_string())).await.is_err() {
-                    break;
+                    return Dropped;
                 }
             }
             frame = read.next() => {
@@ -165,11 +178,11 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
                         let _ = write.send(Ws::Pong(p)).await;
                         continue;
                     }
-                    Some(Ok(Ws::Close(_))) | None => break,
+                    Some(Ok(Ws::Close(_))) | None => return Dropped,
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => {
                         eprintln!("discord: gateway read error: {e}");
-                        break;
+                        return Dropped;
                     }
                 };
                 let frame = parse_frame(&text);
@@ -181,7 +194,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
                     Event::HeartbeatRequest => {
                         let hb = serde_json::json!({ "op": 1, "d": last_seq });
                         if write.send(Ws::text(hb.to_string())).await.is_err() {
-                            break;
+                            return Dropped;
                         }
                     }
                     Event::Message { channel_id, author_id, author, content } => {
@@ -205,11 +218,10 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
                         eprintln!("discord: send to {id} failed: {e}");
                     }
                 }
-                None => break, // every handle dropped
+                None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
     }
-    ends.emit(DriverEvent::Disconnected);
 }
 
 /// A parsed gateway frame: its sequence number (if any) and classified

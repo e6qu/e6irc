@@ -59,6 +59,19 @@ pub fn network_config_from_row(
 
 use tokio::sync::mpsc;
 
+/// Outcome of one driver session attempt, for the always-on drivers'
+/// reconnect loops: the owner dropped the handle (stop for good), or the
+/// upstream connection dropped and the driver should reconnect with backoff.
+/// Reconnecting from scratch is intentionally simple (it re-syncs/re-joins
+/// rather than resuming); losing that optimization is far better than the
+/// task dying on the first disconnect and silently dropping all later
+/// upstream traffic.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) enum SessionOutcome {
+    Stopped,
+    Dropped,
+}
+
 /// An event a driver emits upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
@@ -100,13 +113,37 @@ impl Buffer {
         }
     }
     fn push(&mut self, line: String) {
-        if self.lines.len() == self.cap {
+        // `>=` (not `==`) so a zero/under-filled cap can never let the ring
+        // grow without bound.
+        while self.lines.len() >= self.cap.max(1) {
             self.lines.pop_front();
         }
         self.lines.push_back(line);
     }
     pub fn snapshot(&self) -> Vec<String> {
         self.lines.iter().cloned().collect()
+    }
+}
+
+/// Neutralize embedded CR/LF/NUL in a synthesized upstream line before it is
+/// buffered or broadcast to attached clients. A bridge builds lines from
+/// free-form remote text (Discord/Slack/Matrix message bodies); an embedded
+/// newline would otherwise let that text inject a second, forged IRC line
+/// into the client's stream. Real IRC-upstream lines never carry these bytes
+/// (the framing splits on them), so this is a no-op fast path for them.
+fn sanitize_upstream_line(line: String) -> String {
+    if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        line.chars()
+            .map(|c| {
+                if matches!(c, '\r' | '\n' | '\0') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect()
+    } else {
+        line
     }
 }
 
@@ -180,8 +217,12 @@ pub struct DriverEnds {
 }
 
 impl DriverEnds {
-    /// Record a line to the detached buffer and broadcast it live.
+    /// Record a line to the detached buffer and broadcast it live. The line
+    /// is neutralized first (see [`sanitize_upstream_line`]) so a bridge that
+    /// builds it from free-form remote text cannot inject a second IRC line
+    /// into an attached client's stream.
     pub fn emit_line(&self, line: String) {
+        let line = sanitize_upstream_line(line);
         self.buffer
             .lock()
             .expect("buffer poisoned")
@@ -288,16 +329,19 @@ where
 
     let (mut read, mut write) = tokio::io::split(stream);
 
+    // Subscribe BEFORE snapshotting the buffer, so a line the driver emits
+    // during playback is caught by the subscription instead of falling into
+    // the gap between the two (a duplicated backlog line is harmless; a lost
+    // one is not). This mirrors the persistence task's ordering.
+    let commands = handle.commands.clone();
+    let mut events = handle.events.subscribe();
+
     // Playback: everything buffered while detached, in order.
     for line in handle.buffer_snapshot() {
         write.write_all(line.as_bytes()).await?;
         write.write_all(b"\r\n").await?;
     }
     write.flush().await?;
-
-    // A fresh subscription for live events; clone the command sender.
-    let commands = handle.commands.clone();
-    let mut events = handle.events.subscribe();
 
     let mut framing = LineBuffer::new(4096 + 510);
     let mut read_buf = vec![0u8; 8192];
@@ -319,8 +363,17 @@ where
                     write.write_all(b":*bnc* NOTICE * :upstream disconnected\r\n").await?;
                     write.flush().await?;
                 }
-                // Lagged (slow client): skip the gap and keep going.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // Lagged (slow client): the gap is unrecoverable, but surface
+                // it rather than dropping upstream lines silently.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    write
+                        .write_all(
+                            format!(":*bnc* NOTICE * :dropped {n} line(s); client too slow\r\n")
+                                .as_bytes(),
+                        )
+                        .await?;
+                    write.flush().await?;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             // Client -> upstream.
@@ -330,13 +383,24 @@ where
                     framing.feed(&read_buf[..n], &mut parsed);
                     for event in parsed.drain(..) {
                         match event {
-                            LineEvent::Line(line) => {
-                                if let Ok(text) = String::from_utf8(line)
-                                    && commands.send(text).is_err()
-                                {
-                                    return Ok(()); // driver gone
+                            LineEvent::Line(line) => match String::from_utf8(line) {
+                                Ok(text) => {
+                                    if commands.send(text).is_err() {
+                                        return Ok(()); // driver gone
+                                    }
                                 }
-                            }
+                                // This relay is UTF-8, like the core ingest
+                                // path; reject a non-UTF-8 line loudly rather
+                                // than swallowing it.
+                                Err(_) => {
+                                    write
+                                        .write_all(
+                                            b":*bnc* NOTICE * :input was not valid UTF-8; not sent upstream\r\n",
+                                        )
+                                        .await?;
+                                    write.flush().await?;
+                                }
+                            },
                             // The framing contract forbids silently dropping an
                             // over-long line; tell the client its line was not
                             // relayed rather than swallowing it.
@@ -356,4 +420,38 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_neutralizes_embedded_crlf_and_nul() {
+        // A bridge-synthesized line carrying an embedded newline must not be
+        // able to inject a second IRC line into an attached client's stream.
+        let injected =
+            ":a!a@bridge PRIVMSG #c :hi\r\n:nickserv!s@svc PRIVMSG victim :give me your password";
+        let safe = sanitize_upstream_line(injected.to_string());
+        assert!(!safe.contains('\r') && !safe.contains('\n'));
+        assert!(!safe.contains('\0'));
+        // A clean line is returned unchanged (fast path).
+        let clean = ":a!a@irc PRIVMSG #c :hello there".to_string();
+        assert_eq!(sanitize_upstream_line(clean.clone()), clean);
+    }
+
+    #[test]
+    fn buffer_never_grows_past_cap() {
+        let mut b = Buffer::new(3);
+        for i in 0..100 {
+            b.push(format!("line{i}"));
+        }
+        assert_eq!(b.snapshot().len(), 3, "ring must stay bounded at cap");
+        // A degenerate cap of 0 must still be bounded, not unbounded.
+        let mut z = Buffer::new(0);
+        for i in 0..100 {
+            z.push(format!("line{i}"));
+        }
+        assert!(z.snapshot().len() <= 1, "cap 0 must not grow without bound");
+    }
 }
