@@ -608,7 +608,24 @@ async fn history_rest_endpoint() {
     db::create_account(&pool, "web", "pw")
         .await
         .expect("create");
+    // The REST history read authorizes the target against a registered
+    // relationship (an account can't read arbitrary channels' history), so
+    // make `web` the founder of #web to exercise an authorized read.
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#web', '#web', id FROM accounts WHERE name_folded = 'web'",
+    )
+    .execute(&pool)
+    .await
+    .expect("register #web");
     let session = db::create_web_session(&pool, "web").await.expect("session");
+    // A second account with no relationship to #web must be refused (IDOR).
+    db::create_account(&pool, "other", "pw")
+        .await
+        .expect("create other");
+    let other_session = db::create_web_session(&pool, "other")
+        .await
+        .expect("other session");
     drop(pool);
 
     let config = Config {
@@ -696,6 +713,19 @@ PING x
     assert_eq!(messages[0]["body"], "rest one");
     assert_eq!(messages[1]["body"], "rest two");
     assert!(messages[0]["msgid"].as_str().is_some());
+
+    // An account with no relationship to #web is refused (IDOR guard).
+    let forbidden = client
+        .get(format!("{base}/api/v1/history?target=%23web"))
+        .header("cookie", format!("e6irc_session={other_session}"))
+        .send()
+        .await
+        .expect("hist");
+    assert_eq!(
+        forbidden.status(),
+        403,
+        "unrelated account must be forbidden"
+    );
 }
 
 #[tokio::test]
@@ -1484,13 +1514,21 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         .expect("system time")
         .as_secs() as i64
         + 600;
+    let logout_token_id = format!(
+        "logout-token-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    );
     assert_eq!(
         db::consume_oidc_backchannel_logout(
             &pool,
             "https://auth.example",
             Some("alice-subject"),
             Some("first-session"),
-            "logout-token-1",
+            &logout_token_id,
             expires,
         )
         .await
@@ -1511,7 +1549,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
             "https://auth.example",
             Some("alice-subject"),
             Some("first-session"),
-            "logout-token-1",
+            &logout_token_id,
             expires,
         )
         .await,
@@ -1526,5 +1564,66 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     assert_eq!(
         db::session_account(&pool, &second).await.expect("second"),
         None
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn history_read_authorization_is_scoped() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    db::create_account(&pool, "bob", "pw").await.expect("bob");
+    db::create_account(&pool, "carol", "pw")
+        .await
+        .expect("carol");
+    // Register #chan with alice as founder.
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#chan', '#chan', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("register channel");
+
+    // Founder may read.
+    assert!(
+        db::account_may_read_channel(&pool, "#chan", "alice")
+            .await
+            .unwrap()
+    );
+    // An unrelated account may NOT read another channel's history (IDOR guard).
+    assert!(
+        !db::account_may_read_channel(&pool, "#chan", "bob")
+            .await
+            .unwrap()
+    );
+    // Granting access lets them read.
+    db::set_channel_access(&pool, "#chan", "bob", Some("v".into()))
+        .await
+        .expect("grant");
+    assert!(
+        db::account_may_read_channel(&pool, "#chan", "bob")
+            .await
+            .unwrap()
+    );
+    // An unregistered channel exposes nothing via this path.
+    assert!(
+        !db::account_may_read_channel(&pool, "#unreg", "alice")
+            .await
+            .unwrap()
+    );
+    // A third account with no relationship stays denied.
+    assert!(
+        !db::account_may_read_channel(&pool, "#chan", "carol")
+            .await
+            .unwrap()
     );
 }

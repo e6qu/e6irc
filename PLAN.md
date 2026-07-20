@@ -30,6 +30,22 @@ injection from bridge content is neutralized at the emit choke point, and the
 three bridges now reconnect with backoff instead of dying on the first
 disconnect (compile-verified; runtime still gated on live credentials).
 
+Second hardening sweep (2026-07-20): a deeper pass closed more of the same
+classes — an unbounded per-session INVITE set and unbounded per-account BNC
+networks (both now capped), a `/api/v1/history` IDOR (any account could read
+any channel's persisted history; now authorized against founder/channel
+access), a `LIST <channels>` silent no-op (it ignored its argument), a TAGMSG
+path that skipped ban/quiet enforcement, and a credential-hardening doc/code
+gap (argon2 params now stated accurately behind a single `hasher()` choke
+point). Fidelity: RPL_USERHOST oper `*`, RPL_MYINFO mode set, LUSERS
+invisible/oper/unknown counts, casefolded multi-target dedup. Bouncer: HTTP
+timeouts on all bridge/OIDC clients (a hung request no longer defeats the
+reconnect design), reconnect backoff now resets after a working session, and
+unmappable bridge commands are surfaced instead of silently dropped. Deferred
+(surfaced, not yet done): full OIDC discovery/JWKS caching, auth-endpoint rate
+limiting, `__Host-` cookie prefix, `/ws/ui` Origin check, and IRC-driver
+message-tag propagation for bouncer backlog.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
@@ -294,6 +310,11 @@ Done (this phase's remaining, now landed):
   e6ircd with `embed-web`, so the deployable image contained the complete UI
   and performed no build work at startup. The chat shell exposed the signed-in
   account, account section, and global Sign out navigation in both themes.
+- Coordinated and local browser logout returned to the public, reload-safe
+  `/auth/signed-out` page instead of the application root. The branded,
+  accessible light/dark page exposed the explicit Shauth OIDC starter, and
+  real-browser coverage exercised catalog launch, direct silent SSO, logout
+  landing reload, and application-local sign-in recovery.
 - askama server-rendered pages (DESIGN §13.1): `/login` (OIDC provider
   buttons) and `/account` (cookie-authed user section listing the
   account's networks + credentials; redirects to /login when

@@ -81,12 +81,21 @@ pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result
     Ok(id)
 }
 
+/// The single Argon2 configuration used for every password hash and verify,
+/// so credential hardening lives in one choke point rather than scattered
+/// `Argon2::default()` calls. These are the argon2 0.5.3 defaults — Argon2id,
+/// v19, m=19456 KiB (~19 MiB), t=2, p=1 — which meet the OWASP minimum.
+/// Documented in DESIGN §15; change here to change it everywhere.
+fn hasher() -> Argon2<'static> {
+    Argon2::default()
+}
+
 /// argon2id via the blocking pool — hashing is deliberately slow and
 /// must not stall the async runtime.
 async fn hash_password(password: String) -> Result<String, DbError> {
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
+        hasher()
             .hash_password(password.as_bytes(), &salt)
             .map(|h| h.to_string())
             .map_err(DbError::Hash)
@@ -703,6 +712,32 @@ pub async fn set_channel_access(
     Ok(())
 }
 
+/// Whether `account` holds a registered relationship with `channel` — its
+/// founder, or an access-flag entry. Used to authorize the REST history read,
+/// which (unlike IRC `CHATHISTORY`) has no view of live channel membership, so
+/// it must fail closed rather than expose any channel's history to any account.
+pub async fn account_may_read_channel(
+    pool: &PgPool,
+    channel_folded: &str,
+    account_folded: &str,
+) -> Result<bool, DbError> {
+    let found: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM channels c
+         JOIN accounts a ON a.name_folded = $2
+         WHERE c.name_folded = $1
+           AND (c.founder_account_id = a.id
+                OR EXISTS (SELECT 1 FROM channel_access ca
+                           WHERE ca.channel_id = c.id AND ca.account_id = a.id))
+         LIMIT 1",
+    )
+    .bind(channel_folded)
+    .bind(account_folded)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(found.is_some())
+}
+
 /// Every channel access entry, as `(channel_folded, account_folded,
 /// flags)` — boot-loaded into the hot access map.
 pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, String)>, DbError> {
@@ -1003,7 +1038,7 @@ fn dummy_verify_hash() -> &'static str {
     HASH.get_or_init(|| {
         let salt =
             SaltString::from_b64("YWJjZGVmZ2hpamtsbW5vcA").expect("static salt is valid B64");
-        Argon2::default()
+        hasher()
             .hash_password(b"e6irc/no-such-account", &salt)
             .expect("dummy hash computes")
             .to_string()
@@ -1040,7 +1075,7 @@ pub async fn verify_credentials(
             let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
             // Always fails (the password never matches); we run it only to
             // spend the argon2 time, so the result is deliberately discarded.
-            let _ = Argon2::default().verify_password(password.as_bytes(), &parsed);
+            let _ = hasher().verify_password(password.as_bytes(), &parsed);
         })
         .await
         .expect("verification task panicked");
@@ -1052,7 +1087,7 @@ pub async fn verify_credentials(
     let verified = tokio::task::spawn_blocking(move || {
         hashes.iter().any(|hash| {
             PasswordHash::new(hash).is_ok_and(|parsed| {
-                Argon2::default()
+                hasher()
                     .verify_password(password.as_bytes(), &parsed)
                     .is_ok()
             })

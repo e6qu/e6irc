@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Signed out · e6irc</title>
+    <link rel="stylesheet" href="/auth.css" />
+  </head>
+  <body>
+    <main class="auth-shell" id="main-content">
+      <section class="auth-card" aria-labelledby="signed-out-title">
+        <span class="brand" aria-label="e6irc">e6irc</span>
+        <p class="eyebrow">Session secured</p>
+        <h1 id="signed-out-title">You are signed out</h1>
+        <p class="lede">Your e6irc session has ended. Sign in again when you are ready.</p>
+        <div class="actions">
+          {% if has_shauth %}
+            <a class="primary-action" href="/api/v1/auth/oidc/shauth/start">Sign in with Shauth</a>
+          {% else %}
+            <a class="primary-action" href="/login">Choose a sign-in provider</a>
+          {% endif %}
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

@@ -9,13 +9,15 @@
   "scripts": {
     "dev": "vite",
     "build": "mkdir -p public && cp node_modules/htmx.org/dist/htmx.min.js public/ && cp node_modules/htmx-ext-ws/dist/ws.min.js public/ && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:oidc-browser": "node ../tools/test-oidc-browser.mjs"
   },
   "dependencies": {
-    "htmx.org": "2.0.10",
-    "htmx-ext-ws": "2.0.4"
+    "htmx-ext-ws": "2.0.4",
+    "htmx.org": "2.0.10"
   },
   "devDependencies": {
+    "playwright": "1.61.1",
     "vite": "8.1.5"
   }
 }

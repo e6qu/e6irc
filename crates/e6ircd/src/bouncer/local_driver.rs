@@ -104,8 +104,10 @@ impl NetworkDriver for LocalDriver {
                     // Core output -> buffer + broadcast (attach playback/live).
                     out = out_rx.pop() => match out {
                         Some(env) => {
+                            // Strip only the frame's CRLF, not all trailing
+                            // whitespace — a trailing param may end in spaces.
                             let line = String::from_utf8_lossy(&env.payload.0)
-                                .trim_end()
+                                .trim_end_matches(['\r', '\n'])
                                 .to_string();
                             ends.emit_line(line);
                         }

@@ -98,6 +98,14 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
+      - name: Exercise OIDC in a real browser
+        run: |
+          pnpm -C web exec playwright install --with-deps chromium
+          cargo build -p e6ircd --features embed-web
+          pnpm -C web test:oidc-browser
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+          E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
       - run: cargo test -p e6ircd --features embed-web --test http -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test

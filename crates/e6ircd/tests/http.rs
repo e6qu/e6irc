@@ -57,6 +57,48 @@ async fn healthz_is_public_and_ok() {
 }
 
 #[tokio::test]
+async fn signed_out_page_is_public_reload_safe_and_accessible() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+
+    for attempt in 1..=2 {
+        let (status, headers, body) = request(http, &get("/auth/signed-out")).await;
+        assert_eq!(status, 200, "attempt {attempt}: {headers}");
+        let headers = headers.to_ascii_lowercase();
+        assert!(
+            headers.contains("content-type: text/html; charset=utf-8"),
+            "attempt {attempt}: {headers}"
+        );
+        assert!(
+            headers.contains("cache-control: no-store"),
+            "attempt {attempt}: {headers}"
+        );
+        assert!(
+            headers.contains("content-security-policy: default-src 'none'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+            "attempt {attempt}: {headers}"
+        );
+        assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
+        assert!(
+            body.contains("<h1 id=\"signed-out-title\">You are signed out</h1>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("href=\"/login\">Choose a sign-in provider</a>"),
+            "{body}"
+        );
+    }
+
+    let (status, headers, styles) = request(http, &get("/auth.css")).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(styles.contains("prefers-color-scheme: dark"), "{styles}");
+    assert!(styles.contains(".primary-action:focus-visible"), "{styles}");
+    assert!(
+        styles.contains("prefers-reduced-motion: no-preference"),
+        "{styles}"
+    );
+}
+
+#[tokio::test]
 async fn server_info_endpoint() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
@@ -1065,6 +1107,9 @@ async fn rp_initiated_logout_redirects_to_provider() {
     )
     .await
     .expect("sso session");
+    let local_session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("local session");
     drop(pool);
 
     let config = Config {
@@ -1121,9 +1166,14 @@ async fn rp_initiated_logout_redirects_to_provider() {
         "{location}"
     );
     assert!(location.contains("client_id=e6irc"), "{location}");
-    assert!(
-        location.contains("post_logout_redirect_uri=https"),
-        "{location}"
+    let location_url = reqwest::Url::parse(location).expect("logout URL");
+    let post_logout_redirect = location_url
+        .query_pairs()
+        .find_map(|(name, value)| (name == "post_logout_redirect_uri").then(|| value.into_owned()))
+        .expect("post_logout_redirect_uri");
+    assert_eq!(
+        post_logout_redirect,
+        "https://e6irc.example/auth/signed-out"
     );
 
     // The local session is gone: the same cookie no longer authenticates.
@@ -1132,6 +1182,38 @@ async fn rp_initiated_logout_redirects_to_provider() {
     );
     let (status, _, _) = request(http, &me).await;
     assert_eq!(status, 401, "session survived logout");
+
+    // The provider returns to a public, persistent app-local page. It keeps
+    // the exact Shauth starter after a reload instead of silently probing SSO.
+    for attempt in 1..=2 {
+        let (status, headers, body) = request(http, &get("/auth/signed-out")).await;
+        assert_eq!(status, 200, "attempt {attempt}: {headers}");
+        assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
+        assert!(body.contains("You are signed out"), "{body}");
+        assert!(
+            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with Shauth</a>"),
+            "{body}"
+        );
+    }
+
+    // Local-account and already-signed-out browser navigations use the same
+    // app-local landing, and stale cookies are expired idempotently.
+    for cookie in [Some(local_session.as_str()), None] {
+        let cookie_header = cookie
+            .map(|value| format!("Cookie: e6irc_session={value}\r\n"))
+            .unwrap_or_default();
+        let logout = format!(
+            "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\n{cookie_header}Connection: close\r\n\r\n"
+        );
+        let (status, headers, _) = request(http, &logout).await;
+        assert_eq!(status, 303, "{headers}");
+        assert!(
+            headers.contains("location: /auth/signed-out")
+                || headers.contains("Location: /auth/signed-out"),
+            "{headers}"
+        );
+        assert!(headers.contains("Max-Age=0"), "{headers}");
+    }
 }
 
 #[cfg(feature = "embed-web")]
