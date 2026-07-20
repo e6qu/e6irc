@@ -85,19 +85,27 @@ enum ConnectionOutcome {
 }
 
 async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> ConnectionOutcome {
-    let mut conn = match connect(config).await {
-        Ok(c) => c,
-        Err(_) => return ConnectionOutcome::Dropped,
+    // Bound connect + registration: an upstream that accepts the TCP handshake
+    // but never sends 001 (firewall dropping data, half-open peer) must not
+    // wedge the driver forever — that would starve the reconnect loop, the
+    // same failure the Matrix driver's timeout guards against.
+    let connect_fut = connect(config);
+    let mut conn = match tokio::time::timeout(Duration::from_secs(30), connect_fut).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(_)) | Err(_) => return ConnectionOutcome::Dropped,
     };
-    let registered = match &config.sasl {
-        Some((account, password)) => {
-            conn.register_sasl(&config.nick, &config.realname, account, password)
-                .await
+    let register_fut = async {
+        match &config.sasl {
+            Some((account, password)) => {
+                conn.register_sasl(&config.nick, &config.realname, account, password)
+                    .await
+            }
+            None => conn.register(&config.nick, &config.realname).await,
         }
-        None => conn.register(&config.nick, &config.realname).await,
     };
-    if registered.is_err() {
-        return ConnectionOutcome::Dropped;
+    match tokio::time::timeout(Duration::from_secs(30), register_fut).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) | Err(_) => return ConnectionOutcome::Dropped,
     }
     ends.emit(DriverEvent::Connected);
     for chan in &config.autojoin {

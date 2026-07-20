@@ -47,11 +47,15 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
 
     // labeled-response: capture direct replies and frame them under the
     // label. Only for clients that negotiated the cap and sent a label.
+    // Re-escape the label: the parser hands us the unescaped tag value, and
+    // it is echoed back into the tag section of every framed reply. Without
+    // re-escaping, a value like `a\s\nb` would inject a space/newline into the
+    // client's own stream and corrupt the labeled response.
     let label = msg
         .tag("label")
         .and_then(|t| t.value.as_deref())
         .filter(|_| state.sessions[&conn].caps.labeled_response)
-        .map(str::to_string);
+        .map(e6irc_proto::message::escape_tag_value);
     if let Some(label) = label {
         state.capture = Some(super::state::Capture {
             conn,
@@ -1495,13 +1499,13 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
             "CHANTYPES=#",
             &format!("NICKLEN={nicklen}"),
             "CHANNELLEN=50",
+            &format!("TOPICLEN={TOPICLEN}"),
+            &format!("KICKLEN={KICKLEN}"),
+            &format!("AWAYLEN={AWAYLEN}"),
             "PREFIX=(ov)@+",
             "STATUSMSG=@+",
             "BOT=B",
             "CHANMODES=eIbq,k,l,imnstC",
-            "EXCEPTS",
-            "INVEX",
-            "UTF8ONLY",
             &format!("NETWORK={}", state.config.network_name),
         ],
         Some("are supported by this server"),
@@ -1510,12 +1514,16 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
         conn,
         RPL_ISUPPORT,
         &[
+            "EXCEPTS",
+            "INVEX",
+            "UTF8ONLY",
+            "WHOX",
             "MONITOR=100",
             "CHATHISTORY=500",
             "MSGREFTYPES=msgid,timestamp",
             &format!("MAXLIST=bqeI:{MAXLIST}"),
             &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
-            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX}"),
+            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},KICK:1"),
         ],
         Some("are supported by this server"),
     );
@@ -1661,6 +1669,25 @@ const MAX_READ_MARKERS_PER_ACCOUNT: usize = 256;
 
 /// Cap on a session's pending-invite set, bounding INVITE-driven growth.
 const INVITE_LIMIT: usize = 100;
+
+/// Advertised (and enforced) length limits, so a client can pre-truncate and
+/// an over-long value can't push the broadcast line past the 512-byte wire
+/// limit. Values mirror Libera's order of magnitude.
+const TOPICLEN: usize = 390;
+const KICKLEN: usize = 390;
+const AWAYLEN: usize = 390;
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary.
+fn truncate_chars(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 fn valid_channel_name(name: &str) -> bool {
     name.starts_with('#')
@@ -2514,7 +2541,7 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
         );
         return;
     }
-    let new_text = p.get(1).copied().unwrap_or("");
+    let new_text = truncate_chars(p.get(1).copied().unwrap_or(""), TOPICLEN);
     let prefix = state.sessions[&conn].prefix();
     let now = (state.config.clock)();
     let new_topic = if new_text.is_empty() {
@@ -3384,7 +3411,10 @@ fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let prefix = state.sessions[&conn].prefix();
     let kicker_nick = state.sessions[&conn].nick.clone().expect("registered");
     let line = match p.get(2) {
-        Some(reason) => format!(":{prefix} KICK {display} {victim_nick} :{reason}"),
+        Some(reason) => format!(
+            ":{prefix} KICK {display} {victim_nick} :{}",
+            truncate_chars(reason, KICKLEN)
+        ),
         None => format!(":{prefix} KICK {display} {victim_nick} :{kicker_nick}"),
     };
     state.broadcast_channel(&key, &line, None);
@@ -3503,7 +3533,10 @@ fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 }
 
 fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let message = p.first().filter(|m| !m.is_empty()).map(|m| m.to_string());
+    let message = p
+        .first()
+        .filter(|m| !m.is_empty())
+        .map(|m| truncate_chars(m, AWAYLEN).to_string());
     let prefix = state.sessions[&conn].prefix();
     let notify = match &message {
         Some(m) => format!(":{prefix} AWAY :{m}"),
@@ -3606,6 +3639,12 @@ fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 // ---- CHATHISTORY (draft/chathistory, hot ring) --------------------------
 
+/// A CHATHISTORY selector is a supported message reference: the open bound
+/// `*`, a `msgid=`, or a `timestamp=`. Anything else is INVALID_MSGREFTYPE.
+fn is_valid_msgref(sel: &str) -> bool {
+    sel == "*" || sel.starts_with("msgid=") || sel.starts_with("timestamp=")
+}
+
 fn chathistory_fail(state: &mut ServerState, conn: ConnId, code: &str, detail: &str) {
     let server = state.config.server_name.clone();
     state.send(
@@ -3650,13 +3689,40 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // BETWEEN takes two selectors then the limit; the others take one
     // selector then the limit.
     let is_between = sub.eq_ignore_ascii_case("BETWEEN");
-    let limit: usize = p
-        .get(if is_between { 4 } else { 3 })
-        .and_then(|l| l.parse().ok())
-        .unwrap_or(50)
-        .min(500);
     let selector = p.get(2).copied().unwrap_or("*");
     let selector2 = p.get(3).copied().unwrap_or("*");
+    // An unrecognized message-reference type is INVALID_MSGREFTYPE, not a
+    // silently-empty batch (we advertise MSGREFTYPES=msgid,timestamp).
+    let refs: &[&str] = if is_between {
+        &[selector, selector2]
+    } else {
+        &[selector]
+    };
+    if refs.iter().any(|s| !is_valid_msgref(s)) {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_MSGREFTYPE",
+            "Unknown message reference type",
+        );
+        return;
+    }
+    // The limit must be a positive integer — never silently default it.
+    let limit: usize = match p
+        .get(if is_between { 4 } else { 3 })
+        .map(|l| l.parse::<usize>())
+    {
+        Some(Ok(n)) if n > 0 => n.min(500),
+        _ => {
+            chathistory_fail(
+                state,
+                conn,
+                "INVALID_PARAMS",
+                "limit must be a positive integer",
+            );
+            return;
+        }
+    };
     let history: std::collections::VecDeque<super::state::HistoryEntry> =
         state.channels[&key].history.clone();
 

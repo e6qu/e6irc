@@ -113,7 +113,12 @@ async fn run_ui(
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Enter => {
                     if let Action::Send(line) = app.on_enter() {
-                        let _ = out_tx.send(line);
+                        // The net task drops the receiver on disconnect; surface
+                        // the failure instead of echoing a message that was
+                        // never actually sent.
+                        if out_tx.send(line).is_err() {
+                            app.status("not connected — message not sent");
+                        }
                     }
                 }
                 _ => {}

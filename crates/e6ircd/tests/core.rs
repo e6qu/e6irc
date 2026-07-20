@@ -3509,3 +3509,106 @@ fn lusers_reports_real_invisible_count() {
         "LUSERS must count invisible users: {client}"
     );
 }
+
+// ---- sweep 3: fidelity + injection regressions --------------------------
+
+#[test]
+fn chathistory_rejects_unknown_msgref() {
+    let mut s = TestServer::new();
+    let a = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(a, "JOIN #h");
+    s.drain(a);
+    s.line(a, "CHATHISTORY BEFORE #h garbage 10");
+    let out = s.drain(a);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL CHATHISTORY INVALID_MSGREFTYPE")),
+        "unknown msgref must FAIL, not return an empty batch: {out:#?}"
+    );
+}
+
+#[test]
+fn chathistory_rejects_bad_limit() {
+    let mut s = TestServer::new();
+    let a = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(a, "JOIN #h");
+    s.drain(a);
+    for bad in [
+        "CHATHISTORY LATEST #h * notanumber",
+        "CHATHISTORY LATEST #h * 0",
+    ] {
+        s.line(a, bad);
+        let out = s.drain(a);
+        assert!(
+            out.iter()
+                .any(|l| l.contains("FAIL CHATHISTORY INVALID_PARAMS")),
+            "'{bad}' must FAIL INVALID_PARAMS, not silently default: {out:#?}"
+        );
+    }
+}
+
+#[test]
+fn topic_is_truncated_to_topiclen() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "op");
+    s.line(op, "JOIN #t");
+    s.drain(op);
+    let long = "x".repeat(500);
+    s.line(op, &format!("TOPIC #t :{long}"));
+    let out = s.drain(op);
+    let topic = out
+        .iter()
+        .find(|l| l.contains(" TOPIC #t :"))
+        .expect("TOPIC broadcast");
+    let trailing = topic.split(" :").nth(1).expect("trailing");
+    assert!(
+        trailing.len() <= 390,
+        "topic must be truncated to TOPICLEN (390): got {}",
+        trailing.len()
+    );
+}
+
+#[test]
+fn labeled_response_reescapes_label() {
+    let mut s = TestServer::new();
+    let a = register_with_caps(&mut s, 1, "alice", "labeled-response");
+    // Wire label `a\s\nb`: the parser unescapes it to a space+newline; the
+    // reply must re-escape it, never emit a raw newline into the stream.
+    s.line(a, r"@label=a\s\nb USERHOST alice");
+    let out = s.drain(a);
+    let reply = out
+        .iter()
+        .find(|l| l.contains("label="))
+        .expect("labeled reply");
+    assert!(
+        !reply.contains('\n') && reply.contains(r"label=a\s\nb"),
+        "label must be re-escaped, not injected raw: {reply:?}"
+    );
+}
+
+#[test]
+fn isupport_advertises_whox_and_length_limits() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK alice");
+    s.line(c, "USER alice 0 * :Alice");
+    let burst = s.drain(c);
+    let isupport: String = burst
+        .iter()
+        .filter(|l| l.split(' ').nth(1) == Some("005"))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for token in [
+        "WHOX",
+        "TOPICLEN=390",
+        "KICKLEN=390",
+        "AWAYLEN=390",
+        "KICK:1",
+    ] {
+        assert!(
+            isupport.contains(token),
+            "ISUPPORT must advertise {token}: {isupport}"
+        );
+    }
+}

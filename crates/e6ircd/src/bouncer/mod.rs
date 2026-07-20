@@ -74,7 +74,7 @@ pub(crate) enum SessionOutcome {
 
 /// Classification of a downstream client command by a bridge, so a message
 /// that can't be delivered upstream is surfaced rather than silently dropped.
-#[cfg(any(feature = "discord", feature = "slack"))]
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RouteResult {
     /// A PRIVMSG mapped to `(upstream_id, text)`; deliver it.
@@ -83,6 +83,29 @@ pub(crate) enum RouteResult {
     Unmapped(String),
     /// Not a deliverable message command (control/other) — ignore quietly.
     Ignore,
+}
+
+/// Classify a downstream client line for a bridge: the single choke point all
+/// three bridges share (Discord/Slack/Matrix), so the routing policy lives in
+/// one place. `targets` maps a bridged channel name to its upstream id.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn route_privmsg(
+    line: &str,
+    targets: &std::collections::HashMap<String, String>,
+) -> RouteResult {
+    let Ok(msg) = e6irc_proto::message::Message::parse(line) else {
+        return RouteResult::Ignore;
+    };
+    if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
+        return RouteResult::Ignore;
+    }
+    let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
+        return RouteResult::Ignore;
+    };
+    match targets.get(*target) {
+        Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
+        None => RouteResult::Unmapped(target.to_string()),
+    }
 }
 
 /// An event a driver emits upward.

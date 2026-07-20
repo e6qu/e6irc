@@ -6,6 +6,16 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use e6irc_client::Connection;
 
+/// IRC numerics that mean a JOIN was refused — so a `send`/`history` client
+/// bails with a clear error instead of waiting forever for a 366 that will
+/// never arrive.
+fn is_join_error(command: &str) -> bool {
+    matches!(
+        command,
+        "403" | "405" | "471" | "473" | "474" | "475" | "476" | "477" | "480"
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "e6irc", about = "Scripting-oriented IRC client", version)]
 struct Cli {
@@ -135,6 +145,12 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     if msg.command == "366" {
                         break; // end of NAMES = joined
                     }
+                    if is_join_error(&msg.command) {
+                        let reason = msg.params.last().cloned().unwrap_or_default();
+                        return Err(std::io::Error::other(format!(
+                            "cannot join {target}: {reason}"
+                        )));
+                    }
                     if msg.command == "PING" {
                         let token = msg.params.first().cloned().unwrap_or_default();
                         conn.send_line(&format!("PONG :{token}")).await?;
@@ -195,6 +211,12 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 };
                 if m.command == "366" {
                     break;
+                }
+                if is_join_error(&m.command) {
+                    let reason = m.params.last().cloned().unwrap_or_default();
+                    return Err(std::io::Error::other(format!(
+                        "cannot join {target}: {reason}"
+                    )));
                 }
                 if m.command == "PING" {
                     let token = m.params.first().cloned().unwrap_or_default();
