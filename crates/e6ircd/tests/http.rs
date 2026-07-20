@@ -1142,10 +1142,35 @@ async fn rp_initiated_logout_redirects_to_provider() {
         .http_addr
         .expect("http");
 
+    // The logout GET now requires the session's CSRF token (anti-forced-logout);
+    // fetch it from the account page the way a browser would.
+    let (_, _, page) = request(
+        http,
+        &format!(
+            "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    let csrf = page
+        .split("X-CSRF-Token\": \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token in page")
+        .to_string();
+    // Without the token, the destructive logout GET is refused (a cross-site
+    // navigation can't forge it): anti-forced-logout CSRF.
+    let (no_csrf, _, _) = request(
+        http,
+        &format!(
+            "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(no_csrf, 403, "logout without CSRF token must be refused");
     // A GET logout on an OIDC session redirects to the provider's end-session
     // endpoint with an id_token_hint and post_logout_redirect_uri.
     let req = format!(
-        "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (status, headers, _) = request(http, &req).await;
     assert_eq!(status, 303, "{headers}");
@@ -1202,8 +1227,28 @@ async fn rp_initiated_logout_redirects_to_provider() {
         let cookie_header = cookie
             .map(|value| format!("Cookie: e6irc_session={value}\r\n"))
             .unwrap_or_default();
+        // A session-bearing logout carries its CSRF token; a cookieless
+        // navigation has no session to protect and needs none.
+        let csrf_q = match cookie {
+            Some(value) => {
+                let (_, _, page) = request(
+                    http,
+                    &format!(
+                        "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={value}\r\nConnection: close\r\n\r\n"
+                    ),
+                )
+                .await;
+                let token = page
+                    .split("X-CSRF-Token\": \"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .expect("csrf token in page");
+                format!("?csrf={token}")
+            }
+            None => String::new(),
+        };
         let logout = format!(
-            "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\n{cookie_header}Connection: close\r\n\r\n"
+            "GET /api/v1/auth/logout{csrf_q} HTTP/1.1\r\nHost: t\r\n{cookie_header}Connection: close\r\n\r\n"
         );
         let (status, headers, _) = request(http, &logout).await;
         assert_eq!(status, 303, "{headers}");
@@ -1344,8 +1389,21 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         .expect("start")
         .http_addr
         .expect("http");
+    let (_, _, page) = request(
+        http,
+        &format!(
+            "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    let csrf = page
+        .split("X-CSRF-Token\": \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token in page")
+        .to_string();
     let logout = format!(
-        "GET /api/v1/auth/logout HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (status, _, body) = request(http, &logout).await;
     assert_eq!(status, 503, "{body}");
