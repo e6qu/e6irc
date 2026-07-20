@@ -106,6 +106,8 @@ pub fn router(state: AppState) -> Router {
     let router = Router::new()
         .route("/healthz", get(async || "ok"))
         .route("/login", get(pages::login))
+        .route("/auth/signed-out", get(pages::signed_out))
+        .route("/auth.css", get(pages::auth_styles))
         .route("/account", get(pages::account))
         .route("/account/networks", post(pages::add_network_form))
         .route(
@@ -282,6 +284,12 @@ mod pages {
         providers: Vec<String>,
     }
 
+    #[derive(Template)]
+    #[template(path = "signed_out.html")]
+    struct SignedOut {
+        has_shauth: bool,
+    }
+
     /// Login landing: one button per configured OIDC provider.
     pub async fn login(State(state): State<Arc<AppState>>) -> Response {
         let providers = state
@@ -289,7 +297,31 @@ mod pages {
             .iter()
             .map(|p| p.name.clone())
             .collect();
-        render(Login { providers })
+        render_auth(Login { providers })
+    }
+
+    /// Public, reload-safe landing after coordinated logout. It deliberately
+    /// never probes the local or provider session, so a completed logout does
+    /// not immediately send the browser back through silent single sign-on.
+    pub async fn signed_out(State(state): State<Arc<AppState>>) -> Response {
+        render_auth(SignedOut {
+            has_shauth: state
+                .oidc_providers
+                .iter()
+                .any(|provider| provider.name == "shauth"),
+        })
+    }
+
+    pub async fn auth_styles() -> Response {
+        (
+            [
+                (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            include_str!("../assets/auth.css"),
+        )
+            .into_response()
     }
 
     struct NetworkView {
@@ -521,6 +553,36 @@ mod pages {
                 problem(StatusCode::INTERNAL_SERVER_ERROR, "Template error", None)
             }
         }
+    }
+
+    fn render_auth<T: Template>(template: T) -> Response {
+        let mut response = render(template);
+        if response.status().is_success() {
+            let headers = response.headers_mut();
+            headers.insert(
+                header::CACHE_CONTROL,
+                "no-store".parse().expect("static header"),
+            );
+            headers.insert(
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+                    .parse()
+                    .expect("static header"),
+            );
+            headers.insert(
+                header::X_FRAME_OPTIONS,
+                "DENY".parse().expect("static header"),
+            );
+            headers.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                "nosniff".parse().expect("static header"),
+            );
+            headers.insert(
+                header::REFERRER_POLICY,
+                "no-referrer".parse().expect("static header"),
+            );
+        }
+        response
     }
 }
 
@@ -1676,7 +1738,14 @@ async fn logout_sso(
         );
     };
     let Some(token) = session_token(&headers) else {
-        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/".to_string())]).into_response();
+        return (
+            StatusCode::SEE_OTHER,
+            [
+                (header::LOCATION, "/auth/signed-out".to_string()),
+                (header::SET_COOKIE, clear),
+            ],
+        )
+            .into_response();
     };
     let (id_token, provider) = match crate::db::session_logout_hint(pool, &token).await {
         Ok(v) => v,
@@ -1722,7 +1791,10 @@ async fn logout_sso(
             url.query_pairs_mut()
                 .append_pair("id_token_hint", &hint)
                 .append_pair("client_id", &provider.client_id)
-                .append_pair("post_logout_redirect_uri", public.trim_end_matches('/'));
+                .append_pair(
+                    "post_logout_redirect_uri",
+                    &format!("{}/auth/signed-out", public.trim_end_matches('/')),
+                );
             url.to_string()
         }
         (Some(_), _, _) | (None, Some(_), _) => {
@@ -1732,7 +1804,7 @@ async fn logout_sso(
                 None,
             );
         }
-        (None, None, None) => "/".to_string(),
+        (None, None, None) => "/auth/signed-out".to_string(),
         (None, None, Some(_)) => {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,

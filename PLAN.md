@@ -310,6 +310,11 @@ Done (this phase's remaining, now landed):
   e6ircd with `embed-web`, so the deployable image contained the complete UI
   and performed no build work at startup. The chat shell exposed the signed-in
   account, account section, and global Sign out navigation in both themes.
+- Coordinated and local browser logout returned to the public, reload-safe
+  `/auth/signed-out` page instead of the application root. The branded,
+  accessible light/dark page exposed the explicit Shauth OIDC starter, and
+  real-browser coverage exercised catalog launch, direct silent SSO, logout
+  landing reload, and application-local sign-in recovery.
 - askama server-rendered pages (DESIGN §13.1): `/login` (OIDC provider
   buttons) and `/account` (cookie-authed user section listing the
   account's networks + credentials; redirects to /login when

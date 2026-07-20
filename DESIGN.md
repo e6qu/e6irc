@@ -535,10 +535,12 @@ kind of account the OIDC first-login path creates.
   revoked the correlated durable sessions. Back-channel token signatures,
   issuer, audience, event, time, `sid`/`sub`, and `jti` were verified, and
   consumed token IDs were retained until expiry to reject replay.
-  RP-initiated logout returned through the application's registered public
-  URL. Missing provider metadata, a malformed end-session endpoint, or a
-  storage failure preserved the local session and failed loudly rather than
-  producing a partial logout.
+  RP-initiated logout returned through the application's registered
+  `/auth/signed-out` URL. That public, non-cacheable page remained local on
+  reload and offered an explicit application-local OIDC starter instead of
+  immediately probing SSO again. Missing provider metadata, a malformed
+  end-session endpoint, or a storage failure preserved the local session and
+  failed loudly rather than producing a partial logout.
 
 ### 9.3 IRC client authentication
 

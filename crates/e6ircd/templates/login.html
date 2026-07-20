@@ -3,40 +3,27 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>e6irc — sign in</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body {
-        margin: 0; min-height: 100vh; display: grid; place-items: center;
-        font: 16px/1.5 system-ui, sans-serif; background: #f6f7f9; color: #16181d;
-      }
-      main { max-width: 22rem; width: 100%; padding: 2rem; text-align: center; }
-      h1 { font-size: 2rem; margin: 0 0 0.25rem; letter-spacing: -0.02em; }
-      p.tag { color: #5b6470; margin: 0 0 2rem; }
-      a.provider {
-        display: block; padding: 0.7rem 1rem; margin: 0.5rem 0;
-        border-radius: 0.5rem; background: #2f6feb; color: #fff;
-        text-decoration: none; font-weight: 600;
-      }
-      a.provider:hover { background: #2358c4; }
-      p.none { color: #8a929e; }
-      @media (prefers-color-scheme: dark) {
-        body { background: #0f1115; color: #e6e8ec; }
-        p.tag { color: #9aa3b1; }
-      }
-    </style>
+    <link rel="stylesheet" href="/auth.css" />
   </head>
   <body>
-    <main>
-      <h1>e6irc</h1>
-      <p class="tag">Sign in to manage your networks.</p>
+    <main class="auth-shell" id="main-content">
+      <section class="auth-card" aria-labelledby="sign-in-title">
+      <span class="brand" aria-label="e6irc">e6irc</span>
+      <p class="eyebrow">Single sign-on</p>
+      <h1 id="sign-in-title">Sign in to e6irc</h1>
+      <p class="lede">Connect to your networks and conversations.</p>
+      <div class="actions">
       {% if providers.is_empty() %}
         <p class="none">No login providers are configured on this server.</p>
       {% else %}
         {% for p in providers %}
-          <a class="provider" href="/api/v1/auth/oidc/{{ p }}/start">Continue with {{ p }}</a>
+          <a class="primary-action" href="/api/v1/auth/oidc/{{ p }}/start">Continue with {{ p }}</a>
         {% endfor %}
       {% endif %}
+      </div>
+      </section>
     </main>
   </body>
 </html>

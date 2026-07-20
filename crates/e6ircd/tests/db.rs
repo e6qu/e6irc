@@ -1514,13 +1514,21 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
         .expect("system time")
         .as_secs() as i64
         + 600;
+    let logout_token_id = format!(
+        "logout-token-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    );
     assert_eq!(
         db::consume_oidc_backchannel_logout(
             &pool,
             "https://auth.example",
             Some("alice-subject"),
             Some("first-session"),
-            "logout-token-1",
+            &logout_token_id,
             expires,
         )
         .await
@@ -1541,7 +1549,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
             "https://auth.example",
             Some("alice-subject"),
             Some("first-session"),
-            "logout-token-1",
+            &logout_token_id,
             expires,
         )
         .await,
