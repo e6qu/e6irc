@@ -396,8 +396,28 @@ Target set (all specs at https://ircv3.net/irc/):
 `account-notify`, `away-notify`, `extended-join`, `multi-prefix`,
 `userhost-in-names`, `chghost`, `setname`, `invite-notify`, `monitor`
 (MONITOR command + extended-monitor), `chathistory` (draft; §11.3),
-`draft/multiline`, `read-marker` (draft) for multi-device read sync,
+`draft/multiline` (§7.5.1), `read-marker` (draft) for multi-device read sync,
 `draft/account-registration` (§9.1).
+
+#### 7.5.1 Multiline
+
+A `draft/multiline` batch is **one message**: it takes one msgid and one
+timestamp, and both delivered forms carry that same pair, so a client seeing the
+batch and one seeing the flattened lines are looking at the same event. A batch
+that is abandoned or fails validation delivers *nothing* — a truncated version
+of what the sender wrote would be worse than silence, and the sender is told why
+with `FAIL BATCH`.
+
+Recipients that negotiated the capability receive the batch as sent, blank lines
+and `draft/multiline-concat` tags intact, because those are what the sender
+wrote. Everyone else receives one message per non-blank line: a PRIVMSG has no
+way to carry a line break, and a blank line would be an empty message. The
+limits (`max-bytes`, `max-lines`) are advertised as the capability's value, so a
+client can see them before starting a batch it cannot finish.
+
+Every message — single-line or batched — resolves its target through one place,
+so `+m`, `+n`, `+C`, bans and quiets cannot be evaded by splitting text across a
+batch, and permission checks see the whole message rather than each fragment.
 
 This is a **superset of Libera's advertised set** (Libera does not offer
 chathistory/multiline); the Libera-compat contract (§7.7) governs the shared

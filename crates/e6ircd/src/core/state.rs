@@ -113,6 +113,8 @@ pub(crate) struct Caps {
     /// Not in [`CAP_NAMES`] either: advertised conditionally, with a value
     /// describing the policy (`draft/account-registration`).
     pub account_registration: bool,
+    /// Also advertised with a value (its limits): `draft/multiline`.
+    pub multiline: bool,
 }
 
 /// Field accessor into [`Caps`], used by the CAP REQ machinery.
@@ -178,6 +180,8 @@ pub(crate) struct Session {
     pub channels: HashSet<ChanKey>,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
+    /// The `draft/multiline` batch this connection is filling, if any.
+    pub multiline: Option<MultilineBatch>,
     /// Read markers for a client that isn't logged in: per-connection and not
     /// persisted (there is no account to key them to). A logged-in client uses
     /// the account-keyed `ServerState::read_markers` instead.
@@ -377,6 +381,32 @@ impl From<&ChanKey> for HistoryKey {
     fn from(key: &ChanKey) -> Self {
         HistoryKey(key.as_str().to_string())
     }
+}
+
+/// A `draft/multiline` batch a client has opened and is still filling.
+///
+/// Held per session because a client may have only one open at a time; the
+/// lines are buffered rather than delivered as they arrive, since a multiline
+/// message is one message — it gets one msgid and one timestamp, and a client
+/// that abandons the batch must deliver nothing at all.
+pub(crate) struct MultilineBatch {
+    /// The client's batch reference, as given after `+`.
+    pub reference: String,
+    /// The target, as the client spelled it.
+    pub target: String,
+    /// Client-only tags from the opening BATCH, replayed on the relayed one.
+    pub client_tags: String,
+    /// Labeled-response label from the opening BATCH. The batch *is* the
+    /// response to that command, so the label rides the echoed BATCH open
+    /// rather than an empty ACK at the time the batch was opened.
+    pub label: Option<String>,
+    /// `(text, concatenate-with-previous)` in the order sent.
+    pub lines: Vec<(String, bool)>,
+    /// Total bytes of line text so far, bounded by `MULTILINE_MAX_BYTES`.
+    pub bytes: usize,
+    /// PRIVMSG or NOTICE, taken from the first line; the batch is one message,
+    /// so it cannot change kind partway through.
+    pub kind: Option<&'static str>,
 }
 
 /// One target's newest-last hot history.
@@ -1028,6 +1058,7 @@ impl ServerState {
                 invited: HashSet::new(),
                 channels: HashSet::new(),
                 monitoring: HashMap::new(),
+                multiline: None,
                 anon_read_markers: HashMap::new(),
                 flood_tokens: 0,
                 flood_refilled_to_ms: 0,
