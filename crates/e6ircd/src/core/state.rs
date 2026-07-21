@@ -48,7 +48,11 @@ pub struct CoreConfig {
     /// CHATHISTORY from Postgres. Bounds hot-history RAM independently
     /// of total channel count (DESIGN §7.4, §11.3).
     pub max_hot_channels: usize,
-    /// Unix-seconds clock, injected so tests are deterministic.
+    /// Unix-**milliseconds** clock, injected so tests are deterministic.
+    /// Millisecond resolution is required, not cosmetic: `server-time` is
+    /// specified to milliseconds and CHATHISTORY pages by timestamp, so a
+    /// whole-second clock makes messages sent in the same second
+    /// indistinguishable and unpageable.
     pub clock: fn() -> u64,
     /// Per-session command-flood bucket size; `None` disables the
     /// throttle. Registered non-oper sessions spend one token per
@@ -162,20 +166,22 @@ pub(crate) struct Session {
     /// the account-keyed `ServerState::read_markers` instead.
     pub anon_read_markers: HashMap<ChanKey, u64>,
     /// Command-flood token bucket (only used when `command_burst` is set):
-    /// tokens remaining and the clock-second of the last refill.
+    /// tokens remaining, and the clock-millisecond through which refill has
+    /// already been credited (it advances by whole seconds only, so a
+    /// sub-second remainder carries forward instead of being discarded).
     pub flood_tokens: u32,
-    pub flood_last_sec: u64,
-    /// Wall-clock second of the last non-keepalive command (for WHOIS idle /
-    /// WHOX `l`), and of connection open (WHOIS signon).
+    pub flood_refilled_to_ms: u64,
+    /// Wall-clock millisecond of the last non-keepalive command (for WHOIS
+    /// idle / WHOX `l`), and of connection open (WHOIS signon).
     pub last_active: u64,
     pub signon: u64,
-    /// Wall-clock second the connection opened, for the registration deadline
-    /// (an unregistered connection that never completes is reaped).
+    /// Wall-clock millisecond the connection opened, for the registration
+    /// deadline (an unregistered connection that never completes is reaped).
     pub opened_at: u64,
     /// A server-initiated liveness PING is outstanding (set by the reaper,
     /// cleared on PONG); if still set at the pong deadline the socket is reaped.
     pub awaiting_pong: bool,
-    /// Wall-clock second the outstanding liveness PING was sent.
+    /// Wall-clock millisecond the outstanding liveness PING was sent.
     pub last_ping_sent: u64,
 }
 
@@ -307,6 +313,8 @@ impl MlockModes {
 #[derive(Clone)]
 pub(crate) struct HistoryEntry {
     pub msgid: String,
+    /// Unix **milliseconds** (see `Config::clock`): CHATHISTORY pages by this,
+    /// so second granularity would make same-second messages unorderable.
     pub ts: u64,
     pub sender_prefix: String,
     /// "PRIVMSG" or "NOTICE" as sent on the wire.
@@ -321,7 +329,10 @@ pub(crate) const HISTORY_RING_CAP: usize = 500;
 pub(crate) struct Topic {
     pub text: String,
     pub set_by: String,
-    pub set_at: u64,
+    /// Unix **seconds** — RPL_TOPICWHOTIME reports whole seconds and the
+    /// column persists seconds, so this is deliberately coarser than the
+    /// millisecond `Config::clock` it is derived from.
+    pub set_at_secs: u64,
 }
 
 /// Which part of a connecting session a [`ServerBan`] mask is tested
@@ -388,7 +399,9 @@ pub(crate) struct Channel {
     pub quiets: Vec<String>,
     pub ban_exceptions: Vec<String>,
     pub invite_exceptions: Vec<String>,
-    pub created_at: u64,
+    /// Unix **seconds** — RPL_CREATIONTIME reports whole seconds, so this is
+    /// deliberately coarser than the millisecond `Config::clock`.
+    pub created_at_secs: u64,
     /// Newest-last hot history ring for CHATHISTORY.
     pub history: std::collections::VecDeque<HistoryEntry>,
     /// True while the ring holds *every* message the channel has ever
@@ -433,7 +446,8 @@ pub(crate) struct ServerState {
     pub db_tx: Sender<super::DbRequest>,
     /// High-water mark of simultaneously registered users (LUSERS max).
     pub max_users: usize,
-    /// Wall-clock second the server state was created (STATS u uptime).
+    /// Wall-clock millisecond the server state was created (STATS u uptime,
+    /// which reports the difference in whole seconds).
     pub started_at: u64,
     /// Monotonic per-process counter for msgid uniqueness.
     pub msgid_counter: u64,
@@ -643,13 +657,13 @@ impl ServerState {
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
         self.registered_topics = rows
             .into_iter()
-            .map(|(name_folded, text, set_by, set_at)| {
+            .map(|(name_folded, text, set_by, set_at_secs)| {
                 (
                     ChanKey(name_folded),
                     Topic {
                         text,
                         set_by,
-                        set_at,
+                        set_at_secs,
                     },
                 )
             })
@@ -818,7 +832,7 @@ impl ServerState {
                 monitoring: HashMap::new(),
                 anon_read_markers: HashMap::new(),
                 flood_tokens: 0,
-                flood_last_sec: 0,
+                flood_refilled_to_ms: 0,
                 last_active: 0,
                 signon: 0,
                 opened_at,
@@ -884,15 +898,26 @@ impl ServerState {
         self.send(conn, &line);
     }
 
-    /// Unique message id: process-scoped counter + timestamp.
-    pub fn next_msgid(&mut self) -> String {
+    /// Stamp a new event: a single clock read yielding both the wall-clock
+    /// millisecond and the unique msgid derived from it. Live delivery, the
+    /// history ring and the `messages` row all take this one value, so a
+    /// message can never be replayed by CHATHISTORY bearing a different
+    /// `time=` than the one it was delivered with. Reading the clock twice
+    /// for the same message is exactly the bug this exists to prevent.
+    pub fn stamp(&mut self) -> (u64, String) {
+        let now = (self.config.clock)();
         self.msgid_counter += 1;
-        format!("{}-{}", (self.config.clock)(), self.msgid_counter)
+        (now, format!("{}-{}", now, self.msgid_counter))
+    }
+
+    /// Unique reference for a batch (no associated event timestamp).
+    pub fn next_msgid(&mut self) -> String {
+        self.stamp().1
     }
 
     /// The `@time=` tag value for events emitted now.
     pub fn time_tag(&self) -> String {
-        e6irc_proto::time::server_time((self.config.clock)() * 1000)
+        e6irc_proto::time::server_time((self.config.clock)())
     }
 
     /// Send a line to one recipient, honoring its `server-time` cap.

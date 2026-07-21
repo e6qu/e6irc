@@ -163,8 +163,8 @@ fn batch_ref_after(line: &str, sign: char) -> Option<&str> {
 /// proceed, `false` if the bucket is empty (the caller closes the link).
 /// No-op (always `true`) when the throttle is off, or for pre-registered
 /// and oper sessions. Refills one token per elapsed second up to the
-/// configured burst; a zero `flood_last_sec` (fresh session) refills to
-/// full on the first command.
+/// configured burst; a zero `flood_refilled_to_ms` (fresh session) refills
+/// to full on the first command.
 fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     let Some(burst) = state.config.command_burst else {
         return true;
@@ -177,9 +177,13 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     }
     let now = (state.config.clock)();
     let s = state.sessions.get_mut(&conn).expect("session present");
-    let refill = now.saturating_sub(s.flood_last_sec);
+    // The clock is milliseconds but the bucket refills per whole second, so
+    // credit only elapsed whole seconds and advance the watermark by exactly
+    // what was credited — otherwise sub-second command bursts would keep
+    // resetting the watermark and the bucket would never refill at all.
+    let refill = now.saturating_sub(s.flood_refilled_to_ms) / 1000;
     let tokens = (u64::from(s.flood_tokens) + refill).min(burst as u64) as u32;
-    s.flood_last_sec = now;
+    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add(refill * 1000);
     if tokens == 0 {
         return false;
     }
@@ -646,10 +650,17 @@ fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 }
             };
             if over {
-                let session = state.sessions.get_mut(&conn).expect("checked");
-                session.sasl_buf.clear();
-                session.sasl = SaslState::Idle;
-                state.numeric(conn, ERR_SASLTOOLONG, &[], Some("SASL message too long"));
+                // ERR_SASLTOOLONG is specified for a single over-long
+                // AUTHENTICATE line (handled above); an accumulated payload
+                // that outgrows the buffer is just a failed authentication, so
+                // it ends with the generic ERR_SASLFAIL and a cleared buffer.
+                state
+                    .sessions
+                    .get_mut(&conn)
+                    .expect("checked")
+                    .sasl_buf
+                    .clear();
+                sasl_fail(state, conn);
                 return;
             }
             if arg.len() == 400 {
@@ -1742,11 +1753,11 @@ fn cmd_ping(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 }
 
 /// Deadline for an unregistered connection to complete registration.
-const REGISTRATION_TIMEOUT_SECS: u64 = 30;
+const REGISTRATION_TIMEOUT_MS: u64 = 30_000;
 /// Idle duration after which a registered client is sent a liveness PING.
-const IDLE_PING_INTERVAL_SECS: u64 = 120;
+const IDLE_PING_INTERVAL_MS: u64 = 120_000;
 /// How long the client then has to PONG before the connection is closed.
-const PONG_TIMEOUT_SECS: u64 = 60;
+const PONG_TIMEOUT_MS: u64 = 60_000;
 
 /// Liveness reaper, driven by the periodic [`super::Input::Tick`]: close
 /// connections that never finished registering (slowloris), and PING idle
@@ -1758,15 +1769,14 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: u64) {
     let mut to_ping: Vec<ConnId> = Vec::new();
     for (&conn, s) in &state.sessions {
         if !s.registered {
-            if now.saturating_sub(s.opened_at) >= REGISTRATION_TIMEOUT_SECS {
+            if now.saturating_sub(s.opened_at) >= REGISTRATION_TIMEOUT_MS {
                 expired.push((conn, "Registration timeout"));
             }
         } else if s.awaiting_pong {
-            if now.saturating_sub(s.last_ping_sent) >= PONG_TIMEOUT_SECS {
+            if now.saturating_sub(s.last_ping_sent) >= PONG_TIMEOUT_MS {
                 expired.push((conn, "Ping timeout"));
             }
-        } else if now.saturating_sub(s.last_active.max(s.last_ping_sent)) >= IDLE_PING_INTERVAL_SECS
-        {
+        } else if now.saturating_sub(s.last_active.max(s.last_ping_sent)) >= IDLE_PING_INTERVAL_MS {
             // Idle since the later of the last real activity and the last
             // liveness PING — so a client that just answered a PING isn't
             // re-pinged every tick. `last_active` stays the pure WHOIS-idle
@@ -1957,7 +1967,8 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
             quiets: Vec::new(),
             ban_exceptions: Vec::new(),
             invite_exceptions: Vec::new(),
-            created_at: now,
+            // The clock is milliseconds; RPL_CREATIONTIME reports seconds.
+            created_at_secs: now / 1000,
             history: std::collections::VecDeque::new(),
             history_complete: ring_is_whole_record,
         });
@@ -2073,7 +2084,7 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     if let Some(chan) = state.channels.get(&key)
         && let Some(topic) = &chan.topic
     {
-        let (text, set_by, set_at) = (topic.text.clone(), topic.set_by.clone(), topic.set_at);
+        let (text, set_by, set_at) = (topic.text.clone(), topic.set_by.clone(), topic.set_at_secs);
         state.numeric(conn, RPL_TOPIC, &[&display], Some(&text));
         state.numeric(
             conn,
@@ -2249,6 +2260,11 @@ struct Delivery<'a> {
     msgid: &'a str,
     client_tags: &'a str,
     body: &'a str,
+    /// Wall-clock millisecond this message was stamped with, paired with
+    /// `msgid` by [`ServerState::stamp`]. Passed in rather than read from the
+    /// clock here so the `time=` a client sees live is byte-identical to the
+    /// one CHATHISTORY later replays.
+    ts: u64,
     /// True to bypass labeled-response capture (echo/fan-out already labeled).
     bypass_capture: bool,
 }
@@ -2256,7 +2272,7 @@ struct Delivery<'a> {
 /// Deliver a message line to recipients, applying per-recipient
 /// `server-time` and `account-tag` variants.
 fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d: &Delivery) {
-    let time = state.time_tag();
+    let time = e6irc_proto::time::server_time(d.ts);
     for &recipient in recipients {
         let Some(session) = state.sessions.get(&recipient) else {
             continue;
@@ -2465,7 +2481,7 @@ fn deliver_one_message(
             .collect();
         let sender_account = state.sessions[&conn].account.clone();
         let sender_is_bot = state.sessions[&conn].bot;
-        let msgid = state.next_msgid();
+        let (ts, msgid) = state.stamp();
         deliver_message(
             state,
             &recipients,
@@ -2475,6 +2491,7 @@ fn deliver_one_message(
                 msgid: &msgid,
                 client_tags,
                 body: &line,
+                ts,
                 bypass_capture: true,
             },
         );
@@ -2488,6 +2505,7 @@ fn deliver_one_message(
                     msgid: &msgid,
                     client_tags,
                     body: &line,
+                    ts,
                     bypass_capture: false,
                 },
             );
@@ -2498,7 +2516,6 @@ fn deliver_one_message(
         if status_prefix != 0 {
             return;
         }
-        let ts = (state.config.clock)();
         state.push_channel_history(
             &key,
             super::state::HistoryEntry {
@@ -2548,7 +2565,7 @@ fn deliver_one_message(
         };
         let sender_account = state.sessions[&conn].account.clone();
         let sender_is_bot = state.sessions[&conn].bot;
-        let msgid = state.next_msgid();
+        let (ts, msgid) = state.stamp();
         deliver_message(
             state,
             &[peer],
@@ -2558,6 +2575,7 @@ fn deliver_one_message(
                 msgid: &msgid,
                 client_tags,
                 body: &line,
+                ts,
                 bypass_capture: true,
             },
         );
@@ -2571,6 +2589,7 @@ fn deliver_one_message(
                     msgid: &msgid,
                     client_tags,
                     body: &line,
+                    ts,
                     bypass_capture: false,
                 },
             );
@@ -2733,7 +2752,7 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
         }
         match &chan.topic {
             Some(t) => {
-                let (text, set_by, set_at) = (t.text.clone(), t.set_by.clone(), t.set_at);
+                let (text, set_by, set_at) = (t.text.clone(), t.set_by.clone(), t.set_at_secs);
                 state.numeric(conn, RPL_TOPIC, &[&display], Some(&text));
                 state.numeric(
                     conn,
@@ -2795,7 +2814,8 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
         Some(Topic {
             text: new_text.to_string(),
             set_by: prefix.clone(),
-            set_at: now,
+            // The clock is milliseconds; RPL_TOPICWHOTIME reports seconds.
+            set_at_secs: now / 1000,
         })
     };
     state.channels.get_mut(&key).expect("checked").topic = new_topic.clone();
@@ -2817,7 +2837,7 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
         }
         let request = super::DbRequest::SetChannelTopic {
             channel: key.as_str().to_string(),
-            topic: new_topic.map(|t| (t.text, t.set_by, t.set_at)),
+            topic: new_topic.map(|t| (t.text, t.set_by, t.set_at_secs)),
         };
         if state.db_tx.try_push(request).is_err() {
             eprintln!(
@@ -3005,7 +3025,7 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
 
     if rest.is_empty() {
         let modes = chan.modes.to_string_with_args(is_member);
-        let created = chan.created_at.to_string();
+        let created = chan.created_at_secs.to_string();
         state.numeric(conn, RPL_CHANNELMODEIS, &[&display, &modes], None);
         state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
         return;
@@ -3421,7 +3441,8 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             who_flags(s, sigil),
                             s.realname.clone().expect("registered"),
                             s.account.clone(),
-                            now.saturating_sub(s.last_active),
+                            // The clock is milliseconds; WHOX `l` is seconds.
+                            now.saturating_sub(s.last_active) / 1000,
                         )
                     })
                     .collect()
@@ -3493,7 +3514,8 @@ fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 s.realname.clone().expect("registered"),
                 s.account.clone(),
                 who_flags(s, ""),
-                now.saturating_sub(s.last_active),
+                // The clock is milliseconds; WHOX `l` is seconds.
+                now.saturating_sub(s.last_active) / 1000,
             );
             match &whox {
                 Some(req) => send_whox_row(
@@ -3610,8 +3632,10 @@ fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             {
                 let s = &state.sessions[&peer];
                 let now = (state.config.clock)();
-                let idle = now.saturating_sub(s.last_active);
-                let signon = s.signon;
+                // The clock is milliseconds; RPL_WHOISIDLE reports seconds
+                // idle and a Unix-*second* signon time.
+                let idle = now.saturating_sub(s.last_active) / 1000;
+                let signon = s.signon / 1000;
                 state.numeric(
                     conn,
                     RPL_WHOISIDLE,
@@ -4009,7 +4033,8 @@ fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Only the STATS letter's first char is significant.
     let letter = &letter[..letter.len().min(1)];
     if letter == "u" {
-        let uptime = (state.config.clock)().saturating_sub(state.started_at);
+        // The clock is milliseconds; STATS u reports whole seconds.
+        let uptime = (state.config.clock)().saturating_sub(state.started_at) / 1000;
         let (days, rem) = (uptime / 86400, uptime % 86400);
         let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
         state.numeric(
@@ -4096,12 +4121,25 @@ fn is_valid_msgref(sel: &str) -> bool {
     sel == "*" || sel.starts_with("msgid=") || sel.starts_with("timestamp=")
 }
 
-fn chathistory_fail(state: &mut ServerState, conn: ConnId, code: &str, detail: &str) {
+/// Emit a draft/chathistory `FAIL`. `context` carries the spec's positional
+/// params for the code — the subcommand, and for target errors the target —
+/// which a client needs to attribute the failure to the request it made.
+fn chathistory_fail(
+    state: &mut ServerState,
+    conn: ConnId,
+    code: &str,
+    context: &[&str],
+    detail: &str,
+) {
     let server = state.config.server_name.clone();
-    state.send(
-        conn,
-        &format!(":{server} FAIL CHATHISTORY {code} :{detail}"),
-    );
+    let mut line = format!(":{server} FAIL CHATHISTORY {code}");
+    for param in context {
+        line.push(' ');
+        line.push_str(param);
+    }
+    line.push_str(" :");
+    line.push_str(detail);
+    state.send(conn, &line);
 }
 
 /// Serve history from the channel's hot ring, falling back to PostgreSQL
@@ -4116,6 +4154,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state,
             conn,
             "NEED_CAPS",
+            &[],
             "batch and draft/chathistory required",
         );
         return;
@@ -4127,7 +4166,14 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let (Some(&sub), Some(&target)) = (p.first(), p.get(1)) else {
-        chathistory_fail(state, conn, "NEED_MORE_PARAMS", "Missing parameters");
+        let sub = p.first().copied().unwrap_or("*");
+        chathistory_fail(
+            state,
+            conn,
+            "NEED_MORE_PARAMS",
+            &[sub],
+            "Missing parameters",
+        );
         return;
     };
     let key = state.chan_key(target);
@@ -4136,7 +4182,13 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .get(&key)
         .is_some_and(|c| c.members.contains_key(&conn));
     if !is_member {
-        chathistory_fail(state, conn, "INVALID_TARGET", "You are not on that channel");
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_TARGET",
+            &[sub, target],
+            "You are not on that channel",
+        );
         return;
     }
     // BETWEEN takes two selectors then the limit; the others take one
@@ -4156,6 +4208,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state,
             conn,
             "INVALID_MSGREFTYPE",
+            &[sub, target],
             "Unknown message reference type",
         );
         return;
@@ -4171,6 +4224,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state,
                 conn,
                 "INVALID_PARAMS",
+                &[sub, target],
                 "limit must be a positive integer",
             );
             return;
@@ -4184,7 +4238,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             history.iter().position(|e| e.msgid == msgid)
         } else if let Some(ts) = sel.strip_prefix("timestamp=") {
             // first entry at/after the timestamp
-            let ts = e6irc_proto::time::parse_server_time_seconds(ts)?;
+            let ts = e6irc_proto::time::parse_server_time_millis(ts)?;
             history.iter().position(|e| e.ts >= ts)
         } else {
             None
@@ -4200,11 +4254,25 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let complete = state.channels[&key].history_complete;
     let (entries, covered): (Vec<super::state::HistoryEntry>, bool) =
         match sub.to_ascii_uppercase().as_str() {
-            "LATEST" => {
+            // `*` is unbounded; any other selector restricts LATEST to
+            // messages strictly newer than it (draft/chathistory).
+            "LATEST" if selector == "*" => {
                 let skip = history.len().saturating_sub(limit);
                 let covered = complete || history.len() >= limit;
                 (history.iter().skip(skip).cloned().collect(), covered)
             }
+            "LATEST" => match position(selector) {
+                Some(pos) => {
+                    let start = pos + 1;
+                    // Keep the newest `limit` of the bounded range, not the
+                    // oldest — LATEST is most-recent-first.
+                    let skip = start + history.len().saturating_sub(start).saturating_sub(limit);
+                    // The bound itself is in the ring, so everything newer is
+                    // too: no database round trip is needed.
+                    (history.iter().skip(skip).cloned().collect(), true)
+                }
+                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            },
             "BEFORE" => match position(selector) {
                 Some(pos) => {
                     let start = pos.saturating_sub(limit);
@@ -4242,12 +4310,25 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 // Both endpoints in the ring: the span between them is
                 // contiguous and fully in memory.
                 (Some(a), Some(b)) => {
+                    // The argument order picks the paging direction: the
+                    // window is walked *from* the first selector *toward* the
+                    // second, so when the first is the newer bound a limit
+                    // smaller than the span keeps the newest entries, not the
+                    // oldest.
+                    let newest_first = a > b;
                     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    let start = lo + 1;
+                    let span = hi.saturating_sub(start);
+                    let skip = if newest_first {
+                        start + span.saturating_sub(limit)
+                    } else {
+                        start
+                    };
                     (
                         history
                             .iter()
                             .take(hi)
-                            .skip(lo + 1)
+                            .skip(skip)
                             .take(limit)
                             .cloned()
                             .collect(),
@@ -4262,6 +4343,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     state,
                     conn,
                     "INVALID_PARAMS",
+                    &[sub, target],
                     &format!("Unknown subcommand {other}"),
                 );
                 return;
@@ -4274,12 +4356,21 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Ring miss with a database available: page from PostgreSQL instead,
     // preserving one code path for rendering (history_page).
     if !covered && state.config.sasl_enabled {
-        // A msgid selector pages on the composite (ts, id) via a msgid pivot
-        // (so same-second messages aren't skipped); a timestamp selector uses
-        // the second-granular ts bound.
+        // A msgid selector pages on the composite (ts, id) via a msgid pivot,
+        // which stays exact even if two messages share a millisecond; a
+        // timestamp selector uses the millisecond ts bound.
         let msgid_of = |sel: &str| sel.strip_prefix("msgid=").map(str::to_string);
         let query = match sub.to_ascii_uppercase().as_str() {
-            "LATEST" => super::HistoryQuery::Latest { limit },
+            // `LATEST <target> * <limit>` is unbounded; any other selector
+            // bounds it to messages strictly newer than the selector.
+            "LATEST" if selector == "*" => super::HistoryQuery::Latest { limit },
+            "LATEST" => match msgid_of(selector) {
+                Some(msgid) => super::HistoryQuery::LatestAfterMsgid { msgid, limit },
+                None => super::HistoryQuery::LatestAfter {
+                    after_ts: selector_ts(&history, selector).unwrap_or(0),
+                    limit,
+                },
+            },
             "BEFORE" => match msgid_of(selector) {
                 Some(msgid) => super::HistoryQuery::BeforeMsgid { msgid, limit },
                 None => super::HistoryQuery::Before {
@@ -4294,23 +4385,42 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     limit,
                 },
             },
-            "BETWEEN" => match (msgid_of(selector), msgid_of(selector2)) {
-                (Some(after_msgid), Some(before_msgid)) => super::HistoryQuery::BetweenMsgid {
-                    after_msgid,
-                    before_msgid,
-                    limit,
-                },
-                _ => {
-                    let a = selector_ts(&history, selector).unwrap_or(0);
-                    let b = selector_ts(&history, selector2).unwrap_or(u64::MAX);
-                    let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
-                    super::HistoryQuery::Between {
-                        after_ts,
-                        before_ts,
-                        limit,
+            // The two selectors may be given newest-first. That does not change
+            // the window, only which end `limit` cuts from, so the bounds are
+            // normalized to (older, newer) — passing them through reversed
+            // would make the SQL range empty — and the direction travels
+            // alongside as `newest_first`.
+            "BETWEEN" => {
+                let a = selector_ts(&history, selector);
+                let b = selector_ts(&history, selector2);
+                let newest_first = matches!((a, b), (Some(a), Some(b)) if a > b);
+                match (msgid_of(selector), msgid_of(selector2)) {
+                    (Some(first), Some(second)) => {
+                        let (after_msgid, before_msgid) = if newest_first {
+                            (second, first)
+                        } else {
+                            (first, second)
+                        };
+                        super::HistoryQuery::BetweenMsgid {
+                            after_msgid,
+                            before_msgid,
+                            limit,
+                            newest_first,
+                        }
+                    }
+                    _ => {
+                        let a = a.unwrap_or(0);
+                        let b = b.unwrap_or(u64::MAX);
+                        let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
+                        super::HistoryQuery::Between {
+                            after_ts,
+                            before_ts,
+                            limit,
+                            newest_first,
+                        }
                     }
                 }
-            },
+            }
             _ => match msgid_of(selector) {
                 Some(msgid) => super::HistoryQuery::AfterMsgid { msgid, limit },
                 None => super::HistoryQuery::After {
@@ -4336,6 +4446,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state,
                 conn,
                 "MESSAGE_ERROR",
+                &[sub, target],
                 "History temporarily unavailable",
             );
         } else if let Some(cap) = state.capture.as_mut() {
@@ -4373,13 +4484,14 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let parse = |i: usize| {
         p.get(i)
             .and_then(|s| s.strip_prefix("timestamp="))
-            .and_then(e6irc_proto::time::parse_server_time_seconds)
+            .and_then(e6irc_proto::time::parse_server_time_millis)
     };
     let (Some(a), Some(b)) = (parse(1), parse(2)) else {
         chathistory_fail(
             state,
             conn,
             "INVALID_PARAMS",
+            &["TARGETS"],
             "Expected two timestamp= bounds",
         );
         return;
@@ -4420,6 +4532,7 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state,
                 conn,
                 "MESSAGE_ERROR",
+                &["TARGETS"],
                 "History temporarily unavailable",
             );
         } else if let Some(cap) = state.capture.as_mut() {
@@ -4481,7 +4594,7 @@ pub(crate) fn targets_page(
             .get(&key)
             .map(|c| c.name.clone())
             .unwrap_or(target);
-        let time = e6irc_proto::time::server_time(ts * 1000);
+        let time = e6irc_proto::time::server_time(ts);
         state.send(
             conn,
             &format!("@batch={batch_ref} :{server} CHATHISTORY TARGETS {display} {time}"),
@@ -4506,7 +4619,7 @@ fn selector_ts(
     if let Some(msgid) = selector.strip_prefix("msgid=") {
         history.iter().find(|e| e.msgid == msgid).map(|e| e.ts)
     } else if let Some(ts) = selector.strip_prefix("timestamp=") {
-        e6irc_proto::time::parse_server_time_seconds(ts)
+        e6irc_proto::time::parse_server_time_millis(ts)
     } else {
         None
     }
@@ -4534,7 +4647,7 @@ pub(crate) fn history_page(
     };
     state.send(conn, &open);
     for row in rows {
-        let time = e6irc_proto::time::server_time(row.ts * 1000);
+        let time = e6irc_proto::time::server_time(row.ts);
         // Canonical uppercase verb on the wire regardless of source: the ring
         // holds "PRIVMSG"/"NOTICE" but the DB stores lowercase, and this is the
         // one render site for both — normalize here so the same message never
@@ -4951,7 +5064,7 @@ fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 fn cmd_time(state: &mut ServerState, conn: ConnId) {
     let server = state.config.server_name.clone();
-    let now = e6irc_proto::time::server_time((state.config.clock)() * 1000);
+    let now = e6irc_proto::time::server_time((state.config.clock)());
     state.numeric(conn, RPL_TIME, &[&server], Some(&now));
 }
 

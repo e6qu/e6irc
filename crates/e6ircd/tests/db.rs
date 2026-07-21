@@ -1330,11 +1330,12 @@ async fn query_targets_enumerates_active_buffers() {
         .await
         .expect("clean");
 
+    // Epoch milliseconds (see above).
     for (target, ts) in [("#a", 1000_i64), ("#a", 2000), ("#b", 1500), ("#c", 3000)] {
         sqlx::query(
             "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
              VALUES ($1, $2, 'x!x@h', NULL, 'privmsg', 'hi',
-                     to_timestamp($3::double precision))",
+                     to_timestamp($3::double precision / 1000))",
         )
         .bind(format!("m-{target}-{ts}"))
         .bind(target)
@@ -1372,11 +1373,13 @@ async fn query_history_around_and_between() {
         .execute(&pool)
         .await
         .expect("clean");
+    // Epoch milliseconds throughout: the ts column is a timestamptz and the
+    // Rust layer converts to/from milliseconds.
     for ts in [1000_i64, 2000, 3000, 4000, 5000] {
         sqlx::query(
             "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
              VALUES ($1, '#h', 'x!x@h', NULL, 'privmsg', $2,
-                     to_timestamp($3::double precision))",
+                     to_timestamp($3::double precision / 1000))",
         )
         .bind(format!("m{ts}"))
         .bind(format!("b{ts}"))
@@ -1409,6 +1412,7 @@ async fn query_history_around_and_between() {
             after_ts: 2000,
             before_ts: 5000,
             limit: 10,
+            newest_first: false,
         },
     )
     .await;
@@ -1416,6 +1420,33 @@ async fn query_history_around_and_between() {
         between.iter().map(|r| r.ts).collect::<Vec<_>>(),
         vec![3000, 4000]
     );
+
+    // Same window, but a limit smaller than the span: the direction decides
+    // which end is kept, and the result stays oldest-first either way.
+    let oldest = db::query_history(
+        &pool,
+        "#h",
+        HistoryQuery::Between {
+            after_ts: 2000,
+            before_ts: 5000,
+            limit: 1,
+            newest_first: false,
+        },
+    )
+    .await;
+    assert_eq!(oldest.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![3000]);
+    let newest = db::query_history(
+        &pool,
+        "#h",
+        HistoryQuery::Between {
+            after_ts: 2000,
+            before_ts: 5000,
+            limit: 1,
+            newest_first: true,
+        },
+    )
+    .await;
+    assert_eq!(newest.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![4000]);
 }
 
 #[tokio::test]
@@ -1483,12 +1514,30 @@ async fn query_history_msgid_paginates_within_a_single_second() {
             after_msgid: "a".into(),
             before_msgid: "e".into(),
             limit: 10,
+            newest_first: false,
         },
     )
     .await;
     assert_eq!(
         between.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
         vec!["b", "c", "d"]
+    );
+
+    // A limit shorter than the span keeps the end the direction points at.
+    let newest = db::query_history(
+        &pool,
+        "#s",
+        HistoryQuery::BetweenMsgid {
+            after_msgid: "a".into(),
+            before_msgid: "e".into(),
+            limit: 1,
+            newest_first: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        newest.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+        vec!["d"]
     );
 }
 

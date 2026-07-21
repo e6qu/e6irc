@@ -467,8 +467,11 @@ we never *diverge* on surface Libera defines.
 
 ## 8. Persistence (PostgreSQL)
 
-Vanilla PostgreSQL ≥ 15 via sqlx; migrations embedded and run on startup
-(refusing to start on drift, loudly).
+Vanilla PostgreSQL 18 (current stable) via sqlx; migrations embedded and run
+on startup (refusing to start on drift, loudly). CI provisions `postgres:18`
+for every database-backed suite — legacy majors are deliberately not a
+support target, so "it happens to work on an older server" is not a claim
+this project makes or tests.
 
 Principal tables (columns abridged):
 
@@ -643,9 +646,15 @@ Design constraints recorded now:
 ## 11. History & CHATHISTORY
 
 - **11.1 What is logged**: channel messages on the local server (per-channel
-  opt-out honoring, e.g., `+P`-style policy decisions), private messages
-  (config), all BNC network buffers. Every stored message has a stable
-  `msgid` (also sent live via `message-ids`).
+  opt-out honoring, e.g., `+P`-style policy decisions) and all BNC network
+  buffers. Every stored message has a stable `msgid` (also sent live via
+  `message-ids`) and a Unix-**millisecond** timestamp, stamped once and shared
+  by live delivery, the hot ring and the `messages` row — `server-time` is
+  specified to milliseconds and CHATHISTORY pages by timestamp, so a coarser
+  or twice-read clock makes messages unorderable or replays them bearing a
+  different time than they were delivered with. Private messages are **not yet
+  persisted**: CHATHISTORY against a nick has no record to serve and TARGETS
+  cannot enumerate correspondents (tracked in PLAN.md).
 - **11.2 Query surface**: IRCv3 `CHATHISTORY` (BEFORE/AFTER/AROUND/BETWEEN/
   LATEST/TARGETS) for IRC clients; `GET /api/v1/history/...` for the web
   client and API consumers — both hit the same query layer.
