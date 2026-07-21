@@ -71,6 +71,8 @@ fn our_isupport() -> HashMap<String, String> {
             server_name: "irc.test.example".into(),
             network_name: "TestNet".into(),
             description: "test server".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
             sendq: 256,
             motd: vec![],
             nicklen: 16,

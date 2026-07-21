@@ -204,6 +204,8 @@ pub async fn start(config: Config) -> io::Result<Running> {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
             description: config.description.clone(),
+            registration_before_connect: config.registration.before_connect,
+            registration_require_email: config.registration.require_email,
             sendq: config.sendq,
             motd: config.motd.clone(),
             nicklen: config.nicklen,

@@ -235,6 +235,10 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
             return;
         }
         "QUIT" => return cmd_quit(state, conn, p),
+        // Legal before registration only when the server allows it, but it is
+        // dispatched here either way so the refusal is the spec's
+        // COMPLETE_CONNECTION_REQUIRED rather than a bare "not registered".
+        "REGISTER" => return cmd_register(state, conn, p),
         _ => {}
     }
     if !state.sessions[&conn].registered {
@@ -440,6 +444,140 @@ fn cap_target(state: &ServerState, conn: ConnId) -> String {
         .unwrap_or_else(|| "*".into())
 }
 
+/// `FAIL REGISTER <code> <account> :<description>` — the spec's shape, with the
+/// account the client asked about so it can tell which attempt failed.
+fn register_fail(state: &mut ServerState, conn: ConnId, code: &str, account: &str, detail: &str) {
+    let server = state.config.server_name.clone();
+    state.send(
+        conn,
+        &format!(":{server} FAIL REGISTER {code} {account} :{detail}"),
+    );
+}
+
+/// `REGISTER <account> <email> <password>` (draft/account-registration).
+///
+/// The account always takes the registering nick's name: `custom-account-name`
+/// is not advertised, so a client cannot register a name it is not currently
+/// holding, and "the account you registered is the nick you held" stays true.
+fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if !state.config.sasl_enabled {
+        // No database means no accounts; the capability is not advertised
+        // either, so this is a client ignoring that.
+        register_fail(
+            state,
+            conn,
+            "TEMPORARILY_UNAVAILABLE",
+            "*",
+            "Account registration is not available on this server",
+        );
+        return;
+    }
+    let nick = state.sessions[&conn].nick.clone();
+    let [account, email, password] = p else {
+        register_fail(
+            state,
+            conn,
+            "NEED_MORE_PARAMS",
+            nick.as_deref().unwrap_or("*"),
+            "Syntax: REGISTER <account|*> <email|*> <password>",
+        );
+        return;
+    };
+    // A connection that has not finished registering has not proven it can
+    // hold the nick it is asking to register, so this is opt-in.
+    if !state.sessions[&conn].registered && !state.config.registration_before_connect {
+        register_fail(
+            state,
+            conn,
+            "COMPLETE_CONNECTION_REQUIRED",
+            nick.as_deref().unwrap_or("*"),
+            "Complete your connection before registering an account",
+        );
+        return;
+    }
+    // `*` means "my current nick". Without a nick there is nothing to name the
+    // account after — which is the case when the nick the client wanted was
+    // already taken, so it is reported as the name being unavailable.
+    let Some(nick) = nick else {
+        register_fail(
+            state,
+            conn,
+            "ACCOUNT_EXISTS",
+            "*",
+            "That nickname is already in use, so it cannot be registered",
+        );
+        return;
+    };
+    if *account != "*" && !state.casemap.eq(account, &nick) {
+        register_fail(
+            state,
+            conn,
+            "ACCOUNT_NAME_MUST_BE_NICK",
+            account,
+            "You may only register the nickname you are currently using",
+        );
+        return;
+    }
+    if state.config.registration_require_email && *email == "*" {
+        register_fail(
+            state,
+            conn,
+            "INVALID_EMAIL",
+            &nick,
+            "An email address is required to register on this server",
+        );
+        return;
+    }
+    if state.sessions[&conn].account.is_some() {
+        register_fail(
+            state,
+            conn,
+            "ALREADY_AUTHENTICATED",
+            &nick,
+            "You are already logged in",
+        );
+        return;
+    }
+    let request = super::DbRequest::CreateAccount {
+        conn,
+        name: nick.clone(),
+        password: password.to_string(),
+        origin: super::AccountOrigin::RegisterCommand,
+    };
+    if state.db_tx.try_push(request).is_err() {
+        register_fail(
+            state,
+            conn,
+            "TEMPORARILY_UNAVAILABLE",
+            &nick,
+            "Account registration is temporarily unavailable",
+        );
+    } else {
+        // The answer needs a database round trip; hold this connection's later
+        // output behind it so the reply cannot be overtaken by, say, the PONG
+        // to a PING the client pipelined after REGISTER.
+        state.defer_reply(conn);
+    }
+}
+
+/// The `draft/account-registration` capability name.
+const ACCOUNT_REGISTRATION_CAP: &str = "draft/account-registration";
+
+/// The capability's advertised value: the policy a client must satisfy,
+/// comma-separated. `custom-account-name` is deliberately absent — an account
+/// always takes the registering nick's name, which is what makes "the account
+/// you registered is the nick you held" true.
+fn account_registration_flags(state: &ServerState) -> String {
+    let mut flags: Vec<&str> = Vec::new();
+    if state.config.registration_before_connect {
+        flags.push("before-connect");
+    }
+    if state.config.registration_require_email {
+        flags.push("email-required");
+    }
+    flags.join(",")
+}
+
 fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     let target = cap_target(state, conn);
@@ -463,6 +601,14 @@ fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     "sasl=PLAIN,OAUTHBEARER".into()
                 } else {
                     "sasl".into()
+                });
+                names.push(if v302 {
+                    match account_registration_flags(state) {
+                        flags if flags.is_empty() => ACCOUNT_REGISTRATION_CAP.into(),
+                        flags => format!("{ACCOUNT_REGISTRATION_CAP}={flags}"),
+                    }
+                } else {
+                    ACCOUNT_REGISTRATION_CAP.into()
                 });
             }
             state.send(
@@ -505,6 +651,10 @@ fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 };
                 if name == "sasl" && state.config.sasl_enabled {
                     caps.sasl = enable;
+                    continue;
+                }
+                if name == ACCOUNT_REGISTRATION_CAP && state.config.sasl_enabled {
+                    caps.account_registration = enable;
                     continue;
                 }
                 match CAP_NAMES.iter().find(|(n, _)| *n == name) {
@@ -800,25 +950,53 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: super::DbRe
                 state.service_notice(conn, "NickServ", &text);
             }
         }
-        super::DbReply::AccountCreated { account } => {
+        super::DbReply::AccountCreated { account, origin } => {
             state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
-            state.service_notice(
-                conn,
-                "NickServ",
-                &format!("\x02{account}\x02 is now registered to your connection."),
-            );
+            match origin {
+                super::AccountOrigin::NickServ => state.service_notice(
+                    conn,
+                    "NickServ",
+                    &format!("\x02{account}\x02 is now registered to your connection."),
+                ),
+                super::AccountOrigin::RegisterCommand => {
+                    let server = state.config.server_name.clone();
+                    let account = account.clone();
+                    state.emit_deferred(conn, move |state| {
+                        state.send(
+                            conn,
+                            &format!(
+                                ":{server} REGISTER SUCCESS {account} :Account registered, \
+                                 you are now logged in"
+                            ),
+                        );
+                    });
+                }
+            }
             notify_account_change(state, conn, &account);
         }
-        super::DbReply::AccountExists => {
+        super::DbReply::AccountExists { origin } => {
             let nick = state.sessions[&conn]
                 .nick
                 .clone()
                 .unwrap_or_else(|| "*".into());
-            state.service_notice(
-                conn,
-                "NickServ",
-                &format!("\x02{nick}\x02 is already registered."),
-            );
+            match origin {
+                super::AccountOrigin::NickServ => state.service_notice(
+                    conn,
+                    "NickServ",
+                    &format!("\x02{nick}\x02 is already registered."),
+                ),
+                super::AccountOrigin::RegisterCommand => {
+                    state.emit_deferred(conn, |state| {
+                        register_fail(
+                            state,
+                            conn,
+                            "ACCOUNT_EXISTS",
+                            &nick,
+                            "Account already exists",
+                        );
+                    });
+                }
+            }
         }
         super::DbReply::ChannelRegistered { channel } => {
             // Record ownership in the hot copy so the founder is re-opped
@@ -916,6 +1094,7 @@ fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str])
                 conn,
                 name,
                 password: password.to_string(),
+                origin: super::AccountOrigin::NickServ,
             };
             if state.db_tx.try_push(request).is_err() {
                 state.service_notice(

@@ -39,6 +39,11 @@ pub struct CoreConfig {
     /// This server's own description, as RPL_LINKS reports it. The network
     /// name identifies the network; this identifies the server on it.
     pub description: String,
+    /// `draft/account-registration`: allow REGISTER before the connection
+    /// has completed registration, and require an email address. Advertised
+    /// as the capability's value so a client knows the rules up front.
+    pub registration_before_connect: bool,
+    pub registration_require_email: bool,
     /// Per-connection outbound queue capacity. The queue itself enforces this,
     /// but output *withheld* behind a deferred reply has not reached the queue
     /// yet, so the same bound is applied to it here — otherwise a connection
@@ -105,6 +110,9 @@ pub(crate) struct Caps {
     pub chghost: bool,
     /// Not in [`CAP_NAMES`]: advertised conditionally (`sasl_enabled`).
     pub sasl: bool,
+    /// Not in [`CAP_NAMES`] either: advertised conditionally, with a value
+    /// describing the policy (`draft/account-registration`).
+    pub account_registration: bool,
 }
 
 /// Field accessor into [`Caps`], used by the CAP REQ machinery.
@@ -1089,6 +1097,16 @@ impl ServerState {
         if let Some(session) = self.sessions.get_mut(&conn) {
             session.deferred_replies += 1;
         }
+    }
+
+    /// Emit a reply the connection has been waiting on: it bypasses that
+    /// connection's hold — it *is* what the hold is waiting for — and releases
+    /// one slot afterwards, letting the output queued behind it through.
+    pub fn emit_deferred(&mut self, conn: ConnId, emit: impl FnOnce(&mut Self)) {
+        let previous = self.emitting_deferred.replace(conn);
+        emit(self);
+        self.emitting_deferred = previous;
+        self.release_deferred(conn);
     }
 
     /// One deferred reply has been emitted: release the output withheld behind

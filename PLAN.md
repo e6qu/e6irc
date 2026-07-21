@@ -446,6 +446,35 @@ validated nick, OIDC provisioning filters to `[A-Za-z0-9-_]` — but that was an
 invariant held by callers, and the next caller can forget it. A CHECK constraint
 enforces it where the name is stored, so the bug class cannot return.
 
+Seventeenth sweep — draft/account-registration (2026-07-21): implemented the
+`REGISTER` command, taking `account_registration` from 8 skipped to **8 passing**
+and adding it to the persistence-backed green list.
+
+`REGISTER <account|*> <email|*> <password>` creates the same account NickServ
+and OIDC first-login create, so the three entry points cannot diverge. The
+capability's advertised value states the policy — `before-connect`,
+`email-required` — so a client knows the rules before it tries.
+`custom-account-name` is deliberately absent: an account always takes the
+registering nick's name, which keeps "the account you registered is the nick you
+were holding" true, and that is exactly what lets direct-message conversations
+be keyed by account (sweep 15). Registration before the connection completes is
+off by default; a half-open connection creating accounts is a spam vector unless
+the operator opts in.
+
+Two design points worth recording. **The origin travels with the request.**
+NickServ and `REGISTER` both create accounts but must answer in different
+languages — notices versus `REGISTER`/`FAIL` — so `DbRequest::CreateAccount`
+carries an `AccountOrigin` that the reply echoes. Tracking it on the session
+would go wrong the moment one client used both.
+
+**The reply is deferred like any other database-backed answer.** The first
+implementation looked correct and failed the tests anyway: the round trip landed
+after the client's sync point, so the reply appeared to be missing entirely — the
+same ordering problem sweep 15 fixed for CHATHISTORY. `REGISTER` now holds the
+connection's later output behind its reply, and the two existing deferred
+emitters were refactored onto a shared `ServerState::emit_deferred` rather than
+repeating the bypass-then-release dance a third time.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

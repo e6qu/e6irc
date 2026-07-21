@@ -270,10 +270,14 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             conn,
             name,
             password,
+            origin,
         } => {
             let reply = match create_account(pool, &name, &password).await {
-                Ok(_) => DbReply::AccountCreated { account: name },
-                Err(DbError::DuplicateAccount(_)) => DbReply::AccountExists,
+                Ok(_) => DbReply::AccountCreated {
+                    account: name,
+                    origin,
+                },
+                Err(DbError::DuplicateAccount(_)) => DbReply::AccountExists { origin },
                 Err(e) => {
                     eprintln!("db: account creation failed: {e}");
                     DbReply::Unavailable

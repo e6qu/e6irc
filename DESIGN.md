@@ -396,7 +396,8 @@ Target set (all specs at https://ircv3.net/irc/):
 `account-notify`, `away-notify`, `extended-join`, `multi-prefix`,
 `userhost-in-names`, `chghost`, `setname`, `invite-notify`, `monitor`
 (MONITOR command + extended-monitor), `chathistory` (draft; §11.3),
-`draft/multiline`, `read-marker` (draft) for multi-device read sync.
+`draft/multiline`, `read-marker` (draft) for multi-device read sync,
+`draft/account-registration` (§9.1).
 
 This is a **superset of Libera's advertised set** (Libera does not offer
 chathistory/multiline); the Libera-compat contract (§7.7) governs the shared
@@ -516,6 +517,18 @@ One `accounts` row per user regardless of origin. An account may have any
 combination of: local password, N app passwords, N OIDC identities. Web
 "user section" manages all of them. NickServ `REGISTER` creates the same
 kind of account the OIDC first-login path creates.
+
+The `draft/account-registration` `REGISTER` command creates that same account,
+so the two entry points cannot diverge; the capability's advertised value states
+the policy (`before-connect`, `email-required`) so a client knows the rules
+before it tries. `custom-account-name` is deliberately **not** advertised: an
+account always takes the registering nick's name, which keeps "the account you
+registered is the nick you were holding" true — and that in turn is what lets
+direct-message conversations be keyed by account (§11.1.1). Registration before
+the connection completes is off by default: a half-open connection creating
+accounts is a spam vector unless the operator opts in. e6ircd cannot send
+verification mail, so `email-required` only enforces that an address was
+supplied.
 
 ### 9.2 Web login
 

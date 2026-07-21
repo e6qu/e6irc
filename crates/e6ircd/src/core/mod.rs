@@ -78,6 +78,8 @@ pub enum DbRequest {
         conn: ConnId,
         name: String,
         password: String,
+        /// Which command asked, so the answer speaks that command's language.
+        origin: AccountOrigin,
     },
     RegisterChannel {
         conn: ConnId,
@@ -204,6 +206,17 @@ pub enum DbRequest {
     },
 }
 
+/// Which command asked for an account to be created. Carried on the request
+/// and echoed on the reply, so the answer is phrased in the language of the
+/// command that asked: NickServ speaks in notices, the
+/// `draft/account-registration` REGISTER command in `REGISTER`/`FAIL`. Tracking
+/// this on the session instead would go wrong the moment a client used both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountOrigin {
+    NickServ,
+    RegisterCommand,
+}
+
 /// A resolved CHATHISTORY window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryQuery {
@@ -292,8 +305,11 @@ pub enum DbReply {
     PasswordRejected,
     AccountCreated {
         account: String,
+        origin: AccountOrigin,
     },
-    AccountExists,
+    AccountExists {
+        origin: AccountOrigin,
+    },
     ChannelRegistered {
         channel: String,
     },
@@ -390,17 +406,16 @@ impl Core {
                 // The batch is what the connection's held output is waiting
                 // behind, so it is emitted through the hold, which is then
                 // released in the order the client issued its commands.
-                self.state.emitting_deferred = Some(conn);
-                handler::history_page(
-                    &mut self.state,
-                    conn,
-                    &display,
-                    &batch_ref,
-                    rows,
-                    label.as_deref(),
-                );
-                self.state.emitting_deferred = None;
-                self.state.release_deferred(conn);
+                self.state.emit_deferred(conn, |state| {
+                    handler::history_page(
+                        state,
+                        conn,
+                        &display,
+                        &batch_ref,
+                        rows,
+                        label.as_deref(),
+                    );
+                });
             }
             Input::TargetsPage {
                 conn,
@@ -408,10 +423,9 @@ impl Core {
                 targets,
                 label,
             } => {
-                self.state.emitting_deferred = Some(conn);
-                handler::targets_page(&mut self.state, conn, &batch_ref, targets, label.as_deref());
-                self.state.emitting_deferred = None;
-                self.state.release_deferred(conn);
+                self.state.emit_deferred(conn, |state| {
+                    handler::targets_page(state, conn, &batch_ref, targets, label.as_deref());
+                });
             }
         }
         // Sweep connections whose SendQ overflowed while handling the
