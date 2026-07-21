@@ -135,6 +135,35 @@ path is framed like every other client→upstream path (no CRLF injection);
 CHATHISTORY replays a canonical uppercase verb from both ring and DB; and
 RPL_WHOISCHANNELS is split across 512-byte lines like RPL_NAMREPLY.
 
+Seventh hardening sweep (2026-07-21): strengthened dead-code detection to the
+one case the compiler cannot see, then a fresh fidelity/bug pass. Tooling:
+`tools/check-dead-code.sh` (compiler-based) catches private and `pub(crate)`
+items only tests keep alive, but rustc treats a lib's fully-`pub` items as
+reachable API, so a `pub` item referenced only by an integration test (a
+separate crate) was still invisible. `tools/check-dead-pub.sh` closes that:
+it flags any `pub` fn/type/const/… in shipped source referenced nowhere else in
+shipped source, with an explicit `// dead-pub-allow:` escape hatch; wired into
+CI and the checklist. It immediately found three dead protocol-limit constants
+(`MAX_LINE_LEN`/`MAX_SERVER_TAGS_LEN`/`MAX_CLIENT_TAGS_LEN`), now wired live as
+the single source of truth for the framing caps that were duplicated as the
+magic `4096 + 510` across five sites — which also fixed a latent gap where the
+client rejected valid large server-tag lines. Bug fixes from an adversarial
+re-audit: (MEDIUM) SASL registration hung forever on a post-auth
+registration-refusal numeric (e.g. `433` when the requested nick is taken) —
+the shared welcome path now treats those as terminal in both loops; (MEDIUM)
+a labeled `CHATHISTORY TARGETS` that resolved via PostgreSQL lost its label and
+double-responded (empty ACK + unlabeled batch) — the label is threaded through
+`QueryTargets`/`TargetsPage` exactly as the earlier `HistoryPage` fix; a
+`network_name` containing a space (which would split the ISUPPORT `NETWORK=`
+token) is now rejected at config load; a banned or quieted external sender can
+no longer speak to a `-n` channel (bans/quiets/moderation are checked for
+non-members too, PRIVMSG and TAGMSG); `MODE +k` on an already-keyed channel
+replies `467 ERR_KEYSET` instead of silently overwriting; the `/ws/ui` socket
+sends the current connection status on attach (the sticky flag was unused); the
+`hot_channels` LRU no longer keeps stale keys for destroyed channels (a shared
+`remove_channel` drops both maps together); and the ws-irc inbound loop breaks
+the connection directly when the core is gone.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

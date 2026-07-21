@@ -2033,7 +2033,7 @@ fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let chan = state.channels.get_mut(&key).expect("checked");
         chan.members.remove(&conn);
         if chan.members.is_empty() {
-            state.channels.remove(&key);
+            state.remove_channel(&key);
         }
         state
             .sessions
@@ -2310,7 +2310,14 @@ fn deliver_one_message(
                     && !chan.is_banned(state.casemap, &prefix)
                     && !chan.is_quieted(state.casemap, &prefix)
             }
-            None => !chan.modes.no_external,
+            // An external sender (to a -n channel) is still subject to +m and to
+            // bans/quiets — being off-channel doesn't exempt a banned mask.
+            None => {
+                !chan.modes.no_external
+                    && !chan.modes.moderated
+                    && !chan.is_banned(state.casemap, &prefix)
+                    && !chan.is_quieted(state.casemap, &prefix)
+            }
         };
         if !may_speak {
             if loud {
@@ -2529,7 +2536,12 @@ fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) 
                     && !chan.is_banned(state.casemap, &prefix)
                     && !chan.is_quieted(state.casemap, &prefix)
             }
-            None => !chan.modes.no_external,
+            None => {
+                !chan.modes.no_external
+                    && !chan.modes.moderated
+                    && !chan.is_banned(state.casemap, &prefix)
+                    && !chan.is_quieted(state.casemap, &prefix)
+            }
         };
         if !may_speak {
             state.numeric(
@@ -2965,6 +2977,17 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                             ERR_INVALIDKEY,
                             &[&display, "k", "*"],
                             Some("Key is not well-formed"),
+                        );
+                        continue;
+                    }
+                    // A key already set is not silently overwritten: reply
+                    // ERR_KEYSET and leave the existing key in place (Solanum).
+                    if chan.modes.key.is_some() {
+                        state.numeric(
+                            conn,
+                            ERR_KEYSET,
+                            &[&display],
+                            Some("Channel key already set"),
                         );
                         continue;
                     }
@@ -3575,7 +3598,7 @@ fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     chan.members.remove(&victim);
     let empty = chan.members.is_empty();
     if empty {
-        state.channels.remove(&key);
+        state.remove_channel(&key);
     }
     state
         .sessions
@@ -4097,12 +4120,15 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let keys: Vec<super::state::ChanKey> = state.sessions[&conn].channels.iter().cloned().collect();
     let batch_ref = state.next_msgid();
     if keys.is_empty() {
-        targets_page(state, conn, &batch_ref, Vec::new());
+        // Runs under labeled-response capture; frame_labeled applies the label.
+        targets_page(state, conn, &batch_ref, Vec::new(), None);
         return;
     }
 
     if state.config.sasl_enabled {
         let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
+        // Carry the labeled-response label (if any) onto the deferred batch.
+        let label = state.capture.as_ref().and_then(|c| c.label.clone());
         let request = super::DbRequest::QueryTargets {
             conn,
             channels,
@@ -4110,14 +4136,23 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             max_ts,
             limit,
             batch_ref,
+            label,
         };
         if state.db_tx.try_push(request).is_err() {
+            // Enqueue failed: fall through to a synchronous FAIL the framer
+            // still handles normally.
             chathistory_fail(
                 state,
                 conn,
                 "MESSAGE_ERROR",
                 "History temporarily unavailable",
             );
+        } else if let Some(cap) = state.capture.as_mut() {
+            // Enqueued: the labeled batch is emitted when the DB replies, so
+            // don't ACK this command as an empty response.
+            if cap.label.is_some() {
+                cap.deferred = true;
+            }
         }
         return;
     }
@@ -4138,7 +4173,8 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     targets.sort_by_key(|t| std::cmp::Reverse(t.1));
     targets.truncate(limit);
-    targets_page(state, conn, &batch_ref, targets);
+    // No-DB path runs under labeled-response capture; frame_labeled applies it.
+    targets_page(state, conn, &batch_ref, targets, None);
 }
 
 /// Emit a `draft/chathistory-targets` batch: one `CHATHISTORY TARGETS
@@ -4148,12 +4184,20 @@ pub(crate) fn targets_page(
     conn: ConnId,
     batch_ref: &str,
     targets: Vec<(String, u64)>,
+    label: Option<&str>,
 ) {
     let server = state.config.server_name.clone();
-    state.send(
-        conn,
-        &format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
-    );
+    // `label` is set only on the async DB path (produced outside the
+    // synchronous labeled-response capture), so it labels its own BATCH open;
+    // the in-memory path runs under capture with `None` and is framed by
+    // frame_labeled instead — mirroring history_page.
+    let open = match label {
+        Some(label) => {
+            format!("@label={label} :{server} BATCH +{batch_ref} draft/chathistory-targets")
+        }
+        None => format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
+    };
+    state.send(conn, &open);
     for (target, ts) in targets {
         // Prefer the channel's display name while it is still in memory.
         let key = state.chan_key(&target);

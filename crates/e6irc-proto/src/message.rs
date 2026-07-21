@@ -20,6 +20,15 @@ pub const MAX_SERVER_TAGS_LEN: usize = 8191;
 /// Maximum bytes of the tags part a client may send to a server.
 pub const MAX_CLIENT_TAGS_LEN: usize = 4096;
 
+/// Maximum bytes of one line a server accepts from a client, *excluding* the
+/// CRLF: the client tag budget plus the traditional message part minus its
+/// 2-byte CRLF. This is the single source of truth for the cap the framing
+/// [`crate::framing::LineBuffer`] enforces on inbound client lines.
+pub const MAX_CLIENT_FRAME_LEN: usize = MAX_CLIENT_TAGS_LEN + MAX_LINE_LEN - 2;
+/// The same cap for a line a client accepts from a server, which may carry the
+/// larger server tag budget (server-time, msgid, account, batch, …).
+pub const MAX_SERVER_FRAME_LEN: usize = MAX_SERVER_TAGS_LEN + MAX_LINE_LEN - 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<'a> {
     pub tags: Vec<Tag<'a>>,

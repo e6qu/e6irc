@@ -95,7 +95,7 @@ impl Connection {
         Self {
             reader,
             writer,
-            framing: LineBuffer::new(4096 + 510),
+            framing: LineBuffer::new(e6irc_proto::message::MAX_SERVER_FRAME_LEN),
             pending: std::collections::VecDeque::new(),
             read_buf: vec![0u8; 8192],
         }
@@ -191,6 +191,13 @@ impl Connection {
     async fn finish_sasl_then_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
             let msg = self.recv("closed during SASL").await?;
+            // A registration-refusal numeric can arrive here, before the
+            // welcome — e.g. the server rejects the requested NICK (433) the
+            // moment it is sent, mid-SASL. Treat it as terminal in this loop
+            // too, or CAP END is sent and await_welcome blocks forever.
+            if let Some(err) = registration_refused(&msg.command) {
+                return Err(err);
+            }
             match msg.command.as_str() {
                 // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
                 "903" => {
@@ -208,16 +215,30 @@ impl Connection {
                 }
             }
         }
+        self.await_welcome(nick).await
+    }
+
+    /// Wait for the `001` welcome, answering PINGs. Registration-refusal
+    /// numerics are terminal — a server that reports the failure but holds the
+    /// socket open would otherwise hang this loop forever; fail loudly instead.
+    async fn await_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
             let msg = self.recv("closed before welcome").await?;
-            if msg.command == "001" {
-                return Ok(msg
-                    .params
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| nick.to_string()));
+            if let Some(err) = registration_refused(&msg.command) {
+                return Err(err);
             }
-            self.answer_ping(&msg).await?;
+            match msg.command.as_str() {
+                "001" => {
+                    return Ok(msg
+                        .params
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| nick.to_string()));
+                }
+                _ => {
+                    self.answer_ping(&msg).await?;
+                }
+            }
         }
     }
 
@@ -291,41 +312,24 @@ impl Connection {
         self.send_line(&format!("USER {nick} 0 * :{realname}"))
             .await?;
         self.send_line("CAP END").await?;
-        while let Some(msg) = self.next_message().await? {
-            match msg.command.as_str() {
-                "001" => {
-                    return Ok(msg
-                        .params
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| nick.to_string()));
-                }
-                "PING" => {
-                    let token = msg.params.first().cloned().unwrap_or_default();
-                    self.send_line(&format!("PONG :{token}")).await?;
-                }
-                "433" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "nickname in use",
-                    ));
-                }
-                // Registration-refusal numerics: return an error rather than
-                // block forever on a server that reports the failure but does
-                // not immediately close the socket.
-                "432" | "451" | "464" | "465" => {
-                    return Err(io::Error::other(format!(
-                        "registration refused ({})",
-                        msg.command
-                    )));
-                }
-                _ => {}
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "closed before welcome",
-        ))
+        self.await_welcome(nick).await
+    }
+}
+
+/// Map a registration-refusal numeric to a terminal error, if it is one. These
+/// are the replies a server sends when it will not complete registration for
+/// the requested nick/credentials; a client that keeps waiting for `001` after
+/// one of them hangs forever.
+fn registration_refused(command: &str) -> Option<io::Error> {
+    match command {
+        "433" => Some(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "nickname in use",
+        )),
+        "432" | "451" | "464" | "465" => Some(io::Error::other(format!(
+            "registration refused ({command})"
+        ))),
+        _ => None,
     }
 }
 

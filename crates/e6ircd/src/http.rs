@@ -2565,10 +2565,10 @@ async fn ws_irc_conn(
         return;
     }
     let core_tx = state.core_tx.clone();
-    let mut framing = LineBuffer::new(4096 + 510);
+    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
     let mut events = Vec::new();
 
-    loop {
+    'conn: loop {
         tokio::select! {
             // Outbound: a core Output line becomes one text frame.
             out = out_rx.pop() => {
@@ -2596,7 +2596,7 @@ async fn ws_irc_conn(
                         LineEvent::TooLong => Input::OverlongLine { conn },
                     };
                     if core_tx.push(input).await.is_err() {
-                        break;
+                        break 'conn; // core gone: stop the connection directly
                     }
                 }
             }
@@ -2670,6 +2670,23 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
     // not). This mirrors attach()'s ordering — the same invariant over WS.
     let mut events = handle.subscribe();
 
+    // Send the current connection status up front: a driver is always-on, so a
+    // client attaching to an already-connected network would otherwise see no
+    // status until the next connect/disconnect transition. The sticky flag
+    // exists precisely to close this subscribe-timing gap.
+    let status = if handle.is_connected() {
+        ConnStatus::Connected
+    } else {
+        ConnStatus::Disconnected
+    };
+    if socket
+        .send(WsMessage::text(render_status_fragment(status)))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
     // Playback: everything buffered while detached, as fragments.
     for line in handle.buffer_snapshot() {
         if socket
@@ -2726,12 +2743,12 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
 
 /// Reduce a composer-derived line to exactly one framed IRC line: cut at the
 /// first embedded CR/LF (which would otherwise inject a second upstream line)
-/// and bound the length to the same 4096+510 cap the framed transports use,
-/// truncating on a UTF-8 char boundary.
+/// and bound the length to the same cap the framed transports use, truncating
+/// on a UTF-8 char boundary.
 fn sanitize_composer_line(line: &str) -> String {
     let end = line.find(['\r', '\n']).unwrap_or(line.len());
     let mut line = line[..end].to_string();
-    let max = 4096 + 510;
+    let max = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
     if line.len() > max {
         let mut cut = max;
         while !line.is_char_boundary(cut) {

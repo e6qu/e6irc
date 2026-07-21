@@ -371,6 +371,18 @@ impl Config {
                 "server_name must be a hostname".into(),
             ));
         }
+        // network_name becomes the ISUPPORT `NETWORK=` token, a space-delimited
+        // 005 middle param — a space (or control char) would split it into two
+        // malformed tokens. Reject at load rather than emit a broken numeric.
+        if self.network_name.is_empty()
+            || self
+                .network_name
+                .contains(|c: char| c == ' ' || c.is_control())
+        {
+            return Err(ConfigError::Invalid(
+                "network_name must be a single token (no spaces or control characters)".into(),
+            ));
+        }
         if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 {
             return Err(ConfigError::Invalid("limits must be nonzero".into()));
         }
@@ -581,6 +593,22 @@ mod tests {
         )
         .expect("parse");
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn network_name_with_space_is_rejected() {
+        // A space would split the ISUPPORT `NETWORK=` token into two.
+        let c: Config = toml::from_str(
+            r#"
+            server_name = "irc.x.example"
+            network_name = "Cool Net"
+            [[listeners]]
+            addr = "127.0.0.1:0"
+            "#,
+        )
+        .expect("parse");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("network_name"), "{err}");
     }
 
     #[test]

@@ -449,7 +449,7 @@ where
     }
     write.flush().await?;
 
-    let mut framing = LineBuffer::new(4096 + 510);
+    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
     let mut read_buf = vec![0u8; 8192];
     let mut parsed = Vec::new();
     loop {
