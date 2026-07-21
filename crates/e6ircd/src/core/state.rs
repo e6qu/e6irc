@@ -157,6 +157,10 @@ pub(crate) struct Session {
     pub channels: HashSet<ChanKey>,
     /// Nicks this session MONITORs (display form as given).
     pub monitoring: HashMap<NickKey, String>,
+    /// Read markers for a client that isn't logged in: per-connection and not
+    /// persisted (there is no account to key them to). A logged-in client uses
+    /// the account-keyed `ServerState::read_markers` instead.
+    pub anon_read_markers: HashMap<ChanKey, u64>,
     /// Command-flood token bucket (only used when `command_burst` is set):
     /// tokens remaining and the clock-second of the last refill.
     pub flood_tokens: u32,
@@ -812,6 +816,7 @@ impl ServerState {
                 invited: HashSet::new(),
                 channels: HashSet::new(),
                 monitoring: HashMap::new(),
+                anon_read_markers: HashMap::new(),
                 flood_tokens: 0,
                 flood_last_sec: 0,
                 last_active: 0,

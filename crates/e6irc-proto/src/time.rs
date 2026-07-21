@@ -35,6 +35,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Parse a `server-time`-format timestamp back to epoch seconds
 /// (milliseconds are truncated). `None` on any format violation.
 pub fn parse_server_time_seconds(text: &str) -> Option<u64> {
+    parse_server_time_millis(text).map(|ms| ms / 1000)
+}
+
+/// Parse a `server-time` string to epoch **milliseconds**, preserving the
+/// optional `.mmm` fraction (padded/truncated to three digits). `None` on any
+/// format violation.
+pub fn parse_server_time_millis(text: &str) -> Option<u64> {
     let text = text.strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut date_parts = date.split('-');
@@ -42,10 +49,9 @@ pub fn parse_server_time_seconds(text: &str) -> Option<u64> {
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
     // The `server-time` format has a 4-digit year. Bounding it here is not
-    // cosmetic: it keeps the returned seconds small enough that callers'
-    // `secs * 1000` (millis) cannot overflow u64 — an unbounded year let a
-    // client trigger that overflow (panic in debug, marker corruption in
-    // release) via MARKREAD.
+    // cosmetic: it keeps the returned milliseconds small enough that the
+    // `* 1000` below cannot overflow u64 — an unbounded year let a client
+    // trigger that overflow (panic in debug, marker corruption in release).
     if date_parts.next().is_some()
         || !(0..=9999).contains(&year)
         || !(1..=12).contains(&month)
@@ -53,17 +59,33 @@ pub fn parse_server_time_seconds(text: &str) -> Option<u64> {
     {
         return None;
     }
-    let time = time.split_once('.').map_or(time, |(t, _)| t);
-    let mut time_parts = time.split(':');
+    let (hms, frac) = time.split_once('.').map_or((time, ""), |(t, f)| (t, f));
+    let mut time_parts = hms.split(':');
     let hh: u64 = time_parts.next()?.parse().ok()?;
     let mm: u64 = time_parts.next()?.parse().ok()?;
     let ss: u64 = time_parts.next()?.parse().ok()?;
     if time_parts.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
         return None;
     }
+    // Leading fraction digits become milliseconds (`.1` → 100, `.123` → 123,
+    // `.1234` → 123); a non-digit ends the fraction, matching the tolerant
+    // behavior the seconds parser had.
+    let mut millis = 0u64;
+    let mut place = 100u64;
+    for c in frac.chars() {
+        let Some(d) = c.to_digit(10) else { break };
+        if place == 0 {
+            break;
+        }
+        millis += d as u64 * place;
+        place /= 10;
+    }
     let days = days_from_civil(year, month, day);
     let secs = days.checked_mul(86_400)? + (hh * 3600 + mm * 60 + ss) as i64;
-    u64::try_from(secs).ok()
+    u64::try_from(secs)
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(millis)
 }
 
 /// Inverse of `civil_from_days` (same Hinnant algorithm family).
@@ -117,6 +139,37 @@ mod tests {
             "2026-07-18 12:00:00Z",
         ] {
             assert_eq!(parse_server_time_seconds(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_millis_preserves_fraction() {
+        // The `.mmm` fraction round-trips at millisecond precision.
+        assert_eq!(
+            parse_server_time_millis("2019-01-04T14:33:26.123Z"),
+            Some(1_546_612_406_123)
+        );
+        // Fewer/more digits pad/truncate to three.
+        assert_eq!(
+            parse_server_time_millis("2026-07-18T12:00:00.5Z"),
+            Some(1_784_376_000_500)
+        );
+        assert_eq!(
+            parse_server_time_millis("2026-07-18T12:00:00.12Z"),
+            Some(1_784_376_000_120)
+        );
+        assert_eq!(
+            parse_server_time_millis("2026-07-18T12:00:00.1239Z"),
+            Some(1_784_376_000_123)
+        );
+        // No fraction ⇒ .000.
+        assert_eq!(
+            parse_server_time_millis("2026-07-18T12:00:00Z"),
+            Some(1_784_376_000_000)
+        );
+        // A full round-trip through the formatter.
+        for ms in [0u64, 1_546_612_406_123, 1_784_376_000_500] {
+            assert_eq!(parse_server_time_millis(&server_time(ms)), Some(ms));
         }
     }
     #[test]

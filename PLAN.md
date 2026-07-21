@@ -269,6 +269,22 @@ case change (`alice`→`Alice`) still broadcasts. The other modules that don't r
 sasl/read_marker) need unimplemented drafts, services, or a database irctest
 doesn't provide, so they stay out of the list.
 
+Thirteenth sweep — draft/read-marker conformance (2026-07-21): irctest's
+`read_marker` module (which connects without authenticating) exposed five real
+draft/read-marker gaps; all fixed, and the module joined the CI green list.
+(1) MARKREAD now works for a client that isn't logged in — per-connection,
+session-local markers (`Session::anon_read_markers`), lost on disconnect; a
+logged-in client still uses the account-keyed, persisted, cross-connection map.
+(2) Markers keep **millisecond** precision — a new `parse_server_time_millis`
+preserves the `.mmm` fraction the seconds parser was truncating; the DB and the
+formatter already round-trip ms. (3) MARKREAD errors are IRCv3 `FAIL`
+(`NEED_MORE_PARAMS`), not the legacy `461` numeric. (4) User (direct-message)
+targets are valid, not only channels. (5) On JOIN, a read-marker-capable client
+is sent the channel's current marker before RPL_ENDOFNAMES (a shared
+`send_current_markread` backs both the query form and the replay). Two internal
+tests that encoded the old, stricter-than-spec behavior (account-required,
+channel-only) were updated to the conformant behavior.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
