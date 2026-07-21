@@ -29,6 +29,8 @@ _DB_URL = os.environ.get("E6IRC_IRCTEST_DB")
 TEMPLATE_CONFIG = """
 server_name = "My.Little.Server"
 network_name = "irctest-net"
+# irctest asserts this exact server description in RPL_LINKS.
+description = "test server"
 motd = ["Welcome to the irctest server"]
 nicklen = 32
 

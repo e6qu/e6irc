@@ -203,6 +203,8 @@ pub async fn start(config: Config) -> io::Result<Running> {
         CoreConfig {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
+            description: config.description.clone(),
+            sendq: config.sendq,
             motd: config.motd.clone(),
             nicklen: config.nicklen,
             sasl_enabled,

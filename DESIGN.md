@@ -659,7 +659,10 @@ Design constraints recorded now:
   copy; replay re-addresses each message to its original recipient rather than
   to the conversation, so a replayed line matches the one delivered live.
   An identity is the participant's **account**, or a `~`-prefixed nick when they
-  have not authenticated. This distinction is load-bearing, not cosmetic: a nick
+  have not authenticated. A database CHECK constraint keeps `!` out of account
+  names, so the key stays unambiguous no matter what future code creates an
+  account — an account called `a!b` would otherwise collide with the
+  conversation between `a` and `b`. This distinction is load-bearing, not cosmetic: a nick
   is released on disconnect and anyone may take it, so keying by nick would mean
   registering a nick handed you the previous holder's private messages. `~`
   cannot occur in a nick or an account name, so an unauthenticated identity can
@@ -678,7 +681,9 @@ Design constraints recorded now:
   them. A reply that has to reach Postgres is *deferred*, and the connection's
   later output is held behind it — replies must reach a client in the order it
   issued the commands, or a client that pipelines CHATHISTORY and PING sees the
-  PONG first and concludes the history was empty.
+  PONG first and concludes the history was empty. Held output carries the same
+  bound as the send queue it is waiting to enter, so a connection blocked on the
+  database is still killed for SendQ overrun rather than buffering without limit.
   **Rings are lazy and LRU-evicted** so hot-history RAM
   is bounded by *activity*, not target count: only the
   `max_hot_channels` (default 8192) most-recently-active targets hold a
