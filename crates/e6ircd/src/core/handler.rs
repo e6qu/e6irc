@@ -571,18 +571,34 @@ fn multiline_fail(
     context: &[&str],
     detail: &str,
 ) {
-    if let Some(session) = state.sessions.get_mut(&conn) {
-        session.multiline = None;
-    }
+    // Abandoning the batch also inherits its labeled-response label. The batch
+    // *was* the response owed to the command that opened it, so if that command
+    // was labeled the failure has to carry the label — otherwise a client
+    // tracking labels waits forever for a response that will never come.
+    let label = state
+        .sessions
+        .get_mut(&conn)
+        .and_then(|session| session.multiline.take())
+        .and_then(|batch| batch.label);
     let server = state.config.server_name.clone();
-    let mut line = format!(":{server} FAIL BATCH {code}");
+    let mut line = String::new();
+    if let Some(label) = &label {
+        line.push_str(&format!("@label={label} "));
+    }
+    line.push_str(&format!(":{server} FAIL BATCH {code}"));
     for param in context {
         line.push(' ');
         line.push_str(param);
     }
     line.push_str(" :");
     line.push_str(detail);
-    state.send(conn, &line);
+    match label {
+        // This answers the BATCH that opened the batch, not whatever line
+        // tripped it, so it must not also be framed as the current command's
+        // response.
+        Some(_) => state.send_bytes_uncaptured(conn, bytes::Bytes::from(format!("{line}\r\n"))),
+        None => state.send(conn, &line),
+    }
 }
 
 /// Client-initiated `BATCH`. Only `draft/multiline` batches are accepted, which
@@ -920,6 +936,25 @@ fn multiline_collect(
             "MULTILINE_INVALID",
             &[],
             "The concat tag cannot be used on a blank message",
+        );
+        return true;
+    }
+    // A batch is one message, so it cannot be half notice: NOTICE exists to
+    // say "never reply to this automatically", and relaying it as a PRIVMSG
+    // would hand recipients a message the sender never wrote.
+    let established = state.sessions[&conn]
+        .multiline
+        .as_ref()
+        .and_then(|b| b.kind);
+    if let Some(established) = established
+        && established != kind
+    {
+        multiline_fail(
+            state,
+            conn,
+            "MULTILINE_INVALID",
+            &[],
+            "A multiline batch cannot mix PRIVMSG and NOTICE",
         );
         return true;
     }
@@ -3298,6 +3333,20 @@ fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) 
             ERR_UNKNOWNCOMMAND,
             &["TAGMSG"],
             Some("Unknown command"),
+        );
+        return;
+    }
+    // A multiline batch carries PRIVMSG and NOTICE only. Delivering a
+    // batch-tagged TAGMSG on its own would take it out of the message the
+    // client was assembling and send it *before* that message, which is not
+    // what was asked for — so it is refused rather than quietly re-routed.
+    if msg.tags.iter().any(|t| t.key == "batch") {
+        multiline_fail(
+            state,
+            conn,
+            "MULTILINE_INVALID",
+            &[],
+            "TAGMSG cannot be part of a multiline batch",
         );
         return;
     }

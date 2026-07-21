@@ -3588,6 +3588,105 @@ fn multiline_batch_is_one_message_to_capable_and_flattened_to_others() {
 }
 
 #[test]
+fn failed_multiline_batch_answers_the_label_that_opened_it() {
+    // The batch is the response owed to the command that opened it, so if that
+    // command was labeled the failure has to carry the label — otherwise a
+    // client tracking labels waits forever for a response that never comes.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/multiline message-tags labeled-response",
+    );
+    s.line(alice, "JOIN #m");
+    s.drain(alice);
+    s.line(alice, "@label=abc BATCH +9 draft/multiline #m");
+    // Nothing is owed yet: the batch is still being assembled.
+    assert!(
+        s.drain(alice).is_empty(),
+        "an opened batch is not yet a response"
+    );
+    s.line(alice, "@batch=9;draft/multiline-concat PRIVMSG #m :");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=abc ") && l.contains("FAIL BATCH MULTILINE_INVALID")),
+        "the failure must answer the labeled BATCH: {out:#?}"
+    );
+}
+
+#[test]
+fn multiline_batch_may_not_mix_privmsg_and_notice() {
+    // NOTICE exists to say "never reply to this automatically". A batch is one
+    // message, so it cannot be half notice — and relaying a NOTICE line as a
+    // PRIVMSG would hand recipients a message the sender never wrote.
+    let mut s = TestServer::new_no_persistence();
+    let caps = "batch draft/multiline message-tags";
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    let bob = register_with_caps(&mut s, 2, "bob", caps);
+    for c in [alice, bob] {
+        s.line(c, "JOIN #m");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "BATCH +1 draft/multiline #m");
+    s.line(alice, "@batch=1 PRIVMSG #m :as privmsg");
+    s.line(alice, "@batch=1 NOTICE #m :as notice");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL BATCH MULTILINE_INVALID")),
+        "{out:#?}"
+    );
+    s.line(alice, "BATCH -1");
+    s.drain(alice);
+    let relayed = s.drain(bob);
+    assert!(
+        relayed.is_empty(),
+        "a rejected batch relays nothing at all: {relayed:#?}"
+    );
+}
+
+#[test]
+fn tagmsg_may_not_claim_membership_of_a_multiline_batch() {
+    // A multiline batch carries PRIVMSG and NOTICE only. Delivering a
+    // batch-tagged TAGMSG on its own would take it out of the message being
+    // assembled and send it *before* that message.
+    let mut s = TestServer::new_no_persistence();
+    let caps = "batch draft/multiline message-tags";
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    let bob = register_with_caps(&mut s, 2, "bob", caps);
+    for c in [alice, bob] {
+        s.line(c, "JOIN #m");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "BATCH +2 draft/multiline #m");
+    s.line(alice, "@batch=2;+x=1 TAGMSG #m");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL BATCH MULTILINE_INVALID")),
+        "{out:#?}"
+    );
+    assert!(
+        !s.drain(bob).iter().any(|l| l.contains("TAGMSG")),
+        "the TAGMSG must not escape the batch it claimed"
+    );
+
+    // An untagged TAGMSG is unaffected.
+    s.line(alice, "@+x=1 TAGMSG #m");
+    s.drain(alice);
+    assert!(
+        s.drain(bob).iter().any(|l| l.contains("TAGMSG #m")),
+        "a plain TAGMSG still works"
+    );
+}
+
+#[test]
 fn multiline_batch_permissions_match_a_plain_message() {
     // Splitting text across a batch must not evade the checks a single message
     // faces: the batch is refused for the same reason, and nothing is relayed.

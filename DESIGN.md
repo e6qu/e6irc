@@ -406,7 +406,11 @@ timestamp, and both delivered forms carry that same pair, so a client seeing the
 batch and one seeing the flattened lines are looking at the same event. A batch
 that is abandoned or fails validation delivers *nothing* — a truncated version
 of what the sender wrote would be worse than silence, and the sender is told why
-with `FAIL BATCH`.
+with `FAIL BATCH`. A batch may not mix PRIVMSG and NOTICE (it is one message,
+and NOTICE's "never auto-reply" meaning cannot be applied to half of it), and
+TAGMSG may not join one at all. If the opening BATCH was labeled, the failure
+carries that label: the batch was the response owed to that command, so without
+it a client tracking labels would wait forever.
 
 Recipients that negotiated the capability receive the batch as sent, blank lines
 and `draft/multiline-concat` tags intact, because those are what the sender
