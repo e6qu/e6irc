@@ -189,6 +189,17 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/{*path}", get(web::asset));
     router
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        // Defense-in-depth: every response (including the JSON/problem+json API
+        // paths, which don't go through security_headers) carries nosniff, so a
+        // response body can never be sniffed into an executable type.
+        .layer(axum::middleware::map_response(
+            |mut resp: Response| async move {
+                resp.headers_mut()
+                    .entry(header::X_CONTENT_TYPE_OPTIONS)
+                    .or_insert(header::HeaderValue::from_static("nosniff"));
+                resp
+            },
+        ))
         .with_state(Arc::new(state))
 }
 

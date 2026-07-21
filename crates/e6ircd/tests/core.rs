@@ -1010,6 +1010,169 @@ fn sasl_rejected_password_is_904() {
 }
 
 #[test]
+fn sasl_verification_attempts_are_capped_per_connection() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :sasl");
+    s.drain(c);
+    // Eight attempts are allowed; each dispatches an argon2 verify and is
+    // rejected, returning to Idle for the next try.
+    for _ in 0..8 {
+        s.line(c, "AUTHENTICATE PLAIN");
+        s.drain(c);
+        s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0wrong")));
+        assert_eq!(s.db_requests().len(), 1, "attempt should dispatch a verify");
+        s.core.handle(Input::DbReply {
+            conn: c,
+            reply: e6ircd::core::DbReply::PasswordRejected,
+        });
+        s.drain(c);
+    }
+    // The ninth exceeds the cap: no argon2 dispatched, connection closed.
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0wrong")));
+    assert!(
+        s.db_requests().is_empty(),
+        "over-cap attempt must not dispatch argon2 work"
+    );
+    assert!(
+        s.drain(c)
+            .iter()
+            .any(|l| l.contains("too many authentication attempts")),
+        "connection must be closed after too many attempts"
+    );
+}
+
+#[test]
+fn unregistered_connection_is_reaped_after_registration_timeout() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK half"); // never sends USER — registration never completes
+    s.drain(c);
+    // A tick past the registration deadline (the test clock is a constant
+    // 1_000_000, so `now` is supplied via the tick).
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 60,
+    });
+    assert!(
+        s.drain(c)
+            .iter()
+            .any(|l| l.contains("Registration timeout")),
+        "an unregistered connection must be reaped"
+    );
+}
+
+#[test]
+fn idle_registered_client_is_pinged_then_reaped_without_pong() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    // Past the idle interval (120s) → server sends a liveness PING.
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 121,
+    });
+    assert!(
+        s.drain(alice).iter().any(|l| l.starts_with("PING ")),
+        "idle client must be pinged"
+    );
+    // No PONG; past the pong deadline (60s) → reaped.
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 121 + 61,
+    });
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
+        "a client that never PONGs must be reaped"
+    );
+}
+
+#[test]
+fn pong_keeps_a_client_alive_across_reaper_ticks() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 121,
+    });
+    assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
+    s.line(alice, "PONG :irc.test.example"); // client answers the ping
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 300,
+    });
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
+        "a client that PONGs must not be reaped"
+    );
+}
+
+#[test]
+fn mode_query_on_secret_channel_hidden_from_nonmembers() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #sec");
+    s.line(alice, "MODE #sec +s");
+    s.line(alice, "MODE #sec +b baddie!*@*");
+    s.drain(alice);
+
+    let bob = s.register(2, "bob"); // not a member
+    s.line(bob, "MODE #sec");
+    assert!(
+        has_numeric(&s.drain(bob), "403"),
+        "a +s channel must look non-existent to non-members"
+    );
+    s.line(bob, "MODE #sec +b");
+    let out = s.drain(bob);
+    assert!(has_numeric(&out, "403"), "ban list hidden on +s");
+    assert!(
+        !out.iter().any(|l| l.contains("baddie")),
+        "ban masks must not leak: {out:#?}"
+    );
+}
+
+#[test]
+fn quieted_member_cannot_set_topic() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice"); // founder → op of #c
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #c");
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(alice, "MODE #c -t"); // any member may set the topic
+    s.line(alice, "MODE #c +q bob!*@*"); // but bob is quieted
+    s.drain(alice);
+    s.drain(bob);
+    s.line(bob, "TOPIC #c :hijacked");
+    assert!(
+        has_numeric(&s.drain(bob), "404"),
+        "a quieted member must not be able to set the topic"
+    );
+}
+
+#[test]
+fn active_client_without_pong_is_not_reaped() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #a");
+    s.drain(alice);
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 121,
+    }); // liveness PING
+    assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
+    // The client sends a normal command instead of a literal PONG — still alive.
+    s.line(alice, "PRIVMSG #a :still here");
+    s.drain(alice);
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 300,
+    });
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
+        "an actively-talking client must not be reaped for not PONGing"
+    );
+}
+
+#[test]
 fn sasl_bad_base64_and_malformed_payload_fail() {
     let mut s = TestServer::new();
     let c = s.connect(1);

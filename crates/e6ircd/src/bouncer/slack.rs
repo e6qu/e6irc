@@ -272,7 +272,10 @@ fn parse_envelope(text: &str) -> Envelope {
 
 /// Render a Slack message as an IRC PRIVMSG line.
 fn render_privmsg(user: &str, channel: &str, text: &str) -> String {
-    format!(":{user}!{user}@slack PRIVMSG {channel} :{text}")
+    // The user id is hostile-upstream input; reduce it to a safe nick token so
+    // it can't forge a source/command in the prefix position.
+    let nick = super::nick_token(user);
+    format!(":{nick}!{nick}@slack PRIVMSG {channel} :{text}")
 }
 
 /// A Slack Web API response's `ok` field is the error contract: `false`

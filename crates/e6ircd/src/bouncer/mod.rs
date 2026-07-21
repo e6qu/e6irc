@@ -236,6 +236,31 @@ impl Buffer {
 /// newline would otherwise let that text inject a second, forged IRC line
 /// into the client's stream. Real IRC-upstream lines never carry these bytes
 /// (the framing splits on them), so this is a no-op fast path for them.
+/// Reduce an arbitrary upstream display name to a safe IRC nick token for the
+/// source-prefix position: any character that isn't nick-legal becomes `_`, so
+/// a hostile upstream can't smuggle a space or `!@:` into the prefix and forge
+/// a different source or command on the attached client's stream. Bounded in
+/// length so an oversized name can't blow the line budget.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+pub(crate) fn nick_token(raw: &str) -> String {
+    let legal = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '[' | ']' | '\\' | '`' | '_' | '^' | '{' | '|' | '}' | '-'
+            )
+    };
+    let mut out: String = raw
+        .chars()
+        .map(|c| if legal(c) { c } else { '_' })
+        .take(30)
+        .collect();
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
 fn sanitize_upstream_line(line: String) -> String {
     if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         line.chars()

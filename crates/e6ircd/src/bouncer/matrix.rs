@@ -316,10 +316,13 @@ fn alias_to_channel(alias: &str) -> String {
 
 /// `@user:server` → nick `user`; render as an IRC PRIVMSG line.
 fn render_privmsg(sender: &str, channel: &str, body: &str) -> String {
-    let nick = sender
+    let local = sender
         .strip_prefix('@')
         .and_then(|s| s.split_once(':').map(|(l, _)| l))
         .unwrap_or(sender);
+    // The sender is hostile-upstream input; reduce it to a safe nick token so it
+    // can't forge a source/command in the prefix position.
+    let nick = super::nick_token(local);
     format!(":{nick}!{nick}@matrix PRIVMSG {channel} :{body}")
 }
 
@@ -355,5 +358,27 @@ mod tests {
     fn urlencodes_room_ids() {
         assert_eq!(urlencode("!abc:localhost"), "%21abc%3Alocalhost");
         assert_eq!(urlencode("#room:localhost"), "%23room%3Alocalhost");
+    }
+
+    #[test]
+    fn hostile_sender_cannot_forge_a_prefix() {
+        // A malicious homeserver sets the sender to smuggle a space and IRC
+        // metacharacters into the source-prefix position; the nick token must
+        // neutralize them so no second source/command is forged.
+        let line = render_privmsg("@evil x!y@z NOTICE victim :hi:localhost", "#room", "body");
+        let prefix = line
+            .strip_prefix(':')
+            .and_then(|l| l.split(' ').next())
+            .expect("prefix");
+        assert!(
+            !prefix.contains(' '),
+            "prefix must be a single token: {line}"
+        );
+        assert!(
+            !prefix.contains('!') || prefix.matches('!').count() == 1,
+            "only the driver's own !user@host separator: {line}"
+        );
+        // The command/target the driver intends is preserved.
+        assert!(line.contains("PRIVMSG #room :body"), "{line}");
     }
 }
