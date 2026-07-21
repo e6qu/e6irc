@@ -24,7 +24,24 @@ impl TestServer {
         Self::with_persistence(false)
     }
 
+    /// Like [`TestServer::new_no_persistence`], but the clock advances on
+    /// every read. A fixed clock cannot detect code that reads it more than
+    /// once for a single event — the two reads simply return the same value —
+    /// so tests that assert one-timestamp-per-message need this one.
+    fn new_with_advancing_clock() -> Self {
+        fn advancing() -> u64 {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NOW_MS: AtomicU64 = AtomicU64::new(1_000_000_000);
+            NOW_MS.fetch_add(1, Ordering::Relaxed)
+        }
+        Self::with_config(false, advancing)
+    }
+
     fn with_persistence(sasl_enabled: bool) -> Self {
+        Self::with_config(sasl_enabled, || 1_000_000_000)
+    }
+
+    fn with_config(sasl_enabled: bool, clock: fn() -> u64) -> Self {
         let (db_tx, db_rx) = queue(Config {
             name: "test-db",
             capacity: 64,
@@ -40,7 +57,7 @@ impl TestServer {
                     sasl_enabled,
                     max_hot_channels: 8192,
                     opers: vec![("god".into(), "letmein".into())],
-                    clock: || 1_000_000,
+                    clock,
                     command_burst: None,
                 },
                 db_tx,
@@ -1052,9 +1069,9 @@ fn unregistered_connection_is_reaped_after_registration_timeout() {
     s.line(c, "NICK half"); // never sends USER — registration never completes
     s.drain(c);
     // A tick past the registration deadline (the test clock is a constant
-    // 1_000_000, so `now` is supplied via the tick).
+    // 1_000_000_000 ms, so `now` is supplied via the tick).
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 60,
+        now: 1_000_000_000 + 60_000,
     });
     assert!(
         s.drain(c)
@@ -1071,7 +1088,7 @@ fn idle_registered_client_is_pinged_then_reaped_without_pong() {
     s.drain(alice);
     // Past the idle interval (120s) → server sends a liveness PING.
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 121,
+        now: 1_000_000_000 + 121_000,
     });
     assert!(
         s.drain(alice).iter().any(|l| l.starts_with("PING ")),
@@ -1079,7 +1096,7 @@ fn idle_registered_client_is_pinged_then_reaped_without_pong() {
     );
     // No PONG; past the pong deadline (60s) → reaped.
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 121 + 61,
+        now: 1_000_000_000 + 121_000 + 61_000,
     });
     assert!(
         s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1093,12 +1110,12 @@ fn pong_keeps_a_client_alive_across_reaper_ticks() {
     let alice = s.register(1, "alice");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 121,
+        now: 1_000_000_000 + 121_000,
     });
     assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
     s.line(alice, "PONG :irc.test.example"); // client answers the ping
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 300,
+        now: 1_000_000_000 + 300_000,
     });
     assert!(
         !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1157,14 +1174,14 @@ fn active_client_without_pong_is_not_reaped() {
     s.line(alice, "JOIN #a");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 121,
+        now: 1_000_000_000 + 121_000,
     }); // liveness PING
     assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
     // The client sends a normal command instead of a literal PONG — still alive.
     s.line(alice, "PRIVMSG #a :still here");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 300,
+        now: 1_000_000_000 + 300_000,
     });
     assert!(
         !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1310,7 +1327,7 @@ fn idle_client_is_not_repinged_every_tick() {
     let alice = s.register(1, "alice");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 121,
+        now: 1_000_000_000 + 121_000,
     }); // first liveness PING
     assert_eq!(
         s.drain(alice)
@@ -1324,7 +1341,7 @@ fn idle_client_is_not_repinged_every_tick() {
     // Only ~20s later: the ping cadence is 120s from the last PING, so no
     // re-ping — the bug was pinging on every 15s tick once idle.
     s.core.handle(Input::Tick {
-        now: 1_000_000 + 141,
+        now: 1_000_000_000 + 141_000,
     });
     assert!(
         s.drain(alice).iter().all(|l| !l.starts_with("PING ")),
@@ -1351,6 +1368,43 @@ fn sasl_bad_base64_and_malformed_payload_fail() {
     s.drain(c);
     s.line(c, &format!("AUTHENTICATE {}", b64("no-separators")));
     assert!(has_numeric(&s.drain(c), "904"));
+}
+
+#[test]
+fn sasl_chunk_overflow_fails_without_growing_the_buffer() {
+    // A single over-long AUTHENTICATE line is ERR_SASLTOOLONG (905), but a
+    // client can also drip 400-byte chunks forever to grow the buffer. That
+    // is bounded, and ends as a plain authentication failure (904) — 905 is
+    // specified for one over-long command, not an accumulated payload.
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :sasl");
+    s.drain(c);
+
+    // One line longer than the 400-byte chunk size: 905.
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    s.line(c, &format!("AUTHENTICATE {}", "x".repeat(401)));
+    assert!(has_numeric(&s.drain(c), "905"));
+
+    // Now drip full 400-byte chunks until the buffer cap is exceeded.
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.drain(c);
+    let chunk = "x".repeat(400);
+    let mut failed = false;
+    for _ in 0..64 {
+        s.line(c, &format!("AUTHENTICATE {chunk}"));
+        if has_numeric(&s.drain(c), "904") {
+            failed = true;
+            break;
+        }
+    }
+    assert!(failed, "an unbounded chunk stream must be cut off with 904");
+    assert!(
+        s.db_requests().is_empty(),
+        "an overflowing payload must never reach the DB"
+    );
 }
 
 #[test]
@@ -2667,7 +2721,7 @@ fn hot_history_ring_is_lru_evicted() {
             sasl_enabled: false,
             opers: vec![],
             max_hot_channels: 2,
-            clock: || 1_000_000,
+            clock: || 1_000_000_000,
             command_burst: None,
         },
         db_tx,
@@ -2888,7 +2942,8 @@ fn chathistory_targets_enumerates_buffers() {
     s.core.handle(Input::TargetsPage {
         conn: alice,
         batch_ref: batch_ref.clone(),
-        targets: vec![("#a".into(), 1_000_000), ("#b".into(), 999_999)],
+        // Epoch milliseconds, as CHATHISTORY TARGETS carries them.
+        targets: vec![("#a".into(), 1_000_000_000), ("#b".into(), 999_999_000)],
         label: None,
     });
     let out = s.drain(alice);
@@ -2911,6 +2966,163 @@ fn chathistory_targets_enumerates_buffers() {
     assert!(
         out.contains(&format!(":irc.test.example BATCH -{batch_ref}")),
         "no batch close: {out:#?}"
+    );
+}
+
+#[test]
+fn chathistory_latest_selector_bounds_the_window() {
+    // `LATEST <target> <selector> <limit>` must return only messages newer
+    // than the selector; only `*` is unbounded. Returning the whole ring for
+    // a bounded request replays messages the client already has.
+    let mut s = TestServer::new_no_persistence();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #hl");
+        s.drain(c);
+    }
+    s.drain(alice);
+    for i in 1..=5 {
+        s.line(alice, &format!("PRIVMSG #hl :m{i}"));
+    }
+    let live = s.drain(bob);
+    let msgid = |body: &str| -> String {
+        live.iter()
+            .find(|l| l.ends_with(&format!(":{body}")))
+            .and_then(|l| {
+                l.trim_start_matches('@')
+                    .split([';', ' '])
+                    .find_map(|t| t.strip_prefix("msgid="))
+            })
+            .expect("msgid")
+            .to_string()
+    };
+
+    s.line(
+        bob,
+        &format!("CHATHISTORY LATEST #hl msgid={} 10", msgid("m3")),
+    );
+    let out = s.drain(bob);
+    let inner: Vec<_> = out[1..out.len() - 1].to_vec();
+    assert_eq!(inner.len(), 2, "only messages after m3: {out:#?}");
+    for (i, body) in ["m4", "m5"].iter().enumerate() {
+        assert!(inner[i].ends_with(&format!(":{body}")), "{}", inner[i]);
+    }
+
+    // `*` stays unbounded.
+    s.line(bob, "CHATHISTORY LATEST #hl * 10");
+    let out = s.drain(bob);
+    assert_eq!(out.len() - 2, 5, "unbounded LATEST: {out:#?}");
+}
+
+#[test]
+fn chathistory_between_direction_picks_which_end_the_limit_keeps() {
+    // BETWEEN walks from its first selector toward its second, so a reversed
+    // (newest-first) request with a short limit keeps the newest messages in
+    // the span, not the oldest. Both orders describe the same window.
+    let mut s = TestServer::new_no_persistence();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #hb");
+        s.drain(c);
+    }
+    s.drain(alice);
+    for i in 1..=6 {
+        s.line(alice, &format!("PRIVMSG #hb :m{i}"));
+    }
+    let live = s.drain(bob);
+    let msgid = |body: &str| -> String {
+        live.iter()
+            .find(|l| l.ends_with(&format!(":{body}")))
+            .and_then(|l| {
+                l.trim_start_matches('@')
+                    .split([';', ' '])
+                    .find_map(|t| t.strip_prefix("msgid="))
+            })
+            .expect("msgid")
+            .to_string()
+    };
+    let (first, last) = (msgid("m1"), msgid("m6"));
+
+    // Oldest-first: the limit keeps m2, m3.
+    s.line(
+        bob,
+        &format!("CHATHISTORY BETWEEN #hb msgid={first} msgid={last} 2"),
+    );
+    let out = s.drain(bob);
+    let inner: Vec<_> = out[1..out.len() - 1].to_vec();
+    assert_eq!(inner.len(), 2, "{out:#?}");
+    for (i, body) in ["m2", "m3"].iter().enumerate() {
+        assert!(inner[i].ends_with(&format!(":{body}")), "{}", inner[i]);
+    }
+
+    // Reversed bounds: same window, but the limit keeps m4, m5 — and the
+    // batch is still rendered oldest-first.
+    s.line(
+        bob,
+        &format!("CHATHISTORY BETWEEN #hb msgid={last} msgid={first} 2"),
+    );
+    let out = s.drain(bob);
+    let inner: Vec<_> = out[1..out.len() - 1].to_vec();
+    assert_eq!(inner.len(), 2, "{out:#?}");
+    for (i, body) in ["m4", "m5"].iter().enumerate() {
+        assert!(inner[i].ends_with(&format!(":{body}")), "{}", inner[i]);
+    }
+}
+
+#[test]
+fn replayed_message_keeps_the_time_it_was_delivered_with() {
+    // A message is stamped once: the `time=` tag a client sees live must be
+    // byte-identical to the one CHATHISTORY replays for the same msgid.
+    // Reading the clock separately for delivery and for history let the two
+    // disagree whenever the millisecond ticked over between them.
+    let mut s = TestServer::new_with_advancing_clock();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(
+        &mut s,
+        2,
+        "bob",
+        "batch draft/chathistory message-tags server-time",
+    );
+    for c in [alice, bob] {
+        s.line(c, "JOIN #ht");
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.line(alice, "PRIVMSG #ht :hello");
+    let live = s.drain(bob);
+    let tags_of = |line: &str| -> (String, String) {
+        let tags = line
+            .trim_start_matches('@')
+            .split(' ')
+            .next()
+            .expect("tags");
+        let get = |k: &str| {
+            tags.split(';')
+                .find_map(|t| t.strip_prefix(k))
+                .unwrap_or_else(|| panic!("missing {k} in {line}"))
+                .to_string()
+        };
+        (get("msgid="), get("time="))
+    };
+    let live_line = live
+        .iter()
+        .find(|l| l.ends_with(":hello"))
+        .expect("live message");
+    let (live_msgid, live_time) = tags_of(live_line);
+
+    s.line(bob, "CHATHISTORY LATEST #ht * 10");
+    let out = s.drain(bob);
+    let replayed = out
+        .iter()
+        .find(|l| l.ends_with(":hello"))
+        .expect("replayed message");
+    let (replayed_msgid, replayed_time) = tags_of(replayed);
+    assert_eq!(live_msgid, replayed_msgid);
+    assert_eq!(
+        live_time, replayed_time,
+        "live and replayed time must match: {live_line} vs {replayed}"
     );
 }
 
@@ -3221,7 +3433,7 @@ fn history_logmessage_gated_on_database() {
                 sasl_enabled,
                 opers: vec![],
                 max_hot_channels: 8,
-                clock: || 1_000_000,
+                clock: || 1_000_000_000,
                 command_burst: None,
             },
             db_tx,

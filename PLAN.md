@@ -285,6 +285,75 @@ is sent the channel's current marker before RPL_ENDOFNAMES (a shared
 tests that encoded the old, stricter-than-spec behavior (account-required,
 channel-only) were updated to the conformant behavior.
 
+Fourteenth sweep — millisecond server-time + CHATHISTORY conformance
+(2026-07-21): stood up a persistence-backed irctest controller (set
+`E6IRC_IRCTEST_DB` and the controller embeds a `[database]` section, advertises
+SASL, registers accounts through the integrated NickServ, and truncates between
+servers), which unlocked the `sasl` and `chathistory` modules and immediately
+found five real bugs.
+
+(1) **The wall clock was whole seconds.** `server-time` is specified to
+millisecond precision, so every message in the same second carried an identical
+`time=` tag and CHATHISTORY — which pages by timestamp — could not order them.
+`CoreConfig::clock` now returns Unix **milliseconds** end to end: the reaper
+deadlines became `_MS` constants, the flood bucket credits whole elapsed seconds
+and carries the sub-second remainder instead of discarding it, and the values
+that are genuinely coarse are named for it (`Topic::set_at_secs`,
+`Channel::created_at_secs`) while WHOIS idle/signon, WHOX `l` and STATS uptime
+divide at the point of display. Message timestamps are milliseconds in the ring,
+across the `messages` SQL, and in the HTTP history API. No migration was needed —
+`messages.ts` was already `TIMESTAMPTZ`; only the Rust conversion truncated. The
+now-unused `parse_server_time_seconds` was deleted (its round-trip coverage moved
+to the millisecond parser, where the round trip is exact).
+
+(2) **A message was stamped twice.** Delivery read the clock for `time=` and the
+history write read it again, so once the clock had millisecond resolution the two
+could disagree and CHATHISTORY replayed a message with a different `time=` than
+the client saw live. `ServerState::stamp` now performs one read yielding both the
+timestamp and the msgid derived from it, and `Delivery` carries that value —
+`deliver_message` no longer has a clock to disagree with. The regression test uses
+a deliberately *advancing* test clock, because a fixed one cannot detect a double
+read at all.
+
+(3) **`CHATHISTORY LATEST` ignored its selector.** Only `*` is unbounded; with a
+`msgid=`/`timestamp=` selector the reply must contain just the messages newer than
+it, and e6ircd returned the whole ring. Fixed in the ring path and via new
+`LatestAfter`/`LatestAfterMsgid` queries, which keep the *newest* `limit` in the
+bound (deliberately distinct from `After`, which keeps the oldest).
+
+(4) **`CHATHISTORY BETWEEN` ignored its direction.** The window is walked from
+the first selector toward the second, so a reversed request with a short limit
+must keep the newest messages in the span. e6ircd normalized the bounds and always
+returned the oldest; worse, a reversed msgid pair reached SQL unnormalized and
+produced an empty range. Bounds are now normalized with the direction carried
+alongside as `newest_first`.
+
+(5) **Two protocol-reply defects.** `FAIL CHATHISTORY` omitted the spec's
+positional context, so a client could not attribute a failure to the request it
+made — the subcommand (and the target, for target errors) is now included. And an
+AUTHENTICATE payload that outgrew the accumulated buffer answered
+ERR_SASLTOOLONG, which the spec reserves for a single over-long line; an
+overflowing accumulation is now the generic ERR_SASLFAIL.
+
+A second CI job (`irctest-services`) runs the two modules against a real
+PostgreSQL. Every deselect names its reason in the workflow. **Direct-message
+history is not implemented** — only channel messages are persisted, so
+CHATHISTORY against a nick has no record to serve and TARGETS cannot enumerate
+correspondents; that accounts for seven of the eight deselected tests and is the
+obvious next piece of work. The eighth (`testChathistoryNoEventPlayback`) is not
+a defect: a limit wider than the hot ring defers to PostgreSQL, and that reply can
+land after the PING the test synchronizes on. `testPlainLarge800` is deselected
+because irctest registers accounts over a normal PRIVMSG, so a 592-byte password
+cannot fit the 512-byte line limit — e6ircd correctly answers ERR_INPUTTOOLONG.
+The controller now fails loudly when registration is not confirmed, rather than
+proceeding and surfacing an inscrutable SASL failure later.
+
+Both CI database jobs moved from `postgres:16` to **`postgres:18`** (current
+stable) in the same pass, and every database-backed suite — the `db`, `http` and
+CLI `e2e` tests plus the new services conformance run — was re-verified against a
+local PostgreSQL 18.4. Legacy majors are not a support target, so DESIGN §8 now
+says 18 rather than "≥ 15": the project should test the version it claims.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

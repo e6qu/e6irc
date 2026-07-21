@@ -32,12 +32,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Parse a `server-time`-format timestamp back to epoch seconds
-/// (milliseconds are truncated). `None` on any format violation.
-pub fn parse_server_time_seconds(text: &str) -> Option<u64> {
-    parse_server_time_millis(text).map(|ms| ms / 1000)
-}
-
 /// Parse a `server-time` string to epoch **milliseconds**, preserving the
 /// optional `.mmm` fraction (padded/truncated to three digits). `None` on any
 /// format violation.
@@ -118,18 +112,23 @@ mod tests {
 
     #[test]
     fn parse_round_trips() {
+        // Formatting and parsing are exact inverses at millisecond precision,
+        // including a non-zero fraction — CHATHISTORY pages on these values,
+        // so a lossy round trip would drop or reorder messages.
         for ms in [
             0u64,
             1_000_000_000_000,
             1_582_934_400_000,
             1_784_376_000_000,
+            1_704_067_199_999,
         ] {
             let text = server_time(ms);
-            assert_eq!(parse_server_time_seconds(&text), Some(ms / 1000), "{text}");
+            assert_eq!(parse_server_time_millis(&text), Some(ms), "{text}");
         }
+        // A fractionless timestamp is accepted and reads as .000.
         assert_eq!(
-            parse_server_time_seconds("2026-07-18T12:00:00Z"),
-            Some(1_784_376_000)
+            parse_server_time_millis("2026-07-18T12:00:00Z"),
+            Some(1_784_376_000_000)
         );
         for bad in [
             "",
@@ -138,7 +137,7 @@ mod tests {
             "2026-07-18T25:00:00Z",
             "2026-07-18 12:00:00Z",
         ] {
-            assert_eq!(parse_server_time_seconds(bad), None, "{bad}");
+            assert_eq!(parse_server_time_millis(bad), None, "{bad}");
         }
     }
 
@@ -174,15 +173,14 @@ mod tests {
     }
     #[test]
     fn rejects_out_of_range_year_to_prevent_millis_overflow() {
-        // A giant year previously returned a huge `secs` whose `* 1000`
+        // A giant year previously produced a huge seconds value whose `* 1000`
         // overflowed u64 downstream (MARKREAD). It is now rejected.
-        assert_eq!(parse_server_time_seconds("585000000-01-01T00:00:00Z"), None);
-        assert_eq!(parse_server_time_seconds("-5-01-01T00:00:00Z"), None);
-        // The largest valid year still parses and its millis fit in u64.
-        let secs = parse_server_time_seconds("9999-12-31T23:59:59Z").expect("valid");
-        assert!(secs.checked_mul(1000).is_some());
-        // A normal timestamp still round-trips.
-        let secs = parse_server_time_seconds("2021-01-02T03:04:05.678Z").expect("valid");
-        assert_eq!(server_time(secs * 1000), "2021-01-02T03:04:05.000Z");
+        assert_eq!(parse_server_time_millis("585000000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_server_time_millis("-5-01-01T00:00:00Z"), None);
+        // The largest valid year still parses, in range as millis.
+        assert!(parse_server_time_millis("9999-12-31T23:59:59Z").is_some());
+        // A normal timestamp still round-trips, fraction preserved.
+        let ms = parse_server_time_millis("2021-01-02T03:04:05.678Z").expect("valid");
+        assert_eq!(server_time(ms), "2021-01-02T03:04:05.678Z");
     }
 }

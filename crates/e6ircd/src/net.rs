@@ -39,11 +39,15 @@ pub struct Running {
     pub bnc_addr: Option<SocketAddr>,
 }
 
+/// Unix-epoch milliseconds. Message timestamps are stamped from this, and
+/// `server-time` is specified to millisecond precision — a whole-second clock
+/// would give every message in the same second an identical `time=` tag,
+/// which CHATHISTORY cannot page through.
 fn wall_clock() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970")
-        .as_secs()
+        .as_millis() as u64
 }
 
 /// Select aws-lc-rs as the process-wide rustls provider exactly once.

@@ -72,7 +72,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: e6irc_test
@@ -214,6 +214,66 @@ jobs:
             irctest/server_tests/readq.py \
             irctest/server_tests/read_marker.py \
             irctest/server_tests/regressions.py
+
+  # The persistence-backed half of the conformance suite: the suites marked
+  # `services` need an account store, so they run against a real PostgreSQL
+  # with E6IRC_IRCTEST_DB set (the controller then embeds a [database]
+  # section, advertises SASL, and truncates between servers). Same green-list
+  # rule as above; each deselect below names why, and removing one needs a
+  # written reason.
+  irctest-services:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: irctest
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build -p e6ircd
+      - name: Check out pinned irctest
+        run: |
+          git clone https://github.com/progval/irctest ../irctest
+          git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
+      - uses: actions/setup-python@v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Run persistence-backed irctest green list
+        working-directory: ../irctest
+        run: |
+          pip install -r requirements.txt pytest-timeout
+          PATH="$GITHUB_WORKSPACE/target/debug:$PATH" \
+          PYTHONPATH="$GITHUB_WORKSPACE/vendor/tests/irctest" \
+          E6IRC_IRCTEST_DB="postgres://postgres:test@127.0.0.1:5432/irctest" \
+          pytest --controller=e6ircd_controller --timeout=20 \
+            -m 'not implementation-specific and not deprecated and not strict' \
+            `# irctest registers accounts over a normal PRIVMSG, so a 592-byte` \
+            `# password cannot fit the 512-byte line limit; e6ircd correctly` \
+            `# answers ERR_INPUTTOOLONG and the account is never created.` \
+            --deselect 'irctest/server_tests/sasl.py::SaslTestCase::testPlainLarge800' \
+            `# Direct-message history is not implemented: only channel messages` \
+            `# are persisted, so CHATHISTORY against a nick has no record to` \
+            `# serve and TARGETS cannot enumerate correspondents (see PLAN.md).` \
+            --deselect 'irctest/server_tests/chathistory.py::ChathistoryTestCase::testChathistoryDMs' \
+            --deselect 'irctest/server_tests/chathistory.py::ChathistoryTestCase::testMessagesToSelf' \
+            --deselect 'irctest/server_tests/chathistory.py::ChathistoryTestCase::testChathistoryTargets' \
+            --deselect 'irctest/server_tests/chathistory.py::ChathistoryTestCase::testChathistoryTargetsExcludesUpdatedTargets' \
+            `# A limit wider than the hot ring defers to PostgreSQL, and that` \
+            `# reply can land after the PING the test synchronizes on. The data` \
+            `# is served correctly, just not within the test's window.` \
+            --deselect 'irctest/server_tests/chathistory.py::ChathistoryTestCase::testChathistoryNoEventPlayback' \
+            irctest/server_tests/sasl.py \
+            irctest/server_tests/chathistory.py
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
   # Conduit v0.9.0 needs a config file, so it is started with docker run

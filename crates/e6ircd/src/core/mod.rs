@@ -33,8 +33,9 @@ pub enum Input {
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
     Closed { conn: ConnId, reason: String },
-    /// A periodic timer tick carrying the current wall-clock second, driving
-    /// the liveness reaper (registration deadline + idle PING/PONG timeout).
+    /// A periodic timer tick carrying the current wall-clock millisecond,
+    /// driving the liveness reaper (registration deadline + idle PING/PONG
+    /// timeout).
     Tick { now: u64 },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply { conn: ConnId, reply: DbReply },
@@ -188,7 +189,7 @@ pub enum DbRequest {
         /// "privmsg" or "notice".
         kind: &'static str,
         body: String,
-        /// Unix seconds.
+        /// Unix milliseconds.
         ts: u64,
     },
 }
@@ -197,6 +198,19 @@ pub enum DbRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryQuery {
     Latest {
+        limit: usize,
+    },
+    /// `LATEST` with a non-`*` selector: the *newest* `limit` messages that
+    /// are strictly newer than the bound. Deliberately distinct from
+    /// [`HistoryQuery::After`], which returns the *oldest* `limit` after the
+    /// bound — the two coincide only when fewer than `limit` messages follow
+    /// it, and draft/chathistory specifies LATEST as most-recent-first.
+    LatestAfter {
+        after_ts: u64,
+        limit: usize,
+    },
+    LatestAfterMsgid {
+        msgid: String,
         limit: usize,
     },
     Before {
@@ -213,17 +227,22 @@ pub enum HistoryQuery {
         around_ts: u64,
         limit: usize,
     },
-    /// Up to `limit` messages strictly between the two timestamps,
-    /// oldest-first.
+    /// Up to `limit` messages strictly between the two timestamps, always
+    /// returned oldest-first. `newest_first` selects which end `limit` cuts
+    /// from: CHATHISTORY BETWEEN walks from its first selector toward its
+    /// second, so a reversed (newer-first) request keeps the newest messages
+    /// in the span rather than the oldest.
     Between {
         after_ts: u64,
         before_ts: u64,
         limit: usize,
+        newest_first: bool,
     },
-    /// Msgid-pivoted variants. Because the wall clock is second-granular,
-    /// paging by timestamp alone skips messages that share the pivot's whole
-    /// second; these page on the composite `(ts, id)` relative to the pivot
-    /// row, so same-second messages are ordered definitively by the unique id.
+    /// Msgid-pivoted variants. Timestamps are millisecond-granular, but two
+    /// messages can still land in the same millisecond; paging by timestamp
+    /// alone would skip one of them. These page on the composite `(ts, id)`
+    /// relative to the pivot row, so ties are ordered definitively by the
+    /// unique id.
     BeforeMsgid {
         msgid: String,
         limit: usize,
@@ -240,6 +259,8 @@ pub enum HistoryQuery {
         after_msgid: String,
         before_msgid: String,
         limit: usize,
+        /// See [`HistoryQuery::Between::newest_first`].
+        newest_first: bool,
     },
 }
 

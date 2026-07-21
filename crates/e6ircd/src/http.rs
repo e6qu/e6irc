@@ -2487,11 +2487,11 @@ async fn history(
     }
     let limit = params.limit.unwrap_or(50).min(500);
     let query = match (&params.before, &params.after) {
-        (Some(ts), _) => match e6irc_proto::time::parse_server_time_seconds(ts) {
+        (Some(ts), _) => match e6irc_proto::time::parse_server_time_millis(ts) {
             Some(before_ts) => crate::core::HistoryQuery::Before { before_ts, limit },
             None => return problem(StatusCode::BAD_REQUEST, "Invalid 'before' timestamp", None),
         },
-        (None, Some(ts)) => match e6irc_proto::time::parse_server_time_seconds(ts) {
+        (None, Some(ts)) => match e6irc_proto::time::parse_server_time_millis(ts) {
             Some(after_ts) => crate::core::HistoryQuery::After { after_ts, limit },
             None => return problem(StatusCode::BAD_REQUEST, "Invalid 'after' timestamp", None),
         },
