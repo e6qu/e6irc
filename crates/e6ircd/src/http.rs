@@ -39,6 +39,7 @@ pub struct AppState {
     pub public_url: Option<String>,
     pub secure_cookies: bool,
     pub oidc_providers: Vec<OidcProviderConfig>,
+    pub application_release_revision: Option<String>,
     pub pending_auth: Mutex<HashMap<String, PendingAuth>>,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: e6irc_queue::Sender<crate::core::Input>,
@@ -118,6 +119,8 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(async || "ok"))
         .route("/login", get(pages::login))
         .route("/auth/signed-out", get(pages::signed_out))
+        .route("/auth/validation", get(pages::validation))
+        .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
         .route("/auth.css", get(pages::auth_styles))
         .route("/account", get(pages::account))
         .route("/account/networks", post(pages::add_network_form))
@@ -314,6 +317,16 @@ mod pages {
         has_shauth: bool,
     }
 
+    #[derive(Template)]
+    #[template(path = "validation.html")]
+    struct Validation {
+        username: String,
+        email: String,
+        role: String,
+        release: String,
+        logout_url: String,
+    }
+
     /// Login landing: one button per configured OIDC provider.
     pub async fn login(State(state): State<Arc<AppState>>) -> Response {
         let providers = state
@@ -334,6 +347,64 @@ mod pages {
                 .iter()
                 .any(|provider| provider.name == "shauth"),
         })
+    }
+
+    /// Deployment-neutral authenticated identity contract consumed by
+    /// Shauth's browser validator. It accepts only a complete durable OIDC
+    /// session and otherwise returns to the application-local signed-out page.
+    pub async fn validation(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Some(pool) = &state.pool else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                None,
+            );
+        };
+        let Some(token) = session_token(&headers, state.secure_cookies) else {
+            return validation_signed_out();
+        };
+        let identity = match crate::db::session_identity(pool, &token).await {
+            Ok(Some(identity)) => identity,
+            Ok(None) => return validation_signed_out(),
+            Err(error) => {
+                eprintln!("validation: session lookup failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session storage failed",
+                    None,
+                );
+            }
+        };
+        if identity.provider.as_deref() != Some("shauth") {
+            return validation_signed_out();
+        }
+        let (Some(email), Some(role), Some(release)) = (
+            identity.email,
+            identity.role,
+            state.application_release_revision.clone(),
+        ) else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authenticated identity contract is incomplete",
+                None,
+            );
+        };
+        render_auth(Validation {
+            username: identity.account,
+            email,
+            role,
+            release,
+            logout_url: format!("/api/v1/auth/logout?csrf={}", state.csrf_token(&token)),
+        })
+    }
+
+    fn validation_signed_out() -> Response {
+        let mut response = Redirect::to("/auth/signed-out").into_response();
+        no_store(response.headers_mut());
+        response
     }
 
     pub async fn auth_styles() -> Response {
@@ -587,10 +658,7 @@ mod pages {
         let mut response = render(template);
         if response.status().is_success() {
             let headers = response.headers_mut();
-            headers.insert(
-                header::CACHE_CONTROL,
-                "no-store".parse().expect("static header"),
-            );
+            no_store(headers);
             headers.insert(
                 header::CONTENT_SECURITY_POLICY,
                 "default-src 'none'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
@@ -653,12 +721,21 @@ async fn discover_client(
         provider.name
     ))
     .map_err(|e| e.to_string())?;
+    let auth_type = match provider.token_endpoint_auth_method {
+        crate::config::TokenEndpointAuthMethod::ClientSecretBasic => {
+            openidconnect::AuthType::BasicAuth
+        }
+        crate::config::TokenEndpointAuthMethod::ClientSecretPost => {
+            openidconnect::AuthType::RequestBody
+        }
+    };
     Ok(openidconnect::core::CoreClient::from_provider_metadata(
         metadata,
         ClientId::new(provider.client_id.clone()),
         Some(ClientSecret::new(provider.client_secret.clone())),
     )
-    .set_redirect_uri(redirect))
+    .set_redirect_uri(redirect)
+    .set_auth_type(auth_type))
 }
 
 /// TTL for a cached OIDC discovery document (and its JWKS). Bounds outbound
@@ -913,6 +990,18 @@ async fn oidc_callback(
             .and_then(|s| state.pending_auth.lock().expect("poisoned").remove(s))
             .is_some_and(|p| p.silent);
         if was_silent {
+            // `consent_required` is not `login_required`: the browser *does*
+            // have a provider session, it has simply never authorized this
+            // client. OpenID Connect answers a silent probe that way on a
+            // relying party's first visit, and the specified next step is one
+            // ordinary authorization request. For a first-party application
+            // the provider grants that without any interaction, so single
+            // sign-on stays seamless; treating it as "not signed in" would
+            // strand a signed-in user on the sign-in page forever, because the
+            // consent that is missing can never be recorded by probing.
+            if err == "consent_required" {
+                return oidc_authorize(&state, &provider_name, None, false).await;
+            }
             return Redirect::to("/?sso=none").into_response();
         }
         return problem(StatusCode::UNAUTHORIZED, "OIDC login refused", Some(&err));
@@ -1034,6 +1123,20 @@ async fn oidc_callback(
     // extended-join, account= tag); strip anything that isn't a safe nick-like
     // character so a spaced/control-laden username can't split a line.
     let preferred = sanitize_account_name(&preferred);
+    let email = claims.email().map(|value| value.as_str().to_string());
+    let role = jwt_string_claim(&id_token.to_string(), "role")
+        .ok()
+        .flatten();
+    let verified_shauth_identity = email.is_some()
+        && claims.email_verified() == Some(true)
+        && matches!(role.as_deref(), Some("developer" | "admin"));
+    if pending.provider == "shauth" && !verified_shauth_identity {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "Shauth identity claims are incomplete",
+            None,
+        );
+    }
     let account =
         match crate::db::find_or_create_oidc_account(&pool, issuer, subject, &preferred).await {
             Ok(a) => a,
@@ -1052,11 +1155,15 @@ async fn oidc_callback(
     let token = match crate::db::create_oidc_web_session(
         &pool,
         &account,
-        &id_token_raw,
-        &pending.provider,
-        issuer,
-        subject,
-        sid.as_deref(),
+        crate::db::OidcSessionIdentity {
+            id_token: Some(&id_token_raw),
+            provider: Some(&pending.provider),
+            issuer: Some(issuer),
+            subject: Some(subject),
+            sid: sid.as_deref(),
+            email: email.as_deref(),
+            role: role.as_deref(),
+        },
     )
     .await
     {
@@ -1505,6 +1612,18 @@ fn security_headers(headers: &mut axum::http::HeaderMap) {
     );
 }
 
+fn no_store(headers: &mut axum::http::HeaderMap) {
+    headers.insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    headers.insert(header::PRAGMA, "no-cache".parse().expect("static header"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        "no-referrer".parse().expect("static header"),
+    );
+}
+
 fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     cookies.split(';').find_map(|part| {
@@ -1868,6 +1987,39 @@ async fn admin_audit(
 }
 
 async fn me(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap) -> Response {
+    if let Some(token) = session_token(&headers, state.secure_cookies) {
+        let Some(pool) = &state.pool else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                None,
+            );
+        };
+        return match crate::db::session_identity(pool, &token).await {
+            Ok(Some(identity)) => (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "account": identity.account,
+                    "email": identity.email,
+                    "role": identity.role,
+                    "provider": identity.provider,
+                    "release_revision": state.application_release_revision,
+                    "logout_url": format!("/api/v1/auth/logout?csrf={}", state.csrf_token(&token)),
+                })
+                .to_string(),
+            )
+                .into_response(),
+            Ok(None) => problem(StatusCode::UNAUTHORIZED, "Not logged in", None),
+            Err(error) => {
+                eprintln!("http: identity lookup failed: {error}");
+                problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                )
+            }
+        };
+    }
     match authenticate(&state, &headers).await {
         Ok(account) => (
             [(header::CONTENT_TYPE, "application/json")],
@@ -2048,7 +2200,14 @@ async fn logout_sso(
                 .append_pair("client_id", &provider.client_id)
                 .append_pair(
                     "post_logout_redirect_uri",
-                    &format!("{}/auth/signed-out", public.trim_end_matches('/')),
+                    &if provider.name == "shauth" {
+                        format!(
+                            "{}/auth/shauth/logout/complete",
+                            public.trim_end_matches('/')
+                        )
+                    } else {
+                        format!("{}/auth/signed-out", public.trim_end_matches('/'))
+                    },
                 );
             url.to_string()
         }
@@ -2081,6 +2240,36 @@ async fn logout_sso(
         [(header::LOCATION, location), (header::SET_COOKIE, clear)],
     )
         .into_response()
+}
+
+/// The only Shauth post-logout redirect registered for e6irc. Query input is
+/// deliberately ignored; Shauth owns the one-time correlation that selects
+/// the trusted application-local signed-out destination.
+async fn shauth_logout_complete(State(state): State<Arc<AppState>>) -> Response {
+    let Some(provider) = state
+        .oidc_providers
+        .iter()
+        .find(|provider| provider.name == "shauth")
+    else {
+        return problem(StatusCode::NOT_FOUND, "Shauth is not configured", None);
+    };
+    let Ok(mut issuer) = openidconnect::url::Url::parse(&provider.issuer_url) else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Shauth issuer is invalid",
+            None,
+        );
+    };
+    issuer.set_path("/oauth/logout/complete");
+    issuer.set_query(None);
+    issuer.set_fragment(None);
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [(header::LOCATION, issuer.to_string())],
+    )
+        .into_response();
+    no_store(response.headers_mut());
+    response
 }
 
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
@@ -3699,6 +3888,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             client_secret: "secret".into(),
             scopes: vec![],
             end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
         };
         let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
         let claims = verify_logout_token_with_metadata(
@@ -3736,6 +3926,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             client_secret: "secret".into(),
             scopes: vec![],
             end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
         };
         let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
         let verify = |payload: serde_json::Value| {

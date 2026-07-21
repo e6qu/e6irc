@@ -51,6 +51,12 @@ body {
   color: var(--fg);
   text-decoration: none;
 }
+.user-role {
+  margin-inline-start: 0.35rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
 #user-nav a:hover,
 #user-nav a:focus-visible {
   color: var(--accent);

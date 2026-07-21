@@ -123,7 +123,7 @@ jobs:
 
   production-container:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - run: docker build --tag e6irc:ci .
@@ -134,6 +134,25 @@ jobs:
           docker cp "$container_id:/usr/local/bin/e6ircd" /tmp/e6ircd
           strings /tmp/e6ircd | grep -F "Open my account"
       - run: tools/test-prune-ghcr-versions.sh
+
+  shauth-sso:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/checkout@v7
+        with:
+          repository: e6qu/shauth
+          ref: 0fda680cba964e5768ed75a9c3e5b7230c418ca6
+          path: .test-deps/shauth
+      - run: npm install --global pnpm@11.15.1
+      - run: pnpm -C web install --frozen-lockfile
+      - run: pnpm -C web exec playwright install --with-deps chromium
+      - run: pnpm -C web build && cargo build -p e6ircd --features embed-web
+      - name: Exercise exact Shauth single sign-on and global logout
+        run: SHAUTH_SOURCE_DIR="$GITHUB_WORKSPACE/.test-deps/shauth" tools/test-shauth-sso.sh
 
   # Protocol conformance against the pinned irctest suite (vendored
   # hookup in vendor/tests/irctest/) with the standard irctest marker

@@ -1745,45 +1745,60 @@ fn token_hash(token: &str) -> Vec<u8> {
         .to_vec()
 }
 
+/// The upstream identity a single-sign-on web session was minted from.
+///
+/// These travel together and are all `Option<&str>` on the wire, so passing
+/// them positionally makes transposing two of them — recording an email as a
+/// role, say — a mistake the compiler cannot catch. Naming each field makes
+/// that class of error unrepresentable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OidcSessionIdentity<'a> {
+    /// The provider's ID token, retained so logout can end the upstream SSO
+    /// session (RP-initiated logout).
+    pub id_token: Option<&'a str>,
+    /// Configured provider name the identity came from.
+    pub provider: Option<&'a str>,
+    /// Issuer that asserted the identity.
+    pub issuer: Option<&'a str>,
+    /// Subject claim identifying the user at the issuer.
+    pub subject: Option<&'a str>,
+    /// Provider session identifier, used to correlate back-channel logout.
+    pub sid: Option<&'a str>,
+    pub email: Option<&'a str>,
+    pub role: Option<&'a str>,
+}
+
 /// Mint a web session for an account: opaque 32-byte token returned to
 /// the caller; only its SHA-256 is stored. 14-day expiry.
 pub async fn create_web_session(pool: &PgPool, account: &str) -> Result<String, DbError> {
-    create_web_session_full(pool, account, None, None, None, None, None).await
+    create_web_session_full(pool, account, OidcSessionIdentity::default()).await
 }
 
-/// Like [`create_web_session`], but records the OIDC `id_token` and the
-/// `provider` it came from so logout can end the upstream SSO session
-/// (RP-initiated logout).
+/// Like [`create_web_session`], but records the upstream identity so logout can
+/// end the provider's SSO session and the account page can show who is signed
+/// in.
 pub async fn create_oidc_web_session(
     pool: &PgPool,
     account: &str,
-    id_token: &str,
-    provider: &str,
-    issuer: &str,
-    subject: &str,
-    sid: Option<&str>,
+    identity: OidcSessionIdentity<'_>,
 ) -> Result<String, DbError> {
-    create_web_session_full(
-        pool,
-        account,
-        Some(id_token),
-        Some(provider),
-        Some(issuer),
-        Some(subject),
-        sid,
-    )
-    .await
+    create_web_session_full(pool, account, identity).await
 }
 
 async fn create_web_session_full(
     pool: &PgPool,
     account: &str,
-    id_token: Option<&str>,
-    provider: Option<&str>,
-    issuer: Option<&str>,
-    subject: Option<&str>,
-    sid: Option<&str>,
+    identity: OidcSessionIdentity<'_>,
 ) -> Result<String, DbError> {
+    let OidcSessionIdentity {
+        id_token,
+        provider,
+        issuer,
+        subject,
+        sid,
+        email,
+        role,
+    } = identity;
     use argon2::password_hash::rand_core::RngCore;
     let mut bytes = [0u8; 32];
     argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
@@ -1797,8 +1812,8 @@ async fn create_web_session_full(
         .map_err(DbError::Query)?;
     let inserted = sqlx::query(
         "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider,
-                                   oidc_issuer, oidc_subject, oidc_sid)
-         SELECT $1, a.id, now() + interval '14 days', $3, $4, $5, $6, $7
+                                   oidc_issuer, oidc_subject, oidc_sid, oidc_email, oidc_role)
+         SELECT $1, a.id, now() + interval '14 days', $3, $4, $5, $6, $7, $8, $9
          FROM accounts a WHERE a.name_folded = $2",
     )
     .bind(token_hash(&token))
@@ -1808,6 +1823,8 @@ async fn create_web_session_full(
     .bind(issuer)
     .bind(subject)
     .bind(sid)
+    .bind(email)
+    .bind(role)
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
@@ -1815,6 +1832,41 @@ async fn create_web_session_full(
         return Err(DbError::BadCredentials);
     }
     Ok(token)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WebSessionIdentity {
+    pub account: String,
+    pub email: Option<String>,
+    pub role: Option<String>,
+    pub provider: Option<String>,
+}
+
+/// Resolve the complete durable browser identity. Personal access tokens do
+/// not enter this path and cannot impersonate a Shauth browser session.
+pub async fn session_identity(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<WebSessionIdentity>, DbError> {
+    // (account name, email, role, provider) as selected below.
+    type IdentityRow = (String, Option<String>, Option<String>, Option<String>);
+    let row: Option<IdentityRow> = sqlx::query_as(
+        "SELECT a.name, s.oidc_email, s.oidc_role, s.oidc_provider FROM web_sessions s
+         JOIN accounts a ON a.id = s.account_id
+         WHERE s.token_hash = $1 AND s.expires_at > now()",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(
+        row.map(|(account, email, role, provider)| WebSessionIdentity {
+            account,
+            email,
+            role,
+            provider,
+        }),
+    )
 }
 
 /// Atomically consumes a signed back-channel logout token and revokes only

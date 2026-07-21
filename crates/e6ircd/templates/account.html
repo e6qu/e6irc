@@ -32,8 +32,8 @@
   </head>
   <body>
     <header>
-      <span class="who">{{ account }}</span>
-      <a href="/api/v1/auth/logout?csrf={{ csrf }}">Sign out</a>
+      <span class="who" data-shauth-user="{{ account }}">{{ account }}</span>
+      <a data-shauth-sign-out href="/api/v1/auth/logout?csrf={{ csrf }}">Sign out</a>
     </header>
     <main>
       <h2>Networks</h2>

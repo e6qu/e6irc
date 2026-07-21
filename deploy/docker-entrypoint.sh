@@ -20,6 +20,7 @@ set -eu
 : "${E6IRC_SERVER_NAME:?E6IRC_SERVER_NAME is required}"
 : "${E6IRC_PUBLIC_URL:?E6IRC_PUBLIC_URL is required}"
 : "${E6IRC_DATABASE_URL:?E6IRC_DATABASE_URL is required}"
+: "${APPLICATION_RELEASE_REVISION:?APPLICATION_RELEASE_REVISION is required}"
 
 # Escape a value for a TOML basic (double-quoted) string.
 toml() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
@@ -28,6 +29,7 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
 {
   printf 'server_name = "%s"\n' "$(toml "$E6IRC_SERVER_NAME")"
   printf 'network_name = "%s"\n\n' "$(toml "${E6IRC_NETWORK_NAME:-e6qu}")"
+  printf 'application_release_revision = "%s"\n\n' "$(toml "$APPLICATION_RELEASE_REVISION")"
 
   # A listener is required. IRC is reached over WebSocket (/ws) publicly; the
   # raw IRC port is bound to loopback only and is not exposed.

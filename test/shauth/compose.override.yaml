@@ -1,0 +1,5 @@
+services:
+  hydra:
+    extra_hosts:
+      - "e6irc-primary.localhost:host-gateway"
+      - "e6irc-secondary.localhost:host-gateway"

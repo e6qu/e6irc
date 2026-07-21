@@ -680,10 +680,27 @@ Done:
   The application root itself became fail-closed: unauthenticated direct and
   catalog entry used a silent Shauth probe, a valid upstream session entered
   without another prompt, and a negative probe reached interactive login
-  without looping. User-facing logout used top-level RP-initiated navigation,
+  without looping. A silent probe answered `consent_required` — the browser
+  holds a provider session but has never authorized this client, which is what
+  a relying party sees on its first visit — took one ordinary authorization
+  request instead, so a first-party application joins an established single
+  sign-on session with no interaction; probing alone can never record the
+  missing consent, so treating it as "not signed in" stranded a signed-in user
+  on the sign-in page. Token-endpoint client authentication became an explicit
+  `token_endpoint_auth_method` on each provider, because the method is a
+  property of the client *registration* that discovery cannot report; Shauth
+  registers managed applications with `client_secret_post`.
+  The account and validation pages published the signed-in user as
+  `data-shauth-user` and the real sign-out control as `data-shauth-sign-out`,
+  so post-deployment qualification exercises the interface a person uses.
+  User-facing logout used top-level RP-initiated navigation,
   returned through the e6irc public URL, and refused incomplete provider or
   storage state without deleting the local session.
-  Verified end-to-end against dockerized dex + PostgreSQL.
+  Verified end-to-end against dockerized dex + PostgreSQL, and against a real
+  Shauth, Ory Hydra, PostgreSQL, two-relying-party, and Chromium stack
+  (`tools/test-shauth-sso.sh`) covering direct entry, catalog entry, single
+  sign-on into a second application, application-initiated and
+  provider-initiated logout, and fail-closed re-entry.
 
 ## Phase 5 — History + multiplexer + local always-on ✅ (2026-07-19)
 Multiplexer core: network drivers are **always-on** (broadcast events,

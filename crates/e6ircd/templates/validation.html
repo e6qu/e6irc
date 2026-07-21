@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Authenticated · e6irc</title>
+    <link rel="stylesheet" href="/auth.css" />
+  </head>
+  <body>
+    <main class="auth-shell" id="main-content">
+      <section class="auth-card" aria-labelledby="validation-title">
+        <span class="brand" aria-label="e6irc">e6irc</span>
+        <p class="eyebrow">Authenticated application</p>
+        <h1 id="validation-title">e6irc is authenticated</h1>
+        <dl class="identity" data-shauth-user="{{ username }}">
+          <div><dt>Username</dt><dd data-testid="validation-username">{{ username }}</dd></div>
+          <div><dt>Email</dt><dd data-testid="validation-email">{{ email }}</dd></div>
+          <div><dt>Role</dt><dd data-testid="validation-role">{{ role }}</dd></div>
+          <div><dt>Release</dt><dd><code data-testid="validation-release">{{ release }}</code></dd></div>
+        </dl>
+        <div class="actions">
+          <a class="primary-action" data-shauth-sign-out href="{{ logout_url }}">Sign out</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
