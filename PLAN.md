@@ -511,6 +511,39 @@ the echoed BATCH open and the framer is told not to ACK. And `FAIL BATCH
 MULTILINE_INVALID` carries no batch reference — only the limit failures take a
 parameter, the limit itself.
 
+Nineteenth sweep — adversarial pass over multiline (2026-07-21): sweep 18 added
+a new client-driven surface (a client now opens batches and the server buffers
+them), so this sweep attacked it before moving on. Three defects, all found by
+probing a running server rather than re-reading the code.
+
+(1) **A NOTICE inside a batch was relayed as a PRIVMSG.** The batch took its
+kind from its first line and silently applied it to the rest, so `NOTICE` sent
+inside a PRIVMSG batch reached recipients as a PRIVMSG. That is not cosmetic:
+NOTICE exists to say "never reply to this automatically", and rewriting it hands
+recipients a message the sender never wrote. A batch is one message, so it
+cannot be half notice — mixing them is now `FAIL BATCH MULTILINE_INVALID` and
+the batch delivers nothing.
+
+(2) **A TAGMSG could claim membership of a batch and escape it.** `TAGMSG`
+never went through the batch collector, so `@batch=<ref> TAGMSG #chan` was
+delivered immediately — *before* the batch it claimed to be part of, with its
+own msgid. A multiline batch carries PRIVMSG and NOTICE only, so a batch-tagged
+TAGMSG is now refused rather than quietly re-routed.
+
+(3) **A labeled BATCH that later failed never got its labeled response.**
+Opening a batch deliberately suppresses the empty ACK, because the batch *is*
+the response owed to that command. But if the batch was then abandoned, the
+resulting FAIL carried no label and the original labeled command was answered by
+nothing at all — a client tracking labels waits forever. Abandoning a batch now
+inherits its label, and the failure is emitted outside the current command's
+capture, since it answers the BATCH rather than whatever line tripped it.
+
+Probes that came back clean, recorded so the next sweep need not redo them:
+relayed lines stay inside the 512-byte limit even with large client tags on the
+opening BATCH (the input line limit bounds them); a second concurrent open is
+refused; and a batch whose target became unreachable before it closed is
+refused at close with nothing relayed.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
