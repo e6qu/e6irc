@@ -360,6 +360,12 @@ fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             session.nick.clone(),
         )
     };
+    // NICK to the *exact* current nick (identical bytes, not merely the same
+    // casefold) is a no-op: no rename, no broadcast, no reply. A case change
+    // (alice→Alice) is a real change and falls through.
+    if registered && old_nick_display.as_deref() == Some(nick) {
+        return;
+    }
     // A pure case change keeps the same monitor/nick key.
     let case_change_only = old_key.as_ref() == Some(&key);
     if registered && !case_change_only {

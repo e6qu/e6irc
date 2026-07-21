@@ -256,6 +256,19 @@ and `KNOCK` (`RPL_KNOCK` 710 to the invite-only channel's ops + `RPL_KNOCKDLVR`
 711 to the knocker; `713`/`714`/`403` for open/on-channel/secret). Only `REHASH`
 remains 421 — implementing it would be a silent no-op (no live config reload).
 
+Twelfth sweep — irctest differential fidelity (2026-07-21): ran the external
+irctest conformance suite locally against the newly-landed command surface and
+grew the CI green list by seven modules (`buffering`, `cap`, `channel`, `help`,
+`isupport`, `readq`, `regressions`) after confirming they pass. Differential
+testing found one real bug: a `NICK` to the client's *exact* current nick
+(identical bytes, not merely the same casefold) broadcast a spurious `NICK`
+line instead of being a silent no-op — `regressions::testCaseChanges` caught it;
+now an exact-same NICK returns early with no rename, reply, or broadcast, while a
+case change (`alice`→`Alice`) still broadcasts. The other modules that don't run
+(metadata/multiline/redact/relaymsg/roleplay/account-registration/chathistory/
+sasl/read_marker) need unimplemented drafts, services, or a database irctest
+doesn't provide, so they stay out of the list.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

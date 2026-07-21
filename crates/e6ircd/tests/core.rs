@@ -1251,6 +1251,33 @@ fn stats_uptime_and_terminator() {
 }
 
 #[test]
+fn nick_to_exact_same_nick_is_a_silent_noop() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #t");
+    s.line(bob, "JOIN #t");
+    s.drain(alice);
+    s.drain(bob);
+
+    // NICK to the exact current nick is a no-op: no reply, no broadcast.
+    s.line(alice, "NICK alice");
+    assert!(
+        s.drain(alice).is_empty(),
+        "no-op NICK must produce no reply"
+    );
+    assert!(s.drain(bob).is_empty(), "no-op NICK must not broadcast");
+
+    // A case change is a real change and IS broadcast.
+    s.line(alice, "NICK Alice");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("NICK Alice")),
+        "a case change must broadcast"
+    );
+    assert!(s.drain(bob).iter().any(|l| l.contains("NICK Alice")));
+}
+
+#[test]
 fn knock_delivers_to_ops_of_invite_only_channel() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice"); // founder → op
