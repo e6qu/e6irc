@@ -241,6 +241,21 @@ the Session but can't abort the parked socket read-task or its per-IP ConnGuard
 without a core→net abort signal — the memory is reclaimed and the OS TCP timeout
 frees the rest.
 
+Eleventh sweep — reaper completion + last commands (2026-07-21): closed the two
+items sweep 10 explicitly deferred. (1) `serve_conn` now `select!`s the read
+loop against the write task instead of awaiting the read loop alone — so a
+core-side close (the reaper, KILL, SASL-cap) drops the session's `Sender`,
+`write_loop` returns, and the read future is cancelled immediately, freeing a
+dead/partitioned peer's read task and its per-IP `ConnGuard` now rather than at
+the OS TCP timeout. Verified with a deterministic unit test (a mock peer whose
+read never completes: dropping the sendq sender must make `serve_conn` return).
+(2) The last two missing standard commands are implemented: `STATS` (`u` →
+`RPL_STATSUPTIME` 242 from a new `started_at`, every query terminated by
+`RPL_ENDOFSTATS` 219 — an unexposed letter yields the conforming empty report)
+and `KNOCK` (`RPL_KNOCK` 710 to the invite-only channel's ops + `RPL_KNOCKDLVR`
+711 to the knocker; `713`/`714`/`403` for open/on-channel/secret). Only `REHASH`
+remains 421 — implementing it would be a silent no-op (no live config reload).
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

@@ -272,6 +272,8 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "ISON" => cmd_ison(state, conn, p),
         "USERIP" => cmd_userip(state, conn, p),
         "LINKS" => cmd_links(state, conn),
+        "STATS" => cmd_stats(state, conn, p),
+        "KNOCK" => cmd_knock(state, conn, p),
         "OPER" => cmd_oper(state, conn, p),
         "KILL" => cmd_kill(state, conn, p),
         "KLINE" => cmd_add_ban(state, conn, BanKind::Kline, p),
@@ -3981,6 +3983,98 @@ fn cmd_links(state: &mut ServerState, conn: ConnId) {
         Some(&format!("0 {info}")),
     );
     state.numeric(conn, RPL_ENDOFLINKS, &["*"], Some("End of /LINKS list"));
+}
+
+fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    let Some(&letter) = p.first() else {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["STATS"],
+            Some("Not enough parameters"),
+        );
+        return;
+    };
+    // Only the STATS letter's first char is significant.
+    let letter = &letter[..letter.len().min(1)];
+    if letter == "u" {
+        let uptime = (state.config.clock)().saturating_sub(state.started_at);
+        let (days, rem) = (uptime / 86400, uptime % 86400);
+        let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        state.numeric(
+            conn,
+            RPL_STATSUPTIME,
+            &[],
+            Some(&format!("Server Up {days} days {h:02}:{m:02}:{s:02}")),
+        );
+    }
+    // Every STATS query is terminated with the end-of-report numeric; a letter
+    // with no data (or one we don't expose) yields just this terminator, which
+    // is the conforming "empty report" rather than a silent drop.
+    state.numeric(
+        conn,
+        RPL_ENDOFSTATS,
+        &[letter],
+        Some("End of /STATS report"),
+    );
+}
+
+fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    let Some(&target) = p.first() else {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["KNOCK"],
+            Some("Not enough parameters"),
+        );
+        return;
+    };
+    let key = state.chan_key(target);
+    let Some(chan) = state.channels.get(&key) else {
+        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        return;
+    };
+    let display = chan.name.clone();
+    // A secret channel is hidden: look non-existent to a non-member.
+    if chan.modes.secret && !chan.members.contains_key(&conn) {
+        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        return;
+    }
+    if chan.members.contains_key(&conn) {
+        state.numeric(
+            conn,
+            ERR_KNOCKONCHAN,
+            &[&display],
+            Some("You are on that channel"),
+        );
+        return;
+    }
+    if !chan.modes.invite_only {
+        state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"));
+        return;
+    }
+    // Deliver the knock to the channel's operators, then confirm to the knocker.
+    let prefix = state.sessions[&conn].prefix();
+    let ops: Vec<ConnId> = chan
+        .members
+        .iter()
+        .filter(|(_, m)| m.op)
+        .map(|(c, _)| *c)
+        .collect();
+    for op in ops {
+        state.numeric(
+            op,
+            RPL_KNOCK,
+            &[&display, &prefix],
+            Some("has asked for an invite"),
+        );
+    }
+    state.numeric(
+        conn,
+        RPL_KNOCKDLVR,
+        &[&display],
+        Some("Your KNOCK has been delivered"),
+    );
 }
 
 // ---- CHATHISTORY (draft/chathistory, hot ring) --------------------------

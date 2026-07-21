@@ -429,6 +429,8 @@ pub(crate) struct ServerState {
     pub db_tx: Sender<super::DbRequest>,
     /// High-water mark of simultaneously registered users (LUSERS max).
     pub max_users: usize,
+    /// Wall-clock second the server state was created (STATS u uptime).
+    pub started_at: u64,
     /// Monotonic per-process counter for msgid uniqueness.
     pub msgid_counter: u64,
     /// MONITOR: watched nick → watching connections.
@@ -494,6 +496,7 @@ pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
     pub fn new(config: CoreConfig, db_tx: Sender<super::DbRequest>) -> Self {
+        let started_at = (config.clock)();
         Self {
             config,
             casemap: CaseMapping::Rfc1459,
@@ -503,6 +506,7 @@ impl ServerState {
             doomed: Vec::new(),
             db_tx,
             max_users: 0,
+            started_at,
             msgid_counter: 0,
             monitors: HashMap::new(),
             read_markers: HashMap::new(),

@@ -1227,6 +1227,57 @@ fn ison_excludes_unregistered_nick_holders() {
 }
 
 #[test]
+fn stats_uptime_and_terminator() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+
+    s.line(alice, "STATS u");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "242"),
+        "STATS u → RPL_STATSUPTIME: {out:#?}"
+    );
+    assert!(has_numeric(&out, "219"), "STATS → RPL_ENDOFSTATS");
+
+    // An unexposed letter still terminates with a (data-less) report.
+    s.line(alice, "STATS z");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "219"),
+        "unknown STATS letter still terminates"
+    );
+    assert!(!has_numeric(&out, "242"), "no uptime for a non-u letter");
+}
+
+#[test]
+fn knock_delivers_to_ops_of_invite_only_channel() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice"); // founder → op
+    s.line(alice, "JOIN #vip");
+    s.line(alice, "MODE #vip +i");
+    s.drain(alice);
+
+    let bob = s.register(2, "bob"); // outsider
+    s.line(bob, "KNOCK #vip");
+    assert!(
+        has_numeric(&s.drain(bob), "711"),
+        "the knocker gets RPL_KNOCKDLVR"
+    );
+    assert!(has_numeric(&s.drain(alice), "710"), "the op gets RPL_KNOCK");
+
+    // Knocking an open (non-+i) channel is refused.
+    s.line(alice, "JOIN #open");
+    s.drain(alice);
+    let carol = s.register(3, "carol");
+    s.line(carol, "KNOCK #open");
+    assert!(
+        has_numeric(&s.drain(carol), "713"),
+        "an open channel → ERR_CHANOPEN"
+    );
+}
+
+#[test]
 fn idle_client_is_not_repinged_every_tick() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
