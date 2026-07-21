@@ -615,6 +615,84 @@ fn banned_external_cannot_speak_to_unmoderated_channel() {
 }
 
 #[test]
+fn topic_query_on_secret_channel_hidden_from_nonmembers() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #sec");
+    s.line(alice, "MODE #sec +s");
+    s.line(alice, "TOPIC #sec :hush hush");
+    s.drain(alice);
+
+    let bob = s.register(2, "bob"); // not a member
+    s.line(bob, "TOPIC #sec");
+    let out = s.drain(bob);
+    assert!(
+        has_numeric(&out, "442"),
+        "non-member must get ERR_NOTONCHANNEL: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("hush")),
+        "secret topic must not leak: {out:#?}"
+    );
+
+    // A member still sees it.
+    s.line(alice, "TOPIC #sec");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("hush hush")),
+        "member must see the topic"
+    );
+}
+
+#[test]
+fn service_nicks_are_reserved() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "NICK NickServ");
+    s.line(c, "USER x 0 * :X");
+    let out = s.drain(c);
+    assert!(
+        has_numeric(&out, "432"),
+        "a reserved service nick must be refused: {out:#?}"
+    );
+    assert!(!has_numeric(&out, "001"), "registration must not complete");
+}
+
+#[test]
+fn nick_and_quit_broadcasts_carry_server_time() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "server-time");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #t");
+    s.line(bob, "JOIN #t");
+    s.drain(alice);
+    s.drain(bob);
+
+    // bob renames; alice (server-time) must see an @time= tag on the NICK.
+    s.line(bob, "NICK bobby");
+    let out = s.drain(alice);
+    let nick_line = out
+        .iter()
+        .find(|l| l.contains("NICK bobby"))
+        .unwrap_or_else(|| panic!("no NICK broadcast: {out:#?}"));
+    assert!(
+        nick_line.starts_with("@time="),
+        "NICK lacks server-time: {nick_line}"
+    );
+
+    // bob quits; alice must see @time= on the QUIT too.
+    s.line(bob, "QUIT :bye");
+    let out = s.drain(alice);
+    let quit_line = out
+        .iter()
+        .find(|l| l.contains("QUIT"))
+        .unwrap_or_else(|| panic!("no QUIT broadcast: {out:#?}"));
+    assert!(
+        quit_line.starts_with("@time="),
+        "QUIT lacks server-time: {quit_line}"
+    );
+}
+
+#[test]
 fn who_and_whois() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");

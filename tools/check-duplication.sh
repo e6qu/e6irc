@@ -23,7 +23,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Ratchet threshold: max duplicated-line percentage. Lower over time.
+# Ratchet threshold: max duplicated-line percentage (jscpd --mode strict).
+# Lower over time. History: 3.75% (sweep 6 start) → 2.3% (sweep 6).
 THRESHOLD=3
 JSCPD_VERSION=4.0.5
 

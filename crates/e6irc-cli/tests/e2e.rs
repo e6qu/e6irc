@@ -162,6 +162,39 @@ async fn cli_sasl_login() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cli_rejects_one_credential_flag_without_the_other() {
+    // Giving only --account (or only --password) must fail loudly, not silently
+    // register unauthenticated and send as the wrong identity.
+    let addr = start_server().await;
+    let bin = env!("CARGO_BIN_EXE_e6irc");
+    let status = tokio::task::spawn_blocking({
+        let addr = addr.to_string();
+        move || {
+            std::process::Command::new(bin)
+                .args([
+                    "--server",
+                    &addr,
+                    "--nick",
+                    "half",
+                    "--account",
+                    "alice",
+                    "send",
+                    "#x",
+                    "hi",
+                ])
+                .status()
+                .expect("run cli")
+        }
+    })
+    .await
+    .expect("join");
+    assert!(
+        !status.success(),
+        "CLI must fail when --account is given without --password"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_history_reads_recent_messages() {
     let addr = start_server().await;
 

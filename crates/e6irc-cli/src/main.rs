@@ -131,8 +131,17 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             conn.register_sasl(&cli.nick, "e6irc-cli", account, password)
                 .await?;
         }
-        _ => {
+        (None, None) => {
             conn.register(&cli.nick, "e6irc-cli").await?;
+        }
+        // One credential without the other is a mistake — registering
+        // unauthenticated instead of what the user asked for would be a silent
+        // fallback of a client-observable option.
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--account and --password must be given together",
+            ));
         }
     }
     match cli.command {
@@ -174,6 +183,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     conn.send_line(&format!("PONG :{token}")).await?;
                     continue;
                 }
+                // A refused JOIN must be reported, not waited on forever — the
+                // same loud failure Send and History give.
+                if target.starts_with('#') && is_join_error(&msg.command) {
+                    let reason = msg.params.last().cloned().unwrap_or_default();
+                    return Err(std::io::Error::other(format!(
+                        "cannot join {target}: {reason}"
+                    )));
+                }
                 if msg.command == "PRIVMSG"
                     && msg.params.first().map(String::as_str) == Some(&target)
                 {
@@ -193,14 +210,31 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             conn.send_line("CAP LS 302").await?;
             conn.send_line("CAP REQ :batch draft/chathistory server-time")
                 .await?;
-            // wait for ACK, then request. (register already sent 001;
-            // caps requested post-registration are ACKed immediately.)
+            // Wait for the ACK, failing loudly on NAK (the whole atomic REQ is
+            // rejected if any cap is unsupported) or a mid-negotiation close —
+            // otherwise this would block forever. Answer PINGs so the server
+            // doesn't ping-timeout us while we wait.
             loop {
                 let Some(m) = conn.next_message().await? else {
-                    break;
+                    return Err(std::io::Error::other(
+                        "connection closed during CAP negotiation",
+                    ));
                 };
-                if m.command == "CAP" && m.params.get(1).map(String::as_str) == Some("ACK") {
-                    break;
+                if m.command == "CAP" {
+                    match m.params.get(1).map(String::as_str) {
+                        Some("ACK") => break,
+                        Some("NAK") => {
+                            return Err(std::io::Error::other(
+                                "server does not support the caps required for history \
+                                 (batch, draft/chathistory, server-time)",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if m.command == "PING" {
+                    let token = m.params.first().cloned().unwrap_or_default();
+                    conn.send_line(&format!("PONG :{token}")).await?;
                 }
             }
             // CHATHISTORY requires channel membership.

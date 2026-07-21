@@ -164,6 +164,31 @@ sends the current connection status on attach (the sticky flag was unused); the
 `remove_channel` drops both maps together); and the ws-irc inbound loop breaks
 the connection directly when the core is gone.
 
+Eighth hardening sweep (2026-07-21): an adversarial pass over the surfaces the
+prior sweeps under-examined — the client binaries, less-common IRC commands,
+and the queue. The `e6irc-queue` MPSC and the ISUPPORT-vs-enforcement mapping
+audited clean. Fixes: (HIGH) the CLI silently registered *unauthenticated* when
+only one of `--account`/`--password` was given — now a loud error; (MEDIUM) the
+CLI `history` subcommand hung forever if the server NAK'd the required caps — it
+now fails loudly on NAK, answers PINGs while waiting, and errors on a
+mid-negotiation close; (MEDIUM) CLI `tail` on a refused JOIN hung silently — now
+reported like `send`/`history`; (MEDIUM) a `TOPIC` query on a `+s` channel
+leaked the topic (and the channel's existence) to non-members — it now returns
+`ERR_NOTONCHANNEL` like every other query surface; (MEDIUM) NICK and QUIT were
+the only membership broadcasts hand-rolling a raw byte loop, so they omitted the
+`server-time` tag for capable clients — both now route through `send_timed`;
+(LOW) the services pseudo-client nicks (`nickserv`/`chanserv`) were not
+reserved, so a user could seize one and intercept its PRIVMSGs — one
+`SERVICE_NICKS` list now backs both the intercept and the NICK reservation;
+`MONITOR +` at the list cap reported only the first over-limit nick and silently
+dropped the rest of the batch — it now reports them all; and `set_read_marker`
+was a silent no-op when the account name didn't resolve — it now surfaces an
+`UnknownAccount` error the worker logs. Not changed, with reasons: the
+`bnc_buffer` orphan-on-account-deletion is unreachable (no account-deletion path
+exists, and `owner` is `TEXT` for the `*` shared-network sentinel, so a FK
+doesn't fit); signal handling / task supervision remains an explicit, logged
+deferral.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
