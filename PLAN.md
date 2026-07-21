@@ -218,6 +218,29 @@ check (match-position timing); a quieted member's PART reason is suppressed; and
 every HTTP response (including the JSON/problem+json paths) now carries
 `X-Content-Type-Options: nosniff`.
 
+Tenth sweep — fidelity + reaper follow-up (2026-07-21): two adversarial audits
+of the I/O layer and numerics. The concurrency audit found no bug — ConnId-reuse
+misdelivery, close() desync, and session/task leaks are structurally
+unrepresentable (monotonic `AtomicU64` ids, `close()` removes every ConnId-keyed
+reference, the reaper's close == a socket close). Fixes: (MEDIUM, self-inflicted
+by the sweep-9 reaper) an idle-but-alive client was re-PINGed on every 15s tick
+instead of every 120s, because `last_active` was serving as both the WHOIS-idle
+clock and the ping-cadence trigger — the ping cadence now keys on
+`last_active.max(last_ping_sent)` so the idle clock stays pure. Fidelity: five
+standard commands that fell through to 421 are now implemented — `VERSION`
+(351, followed by the ISUPPORT tokens), `ADMIN` (256–259 from real config),
+`ISON` (303, and only *registered* nicks, with 461 on empty), `USERIP` (340,
+sharing USERHOST's entry-builder), and `LINKS` (364/365, single-server). The two
+ISUPPORT (005) lines were factored into one `send_isupport` choke point reused
+by registration and VERSION. `deliver`'s writer-first-close comment was
+corrected to note the reaper is what bounds that drop window. Left as honest 421
+(surfaced, not silently faked): `REHASH` (would be a no-op — we have no live
+config reload), and `STATS`/`KNOCK` (larger oper-tooling / invite-request
+features for a later pass). Not fixed (architectural, bounded): the reaper frees
+the Session but can't abort the parked socket read-task or its per-IP ConnGuard
+without a core→net abort signal — the memory is reclaimed and the OS TCP timeout
+frees the rest.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
