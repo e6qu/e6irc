@@ -36,6 +36,15 @@ impl NickKey {
 pub struct CoreConfig {
     pub server_name: String,
     pub network_name: String,
+    /// This server's own description, as RPL_LINKS reports it. The network
+    /// name identifies the network; this identifies the server on it.
+    pub description: String,
+    /// Per-connection outbound queue capacity. The queue itself enforces this,
+    /// but output *withheld* behind a deferred reply has not reached the queue
+    /// yet, so the same bound is applied to it here — otherwise a connection
+    /// waiting on the database could accumulate lines without limit and escape
+    /// the SendQ kill entirely.
+    pub sendq: usize,
     pub motd: Vec<String>,
     pub nicklen: usize,
     /// Advertise and accept SASL. Off when no database is configured —
@@ -1049,13 +1058,22 @@ impl ServerState {
     /// labeled response to its own command — only direct replies are.
     pub fn send_bytes_uncaptured(&mut self, conn: ConnId, bytes: Bytes) {
         // Hold this line behind an in-flight deferred reply, unless it *is*
-        // that reply being emitted right now.
-        if self.emitting_deferred != Some(conn)
-            && let Some(session) = self.sessions.get_mut(&conn)
-            && session.deferred_replies > 0
-        {
-            session.held.push(bytes);
-            return;
+        // that reply being emitted right now. Held output is bounded exactly
+        // like the queue it is waiting to enter: overflowing it is a SendQ
+        // kill, not unbounded growth.
+        if self.emitting_deferred != Some(conn) {
+            let sendq = self.config.sendq;
+            match self.sessions.get_mut(&conn) {
+                Some(session) if session.deferred_replies > 0 => {
+                    if session.held.len() < sendq {
+                        session.held.push(bytes);
+                    } else {
+                        self.doomed.push(conn);
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
         let Some(session) = self.sessions.get(&conn) else {
             return; // events may race a close; the session is gone

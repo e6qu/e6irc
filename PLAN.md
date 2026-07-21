@@ -412,6 +412,40 @@ unchanged from sweep 14 (irctest registers accounts over a normal PRIVMSG, so a
 592-byte password cannot fit the 512-byte line limit; e6ircd correctly answers
 ERR_INPUTTOOLONG).
 
+Sixteenth sweep — LINKS fidelity + hardening the deferred-reply path
+(2026-07-21): a differential pass over the irctest modules neither green list
+covers found `links` failing, and an adversarial re-read of the machinery sweep
+15 had just landed found a denial-of-service vector in it.
+
+**RPL_LINKS reported the network name where the spec asks for `<server info>`**
+— this server's own description. Those are different things, and e6ircd had no
+description to report, so it substituted the network's name. A `description`
+config field now exists (default `"e6irc server"`) and RPL_LINKS uses it;
+`links` joins both green lists. Its services case stays deselected with a
+written reason: e6ircd's services are integrated, not a linked second server, so
+there is no `My.Little.Services` entry to report — the same reason the test
+records for Ergo.
+
+**Held output was unbounded.** Sweep 15 made a connection's output wait behind
+an in-flight database reply so replies stay in command order. That held output
+had not yet entered the send queue, so it escaped the queue's capacity — and
+with it the SendQ kill. A connection that deferred a reply and then drew traffic
+could grow a buffer without limit, which is a memory-exhaustion vector the
+sweep introduced. Held output now carries exactly the bound of the queue it is
+waiting to enter, and overrunning it is a SendQ kill like any other. The
+regression test was checked against the unfixed code first: it buffers 202 lines
+without the bound and is capped with it. (The first version of that test passed
+either way — a held PONG is indistinguishable from a closed connection — which
+is why it is now written to release the hold and count what comes out.)
+
+**Account names can no longer contain `!`** (migration 0023). Conversations are
+keyed by their participants' identities joined with `!`, so an account named
+`a!b` could collide with the conversation between `a` and `b` and read it.
+Both paths that create accounts already exclude it — NickServ registers a
+validated nick, OIDC provisioning filters to `[A-Za-z0-9-_]` — but that was an
+invariant held by callers, and the next caller can forget it. A CHECK constraint
+enforces it where the name is stored, so the bug class cannot return.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

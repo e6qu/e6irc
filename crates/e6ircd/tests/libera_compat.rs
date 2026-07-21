@@ -70,6 +70,8 @@ fn our_isupport() -> HashMap<String, String> {
         CoreConfig {
             server_name: "irc.test.example".into(),
             network_name: "TestNet".into(),
+            description: "test server".into(),
+            sendq: 256,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: true,

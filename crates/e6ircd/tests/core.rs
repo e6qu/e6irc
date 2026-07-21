@@ -34,14 +34,20 @@ impl TestServer {
             static NOW_MS: AtomicU64 = AtomicU64::new(1_000_000_000);
             NOW_MS.fetch_add(1, Ordering::Relaxed)
         }
-        Self::with_config(false, advancing)
+        Self::with_config(false, advancing, 256)
+    }
+
+    /// A database-backed server with a deliberately small per-connection
+    /// output bound, for exercising SendQ-style limits.
+    fn with_sendq(sendq: usize) -> Self {
+        Self::with_config(true, || 1_000_000_000, sendq)
     }
 
     fn with_persistence(sasl_enabled: bool) -> Self {
-        Self::with_config(sasl_enabled, || 1_000_000_000)
+        Self::with_config(sasl_enabled, || 1_000_000_000, 256)
     }
 
-    fn with_config(sasl_enabled: bool, clock: fn() -> u64) -> Self {
+    fn with_config(sasl_enabled: bool, clock: fn() -> u64, sendq: usize) -> Self {
         let (db_tx, db_rx) = queue(Config {
             name: "test-db",
             capacity: 64,
@@ -52,6 +58,8 @@ impl TestServer {
                 CoreConfig {
                     server_name: "irc.test.example".into(),
                     network_name: "TestNet".into(),
+                    description: "test server".into(),
+                    sendq,
                     motd: vec!["Welcome to the test net".into()],
                     nicklen: 16,
                     sasl_enabled,
@@ -2716,6 +2724,8 @@ fn hot_history_ring_is_lru_evicted() {
         CoreConfig {
             server_name: "irc.test.example".into(),
             network_name: "T".into(),
+            description: "test server".into(),
+            sendq: 256,
             motd: vec![],
             nicklen: 16,
             sasl_enabled: false,
@@ -3494,6 +3504,47 @@ fn chanserv_set_mlock_enforces_modes() {
 }
 
 #[test]
+fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
+    // A CHATHISTORY page that reaches PostgreSQL is answered asynchronously,
+    // and the connection's later output waits behind it so replies stay in
+    // command order. That held output has not entered the send queue yet, so
+    // it must carry the same bound: without one, a connection waiting on the
+    // database could accumulate lines without limit and escape the SendQ kill.
+    const SENDQ: usize = 8;
+    const FLOOD: usize = 200;
+    let mut s = TestServer::with_sendq(SENDQ);
+    // echo-message so the connection's own traffic is output *to it*, which is
+    // what accumulates behind the hold.
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/chathistory message-tags echo-message",
+    );
+    s.line(alice, "JOIN #room");
+    s.drain(alice);
+    // Defer a reply: nothing drains the fake DB queue, so the hold stays open.
+    s.line(alice, "CHATHISTORY LATEST #room * 50");
+    s.drain(alice);
+    for i in 0..FLOOD {
+        s.line(alice, &format!("PRIVMSG #room :flood {i}"));
+    }
+    // Now let the deferred reply land, which releases whatever was held.
+    s.core.handle(Input::HistoryPage {
+        conn: alice,
+        display: "#room".into(),
+        batch_ref: "b1".into(),
+        rows: Vec::new(),
+        label: None,
+    });
+    let released = s.drain(alice).len();
+    assert!(
+        released < FLOOD,
+        "held output must be bounded, not buffer the whole flood: {released} lines"
+    );
+}
+
+#[test]
 fn history_logmessage_gated_on_database() {
     // A channel message enqueues a LogMessage to persist history only when
     // a database is present. Without one, every enqueue would fail (no db
@@ -3509,6 +3560,8 @@ fn history_logmessage_gated_on_database() {
             CoreConfig {
                 server_name: "irc.test.example".into(),
                 network_name: "T".into(),
+                description: "test server".into(),
+                sendq: 256,
                 motd: vec![],
                 nicklen: 16,
                 sasl_enabled,

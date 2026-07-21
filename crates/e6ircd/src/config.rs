@@ -15,6 +15,10 @@ fn default_sendq() -> usize {
 fn default_core_queue() -> usize {
     65536
 }
+fn default_description() -> String {
+    "e6irc server".into()
+}
+
 fn default_max_hot_channels() -> usize {
     8192
 }
@@ -24,6 +28,11 @@ fn default_max_hot_channels() -> usize {
 pub struct Config {
     pub server_name: String,
     pub network_name: String,
+    /// Human-readable description of *this server* (RPL_LINKS `<server info>`).
+    /// Distinct from `network_name`, which names the network this server
+    /// belongs to — the two are different things and RPL_LINKS wants this one.
+    #[serde(default = "default_description")]
+    pub description: String,
     #[serde(default)]
     pub motd: Vec<String>,
     #[serde(default)]
@@ -236,6 +245,7 @@ impl Default for Config {
         Self {
             server_name: "irc.localhost".into(),
             network_name: "e6irc".into(),
+            description: default_description(),
             motd: Vec::new(),
             listeners: Vec::new(),
             nicklen: default_nicklen(),

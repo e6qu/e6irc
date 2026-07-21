@@ -213,6 +213,7 @@ jobs:
             irctest/server_tests/isupport.py \
             irctest/server_tests/readq.py \
             irctest/server_tests/read_marker.py \
+            irctest/server_tests/links.py \
             irctest/server_tests/regressions.py
 
   # The persistence-backed half of the conformance suite: the suites marked
@@ -261,8 +262,13 @@ jobs:
             `# password cannot fit the 512-byte line limit; e6ircd correctly` \
             `# answers ERR_INPUTTOOLONG and the account is never created.` \
             --deselect 'irctest/server_tests/sasl.py::SaslTestCase::testPlainLarge800' \
+            `# e6ircd's services are integrated, not a linked second server, so` \
+            `# there is no My.Little.Services entry for LINKS to report (the` \
+            `# same reason the test notes for Ergo).` \
+            --deselect 'irctest/server_tests/links.py::ServicesLinksTestCase::testLinksWithServices' \
             irctest/server_tests/sasl.py \
-            irctest/server_tests/chathistory.py
+            irctest/server_tests/chathistory.py \
+            irctest/server_tests/links.py
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
   # Conduit v0.9.0 needs a config file, so it is started with docker run

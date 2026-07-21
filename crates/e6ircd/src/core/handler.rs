@@ -4049,7 +4049,9 @@ fn cmd_userip(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 fn cmd_links(state: &mut ServerState, conn: ConnId) {
     // A single server links only to itself, at hop 0.
     let server = state.config.server_name.clone();
-    let info = state.config.network_name.clone();
+    // `<hopcount> <server info>`: the server's own description, not the
+    // network's name — this server is the only link it knows about.
+    let info = state.config.description.clone();
     state.numeric(
         conn,
         RPL_LINKS,
