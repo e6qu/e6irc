@@ -354,6 +354,64 @@ CLI `e2e` tests plus the new services conformance run — was re-verified agains
 local PostgreSQL 18.4. Legacy majors are not a support target, so DESIGN §8 now
 says 18 rather than "≥ 15": the project should test the version it claims.
 
+Fifteenth sweep — direct-message history (2026-07-21): implemented the feature
+sweep 14 surfaced as missing, taking `chathistory` conformance from 7/16 to
+**16/16** and emptying that green list's deselects.
+
+A conversation is stored **once**, under a key built from both participants'
+identities sorted and joined by `!`. Sorting makes the key symmetric, so both
+sides read the same thread from one copy; replay re-addresses each message to
+its original recipient rather than to the conversation, so a replayed line is
+identical to the one delivered live, and the batch still echoes the target as
+the client spelled it.
+
+The identity is the participant's **account**, not their nick — and irctest has
+a regression test that explains why. A nick is released on disconnect and anyone
+may take it, so a nick-keyed conversation would mean *registering a nick handed
+you the previous holder's private messages*. An unauthenticated participant gets
+a `~`-prefixed identity instead; `~` is legal in neither a nick nor an account
+name, so it can never be claimed by an account of the same name. Two successive
+unauthenticated holders of a nick do still share one identity — there is nothing
+stronger to key on, and scoping to the connection would cut the other side off
+from their own conversation the moment the peer left. The account boundary is
+the one that carries privilege, and it is the one enforced.
+
+Four real bugs surfaced on the way, none of them specific to direct messages:
+
+(1) **Reads overtook their own writes.** The database worker buffers
+`LogMessage` rows to batch them, but ran any *other* request — including a
+CHATHISTORY query — before flushing that buffer. A client that sent a message
+and immediately asked for history queried a database that did not contain it
+yet. A read now flushes the pending batch first; consecutive messages still
+batch.
+
+(2) **Replies could arrive out of order.** A CHATHISTORY page that reaches
+Postgres is answered asynchronously, so anything produced meanwhile — including
+the PONG to a PING the client pipelined behind it — overtook the batch. A client
+treating that PONG as a sync point concluded the history was empty, which is
+indistinguishable from the server having none. A connection with a deferred
+reply in flight now holds its later output behind it. This also fixed the one
+non-DM test sweep 14 had deselected (`testChathistoryNoEventPlayback`).
+
+(3) **CHATHISTORY TARGETS was ordered backwards** (newest-first) and its window
+bounds were inclusive; both are the opposite of what draft/chathistory
+specifies. Targets are now oldest-activity-first with exclusive bounds, so a
+limit keeps the oldest buffers.
+
+(4) **TARGETS matched a buffer on any message in the window** rather than on its
+*latest* message falling there. A buffer whose newest activity is outside the
+window has already been read past, and reporting it hands a reconnecting client
+backlog it does not need.
+
+Boy-scout: the per-channel ring moved out of `Channel` into one history store
+shared by channels and conversations — one ring, one LRU, one cap, one
+overflow/eviction rule — rather than growing a second parallel copy for direct
+messages. `Topic`/`Channel` timestamps and the message path went with it. The
+one remaining deselect in the persistence-backed list is `testPlainLarge800`,
+unchanged from sweep 14 (irctest registers accounts over a normal PRIVMSG, so a
+592-byte password cannot fit the 512-byte line limit; e6ircd correctly answers
+ERR_INPUTTOOLONG).
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

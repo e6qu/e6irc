@@ -183,6 +183,18 @@ pub(crate) struct Session {
     pub awaiting_pong: bool,
     /// Wall-clock millisecond the outstanding liveness PING was sent.
     pub last_ping_sent: u64,
+    /// How many database-backed replies this connection is still waiting on,
+    /// and the output withheld behind them.
+    ///
+    /// A client's replies must reach it in the order it issued the commands.
+    /// CHATHISTORY can only be answered after a round trip to PostgreSQL, and
+    /// everything produced in the meantime — including the PONG to a PING the
+    /// client pipelined right after — would otherwise overtake the batch. A
+    /// client that treats that PONG as a sync point then concludes the history
+    /// was empty, which is indistinguishable from the server having no history
+    /// at all.
+    pub deferred_replies: usize,
+    pub held: Vec<Bytes>,
 }
 
 impl Session {
@@ -322,8 +334,42 @@ pub(crate) struct HistoryEntry {
     pub body: String,
 }
 
-/// Ring capacity per channel; older entries live only in PostgreSQL.
+/// Ring capacity per target; older entries live only in PostgreSQL.
 pub(crate) const HISTORY_RING_CAP: usize = 500;
+
+/// Casefolded key for anything that can hold history: a channel, or the
+/// direct-message conversation between two nicks.
+///
+/// A conversation key is the two casefolded nicks sorted and joined by `!`,
+/// which is invalid in a nick (it delimits `nick!user@host`), so a
+/// conversation can never collide with a nick; and channel names start with
+/// `#`/`&`, which is not a legal nick start, so it can never collide with a
+/// channel either. Sorting is what makes the key *symmetric*: both
+/// participants derive the identical key, so one stored copy serves both
+/// sides of the conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HistoryKey(String);
+
+impl HistoryKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&ChanKey> for HistoryKey {
+    fn from(key: &ChanKey) -> Self {
+        HistoryKey(key.as_str().to_string())
+    }
+}
+
+/// One target's newest-last hot history.
+pub(crate) struct HistoryRing {
+    pub entries: std::collections::VecDeque<HistoryEntry>,
+    /// True while the ring holds *every* message this target has ever seen
+    /// (never overflowed, never evicted). When false, older history lives
+    /// only in Postgres and CHATHISTORY must fall back.
+    pub complete: bool,
+}
 
 #[derive(Clone)]
 pub(crate) struct Topic {
@@ -402,12 +448,6 @@ pub(crate) struct Channel {
     /// Unix **seconds** — RPL_CREATIONTIME reports whole seconds, so this is
     /// deliberately coarser than the millisecond `Config::clock`.
     pub created_at_secs: u64,
-    /// Newest-last hot history ring for CHATHISTORY.
-    pub history: std::collections::VecDeque<HistoryEntry>,
-    /// True while the ring holds *every* message the channel has ever
-    /// seen (never overflowed, never evicted). When false, older
-    /// history lives only in Postgres and CHATHISTORY must fall back.
-    pub history_complete: bool,
 }
 
 impl Channel {
@@ -480,11 +520,18 @@ pub(crate) struct ServerState {
     pub server_bans: Vec<ServerBan>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
-    /// Channels holding a hot history ring, most-recently-active first.
-    pub hot_channels: std::collections::VecDeque<ChanKey>,
+    /// Hot history rings, keyed by channel or direct-message conversation.
+    /// Channels and conversations share one store, one LRU and one cap, so
+    /// the ring, overflow and eviction rules cannot drift apart between them.
+    pub history: HashMap<HistoryKey, HistoryRing>,
+    /// Targets holding a hot history ring, most-recently-active first.
+    pub hot_history: std::collections::VecDeque<HistoryKey>,
     /// When set, direct sends to this connection are captured instead
     /// of delivered — the labeled-response machinery frames them.
     pub capture: Option<Capture>,
+    /// While set, output to this connection bypasses its deferred-reply hold:
+    /// it is the deferred reply itself, which the held output waits behind.
+    pub emitting_deferred: Option<ConnId>,
 }
 
 /// Buffered direct responses to a labeled command.
@@ -535,7 +582,9 @@ impl ServerState {
             channel_access: HashMap::new(),
             server_bans: Vec::new(),
             whowas: std::collections::VecDeque::new(),
-            hot_channels: std::collections::VecDeque::new(),
+            history: HashMap::new(),
+            hot_history: std::collections::VecDeque::new(),
+            emitting_deferred: None,
             capture: None,
         }
     }
@@ -545,29 +594,60 @@ impl ServerState {
     /// the least-recently-active channel once the cap is exceeded. An
     /// evicted or overflowed ring is marked incomplete so CHATHISTORY
     /// pages the remainder from Postgres.
-    pub fn push_channel_history(&mut self, key: &ChanKey, entry: HistoryEntry) {
+    /// Append to a target's hot ring, creating it if absent, and keep the LRU
+    /// within `max_hot_channels`. One implementation serves channels and
+    /// direct-message conversations alike — the eviction discipline that
+    /// bounds hot-history RAM must not differ by target kind.
+    pub fn push_history(&mut self, key: &HistoryKey, entry: HistoryEntry) {
         {
-            let Some(chan) = self.channels.get_mut(key) else {
-                return;
-            };
-            if chan.history.len() == HISTORY_RING_CAP {
-                chan.history.pop_front();
-                chan.history_complete = false;
+            // A ring being created now is the *entire* record only when no
+            // database backs it. With a DB this target may have rows in
+            // `messages` already — an earlier incarnation of the channel
+            // (they are dropped when they empty), or an earlier stretch of
+            // the same conversation — so the ring is not authoritative and
+            // CHATHISTORY must be able to fall back rather than report an
+            // empty batch. One rule for channels and conversations alike.
+            let whole_record = !self.config.sasl_enabled;
+            let ring = self
+                .history
+                .entry(key.clone())
+                .or_insert_with(|| HistoryRing {
+                    entries: std::collections::VecDeque::new(),
+                    complete: whole_record,
+                });
+            if ring.entries.len() == HISTORY_RING_CAP {
+                ring.entries.pop_front();
+                ring.complete = false;
             }
-            chan.history.push_back(entry);
+            ring.entries.push_back(entry);
         }
         // Move to MRU.
-        self.hot_channels.retain(|k| k != key);
-        self.hot_channels.push_front(key.clone());
-        // Evict cold rings beyond the cap.
-        while self.hot_channels.len() > self.config.max_hot_channels {
-            if let Some(cold) = self.hot_channels.pop_back()
-                && let Some(chan) = self.channels.get_mut(&cold)
-            {
-                chan.history.clear();
-                chan.history.shrink_to_fit();
-                chan.history_complete = false;
+        self.hot_history.retain(|k| k != key);
+        self.hot_history.push_front(key.clone());
+        // Evict cold rings beyond the cap. An evicted target keeps no ring at
+        // all; its history is served from Postgres.
+        while self.hot_history.len() > self.config.max_hot_channels {
+            if let Some(cold) = self.hot_history.pop_back() {
+                self.history.remove(&cold);
             }
+        }
+    }
+
+    /// A target's hot ring, or an empty incomplete one when it has never been
+    /// created or was evicted — an absent ring is never "the whole record".
+    pub fn history_ring(&self, key: &HistoryKey) -> (Vec<HistoryEntry>, bool) {
+        match self.history.get(key) {
+            Some(ring) => (ring.entries.iter().cloned().collect(), ring.complete),
+            None => (Vec::new(), false),
+        }
+    }
+
+    /// Mark a target's ring as no longer the whole record (a message was
+    /// delivered but could not be persisted, so a gap exists that only
+    /// Postgres could fill — and it does not have it either).
+    pub fn mark_history_incomplete(&mut self, key: &HistoryKey) {
+        if let Some(ring) = self.history.get_mut(key) {
+            ring.complete = false;
         }
     }
 
@@ -577,7 +657,9 @@ impl ServerState {
     /// ring early under the `max_hot_channels` cap.
     pub fn remove_channel(&mut self, key: &ChanKey) {
         self.channels.remove(key);
-        self.hot_channels.retain(|k| k != key);
+        let hist = HistoryKey::from(key);
+        self.history.remove(&hist);
+        self.hot_history.retain(|k| k != &hist);
     }
 
     /// Record a nick's details into the WHOWAS ring (on quit/nick change).
@@ -622,6 +704,13 @@ impl ServerState {
     /// Key a channel name for lookup/storage.
     pub fn chan_key(&self, name: &str) -> ChanKey {
         ChanKey(self.casemap.casefold(name))
+    }
+
+    /// The channel key for `target`, or `None` when it does not name a
+    /// channel at all — so a caller handling both channels and users cannot
+    /// accidentally casefold a nick into the channel table.
+    pub fn chan_key_if_channel(&self, target: &str) -> Option<ChanKey> {
+        target.starts_with('#').then(|| self.chan_key(target))
     }
 
     /// Load persisted channel ownership as `(name_folded, founder_folded)`
@@ -789,6 +878,98 @@ impl ServerState {
         NickKey(self.casemap.casefold(nick))
     }
 
+    /// A casefolded nick rendered for display: the online user's actual nick
+    /// casing when they are connected, otherwise the casefolded form itself
+    /// (the only spelling still on record once they have gone).
+    pub fn display_nick(&self, folded: &str) -> String {
+        self.nicks
+            .get(&NickKey(folded.to_string()))
+            .and_then(|&conn| self.sessions.get(&conn))
+            .and_then(|s| s.nick.clone())
+            .unwrap_or_else(|| folded.to_string())
+    }
+
+    /// A conversation participant rendered as a nick for display: the `~`
+    /// marker is stripped from an unauthenticated identity, and an account is
+    /// shown as the nick currently using it when its owner is online.
+    pub fn identity_nick(&self, identity: &str) -> String {
+        match identity.strip_prefix('~') {
+            Some(nick) => self.display_nick(nick),
+            None => self
+                .sessions
+                .values()
+                .find(|s| {
+                    s.account
+                        .as_deref()
+                        .is_some_and(|a| self.casemap.casefold(a) == identity)
+                })
+                .and_then(|s| s.nick.clone())
+                .unwrap_or_else(|| identity.to_string()),
+        }
+    }
+
+    /// Who a connection *is*, for the purpose of owning direct-message
+    /// history: its services account, or — when it has not authenticated —
+    /// a `~`-prefixed form of its nick.
+    ///
+    /// A nick is not an identity: it is released on disconnect and anyone may
+    /// then take it. Keying conversations by nick alone would mean registering
+    /// a nick handed you the previous holder's private messages. `~` cannot
+    /// occur in a nick or an account name, so an unauthenticated identity can
+    /// never be claimed later by an account of the same name.
+    ///
+    /// Two successive *unauthenticated* holders of a nick do still share the
+    /// `~nick` identity — without accounts there is nothing stronger to key on,
+    /// and scoping it to the connection instead would cut the other participant
+    /// off from their own conversation the moment the peer disconnected. The
+    /// account boundary is the one that carries privilege, and it is the one
+    /// enforced here; irctest's `testChathistoryDMs` covers the regression.
+    pub fn conn_identity(&self, conn: ConnId) -> String {
+        match self.sessions.get(&conn) {
+            Some(s) => match &s.account {
+                Some(account) => self.casemap.casefold(account),
+                None => format!(
+                    "~{}",
+                    self.casemap.casefold(s.nick.as_deref().unwrap_or(""))
+                ),
+            },
+            None => String::new(),
+        }
+    }
+
+    /// The identity behind a nick. An online nick resolves through its session
+    /// (so an unauthenticated user resolves to their unclaimable `~` identity);
+    /// an offline one is taken to be an account name, which is what lets a
+    /// conversation with a registered user be read while they are away.
+    pub fn nick_identity(&self, nick: &str) -> String {
+        match self.registered_peer(&self.nick_key(nick)) {
+            Some(conn) => self.conn_identity(conn),
+            None => self.casemap.casefold(nick),
+        }
+    }
+
+    /// The history key for the direct-message conversation between two
+    /// identities (see [`ServerState::conn_identity`]), with its participants.
+    ///
+    /// Both are returned from one place so they cannot disagree: the key is
+    /// exactly the participants joined, and a mismatch between "where the
+    /// message is stored" and "who is allowed to find it" would either hide a
+    /// conversation from a participant or expose it to a stranger.
+    ///
+    /// Sorting makes the key symmetric — both participants derive the same one,
+    /// so a single stored copy serves both sides. A message to oneself yields a
+    /// single participant.
+    pub fn dm_conversation(&self, a: &str, b: &str) -> (HistoryKey, Vec<String>) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let key = HistoryKey(format!("{lo}!{hi}"));
+        let peers = if lo == hi {
+            vec![lo.to_string()]
+        } else {
+            vec![lo.to_string(), hi.to_string()]
+        };
+        (key, peers)
+    }
+
     /// Resolve a nick to the connection that owns it, but only once that
     /// session is fully registered. A pre-registration session reserves its
     /// nick (so the nick collides for others) yet has no `user`/`realname`
@@ -837,6 +1018,8 @@ impl ServerState {
                 signon: 0,
                 opened_at,
                 awaiting_pong: false,
+                deferred_replies: 0,
+                held: Vec::new(),
                 last_ping_sent: 0,
             },
         );
@@ -865,11 +1048,43 @@ impl ServerState {
     /// connection *receives* (deliveries), which are never part of the
     /// labeled response to its own command — only direct replies are.
     pub fn send_bytes_uncaptured(&mut self, conn: ConnId, bytes: Bytes) {
+        // Hold this line behind an in-flight deferred reply, unless it *is*
+        // that reply being emitted right now.
+        if self.emitting_deferred != Some(conn)
+            && let Some(session) = self.sessions.get_mut(&conn)
+            && session.deferred_replies > 0
+        {
+            session.held.push(bytes);
+            return;
+        }
         let Some(session) = self.sessions.get(&conn) else {
             return; // events may race a close; the session is gone
         };
         if deliver(&session.tx, Output(bytes)).is_err() {
             self.doomed.push(conn);
+        }
+    }
+
+    /// Note that a connection is now waiting on a database-backed reply, so
+    /// its later output queues behind it.
+    pub fn defer_reply(&mut self, conn: ConnId) {
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.deferred_replies += 1;
+        }
+    }
+
+    /// One deferred reply has been emitted: release the output withheld behind
+    /// it, in the order it was produced.
+    pub fn release_deferred(&mut self, conn: ConnId) {
+        let Some(session) = self.sessions.get_mut(&conn) else {
+            return;
+        };
+        session.deferred_replies = session.deferred_replies.saturating_sub(1);
+        if session.deferred_replies > 0 {
+            return;
+        }
+        for bytes in std::mem::take(&mut session.held) {
+            self.send_bytes_uncaptured(conn, bytes);
         }
     }
 

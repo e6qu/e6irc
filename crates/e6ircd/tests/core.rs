@@ -3127,6 +3127,87 @@ fn replayed_message_keeps_the_time_it_was_delivered_with() {
 }
 
 #[test]
+fn direct_message_history_is_shared_by_both_participants() {
+    // A conversation is stored once under a key both sides derive, so each
+    // participant's CHATHISTORY sees the whole thread — not just the half they
+    // sent — and every message keeps the recipient it was addressed to.
+    let mut s = TestServer::new_no_persistence();
+    let caps = "batch draft/chathistory message-tags";
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    let bob = register_with_caps(&mut s, 2, "bob", caps);
+    s.line(alice, "PRIVMSG bob :hi bob");
+    s.line(bob, "PRIVMSG alice :hi alice");
+    s.drain(alice);
+    s.drain(bob);
+
+    for (who, peer, expected_targets) in [
+        (alice, "bob", ["bob", "alice"]),
+        (bob, "alice", ["bob", "alice"]),
+    ] {
+        s.line(who, &format!("CHATHISTORY LATEST {peer} * 10"));
+        let out = s.drain(who);
+        let inner: Vec<_> = out[1..out.len() - 1].to_vec();
+        assert_eq!(inner.len(), 2, "both sides of the thread: {out:#?}");
+        assert!(inner[0].ends_with(":hi bob"), "{}", inner[0]);
+        assert!(inner[1].ends_with(":hi alice"), "{}", inner[1]);
+        // Each row keeps its original recipient, not the conversation name.
+        for (i, target) in expected_targets.iter().enumerate() {
+            assert!(
+                inner[i].contains(&format!(" PRIVMSG {target} :")),
+                "row {i} addressed to {target}: {}",
+                inner[i]
+            );
+        }
+    }
+}
+
+#[test]
+fn chathistory_targets_lists_conversations_and_orders_oldest_first() {
+    // TARGETS enumerates channels *and* direct-message correspondents, oldest
+    // activity first, and matches a buffer on its latest message falling in the
+    // window — a buffer whose newest activity is outside it has been read past.
+    let mut s = TestServer::new_no_persistence();
+    let caps = "batch draft/chathistory message-tags server-time";
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    let bob = register_with_caps(&mut s, 2, "bob", caps);
+    s.line(alice, "JOIN #room");
+    s.line(bob, "JOIN #room");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(alice, "PRIVMSG #room :in the channel");
+    s.line(alice, "PRIVMSG bob :in a dm");
+    s.drain(alice);
+    s.drain(bob);
+
+    s.line(
+        alice,
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z          timestamp=2262-01-01T00:00:00.000Z 10",
+    );
+    let out = s.drain(alice);
+    let listed: Vec<String> = out
+        .iter()
+        .filter(|l| l.contains("CHATHISTORY TARGETS "))
+        .filter_map(|l| l.split_whitespace().nth(4).map(str::to_string))
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["#room".to_string(), "bob".to_string()],
+        "{out:#?}"
+    );
+
+    // A window that ends before the buffers' latest activity matches nothing.
+    s.line(
+        alice,
+        "CHATHISTORY TARGETS timestamp=1970-01-01T00:00:00.000Z          timestamp=1970-01-02T00:00:00.000Z 10",
+    );
+    let out = s.drain(alice);
+    assert!(
+        !out.iter().any(|l| l.contains("CHATHISTORY TARGETS ")),
+        "no buffer's latest message is in that window: {out:#?}"
+    );
+}
+
+#[test]
 fn chathistory_around_msgid() {
     let mut s = TestServer::new_no_persistence();
     let alice = s.register(1, "alice");

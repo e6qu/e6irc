@@ -119,6 +119,10 @@ pub enum DbRequest {
         conn: ConnId,
         /// Casefolded channel targets the requester may see.
         channels: Vec<String>,
+        /// The requester's casefolded nick, used to find the direct-message
+        /// conversations they take part in. Their correspondents are buffers
+        /// too, and a bouncer reconnecting needs them alongside channels.
+        me: String,
         min_ts: u64,
         max_ts: u64,
         limit: usize,
@@ -182,8 +186,14 @@ pub enum DbRequest {
     /// Append one chat message to history. Fire-and-forget: no reply.
     LogMessage {
         msgid: String,
-        /// Casefolded target.
+        /// Casefolded target: a channel name, or a direct-message
+        /// conversation key (both participants' nicks, sorted).
         target: String,
+        /// For a direct message, the conversation's two casefolded
+        /// participants; empty for a channel. CHATHISTORY TARGETS needs to
+        /// find the conversations a given user takes part in, which the
+        /// composite conversation key cannot be searched for.
+        dm_peers: Vec<String>,
         sender_prefix: String,
         sender_account: Option<String>,
         /// "privmsg" or "notice".
@@ -376,21 +386,32 @@ impl Core {
                 batch_ref,
                 rows,
                 label,
-            } => handler::history_page(
-                &mut self.state,
-                conn,
-                &display,
-                &batch_ref,
-                rows,
-                label.as_deref(),
-            ),
+            } => {
+                // The batch is what the connection's held output is waiting
+                // behind, so it is emitted through the hold, which is then
+                // released in the order the client issued its commands.
+                self.state.emitting_deferred = Some(conn);
+                handler::history_page(
+                    &mut self.state,
+                    conn,
+                    &display,
+                    &batch_ref,
+                    rows,
+                    label.as_deref(),
+                );
+                self.state.emitting_deferred = None;
+                self.state.release_deferred(conn);
+            }
             Input::TargetsPage {
                 conn,
                 batch_ref,
                 targets,
                 label,
             } => {
-                handler::targets_page(&mut self.state, conn, &batch_ref, targets, label.as_deref())
+                self.state.emitting_deferred = Some(conn);
+                handler::targets_page(&mut self.state, conn, &batch_ref, targets, label.as_deref());
+                self.state.emitting_deferred = None;
+                self.state.release_deferred(conn);
             }
         }
         // Sweep connections whose SendQ overflowed while handling the

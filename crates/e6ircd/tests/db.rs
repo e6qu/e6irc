@@ -1348,17 +1348,83 @@ async fn query_targets_enumerates_active_buffers() {
     // Visible targets #a and #b; window [1200,2500] excludes #a@1000 but
     // keeps #a@2000 and #b@1500; #c is not a member so never appears.
     // Result is newest-first by each target's latest in-window message.
-    let targets = db::query_targets(&pool, &["#a".into(), "#b".into()], 1200, 2500, 10).await;
+    // Oldest activity first: #b's latest in-window message precedes #a's.
+    let targets =
+        db::query_targets(&pool, &["#a".into(), "#b".into()], "nobody", 1200, 2500, 10).await;
     assert_eq!(
         targets,
-        vec![("#a".to_string(), 2000), ("#b".to_string(), 1500)]
+        vec![("#b".to_string(), 1500), ("#a".to_string(), 2000)]
     );
 
     // A window that excludes everything yields nothing.
     assert!(
-        db::query_targets(&pool, &["#a".into()], 5000, 6000, 10)
+        db::query_targets(&pool, &["#a".into()], "nobody", 5000, 6000, 10)
             .await
             .is_empty()
+    );
+
+    // A buffer matches on its *latest* message: #a has a message inside
+    // (500, 1500) but its newest is at 2000, so it has been read past.
+    assert!(
+        db::query_targets(&pool, &["#a".into()], "nobody", 500, 1500, 10)
+            .await
+            .is_empty(),
+        "a buffer whose latest message is outside the window must not match"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn query_targets_includes_direct_message_correspondents() {
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+
+    // One conversation between alice and bob, stored once under the sorted
+    // pair, and one channel alice is in. Epoch milliseconds throughout.
+    for (target, peers, ts) in [
+        ("#room", None, 1000_i64),
+        (
+            "alice!bob",
+            Some(vec!["alice".to_string(), "bob".to_string()]),
+            2000,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+             VALUES ($1, $2, 'x!x@h', NULL, 'privmsg', 'hi',
+                     to_timestamp($3::double precision / 1000), $4)",
+        )
+        .bind(format!("m-{target}-{ts}"))
+        .bind(target)
+        .bind(ts)
+        .bind(peers)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+
+    // alice sees the channel and the conversation, reported under bob's name.
+    let targets = db::query_targets(&pool, &["#room".into()], "alice", 0, 9999, 10).await;
+    assert_eq!(
+        targets,
+        vec![("#room".to_string(), 1000), ("bob".to_string(), 2000)]
+    );
+
+    // bob is not in #room, but still sees the conversation, under alice.
+    let targets = db::query_targets(&pool, &[], "bob", 0, 9999, 10).await;
+    assert_eq!(targets, vec![("alice".to_string(), 2000)]);
+
+    // A stranger sees neither.
+    assert!(
+        db::query_targets(&pool, &[], "mallory", 0, 9999, 10)
+            .await
+            .is_empty(),
+        "a non-participant must not see the conversation"
     );
 }
 
