@@ -205,7 +205,14 @@ jobs:
             irctest/server_tests/whois.py \
             irctest/server_tests/labeled_responses.py \
             irctest/server_tests/messages.py \
-            irctest/server_tests/statusmsg.py
+            irctest/server_tests/statusmsg.py \
+            irctest/server_tests/buffering.py \
+            irctest/server_tests/cap.py \
+            irctest/server_tests/channel.py \
+            irctest/server_tests/help.py \
+            irctest/server_tests/isupport.py \
+            irctest/server_tests/readq.py \
+            irctest/server_tests/regressions.py
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
   # Conduit v0.9.0 needs a config file, so it is started with docker run
