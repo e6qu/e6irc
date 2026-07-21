@@ -2245,22 +2245,61 @@ fn markread_set_query_and_broadcast() {
 }
 
 #[test]
-fn markread_requires_account_and_cap() {
+fn markread_requires_cap_and_works_anonymously() {
     let mut s = TestServer::new();
-    // no cap
+    // No cap → unknown command.
     let plain = s.register(1, "bob");
     s.line(plain, "MARKREAD #x");
     assert!(has_numeric(&s.drain(plain), "421"));
-    // cap but not logged in → FAIL
+    // Cap but not logged in → works per-connection (session-local); an unset
+    // marker queries as '*'.
     let capped = register_with_caps(&mut s, 2, "carol", "draft/read-marker");
     s.line(capped, "MARKREAD #x");
-    let out = s.drain(capped);
-    assert!(out[0].contains("FAIL MARKREAD"), "{out:#?}");
-    // malformed timestamp → FAIL
-    identify(&mut s, capped, "carol");
+    assert!(
+        s.drain(capped)[0].contains("MARKREAD #x *"),
+        "anonymous query returns *"
+    );
+    // Set then get, preserving millisecond precision.
+    s.line(capped, "MARKREAD #x timestamp=2026-07-18T12:00:00.500Z");
+    s.drain(capped);
+    s.line(capped, "MARKREAD #x");
+    assert!(
+        s.drain(capped)[0].contains("timestamp=2026-07-18T12:00:00.500Z"),
+        "millisecond precision must round-trip"
+    );
+    // Malformed timestamp → FAIL.
     s.line(capped, "MARKREAD #x timestamp=not-a-time");
-    let out = s.drain(capped);
-    assert!(out[0].contains("FAIL MARKREAD"), "{out:#?}");
+    assert!(s.drain(capped)[0].contains("FAIL MARKREAD"));
+}
+
+#[test]
+fn join_replays_read_marker_before_end_of_names() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    s.line(alice, "JOIN #c");
+    let out = s.drain(alice);
+    let mr = out
+        .iter()
+        .position(|l| l.contains("MARKREAD #c"))
+        .expect("MARKREAD on join");
+    let end = out
+        .iter()
+        .position(|l| l.contains(" 366 "))
+        .expect("RPL_ENDOFNAMES");
+    assert!(mr < end, "MARKREAD must precede 366: {out:#?}");
+    assert!(out[mr].contains("MARKREAD #c *"), "no marker → *");
+
+    // Set a marker, part, rejoin → the marker is replayed on the rejoin.
+    s.line(alice, "MARKREAD #c timestamp=2026-07-18T12:00:00.000Z");
+    s.line(alice, "PART #c");
+    s.drain(alice);
+    s.line(alice, "JOIN #c");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.contains("MARKREAD #c timestamp=2026-07-18T12:00:00.000Z")),
+        "rejoin must replay the stored marker"
+    );
 }
 
 #[test]
@@ -3921,15 +3960,24 @@ fn exception_list_query_requires_op() {
 }
 
 #[test]
-fn markread_rejects_non_channel_target() {
+fn markread_accepts_user_target_rejects_invalid() {
     let mut s = TestServer::new();
     let a = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
     identify(&mut s, a, "alice");
-    s.line(a, "MARKREAD notachannel timestamp=2026-07-18T12:00:00.000Z");
+    // A user (DM) target is a valid marker target (draft/read-marker allows
+    // both channels and users).
+    s.line(a, "MARKREAD bob timestamp=2026-07-18T12:00:00.000Z");
     let out = s.drain(a);
     assert!(
-        out.iter().any(|l| l.contains("FAIL MARKREAD")),
-        "a non-channel MARKREAD target must fail loudly: {out:#?}"
+        !out.iter().any(|l| l.contains("FAIL")),
+        "a user target must be accepted: {out:#?}"
+    );
+    assert!(out.iter().any(|l| l.contains("MARKREAD bob timestamp=")));
+    // A target that is neither a valid channel nor a valid nick fails loudly.
+    s.line(a, "MARKREAD !!! timestamp=2026-07-18T12:00:00.000Z");
+    assert!(
+        s.drain(a).iter().any(|l| l.contains("FAIL MARKREAD")),
+        "an invalid target must fail loudly"
     );
 }
 

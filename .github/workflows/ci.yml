@@ -212,6 +212,7 @@ jobs:
             irctest/server_tests/help.py \
             irctest/server_tests/isupport.py \
             irctest/server_tests/readq.py \
+            irctest/server_tests/read_marker.py \
             irctest/server_tests/regressions.py
 
   # Matrix bridge (feature-gated) against a pinned Conduit homeserver.
