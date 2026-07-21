@@ -86,6 +86,8 @@ rule exists to override it every time.
       panics in shipped source).
 - [ ] `tools/check-dead-code.sh` clean (no code kept alive only by tests —
       it builds the shipped artifacts with `cfg(test)` off).
+- [ ] `tools/check-dead-pub.sh` clean (no fully-`pub` item referenced only by
+      an integration test — the cross-crate case the compiler can't see).
 - [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
       fix is to extract shared logic, never to raise the threshold).
 - [ ] Anything you moved/renamed: all references updated.

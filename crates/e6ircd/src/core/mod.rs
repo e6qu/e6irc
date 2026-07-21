@@ -51,6 +51,9 @@ pub enum Input {
         conn: ConnId,
         batch_ref: String,
         targets: Vec<(String, u64)>,
+        /// Labeled-response label to place on the batch, if the command that
+        /// triggered this deferred page was labeled.
+        label: Option<String>,
     },
 }
 
@@ -116,6 +119,9 @@ pub enum DbRequest {
         max_ts: u64,
         limit: usize,
         batch_ref: String,
+        /// Escaped labeled-response label to carry onto the deferred batch, if
+        /// the originating command was labeled.
+        label: Option<String>,
     },
     /// Persist a read marker (fire-and-forget).
     SetReadMarker {
@@ -357,7 +363,10 @@ impl Core {
                 conn,
                 batch_ref,
                 targets,
-            } => handler::targets_page(&mut self.state, conn, &batch_ref, targets),
+                label,
+            } => {
+                handler::targets_page(&mut self.state, conn, &batch_ref, targets, label.as_deref())
+            }
         }
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast

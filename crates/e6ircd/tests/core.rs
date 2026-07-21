@@ -570,6 +570,51 @@ fn whois_channels_split_to_respect_512_byte_limit() {
 }
 
 #[test]
+fn mode_key_already_set_is_rejected_with_467() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #k");
+    s.drain(alice);
+    s.line(alice, "MODE #k +k secret");
+    s.drain(alice);
+    // A second +k must not silently overwrite: reply 467 and keep the old key.
+    s.line(alice, "MODE #k +k other");
+    let out = s.drain(alice);
+    assert!(has_numeric(&out, "467"), "expected ERR_KEYSET: {out:#?}");
+    assert!(
+        !out.iter()
+            .any(|l| l.contains("MODE") && l.contains("other")),
+        "key must not change: {out:#?}"
+    );
+}
+
+#[test]
+fn banned_external_cannot_speak_to_unmoderated_channel() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice"); // founder → opped on #x
+    let bob = s.register(2, "bob"); // external
+    s.line(alice, "JOIN #x");
+    s.drain(alice);
+    // -n lets externals speak; but a banned external still cannot.
+    s.line(alice, "MODE #x -n");
+    s.line(alice, "MODE #x +b bob!*@*");
+    s.drain(alice);
+    s.line(bob, "PRIVMSG #x :hi");
+    assert!(
+        has_numeric(&s.drain(bob), "404"),
+        "banned external sender must be blocked even on a -n channel"
+    );
+    // A non-banned external may still speak (proves -n is honored otherwise).
+    let carol = s.register(3, "carol");
+    s.line(carol, "PRIVMSG #x :hello");
+    assert!(
+        !has_numeric(&s.drain(carol), "404"),
+        "unbanned external must be allowed on a -n channel"
+    );
+    assert!(s.drain(alice).iter().any(|l| l.contains("hello")));
+}
+
+#[test]
 fn who_and_whois() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
@@ -2404,6 +2449,7 @@ fn chathistory_targets_enumerates_buffers() {
         conn: alice,
         batch_ref: batch_ref.clone(),
         targets: vec![("#a".into(), 1_000_000), ("#b".into(), 999_999)],
+        label: None,
     });
     let out = s.drain(alice);
     assert!(

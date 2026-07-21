@@ -30,6 +30,9 @@ jobs:
       # Dead-code guard: compile only the shipped artifacts (no test targets)
       # with -D warnings, so code kept alive solely by tests is caught as dead.
       - run: tools/check-dead-code.sh
+      # Dead-pub guard: the cross-crate case the compiler can't see — a `pub`
+      # item referenced only by an integration test (a separate crate).
+      - run: tools/check-dead-pub.sh
       # Copy-paste guard: fail if duplicated Rust source exceeds the ratchet.
       - run: tools/check-duplication.sh
 

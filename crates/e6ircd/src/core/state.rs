@@ -537,6 +537,15 @@ impl ServerState {
         }
     }
 
+    /// Destroy an emptied channel: drop it from `channels` and its LRU slot in
+    /// `hot_channels` together, so the two can't desync — a stale `hot_channels`
+    /// key would otherwise inflate the length and evict a still-live channel's
+    /// ring early under the `max_hot_channels` cap.
+    pub fn remove_channel(&mut self, key: &ChanKey) {
+        self.channels.remove(key);
+        self.hot_channels.retain(|k| k != key);
+    }
+
     /// Record a nick's details into the WHOWAS ring (on quit/nick change).
     pub fn record_whowas(&mut self, conn: ConnId) {
         let Some(session) = self.sessions.get(&conn) else {
@@ -956,7 +965,7 @@ impl ServerState {
             if let Some(chan) = self.channels.get_mut(&key) {
                 chan.members.remove(&conn);
                 if chan.members.is_empty() {
-                    self.channels.remove(&key);
+                    self.remove_channel(&key);
                 }
             }
         }

@@ -310,6 +310,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             max_ts,
             limit,
             batch_ref,
+            label,
         } => {
             let targets = query_targets(pool, &channels, min_ts, max_ts, limit).await;
             core_tx
@@ -317,6 +318,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     conn,
                     batch_ref,
                     targets,
+                    label,
                 })
                 .await
                 .is_ok()

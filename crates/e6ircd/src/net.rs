@@ -24,7 +24,7 @@ use e6irc_queue::{Policy, Receiver, Sender, queue};
 /// Traditional 512-byte line minus CRLF, plus the 4096-byte client tag
 /// allowance (message-tags spec); the body-only limit is enforced in
 /// the core after the tag section is split off.
-const LINE_LIMIT: usize = 4096 + 510;
+const LINE_LIMIT: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 const READ_BUF: usize = 4096;
 
 pub struct Running {

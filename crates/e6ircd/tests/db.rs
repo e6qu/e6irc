@@ -1112,6 +1112,134 @@ async fn read_marker_preloaded_after_restart() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn sasl_registration_fails_loudly_on_nick_in_use() {
+    // Regression: the shared SASL epilogue must treat a post-auth 433 (nick in
+    // use, reported after CAP END) as terminal instead of blocking forever.
+    let url = test_db_url();
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    sqlx::query("TRUNCATE accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "dupacct", "pw")
+        .await
+        .expect("acct");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.dup.example".into(),
+        network_name: "DupNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let addr = net::start(config).await.expect("start").addrs[0];
+
+    // Client 1 reserves the nick "dup".
+    let mut c1 = e6irc_client::Connection::connect(&addr.to_string())
+        .await
+        .unwrap();
+    c1.register("dup", "First").await.expect("register");
+
+    // Client 2 authenticates via SASL but requests the same nick. After 903 the
+    // server refuses registration with 433; register_sasl must return an error,
+    // not hang — the timeout guard fails the test if it hangs.
+    let mut c2 = e6irc_client::Connection::connect(&addr.to_string())
+        .await
+        .unwrap();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        c2.register_sasl("dup", "Second", "dupacct", "pw"),
+    )
+    .await
+    .expect("register_sasl must not hang on an in-use nick");
+    assert!(
+        res.is_err(),
+        "SASL registration with an in-use nick must fail loudly"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn labeled_chathistory_targets_carries_label_on_db_path() {
+    // Regression: a labeled CHATHISTORY TARGETS that resolves via PostgreSQL
+    // must tag its deferred batch with the label (and not ACK it empty first).
+    let url = test_db_url();
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+
+    let config = Config {
+        server_name: "irc.tgt.example".into(),
+        network_name: "TgtNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let stream = TcpStream::connect(running.addrs[0]).await.expect("irc");
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+
+    w.write_all(
+        b"CAP LS 302\r\n\
+          CAP REQ :batch draft/chathistory message-tags server-time labeled-response\r\n\
+          NICK tgt\r\nUSER t 0 * :T\r\nCAP END\r\nJOIN #a\r\nJOIN #b\r\n",
+    )
+    .await
+    .unwrap();
+    expect_line(&mut reader, "JOIN #b").await;
+    w.write_all(b"PRIVMSG #a :ma\r\nPRIVMSG #b :mb\r\nPING flush\r\n")
+        .await
+        .unwrap();
+    expect_line(&mut reader, "PONG").await;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // A wide timestamp window forces the DB (QueryTargets) path.
+    let lo = e6irc_proto::time::server_time(1000);
+    let hi = e6irc_proto::time::server_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            * 1000
+            + 60_000,
+    );
+    w.write_all(
+        format!("@label=tt CHATHISTORY TARGETS timestamp={lo} timestamp={hi} 50\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let batch_open = expect_line(&mut reader, "chathistory-targets").await;
+    assert!(
+        batch_open.contains("label=tt"),
+        "deferred TARGETS batch must carry the label: {batch_open}"
+    );
+    assert!(
+        batch_open.contains("BATCH +"),
+        "expected a BATCH open line: {batch_open}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_networks_crud() {
     let pool = db::connect_and_migrate(&test_db_url())
         .await
