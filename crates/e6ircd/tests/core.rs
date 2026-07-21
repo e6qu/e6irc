@@ -59,6 +59,8 @@ impl TestServer {
                     server_name: "irc.test.example".into(),
                     network_name: "TestNet".into(),
                     description: "test server".into(),
+                    registration_before_connect: false,
+                    registration_require_email: false,
                     sendq,
                     motd: vec!["Welcome to the test net".into()],
                     nicklen: 16,
@@ -1458,12 +1460,14 @@ fn nickserv_register_creates_account() {
             conn: alice,
             name: "alice".into(),
             password: "hunter2".into(),
+            origin: e6ircd::core::AccountOrigin::NickServ,
         }]
     );
     s.core.handle(Input::DbReply {
         conn: alice,
         reply: e6ircd::core::DbReply::AccountCreated {
             account: "alice".into(),
+            origin: e6ircd::core::AccountOrigin::NickServ,
         },
     });
     let out = s.drain(alice);
@@ -1491,7 +1495,9 @@ fn nickserv_register_duplicate_and_syntax() {
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
-        reply: e6ircd::core::DbReply::AccountExists,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::NickServ,
+        },
     });
     let out = s.drain(alice);
     assert!(out[0].contains("already registered"), "{out:#?}");
@@ -2725,6 +2731,8 @@ fn hot_history_ring_is_lru_evicted() {
             server_name: "irc.test.example".into(),
             network_name: "T".into(),
             description: "test server".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
             sendq: 256,
             motd: vec![],
             nicklen: 16,
@@ -3504,6 +3512,99 @@ fn chanserv_set_mlock_enforces_modes() {
 }
 
 #[test]
+fn register_command_refuses_a_name_other_than_the_callers_nick() {
+    // `custom-account-name` is not advertised, so REGISTER may only claim the
+    // nick the caller is currently holding — otherwise a client could register
+    // a name it has never proven it can hold.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
+    s.drain(alice);
+    s.line(alice, "REGISTER bob * hunter2");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL REGISTER ACCOUNT_NAME_MUST_BE_NICK bob")),
+        "{out:#?}"
+    );
+    assert!(
+        s.db_requests().is_empty(),
+        "a refused registration must never reach the database"
+    );
+
+    // `*` and the caller's own nick both name the caller's account.
+    for arg in ["*", "alice"] {
+        s.line(alice, &format!("REGISTER {arg} * hunter2"));
+        s.drain(alice);
+        assert_eq!(
+            s.db_requests(),
+            vec![e6ircd::core::DbRequest::CreateAccount {
+                conn: alice,
+                name: "alice".into(),
+                password: "hunter2".into(),
+                origin: e6ircd::core::AccountOrigin::RegisterCommand,
+            }],
+            "REGISTER {arg} must register the caller's own nick"
+        );
+    }
+}
+
+#[test]
+fn register_before_connect_is_refused_unless_enabled() {
+    // A connection that has not completed registration has not proven it can
+    // hold the nick it is asking to register, so this is opt-in — and the
+    // refusal is the spec's code, not a bare "you have not registered".
+    let mut s = TestServer::new();
+    let conn = s.connect(1);
+    s.line(conn, "NICK earlybird");
+    s.drain(conn);
+    s.line(conn, "REGISTER * * hunter2");
+    let out = s.drain(conn);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL REGISTER COMPLETE_CONNECTION_REQUIRED")),
+        "{out:#?}"
+    );
+    assert!(s.db_requests().is_empty());
+}
+
+#[test]
+fn register_reply_waits_behind_nothing_but_arrives_in_order() {
+    // The answer needs a database round trip, so the connection's later output
+    // is held behind it: a client that pipelines REGISTER and PING must not see
+    // the PONG first and conclude the registration produced no reply.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
+    s.drain(alice);
+    s.line(alice, "REGISTER * * hunter2");
+    s.line(alice, "PING :sync");
+    let before = s.drain(alice);
+    assert!(
+        before.is_empty(),
+        "output must wait for the pending registration reply: {before:#?}"
+    );
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountCreated {
+            account: "alice".into(),
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    let out = s.drain(alice);
+    let register = out
+        .iter()
+        .position(|l| l.contains("REGISTER SUCCESS alice"))
+        .expect("registration reply");
+    let pong = out
+        .iter()
+        .position(|l| l.contains("PONG"))
+        .expect("pong released after it");
+    assert!(
+        register < pong,
+        "reply order must match command order: {out:#?}"
+    );
+}
+
+#[test]
 fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
     // A CHATHISTORY page that reaches PostgreSQL is answered asynchronously,
     // and the connection's later output waits behind it so replies stay in
@@ -3561,6 +3662,8 @@ fn history_logmessage_gated_on_database() {
                 server_name: "irc.test.example".into(),
                 network_name: "T".into(),
                 description: "test server".into(),
+                registration_before_connect: false,
+                registration_require_email: false,
                 sendq: 256,
                 motd: vec![],
                 nicklen: 16,

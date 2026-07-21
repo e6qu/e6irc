@@ -19,6 +19,22 @@ fn default_description() -> String {
     "e6irc server".into()
 }
 
+/// `draft/account-registration` policy, advertised as the capability's value
+/// so a client knows the rules before it tries.
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationConfig {
+    /// Allow REGISTER before the connection completes registration
+    /// (`before-connect`). Off by default: a half-open connection creating
+    /// accounts is a spam vector unless the operator opts in.
+    #[serde(default)]
+    pub before_connect: bool,
+    /// Require an email address (`email-required`). e6ircd cannot send
+    /// verification mail, so this only enforces that one was supplied.
+    #[serde(default)]
+    pub require_email: bool,
+}
+
 fn default_max_hot_channels() -> usize {
     8192
 }
@@ -52,6 +68,10 @@ pub struct Config {
     /// beyond this; evicted channels serve CHATHISTORY from Postgres).
     #[serde(default = "default_max_hot_channels")]
     pub max_hot_channels: usize,
+    /// `draft/account-registration` policy. Only meaningful with a database,
+    /// since there are no accounts without one.
+    #[serde(default)]
+    pub registration: RegistrationConfig,
     /// PostgreSQL connection; enables accounts and SASL when present.
     #[serde(default)]
     pub database: Option<DatabaseConfig>,
@@ -246,6 +266,7 @@ impl Default for Config {
             server_name: "irc.localhost".into(),
             network_name: "e6irc".into(),
             description: default_description(),
+            registration: RegistrationConfig::default(),
             motd: Vec::new(),
             listeners: Vec::new(),
             nicklen: default_nicklen(),

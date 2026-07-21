@@ -130,6 +130,12 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
         assert self.directory
 
         config = TEMPLATE_CONFIG.format(hostname=hostname, port=port)
+        # draft/account-registration policy, which irctest varies per test case.
+        config += (
+            "\n[registration]\n"
+            f"before_connect = {str(self.test_config.account_registration_before_connect).lower()}\n"
+            f"require_email = {str(self.test_config.account_registration_requires_email).lower()}\n"
+        )
         if _DB_URL is not None:
             # Fresh account + message store per test (a no-op on the very first
             # run, before migrations create the schema).
