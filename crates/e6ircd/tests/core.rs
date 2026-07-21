@@ -3512,6 +3512,141 @@ fn chanserv_set_mlock_enforces_modes() {
 }
 
 #[test]
+fn multiline_batch_is_one_message_to_capable_and_flattened_to_others() {
+    // A multiline message is one message: both forms carry the same msgid, the
+    // batch keeps the sender's blank lines and concat tags, and a client
+    // without the capability gets one message per non-blank line because it has
+    // no way to represent a line break inside a PRIVMSG.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/multiline message-tags echo-message server-time",
+    );
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/multiline message-tags");
+    let carol = register_with_caps(&mut s, 3, "carol", "message-tags");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #m");
+    }
+    // Drain after every join, so no one is still holding another's JOIN.
+    for c in [alice, bob, carol] {
+        s.drain(c);
+    }
+    s.line(alice, "BATCH +99 draft/multiline #m");
+    s.line(alice, "@batch=99 PRIVMSG #m :hello");
+    s.line(alice, "@batch=99 PRIVMSG #m :");
+    s.line(alice, "@batch=99;draft/multiline-concat PRIVMSG #m :world");
+    s.line(alice, "BATCH -99");
+
+    let capable = s.drain(bob);
+    assert!(capable[0].contains("BATCH +"), "{capable:#?}");
+    assert!(
+        capable[capable.len() - 1].contains("BATCH -"),
+        "{capable:#?}"
+    );
+    let inner: Vec<_> = capable[1..capable.len() - 1].to_vec();
+    assert_eq!(
+        inner.len(),
+        3,
+        "blank line is kept in the batch: {capable:#?}"
+    );
+    assert!(inner[2].contains("draft/multiline-concat"), "{}", inner[2]);
+    // The msgid identifies the message, so it is on the batch, not the lines.
+    let batch_msgid = capable[0]
+        .trim_start_matches('@')
+        .split(' ')
+        .next()
+        .expect("tag section")
+        .split(';')
+        .find_map(|t| t.strip_prefix("msgid="))
+        .expect("msgid on the batch open")
+        .to_string();
+    for line in &inner {
+        assert!(
+            !line.contains("msgid="),
+            "inner lines carry no msgid: {line}"
+        );
+    }
+
+    // Without the capability: no batch, blank line dropped, msgid on the first.
+    let flat = s.drain(carol);
+    assert!(!flat.iter().any(|l| l.contains("BATCH")), "{flat:#?}");
+    assert_eq!(flat.len(), 2, "blank line dropped: {flat:#?}");
+    assert!(flat[0].ends_with(":hello"), "{}", flat[0]);
+    assert!(flat[1].ends_with(":world"), "{}", flat[1]);
+    assert!(
+        flat[0].contains(&format!("msgid={batch_msgid}")),
+        "the flattened form is the same message: {}",
+        flat[0]
+    );
+    assert!(!flat[1].contains("msgid="), "{}", flat[1]);
+    assert!(
+        !flat.iter().any(|l| l.contains("draft/multiline-concat")),
+        "concat is meaningless without the capability: {flat:#?}"
+    );
+}
+
+#[test]
+fn multiline_batch_permissions_match_a_plain_message() {
+    // Splitting text across a batch must not evade the checks a single message
+    // faces: the batch is refused for the same reason, and nothing is relayed.
+    let mut s = TestServer::new_no_persistence();
+    let caps = "batch draft/multiline message-tags";
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    let bob = register_with_caps(&mut s, 2, "bob", caps);
+    s.line(bob, "JOIN #locked");
+    s.line(bob, "MODE #locked +m");
+    s.drain(bob);
+    s.line(alice, "JOIN #locked");
+    s.drain(alice);
+
+    s.line(alice, "BATCH +7 draft/multiline #locked");
+    s.line(alice, "@batch=7 PRIVMSG #locked :let me in");
+    s.line(alice, "BATCH -7");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("404")),
+        "a moderated channel refuses the batch too: {out:#?}"
+    );
+    assert!(
+        !s.drain(bob).iter().any(|l| l.contains("let me in")),
+        "nothing may be relayed from a refused batch"
+    );
+}
+
+#[test]
+fn multiline_batch_abandoned_on_error_delivers_nothing() {
+    // A batch that went wrong delivers nothing at all rather than a truncated
+    // version of what the sender meant.
+    let mut s = TestServer::new_no_persistence();
+    let caps = "batch draft/multiline message-tags";
+    let alice = register_with_caps(&mut s, 1, "alice", caps);
+    let bob = register_with_caps(&mut s, 2, "bob", caps);
+    for c in [alice, bob] {
+        s.line(c, "JOIN #m");
+        s.drain(c);
+    }
+    s.line(alice, "BATCH +5 draft/multiline #m");
+    s.line(alice, "@batch=5 PRIVMSG #m :first");
+    // Concat on a blank line is invalid, and abandons the batch.
+    s.line(alice, "@batch=5;draft/multiline-concat PRIVMSG #m :");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL BATCH MULTILINE_INVALID")),
+        "{out:#?}"
+    );
+    // Closing the abandoned batch is itself an error, and still sends nothing.
+    s.line(alice, "BATCH -5");
+    s.drain(alice);
+    assert!(
+        !s.drain(bob).iter().any(|l| l.contains("first")),
+        "an abandoned batch must deliver nothing"
+    );
+}
+
+#[test]
 fn register_command_refuses_a_name_other_than_the_callers_nick() {
     // `custom-account-name` is not advertised, so REGISTER may only claim the
     // nick the caller is currently holding — otherwise a client could register

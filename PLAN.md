@@ -475,6 +475,42 @@ connection's later output behind its reply, and the two existing deferred
 emitters were refactored onto a shared `ServerState::emit_deferred` rather than
 repeating the bypass-then-release dance a third time.
 
+Eighteenth sweep — draft/multiline (2026-07-21): the last capability DESIGN
+§7.5 listed and e6ircd did not implement. All **7** of irctest's multiline tests
+pass, including the three limit/validation cases the marker filter deselects,
+and the module joins the green list.
+
+This needed client-initiated `BATCH`, which e6ircd had none of: a client opens
+`BATCH +<ref> draft/multiline <target>`, tags its lines `@batch=<ref>`, and
+closes with `BATCH -<ref>`. The lines are buffered rather than delivered as they
+arrive, because a multiline message is **one message** — it takes one msgid and
+one timestamp, and both delivered forms carry that same pair, so a client seeing
+the batch and one seeing the flattened lines are looking at the same event.
+
+Recipients with the capability get the batch as sent, blank lines and concat
+tags intact, because those are what the sender wrote. Everyone else gets one
+message per non-blank line: a PRIVMSG cannot carry a line break, and a blank
+line would be an empty message. A batch that is abandoned or fails validation
+delivers nothing at all rather than a truncated version of what the sender
+meant, and says why with `FAIL BATCH`. Limits (32 lines, 4096 bytes) are
+advertised as the capability's value so a client can see them before starting a
+batch it cannot finish.
+
+Boy-scout: rather than reimplementing target resolution for the second delivery
+path, the checks came *out* of `deliver_one_message` into a shared
+`resolve_message_target`. Both paths now resolve identically, which is not
+tidiness but correctness — otherwise `+m`, `+n`, `+C`, bans and quiets could be
+evaded by splitting the same text across a batch. Permission checks also see the
+joined message rather than each fragment, so a CTCP cannot be smuggled past `+C`
+a piece at a time. A Rust test pins that equivalence directly.
+
+Two details the tests pinned down. The labeled-response **label belongs to the
+batch**, not to an empty ACK at the time the batch was opened: the response to
+`@label=xyz BATCH +123 …` is the batch that arrives later, so the label rides
+the echoed BATCH open and the framer is told not to ACK. And `FAIL BATCH
+MULTILINE_INVALID` carries no batch reference — only the limit failures take a
+parameter, the limit itself.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
