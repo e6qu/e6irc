@@ -154,8 +154,20 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
         while let Some(request) = next.take() {
             if let DbRequest::LogMessage { .. } = request {
                 log_batch.push(request);
-            } else if !handle_request(&pool, &core_tx, request).await {
-                return;
+            } else {
+                // Any other request may *read* the messages table, so the
+                // writes queued ahead of it must land first. Without this a
+                // client that sends a message and immediately asks for its
+                // history queries a database that does not contain it yet —
+                // the buffered rows would still be sitting in `log_batch`.
+                // Consecutive messages still batch; only a read forces the
+                // flush, which is exactly the ordering the queue promises.
+                if !log_batch.is_empty() {
+                    flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+                }
+                if !handle_request(&pool, &core_tx, request).await {
+                    return;
+                }
             }
             next = rx.try_pop().map(|e| e.payload);
         }
@@ -180,10 +192,17 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         Vec::with_capacity(n),
         Vec::with_capacity(n),
     );
+    // A channel message stores NULL here; a direct message stores its
+    // casefolded participants, which is what CHATHISTORY TARGETS searches.
+    // Bound as the joined form and split back into an array in SQL: a
+    // conversation has one or two participants, and Postgres arrays passed
+    // through UNNEST must be rectangular, which a ragged nesting is not.
+    let mut peers: Vec<Option<String>> = Vec::with_capacity(n);
     for request in batch {
         let DbRequest::LogMessage {
             msgid,
             target,
+            dm_peers,
             sender_prefix,
             sender_account,
             kind,
@@ -195,6 +214,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         };
         msgids.push(msgid);
         targets.push(target);
+        peers.push((!dm_peers.is_empty()).then(|| dm_peers.join("!")));
         prefixes.push(sender_prefix);
         accounts.push(sender_account);
         kinds.push(kind.to_string());
@@ -202,9 +222,12 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         tss.push(ts as i64);
     }
     let result = sqlx::query(
-        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
-         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                              $6::text[], ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x))",
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+         SELECT m, t, p, a, k, b, at,
+                CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END
+         FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                     ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x),
+                     $8::text[]) AS u(m, t, p, a, k, b, at, d)",
     )
     .bind(&msgids)
     .bind(&targets)
@@ -213,6 +236,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
     .bind(&kinds)
     .bind(&bodies)
     .bind(&tss)
+    .bind(&peers)
     .execute(pool)
     .await;
     if let Err(e) = result {
@@ -309,13 +333,14 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
         DbRequest::QueryTargets {
             conn,
             channels,
+            me,
             min_ts,
             max_ts,
             limit,
             batch_ref,
             label,
         } => {
-            let targets = query_targets(pool, &channels, min_ts, max_ts, limit).await;
+            let targets = query_targets(pool, &channels, &me, min_ts, max_ts, limit).await;
             core_tx
                 .push(Input::TargetsPage {
                     conn,
@@ -817,27 +842,53 @@ pub async fn query_history(
 /// CHATHISTORY TARGETS: among `channels` (casefolded), the buffers with a
 /// message in `[min_ts, max_ts]`, each with its most recent message time,
 /// most-recent first. Empty on a query error (logged loudly).
+/// Buffers with activity strictly between `min_ts` and `max_ts`: the
+/// `channels` the requester
+/// can see, plus every direct-message conversation `me` takes part in, reported
+/// as the correspondent's casefolded nick. Oldest activity first, so a `limit`
+/// keeps the oldest buffers.
 pub async fn query_targets(
     pool: &PgPool,
     channels: &[String],
+    me: &str,
     min_ts: u64,
     max_ts: u64,
     limit: usize,
 ) -> Vec<(String, u64)> {
+    // A conversation is keyed by both participants, so it is reported under the
+    // *other* one — and under `me` for a conversation with oneself, whose key
+    // has only the single participant.
+    // The window is tested against each buffer's *latest* message, not against
+    // any message it happens to contain: a buffer whose newest activity is
+    // outside the window has already been read past, so reporting it would
+    // hand a reconnecting client backlog it does not need.
     let rows: Result<Vec<(String, i64)>, sqlx::Error> = sqlx::query_as(
-        "SELECT target, (EXTRACT(EPOCH FROM MAX(ts)) * 1000)::bigint AS latest
-         FROM messages
-         WHERE target = ANY($1)
-           AND ts >= to_timestamp($2::double precision / 1000)
-           AND ts <= to_timestamp($3::double precision / 1000)
-         GROUP BY target
-         ORDER BY latest DESC
+        "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
+             SELECT target AS name, MAX(ts) AS latest
+             FROM messages
+             WHERE target = ANY($1)
+             GROUP BY target
+             UNION ALL
+             SELECT COALESCE(
+                        (SELECT p FROM UNNEST(dm_peers) p WHERE p <> $5 LIMIT 1),
+                        $5
+                    ) AS name,
+                    MAX(ts) AS latest
+             FROM messages
+             WHERE dm_peers @> ARRAY[$5::text]
+             GROUP BY name
+         ) buffers
+         GROUP BY name
+         HAVING MAX(latest) > to_timestamp($2::double precision / 1000)
+            AND MAX(latest) < to_timestamp($3::double precision / 1000)
+         ORDER BY latest ASC
          LIMIT $4",
     )
     .bind(channels)
     .bind(min_ts as f64)
     .bind(max_ts as f64)
     .bind(limit as i64)
+    .bind(me)
     .fetch_all(pool)
     .await;
     match rows {

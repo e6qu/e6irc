@@ -1945,12 +1945,6 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     } else {
         None
     };
-    // A fresh in-memory channel's ring is the *entire* record only when no
-    // database backs it. With a DB, this channel name may have existed before
-    // (channels are dropped when they empty) and left rows in the `messages`
-    // table, so the ring is not authoritative — mark it incomplete so
-    // CHATHISTORY falls back to PostgreSQL instead of reporting an empty batch.
-    let ring_is_whole_record = !state.config.sasl_enabled;
     let chan = state
         .channels
         .entry(key.clone())
@@ -1969,8 +1963,6 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
             invite_exceptions: Vec::new(),
             // The clock is milliseconds; RPL_CREATIONTIME reports seconds.
             created_at_secs: now / 1000,
-            history: std::collections::VecDeque::new(),
-            history_complete: ring_is_whole_record,
         });
     if chan.members.contains_key(&conn) {
         return; // already joined: JOIN is idempotent per Solanum
@@ -2388,6 +2380,56 @@ fn cmd_message(
 
 /// Deliver a PRIVMSG/NOTICE to a single already-split `target`. `loud` is
 /// false for NOTICE (which must never trigger error numerics or auto-replies).
+/// Record a delivered message in its target's hot ring and, when a database is
+/// configured, enqueue it for persistence.
+///
+/// `dm_peers` carries a direct message's casefolded participants (empty for a
+/// channel); it is what lets CHATHISTORY TARGETS find the conversations a user
+/// takes part in, which the composite conversation key cannot be searched for.
+///
+/// Channels and direct messages share this one path deliberately: the ring, the
+/// persistence rule and the "a gap exists" bookkeeping must not differ by target
+/// kind, or CHATHISTORY would answer differently depending on where a message
+/// came from.
+fn record_history(
+    state: &mut ServerState,
+    key: &super::state::HistoryKey,
+    dm_peers: Vec<String>,
+    entry: super::state::HistoryEntry,
+    sender_account: Option<String>,
+) {
+    let (msgid, ts) = (entry.msgid.clone(), entry.ts);
+    let (prefix, body, kind) = (entry.sender_prefix.clone(), entry.body.clone(), entry.kind);
+    state.push_history(key, entry);
+    // Persist only when a database is configured (the same db-present proxy the
+    // other DB writes use). Without one the hot ring is the entire record, so
+    // there is nothing to enqueue — and enqueuing anyway would fail on every
+    // message, flooding stderr and starving the core worker under load.
+    if !state.config.sasl_enabled {
+        return;
+    }
+    let log = super::DbRequest::LogMessage {
+        msgid,
+        target: key.as_str().to_string(),
+        dm_peers,
+        sender_prefix: prefix,
+        sender_account,
+        kind: if kind == "PRIVMSG" {
+            "privmsg"
+        } else {
+            "notice"
+        },
+        body,
+        ts,
+    };
+    if state.db_tx.try_push(log).is_err() {
+        eprintln!("history: log queue full or closed; message not persisted");
+        // Delivered but not persisted: mark the ring incomplete so CHATHISTORY
+        // does not imply a gap-free record.
+        state.mark_history_incomplete(key);
+    }
+}
+
 fn deliver_one_message(
     state: &mut ServerState,
     conn: ConnId,
@@ -2516,40 +2558,19 @@ fn deliver_one_message(
         if status_prefix != 0 {
             return;
         }
-        state.push_channel_history(
-            &key,
+        record_history(
+            state,
+            &(&key).into(),
+            Vec::new(),
             super::state::HistoryEntry {
-                msgid: msgid.clone(),
+                msgid,
                 ts,
                 sender_prefix: prefix.clone(),
                 kind,
                 body: text.to_string(),
             },
+            sender_account,
         );
-        // Persist to the history table only when a database is configured
-        // (same db-present proxy the other DB writes use). Without one the
-        // hot ring is the entire record, so there is nothing to enqueue —
-        // and enqueuing anyway would fail on every message, flooding stderr
-        // and starving the core worker under load.
-        if state.config.sasl_enabled {
-            let log = super::DbRequest::LogMessage {
-                msgid,
-                target: key.as_str().to_string(),
-                sender_prefix: prefix.clone(),
-                sender_account,
-                kind: if loud { "privmsg" } else { "notice" },
-                body: text.to_string(),
-                ts,
-            };
-            if state.db_tx.try_push(log).is_err() {
-                eprintln!("history: log queue full or closed; message not persisted");
-                // Delivered but not persisted: mark the channel's history
-                // incomplete so CHATHISTORY does not imply a gap-free record.
-                if let Some(chan) = state.channels.get_mut(&key) {
-                    chan.history_complete = false;
-                }
-            }
-        }
     } else {
         let key = state.nick_key(target);
         let Some(peer) = state.registered_peer(&key) else {
@@ -2594,9 +2615,27 @@ fn deliver_one_message(
                 },
             );
         }
+        // The conversation is recorded once, under a key both participants
+        // derive identically, so each side's CHATHISTORY sees the whole thread
+        // rather than only the half it sent.
+        let peer_nick = state.sessions[&peer].nick.clone().expect("registered");
+        let (conv, peers) =
+            state.dm_conversation(&state.conn_identity(conn), &state.conn_identity(peer));
+        record_history(
+            state,
+            &conv,
+            peers,
+            super::state::HistoryEntry {
+                msgid,
+                ts,
+                sender_prefix: prefix.clone(),
+                kind,
+                body: text.to_string(),
+            },
+            sender_account,
+        );
         // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free).
         if loud && let Some(away) = state.sessions[&peer].away.clone() {
-            let peer_nick = state.sessions[&peer].nick.clone().expect("registered");
             state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
         }
     }
@@ -4176,21 +4215,42 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    let key = state.chan_key(target);
-    let is_member = state
-        .channels
-        .get(&key)
-        .is_some_and(|c| c.members.contains_key(&conn));
-    if !is_member {
-        chathistory_fail(
-            state,
-            conn,
-            "INVALID_TARGET",
-            &[sub, target],
-            "You are not on that channel",
-        );
-        return;
-    }
+    // A channel target requires membership. Any other target names the other
+    // participant in a direct-message conversation, which the requester is a
+    // participant of by construction — the key is derived from their own nick,
+    // so a client can only ever ask for a conversation it is part of.
+    let hist_key = if target.starts_with('#') {
+        let key = state.chan_key(target);
+        let is_member = state
+            .channels
+            .get(&key)
+            .is_some_and(|c| c.members.contains_key(&conn));
+        if !is_member {
+            chathistory_fail(
+                state,
+                conn,
+                "INVALID_TARGET",
+                &[sub, target],
+                "You are not on that channel",
+            );
+            return;
+        }
+        super::state::HistoryKey::from(&key)
+    } else {
+        if state.sessions[&conn].nick.is_none() {
+            chathistory_fail(
+                state,
+                conn,
+                "INVALID_TARGET",
+                &[sub, target],
+                "You are not registered",
+            );
+            return;
+        }
+        state
+            .dm_conversation(&state.conn_identity(conn), &state.nick_identity(target))
+            .0
+    };
     // BETWEEN takes two selectors then the limit; the others take one
     // selector then the limit.
     let is_between = sub.eq_ignore_ascii_case("BETWEEN");
@@ -4230,8 +4290,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             return;
         }
     };
-    let history: std::collections::VecDeque<super::state::HistoryEntry> =
-        state.channels[&key].history.clone();
+    let (history, complete) = state.history_ring(&hist_key);
 
     let position = |sel: &str| -> Option<usize> {
         if let Some(msgid) = sel.strip_prefix("msgid=") {
@@ -4251,7 +4310,6 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // The ring answers completely only while it holds the channel's
     // entire history; once overflowed or evicted (LRU), older rows live
     // in Postgres and the request must fall back.
-    let complete = state.channels[&key].history_complete;
     let (entries, covered): (Vec<super::state::HistoryEntry>, bool) =
         match sub.to_ascii_uppercase().as_str() {
             // `*` is unbounded; any other selector restricts LATEST to
@@ -4350,7 +4408,12 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         };
 
-    let display = state.channels[&key].name.clone();
+    // The batch names the target the client asked for, echoed as given; the
+    // replayed messages carry their own canonical addressing (history_page).
+    let display = state
+        .chan_key_if_channel(target)
+        .and_then(|k| state.channels.get(&k).map(|c| c.name.clone()))
+        .unwrap_or_else(|| target.to_string());
     let batch_ref = state.next_msgid();
 
     // Ring miss with a database available: page from PostgreSQL instead,
@@ -4433,7 +4496,7 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let label = state.capture.as_ref().and_then(|c| c.label.clone());
         let request = super::DbRequest::QueryHistory {
             conn,
-            target: key.as_str().to_string(),
+            target: hist_key.as_str().to_string(),
             display: display.clone(),
             batch_ref,
             query,
@@ -4449,11 +4512,16 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 &[sub, target],
                 "History temporarily unavailable",
             );
-        } else if let Some(cap) = state.capture.as_mut() {
-            // Enqueued: the labeled batch will be emitted when the DB replies,
-            // so tell the framer not to ACK this command as an empty response.
-            if cap.label.is_some() {
-                cap.deferred = true;
+        } else {
+            // Queued: hold this connection's later output behind the batch so
+            // the reply order matches the command order.
+            state.defer_reply(conn);
+            if let Some(cap) = state.capture.as_mut() {
+                // The labeled batch is emitted when the DB replies, so tell the
+                // framer not to ACK this command as an empty response.
+                if cap.label.is_some() {
+                    cap.deferred = true;
+                }
             }
         }
         return;
@@ -4474,12 +4542,32 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     history_page(state, conn, &display, &batch_ref, rows, None);
 }
 
-/// CHATHISTORY TARGETS: enumerate the requester's buffers with activity in
-/// a `timestamp=<a> timestamp=<b> <limit>` window (DESIGN §11.2). A
-/// bouncer/multi-buffer client uses this to find which channels have
-/// backlog on reconnect. Targets are the channels the requester is on;
-/// the authoritative source is PostgreSQL, with the hot ring answering
-/// when no database is configured.
+/// The correspondent in a conversation key, from `me`'s point of view, or
+/// `None` when the key names a channel or a conversation `me` is not part of.
+/// A conversation with oneself yields oneself.
+fn dm_correspondent(key: &super::state::HistoryKey, me: &str) -> Option<String> {
+    let raw = key.as_str();
+    if raw.starts_with('#') {
+        return None;
+    }
+    let (lo, hi) = raw.split_once('!')?;
+    if lo == me {
+        Some(hi.to_string())
+    } else if hi == me {
+        Some(lo.to_string())
+    } else {
+        None
+    }
+}
+
+/// CHATHISTORY TARGETS: enumerate the requester's buffers with activity
+/// strictly inside a `timestamp=<a> timestamp=<b> <limit>` window — the bounds
+/// are exclusive, as they are for BETWEEN (DESIGN §11.2). A
+/// bouncer/multi-buffer client uses this to find which buffers have backlog
+/// on reconnect. Targets are the channels the requester is on *and* the
+/// correspondents they have exchanged direct messages with; the authoritative
+/// source is PostgreSQL, with the hot rings answering when no database is
+/// configured. Ordered oldest-activity-first, so a limit keeps the oldest.
 fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let parse = |i: usize| {
         p.get(i)
@@ -4503,14 +4591,12 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .unwrap_or(100)
         .clamp(1, 500);
 
-    // Visible targets are the channels the requester is on.
+    // Visible targets are the channels the requester is on, plus every
+    // conversation they take part in. (No early return on "no channels": a
+    // client with only direct messages still has buffers to report.)
     let keys: Vec<super::state::ChanKey> = state.sessions[&conn].channels.iter().cloned().collect();
+    let me = state.conn_identity(conn);
     let batch_ref = state.next_msgid();
-    if keys.is_empty() {
-        // Runs under labeled-response capture; frame_labeled applies the label.
-        targets_page(state, conn, &batch_ref, Vec::new(), None);
-        return;
-    }
 
     if state.config.sasl_enabled {
         let channels = keys.iter().map(|k| k.as_str().to_string()).collect();
@@ -4519,6 +4605,7 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let request = super::DbRequest::QueryTargets {
             conn,
             channels,
+            me,
             min_ts,
             max_ts,
             limit,
@@ -4535,31 +4622,50 @@ fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 &["TARGETS"],
                 "History temporarily unavailable",
             );
-        } else if let Some(cap) = state.capture.as_mut() {
-            // Enqueued: the labeled batch is emitted when the DB replies, so
-            // don't ACK this command as an empty response.
-            if cap.label.is_some() {
-                cap.deferred = true;
+        } else {
+            state.defer_reply(conn);
+            if let Some(cap) = state.capture.as_mut() {
+                // The labeled batch is emitted when the DB replies, so don't
+                // ACK this command as an empty response.
+                if cap.label.is_some() {
+                    cap.deferred = true;
+                }
             }
         }
         return;
     }
 
     // No database: enumerate from the hot rings.
+    // A buffer qualifies on its *latest* message falling inside the window,
+    // not on merely containing one: newer activity means the client has
+    // already moved past it.
+    let latest_in_window = |state: &ServerState, key: &super::state::HistoryKey| -> Option<u64> {
+        let latest = state.history.get(key)?.entries.iter().map(|e| e.ts).max()?;
+        (latest > min_ts && latest < max_ts).then_some(latest)
+    };
     let mut targets: Vec<(String, u64)> = Vec::new();
-    for key in keys {
-        if let Some(chan) = state.channels.get(&key)
-            && let Some(latest) = chan
-                .history
-                .iter()
-                .filter(|e| e.ts >= min_ts && e.ts <= max_ts)
-                .map(|e| e.ts)
-                .max()
+    for key in &keys {
+        if let Some(latest) = latest_in_window(state, &key.into())
+            && let Some(chan) = state.channels.get(key)
         {
             targets.push((chan.name.clone(), latest));
         }
     }
-    targets.sort_by_key(|t| std::cmp::Reverse(t.1));
+    // Conversations: every hot key that is not a channel and lists the
+    // requester as a participant. The correspondent is the other participant
+    // (or the requester, for a conversation with oneself).
+    let conversations: Vec<(super::state::HistoryKey, String)> = state
+        .history
+        .keys()
+        .filter_map(|k| dm_correspondent(k, &me).map(|peer| (k.clone(), peer)))
+        .collect();
+    for (key, peer) in conversations {
+        if let Some(latest) = latest_in_window(state, &key) {
+            targets.push((state.identity_nick(&peer), latest));
+        }
+    }
+    // Oldest activity first; a limit therefore keeps the oldest buffers.
+    targets.sort_by_key(|t| t.1);
     targets.truncate(limit);
     // No-DB path runs under labeled-response capture; frame_labeled applies it.
     targets_page(state, conn, &batch_ref, targets, None);
@@ -4612,10 +4718,7 @@ fn needs_db_for_missing_ref(ring_full: bool, selector: &str) -> bool {
 }
 
 /// Resolve a msgid=/timestamp= selector to a timestamp for DB paging.
-fn selector_ts(
-    history: &std::collections::VecDeque<super::state::HistoryEntry>,
-    selector: &str,
-) -> Option<u64> {
+fn selector_ts(history: &[super::state::HistoryEntry], selector: &str) -> Option<u64> {
     if let Some(msgid) = selector.strip_prefix("msgid=") {
         history.iter().find(|e| e.msgid == msgid).map(|e| e.ts)
     } else if let Some(ts) = selector.strip_prefix("timestamp=") {
@@ -4646,15 +4749,44 @@ pub(crate) fn history_page(
         None => format!(":{server} BATCH +{batch_ref} chathistory {display}"),
     };
     state.send(conn, &open);
+    // A channel message was addressed to the channel, so every replayed row
+    // carries the same target. A direct message was addressed to a *person*,
+    // and a conversation holds both directions — so each row is re-addressed
+    // the way it was originally sent: rows the requester sent name the
+    // correspondent, rows the correspondent sent name the requester. Replaying
+    // a whole thread under one target would rewrite who each message was to.
+    //
+    // Both sides are named in their canonical casing rather than however the
+    // client spelled the target, so a replayed message is byte-identical to the
+    // one delivered live.
+    let dm = (!display.starts_with('#'))
+        .then(|| state.sessions.get(&conn).and_then(|s| s.nick.clone()))
+        .flatten()
+        .map(|me| {
+            let my_key = state.casemap.casefold(&me);
+            let peer = state.display_nick(&state.casemap.casefold(display));
+            (me, my_key, peer)
+        });
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts);
+        let target = match &dm {
+            Some((me, my_key, peer)) => {
+                let sender = row.sender_prefix.split('!').next().unwrap_or_default();
+                if &state.casemap.casefold(sender) == my_key {
+                    peer.as_str()
+                } else {
+                    me.as_str()
+                }
+            }
+            None => display,
+        };
         // Canonical uppercase verb on the wire regardless of source: the ring
         // holds "PRIVMSG"/"NOTICE" but the DB stores lowercase, and this is the
         // one render site for both — normalize here so the same message never
         // replays with a different verb case depending on where it came from.
         let verb = row.kind.to_ascii_uppercase();
         let line = format!(
-            "@batch={batch_ref};msgid={};time={time} :{} {verb} {display} :{}",
+            "@batch={batch_ref};msgid={};time={time} :{} {verb} {target} :{}",
             row.msgid, row.sender_prefix, row.body,
         );
         state.send(conn, &line);
