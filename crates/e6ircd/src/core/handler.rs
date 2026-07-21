@@ -309,6 +309,18 @@ fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let key = state.nick_key(nick);
+    // Service pseudo-client nicks are reserved: PRIVMSG to them is intercepted,
+    // so a user holding one could never receive messages and could impersonate
+    // the service.
+    if is_service_nick(key.as_str()) {
+        state.numeric(
+            conn,
+            ERR_ERRONEUSNICKNAME,
+            &[nick],
+            Some("Nickname is reserved"),
+        );
+        return;
+    }
     if let Some(&owner) = state.nicks.get(&key)
         && owner != conn
     {
@@ -343,11 +355,13 @@ fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
     if registered {
         let line = format!(":{} NICK {nick}", prefix.expect("registered"));
-        state.send(conn, &line);
+        // Route through send_timed (self and each peer) so server-time clients
+        // get an @time= tag, like every other membership event — a raw
+        // send_bytes loop would silently omit it for NICK alone.
+        state.send_timed(conn, &line);
         let peers = state.channel_peers(conn);
-        let bytes = bytes::Bytes::from(format!("{line}\r\n"));
         for peer in peers {
-            state.send_bytes(peer, bytes.clone());
+            state.send_timed(peer, &line);
         }
         if !case_change_only {
             if let Some(old_nick) = old_nick_display {
@@ -793,6 +807,17 @@ fn notify_account_change(state: &mut ServerState, conn: ConnId, account: &str) {
 }
 
 // ---- services pseudo-clients --------------------------------------------
+
+/// Casefolded nicks the built-in services pseudo-clients occupy. PRIVMSG to
+/// these is intercepted (see `deliver_one_message`), so they are also reserved
+/// at NICK — one list backs both, so the intercept and the reservation can't
+/// disagree and let a user seize a service nick.
+const SERVICE_NICKS: [&str; 2] = ["nickserv", "chanserv"];
+
+/// Whether `key` (a casefolded nick) is a reserved services pseudo-client.
+fn is_service_nick(key: &str) -> bool {
+    SERVICE_NICKS.contains(&key)
+}
 
 fn services_dispatch(state: &mut ServerState, conn: ConnId, service_key: &str, text: &str) {
     let mut words = text.split_whitespace();
@@ -2277,7 +2302,7 @@ fn deliver_one_message(
     // to services is dropped without reply (spec: NOTICE never triggers
     // automatic responses).
     let target_key = state.nick_key(target);
-    if target_key.as_str() == "nickserv" || target_key.as_str() == "chanserv" {
+    if is_service_nick(target_key.as_str()) {
         if loud {
             services_dispatch(state, conn, target_key.as_str(), text);
         }
@@ -2612,6 +2637,17 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
     // Query: exactly one param. Setting requires the second param —
     // distinguished from "TOPIC #c :" (clearing) by has_trailing/params.
     if p.len() == 1 && !msg.has_trailing {
+        // A +s channel's topic — and its very existence — is hidden from
+        // non-members, like every other query surface (NAMES/WHO/WHOIS/LIST).
+        if chan.modes.secret && !chan.members.contains_key(&conn) {
+            state.numeric(
+                conn,
+                ERR_NOTONCHANNEL,
+                &[target],
+                Some("You're not on that channel"),
+            );
+            return;
+        }
         match &chan.topic {
             Some(t) => {
                 let (text, set_by, set_at) = (t.text.clone(), t.set_by.clone(), t.set_at);
@@ -4348,22 +4384,18 @@ fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 return;
             };
             let mut added = Vec::new();
+            let mut rejected = Vec::new();
             for nick in list.split(',').filter(|n| !n.is_empty()) {
                 let key = state.nick_key(nick);
                 if state.sessions[&conn].monitoring.contains_key(&key) {
                     continue;
                 }
                 if state.sessions[&conn].monitoring.len() >= MONITOR_LIMIT {
-                    state.numeric(
-                        conn,
-                        ERR_MONLISTFULL,
-                        &[&MONITOR_LIMIT.to_string(), nick],
-                        Some("Monitor list is full."),
-                    );
-                    // Still report the nicks accepted before the cap — the spec
-                    // requires an online/offline reply for every added target.
-                    monitor_status(state, conn, &added);
-                    return;
+                    // At the cap: collect every over-limit nick rather than
+                    // returning after the first, so the rest of the batch isn't
+                    // silently dropped.
+                    rejected.push(nick.to_string());
+                    continue;
                 }
                 state
                     .sessions
@@ -4374,6 +4406,15 @@ fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 state.monitors.entry(key.clone()).or_default().insert(conn);
                 added.push((key, nick.to_string()));
             }
+            if !rejected.is_empty() {
+                state.numeric(
+                    conn,
+                    ERR_MONLISTFULL,
+                    &[&MONITOR_LIMIT.to_string(), &rejected.join(",")],
+                    Some("Monitor list is full."),
+                );
+            }
+            // The spec requires an online/offline reply for every added target.
             monitor_status(state, conn, &added);
         }
         "-" => {

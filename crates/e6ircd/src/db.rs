@@ -26,6 +26,8 @@ pub enum DbError {
     DuplicateNetwork(String),
     /// Unknown account or wrong password (indistinguishable on purpose).
     BadCredentials,
+    /// A write resolved to no account row for the given name.
+    UnknownAccount(String),
     ReplayedLogoutToken,
 }
 
@@ -39,6 +41,7 @@ impl std::fmt::Display for DbError {
             Self::DuplicateAccount(n) => write!(f, "account already exists: {n}"),
             Self::DuplicateNetwork(n) => write!(f, "network already exists: {n}"),
             Self::BadCredentials => write!(f, "invalid account or password"),
+            Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
         }
     }
@@ -433,7 +436,7 @@ async fn set_read_marker(
     marker_ms: u64,
 ) -> Result<(), DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO read_markers (account_id, target, marker_ts)
          SELECT a.id, $1, to_timestamp($2::double precision / 1000)
          FROM accounts a WHERE a.name_folded = $3
@@ -446,6 +449,12 @@ async fn set_read_marker(
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
+    // The SELECT matches no row if the account name doesn't resolve; that
+    // persists nothing while the in-core mirror already moved, silently
+    // diverging the two. Surface it instead.
+    if result.rows_affected() == 0 {
+        return Err(DbError::UnknownAccount(account.to_string()));
+    }
     Ok(())
 }
 

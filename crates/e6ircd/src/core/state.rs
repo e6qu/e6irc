@@ -955,10 +955,12 @@ impl ServerState {
         let joined: Vec<ChanKey> = session.channels.iter().cloned().collect();
 
         if let Some(line) = quit_line {
+            // send_timed per peer so server-time clients get an @time= tag,
+            // consistent with every other membership event (a raw send_bytes
+            // loop would omit it for QUIT alone).
             let peers = self.channel_peers(conn);
-            let bytes = Bytes::from(format!("{line}\r\n"));
             for p in peers {
-                self.send_bytes(p, bytes.clone());
+                self.send_timed(p, &line);
             }
         }
         for key in joined {
