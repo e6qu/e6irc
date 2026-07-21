@@ -60,9 +60,18 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         state.capture = Some(super::state::Capture {
             conn,
             lines: Vec::new(),
+            label: Some(label.to_string()),
+            deferred: false,
         });
         dispatch_parsed(state, conn, &msg);
-        let captured = state.capture.take().map(|c| c.lines).unwrap_or_default();
+        let cap = state.capture.take();
+        // A handler that deferred its response to an async path (CHATHISTORY →
+        // PostgreSQL) emits its own labeled batch when the reply lands; framing
+        // an empty ACK here would wrongly tell the client there was no response.
+        if cap.as_ref().is_some_and(|c| c.deferred) {
+            return;
+        }
+        let captured = cap.map(|c| c.lines).unwrap_or_default();
         frame_labeled(state, conn, &label, captured);
         return;
     }
@@ -1833,6 +1842,12 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
     } else {
         None
     };
+    // A fresh in-memory channel's ring is the *entire* record only when no
+    // database backs it. With a DB, this channel name may have existed before
+    // (channels are dropped when they empty) and left rows in the `messages`
+    // table, so the ring is not authoritative — mark it incomplete so
+    // CHATHISTORY falls back to PostgreSQL instead of reporting an empty batch.
+    let ring_is_whole_record = !state.config.sasl_enabled;
     let chan = state
         .channels
         .entry(key.clone())
@@ -1851,7 +1866,7 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
             invite_exceptions: Vec::new(),
             created_at: now,
             history: std::collections::VecDeque::new(),
-            history_complete: true,
+            history_complete: ring_is_whole_record,
         });
     if chan.members.contains_key(&conn) {
         return; // already joined: JOIN is idempotent per Solanum
@@ -2938,7 +2953,10 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                             &["MODE"],
                             Some("Not enough parameters"),
                         );
-                        return;
+                        // Stop, but still broadcast the modes already applied
+                        // this command — returning here would mutate state
+                        // (e.g. a preceding +m) without ever announcing it.
+                        break;
                     };
                     // Keys with spaces or empty are unusable on the wire.
                     if k.is_empty() || k.contains(' ') {
@@ -2971,7 +2989,8 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                             &["MODE"],
                             Some("Not enough parameters"),
                         );
-                        return;
+                        // Broadcast what already applied before stopping.
+                        break;
                     };
                     let n = l.parse::<u32>().ok().filter(|&n| n > 0);
                     let Some(n) = n else {
@@ -3058,7 +3077,8 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
                         &["MODE"],
                         Some("Not enough parameters"),
                     );
-                    return;
+                    // Broadcast what already applied before stopping.
+                    break;
                 };
                 let nick_key = state.nick_key(who);
                 let Some(&member_conn) = state.nicks.get(&nick_key) else {
@@ -3382,7 +3402,27 @@ fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 Some(&realname),
             );
             if !chans.is_empty() {
-                state.numeric(conn, RPL_WHOISCHANNELS, &[&nick], Some(&chans.join(" ")));
+                // Split across as many 319 lines as needed so none exceeds the
+                // 512-byte wire limit (the same guard send_names applies to
+                // 353): prefix, numeric, requester, target nick, " :" and CRLF
+                // are fixed overhead; the channel list fills the rest.
+                let requester_nick = state.sessions[&conn].nick.clone().unwrap_or_default();
+                let overhead = 1 + server.len() + 5 + requester_nick.len() + 1 + nick.len() + 4;
+                let budget = 512usize.saturating_sub(overhead).max(1);
+                let mut line = String::new();
+                for ch in &chans {
+                    if !line.is_empty() && line.len() + 1 + ch.len() > budget {
+                        state.numeric(conn, RPL_WHOISCHANNELS, &[&nick], Some(&line));
+                        line.clear();
+                    }
+                    if !line.is_empty() {
+                        line.push(' ');
+                    }
+                    line.push_str(ch);
+                }
+                if !line.is_empty() {
+                    state.numeric(conn, RPL_WHOISCHANNELS, &[&nick], Some(&line));
+                }
             }
             if state.sessions[&peer].bot {
                 state.numeric(conn, RPL_WHOISBOT, &[&nick], Some("is a bot"));
@@ -3981,20 +4021,31 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 },
             },
         };
+        // Carry the labeled-response label (if any) onto the deferred batch.
+        let label = state.capture.as_ref().and_then(|c| c.label.clone());
         let request = super::DbRequest::QueryHistory {
             conn,
             target: key.as_str().to_string(),
             display: display.clone(),
             batch_ref,
             query,
+            label,
         };
         if state.db_tx.try_push(request).is_err() {
+            // Enqueue failed: fall through to a synchronous FAIL, which the
+            // labeled-response framer still handles normally.
             chathistory_fail(
                 state,
                 conn,
                 "MESSAGE_ERROR",
                 "History temporarily unavailable",
             );
+        } else if let Some(cap) = state.capture.as_mut() {
+            // Enqueued: the labeled batch will be emitted when the DB replies,
+            // so tell the framer not to ACK this command as an empty response.
+            if cap.label.is_some() {
+                cap.deferred = true;
+            }
         }
         return;
     }
@@ -4009,7 +4060,9 @@ fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             body: e.body,
         })
         .collect();
-    history_page(state, conn, &display, &batch_ref, rows);
+    // Ring path runs under labeled-response capture; frame_labeled applies the
+    // label, so history_page must not (pass None).
+    history_page(state, conn, &display, &batch_ref, rows, None);
 }
 
 /// CHATHISTORY TARGETS: enumerate the requester's buffers with activity in
@@ -4142,23 +4195,35 @@ fn selector_ts(
 
 /// Render a resolved history window as a batch. The single choke point
 /// for CHATHISTORY output, used by both the ring and DB paths.
+///
+/// `label` is set only on the async DB path: that reply is produced outside the
+/// synchronous labeled-response capture, so it must tag its own opening BATCH
+/// line with the label. The ring path runs under capture (`label` is `None`)
+/// and is framed by [`frame_labeled`] instead.
 pub(crate) fn history_page(
     state: &mut ServerState,
     conn: ConnId,
     display: &str,
     batch_ref: &str,
     rows: Vec<super::HistoryRow>,
+    label: Option<&str>,
 ) {
     let server = state.config.server_name.clone();
-    state.send(
-        conn,
-        &format!(":{server} BATCH +{batch_ref} chathistory {display}"),
-    );
+    let open = match label {
+        Some(label) => format!("@label={label} :{server} BATCH +{batch_ref} chathistory {display}"),
+        None => format!(":{server} BATCH +{batch_ref} chathistory {display}"),
+    };
+    state.send(conn, &open);
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts * 1000);
+        // Canonical uppercase verb on the wire regardless of source: the ring
+        // holds "PRIVMSG"/"NOTICE" but the DB stores lowercase, and this is the
+        // one render site for both — normalize here so the same message never
+        // replays with a different verb case depending on where it came from.
+        let verb = row.kind.to_ascii_uppercase();
         let line = format!(
-            "@batch={batch_ref};msgid={};time={time} :{} {} {display} :{}",
-            row.msgid, row.sender_prefix, row.kind, row.body,
+            "@batch={batch_ref};msgid={};time={time} :{} {verb} {display} :{}",
+            row.msgid, row.sender_prefix, row.body,
         );
         state.send(conn, &line);
     }

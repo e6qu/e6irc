@@ -289,6 +289,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             display,
             batch_ref,
             query,
+            label,
         } => {
             let rows = query_history(pool, &target, query).await;
             core_tx
@@ -297,6 +298,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     display,
                     batch_ref,
                     rows,
+                    label,
                 })
                 .await
                 .is_ok()
@@ -403,6 +405,20 @@ pub async fn list_read_markers(
          WHERE a.name_folded = $1 ORDER BY r.target",
     )
     .bind(&folded)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Every stored read marker as (account display name, target, epoch-millis),
+/// for the core's boot-time preload of its hot mirror of the `read_markers`
+/// table. Without this the mirror starts empty after a restart and MARKREAD
+/// queries wrongly report `*` for markers that are in fact persisted.
+pub async fn list_all_read_markers(pool: &PgPool) -> Result<Vec<(String, String, i64)>, DbError> {
+    sqlx::query_as(
+        "SELECT a.name, r.target, (EXTRACT(EPOCH FROM r.marker_ts) * 1000)::bigint
+         FROM read_markers r JOIN accounts a ON a.id = r.account_id",
+    )
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)

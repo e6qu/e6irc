@@ -59,6 +59,35 @@ pub fn network_config_from_row(
 
 use tokio::sync::mpsc;
 
+/// Jittered exponential reconnect backoff shared by every always-on driver, so
+/// their reconnect timing stays identical in one place. Starts at 200ms,
+/// doubles per drop, caps at 30s, and resets once a session lasted long enough
+/// (≥10s) to have clearly connected — otherwise a flapping-but-reachable
+/// upstream would ratchet toward the cap forever. Jitter is a coarse
+/// deterministic function of the delay (no RNG), enough to spread reconnects.
+pub(crate) struct Backoff {
+    current: std::time::Duration,
+}
+
+impl Backoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            current: std::time::Duration::from_millis(200),
+        }
+    }
+
+    /// Sleep before the next reconnect attempt, given how long the session that
+    /// just ended lasted, then grow the delay for the attempt after this one.
+    pub(crate) async fn wait(&mut self, session_ran: std::time::Duration) {
+        if session_ran >= std::time::Duration::from_secs(10) {
+            self.current = std::time::Duration::from_millis(200);
+        }
+        let jitter = std::time::Duration::from_millis((self.current.as_millis() as u64) % 97);
+        tokio::time::sleep(self.current + jitter).await;
+        self.current = (self.current * 2).min(std::time::Duration::from_secs(30));
+    }
+}
+
 /// Outcome of one driver session attempt, for the always-on drivers'
 /// reconnect loops: the owner dropped the handle (stop for good), or the
 /// upstream connection dropped and the driver should reconnect with backoff.

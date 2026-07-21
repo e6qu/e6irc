@@ -41,6 +41,9 @@ pub enum Input {
         display: String,
         batch_ref: String,
         rows: Vec<HistoryRow>,
+        /// Labeled-response label to place on the batch, if the command that
+        /// triggered this deferred page was labeled.
+        label: Option<String>,
     },
     /// Resolved CHATHISTORY TARGETS from PostgreSQL: `(target, latest ts)`
     /// pairs for the buffers with activity in the requested window.
@@ -98,6 +101,9 @@ pub enum DbRequest {
         display: String,
         batch_ref: String,
         query: HistoryQuery,
+        /// Escaped labeled-response label to carry onto the deferred batch, if
+        /// the originating command was labeled.
+        label: Option<String>,
     },
     /// Enumerate the buffers (among `channels`, the requester's memberships)
     /// with messages in `[min_ts, max_ts]`. Answered with
@@ -318,6 +324,12 @@ impl Core {
         self.state.preload_server_bans(rows);
     }
 
+    /// Seed the read-marker mirror from persisted rows before the worker loop
+    /// starts (see [`ServerState::preload_read_markers`]).
+    pub fn preload_read_markers(&mut self, rows: Vec<(String, String, u64)>) {
+        self.state.preload_read_markers(rows);
+    }
+
     /// Process one event. All state transitions happen here, on one
     /// thread, in queue order.
     pub fn handle(&mut self, input: Input) {
@@ -332,7 +344,15 @@ impl Core {
                 display,
                 batch_ref,
                 rows,
-            } => handler::history_page(&mut self.state, conn, &display, &batch_ref, rows),
+                label,
+            } => handler::history_page(
+                &mut self.state,
+                conn,
+                &display,
+                &batch_ref,
+                rows,
+                label.as_deref(),
+            ),
             Input::TargetsPage {
                 conn,
                 batch_ref,

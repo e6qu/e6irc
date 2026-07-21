@@ -27,6 +27,11 @@ jobs:
       # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
       # deferred-work markers or unmessaged panics.
       - run: tools/check-noops.sh
+      # Dead-code guard: compile only the shipped artifacts (no test targets)
+      # with -D warnings, so code kept alive solely by tests is caught as dead.
+      - run: tools/check-dead-code.sh
+      # Copy-paste guard: fail if duplicated Rust source exceeds the ratchet.
+      - run: tools/check-duplication.sh
 
   deny:
     runs-on: ubuntu-24.04

@@ -134,26 +134,34 @@ impl Connection {
         }
     }
 
-    /// Register with SASL PLAIN: authenticate as `account`/`password`
-    /// during CAP negotiation, then register `nick`.
-    pub async fn register_sasl(
-        &mut self,
-        nick: &str,
-        realname: &str,
-        account: &str,
-        password: &str,
-    ) -> io::Result<String> {
+    /// Receive the next message, or fail loudly if the peer closed the socket
+    /// mid-handshake instead of hanging on a stream that will never speak.
+    async fn recv(&mut self, context: &'static str) -> io::Result<OwnedMessage> {
+        self.next_message()
+            .await?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, context))
+    }
+
+    /// Answer a `PING` and report whether `msg` was one, so registration loops
+    /// stay alive without duplicating the PONG dance at every match arm.
+    async fn answer_ping(&mut self, msg: &OwnedMessage) -> io::Result<bool> {
+        if msg.command == "PING" {
+            let token = msg.params.first().cloned().unwrap_or_default();
+            self.send_line(&format!("PONG :{token}")).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// `CAP LS` then request `sasl`, returning once the server ACKs it (or
+    /// erroring on NAK). The shared prologue of every SASL path.
+    async fn negotiate_sasl_cap(&mut self) -> io::Result<()> {
         self.send_line("CAP LS 302").await?;
         self.send_line("CAP REQ :sasl").await?;
         loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed during CAP",
-                ));
-            };
+            let msg = self.recv("closed during CAP").await?;
             match msg.params.get(1).map(String::as_str) {
-                Some("ACK") if msg.command == "CAP" => break,
+                Some("ACK") if msg.command == "CAP" => return Ok(()),
                 Some("NAK") if msg.command == "CAP" => {
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -163,49 +171,26 @@ impl Connection {
                 _ => {}
             }
         }
-        // Best-effort: request the message-tag caps so the bouncer receives
-        // server-time/msgid/account and can preserve them in backlog. Each is
-        // requested separately (an atomic multi-cap REQ would lose all on one
-        // NAK); a NAK just means that cap isn't enabled. The ACK/NAK replies
-        // are ignored by the loops below — the server enables the ACKed caps
-        // regardless.
-        for cap in ["server-time", "message-tags", "account-tag"] {
-            self.send_line(&format!("CAP REQ :{cap}")).await?;
-        }
-        self.send_line("AUTHENTICATE PLAIN").await?;
+    }
+
+    /// Wait for the server's empty `AUTHENTICATE +` challenge after a mechanism
+    /// has been offered.
+    async fn await_authenticate_challenge(&mut self) -> io::Result<()> {
         loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed during SASL",
-                ));
-            };
+            let msg = self.recv("closed during SASL").await?;
             if msg.command == "AUTHENTICATE" {
-                break;
+                return Ok(());
             }
         }
-        let payload = {
-            let mut bytes = vec![0u8];
-            bytes.extend_from_slice(account.as_bytes());
-            bytes.push(0);
-            bytes.extend_from_slice(password.as_bytes());
-            e6irc_proto::base64::encode(&bytes)
-        };
-        // Send registration info while CAP is still open, then the
-        // credentials — but wait for the SASL *result* before CAP END,
-        // so the server doesn't complete registration (001) ahead of the
-        // verdict and mask a failure.
-        self.send_line(&format!("NICK {nick}")).await?;
-        self.send_line(&format!("USER {nick} 0 * :{realname}"))
-            .await?;
-        self.send_line(&format!("AUTHENTICATE {payload}")).await?;
+    }
+
+    /// After the credential is sent: wait for the SASL verdict, finish CAP on
+    /// success (903), then wait for the welcome (001). The shared epilogue of
+    /// every SASL path — waiting for the verdict before `CAP END` so the server
+    /// can't complete registration ahead of it and mask a failure.
+    async fn finish_sasl_then_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed during SASL",
-                ));
-            };
+            let msg = self.recv("closed during SASL").await?;
             match msg.command.as_str() {
                 // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
                 "903" => {
@@ -218,35 +203,57 @@ impl Connection {
                         "SASL authentication failed",
                     ));
                 }
-                "PING" => {
-                    let token = msg.params.first().cloned().unwrap_or_default();
-                    self.send_line(&format!("PONG :{token}")).await?;
+                _ => {
+                    self.answer_ping(&msg).await?;
                 }
-                _ => {}
             }
         }
         loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed before welcome",
-                ));
-            };
-            match msg.command.as_str() {
-                "001" => {
-                    return Ok(msg
-                        .params
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| nick.to_string()));
-                }
-                "PING" => {
-                    let token = msg.params.first().cloned().unwrap_or_default();
-                    self.send_line(&format!("PONG :{token}")).await?;
-                }
-                _ => {}
+            let msg = self.recv("closed before welcome").await?;
+            if msg.command == "001" {
+                return Ok(msg
+                    .params
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| nick.to_string()));
             }
+            self.answer_ping(&msg).await?;
         }
+    }
+
+    /// Register with SASL PLAIN: authenticate as `account`/`password`
+    /// during CAP negotiation, then register `nick`.
+    pub async fn register_sasl(
+        &mut self,
+        nick: &str,
+        realname: &str,
+        account: &str,
+        password: &str,
+    ) -> io::Result<String> {
+        self.negotiate_sasl_cap().await?;
+        // Best-effort: request the message-tag caps so the bouncer receives
+        // server-time/msgid/account and can preserve them in backlog. Each is
+        // requested separately (an atomic multi-cap REQ would lose all on one
+        // NAK); a NAK just means that cap isn't enabled. The ACK/NAK replies
+        // are ignored below — the server enables the ACKed caps regardless.
+        for cap in ["server-time", "message-tags", "account-tag"] {
+            self.send_line(&format!("CAP REQ :{cap}")).await?;
+        }
+        self.send_line("AUTHENTICATE PLAIN").await?;
+        self.await_authenticate_challenge().await?;
+        let payload = {
+            let mut bytes = vec![0u8];
+            bytes.extend_from_slice(account.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(password.as_bytes());
+            e6irc_proto::base64::encode(&bytes)
+        };
+        // Send registration info while CAP is still open, then the credentials.
+        self.send_line(&format!("NICK {nick}")).await?;
+        self.send_line(&format!("USER {nick} 0 * :{realname}"))
+            .await?;
+        self.send_line(&format!("AUTHENTICATE {payload}")).await?;
+        self.finish_sasl_then_welcome(nick).await
     }
 
     /// Register with SASL OAUTHBEARER: authenticate with `token` (an
@@ -257,38 +264,9 @@ impl Connection {
         realname: &str,
         token: &str,
     ) -> io::Result<String> {
-        self.send_line("CAP LS 302").await?;
-        self.send_line("CAP REQ :sasl").await?;
-        loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed during CAP",
-                ));
-            };
-            match msg.params.get(1).map(String::as_str) {
-                Some("ACK") if msg.command == "CAP" => break,
-                Some("NAK") if msg.command == "CAP" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "server refused SASL",
-                    ));
-                }
-                _ => {}
-            }
-        }
+        self.negotiate_sasl_cap().await?;
         self.send_line("AUTHENTICATE OAUTHBEARER").await?;
-        loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed during SASL",
-                ));
-            };
-            if msg.command == "AUTHENTICATE" {
-                break;
-            }
-        }
+        self.await_authenticate_challenge().await?;
         // RFC 7628 client response: gs2 header, then the bearer credential.
         let payload =
             e6irc_proto::base64::encode(format!("n,,\x01auth=Bearer {token}\x01\x01").as_bytes());
@@ -296,53 +274,7 @@ impl Connection {
         self.send_line(&format!("USER {nick} 0 * :{realname}"))
             .await?;
         self.send_line(&format!("AUTHENTICATE {payload}")).await?;
-        loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed during SASL",
-                ));
-            };
-            match msg.command.as_str() {
-                "903" => {
-                    self.send_line("CAP END").await?;
-                    break;
-                }
-                "902" | "904" | "905" | "906" | "908" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "SASL authentication failed",
-                    ));
-                }
-                "PING" => {
-                    let token = msg.params.first().cloned().unwrap_or_default();
-                    self.send_line(&format!("PONG :{token}")).await?;
-                }
-                _ => {}
-            }
-        }
-        loop {
-            let Some(msg) = self.next_message().await? else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "closed before welcome",
-                ));
-            };
-            match msg.command.as_str() {
-                "001" => {
-                    return Ok(msg
-                        .params
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| nick.to_string()));
-                }
-                "PING" => {
-                    let token = msg.params.first().cloned().unwrap_or_default();
-                    self.send_line(&format!("PONG :{token}")).await?;
-                }
-                _ => {}
-            }
-        }
+        self.finish_sasl_then_welcome(nick).await
     }
 
     /// Register with a nick and realname, answering PINGs, until the

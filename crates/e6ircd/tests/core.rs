@@ -13,6 +13,18 @@ struct TestServer {
 
 impl TestServer {
     fn new() -> Self {
+        Self::with_persistence(true)
+    }
+
+    /// A server with no database configured (`sasl_enabled = false`), so the
+    /// in-memory ring is the entire record and CHATHISTORY never defers to a
+    /// (fake, non-replying) DB worker. Use this for pure-ring behavior tests;
+    /// the DB fallback path is covered by the PostgreSQL suite in tests/db.rs.
+    fn new_no_persistence() -> Self {
+        Self::with_persistence(false)
+    }
+
+    fn with_persistence(sasl_enabled: bool) -> Self {
         let (db_tx, db_rx) = queue(Config {
             name: "test-db",
             capacity: 64,
@@ -25,7 +37,7 @@ impl TestServer {
                     network_name: "TestNet".into(),
                     motd: vec!["Welcome to the test net".into()],
                     nicklen: 16,
-                    sasl_enabled: true,
+                    sasl_enabled,
                     max_hot_channels: 8192,
                     opers: vec![("god".into(), "letmein".into())],
                     clock: || 1_000_000,
@@ -475,6 +487,86 @@ fn channel_mode_and_ops() {
     s.drain(carol);
     s.line(carol, "PRIVMSG #room :can speak");
     assert_eq!(s.drain(alice).len(), 1);
+}
+
+#[test]
+fn mode_partial_application_is_announced_not_silent() {
+    // A mode that runs out of arguments must not discard the modes already
+    // applied earlier in the same command: `+mo` with no nick applies +m, so
+    // the +m must be broadcast (not silently mutate state) alongside the error.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #room");
+        s.drain(c);
+    }
+    s.drain(alice);
+
+    s.line(alice, "MODE #room +mo");
+    let out = s.drain(alice);
+    // The error for the arg-less +o is sent...
+    assert!(
+        has_numeric(&out, "461"),
+        "expected ERR_NEEDMOREPARAMS: {out:#?}"
+    );
+    // ...and the +m that DID apply is announced, not silently swallowed.
+    let announced = out
+        .iter()
+        .find(|l| l.contains("MODE #room") && l.contains("+m"))
+        .unwrap_or_else(|| panic!("applied +m must be broadcast: {out:#?}"));
+    // Only +m applied — the arg-less +o must not appear in the mode string.
+    assert!(
+        announced.trim_end().ends_with("+m"),
+        "broadcast must be exactly +m, not +mo: {announced}"
+    );
+    // Bob (a member) also saw the +m broadcast.
+    assert!(
+        s.drain(bob)
+            .iter()
+            .any(|l| l.contains("MODE #room") && l.contains("+m")),
+        "members must see the applied +m"
+    );
+
+    // State really is +m: an unvoiced non-op cannot speak.
+    let carol = s.register(3, "carol");
+    s.line(carol, "JOIN #room");
+    s.drain(carol);
+    s.line(carol, "PRIVMSG #room :muted?");
+    assert!(has_numeric(&s.drain(carol), "404"), "channel must be +m");
+}
+
+#[test]
+fn whois_channels_split_to_respect_512_byte_limit() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    // Join enough long-named channels that the RPL_WHOISCHANNELS list cannot
+    // fit one 512-byte line, forcing the same split send_names applies to 353.
+    for i in 0..40 {
+        s.line(
+            alice,
+            &format!("JOIN #channel-with-a-fairly-long-name-{i:02}"),
+        );
+    }
+    s.drain(alice);
+
+    let bob = s.register(2, "bob");
+    s.line(bob, "WHOIS alice");
+    let out = s.drain(bob);
+    let lines_319: Vec<&String> = out.iter().filter(|l| l.contains(" 319 ")).collect();
+    assert!(
+        lines_319.len() > 1,
+        "319 must split across multiple lines, got {}",
+        lines_319.len()
+    );
+    for l in &lines_319 {
+        // +2 for the CRLF the transport appends.
+        assert!(
+            l.len() + 2 <= 512,
+            "319 line exceeds 512 bytes: {} bytes",
+            l.len() + 2
+        );
+    }
 }
 
 #[test]
@@ -1545,7 +1637,7 @@ fn chathistory_requires_caps_and_membership() {
 
 #[test]
 fn chathistory_before_msgid() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::new_no_persistence();
     let alice = s.register(1, "alice");
     let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
     for c in [alice, bob] {
@@ -2338,7 +2430,7 @@ fn chathistory_targets_enumerates_buffers() {
 
 #[test]
 fn chathistory_around_msgid() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::new_no_persistence();
     let alice = s.register(1, "alice");
     let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
     for c in [alice, bob] {
@@ -3647,7 +3739,7 @@ fn maxlist_is_a_combined_cap() {
 
 #[test]
 fn labeled_chathistory_has_single_batch_tag() {
-    let mut s = TestServer::new();
+    let mut s = TestServer::new_no_persistence();
     let a = register_with_caps(
         &mut s,
         1,

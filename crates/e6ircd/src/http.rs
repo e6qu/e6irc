@@ -67,6 +67,9 @@ pub struct AppState {
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
     pub auth_buckets: Mutex<HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+    /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
+    /// opened over `/ws/irc` count against the same budget as raw-socket ones.
+    pub(crate) conn_limiter: crate::net::ConnLimiter,
 }
 
 impl AppState {
@@ -2507,8 +2510,25 @@ async fn history(
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
-async fn ws_irc(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| ws_irc_conn(state, socket))
+async fn ws_irc(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Enforce the same per-IP connection cap the raw IRC listeners apply,
+    // keyed on the real client IP (X-Forwarded-For behind a trusted proxy) so
+    // /ws/irc can't be used to sidestep it. The guard is held for the
+    // connection's lifetime and releases the slot on drop.
+    let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
+    let Some(guard) = state.conn_limiter.try_acquire(ip) else {
+        return problem(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Per-IP connection limit reached",
+            None,
+        );
+    };
+    ws.on_upgrade(move |socket| ws_irc_conn(state, socket, guard))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -2516,11 +2536,16 @@ async fn ws_irc(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Res
 /// the TCP connection path (net::serve_conn) over the WS transport. A
 /// single task owns the socket and selects between inbound frames and
 /// the drained SendQ — no split, so no extra dependency.
-async fn ws_irc_conn(state: Arc<AppState>, mut socket: WebSocket) {
+async fn ws_irc_conn(
+    state: Arc<AppState>,
+    mut socket: WebSocket,
+    _conn_guard: crate::net::ConnGuard,
+) {
     use crate::core::{ConnId, Input, Output};
     use e6irc_proto::framing::{LineBuffer, LineEvent};
     use std::sync::atomic::Ordering;
 
+    // Held for the whole connection; its Drop releases the per-IP slot.
     let conn = ConnId(state.next_conn.fetch_add(1, Ordering::Relaxed));
     let (out_tx, mut out_rx) = e6irc_queue::queue::<Output>(e6irc_queue::Config {
         name: "ws-sendq",
@@ -2639,6 +2664,12 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
     use crate::bouncer::DriverEvent;
     use tokio::sync::broadcast::error::RecvError;
 
+    // Subscribe BEFORE snapshotting the buffer, so a line the driver emits
+    // during playback is caught by the subscription instead of falling into the
+    // gap between the two (a duplicated backlog line is harmless; a lost one is
+    // not). This mirrors attach()'s ordering — the same invariant over WS.
+    let mut events = handle.subscribe();
+
     // Playback: everything buffered while detached, as fragments.
     for line in handle.buffer_snapshot() {
         if socket
@@ -2649,7 +2680,6 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
             return;
         }
     }
-    let mut events = handle.subscribe();
     loop {
         tokio::select! {
             ev = events.recv() => match ev {
@@ -2668,12 +2698,22 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
                 Ok(DriverEvent::Disconnected) => {
                     let _ = socket.send(WsMessage::text(render_status_fragment(ConnStatus::Disconnected))).await;
                 }
-                Err(RecvError::Lagged(_)) => {}      // slow client: skip the gap
+                Err(RecvError::Lagged(n)) => {
+                    // Slow client: the broadcast buffer overwrote lines this
+                    // socket hadn't read. They're unrecoverable, but surface
+                    // the gap rather than let it vanish silently.
+                    let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
+                    let _ = socket.send(WsMessage::text(render_line_fragment(&notice))).await;
+                }
                 Err(RecvError::Closed) => break,      // driver gone
             },
             frame = socket.recv() => match frame {
                 Some(Ok(WsMessage::Text(t))) => {
-                    if !handle.send(&composer_to_irc(&t)) {
+                    // One composer frame is exactly one upstream line; the
+                    // other client→upstream paths run bytes through LineBuffer,
+                    // so match that invariant here (no CRLF injection, bounded
+                    // length) instead of sending the raw frame unframed.
+                    if !handle.send(&sanitize_composer_line(&composer_to_irc(&t))) {
                         break; // driver gone
                     }
                 }
@@ -2682,6 +2722,24 @@ async fn ws_ui_conn(handle: std::sync::Arc<crate::bouncer::NetworkHandle>, mut s
             },
         }
     }
+}
+
+/// Reduce a composer-derived line to exactly one framed IRC line: cut at the
+/// first embedded CR/LF (which would otherwise inject a second upstream line)
+/// and bound the length to the same 4096+510 cap the framed transports use,
+/// truncating on a UTF-8 char boundary.
+fn sanitize_composer_line(line: &str) -> String {
+    let end = line.find(['\r', '\n']).unwrap_or(line.len());
+    let mut line = line[..end].to_string();
+    let max = 4096 + 510;
+    if line.len() > max {
+        let mut cut = max;
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        line.truncate(cut);
+    }
+    line
 }
 
 /// Translate a composer frame into an IRC line. The htmx web composer

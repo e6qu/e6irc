@@ -129,6 +129,11 @@ pub async fn start(config: Config) -> io::Result<Running> {
         None
     };
 
+    // One per-IP connection cap shared by the TCP IRC listeners and the
+    // IRC-over-WebSocket path, so a client can't sidestep the cap by opening
+    // its sessions through /ws/irc instead of the raw port.
+    let limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
+
     let http_addr = match &config.http {
         Some(http_config) => {
             let listener = TcpListener::bind(http_config.addr).await?;
@@ -172,6 +177,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 trusted_proxies,
                 auth_rate_burst: config.limits.auth_rate_burst,
                 auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+                conn_limiter: limiter.clone(),
             });
             tokio::spawn(async move {
                 // `ConnectInfo<SocketAddr>` so handlers can see the socket peer
@@ -238,6 +244,16 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?,
         );
+        // The read-marker mirror must be seeded too, or MARKREAD queries report
+        // `*` after a restart and a stale set could move a marker backwards.
+        core.preload_read_markers(
+            crate::db::list_all_read_markers(pool)
+                .await
+                .map_err(io::Error::other)?
+                .into_iter()
+                .map(|(account, target, ms)| (account, target, ms.max(0) as u64))
+                .collect(),
+        );
     }
     tokio::spawn(core_worker(core, core_rx));
 
@@ -263,7 +279,10 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         let Some(guard) = bnc_limiter.try_acquire(peer.ip()) else {
-                            continue; // at the per-IP cap: drop the connection
+                            // At the per-IP cap: drop it, logging like the IRC
+                            // accept loop rather than dropping silently.
+                            eprintln!("bnc refused {peer}: per-IP connection limit reached");
+                            continue;
                         };
                         let registry = registry.clone();
                         let server_name = server_name.clone();
@@ -285,7 +304,6 @@ pub async fn start(config: Config) -> io::Result<Running> {
         });
     }
 
-    let limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
     let mut addrs = Vec::new();
     for listener_config in &config.listeners {
         let listener = TcpListener::bind(listener_config.addr).await?;
@@ -338,13 +356,13 @@ async fn core_worker(mut core: Core, mut rx: Receiver<Input>) {
 /// limiter is a no-op; otherwise it refuses connections beyond the cap
 /// and releases the slot when the connection's guard drops.
 #[derive(Clone)]
-struct ConnLimiter {
+pub(crate) struct ConnLimiter {
     counts: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     max_per_ip: Option<usize>,
 }
 
 impl ConnLimiter {
-    fn new(max_per_ip: Option<usize>) -> Self {
+    pub(crate) fn new(max_per_ip: Option<usize>) -> Self {
         Self {
             counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             max_per_ip,
@@ -352,7 +370,7 @@ impl ConnLimiter {
     }
 
     /// Reserve a slot for `ip`, or `None` if it is already at the cap.
-    fn try_acquire(&self, ip: std::net::IpAddr) -> Option<ConnGuard> {
+    pub(crate) fn try_acquire(&self, ip: std::net::IpAddr) -> Option<ConnGuard> {
         let Some(max) = self.max_per_ip else {
             return Some(ConnGuard { limiter: None, ip });
         };
@@ -380,7 +398,7 @@ impl ConnLimiter {
 }
 
 /// Releases its per-IP slot when the connection ends (on drop).
-struct ConnGuard {
+pub(crate) struct ConnGuard {
     limiter: Option<ConnLimiter>,
     ip: std::net::IpAddr,
 }

@@ -84,6 +84,10 @@ rule exists to override it every time.
 - [ ] `cargo deny check` clean.
 - [ ] `tools/check-noops.sh` clean (no deferred-work markers or unmessaged
       panics in shipped source).
+- [ ] `tools/check-dead-code.sh` clean (no code kept alive only by tests —
+      it builds the shipped artifacts with `cfg(test)` off).
+- [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
+      fix is to extract shared logic, never to raise the threshold).
 - [ ] Anything you moved/renamed: all references updated.
 - [ ] Anything broken you noticed on the way: fixed, or loudly surfaced
       with the reason it wasn't.

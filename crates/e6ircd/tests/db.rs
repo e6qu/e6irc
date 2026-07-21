@@ -914,6 +914,202 @@ async fn chathistory_pages_from_postgres_past_the_ring() {
     );
 }
 
+async fn expect_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    needle: &str,
+) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).await.expect("read") > 0, "EOF");
+            if line.contains(needle) {
+                return line.trim_end().to_string();
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timeout waiting for {needle}"))
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
+    // Regression: a channel that empties is dropped from memory; when re-created
+    // its ring is empty but PostgreSQL still holds the old rows. It must NOT be
+    // marked history-complete (which would make CHATHISTORY return an empty
+    // batch), and a labeled request's deferred DB batch must carry the label.
+    let url = test_db_url();
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+
+    let config = Config {
+        server_name: "irc.recreate.example".into(),
+        network_name: "RecNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let stream = TcpStream::connect(running.addrs[0]).await.expect("irc");
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+
+    w.write_all(
+        b"CAP LS 302\r\n\
+          CAP REQ :batch draft/chathistory message-tags server-time labeled-response\r\n\
+          NICK rec\r\nUSER r 0 * :R\r\nCAP END\r\nJOIN #r\r\n",
+    )
+    .await
+    .unwrap();
+    expect_line(&mut reader, " 366 ").await;
+    for i in 0..5 {
+        w.write_all(format!("PRIVMSG #r :m{i}\r\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    w.write_all(b"PING flushed\r\n").await.unwrap();
+    expect_line(&mut reader, "PONG").await;
+
+    // Wait until all 5 are durably in PG, then leave so the channel is dropped.
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE target = '#r'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n == 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    w.write_all(b"PART #r\r\nPING parted\r\n").await.unwrap();
+    expect_line(&mut reader, "PONG").await;
+
+    // Re-create the channel: its ring is empty, PG still holds m0..m4.
+    w.write_all(b"JOIN #r\r\n").await.unwrap();
+    expect_line(&mut reader, " 366 ").await;
+
+    // Labeled CHATHISTORY: the batch is served from PG (empty ring) and its
+    // opening BATCH line must carry the label.
+    w.write_all(b"@label=zz CHATHISTORY LATEST #r * 10\r\n")
+        .await
+        .unwrap();
+    let batch_open = expect_line(&mut reader, "BATCH +").await;
+    assert!(
+        batch_open.contains("label=zz"),
+        "deferred DB batch must carry the label: {batch_open}"
+    );
+    let batch_ref = batch_open
+        .split(" BATCH +")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .expect("batch ref")
+        .to_string();
+    let mut bodies = Vec::new();
+    loop {
+        let line = expect_line(&mut reader, "").await;
+        if line.contains("BATCH -") {
+            break;
+        }
+        if line.contains(&format!("batch={batch_ref}")) {
+            // Verb is canonical uppercase even when served from PG.
+            assert!(
+                line.contains("PRIVMSG"),
+                "DB replay verb must be uppercase: {line}"
+            );
+            if let Some((_, body)) = line.rsplit_once(" :") {
+                bodies.push(body.to_string());
+            }
+        }
+    }
+    for i in 0..5 {
+        assert!(
+            bodies.contains(&format!("m{i}")),
+            "recreated channel lost persisted history: {bodies:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn read_marker_preloaded_after_restart() {
+    // The read-marker mirror must be seeded from PostgreSQL at boot; otherwise a
+    // MARKREAD query returns `*` after a restart even though a marker persists.
+    let url = test_db_url();
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    sqlx::query("TRUNCATE read_markers, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    db::create_account(&pool, "marky", "pw")
+        .await
+        .expect("acct");
+    drop(pool);
+
+    let make_config = || Config {
+        server_name: "irc.rm.example".into(),
+        network_name: "RmNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        database: Some(DatabaseConfig { url: url.clone() }),
+        ..Config::default()
+    };
+
+    // Authenticate with SASL PLAIN and the read-marker cap, sequencing each
+    // step (the payload only after the server's `AUTHENTICATE +` challenge).
+    async fn login_marky(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        w: &mut tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        w.write_all(b"CAP LS 302\r\nCAP REQ :sasl draft/read-marker\r\nAUTHENTICATE PLAIN\r\n")
+            .await
+            .unwrap();
+        expect_line(reader, "AUTHENTICATE +").await;
+        let payload = e6irc_proto::base64::encode(b"\0marky\0pw");
+        w.write_all(format!("AUTHENTICATE {payload}\r\n").as_bytes())
+            .await
+            .unwrap();
+        expect_line(reader, " 903 ").await;
+        w.write_all(b"NICK marky\r\nUSER m 0 * :M\r\nCAP END\r\n")
+            .await
+            .unwrap();
+        expect_line(reader, " 001 ").await;
+    }
+
+    // First boot: authenticate, set a marker, confirm it persisted.
+    let running = net::start(make_config()).await.expect("start");
+    {
+        let stream = TcpStream::connect(running.addrs[0]).await.expect("irc");
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        login_marky(&mut reader, &mut w).await;
+        w.write_all(b"MARKREAD #chan timestamp=2020-01-01T00:00:00.000Z\r\n")
+            .await
+            .unwrap();
+        expect_line(&mut reader, "MARKREAD #chan timestamp=2020-01-01").await;
+    }
+
+    // Second boot on the same database: the marker must be present immediately.
+    let running2 = net::start(make_config()).await.expect("restart");
+    let stream = TcpStream::connect(running2.addrs[0]).await.expect("irc");
+    let (r, mut w) = stream.into_split();
+    let mut reader = BufReader::new(r);
+    login_marky(&mut reader, &mut w).await;
+    w.write_all(b"MARKREAD #chan\r\n").await.unwrap();
+    let reply = expect_line(&mut reader, "MARKREAD #chan").await;
+    assert!(
+        reply.contains("timestamp=2020-01-01T00:00:00.000Z"),
+        "preloaded marker missing after restart: {reply}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_networks_crud() {
