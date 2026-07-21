@@ -267,6 +267,11 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "LUSERS" => send_lusers(state, conn),
         "TIME" => cmd_time(state, conn),
         "INFO" => cmd_info(state, conn),
+        "VERSION" => cmd_version(state, conn),
+        "ADMIN" => cmd_admin(state, conn),
+        "ISON" => cmd_ison(state, conn, p),
+        "USERIP" => cmd_userip(state, conn, p),
+        "LINKS" => cmd_links(state, conn),
         "OPER" => cmd_oper(state, conn, p),
         "KILL" => cmd_kill(state, conn, p),
         "KLINE" => cmd_add_ban(state, conn, BanKind::Kline, p),
@@ -1620,43 +1625,7 @@ fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
         ],
         None,
     );
-    let nicklen = state.config.nicklen;
-    state.numeric(
-        conn,
-        RPL_ISUPPORT,
-        &[
-            "CASEMAPPING=rfc1459",
-            "CHANTYPES=#",
-            &format!("NICKLEN={nicklen}"),
-            "CHANNELLEN=50",
-            &format!("TOPICLEN={TOPICLEN}"),
-            &format!("KICKLEN={KICKLEN}"),
-            &format!("AWAYLEN={AWAYLEN}"),
-            "PREFIX=(ov)@+",
-            "STATUSMSG=@+",
-            "BOT=B",
-            "CHANMODES=eIbq,k,l,imnstC",
-            &format!("NETWORK={}", state.config.network_name),
-        ],
-        Some("are supported by this server"),
-    );
-    state.numeric(
-        conn,
-        RPL_ISUPPORT,
-        &[
-            "EXCEPTS",
-            "INVEX",
-            "UTF8ONLY",
-            "WHOX",
-            "MONITOR=100",
-            "CHATHISTORY=500",
-            "MSGREFTYPES=msgid,timestamp",
-            &format!("MAXLIST=bqeI:{MAXLIST}"),
-            &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
-            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},KICK:1"),
-        ],
-        Some("are supported by this server"),
-    );
+    send_isupport(state, conn);
     send_lusers(state, conn);
     send_motd(state, conn);
     let nick = state.sessions[&conn].nick.clone().expect("registered");
@@ -1788,7 +1757,13 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: u64) {
             if now.saturating_sub(s.last_ping_sent) >= PONG_TIMEOUT_SECS {
                 expired.push((conn, "Ping timeout"));
             }
-        } else if now.saturating_sub(s.last_active) >= IDLE_PING_INTERVAL_SECS {
+        } else if now.saturating_sub(s.last_active.max(s.last_ping_sent)) >= IDLE_PING_INTERVAL_SECS
+        {
+            // Idle since the later of the last real activity and the last
+            // liveness PING — so a client that just answered a PING isn't
+            // re-pinged every tick. `last_active` stays the pure WHOIS-idle
+            // clock (a keepalive PONG must not reset a user's idle time); the
+            // ping cadence is driven by `last_ping_sent` here.
             to_ping.push(conn);
         }
     }
@@ -3941,16 +3916,10 @@ fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
 }
 
-fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    if p.is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["USERHOST"],
-            Some("Not enough parameters"),
-        );
-        return;
-    }
+/// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP
+/// (the daemon does no rDNS, so a session's `host` is already the peer IP —
+/// the two commands produce the same entries).
+fn userhost_entries(state: &ServerState, p: &[&str]) -> Vec<String> {
     let mut entries = Vec::new();
     for &nick in p.iter().take(5) {
         let key = state.nick_key(nick);
@@ -3970,7 +3939,48 @@ fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             ));
         }
     }
+    entries
+}
+
+fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if p.is_empty() {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["USERHOST"],
+            Some("Not enough parameters"),
+        );
+        return;
+    }
+    let entries = userhost_entries(state, p);
     state.numeric(conn, RPL_USERHOST, &[], Some(&entries.join(" ")));
+}
+
+fn cmd_userip(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if p.is_empty() {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["USERIP"],
+            Some("Not enough parameters"),
+        );
+        return;
+    }
+    let entries = userhost_entries(state, p);
+    state.numeric(conn, RPL_USERIP, &[], Some(&entries.join(" ")));
+}
+
+fn cmd_links(state: &mut ServerState, conn: ConnId) {
+    // A single server links only to itself, at hop 0.
+    let server = state.config.server_name.clone();
+    let info = state.config.network_name.clone();
+    state.numeric(
+        conn,
+        RPL_LINKS,
+        &[&server, &server],
+        Some(&format!("0 {info}")),
+    );
+    state.numeric(conn, RPL_ENDOFLINKS, &["*"], Some("End of /LINKS list"));
 }
 
 // ---- CHATHISTORY (draft/chathistory, hot ring) --------------------------
@@ -4809,6 +4819,104 @@ fn cmd_info(state: &mut ServerState, conn: ConnId) {
         state.numeric(conn, RPL_INFO, &[], Some(line));
     }
     state.numeric(conn, RPL_ENDOFINFO, &[], Some("End of INFO list"));
+}
+
+/// Emit the two RPL_ISUPPORT (005) lines — the single source of truth for the
+/// advertised ISUPPORT tokens, sent both in the registration burst and after
+/// VERSION.
+fn send_isupport(state: &mut ServerState, conn: ConnId) {
+    let nicklen = state.config.nicklen;
+    state.numeric(
+        conn,
+        RPL_ISUPPORT,
+        &[
+            "CASEMAPPING=rfc1459",
+            "CHANTYPES=#",
+            &format!("NICKLEN={nicklen}"),
+            "CHANNELLEN=50",
+            &format!("TOPICLEN={TOPICLEN}"),
+            &format!("KICKLEN={KICKLEN}"),
+            &format!("AWAYLEN={AWAYLEN}"),
+            "PREFIX=(ov)@+",
+            "STATUSMSG=@+",
+            "BOT=B",
+            "CHANMODES=eIbq,k,l,imnstC",
+            &format!("NETWORK={}", state.config.network_name),
+        ],
+        Some("are supported by this server"),
+    );
+    state.numeric(
+        conn,
+        RPL_ISUPPORT,
+        &[
+            "EXCEPTS",
+            "INVEX",
+            "UTF8ONLY",
+            "WHOX",
+            "MONITOR=100",
+            "CHATHISTORY=500",
+            "MSGREFTYPES=msgid,timestamp",
+            &format!("MAXLIST=bqeI:{MAXLIST}"),
+            &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
+            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},KICK:1"),
+        ],
+        Some("are supported by this server"),
+    );
+}
+
+fn cmd_version(state: &mut ServerState, conn: ConnId) {
+    let server = state.config.server_name.clone();
+    let version = concat!("e6ircd-", env!("CARGO_PKG_VERSION"));
+    state.numeric(
+        conn,
+        RPL_VERSION,
+        &[version, &server],
+        Some("A monolithic Rust IRCv3 server."),
+    );
+    // A VERSION reply is conventionally followed by the ISUPPORT tokens.
+    send_isupport(state, conn);
+}
+
+fn cmd_admin(state: &mut ServerState, conn: ConnId) {
+    let server = state.config.server_name.clone();
+    let network = state.config.network_name.clone();
+    state.numeric(conn, RPL_ADMINME, &[&server], Some("Administrative info"));
+    state.numeric(
+        conn,
+        RPL_ADMINLOC1,
+        &[],
+        Some(&format!("{network} network")),
+    );
+    state.numeric(
+        conn,
+        RPL_ADMINLOC2,
+        &[],
+        Some(concat!("Running e6ircd ", env!("CARGO_PKG_VERSION"))),
+    );
+    state.numeric(conn, RPL_ADMINEMAIL, &[], Some(&server));
+}
+
+fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
+    if p.is_empty() {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["ISON"],
+            Some("Not enough parameters"),
+        );
+        return;
+    }
+    // ISON takes a space-separated nick list (as many middle params, or one
+    // trailing param); reply with just those currently online. `registered_peer`
+    // (not `nicks`) so a connection that only sent NICK but never finished
+    // registration isn't reported as online.
+    let online: Vec<String> = p
+        .iter()
+        .flat_map(|arg| arg.split_whitespace())
+        .filter(|nick| state.registered_peer(&state.nick_key(nick)).is_some())
+        .map(str::to_string)
+        .collect();
+    state.numeric(conn, RPL_ISON, &[], Some(&online.join(" ")));
 }
 
 // ---- OPER ---------------------------------------------------------------

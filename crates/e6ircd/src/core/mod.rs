@@ -390,8 +390,12 @@ fn deliver(tx: &Sender<Output>, out: Output) -> Result<(), SendqExceeded> {
     match tx.try_push(out) {
         Ok(_) => Ok(()),
         Err(PushError::Full(_)) => Err(SendqExceeded),
-        // Receiver gone: the I/O task is already dead; Closed{conn} is
-        // in flight to us. Nothing to do.
+        // Receiver gone: the I/O task is already dead. On the common
+        // reader-first close a `Closed{conn}` event is already in flight to us.
+        // On a writer-first close (write half RSTs while the read half hangs)
+        // there is no such event and outbound lines are dropped for now — but
+        // the liveness reaper PINGs the idle session and reaps it once the PONG
+        // deadline passes, so this can't leave a permanent zombie.
         Err(PushError::Closed(_)) => Ok(()),
     }
 }

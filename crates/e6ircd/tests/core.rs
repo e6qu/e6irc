@@ -1173,6 +1173,88 @@ fn active_client_without_pong_is_not_reaped() {
 }
 
 #[test]
+fn version_admin_and_ison_reply() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+
+    s.line(alice, "VERSION");
+    assert!(has_numeric(&s.drain(alice), "351"), "VERSION → RPL_VERSION");
+
+    s.line(alice, "ADMIN");
+    let out = s.drain(alice);
+    for code in ["256", "257", "258", "259"] {
+        assert!(has_numeric(&out, code), "ADMIN missing {code}: {out:#?}");
+    }
+
+    s.line(alice, "ISON alice ghost");
+    let ison = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 303 "))
+        .expect("RPL_ISON");
+    assert!(ison.contains("alice"), "online nick present: {ison}");
+    assert!(!ison.contains("ghost"), "offline nick absent: {ison}");
+
+    s.line(alice, "USERIP alice");
+    assert!(has_numeric(&s.drain(alice), "340"), "USERIP → RPL_USERIP");
+
+    s.line(alice, "LINKS");
+    let out = s.drain(alice);
+    assert!(has_numeric(&out, "364"), "LINKS → RPL_LINKS");
+    assert!(has_numeric(&out, "365"), "LINKS → RPL_ENDOFLINKS");
+}
+
+#[test]
+fn ison_excludes_unregistered_nick_holders() {
+    let mut s = TestServer::new();
+    let asker = s.register(1, "asker");
+    s.drain(asker);
+    // A second connection sends NICK but never finishes registration.
+    let half = s.connect(2);
+    s.line(half, "NICK pending");
+    s.drain(half);
+    s.line(asker, "ISON pending");
+    let ison = s
+        .drain(asker)
+        .into_iter()
+        .find(|l| l.contains(" 303 "))
+        .expect("RPL_ISON");
+    assert!(
+        !ison.contains("pending"),
+        "an unregistered nick-holder must not be reported online: {ison}"
+    );
+}
+
+#[test]
+fn idle_client_is_not_repinged_every_tick() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 121,
+    }); // first liveness PING
+    assert_eq!(
+        s.drain(alice)
+            .iter()
+            .filter(|l| l.starts_with("PING "))
+            .count(),
+        1
+    );
+    s.line(alice, "PONG :x"); // client answers
+    s.drain(alice);
+    // Only ~20s later: the ping cadence is 120s from the last PING, so no
+    // re-ping — the bug was pinging on every 15s tick once idle.
+    s.core.handle(Input::Tick {
+        now: 1_000_000 + 141,
+    });
+    assert!(
+        s.drain(alice).iter().all(|l| !l.starts_with("PING ")),
+        "an idle client must not be re-pinged every tick"
+    );
+}
+
+#[test]
 fn sasl_bad_base64_and_malformed_payload_fail() {
     let mut s = TestServer::new();
     let c = s.connect(1);
