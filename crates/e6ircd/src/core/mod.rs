@@ -33,6 +33,9 @@ pub enum Input {
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
     Closed { conn: ConnId, reason: String },
+    /// A periodic timer tick carrying the current wall-clock second, driving
+    /// the liveness reaper (registration deadline + idle PING/PONG timeout).
+    Tick { now: u64 },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply { conn: ConnId, reply: DbReply },
     /// A resolved CHATHISTORY page from PostgreSQL.
@@ -344,6 +347,7 @@ impl Core {
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
+            Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
             Input::HistoryPage {
                 conn,

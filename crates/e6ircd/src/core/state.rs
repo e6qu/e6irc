@@ -134,6 +134,10 @@ pub(crate) struct Session {
     /// Accumulates 400-byte AUTHENTICATE continuation chunks (SASL spec)
     /// until a short line completes the payload.
     pub sasl_buf: String,
+    /// Credential-verification attempts made on this connection, capped so a
+    /// single socket can't drive unbounded argon2 work (unauth CPU DoS / online
+    /// brute-force). Never reset — the budget is per connection lifetime.
+    pub sasl_attempts: u32,
     /// A NickServ IDENTIFY is awaiting its DB verdict.
     pub pending_identify: bool,
     /// Away message, when set.
@@ -161,6 +165,14 @@ pub(crate) struct Session {
     /// WHOX `l`), and of connection open (WHOIS signon).
     pub last_active: u64,
     pub signon: u64,
+    /// Wall-clock second the connection opened, for the registration deadline
+    /// (an unregistered connection that never completes is reaped).
+    pub opened_at: u64,
+    /// A server-initiated liveness PING is outstanding (set by the reaper,
+    /// cleared on PONG); if still set at the pong deadline the socket is reaped.
+    pub awaiting_pong: bool,
+    /// Wall-clock second the outstanding liveness PING was sent.
+    pub last_ping_sent: u64,
 }
 
 impl Session {
@@ -771,6 +783,7 @@ impl ServerState {
     }
 
     pub fn open(&mut self, conn: ConnId, tx: Sender<Output>, host: String) {
+        let opened_at = (self.config.clock)();
         let prev = self.sessions.insert(
             conn,
             Session {
@@ -785,6 +798,7 @@ impl ServerState {
                 account: None,
                 sasl: SaslState::default(),
                 sasl_buf: String::new(),
+                sasl_attempts: 0,
                 pending_identify: false,
                 away: None,
                 oper: false,
@@ -798,6 +812,9 @@ impl ServerState {
                 flood_last_sec: 0,
                 last_active: 0,
                 signon: 0,
+                opened_at,
+                awaiting_pong: false,
+                last_ping_sent: 0,
             },
         );
         assert!(prev.is_none(), "duplicate ConnId {conn:?} from acceptor");

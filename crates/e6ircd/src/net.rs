@@ -26,6 +26,9 @@ use e6irc_queue::{Policy, Receiver, Sender, queue};
 /// the core after the tag section is split off.
 const LINE_LIMIT: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 const READ_BUF: usize = 4096;
+/// How often the liveness reaper tick fires (seconds); the reaper's own
+/// deadlines are coarse minutes, so a fine tick isn't needed.
+const REAP_TICK_SECS: u64 = 15;
 
 pub struct Running {
     /// Bound IRC addresses, in listener-config order (useful with port 0).
@@ -256,6 +259,25 @@ pub async fn start(config: Config) -> io::Result<Running> {
         );
     }
     tokio::spawn(core_worker(core, core_rx));
+
+    // Liveness reaper tick: drives the core's registration deadline and idle
+    // PING/PONG timeout so a silent connection can't hold a session forever.
+    {
+        let core_tx = core_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(REAP_TICK_SECS));
+            loop {
+                ticker.tick().await;
+                if core_tx
+                    .push(Input::Tick { now: wall_clock() })
+                    .await
+                    .is_err()
+                {
+                    break; // core gone
+                }
+            }
+        });
+    }
 
     // BNC listener: clients attach to always-on upstream networks.
     let mut bnc_addr = None;

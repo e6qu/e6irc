@@ -189,6 +189,35 @@ exists, and `owner` is `TEXT` for the `*` shared-network sentinel, so a FK
 doesn't fit); signal handling / task supervision remains an explicit, logged
 deferral.
 
+Ninth sweep — adversarial security (2026-07-21): two adversarial security
+audits (auth/session/crypto and injection/access/DoS/isolation). Structurally
+the daemon held up well — no SQL injection, stored XSS, IDOR, cross-account BNC
+leak, open redirect, or TLS weakness; secrets (ChaCha20-Poly1305 sealing),
+sessions (`__Host-`/HttpOnly/SHA-256-hashed tokens), CSRF (HMAC, constant-time),
+OIDC (PKCE + constant-time state, single-key back-channel-logout verification
+with replay protection), and admin authz were all found sound. Fixes: (HIGH,
+H2) the event-driven core had no timer, so a slowloris (open a socket, send
+nothing) held a Session forever and dead sockets were never reaped — added an
+`Input::Tick` reaper: unregistered connections are closed after a 30s
+registration deadline, and idle registered clients are PINGed (120s) then closed
+if they don't PONG (60s), with any client line counting as liveness. (HIGH, H1)
+the bridge drivers built an IRC source prefix straight from hostile-upstream
+sender names, so a malicious homeserver/username could forge a NOTICE/PRIVMSG
+from any nick on the attached client's stream — a shared `nick_token` now
+reduces the sender to a safe nick token (no space/`!@:`/control) at each bridge
+boundary. (MEDIUM) SASL verification is now capped at 8 attempts per connection
+(always on) so a single socket can't drive unbounded argon2 work (online
+brute-force / CPU DoS). (MEDIUM) MODE now hides a `+s` channel from non-members
+(its mode string, creation time, and `+b`/`+q` mask lists were disclosed —
+the same secret-channel gate the other query surfaces already apply, extended
+after the sweep-8 TOPIC fix). (MEDIUM) a quieted/banned member can no longer set
+the channel TOPIC (topic-defacement quiet-evasion). (LOW) the oper-password and
+`+k` channel-key comparisons are now length-safe constant-time (digest-then-
+compare); `verify_credentials` no longer short-circuits its multi-credential
+check (match-position timing); a quieted member's PART reason is suppressed; and
+every HTTP response (including the JSON/problem+json paths) now carries
+`X-Content-Type-Options: nosniff`.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
@@ -212,10 +241,11 @@ deferral.
   the sharded design), serialize-once fan-out via Bytes, TOML config
   with unknown-key rejection, e2e socket tests incl. TLS handshake.
   (DESIGN §7.2–7.3)
-- Deferred: WHOX (Phase 3 with the compat harness), PING liveness reaper
-  + registration/flood throttles (Phase 2 alongside CAP), queue
+- Deferred: WHOX (Phase 3 with the compat harness), queue
   step-scheduler/trace hooks (first deterministic-sim phase that needs
-  them), rDNS/ident (decide with oper tooling).
+  them), rDNS/ident (decide with oper tooling). (The PING liveness reaper +
+  registration deadline landed in the ninth, security, sweep; the
+  per-session flood throttle landed with CAP.)
 
 ## Phase 2 — IRCv3 + persistence + accounts ✅ (2026-07-18)
 - CAP 302 (LS/LIST/REQ/END, registration gating), server-time,

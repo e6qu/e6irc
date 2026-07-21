@@ -209,6 +209,10 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         && let Some(session) = state.sessions.get_mut(&conn)
     {
         session.last_active = (state.config.clock)();
+        // Any client line proves liveness, so it also answers an outstanding
+        // liveness PING — the reaper mustn't close an actively-talking client
+        // just because it didn't send a literal PONG.
+        session.awaiting_pong = false;
     }
 
     // Commands legal before registration.
@@ -218,7 +222,14 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "NICK" => return cmd_nick(state, conn, p),
         "USER" => return cmd_user(state, conn, p),
         "PING" => return cmd_ping(state, conn, p),
-        "PONG" => return, // liveness marker; no reply by protocol
+        "PONG" => {
+            // Liveness marker (no protocol reply); clears any outstanding
+            // server-initiated PING so the reaper doesn't close a live client.
+            if let Some(s) = state.sessions.get_mut(&conn) {
+                s.awaiting_pong = false;
+            }
+            return;
+        }
         "QUIT" => return cmd_quit(state, conn, p),
         _ => {}
     }
@@ -519,6 +530,32 @@ fn sasl_fail(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_SASLFAIL, &[], Some("SASL authentication failed"));
 }
 
+/// Max credential-verification attempts per connection before the socket is
+/// closed — a single connection can't drive unbounded argon2 work.
+const MAX_SASL_ATTEMPTS_PER_CONN: u32 = 8;
+
+/// Charge one credential-verification attempt against the connection's budget
+/// before an (expensive) argon2 verify is dispatched. Returns false — and closes
+/// the connection — once the budget is exceeded, bounding the online
+/// brute-force / CPU-exhaustion surface even when per-IP rate limits are off.
+fn sasl_attempt_ok(state: &mut ServerState, conn: ConnId) -> bool {
+    let attempts = {
+        let s = state.sessions.get_mut(&conn).expect("checked");
+        s.sasl_attempts += 1;
+        s.sasl_attempts
+    };
+    if attempts > MAX_SASL_ATTEMPTS_PER_CONN {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &format!(":{server} ERROR :Closing Link: too many authentication attempts"),
+        );
+        state.close(conn, "Too many authentication attempts");
+        return false;
+    }
+    true
+}
+
 /// Upper bound on a reassembled SASL response (across 400-byte continuation
 /// chunks). Generous for a bearer JWT, but bounds client-driven buffering.
 const SASL_MAX: usize = 8192;
@@ -623,6 +660,9 @@ fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     sasl_fail(state, conn);
                     return;
                 };
+                if !sasl_attempt_ok(state, conn) {
+                    return;
+                }
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = super::DbRequest::VerifyPassword {
                     conn,
@@ -649,6 +689,9 @@ fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     sasl_fail(state, conn);
                     return;
                 };
+                if !sasl_attempt_ok(state, conn) {
+                    return;
+                }
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = super::DbRequest::VerifyToken { conn, token };
                 if state.db_tx.try_push(request).is_err() {
@@ -1721,6 +1764,48 @@ fn cmd_ping(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.send(conn, &format!(":{server} PONG {server} :{token}"));
 }
 
+/// Deadline for an unregistered connection to complete registration.
+const REGISTRATION_TIMEOUT_SECS: u64 = 30;
+/// Idle duration after which a registered client is sent a liveness PING.
+const IDLE_PING_INTERVAL_SECS: u64 = 120;
+/// How long the client then has to PONG before the connection is closed.
+const PONG_TIMEOUT_SECS: u64 = 60;
+
+/// Liveness reaper, driven by the periodic [`super::Input::Tick`]: close
+/// connections that never finished registering (slowloris), and PING idle
+/// registered clients, closing those that don't PONG in time (dead sockets).
+/// Without it a connection that opens and then goes silent holds its `Session`
+/// and send queue forever.
+pub(crate) fn reap_idle(state: &mut ServerState, now: u64) {
+    let mut expired: Vec<(ConnId, &'static str)> = Vec::new();
+    let mut to_ping: Vec<ConnId> = Vec::new();
+    for (&conn, s) in &state.sessions {
+        if !s.registered {
+            if now.saturating_sub(s.opened_at) >= REGISTRATION_TIMEOUT_SECS {
+                expired.push((conn, "Registration timeout"));
+            }
+        } else if s.awaiting_pong {
+            if now.saturating_sub(s.last_ping_sent) >= PONG_TIMEOUT_SECS {
+                expired.push((conn, "Ping timeout"));
+            }
+        } else if now.saturating_sub(s.last_active) >= IDLE_PING_INTERVAL_SECS {
+            to_ping.push(conn);
+        }
+    }
+    let server = state.config.server_name.clone();
+    for conn in to_ping {
+        if let Some(s) = state.sessions.get_mut(&conn) {
+            s.awaiting_pong = true;
+            s.last_ping_sent = now;
+        }
+        state.send(conn, &format!("PING :{server}"));
+    }
+    for (conn, reason) in expired {
+        state.send(conn, &format!(":{server} ERROR :Closing Link: {reason}"));
+        state.close(conn, reason);
+    }
+}
+
 fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let reason = match p.first() {
         Some(r) => format!("Quit: {r}"),
@@ -1929,8 +2014,9 @@ fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<
         return;
     }
     if let Some(chan_key) = &chan.modes.key
-        && join_key != Some(chan_key.as_str())
+        && !join_key.is_some_and(|k| constant_time_eq(k.as_bytes(), chan_key.as_bytes()))
     {
+        // Constant-time so the key isn't recoverable by timing the compare.
         state.numeric(
             conn,
             ERR_BADCHANNELKEY,
@@ -2050,9 +2136,18 @@ fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         let display = state.channels[&key].name.clone();
         let prefix = state.sessions[&conn].prefix();
+        // A quieted or banned member can't broadcast a PART reason (which would
+        // evade the quiet), unless op/voice — same speak-gate as messages.
+        let exempt = state.channels[&key]
+            .members
+            .get(&conn)
+            .is_some_and(|m| m.op || m.voice);
+        let suppress_reason = !exempt
+            && (state.channels[&key].is_banned(state.casemap, &prefix)
+                || state.channels[&key].is_quieted(state.casemap, &prefix));
         let line = match &reason {
-            Some(r) => format!(":{prefix} PART {display} :{r}"),
-            None => format!(":{prefix} PART {display}"),
+            Some(r) if !suppress_reason => format!(":{prefix} PART {display} :{r}"),
+            _ => format!(":{prefix} PART {display}"),
         };
         state.broadcast_channel(&key, &line, None);
         let chan = state.channels.get_mut(&key).expect("checked");
@@ -2683,6 +2778,26 @@ fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
         );
         return;
     }
+    // A quieted or banned member can't set the topic (which would evade the
+    // quiet by defacing the channel), unless op/voice — same speak-gate as
+    // PRIVMSG/TAGMSG.
+    let exempt = member.op || member.voice;
+    if !exempt {
+        let prefix = state.sessions[&conn].prefix();
+        let blocked = {
+            let chan = &state.channels[&key];
+            chan.is_banned(state.casemap, &prefix) || chan.is_quieted(state.casemap, &prefix)
+        };
+        if blocked {
+            state.numeric(
+                conn,
+                ERR_CANNOTSENDTOCHAN,
+                &[target],
+                Some("Cannot send to channel"),
+            );
+            return;
+        }
+    }
     let new_text = truncate_chars(p.get(1).copied().unwrap_or(""), TOPICLEN);
     let prefix = state.sessions[&conn].prefix();
     let now = (state.config.clock)();
@@ -2890,6 +3005,15 @@ fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&st
     let display = chan.name.clone();
     let is_member = chan.members.contains_key(&conn);
     let is_op = chan.members.get(&conn).is_some_and(|m| m.op);
+
+    // A +s channel is hidden from non-members on every surface — including
+    // MODE, whose mode string, creation time, and +b/+q mask lists would all
+    // otherwise confirm the channel and disclose its state. Look non-existent,
+    // like NAMES/WHO/LIST do.
+    if chan.modes.secret && !is_member {
+        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        return;
+    }
 
     if rest.is_empty() {
         let modes = chan.modes.to_string_with_args(is_member);
@@ -4723,13 +4847,16 @@ fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.send(conn, &format!(":{server} MODE {nick} :+o"));
 }
 
-/// Length-independent comparison — oper passwords must not leak length
-/// or prefix via timing.
+/// Length-independent constant-time comparison: both inputs are reduced to a
+/// fixed-size SHA-256 digest first, so neither content nor length leaks via
+/// timing (a bare byte-compare early-returns on a length mismatch, leaking the
+/// secret's length). The digests never leave the process — they exist only to
+/// normalize length for the constant-time compare.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    use aws_lc_rs::digest::{SHA256, digest};
+    let da = digest(&SHA256, a);
+    let db = digest(&SHA256, b);
+    aws_lc_rs::constant_time::verify_slices_are_equal(da.as_ref(), db.as_ref()).is_ok()
 }
 
 // ---- KILL ---------------------------------------------------------------

@@ -326,7 +326,10 @@ fn parse_frame(text: &str) -> Frame {
 
 /// A Discord message author + channel + text, rendered as an IRC line.
 fn render_privmsg(author: &str, channel: &str, content: &str) -> String {
-    format!(":{author}!{author}@discord PRIVMSG {channel} :{content}")
+    // The author name is hostile-upstream input; reduce it to a safe nick token
+    // so it can't forge a source/command in the prefix position.
+    let nick = super::nick_token(author);
+    format!(":{nick}!{nick}@discord PRIVMSG {channel} :{content}")
 }
 
 async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {

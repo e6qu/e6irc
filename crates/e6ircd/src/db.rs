@@ -1185,10 +1185,12 @@ pub async fn verify_credentials(
     .await
     .map_err(DbError::Query)?;
     if rows.is_empty() {
-        // No such account. Still spend one argon2 verification against a
-        // fixed throwaway hash, so response time does not reveal whether the
-        // account exists — the "no existence oracle" invariant above holds
-        // only if the empty case costs the same as a real rejection.
+        // No such account. Still spend one argon2 verification against a fixed
+        // throwaway hash, so a non-existent account is indistinguishable from a
+        // single-credential account being rejected. (An account with extra app
+        // passwords costs proportionally more argon2 to reject — an accepted,
+        // minor timing signal of "has app passwords", inherent to checking each
+        // stored credential; it never reveals the password itself.)
         let password = password.to_string();
         tokio::task::spawn_blocking(move || {
             let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
@@ -1204,13 +1206,18 @@ pub async fn verify_credentials(
     let hashes: Vec<String> = rows.into_iter().map(|(_, h)| h).collect();
     let password = password.to_string();
     let verified = tokio::task::spawn_blocking(move || {
-        hashes.iter().any(|hash| {
-            PasswordHash::new(hash).is_ok_and(|parsed| {
+        // Evaluate every credential (|=, not a short-circuiting any()) so the
+        // reject time doesn't reveal which credential matched or how early.
+        let mut matched = false;
+        for hash in &hashes {
+            let ok = PasswordHash::new(hash).is_ok_and(|parsed| {
                 hasher()
                     .verify_password(password.as_bytes(), &parsed)
                     .is_ok()
-            })
-        })
+            });
+            matched |= ok;
+        }
+        matched
     })
     .await
     .expect("verification task panicked");
