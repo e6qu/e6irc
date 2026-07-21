@@ -503,9 +503,18 @@ async fn serve_conn<S>(
     {
         return; // core gone: shutting down
     }
-    let writer = tokio::spawn(write_loop(write_half, out_rx));
-    read_loop(read_half, conn, &core_tx).await;
-    writer.abort(); // reader done ⇒ session closed; writer may be parked
+    let mut writer = tokio::spawn(write_loop(write_half, out_rx));
+    tokio::select! {
+        // The client closed/errored, or the core queue is gone: the read side
+        // is done — stop the (possibly parked) writer.
+        () = read_loop(read_half, conn, &core_tx) => writer.abort(),
+        // The core closed this session (its `Sender<Output>` dropped, so the
+        // sendq closed and write_loop returned). Cancel the read future so a
+        // dead or partitioned peer's read task — and its per-IP ConnGuard — are
+        // freed now, not only when the OS TCP timeout eventually fires. The
+        // session is already gone core-side, so no Input::Closed is needed.
+        _ = &mut writer => {}
+    }
 }
 
 async fn read_loop<R>(mut read_half: R, conn: ConnId, core_tx: &Sender<Input>)
@@ -556,5 +565,68 @@ where
             return; // broken pipe: reader half will surface the close
         }
         let _ = write_half.flush().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Input;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A stream whose read never completes (a partitioned/dead peer) and whose
+    /// writes are silently accepted — so the connection can only end if the
+    /// core closes it, not by the peer.
+    struct DeadPeer;
+
+    impl AsyncRead for DeadPeer {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending // never yields — the peer is silent
+        }
+    }
+    impl AsyncWrite for DeadPeer {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn core_close_cancels_a_parked_read() {
+        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-core",
+            capacity: 8,
+            policy: Policy::Fifo,
+        });
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let served = tokio::spawn(serve_conn(DeadPeer, ConnId(1), peer, core_tx, 8));
+
+        // The connection registered its sendq via Open; take that sender.
+        let env = core_rx.pop().await.expect("Open event");
+        let Input::Open { tx, .. } = env.payload else {
+            panic!("expected Open");
+        };
+        // Simulate the core closing the session: dropping the last Sender closes
+        // the sendq, so write_loop returns — and serve_conn must then cancel the
+        // parked read and finish, rather than hang until an OS TCP timeout.
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), served)
+            .await
+            .expect("serve_conn must return promptly after the core closes the session")
+            .expect("serve_conn task panicked");
     }
 }
