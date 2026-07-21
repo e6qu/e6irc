@@ -1099,11 +1099,15 @@ async fn rp_initiated_logout_redirects_to_provider() {
     let session = e6ircd::db::create_oidc_web_session(
         &pool,
         "alice",
-        "the.id.token",
-        "shauth",
-        "https://auth.example",
-        "alice-subject",
-        Some("alice-session"),
+        e6ircd::db::OidcSessionIdentity {
+            id_token: Some("the.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("alice-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
     )
     .await
     .expect("sso session");
@@ -1133,7 +1137,9 @@ async fn rp_initiated_logout_redirects_to_provider() {
             client_secret: "x".repeat(32),
             scopes: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
+            token_endpoint_auth_method: Default::default(),
         }],
+        application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
     };
     let http = net::start(config)
@@ -1141,6 +1147,33 @@ async fn rp_initiated_logout_redirects_to_provider() {
         .expect("start")
         .http_addr
         .expect("http");
+
+    let (validation_status, validation_headers, validation_body) = request(
+        http,
+        &format!(
+            "GET /auth/validation HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(validation_status, 200, "{validation_headers}");
+    let lowered_validation_headers = validation_headers.to_ascii_lowercase();
+    assert!(
+        lowered_validation_headers.contains("cache-control: no-store"),
+        "{validation_headers}"
+    );
+    for exact in [
+        "data-testid=\"validation-username\">alice</dd>",
+        "data-testid=\"validation-email\">alice@example.test</dd>",
+        "data-testid=\"validation-role\">developer</dd>",
+        "data-testid=\"validation-release\">0123456789ab</code>",
+        "data-shauth-user=\"alice\"",
+        "data-shauth-sign-out",
+    ] {
+        assert!(
+            validation_body.contains(exact),
+            "missing {exact}: {validation_body}"
+        );
+    }
 
     // The logout GET now requires the session's CSRF token (anti-forced-logout);
     // fetch it from the account page the way a browser would.
@@ -1198,7 +1231,36 @@ async fn rp_initiated_logout_redirects_to_provider() {
         .expect("post_logout_redirect_uri");
     assert_eq!(
         post_logout_redirect,
-        "https://e6irc.example/auth/signed-out"
+        "https://e6irc.example/auth/shauth/logout/complete"
+    );
+
+    // The registered bridge ignores every caller-supplied redirect and
+    // credential-like query value and forwards only to Shauth's fixed
+    // completion coordinate.
+    let (bridge_status, bridge_headers, _) = request(
+        http,
+        &get(
+            "/auth/shauth/logout/complete?next=https%3A%2F%2Fattacker.example&redirect_uri=https%3A%2F%2Fattacker.example&code=secret",
+        ),
+    )
+    .await;
+    assert_eq!(bridge_status, 303, "{bridge_headers}");
+    let bridge_headers = bridge_headers.to_ascii_lowercase();
+    assert!(
+        bridge_headers.contains("location: https://auth.example/oauth/logout/complete"),
+        "{bridge_headers}"
+    );
+    assert!(
+        bridge_headers.contains("cache-control: no-store"),
+        "{bridge_headers}"
+    );
+    assert!(
+        bridge_headers.contains("pragma: no-cache"),
+        "{bridge_headers}"
+    );
+    assert!(
+        bridge_headers.contains("referrer-policy: no-referrer"),
+        "{bridge_headers}"
     );
 
     // The local session is gone: the same cookie no longer authenticates.
@@ -1207,6 +1269,14 @@ async fn rp_initiated_logout_redirects_to_provider() {
     );
     let (status, _, _) = request(http, &me).await;
     assert_eq!(status, 401, "session survived logout");
+    let (anonymous_validation, anonymous_headers, _) =
+        request(http, &get("/auth/validation")).await;
+    assert_eq!(anonymous_validation, 303, "{anonymous_headers}");
+    assert!(
+        anonymous_headers.contains("location: /auth/signed-out")
+            || anonymous_headers.contains("Location: /auth/signed-out"),
+        "{anonymous_headers}"
+    );
 
     // The provider returns to a public, persistent app-local page. It keeps
     // the exact Shauth starter after a reload instead of silently probing SSO.
@@ -1216,7 +1286,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
         assert!(body.contains("You are signed out"), "{body}");
         assert!(
-            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with Shauth</a>"),
+            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with shauth</a>"),
             "{body}"
         );
     }
@@ -1303,7 +1373,9 @@ async fn application_entry_is_fail_closed_and_uses_silent_sso() {
             client_secret: "x".repeat(32),
             scopes: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
+            token_endpoint_auth_method: Default::default(),
         }],
+        application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
     };
     let http = net::start(config)
@@ -1351,11 +1423,15 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
     let session = e6ircd::db::create_oidc_web_session(
         &pool,
         "alice",
-        "the.id.token",
-        "shauth",
-        "https://auth.example",
-        "alice-subject",
-        Some("alice-session"),
+        e6ircd::db::OidcSessionIdentity {
+            id_token: Some("the.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("alice-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
     )
     .await
     .expect("session");
@@ -1382,7 +1458,9 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
             client_secret: "x".repeat(32),
             scopes: vec![],
             end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
         }],
+        application_release_revision: Some("0123456789ab".into()),
         ..Config::default()
     };
     let http = net::start(config)

@@ -14,12 +14,16 @@
 #              E6IRC_OIDC_ISSUER  E6IRC_OIDC_CLIENT_ID  E6IRC_OIDC_CLIENT_SECRET
 #              E6IRC_OIDC_END_SESSION
 #              E6IRC_OIDC_NAME (default shauth)
+#              E6IRC_OIDC_TOKEN_AUTH (default client_secret_post, which is how
+#                Shauth registers managed applications; the method belongs to
+#                the client registration, so discovery cannot report it)
 set -eu
 
 # Fail loudly on missing required config rather than starting half-configured.
 : "${E6IRC_SERVER_NAME:?E6IRC_SERVER_NAME is required}"
 : "${E6IRC_PUBLIC_URL:?E6IRC_PUBLIC_URL is required}"
 : "${E6IRC_DATABASE_URL:?E6IRC_DATABASE_URL is required}"
+: "${APPLICATION_RELEASE_REVISION:?APPLICATION_RELEASE_REVISION is required}"
 
 # Escape a value for a TOML basic (double-quoted) string.
 toml() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
@@ -28,6 +32,7 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
 {
   printf 'server_name = "%s"\n' "$(toml "$E6IRC_SERVER_NAME")"
   printf 'network_name = "%s"\n\n' "$(toml "${E6IRC_NETWORK_NAME:-e6qu}")"
+  printf 'application_release_revision = "%s"\n\n' "$(toml "$APPLICATION_RELEASE_REVISION")"
 
   # A listener is required. IRC is reached over WebSocket (/ws) publicly; the
   # raw IRC port is bound to loopback only and is not exposed.
@@ -57,6 +62,8 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
     printf 'issuer_url = "%s"\n' "$(toml "$E6IRC_OIDC_ISSUER")"
     printf 'client_id = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_ID")"
     printf 'client_secret = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_SECRET")"
+    printf 'token_endpoint_auth_method = "%s"\n' \
+      "$(toml "${E6IRC_OIDC_TOKEN_AUTH:-client_secret_post}")"
     printf 'end_session_endpoint = "%s"\n' "$(toml "$E6IRC_OIDC_END_SESSION")"
   fi
 } > "$CONFIG"

@@ -46,6 +46,7 @@ async fn full_oidc_login_provisions_account_and_session() {
             client_secret: "e6irc-test-secret".into(),
             scopes: vec![],
             end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
         }],
         ..Config::default()
     };
@@ -267,6 +268,7 @@ async fn oidc_identity_link_flow_and_conflict() {
             client_secret: "e6irc-test-secret".into(),
             scopes: vec![],
             end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
         }],
         ..Config::default()
     };
@@ -394,6 +396,7 @@ async fn oidc_silent_sso_reuses_provider_session() {
             client_secret: "e6irc-test-secret".into(),
             scopes: vec![],
             end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
         }],
         ..Config::default()
     };

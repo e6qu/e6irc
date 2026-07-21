@@ -2034,17 +2034,30 @@ async fn oidc_web_session_records_logout_hint() {
     let sso = db::create_oidc_web_session(
         &pool,
         "alice",
-        "the.id.token",
-        "shauth",
-        "https://auth.example",
-        "alice-subject",
-        Some("alice-session"),
+        db::OidcSessionIdentity {
+            id_token: Some("the.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("alice-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
     )
     .await
     .expect("sso");
     assert_eq!(
         db::session_logout_hint(&pool, &sso).await.expect("hint"),
         (Some("the.id.token".to_string()), Some("shauth".to_string()))
+    );
+    assert_eq!(
+        db::session_identity(&pool, &sso).await.expect("identity"),
+        Some(db::WebSessionIdentity {
+            account: "alice".to_string(),
+            email: Some("alice@example.test".to_string()),
+            role: Some("developer".to_string()),
+            provider: Some("shauth".to_string()),
+        })
     );
     // Both resolve to the account.
     assert_eq!(
@@ -2069,22 +2082,30 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     let first = db::create_oidc_web_session(
         &pool,
         "alice",
-        "first.id.token",
-        "shauth",
-        "https://auth.example",
-        "alice-subject",
-        Some("first-session"),
+        db::OidcSessionIdentity {
+            id_token: Some("first.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("first-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
     )
     .await
     .expect("first session");
     let second = db::create_oidc_web_session(
         &pool,
         "alice",
-        "second.id.token",
-        "shauth",
-        "https://auth.example",
-        "alice-subject",
-        Some("second-session"),
+        db::OidcSessionIdentity {
+            id_token: Some("second.id.token"),
+            provider: Some("shauth"),
+            issuer: Some("https://auth.example"),
+            subject: Some("alice-subject"),
+            sid: Some("second-session"),
+            email: Some("alice@example.test"),
+            role: Some("developer"),
+        },
     )
     .await
     .expect("second session");

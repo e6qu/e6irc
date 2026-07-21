@@ -15,11 +15,12 @@
         <h1 id="signed-out-title">You are signed out</h1>
         <p class="lede">Your e6irc session has ended. Sign in again when you are ready.</p>
         <div class="actions">
-          {% if has_shauth %}
-            <a class="primary-action" href="/api/v1/auth/oidc/shauth/start">Sign in with Shauth</a>
-          {% else %}
-            <a class="primary-action" href="/login">Choose a sign-in provider</a>
-          {% endif %}
+          {% match sole_provider %}
+            {% when Some with (provider) %}
+              <a class="primary-action" href="/api/v1/auth/oidc/{{ provider }}/start">Sign in with {{ provider }}</a>
+            {% when None %}
+              <a class="primary-action" href="/login">Choose a sign-in provider</a>
+          {% endmatch %}
         </div>
       </section>
     </main>

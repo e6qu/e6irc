@@ -17,8 +17,9 @@
         <nav id="user-nav" aria-label="User">
           <a id="account-link" href="/account" aria-label="Open my account">
             <span id="account-name" aria-live="polite">signed in</span>
+            <span id="account-role" class="user-role" aria-live="polite"></span>
           </a>
-          <a id="logout-link" href="/api/v1/auth/logout">Sign out</a>
+          <a id="logout-link" data-shauth-sign-out href="/api/v1/auth/logout">Sign out</a>
         </nav>
       </header>
 

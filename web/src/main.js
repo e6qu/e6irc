@@ -20,6 +20,9 @@ const target = document.getElementById("target");
 const buffer = document.getElementById("buffer");
 const status = document.getElementById("status");
 const accountName = document.getElementById("account-name");
+const accountLink = document.getElementById("account-link");
+const accountRole = document.getElementById("account-role");
+const logoutLink = document.getElementById("logout-link");
 
 const identityResponse = await fetch("/api/v1/me", {
   headers: { Accept: "application/json" },
@@ -32,6 +35,21 @@ if (typeof identity.account !== "string" || identity.account.length === 0) {
   throw new Error("identity response did not contain an account name");
 }
 accountName.textContent = identity.account;
+accountLink.dataset.shauthUser = identity.account;
+if (identity.provider === "shauth") {
+  if (typeof identity.email !== "string" || identity.email.length === 0) {
+    throw new Error("Shauth identity response did not contain an email address");
+  }
+  if (identity.role !== "developer" && identity.role !== "admin") {
+    throw new Error("Shauth identity response did not contain a valid role");
+  }
+}
+if (typeof identity.logout_url !== "string" || !identity.logout_url.startsWith("/api/v1/auth/logout?csrf=")) {
+  throw new Error("identity response did not contain a logout coordinate");
+}
+accountName.title = typeof identity.email === "string" ? identity.email : "";
+accountRole.textContent = typeof identity.role === "string" ? identity.role : "";
+logoutLink.href = identity.logout_url;
 
 target.value = channel;
 

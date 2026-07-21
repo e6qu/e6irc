@@ -38,7 +38,12 @@ secure_cookies = false
 url = ${JSON.stringify(databaseURL)}
 
 [[oidc]]
-name = "shauth"
+# dex, not Shauth: this harness proves the generic OpenID Connect relying-party
+# path against a real provider. dex advertises no end-session endpoint, which is
+# a supported configuration here (logout fails closed), whereas a provider named
+# "shauth" must satisfy Shauth's stricter contract. tools/test-shauth-sso.sh
+# covers that contract against a real Shauth.
+name = "dex"
 issuer_url = ${JSON.stringify(issuerURL)}
 client_id = "e6irc-test"
 client_secret = "e6irc-test-secret"
@@ -69,16 +74,16 @@ try {
   page.on("pageerror", (error) => browserErrors.push(error.message));
   page.on("requestfailed", (request) => browserErrors.push(`${request.url()}: ${request.failure()?.errorText ?? "request failed"}`));
 
-  // The Shauth catalog launches this exact same-origin starter. A real Dex
+  // The Shauth catalog launches this exact same-origin starter. A real dex
   // authorization-code + PKCE flow provisions the account and returns to the
   // baked e6irc application.
-  await page.goto(`${applicationOrigin}/api/v1/auth/oidc/shauth/start`);
+  await page.goto(`${applicationOrigin}/api/v1/auth/oidc/dex/start`);
   await page.waitForURL(`${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
   assert.notEqual(await page.locator("#account-name").textContent(), "signed in");
   assert.ok(
-    navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/shauth/start`),
-    `portal flow bypassed the e6irc Shauth starter:\n${navigationTrace.join("\n")}`,
+    navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
+    `portal flow bypassed the e6irc OpenID Connect starter:\n${navigationTrace.join("\n")}`,
   );
 
   // Clearing only e6irc's application session leaves the provider SSO cookie
@@ -90,8 +95,8 @@ try {
   await page.waitForURL(`${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
   assert.ok(
-    navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/shauth/sso`),
-    `direct flow did not use silent Shauth SSO:\n${navigationTrace.slice(directTraceStart).join("\n")}`,
+    navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/sso`),
+    `direct flow did not use silent single sign-on:\n${navigationTrace.slice(directTraceStart).join("\n")}`,
   );
 
   // The provider's registered post-logout return is public, persistent, and
@@ -99,18 +104,18 @@ try {
   assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
   await page.goto(`${applicationOrigin}/auth/signed-out`);
   await page.getByRole("heading", { name: "You are signed out" }).waitFor();
-  let signIn = page.getByRole("link", { name: "Sign in with Shauth" });
-  assert.equal(await signIn.getAttribute("href"), "/api/v1/auth/oidc/shauth/start");
+  let signIn = page.getByRole("link", { name: "Sign in with dex" });
+  assert.equal(await signIn.getAttribute("href"), "/api/v1/auth/oidc/dex/start");
   await page.reload();
   await page.getByRole("heading", { name: "You are signed out" }).waitFor();
-  signIn = page.getByRole("link", { name: "Sign in with Shauth" });
-  assert.equal(await signIn.getAttribute("href"), "/api/v1/auth/oidc/shauth/start");
+  signIn = page.getByRole("link", { name: "Sign in with dex" });
+  assert.equal(await signIn.getAttribute("href"), "/api/v1/auth/oidc/dex/start");
   const recoveryTraceStart = navigationTrace.length;
   await signIn.click();
   await page.waitForURL(`${applicationOrigin}/`);
   assert.ok(
-    navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/shauth/start`),
-    `signed-out recovery bypassed the e6irc Shauth starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
+    navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
+    `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
   );
   assert.deepEqual(browserErrors, []);
 } finally {

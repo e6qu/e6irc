@@ -162,6 +162,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 public_url: http_config.public_url.clone(),
                 secure_cookies: http_config.secure_cookies,
                 oidc_providers: config.oidc_providers.clone(),
+                application_release_revision: config.application_release_revision.clone(),
                 pending_auth: crate::http::AppState::no_pending_auth(),
                 core_tx: core_tx.clone(),
                 next_conn: next_conn.clone(),

@@ -25,6 +25,7 @@ env:
 jobs:
   metadata:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       tag: ${{ steps.revision.outputs.tag }}
     steps:
@@ -52,6 +53,7 @@ jobs:
             runner: ubuntu-24.04-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: docker/setup-buildx-action@v4.2.0
@@ -74,6 +76,7 @@ jobs:
   manifest:
     needs: [metadata, build]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.0
       - uses: docker/setup-buildx-action@v4.2.0
@@ -95,6 +98,7 @@ jobs:
   prune:
     needs: [metadata, manifest]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.0
       - name: Prune old images (keep newest 20 releases)

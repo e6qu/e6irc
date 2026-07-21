@@ -81,6 +81,10 @@ pub struct Config {
     /// OIDC providers for web login (requires http + database).
     #[serde(default, rename = "oidc")]
     pub oidc_providers: Vec<OidcProviderConfig>,
+    /// Immutable deployed source revision exposed to post-deployment
+    /// acceptance checks. Required when Shauth is configured.
+    #[serde(default)]
+    pub application_release_revision: Option<String>,
     /// IRC operators. Passwords are plaintext in the config file, which
     /// must therefore be protected (0600); this matches ircd.conf
     /// convention.
@@ -252,6 +256,24 @@ pub struct OidcProviderConfig {
     /// this at `<issuer>/oauth2/sessions/logout`.
     #[serde(default)]
     pub end_session_endpoint: Option<String>,
+    /// How this client authenticates to the token endpoint. The method is a
+    /// property of the *client registration*, not of the provider, so
+    /// discovery cannot supply it: a provider that advertises several methods
+    /// still rejects every one the client was not registered for. Shauth
+    /// registers managed applications with `client_secret_post`.
+    #[serde(default)]
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
+}
+
+/// Client authentication methods e6irc supports at the token endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    /// HTTP Basic credentials, the OAuth 2.0 default.
+    #[default]
+    ClientSecretBasic,
+    /// Credentials in the request body, which Shauth's registrations require.
+    ClientSecretPost,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -276,6 +298,7 @@ impl Default for Config {
             database: None,
             http: None,
             oidc_providers: Vec::new(),
+            application_release_revision: None,
             opers: Vec::new(),
             networks: Vec::new(),
             bnc: None,
@@ -500,6 +523,42 @@ impl Config {
                             provider.name
                         )));
                     }
+                }
+            }
+            if let Some(shauth) = self
+                .oidc_providers
+                .iter()
+                .find(|provider| provider.name == "shauth")
+            {
+                let revision = self.application_release_revision.as_deref().unwrap_or("");
+                let immutable_revision = (12..=64).contains(&revision.len())
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    || revision.strip_prefix("sha256:").is_some_and(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                    });
+                if !immutable_revision {
+                    return Err(ConfigError::Invalid(
+                        "Shauth requires application_release_revision to be an immutable lowercase hexadecimal revision or sha256 digest".into(),
+                    ));
+                }
+                let Some(end_session) = shauth.end_session_endpoint.as_deref() else {
+                    return Err(ConfigError::Invalid(
+                        "Shauth requires end_session_endpoint for global logout".into(),
+                    ));
+                };
+                let issuer = openidconnect::url::Url::parse(&shauth.issuer_url)
+                    .expect("OIDC issuer was validated above");
+                let logout = openidconnect::url::Url::parse(end_session)
+                    .expect("OIDC logout endpoint was validated above");
+                if issuer.origin() != logout.origin() {
+                    return Err(ConfigError::Invalid(
+                        "Shauth end_session_endpoint must use the configured issuer origin".into(),
+                    ));
                 }
             }
         }
@@ -818,7 +877,9 @@ mod tests {
                 client_secret: "secret".into(),
                 scopes: vec![],
                 end_session_endpoint: end_session.map(str::to_string),
+                token_endpoint_auth_method: Default::default(),
             }],
+            application_release_revision: Some("0123456789ab".into()),
             ..Config::default()
         }
     }
@@ -851,6 +912,30 @@ mod tests {
                 "accepted invalid OIDC coordinates: {name} {issuer} {end_session:?}"
             );
         }
+
+        for revision in [None, Some("main"), Some("ABCDEF012345"), Some("sha256:bad")] {
+            let mut config = oidc_config(
+                "shauth",
+                "https://auth.example",
+                Some("https://auth.example/logout"),
+            );
+            config.application_release_revision = revision.map(str::to_string);
+            assert!(
+                config.validate().is_err(),
+                "accepted mutable Shauth release revision {revision:?}"
+            );
+        }
+
+        let mut foreign_logout = oidc_config(
+            "shauth",
+            "https://auth.example",
+            Some("https://attacker.example/logout"),
+        );
+        foreign_logout.application_release_revision = Some("0123456789ab".into());
+        assert!(
+            foreign_logout.validate().is_err(),
+            "accepted a Shauth logout endpoint on another origin"
+        );
     }
 
     #[test]
@@ -871,6 +956,7 @@ mod tests {
                 client_secret: key.seal("oidcsecret"),
                 scopes: vec![],
                 end_session_endpoint: None,
+                token_endpoint_auth_method: Default::default(),
             }],
             secrets: Some(SecretsConfig {
                 key_file: path.clone(),
