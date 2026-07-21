@@ -14,6 +14,9 @@
 #              E6IRC_OIDC_ISSUER  E6IRC_OIDC_CLIENT_ID  E6IRC_OIDC_CLIENT_SECRET
 #              E6IRC_OIDC_END_SESSION
 #              E6IRC_OIDC_NAME (default shauth)
+#              E6IRC_OIDC_TOKEN_AUTH (default client_secret_post, which is how
+#                Shauth registers managed applications; the method belongs to
+#                the client registration, so discovery cannot report it)
 set -eu
 
 # Fail loudly on missing required config rather than starting half-configured.
@@ -59,6 +62,8 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
     printf 'issuer_url = "%s"\n' "$(toml "$E6IRC_OIDC_ISSUER")"
     printf 'client_id = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_ID")"
     printf 'client_secret = "%s"\n' "$(toml "$E6IRC_OIDC_CLIENT_SECRET")"
+    printf 'token_endpoint_auth_method = "%s"\n' \
+      "$(toml "${E6IRC_OIDC_TOKEN_AUTH:-client_secret_post}")"
     printf 'end_session_endpoint = "%s"\n' "$(toml "$E6IRC_OIDC_END_SESSION")"
   fi
 } > "$CONFIG"

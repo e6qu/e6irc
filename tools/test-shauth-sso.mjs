@@ -88,10 +88,10 @@ try {
   await page.locator("[data-shauth-sign-out]").click();
   await page.waitForURL(`${primaryOrigin}/auth/signed-out`);
   assert.deepEqual(bridgeRequests.slice(bridgeCount), [primaryBridge]);
-  let recovery = page.getByRole("link", { name: "Sign in with Shauth", exact: true });
+  let recovery = page.getByRole("link", { name: "Sign in with shauth", exact: true });
   assert.equal(await recovery.getAttribute("href"), "/api/v1/auth/oidc/shauth/start");
   await page.reload();
-  recovery = page.getByRole("link", { name: "Sign in with Shauth", exact: true });
+  recovery = page.getByRole("link", { name: "Sign in with shauth", exact: true });
   await recovery.waitFor();
   await waitForRevocation(context, primaryOrigin);
   await waitForRevocation(context, secondaryOrigin);

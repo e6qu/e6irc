@@ -1286,7 +1286,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
         assert!(body.contains("You are signed out"), "{body}");
         assert!(
-            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with Shauth</a>"),
+            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with shauth</a>"),
             "{body}"
         );
     }

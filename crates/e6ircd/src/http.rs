@@ -314,7 +314,12 @@ mod pages {
     #[derive(Template)]
     #[template(path = "signed_out.html")]
     struct SignedOut {
-        has_shauth: bool,
+        /// The single configured provider to offer directly, when there is
+        /// exactly one. The provider's configured name is part of its starter
+        /// path, so this cannot be a fixed string: an operator who names the
+        /// provider anything other than `shauth` would otherwise be offered a
+        /// link to a starter that does not exist.
+        sole_provider: Option<String>,
     }
 
     #[derive(Template)]
@@ -341,12 +346,12 @@ mod pages {
     /// never probes the local or provider session, so a completed logout does
     /// not immediately send the browser back through silent single sign-on.
     pub async fn signed_out(State(state): State<Arc<AppState>>) -> Response {
-        render_auth(SignedOut {
-            has_shauth: state
-                .oidc_providers
-                .iter()
-                .any(|provider| provider.name == "shauth"),
-        })
+        let mut providers = state.oidc_providers.iter();
+        let sole_provider = match (providers.next(), providers.next()) {
+            (Some(provider), None) => Some(provider.name.clone()),
+            _ => None,
+        };
+        render_auth(SignedOut { sole_provider })
     }
 
     /// Deployment-neutral authenticated identity contract consumed by
