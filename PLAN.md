@@ -798,6 +798,30 @@ string literals before counting. Both directions were re-verified — the
 `dead-pub-allow` exemption still works (the marker lives in a comment, so
 stripping naively would have broken it), and the real tree is still clean.
 
+Twenty-eighth sweep — split the HTTP surface (2026-07-22): `http.rs` was the
+last file over a thousand lines, at 3,965. It is now `http/` with seven modules
+— oidc, device, openapi, history, ws, credentials, networks — and `mod.rs`
+keeping the router, `AppState`, the extractors and the shared response helpers.
+No file in the crate is now larger than `oidc.rs` at 1,042 lines, down from
+6,417 two sweeps ago.
+
+The first attempt cut three items in half. Section-marker comments sit between
+items and are safe boundaries, but the sub-splits inside a section (pulling the
+OpenAPI document out of the device-grant section, the test modules out of the
+networks section) were chosen by line number and landed mid-item. The failure
+mode is worth recording: a half-item means the file does not parse, so *none* of
+its items exist, which surfaced as ~25 "cannot find value `list_networks`"
+errors in the router — that reads like a visibility problem and sends you
+looking in the wrong place entirely. Redone with every boundary snapped to an
+item start: the line where its doc comment or attributes begin, not where its
+`fn` does.
+
+Two things needed fixing that a pure move would not suggest: `include_str!`
+paths are relative to the *file*, so moving a directory deeper broke the
+embedded stylesheet (loudly, at compile time — but only because the asset is
+embedded rather than read at runtime), and structs whose fields are read from a
+sibling module needed those fields visible, not just the type.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
