@@ -822,6 +822,37 @@ embedded stylesheet (loudly, at compile time — but only because the asset is
 embedded rather than read at runtime), and structs whose fields are read from a
 sibling module needed those fields visible, not just the type.
 
+Twenty-ninth sweep — one reconnect policy, not four (2026-07-22): the
+duplication guard's own comment records the bridge drivers' reconnect loop as a
+copy-paste class an earlier sweep removed. It had grown back — four copies,
+matrix/slack/discord/irc — which is exactly what a ratchet exists to notice.
+
+They are now one `run_with_backoff`. The saving is small (about fifteen lines
+each) but the point is not line count: reconnect pacing is a *policy*, and four
+copies meant a change to it reached whichever bridge was being edited and
+quietly left the other three on the old behaviour. `irc_driver` also carried its
+own `ConnectionOutcome`, identical in shape and meaning to the other three
+drivers' `SessionOutcome`; there is now one type for "a driver session ended,
+either stopped or dropped".
+
+The shared loop takes a function returning a boxed future rather than an async
+closure. The closure form cannot prove `Send` for a higher-ranked borrow of the
+driver's ends, and the spawned task needs it; one allocation per *reconnect* is
+not worth contorting the signature to avoid. That trade is written at the
+signature so the next reader does not try to "simplify" it back.
+
+Duplication 3.54% → 3.48%, ratchet to 3.5%.
+
+`db.rs` was examined and deliberately left. Most of its clones are sqlx builder
+chains — `.bind().execute().await.map_err()` — which are plumbing, and
+abstracting them would read worse than the repetition. The one real target
+there is the CHATHISTORY column list, repeated across eleven query variants: a
+contract between those queries and one row type, and the thing that drifted
+when timestamps moved from seconds to milliseconds. It wants a compile-time
+`concat!` rather than a runtime `format!` that would cost the SQL its
+greppability, and it wants doing at the start of a sweep rather than the end of
+a long one — so it is recorded in the guard as the next target instead.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

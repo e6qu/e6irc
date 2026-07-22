@@ -95,10 +95,48 @@ impl Backoff {
 /// rather than resuming); losing that optimization is far better than the
 /// task dying on the first disconnect and silently dropping all later
 /// upstream traffic.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) enum SessionOutcome {
     Stopped,
     Dropped,
+}
+
+/// Run `session` forever, reconnecting with backoff whenever it drops.
+///
+/// Every always-on driver needs exactly this: a transient failure must
+/// reconnect rather than kill the network, because a dead driver silently
+/// drops every later upstream message; only a dropped handle stops it. The
+/// `Disconnected` event is emitted on each drop so an attached client sees the
+/// gap rather than an unexplained silence.
+///
+/// Written once because it is a policy, not a shape. Four copies meant a change
+/// to how reconnects are paced reached whichever bridge was being edited and
+/// quietly left the other three on the old behaviour.
+/// `session` is a plain function returning a boxed future rather than an async
+/// closure: the closure form cannot prove `Send` for a higher-ranked borrow of
+/// `ends`, and the spawned driver task needs it. One allocation per *reconnect*
+/// is not a cost worth contorting the signature to avoid.
+pub(crate) type DriverSession<C> =
+    for<'a> fn(
+        &'a C,
+        &'a mut DriverEnds,
+    ) -> std::pin::Pin<Box<dyn Future<Output = SessionOutcome> + Send + 'a>>;
+
+pub(crate) async fn run_with_backoff<C>(
+    config: C,
+    ends: &mut DriverEnds,
+    session: DriverSession<C>,
+) {
+    let mut backoff = Backoff::new();
+    loop {
+        let started = tokio::time::Instant::now();
+        match session(&config, ends).await {
+            SessionOutcome::Stopped => return,
+            SessionOutcome::Dropped => {
+                ends.emit(ConnectionEvent::Disconnected);
+                backoff.wait(started.elapsed()).await;
+            }
+        }
+    }
 }
 
 /// Classification of a downstream client command by a bridge, so a message
