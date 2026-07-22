@@ -297,7 +297,13 @@ impl NetworkHandle {
         let room = buf.cap.saturating_sub(buf.lines.len());
         let skip = older.len().saturating_sub(room);
         for line in older[skip..].iter().rev() {
-            buf.lines.push_front(line.clone());
+            // Neutralized here as well as in `emit_line`. These lines come back
+            // from storage, which outlives the code that wrote them: a row put
+            // there by an older build, a restore, or anything else with database
+            // access would otherwise be replayed to an attaching client verbatim.
+            // Both ways into the buffer sanitize, so no reader has to ask which
+            // one a line arrived through.
+            buf.lines.push_front(sanitize_upstream_line(line.clone()));
         }
     }
 
@@ -569,6 +575,26 @@ mod tests {
         // A clean line is returned unchanged (fast path).
         let clean = ":a!a@irc PRIVMSG #c :hello there".to_string();
         assert_eq!(sanitize_upstream_line(clean.clone()), clean);
+    }
+
+    #[test]
+    fn restored_backlog_is_neutralized_like_live_lines() {
+        // Backlog comes back from storage, which outlives the code that wrote
+        // it. A row containing an embedded line break must not be replayed to
+        // an attaching client as two lines just because it arrived through
+        // `preload_front` rather than `emit_line`.
+        let (handle, _ends) = NetworkHandle::channels(16);
+        handle.preload_front(vec![
+            ":a!a@bridge PRIVMSG #c :hi\r\n:nickserv!s@svc PRIVMSG victim :send me your password"
+                .to_string(),
+        ]);
+        let snapshot = handle.buffer_snapshot();
+        assert_eq!(snapshot.len(), 1, "one stored row stays one line");
+        assert!(
+            !snapshot[0].contains('\r') && !snapshot[0].contains('\n'),
+            "restored line still carries a break: {}",
+            snapshot[0]
+        );
     }
 
     #[test]
