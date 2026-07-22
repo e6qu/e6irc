@@ -27,6 +27,10 @@ struct Cli {
     channel: String,
 }
 
+/// Server events buffered between draws before the reader task waits on the
+/// render loop. One screenful of scrollback is generous for a 50 ms poll.
+const NET_QUEUE_DEPTH: usize = 1024;
+
 /// Events the render loop consumes.
 enum Ev {
     Net(OwnedMessage),
@@ -46,7 +50,12 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     conn.register(&cli.nick, "e6irc-tui").await?;
     conn.send_line(&format!("JOIN {}", cli.channel)).await?;
 
-    let (net_tx, mut net_rx) = mpsc::unbounded_channel::<Ev>();
+    // Bounded: the server decides how fast this fills, and the render loop
+    // only drains it between draws. A full queue makes the reader task wait,
+    // which stops reading the socket and lets TCP apply the backpressure —
+    // the same shape as the daemon's SendQ, in the other direction.
+    let (net_tx, mut net_rx) = mpsc::channel::<Ev>(NET_QUEUE_DEPTH);
+    // Outbound is unbounded because a human at a keyboard fills it.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
 
     // Networking task: read messages up, write outbound lines down.
@@ -59,9 +68,9 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                             let token = m.params.first().cloned().unwrap_or_default();
                             let _ = conn.send_line(&format!("PONG :{token}")).await;
                         }
-                        if net_tx.send(Ev::Net(m)).is_err() { break; }
+                        if net_tx.send(Ev::Net(m)).await.is_err() { break; }
                     }
-                    _ => { let _ = net_tx.send(Ev::Disconnected); break; }
+                    _ => { let _ = net_tx.send(Ev::Disconnected).await; break; }
                 },
                 line = out_rx.recv() => match line {
                     Some(l) => { let _ = conn.send_line(&l).await; }
@@ -81,7 +90,7 @@ async fn async_main(cli: Cli) -> io::Result<()> {
 async fn run_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    net_rx: &mut mpsc::UnboundedReceiver<Ev>,
+    net_rx: &mut mpsc::Receiver<Ev>,
     out_tx: &mpsc::UnboundedSender<String>,
 ) -> io::Result<()> {
     loop {

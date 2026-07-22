@@ -34,8 +34,12 @@ pub struct OwnedMessage {
     pub params: Vec<String>,
 }
 
-impl OwnedMessage {
-    fn from(msg: &Message) -> Self {
+/// The borrowed → owned conversion. Public because [`OwnedMessage`] is: a
+/// caller holding a parsed [`Message`] (a test, a bridge, a replay tool) has no
+/// other way to build one, and a second hand-written copy of this mapping is
+/// free to drift from the one the connection actually uses.
+impl From<&Message<'_>> for OwnedMessage {
+    fn from(msg: &Message<'_>) -> Self {
         Self {
             tags: msg
                 .tags

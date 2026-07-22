@@ -11,21 +11,14 @@ use e6ircd::{db, net};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-fn test_db_url() -> String {
-    std::env::var("E6IRC_TEST_DATABASE_URL")
-        .expect("E6IRC_TEST_DATABASE_URL must be set for --ignored db tests")
-}
+mod support;
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn verify_password_roundtrip() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("verify_password_roundtrip").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
 
     db::create_account(&pool, "Alice", "correct horse")
         .await
@@ -100,12 +93,8 @@ async fn verify_password_roundtrip() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn sasl_over_real_socket() {
-    let url = test_db_url();
+    let url = support::test_db("sasl_over_real_socket").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "sasluser", "s3cret")
         .await
         .expect("create");
@@ -160,12 +149,8 @@ async fn sasl_over_real_socket() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn sasl_oauthbearer_with_api_token() {
-    let url = test_db_url();
+    let url = support::test_db("sasl_oauthbearer_with_api_token").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "tokuser", "pw")
         .await
         .expect("create");
@@ -233,12 +218,8 @@ async fn app_password_issued_over_http_works_for_sasl() {
     use e6ircd::config::HttpConfig;
     use tokio::io::AsyncReadExt;
 
-    let url = test_db_url();
+    let url = support::test_db("app_password_issued_over_http_works_for_sasl").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "apppw", "mainpass")
         .await
         .expect("create");
@@ -330,12 +311,8 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
     use e6ircd::config::{HttpConfig, LimitsConfig};
     use tokio::io::AsyncReadExt;
 
-    let url = test_db_url();
+    let url = support::test_db("auth_endpoint_rate_limit_returns_429_after_burst").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "rluser", "mainpass")
         .await
         .expect("create");
@@ -394,12 +371,8 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_messages_are_persisted() {
-    let url = test_db_url();
+    let url = support::test_db("channel_messages_are_persisted").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
 
     let config = Config {
         server_name: "irc.hist.example".into(),
@@ -466,12 +439,8 @@ async fn credential_list_and_revoke() {
     use e6ircd::config::HttpConfig;
     use tokio::io::AsyncReadExt;
 
-    let url = test_db_url();
+    let url = support::test_db("credential_list_and_revoke").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "creduser", "pw")
         .await
         .expect("create");
@@ -581,12 +550,8 @@ async fn credential_list_and_revoke() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn read_marker_persists() {
-    let url = test_db_url();
+    let url = support::test_db("read_marker_persists").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "mark", "pw")
         .await
         .expect("create");
@@ -666,12 +631,8 @@ async fn read_marker_persists() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn history_rest_endpoint() {
     use e6ircd::config::HttpConfig;
-    let url = test_db_url();
+    let url = support::test_db("history_rest_endpoint").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "web", "pw")
         .await
         .expect("create");
@@ -935,12 +896,8 @@ PING x
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn chathistory_pages_from_postgres_past_the_ring() {
-    let url = test_db_url();
+    let url = support::test_db("chathistory_pages_from_postgres_past_the_ring").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
 
     let config = Config {
         server_name: "irc.ch.example".into(),
@@ -1075,12 +1032,9 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
     // its ring is empty but PostgreSQL still holds the old rows. It must NOT be
     // marked history-complete (which would make CHATHISTORY return an empty
     // batch), and a labeled request's deferred DB batch must carry the label.
-    let url = test_db_url();
+    let url =
+        support::test_db("chathistory_recreated_channel_serves_persisted_history_with_label").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
 
     let config = Config {
         server_name: "irc.recreate.example".into(),
@@ -1177,12 +1131,8 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
 async fn read_marker_preloaded_after_restart() {
     // The read-marker mirror must be seeded from PostgreSQL at boot; otherwise a
     // MARKREAD query returns `*` after a restart even though a marker persists.
-    let url = test_db_url();
+    let url = support::test_db("read_marker_preloaded_after_restart").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE read_markers, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "marky", "pw")
         .await
         .expect("acct");
@@ -1252,12 +1202,8 @@ async fn read_marker_preloaded_after_restart() {
 async fn sasl_registration_fails_loudly_on_nick_in_use() {
     // Regression: the shared SASL epilogue must treat a post-auth 433 (nick in
     // use, reported after CAP END) as terminal instead of blocking forever.
-    let url = test_db_url();
+    let url = support::test_db("sasl_registration_fails_loudly_on_nick_in_use").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "dupacct", "pw")
         .await
         .expect("acct");
@@ -1304,12 +1250,8 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
 async fn labeled_chathistory_targets_carries_label_on_db_path() {
     // Regression: a labeled CHATHISTORY TARGETS that resolves via PostgreSQL
     // must tag its deferred batch with the label (and not ACK it empty first).
-    let url = test_db_url();
+    let url = support::test_db("labeled_chathistory_targets_carries_label_on_db_path").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
 
     let config = Config {
         server_name: "irc.tgt.example".into(),
@@ -1378,13 +1320,9 @@ async fn labeled_chathistory_targets_carries_label_on_db_path() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_networks_crud() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("bnc_networks_crud").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -1459,13 +1397,10 @@ async fn bnc_networks_crud() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn query_targets_enumerates_active_buffers() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("query_targets_enumerates_active_buffers").await)
+            .await
+            .expect("connect");
 
     // Epoch milliseconds (see above).
     for (target, ts) in [("#a", 1000_i64), ("#a", 2000), ("#b", 1500), ("#c", 3000)] {
@@ -1514,13 +1449,10 @@ async fn query_targets_enumerates_active_buffers() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn msgid_pivot_is_scoped_to_its_own_target() {
     use e6ircd::core::HistoryQuery;
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("msgid_pivot_is_scoped_to_its_own_target").await)
+            .await
+            .expect("connect");
     // A public channel either side of a message in a private conversation.
     for (msgid, target, body, ts) in [
         ("pub-1", "#public", "public one", 1000_i64),
@@ -1599,13 +1531,11 @@ async fn msgid_pivot_is_scoped_to_its_own_target() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn query_targets_includes_direct_message_correspondents() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool = db::connect_and_migrate(
+        &support::test_db("query_targets_includes_direct_message_correspondents").await,
+    )
+    .await
+    .expect("connect");
 
     // One conversation between alice and bob, stored once under the sorted
     // pair, and one channel alice is in. Epoch milliseconds throughout.
@@ -1655,13 +1585,9 @@ async fn query_targets_includes_direct_message_correspondents() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn query_history_around_and_between() {
     use e6ircd::core::HistoryQuery;
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("query_history_around_and_between").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     // Epoch milliseconds throughout: the ts column is a timestamptz and the
     // Rust layer converts to/from milliseconds.
     for ts in [1000_i64, 2000, 3000, 4000, 5000] {
@@ -1742,13 +1668,11 @@ async fn query_history_around_and_between() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn query_history_msgid_paginates_within_a_single_second() {
     use e6ircd::core::HistoryQuery;
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool = db::connect_and_migrate(
+        &support::test_db("query_history_msgid_paginates_within_a_single_second").await,
+    )
+    .await
+    .expect("connect");
     // Five messages that all share the SAME whole second. Timestamp-only
     // paging cannot separate them; composite `(ts, id)` paging must, ordering
     // them by the monotonically-increasing insertion id.
@@ -1833,13 +1757,9 @@ async fn query_history_msgid_paginates_within_a_single_second() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_topic_persist_and_load() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("channel_topic_persist_and_load").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "boss", "pw")
         .await
         .expect("account");
@@ -1884,13 +1804,10 @@ async fn channel_topic_persist_and_load() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_keeptopic_persist_and_load() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("channel_keeptopic_persist_and_load").await)
+            .await
+            .expect("connect");
     db::create_account(&pool, "boss", "pw")
         .await
         .expect("account");
@@ -1934,13 +1851,9 @@ async fn channel_keeptopic_persist_and_load() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_mlock_persist_and_load() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("channel_mlock_persist_and_load").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "boss", "pw")
         .await
         .expect("account");
@@ -1984,13 +1897,9 @@ async fn channel_mlock_persist_and_load() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_access_persist_and_load() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("channel_access_persist_and_load").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "boss", "pw").await.expect("boss");
     db::create_account(&pool, "alice", "pw")
         .await
@@ -2025,13 +1934,9 @@ async fn channel_access_persist_and_load() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_founder_transfer() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("channel_founder_transfer").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE messages, accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::create_account(&pool, "boss", "pw").await.expect("boss");
     db::create_account(&pool, "alice", "pw")
         .await
@@ -2066,13 +1971,9 @@ async fn channel_founder_transfer() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn server_bans_persist_and_load() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("server_bans_persist_and_load").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE server_bans")
-        .execute(&pool)
-        .await
-        .expect("clean");
 
     db::add_server_ban(&pool, "baddie@*", "spam", "god", "kline")
         .await
@@ -2150,13 +2051,9 @@ async fn server_bans_persist_and_load() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn audit_log_records_and_lists() {
-    let pool = db::connect_and_migrate(&test_db_url())
+    let pool = db::connect_and_migrate(&support::test_db("audit_log_records_and_lists").await)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE audit_log")
-        .execute(&pool)
-        .await
-        .expect("clean");
     db::insert_audit_log(&pool, "god", "OPER", "god", "")
         .await
         .expect("a1");
@@ -2177,13 +2074,10 @@ async fn audit_log_records_and_lists() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_identity_link_list_and_conflict() {
     use e6ircd::db::LinkOutcome;
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("oidc_identity_link_list_and_conflict").await)
+            .await
+            .expect("connect");
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -2235,13 +2129,10 @@ async fn oidc_identity_link_list_and_conflict() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_web_session_records_logout_hint() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("oidc_web_session_records_logout_hint").await)
+            .await
+            .expect("connect");
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -2292,13 +2183,11 @@ async fn oidc_web_session_records_logout_hint() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool = db::connect_and_migrate(
+        &support::test_db("oidc_logout_revokes_correlated_sessions_and_rejects_replay").await,
+    )
+    .await
+    .expect("connect");
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -2394,13 +2283,10 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn history_read_authorization_is_scoped() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("history_read_authorization_is_scoped").await)
+            .await
+            .expect("connect");
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -2455,13 +2341,10 @@ async fn history_read_authorization_is_scoped() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn device_grants_are_pruned_on_create() {
-    let pool = db::connect_and_migrate(&test_db_url())
-        .await
-        .expect("connect");
-    sqlx::query("TRUNCATE device_grants")
-        .execute(&pool)
-        .await
-        .expect("clean");
+    let pool =
+        db::connect_and_migrate(&support::test_db("device_grants_are_pruned_on_create").await)
+            .await
+            .expect("connect");
     // An already-expired grant, as a never-approved /device/start flood leaves.
     sqlx::query(
         "INSERT INTO device_grants (device_code, user_code, expires_at)

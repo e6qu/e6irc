@@ -93,9 +93,8 @@ jobs:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - name: Start dex (mock connector)
         run: |
-          sed 's/127.0.0.1:15556/127.0.0.1:15556/' tools/dex-config.yaml > /tmp/dex.yaml
           docker run -d --name dex -p 15556:5556 \
-            -v /tmp/dex.yaml:/etc/dex/config.yaml \
+            -v "$PWD/tools/dex-config.yaml:/etc/dex/config.yaml" \
             ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
@@ -333,6 +332,10 @@ jobs:
   # the events no client sends — the liveness tick and deferred database pages.
   # Any panic is a finding: one worker serves every client, so a panic reached
   # through any connection takes down all of them.
+  #
+  # `client_messages` runs the other direction: it feeds the TUI arbitrary
+  # *server* output. A client's whole state is derived from lines a remote
+  # server chose, and that server is not necessarily this one.
   fuzz-smoke:
     runs-on: ubuntu-24.04
     # `core_dispatch` links the whole daemon (sqlx, rustls) rather than just the
@@ -348,7 +351,7 @@ jobs:
       - name: Fuzz each target briefly
         working-directory: fuzz
         run: |
-          for target in parse_message tag_escaping isupport_token core_dispatch core_multi; do
+          for target in parse_message tag_escaping isupport_token core_dispatch core_multi client_messages; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30
           done
 
