@@ -706,6 +706,31 @@ Both fixes carry regression tests checked against the unfixed code first, and
 `core_dispatch` joins the CI fuzz loop so the stateful surface keeps getting
 exercised as it grows.
 
+Twenty-fifth sweep — fuzzing between connections (2026-07-22): sweep 24's
+target drives a single connection, which cannot reach the invariants that only
+exist *between* them — nick collisions, kicks and invites, a conversation
+needing two participants, a multiline batch relayed to somebody else — nor the
+events no client sends: the liveness `Tick`, which closes connections part-way
+through another's command stream, and the deferred database pages whose whole
+job is to be ordered against a connection's other output.
+
+`core_multi` drives three connections interleaved and feeds `Tick`,
+`OverlongLine`, `Closed`, `HistoryPage` and `TargetsPage` alongside client
+lines, each action chosen by the leading byte so a corpus of plain IRC still
+works and the fuzzer discovers the rest by mutation. It reaches ~200 more edges
+than the single-connection target, which is the measure of what the older one
+could not see.
+
+The daemon came through it. The one bug found was in the harness: `&raw[1..]`
+sliced the action byte off by *byte*, so a line starting with a multi-byte
+character panicked the fuzzer itself — the same mistake `cmd_batch` made and
+sweep 24 fixed. Worth recording rather than quietly correcting: a panic in the
+harness is indistinguishable from a finding until the backtrace is read, and
+writing the identical bug days after fixing it says the shape is easy to reach
+for, not that the earlier one was careless.
+
+Both core targets now run in CI.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

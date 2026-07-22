@@ -326,10 +326,13 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom -Dwarnings
 
-  # `core_dispatch` differs from the parser targets: it drives the stateful
-  # core with a command stream, where a line's effect depends on every line
-  # before it. Any panic is a finding — that is the whole oracle, and it is the
-  # contract a server owes a hostile peer.
+  # `core_dispatch` and `core_multi` differ from the parser targets: they drive
+  # the stateful core with a command stream, where a line's effect depends on
+  # every line before it. `core_multi` adds the parts only reachable with more
+  # than one connection (collisions, kicks, conversations, relayed batches) and
+  # the events no client sends — the liveness tick and deferred database pages.
+  # Any panic is a finding: one worker serves every client, so a panic reached
+  # through any connection takes down all of them.
   fuzz-smoke:
     runs-on: ubuntu-24.04
     # `core_dispatch` links the whole daemon (sqlx, rustls) rather than just the
@@ -345,7 +348,7 @@ jobs:
       - name: Fuzz each target briefly
         working-directory: fuzz
         run: |
-          for target in parse_message tag_escaping isupport_token core_dispatch; do
+          for target in parse_message tag_escaping isupport_token core_dispatch core_multi; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30
           done
 

@@ -268,9 +268,10 @@ strip = "symbols"
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL
   client/server state machines (pure, I/O-free, unit-tested).
 - Fuzz targets (cargo-fuzz) for parser and tag unescaping, and for the
-  stateful core driven by an arbitrary command stream (`core_dispatch`): a
-  panic there takes the single worker down for every client, so "survives
-  whatever a client sends" is the whole oracle.
+  stateful core: `core_dispatch` drives one connection, `core_multi` drives
+  several interleaved and adds the events no client sends (the liveness tick,
+  deferred database pages). A panic there takes the single worker down for
+  every client, so "survives whatever a client sends" is the whole oracle.
 
 ### 7.2 Connection lifecycle
 
