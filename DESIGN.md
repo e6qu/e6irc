@@ -108,7 +108,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
 
 ## 3. Architecture overview
 
-**Module layout.** The core worker's command handling lives in
+**Module layout.** The HTTP surface lives in `http/`, one module per concern —
+oidc, device, openapi, history, ws, credentials, networks — with `mod.rs`
+holding the router, `AppState`, the extractors and the shared response helpers.
+The core worker's command handling lives in
 `core/handler/`, one module per command family — registration, sasl, services,
 channel, message, chanops, query, history, monitor, read_marker, oper — with
 `mod.rs` holding dispatch and the helpers they share. It was a single 6,400-line
