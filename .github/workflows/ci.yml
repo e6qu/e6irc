@@ -326,9 +326,15 @@ jobs:
         env:
           RUSTFLAGS: --cfg loom -Dwarnings
 
+  # `core_dispatch` differs from the parser targets: it drives the stateful
+  # core with a command stream, where a line's effect depends on every line
+  # before it. Any panic is a finding — that is the whole oracle, and it is the
+  # contract a server owes a hostile peer.
   fuzz-smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # `core_dispatch` links the whole daemon (sqlx, rustls) rather than just the
+    # protocol crate, so a cold cache spends most of the budget compiling.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -339,7 +345,7 @@ jobs:
       - name: Fuzz each target briefly
         working-directory: fuzz
         run: |
-          for target in parse_message tag_escaping isupport_token; do
+          for target in parse_message tag_escaping isupport_token core_dispatch; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30
           done
 

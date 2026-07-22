@@ -614,9 +614,14 @@ fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
         );
         return;
     };
-    let (sign, reference) = reference.split_at(1);
+    // Split off the leading *character*, not the leading byte: a reference
+    // beginning with a multi-byte character (`BATCH \u{61c}x`) would land
+    // `split_at(1)` inside it and panic, which any registered client could do.
+    let mut chars = reference.chars();
+    let sign = chars.next();
+    let reference = chars.as_str();
     match sign {
-        "+" => {
+        Some('+') => {
             if !state.sessions[&conn].caps.multiline {
                 multiline_fail(
                     state,
@@ -676,7 +681,7 @@ fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
                 kind: None,
             });
         }
-        "-" => {
+        Some('-') => {
             let open = state.sessions[&conn]
                 .multiline
                 .as_ref()
@@ -2476,21 +2481,20 @@ fn normalize_ban_mask(mask: &str) -> String {
     fn star(s: &str) -> &str {
         if s.is_empty() { "*" } else { s }
     }
-    match (mask.contains('!'), mask.contains('@')) {
-        (true, true) => {
-            let (nick, rest) = mask.split_once('!').unwrap();
-            let (user, host) = rest.split_once('@').unwrap();
-            format!("{}!{}@{}", star(nick), star(user), star(host))
-        }
-        (true, false) => {
-            let (nick, user) = mask.split_once('!').unwrap();
-            format!("{}!{}@*", star(nick), star(user))
-        }
-        (false, true) => {
-            let (user, host) = mask.split_once('@').unwrap();
-            format!("*!{}@{}", star(user), star(host))
-        }
-        (false, false) => format!("{}!*@*", star(mask)),
+    // Parsed positionally, one separator at a time. Asking whether the mask
+    // *contains* `!` and `@` says nothing about their order: `@!x` contains
+    // both, yet has no `@` after the `!`, so splitting on the strength of the
+    // `contains` answer found nothing there and panicked — reachable by any
+    // user, since creating a channel makes you its operator.
+    match mask.split_once('!') {
+        Some((nick, rest)) => match rest.split_once('@') {
+            Some((user, host)) => format!("{}!{}@{}", star(nick), star(user), star(host)),
+            None => format!("{}!{}@*", star(nick), star(rest)),
+        },
+        None => match mask.split_once('@') {
+            Some((user, host)) => format!("*!{}@{}", star(user), star(host)),
+            None => format!("{}!*@*", star(mask)),
+        },
     }
 }
 
@@ -6367,6 +6371,33 @@ fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ban_mask_normalizes_separators_in_any_order() {
+        // The ordinary shapes.
+        assert_eq!(normalize_ban_mask("n!u@h"), "n!u@h");
+        assert_eq!(normalize_ban_mask("n!u"), "n!u@*");
+        assert_eq!(normalize_ban_mask("u@h"), "*!u@h");
+        assert_eq!(normalize_ban_mask("n"), "n!*@*");
+        // Empty components become `*` rather than matching nothing.
+        assert_eq!(normalize_ban_mask("!@"), "*!*@*");
+        assert_eq!(normalize_ban_mask("n!@h"), "n!*@h");
+        // The separators need not appear in the expected order. `@!x` holds
+        // both, but has no `@` after the `!` — deciding the shape from
+        // `contains` and then splitting on that answer panicked the core
+        // worker, which any user could reach by creating a channel (making
+        // them its operator) and setting one mode.
+        assert_eq!(normalize_ban_mask("@!x"), "@!x@*");
+        assert_eq!(normalize_ban_mask("@!"), "@!*@*");
+        assert_eq!(normalize_ban_mask("@!:UUU"), "@!:UUU@*");
+        // Whatever the input, the result always has both separators exactly
+        // once in the right order, so it can be matched against a prefix.
+        for mask in ["", "!", "@", "@!x", "a!b@c@d", "!!!", "@@@", "a@b!c"] {
+            let out = normalize_ban_mask(mask);
+            let (_, rest) = out.split_once('!').expect("normalized mask has a !");
+            assert!(rest.contains('@'), "{mask:?} normalized to {out:?}");
+        }
+    }
 
     #[test]
     fn ban_mask_canonicalizes_to_nick_user_host() {
