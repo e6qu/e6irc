@@ -44,17 +44,15 @@ cd "$(dirname "$0")/.."
 # (sweep 26: first full scan; see above — the earlier figures omitted the four
 # largest files) → 3.6% (sweep 27: HTTP prologues became extractors, ChanServ's
 # founder gate became one function) → 3.5% (sweep 29: the four bridge
-# connect-retry loops became one `run_with_backoff`).
+# connect-retry loops became one `run_with_backoff`) → 3.3% (sweep 30: the
+# CHATHISTORY column list became one `history_select!`/`history_window!`).
 #
-# Next target: `db.rs` repeats the CHATHISTORY column list across eleven query
-# variants. That is a real contract between those queries and one row type —
-# when the timestamp moved from seconds to milliseconds each copy was edited by
-# hand and the one that was missed stayed wrong for six sweeps — so it wants a
-# compile-time `concat!`, not a runtime `format!` that would cost the literal
-# SQL its greppability. The remaining db.rs clones are sqlx builder chains
-# (`.bind().execute().await.map_err()`); those are plumbing, and abstracting
-# them would read worse than the repetition.
-THRESHOLD=3.5
+# What is left is mostly sqlx builder chains — `.bind().execute().await
+# .map_err()` — and per-route response shaping. Those are plumbing: abstracting
+# them would read worse than the repetition, so the number is expected to sit
+# here rather than keep falling. Lower it only when a real shared concept is
+# found, not by wrapping boilerplate to move a metric.
+THRESHOLD=3.3
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."
