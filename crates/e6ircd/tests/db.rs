@@ -693,6 +693,7 @@ async fn history_rest_endpoint() {
     let other_session = db::create_web_session(&pool, "other")
         .await
         .expect("other session");
+    let pool2 = pool.clone();
     drop(pool);
 
     let config = Config {
@@ -780,6 +781,20 @@ PING x
     assert_eq!(messages[0]["body"], "rest one");
     assert_eq!(messages[1]["body"], "rest two");
     assert!(messages[0]["msgid"].as_str().is_some());
+    // The timestamp must be the moment the message was sent. Asserting only on
+    // the body let a unit mismatch (milliseconds scaled a second time) put every
+    // REST timestamp a thousand-fold into the future unnoticed.
+    let reported = messages[0]["time"].as_str().expect("time");
+    let reported_ms = e6irc_proto::time::parse_server_time_millis(reported)
+        .unwrap_or_else(|| panic!("unparseable time {reported}"));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    assert!(
+        reported_ms.abs_diff(now_ms) < 60 * 60 * 1000,
+        "history timestamp {reported} is not close to now"
+    );
 
     // An account with no relationship to #web is refused (IDOR guard).
     let forbidden = client
@@ -793,6 +808,128 @@ PING x
         403,
         "unrelated account must be forbidden"
     );
+
+    // Direct-message history is readable over REST too — DESIGN §11.2 says the
+    // web and IRC hit one history, and it used to serve channels only.
+    // Conversations are keyed by *account*, so both parties authenticate.
+    async fn dm_client(
+        addr: std::net::SocketAddr,
+        account: &str,
+    ) -> (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        let stream = TcpStream::connect(addr).await.expect("irc");
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let sasl = e6irc_proto::base64::encode(format!("\0{account}\0pw").as_bytes());
+        w.write_all(
+            format!("CAP LS 302\r\nCAP REQ :sasl\r\nAUTHENTICATE PLAIN\r\nAUTHENTICATE {sasl}\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        // Wait for the SASL verdict before finishing registration: the account
+        // must be attached before any message, or the conversation is keyed to
+        // an unauthenticated identity instead.
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(!line.contains(" 904 "), "SASL failed for {account}");
+            if line.contains(" 903 ") {
+                break;
+            }
+        }
+        w.write_all(format!("NICK {account}\r\nUSER u 0 * :U\r\nCAP END\r\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if line.contains(" 001 ") {
+                break;
+            }
+        }
+        (reader, w)
+    }
+    let (_r_other, _w_other) = dm_client(running.addrs[0], "other").await;
+    let (mut r_web, mut w_web) = dm_client(running.addrs[0], "web").await;
+    w_web
+        .write_all(b"PRIVMSG other :a private word\r\nPING y\r\n")
+        .await
+        .unwrap();
+    loop {
+        let mut line = String::new();
+        r_web.read_line(&mut line).await.unwrap();
+        if line.contains("PONG") {
+            break;
+        }
+    }
+    let mut dm = vec![];
+    for _ in 0..50 {
+        let v: serde_json::Value = client
+            .get(format!("{base}/api/v1/history?target=other"))
+            .header("cookie", format!("e6irc_session={session}"))
+            .send()
+            .await
+            .expect("dm hist")
+            .json()
+            .await
+            .expect("json");
+        dm = v["messages"].as_array().cloned().unwrap_or_default();
+        if !dm.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        dm.len(),
+        1,
+        "own direct-message history is readable: {dm:?}"
+    );
+    assert_eq!(dm[0]["body"], "a private word");
+
+    // The other participant sees the same conversation from their side.
+    let v: serde_json::Value = client
+        .get(format!("{base}/api/v1/history?target=web"))
+        .header("cookie", format!("e6irc_session={other_session}"))
+        .send()
+        .await
+        .expect("peer hist")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        v["messages"].as_array().map(Vec::len),
+        Some(1),
+        "both participants read one conversation"
+    );
+
+    // A third party cannot reach it, not even by passing the raw conversation
+    // key: the key is derived from *their* account, so it can only ever name a
+    // conversation they are part of.
+    db::create_account(&pool2, "snoop", "pw")
+        .await
+        .expect("snoop");
+    let snoop_session = db::create_web_session(&pool2, "snoop")
+        .await
+        .expect("snoop session");
+    for probe in ["web", "other", "other!web", "web!other"] {
+        let v: serde_json::Value = client
+            .get(format!("{base}/api/v1/history?target={probe}"))
+            .header("cookie", format!("e6irc_session={snoop_session}"))
+            .send()
+            .await
+            .expect("probe")
+            .json()
+            .await
+            .expect("json");
+        let leaked = v["messages"].as_array().cloned().unwrap_or_default();
+        assert!(
+            leaked.is_empty(),
+            "target={probe} leaked another account's conversation: {leaked:?}"
+        );
+    }
 }
 
 #[tokio::test]

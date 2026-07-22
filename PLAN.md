@@ -544,6 +544,36 @@ opening BATCH (the input line limit bounds them); a second concurrent open is
 refused; and a batch whose target became unreachable before it closed is
 refused at close with nothing relayed.
 
+Twentieth sweep — REST history audit (2026-07-22): the recent sweeps all worked
+through irctest, which never exercises the REST surface, so this one audited the
+history endpoint against the storage changes made underneath it.
+
+**A timestamp regression I introduced in sweep 14 and never noticed.** That
+sweep made `HistoryRow::ts` milliseconds; the IRC render site was updated, the
+REST one still multiplied by a thousand. Every timestamp the REST history API
+returned was a thousand-fold into the future. It survived six sweeps because the
+test asserted message bodies and msgids but never the time — so the assertion is
+now there, checked against the unfixed code first (it fails, as it should have
+all along).
+
+**Direct-message history was unreachable over REST.** DESIGN §11.2 claimed the
+web and IRC hit one history, but the endpoint authorized every target as a
+channel, so a conversation could only ever be refused. It now serves them.
+
+The authorization difference between the two target kinds is worth stating
+plainly, because it looks like an inconsistency and is not: a channel read over
+REST has no view of live membership, so it fails closed to a registered
+relationship; a conversation read needs no check *because none could be
+bypassed* — the key is built from the authenticated account, so a caller can
+only ever name a conversation it is part of. That includes a caller who passes a
+raw conversation key: it becomes one component of a key derived from their own
+account, which matches nothing. The test probes exactly that, with a third
+account trying `web`, `other`, `other!web` and `web!other`.
+
+Both surfaces now derive the conversation key from a single
+`dm_conversation_key`, rather than each spelling out the sort-and-join. Two
+implementations that must agree is how a privacy boundary drifts.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

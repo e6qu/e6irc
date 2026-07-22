@@ -2661,24 +2661,34 @@ async fn history(
     // could read any channel's history, including secret (+s) ones.
     let target_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&params.target);
     let account_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-    match crate::db::account_may_read_channel(pool, &target_folded, &account_folded).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return problem(
-                StatusCode::FORBIDDEN,
-                "Not authorized to read this target's history",
-                None,
-            );
+    // A channel needs an explicit authorization check. Anything else names a
+    // direct-message correspondent, and the conversation key is built *from the
+    // authenticated account* — so a caller can only ever address a conversation
+    // it is part of, and no check is needed because none can be bypassed. A
+    // caller passing a raw conversation key gets a key derived from it in turn,
+    // which matches nothing.
+    let target_folded = if target_folded.starts_with('#') {
+        match crate::db::account_may_read_channel(pool, &target_folded, &account_folded).await {
+            Ok(true) => target_folded,
+            Ok(false) => {
+                return problem(
+                    StatusCode::FORBIDDEN,
+                    "Not authorized to read this target's history",
+                    None,
+                );
+            }
+            Err(e) => {
+                eprintln!("http: history authorization query failed: {e}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                );
+            }
         }
-        Err(e) => {
-            eprintln!("http: history authorization query failed: {e}");
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            );
-        }
-    }
+    } else {
+        crate::core::dm_conversation_key(&account_folded, &target_folded).0
+    };
     let limit = params.limit.unwrap_or(50).min(500);
     let query = match (&params.before, &params.after) {
         (Some(ts), _) => match e6irc_proto::time::parse_server_time_millis(ts) {
@@ -2697,7 +2707,9 @@ async fn history(
         .map(|r| {
             serde_json::json!({
                 "msgid": r.msgid,
-                "time": e6irc_proto::time::server_time(r.ts * 1000),
+                // `HistoryRow::ts` is already milliseconds; scaling it again
+                // put every REST timestamp a thousand-fold into the future.
+                "time": e6irc_proto::time::server_time(r.ts),
                 "from": r.sender_prefix,
                 "kind": r.kind,
                 "body": r.body,
