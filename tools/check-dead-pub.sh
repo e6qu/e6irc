@@ -33,7 +33,36 @@ import re, glob, sys
 files = [f for f in glob.glob("crates/**/src/**/*.rs", recursive=True)
          if "/tests/" not in f]
 texts = {f: open(f, encoding="utf-8", errors="replace").read() for f in files}
-allsrc = "\n".join(texts.values())
+def code_only(text: str) -> str:
+    """Source with comments and string literals blanked out.
+
+    The reference count below is textual, so a name merely *mentioned* in a doc
+    comment (or inside a string) would look like a use and hide a genuinely dead
+    item. Blanking them first means the guard counts calls, not prose.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            j = text.find('\n', i)
+            i = n if j == -1 else j
+        elif c == '/' and i + 1 < n and text[i + 1] == '*':
+            j = text.find('*/', i + 2)
+            i = n if j == -1 else j + 2
+        elif c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+# Definitions and the `dead-pub-allow` marker are read from the original text
+# (the marker lives in a comment); only the reference count uses the stripped
+# form, so prose cannot keep a dead item alive.
+allsrc = "\n".join(code_only(t) for t in texts.values())
 
 # Fully-`pub` item definitions (not pub(crate) — those are the compiler gate's
 # job): fn/struct/enum/const/static/type/trait.

@@ -764,6 +764,40 @@ guard for the next ratchet: the HTTP handlers' authenticate/lookup/problem
 prologues, ChanServ's per-subcommand permission preamble, and the bridge
 drivers' connect-retry loops.
 
+Twenty-seventh sweep — paying back the threshold, and checking the guards
+themselves (2026-07-22): sweep 26 raised the duplication threshold to 4.3% on
+the argument that the old 3% had been measured against a partial scan. That is
+only defensible if the number then comes back down, so this sweep did that
+first: **4.2% → 3.54%**, and the ratchet is set to 3.6%.
+
+Two clusters went. The HTTP handlers each opened with the same eight lines —
+authenticate, return its rejection, re-derive the pool it had already proved
+existed — and four more repeated a ten-line `JsonRejection` match. Both are now
+axum extractors (`Authenticated`, `JsonBody`), so a route is authenticated
+because its *signature* says so, which is also where a reader looks. ChanServ's
+identify → registered → founder preamble became one `chanserv_founder_gate`;
+that one matters beyond tidiness, because a permission check written three
+times can drift, and the copy that drifts is the one that stops refusing.
+
+Two things were deliberately *not* unified. Two routes answer "Invalid request
+body" where the rest say "Invalid JSON", and ChanServ DROP reports "you are not
+the founder" where its siblings would say "not registered". Both are
+user-visible strings; collapsing them would have been a silent behaviour change
+smuggled inside a refactor, so they keep their exact wording and the
+duplication that comes with it.
+
+**The guards were then tested rather than trusted**, prompted by sweep 26's
+finding that jscpd had never opened the four largest files. Three probes:
+a private function used only by an inline `#[cfg(test)]` module (caught), a
+`pub` item reachable only from an integration test (caught by
+`check-dead-pub`, invisible to the compiler as expected), and no benches exist
+to form a third blind spot. The third probe found one: `check-dead-pub` counted
+a name appearing in a *doc comment* as a use, so an item that was never called
+passed as long as something mentioned it in prose. It now strips comments and
+string literals before counting. Both directions were re-verified — the
+`dead-pub-allow` exemption still works (the marker lives in a comment, so
+stripping naively would have broken it), and the real tree is still clean.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

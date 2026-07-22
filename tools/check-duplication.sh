@@ -42,10 +42,11 @@ cd "$(dirname "$0")/.."
 # Ratchet threshold: max duplicated-line percentage (jscpd --mode strict).
 # Lower over time. History: 3.75% → 2.3% (sweep 6, partial scan) → 4.3%
 # (sweep 26: first full scan; see above — the earlier figures omitted the four
-# largest files). Known remaining clusters, in size order: the HTTP handlers'
-# authenticate/lookup/problem prologues, ChanServ's per-subcommand permission
-# preamble, and the bridge drivers' connect-retry loops.
-THRESHOLD=4.3
+# largest files) → 3.6% (sweep 27: the HTTP prologues became extractors and
+# ChanServ's founder gate became one function). Remaining clusters, in size
+# order: the bridge drivers' connect-retry loops, db.rs's per-query row
+# mapping, and the remaining http.rs response-shaping.
+THRESHOLD=3.6
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."

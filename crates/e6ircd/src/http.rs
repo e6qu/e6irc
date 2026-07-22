@@ -502,7 +502,7 @@ mod pages {
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let pool = state.pool.as_ref().expect("authenticate checked the pool");
+        let pool = pool_of(&state);
 
         let networks = match network_views(pool, &account).await {
             Ok(n) => n,
@@ -614,7 +614,7 @@ mod pages {
         let Some(registry) = &state.bnc_registry else {
             return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
         };
-        let pool = state.pool.as_ref().expect("authenticate checked the pool");
+        let pool = pool_of(&state);
         match crate::db::delete_bnc_network(pool, &account, &name).await {
             Ok(true) => registry.remove(Some(&account), &name),
             Ok(false) => return problem(StatusCode::NOT_FOUND, "No such network", None),
@@ -841,13 +841,9 @@ async fn oidc_sso_start(
 /// identity when the provider returns.
 async fn oidc_link_start(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Path(provider_name): Path<String>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     oidc_authorize(&state, &provider_name, Some(account), false).await
 }
 
@@ -1485,6 +1481,59 @@ async fn oidc_frontchannel_logout(
 
 /// The single authentication choke point for the REST API: session
 /// cookie or `Authorization: Bearer` PAT, resolved to an account name.
+/// A JSON body, rejected as a problem document rather than axum's default.
+///
+/// Several routes spelled out the same ten-line match to turn a
+/// `JsonRejection` into `400 Invalid JSON`. As an extractor the conversion
+/// happens once and a handler simply asks for the body it needs.
+pub(crate) struct JsonBody<T>(pub(crate) T);
+
+impl<T, S> axum::extract::FromRequest<S> for JsonBody<T>
+where
+    axum::Json<T>:
+        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(value)) => Ok(JsonBody(value)),
+            Err(e) => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON",
+                Some(&e.to_string()),
+            )),
+        }
+    }
+}
+
+/// An authenticated account, extracted before the handler body runs.
+///
+/// Every authenticated route opened with the same eight lines: call
+/// `authenticate`, return its rejection, then re-derive the pool it had already
+/// proved was there. As an extractor that prologue does not exist to be
+/// repeated — a route is authenticated because it asks for this in its
+/// signature, which is also where a reader looks to find out.
+pub(crate) struct Authenticated(pub(crate) String);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for Authenticated {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        authenticate(state, &parts.headers).await.map(Authenticated)
+    }
+}
+
+/// The pool, once a request has authenticated. `authenticate` fails closed when
+/// no database is configured, so reaching a handler body proves one.
+fn pool_of(state: &AppState) -> &sqlx::PgPool {
+    state.pool.as_ref().expect("authenticate checked the pool")
+}
+
 async fn authenticate(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -1729,7 +1778,7 @@ struct DeviceTokenReq {
 /// Poll for the token. RFC 8628 error codes on the not-yet-ready cases.
 async fn device_token(
     State(state): State<Arc<AppState>>,
-    body: Result<axum::Json<DeviceTokenReq>, axum::extract::rejection::JsonRejection>,
+    JsonBody(req): JsonBody<DeviceTokenReq>,
 ) -> Response {
     let Some(pool) = &state.pool else {
         return problem(
@@ -1737,16 +1786,6 @@ async fn device_token(
             "No database configured",
             None,
         );
-    };
-    let axum::Json(req) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON",
-                Some(&e.to_string()),
-            );
-        }
     };
     let oauth_err = |code: &str| {
         (
@@ -1797,24 +1836,10 @@ struct DeviceApproveReq {
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 async fn device_approve(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    body: Result<axum::Json<DeviceApproveReq>, axum::extract::rejection::JsonRejection>,
+    Authenticated(account): Authenticated,
+    JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let axum::Json(req) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON",
-                Some(&e.to_string()),
-            );
-        }
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     // Normalise: users may type the code lowercase or with a separator.
     let code: String = req
         .user_code
@@ -1859,7 +1884,7 @@ async fn admin_accounts(
     if let Err(response) = require_admin(&state, &headers).await {
         return response;
     }
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_accounts(pool).await {
         Ok(names) => (
             [(header::CONTENT_TYPE, "application/json")],
@@ -1902,7 +1927,7 @@ async fn admin_stats(
     if let Err(response) = require_admin(&state, &headers).await {
         return response;
     }
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::server_stats(pool).await {
         Ok((accounts, channels, server_bans)) => admin_json(serde_json::json!({
             "server": state.server_name,
@@ -1923,7 +1948,7 @@ async fn admin_channels(
     if let Err(response) = require_admin(&state, &headers).await {
         return response;
     }
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_registered_channels(pool).await {
         Ok(rows) => admin_json(serde_json::json!({
             "channels": rows
@@ -1943,7 +1968,7 @@ async fn admin_server_bans(
     if let Err(response) = require_admin(&state, &headers).await {
         return response;
     }
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_server_bans(pool).await {
         Ok(rows) => admin_json(serde_json::json!({
             "bans": rows
@@ -1973,7 +1998,7 @@ async fn admin_audit(
     if let Err(response) = require_admin(&state, &headers).await {
         return response;
     }
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
     match crate::db::list_audit_log(pool, limit).await {
         Ok(rows) => admin_json(serde_json::json!({
@@ -2043,13 +2068,9 @@ struct TokenRequest {
 /// Mint a PAT for the authenticated account (shown once).
 async fn create_api_token(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     let axum::Json(req) = match body {
         Ok(b) => b,
         Err(e) => {
@@ -2060,7 +2081,7 @@ async fn create_api_token(
             );
         }
     };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::issue_api_token(pool, &account, &req.label).await {
         Ok(token) => (
             StatusCode::CREATED,
@@ -2654,7 +2675,7 @@ async fn history(
         Ok(account) => account,
         Err(response) => return response,
     };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     // Authorize the target: without a view of live membership this endpoint
     // must fail closed, so restrict it to channels the account has a
     // registered relationship with (founder or access). Otherwise any account
@@ -2844,6 +2865,7 @@ struct UiParams {
 async fn ws_ui(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Query(params): Query<UiParams>,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -2864,10 +2886,6 @@ async fn ws_ui(
             None,
         );
     }
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
@@ -3082,13 +3100,9 @@ fn render_status_fragment(status: ConnStatus) -> String {
 
 async fn list_credentials(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_credentials(pool, &account).await {
         Ok(rows) => {
             let creds: Vec<serde_json::Value> = rows
@@ -3126,13 +3140,9 @@ async fn list_credentials(
 /// added via `GET /api/v1/auth/oidc/{provider}/link`.
 async fn me_identities(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_oidc_identities(pool, &account).await {
         Ok(rows) => {
             let identities: Vec<serde_json::Value> = rows
@@ -3162,13 +3172,9 @@ async fn me_identities(
 /// point they have read in each target, mirrored from MARKREAD.
 async fn me_read_markers(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_read_markers(pool, &account).await {
         Ok(rows) => {
             let markers: Vec<serde_json::Value> = rows
@@ -3196,13 +3202,9 @@ async fn me_read_markers(
 
 async fn me_tokens_list(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_api_tokens(pool, &account).await {
         Ok(rows) => {
             let tokens: Vec<serde_json::Value> = rows
@@ -3234,14 +3236,10 @@ async fn me_tokens_list(
 /// Revoke one of the authenticated account's PATs by id.
 async fn me_tokens_revoke(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::delete_api_token(pool, &account, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem(StatusCode::NOT_FOUND, "No such token", None),
@@ -3258,14 +3256,10 @@ async fn me_tokens_revoke(
 
 async fn revoke_credential(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::revoke_credential(pool, &account, id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem(StatusCode::NOT_FOUND, "No such credential", None),
@@ -3304,16 +3298,12 @@ struct CreateNetwork {
 /// The account's own networks (metadata only — never the secret).
 async fn list_networks(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::list_bnc_networks(pool, &account).await {
         Ok(rows) => {
             let nets: Vec<serde_json::Value> = rows
@@ -3357,25 +3347,11 @@ async fn list_networks(
 /// driver.
 async fn create_network(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-    body: Result<axum::Json<CreateNetwork>, axum::extract::rejection::JsonRejection>,
+    Authenticated(account): Authenticated,
+    JsonBody(req): JsonBody<CreateNetwork>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-    };
-    let axum::Json(req) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON",
-                Some(&e.to_string()),
-            );
-        }
     };
 
     match create_network_core(&state, registry, &account, &req).await {
@@ -3526,18 +3502,14 @@ struct BufferQuery {
 /// network's driver is currently running.
 async fn network_buffer(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Path(name): Path<String>,
     axum::extract::Query(params): axum::extract::Query<BufferQuery>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     if state.bnc_registry.is_none() {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     }
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     // The network must belong to the caller — no cross-account reads.
     match crate::db::get_bnc_network(pool, &account, &name).await {
         Ok(Some(_)) => {}
@@ -3582,28 +3554,14 @@ struct PatchNetwork {
 /// buffers are untouched — a disabled network can be re-enabled later.
 async fn patch_network(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Path(name): Path<String>,
-    body: Result<axum::Json<PatchNetwork>, axum::extract::rejection::JsonRejection>,
+    JsonBody(req): JsonBody<PatchNetwork>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let axum::Json(req) = match body {
-        Ok(b) => b,
-        Err(e) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid JSON",
-                Some(&e.to_string()),
-            );
-        }
-    };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
 
     // Persist the flag first; a miss means the caller owns no such network.
     match crate::db::set_bnc_network_enabled(pool, &account, &name, req.enabled).await {
@@ -3665,17 +3623,13 @@ async fn patch_network(
 /// Delete one of the caller's networks and stop its driver.
 async fn delete_network(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Path(name): Path<String>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(a) => a,
-        Err(response) => return response,
-    };
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let pool = state.pool.as_ref().expect("authenticate checked the pool");
+    let pool = pool_of(&state);
     match crate::db::delete_bnc_network(pool, &account, &name).await {
         Ok(true) => {
             registry.remove(Some(&account), &name);
