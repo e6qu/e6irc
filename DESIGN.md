@@ -724,7 +724,11 @@ Design constraints recorded now:
   the common "LATEST *" without Postgres; misses fall through to the
   `messages` table. Channels and conversations share one ring store, one LRU
   and one cap, so the overflow and eviction rules cannot drift apart between
-  them. A reply that has to reach Postgres is *deferred*, and the connection's
+  them. A msgid used as a paging pivot is resolved **within the target being
+  paged**: a msgid belonging to some other buffer names a position that does not
+  exist here, so it yields an empty result rather than silently positioning the
+  query from a message the caller may never have been able to see.
+  A reply that has to reach Postgres is *deferred*, and the connection's
   later output is held behind it — replies must reach a client in the order it
   issued the commands, or a client that pipelines CHATHISTORY and PING sees the
   PONG first and concludes the history was empty. Held output carries the same

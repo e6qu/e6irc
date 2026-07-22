@@ -1512,6 +1512,92 @@ async fn query_targets_enumerates_active_buffers() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn msgid_pivot_is_scoped_to_its_own_target() {
+    use e6ircd::core::HistoryQuery;
+    let pool = db::connect_and_migrate(&test_db_url())
+        .await
+        .expect("connect");
+    sqlx::query("TRUNCATE messages, accounts CASCADE")
+        .execute(&pool)
+        .await
+        .expect("clean");
+    // A public channel either side of a message in a private conversation.
+    for (msgid, target, body, ts) in [
+        ("pub-1", "#public", "public one", 1000_i64),
+        ("priv-1", "alice!bob", "SECRET", 1500),
+        ("pub-2", "#public", "public two", 2000),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, $2, 'x!x@h', NULL, 'privmsg', $3,
+                     to_timestamp($4::double precision / 1000))",
+        )
+        .bind(msgid)
+        .bind(target)
+        .bind(body)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+
+    // Paging #public from a msgid that lives in someone else's conversation
+    // must find nothing: that position does not exist in this buffer, and
+    // answering anyway makes any known msgid an oracle for when it was sent.
+    for query in [
+        HistoryQuery::AfterMsgid {
+            msgid: "priv-1".into(),
+            limit: 10,
+        },
+        HistoryQuery::BeforeMsgid {
+            msgid: "priv-1".into(),
+            limit: 10,
+        },
+        HistoryQuery::LatestAfterMsgid {
+            msgid: "priv-1".into(),
+            limit: 10,
+        },
+        HistoryQuery::AroundMsgid {
+            msgid: "priv-1".into(),
+            limit: 10,
+        },
+    ] {
+        let rows = db::query_history(&pool, "#public", query.clone()).await;
+        assert!(
+            rows.is_empty(),
+            "a foreign msgid must not position a query: {query:?} returned {:?}",
+            rows.iter().map(|r| &r.body).collect::<Vec<_>>()
+        );
+    }
+    // A pivot that does belong to the target still works.
+    let rows = db::query_history(
+        &pool,
+        "#public",
+        HistoryQuery::AfterMsgid {
+            msgid: "pub-1".into(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(
+        rows.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(),
+        vec!["public two"]
+    );
+    // And the private conversation still pages from its own msgid.
+    let rows = db::query_history(
+        &pool,
+        "alice!bob",
+        HistoryQuery::BeforeMsgid {
+            msgid: "priv-1".into(),
+            limit: 10,
+        },
+    )
+    .await;
+    assert!(rows.is_empty(), "nothing precedes it in that conversation");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn query_targets_includes_direct_message_correspondents() {
     let pool = db::connect_and_migrate(&test_db_url())
         .await
