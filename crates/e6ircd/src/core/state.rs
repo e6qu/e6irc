@@ -653,15 +653,15 @@ impl ServerState {
         }
     }
 
-    /// Append a message to a channel's hot ring, managing the global
-    /// hot-channel LRU: touches this channel to MRU, evicts the ring of
-    /// the least-recently-active channel once the cap is exceeded. An
-    /// evicted or overflowed ring is marked incomplete so CHATHISTORY
-    /// pages the remainder from Postgres.
-    /// Append to a target's hot ring, creating it if absent, and keep the LRU
-    /// within `max_hot_channels`. One implementation serves channels and
-    /// direct-message conversations alike — the eviction discipline that
-    /// bounds hot-history RAM must not differ by target kind.
+    /// Append to a target's hot ring, creating it if absent, and keep the
+    /// global LRU within `max_hot_channels`: this target is touched to MRU and
+    /// the least-recently-active ring is evicted once the cap is exceeded. An
+    /// evicted or overflowed ring is marked incomplete, so CHATHISTORY pages
+    /// the remainder from Postgres rather than reporting a short history.
+    ///
+    /// One implementation serves channels and direct-message conversations
+    /// alike — the eviction discipline that bounds hot-history RAM must not
+    /// differ by target kind.
     pub fn push_history(&mut self, key: &HistoryKey, entry: HistoryEntry) {
         {
             // A ring being created now is the *entire* record only when no

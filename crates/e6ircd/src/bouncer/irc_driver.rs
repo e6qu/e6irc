@@ -94,8 +94,8 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
     loop {
         tokio::select! {
             // Upstream -> buffer + event.
-            msg = conn.next_message() => match msg {
-                Ok(Some(m)) => {
+            msg = conn.next_message_with_line() => match msg {
+                Ok(Some((m, raw))) => {
                     // Answer PINGs transparently (keepalive is the
                     // driver's job, not the attached client's).
                     if m.command == "PING" {
@@ -103,9 +103,14 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                         let _ = conn.send_line(&format!("PONG :{token}")).await;
                         continue;
                     }
+                    // The upstream's own bytes, not a re-serialization of the
+                    // parse: attached clients and the detached buffer get what
+                    // the network actually sent, tags and all. `attach` strips
+                    // the tags a client did not negotiate.
+                    //
                     // A send with zero subscribers is fine — the driver
                     // is always-on regardless of attach.
-                    ends.emit_line(render(&m));
+                    ends.emit_line(raw);
                 }
                 _ => return super::SessionOutcome::Dropped,
             },
@@ -133,41 +138,4 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     } else {
         Connection::connect(&config.addr).await
     }
-}
-
-/// Reconstruct a wire line from an owned message for the buffer/attach.
-fn render(m: &e6irc_client::OwnedMessage) -> String {
-    let mut out = String::new();
-    // Carry the IRCv3 message tags (server-time/msgid/account) so bouncer
-    // backlog keeps timestamps. `attach` strips tags an attaching client did
-    // not negotiate, so it is safe to store the fully-tagged line here.
-    if !m.tags.is_empty() {
-        out.push('@');
-        for (i, (k, v)) in m.tags.iter().enumerate() {
-            if i > 0 {
-                out.push(';');
-            }
-            out.push_str(k);
-            if let Some(v) = v {
-                out.push('=');
-                out.push_str(&e6irc_proto::message::escape_tag_value(v));
-            }
-        }
-        out.push(' ');
-    }
-    if let Some(src) = &m.source {
-        out.push(':');
-        out.push_str(src);
-        out.push(' ');
-    }
-    out.push_str(&m.command);
-    for (i, p) in m.params.iter().enumerate() {
-        out.push(' ');
-        let last = i == m.params.len() - 1;
-        if last && (p.is_empty() || p.contains(' ') || p.starts_with(':')) {
-            out.push(':');
-        }
-        out.push_str(p);
-    }
-    out
 }

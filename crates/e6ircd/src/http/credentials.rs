@@ -77,6 +77,7 @@ pub(super) async fn create_app_password(
 
 // ---- credential management ----------------------------------------------
 
+/// List the authenticated account's app passwords by id and label.
 pub(super) async fn list_credentials(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
@@ -113,8 +114,6 @@ pub(super) async fn list_credentials(
     }
 }
 
-/// List the authenticated account's personal access tokens (never the
-/// token itself).
 /// List the OIDC identities linked to the caller's account. New ones are
 /// added via `GET /api/v1/auth/oidc/{provider}/link`.
 pub(super) async fn me_identities(
@@ -179,6 +178,8 @@ pub(super) async fn me_read_markers(
     }
 }
 
+/// List the authenticated account's personal access tokens (never the token
+/// itself — only its hash is stored).
 pub(super) async fn me_tokens_list(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
@@ -233,6 +234,7 @@ pub(super) async fn me_tokens_revoke(
     }
 }
 
+/// Revoke one of the authenticated account's app passwords by id.
 pub(super) async fn revoke_credential(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,

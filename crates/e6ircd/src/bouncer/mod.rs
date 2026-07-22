@@ -282,12 +282,6 @@ impl Buffer {
     }
 }
 
-/// Neutralize embedded CR/LF/NUL in a synthesized upstream line before it is
-/// buffered or broadcast to attached clients. A bridge builds lines from
-/// free-form remote text (Discord/Slack/Matrix message bodies); an embedded
-/// newline would otherwise let that text inject a second, forged IRC line
-/// into the client's stream. Real IRC-upstream lines never carry these bytes
-/// (the framing splits on them), so this is a no-op fast path for them.
 /// Reduce an arbitrary upstream display name to a safe IRC nick token for the
 /// source-prefix position: any character that isn't nick-legal becomes `_`, so
 /// a hostile upstream can't smuggle a space or `!@:` into the prefix and forge
@@ -313,6 +307,12 @@ pub(crate) fn nick_token(raw: &str) -> String {
     out
 }
 
+/// Neutralize embedded CR/LF/NUL in a synthesized upstream line before it is
+/// buffered or broadcast to attached clients. A bridge builds lines from
+/// free-form remote text (Discord/Slack/Matrix message bodies); an embedded
+/// newline would otherwise let that text inject a second, forged IRC line into
+/// the client's stream. Real IRC-upstream lines never carry these bytes (the
+/// framing splits on them), so this is a no-op fast path for them.
 fn sanitize_upstream_line(line: String) -> String {
     if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         line.chars()
@@ -418,9 +418,8 @@ impl DriverEnds {
         let _ = self.events.send(DriverEvent::Line(line));
     }
 
-    /// Broadcast a non-line event (Connected/Disconnected), updating the
-    /// sticky connection state so late subscribers can still read it.
-    /// Report a connection-state change. Lines have their own entry point
+    /// Report a connection-state change, updating the sticky connection state
+    /// so late subscribers can still read it. Lines have their own entry point
     /// ([`DriverEnds::emit_line`]) because they need sanitizing and buffering;
     /// see [`ConnectionEvent`].
     pub fn emit(&self, event: ConnectionEvent) {

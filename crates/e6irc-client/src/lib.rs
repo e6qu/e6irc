@@ -116,12 +116,24 @@ impl Connection {
     /// connection closes (`None`). Over-long and malformed lines are
     /// skipped.
     pub async fn next_message(&mut self) -> io::Result<Option<OwnedMessage>> {
+        Ok(self.next_message_with_line().await?.map(|(msg, _)| msg))
+    }
+
+    /// As [`Connection::next_message`], but also returns the line exactly as
+    /// the server sent it (CRLF stripped).
+    ///
+    /// For callers that relay or store what they receive rather than acting on
+    /// it — a bouncer's detached buffer, a logger. Re-serializing the parsed
+    /// message would be a second implementation of the wire format kept in step
+    /// with `Message::to_line` by hand, and it cannot be more faithful than the
+    /// bytes that arrived.
+    pub async fn next_message_with_line(&mut self) -> io::Result<Option<(OwnedMessage, String)>> {
         loop {
             while let Some(line) = self.pending.pop_front() {
                 if let Ok(text) = std::str::from_utf8(&line)
                     && let Ok(msg) = Message::parse(text)
                 {
-                    return Ok(Some(OwnedMessage::from(&msg)));
+                    return Ok(Some((OwnedMessage::from(&msg), text.to_string())));
                 }
             }
             let n = self.reader.read(&mut self.read_buf).await?;

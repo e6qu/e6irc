@@ -2367,3 +2367,41 @@ async fn device_grants_are_pruned_on_create() {
         .expect("count");
     assert_eq!(total, 1, "only the fresh grant should remain");
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_buffer_trim_is_scoped_to_one_network() {
+    // An upstream decides how many lines arrive, so an untrimmed network grows
+    // the table until the disk is full. Two networks here because the trim must
+    // bound the one it is asked about and leave the other's backlog alone.
+    let url = support::test_db("bnc_buffer_trim_is_scoped_to_one_network").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+
+    let count = async |network: &str| -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM bnc_buffer WHERE owner = 'owner' AND network = $1")
+            .bind(network)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+    };
+
+    for i in 0..6_000 {
+        for network in ["alpha", "beta"] {
+            db::persist_bnc_line(&pool, "owner", network, &format!("line {i}"))
+                .await
+                .expect("persist");
+        }
+    }
+    db::trim_bnc_buffer(&pool, "owner", "alpha")
+        .await
+        .expect("trim");
+
+    assert_eq!(count("alpha").await, 5_000, "alpha trimmed to the cap");
+    assert_eq!(count("beta").await, 6_000, "beta untouched");
+    // The newest lines are what survive — a trim that kept the oldest would
+    // leave the buffer bounded and useless.
+    let kept = db::recent_bnc_lines(&pool, "owner", "alpha", 1)
+        .await
+        .expect("read");
+    assert_eq!(kept, vec!["line 5999"]);
+}
