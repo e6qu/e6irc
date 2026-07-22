@@ -544,7 +544,10 @@ Principal tables (columns abridged):
   matching the registry key. Both ways into a network's buffer — a live line
   from a driver and restored backlog from this table — neutralize embedded
   CR/LF/NUL, so a line replayed to an attaching client cannot become two
-  regardless of which path it arrived through or which build wrote it.
+  regardless of which path it arrived through or which build wrote it, and a
+  bridge-synthesized line is split to fit `MAX_LINE_LEN` — an over-long line is
+  discarded whole by the receiving client's framing, so emitting one loses the
+  message silently.
   Retention is per (owner, network): the persistence task counts its own
   appends and trims to the newest `BNC_BUFFER_CAP` at every
   `BNC_TRIM_INTERVAL`. The count belongs to that task, not to the table's `id`

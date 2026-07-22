@@ -235,7 +235,11 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                             continue;
                         }
                         if let Some(channel) = id_to_channel.get(&channel_id) {
-                            ends.emit_line(render_privmsg(&author, channel, &content));
+                            for line in super::render_bridged_privmsg(
+                                "discord", &author, channel, &content,
+                            ) {
+                                ends.emit_line(line);
+                            }
                         }
                     }
                     Event::Hello(_) | Event::Ack | Event::Ignore => {}
@@ -254,8 +258,8 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         }
                     }
                     super::RouteResult::Unmapped(target) => {
-                        ends.emit_line(format!(
-                            ":*bnc* NOTICE {target} :not delivered: no bridged Discord channel for {target}"
+                        ends.emit_line(super::unmapped_target_notice(
+                            "Discord", "channel", &target,
                         ));
                     }
                     super::RouteResult::Ignore => {}
@@ -315,14 +319,6 @@ fn parse_frame(text: &str) -> Frame {
         _ => Event::Ignore,
     };
     Frame { seq, event }
-}
-
-/// A Discord message author + channel + text, rendered as an IRC line.
-fn render_privmsg(author: &str, channel: &str, content: &str) -> String {
-    // The author name is hostile-upstream input; reduce it to a safe nick token
-    // so it can't forge a source/command in the prefix position.
-    let nick = super::nick_token(author);
-    format!(":{nick}!{nick}@discord PRIVMSG {channel} :{content}")
 }
 
 async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {
@@ -438,8 +434,8 @@ mod tests {
     #[test]
     fn renders_and_routes() {
         assert_eq!(
-            render_privmsg("alice", "#general", "hi there"),
-            ":alice!alice@discord PRIVMSG #general :hi there"
+            crate::bouncer::render_bridged_privmsg("discord", "alice", "#general", "hi there"),
+            vec![":alice!alice@discord PRIVMSG #general :hi there"]
         );
         let mut map = HashMap::new();
         map.insert("#general".to_string(), "42".to_string());

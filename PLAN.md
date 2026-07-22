@@ -1003,6 +1003,50 @@ one where a function's doc had migrated onto the *next* item, leaving
 for doc blocks with two item-introducing openings, which turned up the two I had
 missed. The scan is clean now.
 
+Thirty-third sweep — a bridged message must not vanish for being long
+(2026-07-22): the Discord/Slack/Matrix bridges turn free-form remote text into
+IRC lines delivered to real users. Sweep 32 fixed what the IRC driver did with
+an upstream's bytes; these three synthesize their own.
+
+**Long messages were silently lost.** Each bridge built one
+`:{nick}!{nick}@{host} PRIVMSG {channel} :{body}` line, and the body is
+whatever the platform allows — 4,000 characters on Discord, 40,000 on Slack —
+against an IRC line limit of 512. That is not a protocol nicety: the receiving
+client's framing discards an over-long line *whole* (`LineEvent::TooLong`), so
+the message arrives as nothing at all, with nothing said about it. The body is
+now split across as many PRIVMSGs as it needs.
+
+Embedded newlines split too. They are line breaks in the source medium, and
+`sanitize_upstream_line` flattens them to spaces further down, so a multi-line
+message used to arrive as one run-on line.
+
+The split is by bytes against a byte budget, so it lands on character
+boundaries — a test with 2-, 3- and 4-byte characters confirms it, and fails
+with a panic (`byte index is not a char boundary`) if the boundary walk is
+removed. That is the third time this repo has met that exact bug; here it was
+written correctly the first time *because* it is the third time.
+
+**The notice that exists to prevent a silent drop was silently dropped.** When
+a client sends to an unbridged target, the bridge answers `:*bnc* NOTICE
+{target} :not delivered: no bridged … for {target}`. `target` comes from the
+client's own line, bounded only by the frame limit — several times 512 — and it
+is interpolated twice. A long enough target produced a notice the client's own
+framing discarded, and the silence the notice exists to prevent came back. It
+is truncated to fit, on a character boundary.
+
+**One renderer, not three.** The three `render_privmsg` copies differed only by
+the `@host` suffix; Matrix additionally reduced `@user:server` to its localpart
+first. Collapsing them nearly dropped that step — which would have renamed
+every bridged Matrix nick — so it survives as `matrix_localpart`, named for what
+it does and applied at the call site.
+
+**Boy-scout: CI never compiled a bridge on its own.** `--all-features` is the
+union, so `cfg(feature = "discord")` code that leans on something `matrix`
+pulls in builds in CI and breaks for the deployment that enables one bridge.
+The lint job now checks each of the three separately. This sweep proved the gap
+was real from the other side: a four-config local check missed two bridge test
+modules that `--all-features` caught immediately.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
