@@ -242,6 +242,10 @@ fn spawn_persistence(
         {
             handle.preload_front(lines);
         }
+        // This task is the only writer for this network, so counting its own
+        // appends is what makes the amortized trim reach every network — see
+        // `db::BNC_TRIM_INTERVAL`.
+        let mut since_trim = 0u64;
         loop {
             match events.recv().await {
                 Ok(DriverEvent::Line(line)) => {
@@ -249,6 +253,16 @@ fn spawn_persistence(
                         crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
                     {
                         eprintln!("bnc: buffer persist failed for {owner_key}/{network}: {e}");
+                        continue;
+                    }
+                    since_trim += 1;
+                    if since_trim >= crate::db::BNC_TRIM_INTERVAL {
+                        since_trim = 0;
+                        if let Err(e) =
+                            crate::db::trim_bnc_buffer(&pool, &owner_key, &network).await
+                        {
+                            eprintln!("bnc: buffer trim failed for {owner_key}/{network}: {e}");
+                        }
                     }
                 }
                 Ok(_) => {}

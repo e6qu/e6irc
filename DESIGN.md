@@ -544,7 +544,12 @@ Principal tables (columns abridged):
   matching the registry key. Both ways into a network's buffer — a live line
   from a driver and restored backlog from this table — neutralize embedded
   CR/LF/NUL, so a line replayed to an attaching client cannot become two
-  regardless of which path it arrived through or which build wrote it
+  regardless of which path it arrived through or which build wrote it.
+  Retention is per (owner, network): the persistence task counts its own
+  appends and trims to the newest `BNC_BUFFER_CAP` at every
+  `BNC_TRIM_INTERVAL`. The count belongs to that task, not to the table's `id`
+  sequence — one sequence is shared by every network, so triggering off it
+  makes retention depend on the interleaving between them
 - `read_markers` (account_id, target, marker_ts) — per-account read
   position, the source for `draft/read-marker`
 - `audit_log` (oper/admin actions, API mutations)

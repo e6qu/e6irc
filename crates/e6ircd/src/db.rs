@@ -1595,46 +1595,57 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
     Ok(res.rows_affected() > 0)
 }
 
-/// Append one upstream line to a network's persisted buffer.
 /// Rows to retain per (owner, network) in `bnc_buffer`. Only the newest are
 /// ever replayed (see `PRELOAD_LIMIT`); the rest are dead weight.
 const BNC_BUFFER_CAP: i64 = 5000;
 
+/// Lines one network may append before [`trim_bnc_buffer`] is due for it.
+///
+/// The trim is amortized rather than run per insert, and the count belongs to
+/// the caller — there is one persistence task per network, so each network
+/// reaches the interval on its own traffic. Keying it off the table's `id`
+/// instead does not work, however cheap it looks: `id` is a single sequence
+/// shared by every network, so which network gets trimmed depends on the
+/// interleaving. Two networks alternating is enough for one of them to never
+/// land on a multiple of the interval and never be trimmed at all.
+pub const BNC_TRIM_INTERVAL: u64 = 1000;
+
+/// Append one upstream line to a network's persisted buffer.
 pub async fn persist_bnc_line(
     pool: &PgPool,
     owner: &str,
     network: &str,
     line: &str,
 ) -> Result<(), DbError> {
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO bnc_buffer (owner, network, line) VALUES ($1, $2, $3) RETURNING id",
-    )
-    .bind(owner)
-    .bind(network)
-    .bind(line)
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
-    // Amortized trim (~0.1% of inserts): keep only the newest BNC_BUFFER_CAP
-    // lines per network so an always-on network can't grow the table forever.
-    if id % 1000 == 0 {
-        sqlx::query(
-            "DELETE FROM bnc_buffer
-             WHERE owner = $1 AND network = $2 AND id < (
-                 SELECT min(id) FROM (
-                     SELECT id FROM bnc_buffer
-                     WHERE owner = $1 AND network = $2
-                     ORDER BY id DESC LIMIT $3
-                 ) keep
-             )",
-        )
+    sqlx::query("INSERT INTO bnc_buffer (owner, network, line) VALUES ($1, $2, $3)")
         .bind(owner)
         .bind(network)
-        .bind(BNC_BUFFER_CAP)
+        .bind(line)
         .execute(pool)
         .await
         .map_err(DbError::Query)?;
-    }
+    Ok(())
+}
+
+/// Drop all but the newest [`BNC_BUFFER_CAP`] lines of one network's buffer,
+/// so an always-on network cannot grow the table forever.
+pub async fn trim_bnc_buffer(pool: &PgPool, owner: &str, network: &str) -> Result<(), DbError> {
+    sqlx::query(
+        "DELETE FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND id < (
+             SELECT min(id) FROM (
+                 SELECT id FROM bnc_buffer
+                 WHERE owner = $1 AND network = $2
+                 ORDER BY id DESC LIMIT $3
+             ) keep
+         )",
+    )
+    .bind(owner)
+    .bind(network)
+    .bind(BNC_BUFFER_CAP)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
     Ok(())
 }
 

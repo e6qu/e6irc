@@ -622,3 +622,155 @@ async fn local_driver_presents_the_in_process_network() {
         "local network did not relay in-process channel traffic"
     );
 }
+
+/// The persistence task must actually reach the trim. Driven through the real
+/// task rather than by calling the database functions directly, because that is
+/// the part a regression would break: whether every network is *reached* is now
+/// structural (each task counts its own appends, so there is no interleaving
+/// left to get wrong), but whether the counter is consulted at all is not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn persisted_bnc_buffer_is_trimmed_by_its_own_traffic() {
+    let url = bnc_account_db(
+        "persisted_bnc_buffer_is_trimmed_by_its_own_traffic",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .expect("peer connect");
+    peer.register("uppeer", "peer")
+        .await
+        .expect("peer register");
+    peer.send_line("JOIN #lobby").await.expect("join");
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+
+    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let rows = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM bnc_buffer WHERE owner = 'alice' AND network = 'up'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+
+    // Enough traffic to cross the retention cap and reach a trim beyond it.
+    // Sent in paced batches: the persistence task reads from a bounded
+    // broadcast, so an unpaced flood makes it lag and drop lines (it says so on
+    // stderr) and the test would measure the lag rather than the trim.
+    let target = 5_000 + 2 * e6ircd::db::BNC_TRIM_INTERVAL as i64 + 100;
+    let mut sent = 0i64;
+    while sent < target {
+        for i in 0..250 {
+            peer.send_line(&format!("PRIVMSG #lobby :line {}", sent + i))
+                .await
+                .expect("send");
+        }
+        sent += 250;
+        // Let persistence catch up before sending more.
+        let want = sent.min(5_000);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while rows().await < want {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("persistence fell behind at {sent} lines"));
+    }
+
+    // Everything is sent; wait for the count to stop moving before asserting.
+    // Sampling while it is still climbing would pass on a buffer that is merely
+    // *passing through* the bound on its way past it — which is exactly what an
+    // earlier version of this test did, and it stayed green with the trim
+    // disabled.
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut last = -1i64;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let n = rows().await;
+            if n == last {
+                return n;
+            }
+            last = n;
+        }
+    })
+    .await
+    .expect("the persisted buffer never stopped growing");
+    let bound = 5_000 + e6ircd::db::BNC_TRIM_INTERVAL as i64;
+    assert!(
+        settled > 5_000 - e6ircd::db::BNC_TRIM_INTERVAL as i64 && settled <= bound,
+        "settled at {settled} rows, outside the retained window"
+    );
+    drop(running);
+}
+
+/// The detached buffer must hold what the upstream actually sent. The driver
+/// used to re-serialize its own parse of each line, which is a second
+/// implementation of the wire format: a single-word trailing parameter came
+/// back without its `:`, because a re-serializer only adds one when it has to.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn buffered_upstream_lines_keep_their_wire_form() {
+    let url = bnc_account_db(
+        "buffered_upstream_lines_keep_their_wire_form",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url.clone()))
+        .await
+        .expect("start");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .expect("peer connect");
+    peer.register("uppeer", "peer")
+        .await
+        .expect("peer register");
+    peer.send_line("JOIN #lobby").await.expect("join");
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    // A single word as the trailing parameter: legal either way on the wire,
+    // and exactly where a re-serializer diverges from the sender.
+    peer.send_line("PRIVMSG #lobby :hi").await.expect("send");
+
+    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let line = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let lines = e6ircd::db::recent_bnc_lines(&pool, "alice", "up", 100)
+                .await
+                .expect("read");
+            if let Some(l) = lines.iter().find(|l| l.contains("PRIVMSG #lobby")) {
+                return l.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the line was never buffered");
+    assert!(
+        line.ends_with(" :hi"),
+        "buffered {line:?}; the trailing colon the upstream sent was lost"
+    );
+    drop(running);
+}

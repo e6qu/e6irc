@@ -957,6 +957,52 @@ somewhere else later.
 Also removed: a `sed 's/127.0.0.1:15556/127.0.0.1:15556/'` in the CI dex setup,
 which substituted a string with itself.
 
+Thirty-second sweep — the bouncer as somebody else's client (2026-07-22):
+sweep 31 audited the shipped clients against hostile servers. The daemon is a
+client too: the BNC driver holds a persistent connection to an upstream network
+this project does not run, and everything that arrives on it is stored and
+replayed to real users.
+
+**A retention trim that reached almost no network.** `persist_bnc_line` kept the
+`bnc_buffer` table bounded by trimming on an amortized schedule — `if id % 1000
+== 0`, where `id` is the table's own sequence. But that sequence is shared by
+every network, so *which* network gets trimmed depends on how their inserts
+interleave. Two networks alternating is enough: one takes the even ids, the
+other the odd, and multiples of 1000 are always even. A test with two networks
+each appending 7,000 lines found one of them holding all 7,000 — never trimmed
+once, growing until the disk is full, at a rate an upstream chooses.
+
+The count now lives in the per-network persistence task, which is the only
+writer for its network. That is not just a fix but the shape that makes the bug
+unrepresentable: there is no longer an interleaving for the trigger to depend
+on. `trim_bnc_buffer` is its own function and the caller decides when it is due.
+
+The end-to-end test for it needed two tries. The first waited for the row count
+to fall inside the retention window — and passed with the trim disabled,
+because an untrimmed buffer *passes through* that window on its way past it. It
+now waits for the count to stop moving and asserts where it came to rest.
+
+**The buffer held a re-serialization, not what arrived.** The driver parsed
+each upstream line and rebuilt a wire line from the parse, with a hand-written
+serializer that skipped every check `Message::to_line` performs — no command,
+tag-key, source or parameter validation, and no rejection of a non-final
+parameter containing a space. It was a second implementation of the wire format,
+and the unsafe one.
+
+It is also unnecessary: the client had the original bytes and discarded them.
+`Connection::next_message_with_line` now hands them back, the driver buffers
+those, and the serializer is deleted. Higher fidelity, not just less code — a
+single-word trailing parameter came back without its `:`, because a
+re-serializer only adds one when it must. That is what the new test pins, and
+it fails against the deleted code.
+
+**Boy-scout: five orphaned doc comments.** Refactors that moved or merged
+functions left the old doc paragraph stacked on top of the new one — including
+one where a function's doc had migrated onto the *next* item, leaving
+`me_tokens_list` undocumented. Found by reading, then generalized into a scan
+for doc blocks with two item-introducing openings, which turned up the two I had
+missed. The scan is clean now.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
