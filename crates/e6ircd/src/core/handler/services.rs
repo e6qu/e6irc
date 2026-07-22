@@ -298,6 +298,42 @@ pub(super) fn apply_flag_changes(current: &str, changes: &str) -> String {
 /// ChanServ FLAGS: list a registered channel's access entries, or (founder
 /// only) modify one account's flags. Auto-op/voice apply on the account's
 /// next join.
+/// The gate every founder-only ChanServ subcommand applies: the caller must be
+/// identified, the channel registered, and the caller its founder. Returns the
+/// channel key and the account, or `None` once the caller has been told why not.
+///
+/// Written once because it is a permission check. Three copies can drift, and
+/// the copy that drifts is the one that stops refusing.
+fn chanserv_founder_gate(
+    state: &mut ServerState,
+    conn: ConnId,
+    channel: &str,
+    identify_hint: &str,
+) -> Option<(ChanKey, String)> {
+    let Some(account) = state.sessions[&conn].account.clone() else {
+        state.service_notice(conn, "ChanServ", identify_hint);
+        return None;
+    };
+    let key = state.chan_key(channel);
+    if !state.is_registered(&key) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{channel}\x02 is not registered."),
+        );
+        return None;
+    }
+    if !state.is_founder(&key, &account) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("You are not the founder of \x02{channel}\x02."),
+        );
+        return None;
+    }
+    Some((key, account))
+}
+
 pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {
     let Some(&channel) = args.first() else {
         state.service_notice(
@@ -307,31 +343,14 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         );
         return;
     };
-    let Some(account) = state.sessions[&conn].account.clone() else {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            "You must identify to services before using FLAGS.",
-        );
+    let Some((key, _account)) = chanserv_founder_gate(
+        state,
+        conn,
+        channel,
+        "You must identify to services before using FLAGS.",
+    ) else {
         return;
     };
-    let key = state.chan_key(channel);
-    if !state.is_registered(&key) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{channel}\x02 is not registered."),
-        );
-        return;
-    }
-    if !state.is_founder(&key, &account) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("You are not the founder of \x02{channel}\x02."),
-        );
-        return;
-    }
 
     // LIST when no account is given.
     if args.len() == 1 {
@@ -509,31 +528,14 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
         state.service_notice(conn, "ChanServ", "Syntax: SET <#channel> <option> <value>");
         return;
     };
-    let Some(account) = state.sessions[&conn].account.clone() else {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            "You must identify to services before using SET.",
-        );
+    let Some((key, _account)) = chanserv_founder_gate(
+        state,
+        conn,
+        channel,
+        "You must identify to services before using SET.",
+    ) else {
         return;
     };
-    let key = state.chan_key(channel);
-    if !state.is_registered(&key) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{channel}\x02 is not registered."),
-        );
-        return;
-    }
-    if !state.is_founder(&key, &account) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("You are not the founder of \x02{channel}\x02."),
-        );
-        return;
-    }
     match option.to_ascii_uppercase().as_str() {
         "FOUNDER" => {
             let Some(&new) = args.get(2) else {
