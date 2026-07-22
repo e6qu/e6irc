@@ -22,7 +22,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Ws;
 
-use super::{DriverEnds, DriverEvent, NetworkDriver, NetworkHandle};
+use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
 
 /// Default Discord REST base; overridable via config `addr` for a custom
 /// or self-hosted API-compatible endpoint.
@@ -83,7 +83,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
-                ends.emit(DriverEvent::Disconnected);
+                ends.emit(ConnectionEvent::Disconnected);
                 backoff.wait(started.elapsed()).await;
             }
         }
@@ -177,7 +177,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     if write.send(Ws::text(identify.to_string())).await.is_err() {
         return Dropped;
     }
-    ends.emit(DriverEvent::Connected);
+    ends.emit(ConnectionEvent::Connected);
 
     let mut heartbeat = tokio::time::interval(Duration::from_millis(hb_interval.max(1000)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

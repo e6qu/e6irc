@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use super::{DriverEnds, DriverEvent, NetworkDriver, NetworkHandle};
+use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
 
 /// Static configuration for one bridged Matrix homeserver.
 #[derive(Debug, Clone)]
@@ -70,7 +70,7 @@ async fn run(config: MatrixConfig, mut ends: DriverEnds) {
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
-                ends.emit(DriverEvent::Disconnected);
+                ends.emit(ConnectionEvent::Disconnected);
                 backoff.wait(started.elapsed()).await;
             }
         }
@@ -85,7 +85,7 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
             return super::SessionOutcome::Dropped;
         }
     };
-    ends.emit(DriverEvent::Connected);
+    ends.emit(ConnectionEvent::Connected);
 
     // Initial sync to get a stream position without replaying all history.
     let mut since = match sync(&session, None).await {

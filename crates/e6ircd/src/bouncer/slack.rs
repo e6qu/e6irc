@@ -21,7 +21,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Ws;
 
-use super::{DriverEnds, DriverEvent, NetworkDriver, NetworkHandle};
+use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
 
 /// Default Slack Web API base; overridable via config `addr`.
 const DEFAULT_API: &str = "https://slack.com/api";
@@ -80,7 +80,7 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
         match session_once(&config, &mut ends).await {
             super::SessionOutcome::Stopped => return,
             super::SessionOutcome::Dropped => {
-                ends.emit(DriverEvent::Disconnected);
+                ends.emit(ConnectionEvent::Disconnected);
                 backoff.wait(started.elapsed()).await;
             }
         }
@@ -144,7 +144,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         }
     };
     let (mut write, mut read) = ws.split();
-    ends.emit(DriverEvent::Connected);
+    ends.emit(ConnectionEvent::Connected);
 
     // Slack sends pings and disconnect envelopes regularly; no data for well
     // over a minute means the socket is black-holed — reconnect, don't hang.
