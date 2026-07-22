@@ -284,6 +284,9 @@ strip = "symbols"
   several interleaved and adds the events no client sends (the liveness tick,
   deferred database pages). A panic there takes the single worker down for
   every client, so "survives whatever a client sends" is the whole oracle.
+  `client_messages` runs the other direction — it feeds the shipped TUI
+  arbitrary *server* output, because a client's state is derived from lines a
+  remote server chose and that server need not be this one.
 
 ### 7.2 Connection lifecycle
 
@@ -846,6 +849,18 @@ web client, chathistory infinite scroll, SASL PLAIN + device-flow login.
 It is a *general* IRCv3 client (works against Libera directly too) — which
 doubles as a continuous test of our client library against the compat
 target.
+
+### 14.3 A client's input is untrusted too
+
+Every clause of §7.2's bounded-buffer rule applies here in reverse. A client's
+state — buffers, scrollback, the queue between the socket and the renderer — is
+derived from lines a *remote server* chose, and a general IRCv3 client connects
+to servers this project does not run. So the same rule holds: scrollback and
+buffer count are capped, the socket→render queue is bounded (a full queue stops
+the reader and lets TCP push back, exactly as SendQ does outbound), and the
+`e6irc api` response read is bounded with an error rather than a truncation.
+Hitting a cap is reported to the user, once — a silent cap reads as the network
+going quiet, which is the client-side form of a silent no-op (§2).
 
 ---
 

@@ -35,7 +35,19 @@ impl Buffer {
 
     fn push(&mut self, line: LogLine) {
         self.log.push(line);
-        // Keep a scrolled-back view stable when a live line arrives.
+        // Scrollback is bounded: every line here came from the server, so an
+        // unbounded log is a remote party deciding how much memory this client
+        // uses. Oldest lines go first, which is what a scrollback is.
+        if self.log.len() > SCROLLBACK_LINES {
+            let excess = self.log.len() - SCROLLBACK_LINES;
+            self.log.drain(..excess);
+            // `scroll` is an offset from the *end*, so dropping lines off the
+            // front does not move the view and must not adjust it. Only the
+            // push below did, and that is what the fixup accounts for.
+        }
+        // Keep a scrolled-back view stable when a live line arrives. Once the
+        // log is at its cap this eventually clamps: the lines being read have
+        // been dropped, so the view holds at the oldest one still kept.
         if self.scroll > 0 {
             self.scroll = (self.scroll + 1).min(self.log.len().saturating_sub(1));
         }
@@ -61,12 +73,21 @@ impl Buffer {
     }
 }
 
+/// Lines of scrollback kept per buffer. Older lines are dropped.
+const SCROLLBACK_LINES: usize = 5_000;
+
+/// Buffers a client will open. Names arrive from the server, so this bounds
+/// what a remote party can make the client allocate.
+const MAX_BUFFERS: usize = 256;
+
 pub struct App {
     pub nick: String,
     pub buffers: Vec<Buffer>,
     pub current: usize,
     pub input: String,
     pub should_quit: bool,
+    /// The buffer cap has been reported to the user; say it once, not per line.
+    buffer_limit_reported: bool,
 }
 
 /// A command the UI wants the network layer to perform.
@@ -85,6 +106,7 @@ impl App {
             current: 0,
             input: String::new(),
             should_quit: false,
+            buffer_limit_reported: false,
         }
     }
 
@@ -102,13 +124,22 @@ impl App {
     }
 
     /// Open a buffer (or focus it if already open) and return its index.
-    fn open_buffer(&mut self, name: String) -> usize {
+    /// The buffer for `name`, opening one if this is the first we have seen of
+    /// it. `None` once [`MAX_BUFFERS`] are open.
+    ///
+    /// Bounded for the same reason as the scrollback: the names come from the
+    /// server, so without a cap a remote party can make this client allocate a
+    /// buffer per message. Hitting the cap is reported once in the current
+    /// buffer rather than dropping the message without a word.
+    fn open_buffer(&mut self, name: String) -> Option<usize> {
         if let Some(i) = self.buffer_index(&name) {
-            i
-        } else {
-            self.buffers.push(Buffer::new(name));
-            self.buffers.len() - 1
+            return Some(i);
         }
+        if self.buffers.len() >= MAX_BUFFERS {
+            return None;
+        }
+        self.buffers.push(Buffer::new(name));
+        Some(self.buffers.len() - 1)
     }
 
     pub fn next_buffer(&mut self) {
@@ -152,12 +183,18 @@ impl App {
                 } else {
                     target
                 };
-                let idx = self.open_buffer(buffer);
+                let Some(idx) = self.open_buffer(buffer) else {
+                    self.note_buffer_limit();
+                    return;
+                };
                 self.buffers[idx].push(LogLine { from: sender, text });
             }
             "JOIN" => {
                 if let Some(chan) = msg.params.first().cloned() {
-                    let idx = self.open_buffer(chan);
+                    let Some(idx) = self.open_buffer(chan) else {
+                        self.note_buffer_limit();
+                        return;
+                    };
                     self.buffers[idx].push(LogLine {
                         from: "*".into(),
                         text: format!("{sender} joined"),
@@ -185,6 +222,19 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Say once that the buffer limit stopped a new buffer from opening. Said
+    /// once rather than per message, because the condition that triggers it is
+    /// exactly the one that would flood the notice.
+    fn note_buffer_limit(&mut self) {
+        if self.buffer_limit_reported {
+            return;
+        }
+        self.buffer_limit_reported = true;
+        self.status(format!(
+            "not opening more than {MAX_BUFFERS} buffers; further new targets are ignored"
+        ));
     }
 
     /// Note a local status line in the current buffer.
@@ -217,7 +267,14 @@ impl App {
         }
         if let Some(chan) = line.strip_prefix("/join ").map(str::trim) {
             if !chan.is_empty() {
-                self.current = self.open_buffer(chan.to_string());
+                // The user's own /join is refused the same way as a
+                // server-driven one, but it is worth saying so: silently not
+                // switching would look like the command did nothing.
+                let Some(idx) = self.open_buffer(chan.to_string()) else {
+                    self.note_buffer_limit();
+                    return Action::None;
+                };
+                self.current = idx;
                 return Action::Send(format!("JOIN {chan}"));
             }
             return Action::None;
@@ -245,24 +302,72 @@ mod tests {
     use super::*;
 
     fn msg(raw: &str) -> OwnedMessage {
-        let parsed = e6irc_proto::message::Message::parse(raw).unwrap();
-        OwnedMessage {
-            tags: vec![],
-            source: parsed.source.as_ref().map(|s| {
-                let mut o = s.name.to_string();
-                if let Some(u) = s.user {
-                    o.push('!');
-                    o.push_str(u);
-                }
-                if let Some(h) = s.host {
-                    o.push('@');
-                    o.push_str(h);
-                }
-                o
-            }),
-            command: parsed.command.to_string(),
-            params: parsed.params.iter().map(|p| p.to_string()).collect(),
+        OwnedMessage::from(&e6irc_proto::message::Message::parse(raw).expect("valid line"))
+    }
+
+    /// Every line below arrives from the server, so the memory the client
+    /// spends on them must not be the server's decision.
+    #[test]
+    fn scrollback_is_bounded() {
+        let mut app = App::new("#home".into(), "me".into());
+        for i in 0..SCROLLBACK_LINES + 500 {
+            app.on_message(&msg(&format!(":a!u@h PRIVMSG #c :line {i}")));
         }
+        let buf = &app.buffers[app.buffer_index("#c").expect("channel buffer")];
+        assert_eq!(buf.log.len(), SCROLLBACK_LINES);
+        // The oldest lines went, not the newest: a scrollback that dropped the
+        // live tail would be worse than one that grew.
+        assert!(buf.log.last().expect("a line").text.ends_with("line 5499"));
+        assert!(buf.log.first().expect("a line").text.ends_with("line 500"));
+    }
+
+    #[test]
+    fn scrolled_view_survives_the_drop() {
+        // Scrolled back into history while the log is trimmed from the front:
+        // `scroll` counts from the end, so it must shrink with the drain or it
+        // would silently walk off into lines that no longer exist.
+        let mut app = App::new("#home".into(), "me".into());
+        for i in 0..SCROLLBACK_LINES {
+            app.on_message(&msg(&format!(":a!u@h PRIVMSG #c :line {i}")));
+        }
+        let idx = app.buffer_index("#c").expect("channel buffer");
+        app.current = idx;
+        app.scroll_up(10);
+        let before: Vec<String> = app.buffers[idx]
+            .visible(5)
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        // Now push past the cap, so every new line drains one from the front.
+        for i in 0..50 {
+            app.on_message(&msg(&format!(":a!u@h PRIVMSG #c :more {i}")));
+        }
+        let buf = &app.buffers[idx];
+        let after: Vec<String> = buf.visible(5).iter().map(|l| l.text.clone()).collect();
+        // The user is looking at the same lines. Without the `scroll` fixup the
+        // drain would slide the viewport forward by one line per arrival.
+        assert_eq!(before, after);
+        // And a legal window at every height, including past the end.
+        for h in [0usize, 1, 10, 100_000] {
+            let _ = buf.visible(h);
+        }
+    }
+
+    #[test]
+    fn buffer_count_is_bounded_and_says_so() {
+        let mut app = App::new("#home".into(), "me".into());
+        for i in 0..MAX_BUFFERS + 100 {
+            app.on_message(&msg(&format!(":a!u@h PRIVMSG #c{i} :hi")));
+        }
+        assert_eq!(app.buffers.len(), MAX_BUFFERS);
+        // Refused, not silently: the user is told once that targets are being
+        // dropped. A silent cap would look like the network went quiet.
+        let said = app.buffers[0]
+            .log
+            .iter()
+            .filter(|l| l.text.contains("not opening more than"))
+            .count();
+        assert_eq!(said, 1, "the limit is reported exactly once");
     }
 
     #[test]

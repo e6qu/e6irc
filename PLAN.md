@@ -881,6 +881,56 @@ Those are plumbing rather than a shared concept, so the guard now records that
 the number is expected to sit here — and that it should be lowered when a real
 abstraction is found, not by wrapping boilerplate to move a metric.
 
+Thirty-first sweep — the client bounds nothing (2026-07-22): every previous
+sweep audited what a hostile *client* can do to the server. The clients ship
+from this repository too, and they face the opposite direction: a client's
+entire state is derived from lines a remote server chose to send, and that
+server is not necessarily this one — it may be hostile, buggy, or a bridge
+relaying somebody else's text.
+
+Reading them against the daemon's own rules found the daemon's care simply
+absent. The daemon bounds everything — SendQ, history rings, held output — and
+its own client bounded nothing:
+
+- `Buffer::push` grew the scrollback forever. Now capped at `SCROLLBACK_LINES`,
+  oldest first.
+- `App::open_buffer` allocated a buffer per distinct target, so a server
+  sending `PRIVMSG #a1`, `#a2`, … forever allocated forever. Capped at
+  `MAX_BUFFERS`, and the cap is *reported* — once, since the condition that
+  triggers it is exactly the one that would flood the notice. A silent cap
+  would read as the network going quiet.
+- The TUI's network event channel was unbounded, filled by the server and
+  drained only between draws. Now bounded, so a full queue stops the reader
+  task and TCP applies the backpressure — the SendQ shape, in the other
+  direction.
+- `e6irc api` read the HTTP response with `read_to_end`. Bounded, and over the
+  cap is an error rather than a truncation: half a JSON document on a script's
+  stdin is worse than a failure.
+
+Worth recording how the scrollback fix went wrong first. `scroll` is an offset
+from the *end* of the log, so draining the front does not move the view — but
+the first version decremented `scroll` by the drained count, which slid the
+viewport forward one line per arrival. The test that caught it was the one
+written to compare the *visible lines* before and after, not the one that
+checked `scroll` stayed in range; the latter passes either way. A bound is not
+correct because it is a bound.
+
+`e6irc api` also built its request head from `method`/`path`/`token` verbatim.
+This is a scripting CLI — a path is routinely built from a shell variable — so
+a CR or LF there let that variable append headers or a second request. Rejected
+before the socket opens, which is also what makes it testable.
+
+A new `client_messages` fuzz target feeds the TUI arbitrary server output
+through the real parse-and-convert path and exercises the render slice at
+degenerate heights, where an off-by-one becomes a panic rather than a wrong
+pixel. Clean over 7.6M executions; it joins the CI fuzz loop.
+
+Writing it turned up a third copy of the borrowed→owned message conversion (the
+connection's, the TUI test helper's, the fuzz target's). `OwnedMessage` is
+`pub` but its constructor was not, so a caller holding a parsed `Message` had no
+way to build one and each site hand-wrote the mapping — free to drift. It is now
+the `From` impl the type should have had, and all three sites use it.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

@@ -17,6 +17,8 @@ libfuzzer-sys = { version = "0.4.13" }
 e6irc-proto = { path = "../crates/e6irc-proto" }
 e6ircd = { path = "../crates/e6ircd" }
 e6irc-queue = { path = "../crates/e6irc-queue" }
+e6irc-client = { path = "../crates/e6irc-client" }
+e6irc-tui = { path = "../crates/e6irc-tui" }
 
 [[bin]]
 name = "parse_message"
@@ -28,6 +30,13 @@ bench = false
 [[bin]]
 name = "tag_escaping"
 path = "fuzz_targets/tag_escaping.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_messages"
+path = "fuzz_targets/client_messages.rs"
 test = false
 doc = false
 bench = false

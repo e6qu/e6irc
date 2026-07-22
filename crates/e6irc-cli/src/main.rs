@@ -311,6 +311,10 @@ async fn run(cli: Cli) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Largest API response body this will read. Generous for the JSON the API
+/// returns; the point is that some number bounds it.
+const MAX_API_RESPONSE: usize = 16 * 1024 * 1024;
+
 /// Minimal HTTP/1.1 client for one request/response over a `Connection:
 /// close` socket. Plain HTTP only; TLS termination belongs to a proxy.
 async fn run_api(
@@ -340,6 +344,23 @@ async fn run_api(
     let token = token.or_else(|| std::env::var("E6IRC_API_TOKEN").ok());
     let body = body.unwrap_or_default();
 
+    // These three go into the request head verbatim. This is a scripting CLI —
+    // a path or token is routinely built from a shell variable — so a CR or LF
+    // in one would let that variable append headers or a second request. Reject
+    // it here rather than sending something other than what was asked for.
+    for (what, value) in [
+        ("method", method),
+        ("path", path),
+        ("token", token.as_deref().unwrap_or("")),
+    ] {
+        if value.contains(['\r', '\n']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{what} contains a line break"),
+            ));
+        }
+    }
+
     let mut req = format!(
         "{} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
         method.to_ascii_uppercase()
@@ -358,8 +379,20 @@ async fn run_api(
 
     let mut stream = TcpStream::connect(&addr).await?;
     stream.write_all(req.as_bytes()).await?;
+    // Bounded: the response length is the server's choice, and reading to end
+    // lets it decide how much memory this process uses. Over the cap is an
+    // error, not a truncation — half a JSON document on a script's stdin is
+    // worse than a failure.
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    let read = (&mut stream)
+        .take(MAX_API_RESPONSE as u64 + 1)
+        .read_to_end(&mut buf)
+        .await?;
+    if read > MAX_API_RESPONSE {
+        return Err(std::io::Error::other(format!(
+            "API response exceeds {MAX_API_RESPONSE} bytes"
+        )));
+    }
 
     let text = String::from_utf8_lossy(&buf);
     let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
@@ -380,5 +413,32 @@ async fn run_api(
         Err(std::io::Error::other(format!(
             "API request failed: HTTP {status}"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard runs before the socket is opened, so an injected line break is
+    /// refused without a connection — which is also what makes this testable.
+    #[tokio::test]
+    async fn api_rejects_line_breaks_in_the_request_head() {
+        for (method, path, token) in [
+            ("GET\r\nX-Evil: 1", "/api/v1/me", None),
+            ("GET", "/api/v1/me\r\nX-Evil: 1", None),
+            ("GET", "/api/v1/me", Some("t\r\nX-Evil: 1".to_string())),
+        ] {
+            let err = run_api(method, path, "http://127.0.0.1:1", token, None)
+                .await
+                .expect_err("a line break must be refused");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{path}");
+        }
+    }
+
+    #[test]
+    fn join_errors_are_recognized() {
+        assert!(is_join_error("475"));
+        assert!(!is_join_error("366"));
     }
 }
