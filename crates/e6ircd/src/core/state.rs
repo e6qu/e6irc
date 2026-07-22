@@ -358,6 +358,23 @@ pub(crate) struct HistoryEntry {
 /// Ring capacity per target; older entries live only in PostgreSQL.
 pub(crate) const HISTORY_RING_CAP: usize = 500;
 
+/// The storage key and participants for the direct-message conversation between
+/// two identities, from already-casefolded inputs.
+///
+/// Free-standing because the REST history endpoint needs the identical key: two
+/// implementations that must agree is exactly how a privacy boundary drifts,
+/// and this one decides who can read whose conversation.
+pub fn dm_conversation_key(a: &str, b: &str) -> (String, Vec<String>) {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let key = format!("{lo}!{hi}");
+    let peers = if lo == hi {
+        vec![lo.to_string()]
+    } else {
+        vec![lo.to_string(), hi.to_string()]
+    };
+    (key, peers)
+}
+
 /// Casefolded key for anything that can hold history: a channel, or the
 /// direct-message conversation between two nicks.
 ///
@@ -1007,14 +1024,8 @@ impl ServerState {
     /// so a single stored copy serves both sides. A message to oneself yields a
     /// single participant.
     pub fn dm_conversation(&self, a: &str, b: &str) -> (HistoryKey, Vec<String>) {
-        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let key = HistoryKey(format!("{lo}!{hi}"));
-        let peers = if lo == hi {
-            vec![lo.to_string()]
-        } else {
-            vec![lo.to_string(), hi.to_string()]
-        };
-        (key, peers)
+        let (key, peers) = dm_conversation_key(a, b);
+        (HistoryKey(key), peers)
     }
 
     /// Resolve a nick to the connection that owns it, but only once that

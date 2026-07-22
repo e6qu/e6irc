@@ -710,7 +710,16 @@ Design constraints recorded now:
   account boundary is the one that carries privilege.)
 - **11.2 Query surface**: IRCv3 `CHATHISTORY` (BEFORE/AFTER/AROUND/BETWEEN/
   LATEST/TARGETS) for IRC clients; `GET /api/v1/history/...` for the web
-  client and API consumers — both hit the same query layer.
+  client and API consumers — both hit the same query layer, including direct
+  messages. The two surfaces authorize differently because they see different
+  things: a channel read over REST has no view of live membership, so it fails
+  closed to a registered relationship (founder or access), while a conversation
+  read needs no check at all — its key is derived from the *authenticated
+  account*, so a caller can only ever address a conversation it is part of and
+  there is nothing to bypass. Both derive that key from one function, since two
+  implementations that must agree is how a privacy boundary drifts. A REST
+  conversation is addressed by account name, so conversations with an
+  unauthenticated party are not reachable there.
 - **11.3 Hot path**: per-target in-memory ring (last 500 events) answers
   the common "LATEST *" without Postgres; misses fall through to the
   `messages` table. Channels and conversations share one ring store, one LRU

@@ -11,7 +11,7 @@
 mod handler;
 mod state;
 
-pub use state::{ConnId, CoreConfig};
+pub use state::{ConnId, CoreConfig, dm_conversation_key};
 
 use bytes::Bytes;
 use e6irc_queue::{PushError, Sender};
