@@ -33,6 +33,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "core_multi"
+path = "fuzz_targets/core_multi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "core_dispatch"
 path = "fuzz_targets/core_dispatch.rs"
 test = false
