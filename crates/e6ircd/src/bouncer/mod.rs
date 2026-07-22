@@ -188,6 +188,20 @@ pub enum DriverEvent {
     Disconnected,
 }
 
+/// A connection-state change a driver reports through [`DriverEnds::emit`].
+///
+/// Deliberately unable to carry a line. Lines must go through
+/// [`DriverEnds::emit_line`], which neutralizes embedded CR/LF/NUL *and*
+/// records the line in the detached buffer; a driver that could hand a line to
+/// `emit` instead would skip both, injecting into attached clients and leaving
+/// detached ones with a gap. `NetworkDriver` is a public SPI, so that has to be
+/// impossible to write rather than merely documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEvent {
+    Connected,
+    Disconnected,
+}
+
 /// A handle to a running, always-on network driver. Events are
 /// broadcast, so any number of clients can attach concurrently and the
 /// driver keeps running while zero are attached.
@@ -368,19 +382,23 @@ impl DriverEnds {
 
     /// Broadcast a non-line event (Connected/Disconnected), updating the
     /// sticky connection state so late subscribers can still read it.
-    pub fn emit(&self, event: DriverEvent) {
-        match event {
-            DriverEvent::Connected => {
+    /// Report a connection-state change. Lines have their own entry point
+    /// ([`DriverEnds::emit_line`]) because they need sanitizing and buffering;
+    /// see [`ConnectionEvent`].
+    pub fn emit(&self, event: ConnectionEvent) {
+        let broadcast = match event {
+            ConnectionEvent::Connected => {
                 self.connected
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                DriverEvent::Connected
             }
-            DriverEvent::Disconnected => {
+            ConnectionEvent::Disconnected => {
                 self.connected
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                DriverEvent::Disconnected
             }
-            DriverEvent::Line(_) => {}
-        }
-        let _ = self.events.send(event);
+        };
+        let _ = self.events.send(broadcast);
     }
 
     /// Await the next downstream command; `None` when every handle is
@@ -442,7 +460,7 @@ impl NetworkDriver for LoopbackDriver {
     fn start(self: Box<Self>) -> NetworkHandle {
         let (handle, mut ends) = NetworkHandle::channels(self.buffer_cap);
         tokio::spawn(async move {
-            ends.emit(DriverEvent::Connected);
+            ends.emit(ConnectionEvent::Connected);
             while let Some(line) = ends.next_command().await {
                 ends.emit_line(line);
             }

@@ -521,10 +521,11 @@ Principal tables (columns abridged):
   server master key (§15), enabled)
 - `bnc_buffer` (id, owner, network, line, created_at) — persisted
   detached-buffer lines replayed on attach after a restart; `owner` is `*`
-  for a shared/server-level network. Both ways into a network's buffer — a
-  live line from a driver and restored backlog from this table — neutralize
-  embedded CR/LF/NUL, so a line replayed to an attaching client cannot become
-  two regardless of which path it arrived through or which build wrote it
+  for a shared/server-level network; `owner` is the RFC1459-casefolded account,
+  matching the registry key. Both ways into a network's buffer — a live line
+  from a driver and restored backlog from this table — neutralize embedded
+  CR/LF/NUL, so a line replayed to an attaching client cannot become two
+  regardless of which path it arrived through or which build wrote it
 - `read_markers` (account_id, target, marker_ts) — per-account read
   position, the source for `draft/read-marker`
 - `audit_log` (oper/admin actions, API mutations)

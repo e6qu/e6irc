@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
 
-use super::{DriverEvent, NetworkConfig, NetworkDriver, NetworkHandle};
+use super::{ConnectionEvent, NetworkConfig, NetworkDriver, NetworkHandle};
 use crate::core::{ConnId, Input, Output};
 
 /// Handles into the core, so the driver can open an in-process session.
@@ -97,7 +97,7 @@ impl NetworkDriver for LocalDriver {
                     })
                     .await;
             }
-            ends.emit(DriverEvent::Connected);
+            ends.emit(ConnectionEvent::Connected);
 
             loop {
                 tokio::select! {

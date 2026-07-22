@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use e6irc_client::Connection;
 
-use super::{DriverEnds, DriverEvent, NetworkHandle};
+use super::{ConnectionEvent, DriverEnds, NetworkHandle};
 
 /// Static configuration for one upstream network.
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ async fn run(config: NetworkConfig, mut ends: DriverEnds) {
             // Clean stop: the command channel closed (handle dropped).
             ConnectionOutcome::Stopped => return,
             ConnectionOutcome::Dropped => {
-                ends.emit(DriverEvent::Disconnected);
+                ends.emit(ConnectionEvent::Disconnected);
                 backoff.wait(started.elapsed()).await;
             }
         }
@@ -98,7 +98,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> Connecti
         Ok(Ok(_)) => {}
         Ok(Err(_)) | Err(_) => return ConnectionOutcome::Dropped,
     }
-    ends.emit(DriverEvent::Connected);
+    ends.emit(ConnectionEvent::Connected);
     for chan in &config.autojoin {
         if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
             return ConnectionOutcome::Dropped;

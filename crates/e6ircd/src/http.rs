@@ -3498,8 +3498,8 @@ async fn create_network_core(
     }
 
     registry.add(
-        Some(account.to_string()),
-        req.name.clone(),
+        Some(account),
+        &req.name,
         Box::new(crate::bouncer::IrcDriver::new(
             crate::bouncer::NetworkConfig {
                 addr: req.addr.clone(),
@@ -3552,7 +3552,10 @@ async fn network_buffer(
         }
     }
     let limit = params.limit.unwrap_or(200).clamp(1, 1000) as i64;
-    match crate::db::recent_bnc_lines(pool, &account, &name, limit).await {
+    // Buffers are stored under the casefolded owner (the registry key), so the
+    // read has to fold too or it would look up a spelling nothing writes.
+    let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
+    match crate::db::recent_bnc_lines(pool, &owner, &name, limit).await {
         Ok(lines) => (
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::json!({ "lines": lines }).to_string(),
@@ -3644,8 +3647,8 @@ async fn patch_network(
             }
         };
         registry.add(
-            Some(account.clone()),
-            name.clone(),
+            Some(&account),
+            &name,
             Box::new(crate::bouncer::IrcDriver::new(cfg)),
         );
     } else {

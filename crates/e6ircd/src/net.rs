@@ -125,8 +125,8 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 let cfg = crate::bouncer::network_config_from_row(&row, secret_key.as_deref())
                     .map_err(io::Error::other)?;
                 reg.add(
-                    Some(owner),
-                    row.name.clone(),
+                    Some(&owner),
+                    &row.name,
                     Box::new(crate::bouncer::IrcDriver::new(cfg)),
                 );
             }

@@ -637,6 +637,34 @@ credential. Disable and delete both stop the driver rather than leaving it
 running behind a flag, and a failed enable rolls the flag back so it cannot
 claim a state the server is not in.
 
+Twenty-third sweep — driver SPI and registry key made unmistakable
+(2026-07-22): sweep 22 hardened the buffer's *restore* path and closed by noting
+that the registry key was correct only because every producer happened to spell
+the account the same way. This sweep removed both kinds of "correct by
+coincidence".
+
+**A line could bypass sanitization entirely.** `DriverEnds::emit` is public,
+took a `DriverEvent`, and that enum carries `Line(String)` — with an arm that
+did nothing for it. A driver calling `emit(DriverEvent::Line(..))` would have
+broadcast straight past `emit_line`, skipping both the CR/LF/NUL neutralization
+*and* the detached buffer: injection into attached clients, and a gap for
+detached ones. No in-tree driver did this, but `NetworkDriver` is a public SPI
+and the loopback driver is documented as a template for real bridges, so the
+wrong call was as easy to write as the right one. `emit` now takes a
+`ConnectionEvent` that cannot carry a line at all; the bypass is a type error,
+confirmed by writing it and watching it fail to compile.
+
+**The registry key is now casefolded at construction.** A miss there does not
+error — `get` falls through to the shared network — so an owner spelled
+differently than it was registered would have silently attached a client to the
+operator's network instead of its own. `NetworkKey::new` is the only way to
+build a key, so no caller can reintroduce the raw form. `bnc_buffer.owner`
+follows the same rule, and migration 0025 folds rows written under the old
+spelling rather than orphaning that backlog under a key nothing looks up.
+
+Both changes are the same shape: the previous code was not wrong, it was
+*relying on every future caller to keep it right*.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

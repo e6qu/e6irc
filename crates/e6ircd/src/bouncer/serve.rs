@@ -16,7 +16,28 @@ use e6irc_proto::message::Message;
 
 /// Registry key: the owning account (`None` = shared) and the network
 /// name the client selects with the `/network` suffix.
-type NetworkKey = (Option<String>, String);
+///
+/// The account is stored casefolded. Every caller happens to pass the stored
+/// `accounts.name` today, so raw strings would match — but a key that is only
+/// correct while every producer remembers to spell it the same way is the wrong
+/// kind of correct. A miss here does not error: `get` falls through to the
+/// shared network, so a mismatch would silently attach a client to the
+/// operator's network instead of its own. [`NetworkKey::new`] is the only way
+/// to build one, so that cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NetworkKey {
+    owner: Option<String>,
+    name: String,
+}
+
+impl NetworkKey {
+    fn new(owner: Option<&str>, name: &str) -> Self {
+        Self {
+            owner: owner.map(|o| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(o)),
+            name: name.to_string(),
+        }
+    }
+}
 
 /// All active networks, each running an always-on driver, keyed by
 /// `(owner, name)`. Mutable at runtime so accounts can add and remove
@@ -142,7 +163,7 @@ impl Registry {
                     }
                 }
             };
-            registry.add(e.owner.clone(), e.name.clone(), driver);
+            registry.add(e.owner.as_deref(), &e.name, driver);
         }
         Ok(registry)
     }
@@ -150,12 +171,15 @@ impl Registry {
     /// Start a driver for `(owner, name)` and register it, replacing any
     /// existing driver under that key (the old handle drops, stopping it).
     /// With a database, restore recent backlog and persist new lines.
-    pub fn add(&self, owner: Option<String>, name: String, driver: Box<dyn super::NetworkDriver>) {
+    pub fn add(&self, owner: Option<&str>, name: &str, driver: Box<dyn super::NetworkDriver>) {
+        let key = NetworkKey::new(owner, name);
         let handle = Arc::new(driver.start());
-        let persistence = self
-            .pool
-            .clone()
-            .map(|pool| spawn_persistence(pool, owner.clone(), name.clone(), handle.clone()));
+        // The persistence task keys `bnc_buffer` rows by the same casefolded
+        // owner the registry uses, so a buffer cannot be written under one
+        // spelling and looked up under another.
+        let persistence = self.pool.clone().map(|pool| {
+            spawn_persistence(pool, key.owner.clone(), key.name.clone(), handle.clone())
+        });
         let slot = Slot {
             handle,
             persistence,
@@ -165,7 +189,7 @@ impl Registry {
             .networks
             .lock()
             .expect("registry poisoned")
-            .insert((owner, name), slot)
+            .insert(key, slot)
         {
             old.stop();
         }
@@ -178,7 +202,7 @@ impl Registry {
             .networks
             .lock()
             .expect("registry poisoned")
-            .remove(&(owner.map(str::to_string), name.to_string()));
+            .remove(&NetworkKey::new(owner, name));
         match removed {
             Some(slot) => {
                 slot.stop();
@@ -194,8 +218,8 @@ impl Registry {
     pub fn get(&self, account: &str, name: &str) -> Option<Arc<NetworkHandle>> {
         let networks = self.networks.lock().expect("registry poisoned");
         networks
-            .get(&(Some(account.to_string()), name.to_string()))
-            .or_else(|| networks.get(&(None, name.to_string())))
+            .get(&NetworkKey::new(Some(account), name))
+            .or_else(|| networks.get(&NetworkKey::new(None, name)))
             .map(|slot| slot.handle.clone())
     }
 }
@@ -517,5 +541,32 @@ async fn verify_plain(pool: &PgPool, payload: &str) -> Option<String> {
             eprintln!("bnc: credential check failed (database error): {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn registry_key_folds_the_owner_so_casing_cannot_miss() {
+        // A miss does not error: `get` falls through to the shared network, so
+        // an owner spelled differently than it was registered would silently
+        // attach a client to the operator's network instead of its own.
+        let registered = NetworkKey::new(Some("Alice"), "libera");
+        assert_eq!(registered, NetworkKey::new(Some("alice"), "libera"));
+        assert_eq!(registered, NetworkKey::new(Some("ALICE"), "libera"));
+        // RFC1459 folds these too, and nicks may contain them.
+        assert_eq!(
+            NetworkKey::new(Some("Ali[ce]"), "n"),
+            NetworkKey::new(Some("ali{ce}"), "n")
+        );
+        // A different account is still a different key, and the shared owner
+        // stays distinct from any account.
+        assert_ne!(registered, NetworkKey::new(Some("bob"), "libera"));
+        assert_ne!(registered, NetworkKey::new(None, "libera"));
+        // The network name is a selector the owner chose, not an identity, and
+        // is matched exactly.
+        assert_ne!(registered, NetworkKey::new(Some("alice"), "Libera"));
     }
 }
