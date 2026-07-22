@@ -663,7 +663,7 @@ pub async fn query_history(
             sqlx::query_as(
                 "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
                  FROM messages
-                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2)
+                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
                  ORDER BY ts DESC, id DESC LIMIT $3",
             )
             .bind(target)
@@ -738,13 +738,22 @@ pub async fn query_history(
             .await
         }
         // Msgid pivots: page on the composite (ts, id) relative to the pivot
-        // row so messages sharing the pivot's whole second are not skipped. An
-        // unknown msgid makes the subquery NULL, yielding an empty result.
+        // row so messages sharing the pivot's timestamp are not skipped.
+        //
+        // The pivot is looked up *within the same target*. Globally, a msgid
+        // that belongs to some other buffer is not "unknown", so an unscoped
+        // lookup would silently position the query from a message the caller
+        // may never have been able to see — answering a request to page from a
+        // position that does not exist in this buffer with a plausible result
+        // instead of an empty one, and turning any known msgid into an oracle
+        // for when it was sent. Scoped, an unknown-here msgid makes the
+        // subquery NULL and the result empty, which is what the caller asked
+        // about.
         HistoryQuery::BeforeMsgid { msgid, limit } => {
             sqlx::query_as(
                 "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
                  FROM messages
-                 WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2)
+                 WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
                  ORDER BY ts DESC, id DESC LIMIT $3",
             )
             .bind(target)
@@ -757,7 +766,7 @@ pub async fn query_history(
             sqlx::query_as(
                 "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
                  FROM messages
-                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2)
+                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
                  ORDER BY ts ASC, id ASC LIMIT $3",
             )
             .bind(target)
@@ -774,13 +783,13 @@ pub async fn query_history(
                      (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix,
                              kind, body, ts, id
                       FROM messages
-                      WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2)
+                      WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
                       ORDER BY ts DESC, id DESC LIMIT $3)
                      UNION ALL
                      (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix,
                              kind, body, ts, id
                       FROM messages
-                      WHERE target = $1 AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $2)
+                      WHERE target = $1 AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
                       ORDER BY ts ASC, id ASC LIMIT $4)
                  ) w ORDER BY ts ASC, id ASC",
             )
@@ -801,15 +810,15 @@ pub async fn query_history(
                 "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
                  FROM messages
                  WHERE target = $1
-                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2)
-                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3)
+                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
+                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1)
                  ORDER BY ts DESC, id DESC LIMIT $4"
             } else {
                 "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
                  FROM messages
                  WHERE target = $1
-                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2)
-                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3)
+                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
+                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1)
                  ORDER BY ts ASC, id ASC LIMIT $4"
             })
             .bind(target)

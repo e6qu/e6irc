@@ -574,6 +574,40 @@ Both surfaces now derive the conversation key from a single
 `dm_conversation_key`, rather than each spelling out the sort-and-join. Two
 implementations that must agree is how a privacy boundary drifts.
 
+Twenty-first sweep — msgid pivots scoped to their buffer (2026-07-22): two
+audits, one clean and one not.
+
+**Clean:** sweep 14's seconds-to-milliseconds change bit twice (CHATHISTORY,
+then the REST endpoint in sweep 20), so every remaining timestamp site was
+checked — the SQL round trip, read markers, and every consumer of
+`HistoryRow::ts`. There is no third instance; the only render sites are the IRC
+path and the REST one, and both now agree. Recorded so it need not be redone.
+
+**Not clean:** CHATHISTORY's msgid pivots resolved the pivot across the *whole*
+`messages` table rather than within the target being paged. The comment above
+those queries already stated the intent — "an unknown msgid makes the subquery
+NULL, yielding an empty result" — but a msgid belonging to another buffer is not
+unknown globally, so `CHATHISTORY AFTER #public msgid=<a private message>`
+silently positioned the query and returned the public messages that followed it.
+
+No message content crossed a buffer (the outer query stays scoped to the
+target), and e6ircd's msgids embed their own timestamp, so today this discloses
+nothing a holder of the msgid could not already compute. That is the wrong thing
+to rely on: the safety came from an unrelated detail of the msgid format rather
+than from the query, and it would become a real oracle the moment msgids became
+opaque. It was also a silent fallback — a request to page from a position that
+does not exist in a buffer was answered with a plausible result instead of an
+empty one. All nine pivot subqueries are now scoped to the target, and the
+regression test checks all four pivoted variants against the unscoped code
+first.
+
+The Shauth relying-party surface that landed alongside these sweeps was audited
+too and held up: every `web_sessions` lookup filters on expiry, back-channel
+logout deletes the correlated rows, the new `oidc_role` is displayed rather than
+used for authorization (admin is still gated on the configured account list),
+and the validation endpoint requires a session and renders only its own
+caller's identity.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
