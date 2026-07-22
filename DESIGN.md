@@ -108,6 +108,15 @@ These are project-wide rules, enforced in review and (where possible) CI:
 
 ## 3. Architecture overview
 
+**Module layout.** The core worker's command handling lives in
+`core/handler/`, one module per command family — registration, sasl, services,
+channel, message, chanops, query, history, monitor, read_marker, oper — with
+`mod.rs` holding dispatch and the helpers they share. It was a single 6,400-line
+file until sweep 26; the split is by *what a command does*, so the module a
+change belongs in follows from the command being changed. Submodules reach
+shared helpers through `use super::*`, and items crossing a module boundary are
+`pub(super)`, which keeps the dead-code guard able to see unused ones.
+
 ```
                         ┌────────────────────────── e6ircd (one process) ─────────────────────────┐
                         │                                                                          │

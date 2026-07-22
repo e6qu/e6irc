@@ -731,6 +731,39 @@ for, not that the earlier one was careless.
 
 Both core targets now run in CI.
 
+Twenty-sixth sweep — split the command handler, and find the guard that was
+not looking (2026-07-22): `core/handler.rs` had grown to 6,417 lines, the file
+every sweep touched. It is now `core/handler/` with eleven modules, one per
+command family, `mod.rs` keeping dispatch and shared helpers. The code moved
+verbatim; what changed is that a command's module now follows from what the
+command does. The multiline batch machinery moved from the capability section
+to `message.rs` on the way, where it belonged.
+
+**The split exposed that `check-duplication.sh` had never opened the four
+biggest files.** jscpd skips any file over 1000 lines *by default and
+silently*, so `handler.rs`, `http.rs`, `db.rs` and `state.rs` — 60% of the
+source — were never scanned. The guard reported a comfortable 1.46% describing
+the other 40%. Splitting one file into pieces under the limit made the numbers
+jump to 3.49%, which looked like the refactor introducing duplication; measured
+with the limit raised, main and the split are identical (4.25% vs 4.26%), so
+the refactor introduced none. The 3.49% was the instrument, not the code.
+
+The guard now raises `--max-lines`/`--max-size` and, more importantly, asserts
+that jscpd scanned every source file it was given, failing loudly when it did
+not. That check was verified by re-imposing the old limit and watching it fail
+with "scanned 40 of 44".
+
+The threshold moves 3% → 4.3%, which the guard's own comment forbids. It is
+recorded there in full: 3% was calibrated against a scan that ignored most of
+the code, so it never described this codebase, and re-baselining a
+mis-calibrated instrument is not the same as loosening a standard to hide a
+regression. The largest clone was extracted on the way — the channel and
+direct-message paths each spelled out deliver-then-echo, now one
+`deliver_and_echo` — taking it to 4.2%. The remaining clusters are named in the
+guard for the next ratchet: the HTTP handlers' authenticate/lookup/problem
+prologues, ChanServ's per-subcommand permission preamble, and the bridge
+drivers' connect-retry loops.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
