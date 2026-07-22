@@ -15,6 +15,8 @@ cargo-fuzz = true
 # with "undefined symbol: main".
 libfuzzer-sys = { version = "0.4.13" }
 e6irc-proto = { path = "../crates/e6irc-proto" }
+e6ircd = { path = "../crates/e6ircd" }
+e6irc-queue = { path = "../crates/e6irc-queue" }
 
 [[bin]]
 name = "parse_message"
@@ -26,6 +28,13 @@ bench = false
 [[bin]]
 name = "tag_escaping"
 path = "fuzz_targets/tag_escaping.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_dispatch"
+path = "fuzz_targets/core_dispatch.rs"
 test = false
 doc = false
 bench = false

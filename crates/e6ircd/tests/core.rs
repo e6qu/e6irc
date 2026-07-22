@@ -3617,6 +3617,32 @@ fn failed_multiline_batch_answers_the_label_that_opened_it() {
 }
 
 #[test]
+fn batch_reference_with_a_multibyte_first_character_is_refused_not_fatal() {
+    // The leading `+`/`-` is one *character*, not one byte. Splitting the
+    // reference by byte landed inside a multi-byte character and panicked the
+    // core worker — reachable by any registered client, and fatal to everyone
+    // on the server, not just the sender.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
+    s.drain(alice);
+    // (A NUL never gets this far — the line framer rejects it as malformed.)
+    for reference in ["\u{61c}CH1", "é+1", "\u{1f600}", "字"] {
+        s.line(alice, &format!("BATCH {reference} draft/multiline #c"));
+        let out = s.drain(alice);
+        assert!(
+            out.iter().any(|l| l.contains("FAIL BATCH")),
+            "reference {reference:?} must be refused: {out:#?}"
+        );
+    }
+    // The connection is still usable afterwards.
+    s.line(alice, "PING :alive");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("PONG")),
+        "the worker must survive a malformed batch reference"
+    );
+}
+
+#[test]
 fn multiline_batch_may_not_mix_privmsg_and_notice() {
     // NOTICE exists to say "never reply to this automatically". A batch is one
     // message, so it cannot be half notice — and relaying a NOTICE line as a

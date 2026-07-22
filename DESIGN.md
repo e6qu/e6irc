@@ -267,7 +267,10 @@ strip = "symbols"
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL
   client/server state machines (pure, I/O-free, unit-tested).
-- Fuzz targets (cargo-fuzz) for parser and tag unescaping.
+- Fuzz targets (cargo-fuzz) for parser and tag unescaping, and for the
+  stateful core driven by an arbitrary command stream (`core_dispatch`): a
+  panic there takes the single worker down for every client, so "survives
+  whatever a client sends" is the whole oracle.
 
 ### 7.2 Connection lifecycle
 

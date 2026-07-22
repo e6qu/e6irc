@@ -665,6 +665,47 @@ spelling rather than orphaning that backlog under a key nothing looks up.
 Both changes are the same shape: the previous code was not wrong, it was
 *relying on every future caller to keep it right*.
 
+Twenty-fourth sweep — fuzzing the stateful core (2026-07-22): five sweeps of
+reading code had reached diminishing returns, so this one changed technique. The
+three existing fuzz targets all cover pure parsing — well-formed in, well-formed
+out. The part with *state* was unfuzzed: registration, capability negotiation,
+channels, and the multiline BATCH machine, where a line's effect depends on
+every line before it, and where the core is full of `expect("checked")`
+invariants that hold for the sequences a normal client produces.
+
+A new `core_dispatch` target drives the core worker with an arbitrary command
+stream from one connection. There is no oracle beyond "the worker survives
+whatever a client sends", which is the contract a server owes a hostile peer.
+
+**It found a remotely-triggerable panic in seconds.** `normalize_ban_mask`
+decided a mask's shape from `mask.contains('!')` and `mask.contains('@')`, then
+split on the strength of that answer. Those two questions say nothing about
+*order*: `@!x` contains both, yet has no `@` after the `!`, so the second
+`split_once(...).unwrap()` unwrapped `None`. `MODE #chan +b @!x` therefore
+killed the core worker — and since creating a channel makes you its operator,
+any connected user could do it. The process stayed up while serving nobody,
+which is the worst shape of failure: alive to a supervisor, dead to every
+client. Confirmed against a running server before and after the fix.
+
+The mask is now parsed positionally, one separator at a time, so ordering cannot
+be assumed. The unit test covers the ordinary shapes, the fuzzer's exact input,
+and a property over adversarial masks: whatever goes in, the result has both
+separators once and in order, because a mask that cannot be matched against a
+prefix is a silently ineffective ban.
+
+**Then it found a second one, in code from six sweeps ago.** `cmd_batch` split
+the batch reference with `split_at(1)` to take its leading `+`/`-`. That is one
+*byte*, not one character, so a reference beginning with a multi-byte character
+— `BATCH \u{61c}CH1` — split inside it and panicked. Any registered client could
+send it, and the whole worker died, not just that connection. The sign is now
+taken with `chars().next()`, which cannot land mid-character. Worth recording
+how it surfaced: a short fuzz run had already come back clean, and only a longer
+one reached it. "The fuzzer found nothing" is a statement about how long it ran.
+
+Both fixes carry regression tests checked against the unfixed code first, and
+`core_dispatch` joins the CI fuzz loop so the stateful surface keeps getting
+exercised as it grows.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
