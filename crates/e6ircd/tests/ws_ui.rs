@@ -9,6 +9,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Tung;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+mod support;
+
 async fn upstream() -> std::net::SocketAddr {
     let cfg = Config {
         server_name: "irc.up.example".into(),
@@ -25,14 +27,10 @@ async fn upstream() -> std::net::SocketAddr {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn ws_ui_streams_fragments_and_relays_composer() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("ws_ui_streams_fragments_and_relays_composer").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "s3cr3t")
         .await
         .expect("acct");
@@ -146,14 +144,10 @@ async fn ws_ui_streams_fragments_and_relays_composer() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn ws_ui_requires_authentication() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("ws_ui_requires_authentication").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     drop(pool);
 
     let config = Config {

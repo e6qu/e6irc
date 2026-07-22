@@ -6,6 +6,8 @@ use e6ircd::net;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+mod support;
+
 fn test_config() -> Config {
     Config {
         server_name: "irc.http.example".into(),
@@ -186,14 +188,10 @@ async fn post_json(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_network_management_lifecycle() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("bnc_network_management_lifecycle").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "s3cr3t")
         .await
         .expect("acct");
@@ -314,14 +312,10 @@ async fn bnc_network_management_lifecycle() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_network_upstream_secret_requires_master_key() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("bnc_network_upstream_secret_requires_master_key").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "s3cr3t")
         .await
         .expect("acct");
@@ -443,18 +437,10 @@ async fn account_page_redirects_when_unauthenticated() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_page_lists_networks_for_a_session() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("account_page_lists_networks_for_a_session").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
-    sqlx::query("TRUNCATE bnc_networks")
-        .execute(&pool)
-        .await
-        .ok();
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -513,18 +499,10 @@ async fn account_page_lists_networks_for_a_session() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn admin_accounts_endpoint_is_gated() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("admin_accounts_endpoint_is_gated").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
-    sqlx::query("TRUNCATE server_bans, audit_log RESTART IDENTITY")
-        .execute(&pool)
-        .await
-        .expect("clean operator state");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -643,18 +621,10 @@ async fn admin_accounts_endpoint_is_gated() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_page_add_network_form_with_csrf() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("account_page_add_network_form_with_csrf").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
-    sqlx::query("TRUNCATE bnc_networks")
-        .execute(&pool)
-        .await
-        .ok();
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -730,14 +700,10 @@ async fn account_page_add_network_form_with_csrf() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn device_authorization_grant_flow() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("device_authorization_grant_flow").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -822,14 +788,10 @@ async fn device_authorization_grant_flow() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn me_tokens_list_and_revoke() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("me_tokens_list_and_revoke").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -899,21 +861,10 @@ async fn me_tokens_list_and_revoke() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn network_buffer_read() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("network_buffer_read").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
-    // bnc_buffer is keyed by (owner, network) text, not an accounts FK, so
-    // TRUNCATE accounts CASCADE does not clear it — wipe it explicitly or a
-    // prior test's buffered lines under the same key leak into this read.
-    sqlx::query("TRUNCATE bnc_buffer")
-        .execute(&pool)
-        .await
-        .expect("clean buffer");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -1003,14 +954,10 @@ async fn network_buffer_read() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn me_read_markers_list() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("me_read_markers_list").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -1085,14 +1032,10 @@ async fn me_read_markers_list() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn rp_initiated_logout_redirects_to_provider() {
     use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("rp_initiated_logout_redirects_to_provider").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -1336,14 +1279,10 @@ async fn rp_initiated_logout_redirects_to_provider() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn application_entry_is_fail_closed_and_uses_silent_sso() {
     use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("application_entry_is_fail_closed_and_uses_silent_sso").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
@@ -1409,14 +1348,10 @@ async fn application_entry_is_fail_closed_and_uses_silent_sso() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_logout_without_end_session_configuration_fails_closed() {
     use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("oidc_logout_without_end_session_configuration_fails_closed").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");

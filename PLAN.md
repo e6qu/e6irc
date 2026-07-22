@@ -931,6 +931,32 @@ connection's, the TUI test helper's, the fuzz target's). `OwnedMessage` is
 way to build one and each site hand-wrote the mapping — free to drift. It is now
 the `From` impl the type should have had, and all three sites use it.
 
+The sweep's boy-scout find was in the test suite, not the code. Running the
+PostgreSQL-gated suites turned three bouncer tests red; they passed under
+`--test-threads=1`. Every one of the 58 database tests ran against the single
+database in `E6IRC_TEST_DATABASE_URL` and began by truncating it — so any two
+running at once were mutually destructive, and `cargo test` runs the tests
+within a binary in parallel. Nothing about that was new; it had simply been
+winning the race.
+
+Scheduling around it (a mutex, `--test-threads=1`) would have kept the tests
+mutually destructive and only hidden it — and only within one process, which
+`cargo nextest` would undo. Instead `E6IRC_TEST_DATABASE_URL` is now the
+*administrative* connection, and `tests/support` hands each test a database
+named after it, dropped and recreated on first ask. The 57 `TRUNCATE`s are
+gone; there is nothing left to truncate.
+
+The migration to it made the mistake it was meant to prevent: the rewrite named
+each database after the enclosing function, and `bnc_account_db` is a helper
+four tests share — so those four shared a database again. Which is why
+`test_db` now records the thread that claimed each name and panics if a second
+one asks: libtest runs each test on its own thread, so that is exactly the
+signature of two tests sharing a database, and it says so instead of failing
+somewhere else later.
+
+Also removed: a `sed 's/127.0.0.1:15556/127.0.0.1:15556/'` in the CI dex setup,
+which substituted a string with itself.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

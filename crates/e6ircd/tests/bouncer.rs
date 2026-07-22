@@ -6,6 +6,8 @@ use e6ircd::bouncer::{DriverEvent, IrcNetwork, NetworkConfig};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::net;
 
+mod support;
+
 async fn upstream() -> std::net::SocketAddr {
     let config = Config {
         server_name: "irc.upstream.example".into(),
@@ -146,22 +148,14 @@ async fn driver_reconnects_after_upstream_drop() {
     assert!(disconnected, "expected a Disconnected event");
 }
 
-/// Provision a fresh single-account database and return its URL.
-async fn bnc_account_db(account: &str, password: &str) -> String {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+/// Provision a fresh single-account database and return its URL. `test` is the
+/// calling test's name — a shared helper must not name the database after
+/// itself, or every test it serves would share one.
+async fn bnc_account_db(test: &str, account: &str, password: &str) -> String {
+    let url = support::test_db(test).await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
-    // bnc_buffer keys on TEXT owner (not an FK), so it survives the
-    // accounts truncate — clear it so persistence tests start empty.
-    sqlx::query("TRUNCATE bnc_buffer")
-        .execute(&pool)
-        .await
-        .expect("clean buffer");
     e6ircd::db::create_account(&pool, account, password)
         .await
         .expect("create");
@@ -218,7 +212,12 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_listener_authenticates_and_routes_client_to_network() {
-    let url = bnc_account_db("alice", "s3cr3t").await;
+    let url = bnc_account_db(
+        "bnc_listener_authenticates_and_routes_client_to_network",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
     let up = upstream().await;
     let running = net::start(bnc_config(up, url)).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
@@ -293,7 +292,12 @@ async fn bnc_listener_authenticates_and_routes_client_to_network() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
-    let url = bnc_account_db("alice", "s3cr3t").await;
+    let url = bnc_account_db(
+        "bnc_listener_rejects_unauthenticated_and_wrong_password",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
     let up = upstream().await;
     let running = net::start(bnc_config(up, url)).await.expect("start");
     let bnc = running.bnc_addr.expect("bnc bound");
@@ -340,14 +344,10 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn driver_authenticates_to_sasl_upstream() {
     use e6ircd::config::DatabaseConfig;
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let url = support::test_db("driver_authenticates_to_sasl_upstream").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "bncacct", "bncpass")
         .await
         .expect("create");
@@ -419,7 +419,12 @@ async fn driver_authenticates_to_sasl_upstream() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_buffer_persists_and_restores_across_restart() {
-    let url = bnc_account_db("alice", "s3cr3t").await;
+    let url = bnc_account_db(
+        "bnc_buffer_persists_and_restores_across_restart",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
     let up = upstream().await;
 
     // Server A: a network owned by alice, connected to the upstream.
@@ -528,7 +533,12 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn local_driver_presents_the_in_process_network() {
     use e6ircd::config::{BncConfig, DatabaseConfig, NetworkEntry, NetworkKind};
-    let url = bnc_account_db("alice", "s3cr3t").await;
+    let url = bnc_account_db(
+        "local_driver_presents_the_in_process_network",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
 
     // A server whose BNC exposes a `local` network (this ircd itself).
     let config = Config {

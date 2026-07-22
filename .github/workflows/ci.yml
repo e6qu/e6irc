@@ -93,9 +93,8 @@ jobs:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
       - name: Start dex (mock connector)
         run: |
-          sed 's/127.0.0.1:15556/127.0.0.1:15556/' tools/dex-config.yaml > /tmp/dex.yaml
           docker run -d --name dex -p 15556:5556 \
-            -v /tmp/dex.yaml:/etc/dex/config.yaml \
+            -v "$PWD/tools/dex-config.yaml:/etc/dex/config.yaml" \
             ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break

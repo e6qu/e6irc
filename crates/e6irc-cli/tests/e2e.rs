@@ -88,7 +88,13 @@ async fn cli_sasl_login() {
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
+    // The e6ircd suites give each of their tests its own database because they
+    // run in parallel within one binary. This is the only database test in this
+    // binary, and cargo runs test binaries one at a time — so it can share the
+    // administrative database, provided it does not delete rows it did not
+    // write. Hence the delete-by-name rather than a TRUNCATE: a second database
+    // test added here would then still be wrong, but only about its own row.
+    sqlx::query("DELETE FROM accounts WHERE name = 'cliuser'")
         .execute(&pool)
         .await
         .expect("clean");

@@ -6,19 +6,17 @@
 use e6ircd::config::{Config, DatabaseConfig, HttpConfig, ListenerConfig, OidcProviderConfig};
 use e6ircd::net;
 
+mod support;
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL + dex; see module docs"]
 async fn full_oidc_login_provisions_account_and_session() {
-    let db_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let db_url = support::test_db("full_oidc_login_provisions_account_and_session").await;
     let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
 
     let pool = e6ircd::db::connect_and_migrate(&db_url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     drop(pool);
 
     // dex validates redirect URIs exactly, so the port is fixed and
@@ -145,14 +143,10 @@ async fn full_oidc_login_provisions_account_and_session() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn pat_bearer_auth_works() {
-    let db_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let db_url = support::test_db("pat_bearer_auth_works").await;
     let pool = e6ircd::db::connect_and_migrate(&db_url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "patuser", "pw")
         .await
         .expect("create");
@@ -222,16 +216,12 @@ async fn pat_bearer_auth_works() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL + dex; see module docs"]
 async fn oidc_identity_link_flow_and_conflict() {
-    let db_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let db_url = support::test_db("oidc_identity_link_flow_and_conflict").await;
     let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
 
     let pool = e6ircd::db::connect_and_migrate(&db_url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
@@ -363,15 +353,11 @@ async fn oidc_identity_link_flow_and_conflict() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL + dex; see module docs"]
 async fn oidc_silent_sso_reuses_provider_session() {
-    let db_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let db_url = support::test_db("oidc_silent_sso_reuses_provider_session").await;
     let dex_url = std::env::var("E6IRC_TEST_DEX_URL").expect("E6IRC_TEST_DEX_URL");
     let pool = e6ircd::db::connect_and_migrate(&db_url)
         .await
         .expect("connect");
-    sqlx::query("TRUNCATE accounts CASCADE")
-        .execute(&pool)
-        .await
-        .expect("clean");
     drop(pool);
 
     let http_addr: std::net::SocketAddr = "127.0.0.1:18082".parse().unwrap();
