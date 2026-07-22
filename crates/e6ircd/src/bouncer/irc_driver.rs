@@ -54,28 +54,14 @@ impl IrcNetwork {
 }
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
-    let mut backoff = super::Backoff::new();
-    loop {
-        let started = tokio::time::Instant::now();
-        match connect_once(&config, &mut ends).await {
-            // Clean stop: the command channel closed (handle dropped).
-            ConnectionOutcome::Stopped => return,
-            ConnectionOutcome::Dropped => {
-                ends.emit(ConnectionEvent::Disconnected);
-                backoff.wait(started.elapsed()).await;
-            }
-        }
-    }
+    // Clean stop: the command channel closed (handle dropped).
+    super::run_with_backoff(config, &mut ends, |config, ends| {
+        Box::pin(connect_once(config, ends))
+    })
+    .await;
 }
 
-enum ConnectionOutcome {
-    /// The command channel closed — the owner dropped the handle.
-    Stopped,
-    /// The upstream connection dropped; caller should retry.
-    Dropped,
-}
-
-async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> ConnectionOutcome {
+async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     // Bound connect + registration: an upstream that accepts the TCP handshake
     // but never sends 001 (firewall dropping data, half-open peer) must not
     // wedge the driver forever — that would starve the reconnect loop, the
@@ -83,7 +69,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> Connecti
     let connect_fut = connect(config);
     let mut conn = match tokio::time::timeout(Duration::from_secs(30), connect_fut).await {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) | Err(_) => return ConnectionOutcome::Dropped,
+        Ok(Err(_)) | Err(_) => return super::SessionOutcome::Dropped,
     };
     let register_fut = async {
         match &config.sasl {
@@ -96,12 +82,12 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> Connecti
     };
     match tokio::time::timeout(Duration::from_secs(30), register_fut).await {
         Ok(Ok(_)) => {}
-        Ok(Err(_)) | Err(_) => return ConnectionOutcome::Dropped,
+        Ok(Err(_)) | Err(_) => return super::SessionOutcome::Dropped,
     }
     ends.emit(ConnectionEvent::Connected);
     for chan in &config.autojoin {
         if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
-            return ConnectionOutcome::Dropped;
+            return super::SessionOutcome::Dropped;
         }
     }
 
@@ -121,16 +107,16 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> Connecti
                     // is always-on regardless of attach.
                     ends.emit_line(render(&m));
                 }
-                _ => return ConnectionOutcome::Dropped,
+                _ => return super::SessionOutcome::Dropped,
             },
             // Downstream command -> upstream.
             cmd = ends.next_command() => match cmd {
                 Some(line) => {
                     if conn.send_line(&line).await.is_err() {
-                        return ConnectionOutcome::Dropped;
+                        return super::SessionOutcome::Dropped;
                     }
                 }
-                None => return ConnectionOutcome::Stopped, // handle dropped
+                None => return super::SessionOutcome::Stopped, // handle dropped
             },
         }
     }

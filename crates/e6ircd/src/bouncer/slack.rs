@@ -74,17 +74,10 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
     // including Slack's routine `disconnect` envelope, which expects a
     // reconnect — rather than dying and silently dropping all later messages.
     // Only a dropped handle stops the driver.
-    let mut backoff = super::Backoff::new();
-    loop {
-        let started = tokio::time::Instant::now();
-        match session_once(&config, &mut ends).await {
-            super::SessionOutcome::Stopped => return,
-            super::SessionOutcome::Dropped => {
-                ends.emit(ConnectionEvent::Disconnected);
-                backoff.wait(started.elapsed()).await;
-            }
-        }
-    }
+    super::run_with_backoff(config, &mut ends, |config, ends| {
+        Box::pin(session_once(config, ends))
+    })
+    .await;
 }
 
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {

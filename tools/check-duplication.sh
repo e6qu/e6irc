@@ -42,11 +42,19 @@ cd "$(dirname "$0")/.."
 # Ratchet threshold: max duplicated-line percentage (jscpd --mode strict).
 # Lower over time. History: 3.75% → 2.3% (sweep 6, partial scan) → 4.3%
 # (sweep 26: first full scan; see above — the earlier figures omitted the four
-# largest files) → 3.6% (sweep 27: the HTTP prologues became extractors and
-# ChanServ's founder gate became one function). Remaining clusters, in size
-# order: the bridge drivers' connect-retry loops, db.rs's per-query row
-# mapping, and the remaining http.rs response-shaping.
-THRESHOLD=3.6
+# largest files) → 3.6% (sweep 27: HTTP prologues became extractors, ChanServ's
+# founder gate became one function) → 3.5% (sweep 29: the four bridge
+# connect-retry loops became one `run_with_backoff`).
+#
+# Next target: `db.rs` repeats the CHATHISTORY column list across eleven query
+# variants. That is a real contract between those queries and one row type —
+# when the timestamp moved from seconds to milliseconds each copy was edited by
+# hand and the one that was missed stayed wrong for six sweeps — so it wants a
+# compile-time `concat!`, not a runtime `format!` that would cost the literal
+# SQL its greppability. The remaining db.rs clones are sqlx builder chains
+# (`.bind().execute().await.map_err()`); those are plumbing, and abstracting
+# them would read worse than the repetition.
+THRESHOLD=3.5
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."
