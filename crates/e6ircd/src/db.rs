@@ -595,6 +595,45 @@ pub async fn set_channel_topic(
 /// (msgid, epoch **milliseconds**, sender prefix, kind, body) as stored.
 type HistoryDbRow = (String, i64, String, String, String);
 
+/// A CHATHISTORY statement: the column list, then whatever narrows it.
+///
+/// The column list is a contract between eleven query variants and one row
+/// type. When the timestamp moved from seconds to milliseconds every copy had
+/// to be edited by hand, and the one that was missed stayed wrong for six
+/// sweeps — so it is written once here.
+///
+/// `concat!` rather than `format!`: `sqlx::query_as` borrows its `&str`, and
+/// this keeps every statement a single `&'static str` with no runtime work and
+/// no temporary to outlive the query. The SQL also stays greppable, which an
+/// interpolated string would not.
+macro_rules! history_select {
+    ($rest:literal) => {
+        concat!(
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body \
+             FROM messages ",
+            $rest
+        )
+    };
+}
+
+/// The windowed form: two bounded halves unioned, then ordered as one. The
+/// inner select aliases the timestamp so the outer query can order by it, and
+/// carries `ts`/`id` for that ordering.
+macro_rules! history_window {
+    ($older:literal, $newer:literal) => {
+        concat!(
+            "SELECT msgid, e, sender_prefix, kind, body FROM ( (SELECT msgid, \
+             (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix, kind, body, ts, id \
+             FROM messages ",
+            $older,
+            ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, \
+             sender_prefix, kind, body, ts, id FROM messages ",
+            $newer,
+            ") ) w ORDER BY ts ASC, id ASC"
+        )
+    };
+}
+
 pub async fn query_history(
     pool: &PgPool,
     target: &str,
@@ -623,21 +662,18 @@ pub async fn query_history(
     // Each branch selects a window, then we return it oldest-first.
     let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = match query {
         HistoryQuery::Latest { limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"
+                ))
             .bind(target)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
         }
         HistoryQuery::Before { before_ts, limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000)
-                 ORDER BY ts DESC, id DESC LIMIT $3",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
+                ))
             .bind(target)
             .bind(before_ts as i64)
             .bind(limit as i64)
@@ -648,11 +684,9 @@ pub async fn query_history(
         // limit smaller than the number of messages after the bound keeps the
         // most recent ones rather than the oldest.
         HistoryQuery::LatestAfter { after_ts, limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000)
-                 ORDER BY ts DESC, id DESC LIMIT $3",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
+                ))
             .bind(target)
             .bind(after_ts as i64)
             .bind(limit as i64)
@@ -660,12 +694,9 @@ pub async fn query_history(
             .await
         }
         HistoryQuery::LatestAfterMsgid { msgid, limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                 ORDER BY ts DESC, id DESC LIMIT $3",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $3"
+                ))
             .bind(target)
             .bind(&msgid)
             .bind(limit as i64)
@@ -673,11 +704,9 @@ pub async fn query_history(
             .await
         }
         HistoryQuery::After { after_ts, limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000)
-                 ORDER BY ts ASC, id ASC LIMIT $3",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $3"
+                ))
             .bind(target)
             .bind(after_ts as i64)
             .bind(limit as i64)
@@ -688,19 +717,10 @@ pub async fn query_history(
             // Half older than the point, half at/after it, then oldest-first.
             let before = (limit / 2) as i64;
             let after = (limit - limit / 2) as i64;
-            sqlx::query_as(
-                "SELECT msgid, e, sender_prefix, kind, body FROM (
-                     (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix,
-                             kind, body, ts, id
-                      FROM messages WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000)
-                      ORDER BY ts DESC, id DESC LIMIT $3)
-                     UNION ALL
-                     (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix,
-                             kind, body, ts, id
-                      FROM messages WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000)
-                      ORDER BY ts ASC, id ASC LIMIT $4)
-                 ) w ORDER BY ts ASC, id ASC",
-            )
+            sqlx::query_as(history_window!(
+                    "WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3",
+                    "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
+                ))
             .bind(target)
             .bind(around_ts as i64)
             .bind(before)
@@ -718,17 +738,9 @@ pub async fn query_history(
             // from differs, so the sort direction is chosen here and a
             // newest-first result is reversed to oldest-first below.
             sqlx::query_as(if desc {
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000)
-                   AND ts < to_timestamp($3::double precision / 1000)
-                 ORDER BY ts DESC, id DESC LIMIT $4"
+                history_select!("WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4")
             } else {
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000)
-                   AND ts < to_timestamp($3::double precision / 1000)
-                 ORDER BY ts ASC, id ASC LIMIT $4"
+                history_select!("WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4")
             })
             .bind(target)
             .bind(after_ts as i64)
@@ -750,12 +762,9 @@ pub async fn query_history(
         // subquery NULL and the result empty, which is what the caller asked
         // about.
         HistoryQuery::BeforeMsgid { msgid, limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                 ORDER BY ts DESC, id DESC LIMIT $3",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $3"
+                ))
             .bind(target)
             .bind(&msgid)
             .bind(limit as i64)
@@ -763,12 +772,9 @@ pub async fn query_history(
             .await
         }
         HistoryQuery::AfterMsgid { msgid, limit } => {
-            sqlx::query_as(
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                 ORDER BY ts ASC, id ASC LIMIT $3",
-            )
+            sqlx::query_as(history_select!(
+                    "WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts ASC, id ASC LIMIT $3"
+                ))
             .bind(target)
             .bind(&msgid)
             .bind(limit as i64)
@@ -778,21 +784,10 @@ pub async fn query_history(
         HistoryQuery::AroundMsgid { msgid, limit } => {
             let before = (limit / 2) as i64;
             let after = (limit - limit / 2) as i64;
-            sqlx::query_as(
-                "SELECT msgid, e, sender_prefix, kind, body FROM (
-                     (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix,
-                             kind, body, ts, id
-                      FROM messages
-                      WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                      ORDER BY ts DESC, id DESC LIMIT $3)
-                     UNION ALL
-                     (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix,
-                             kind, body, ts, id
-                      FROM messages
-                      WHERE target = $1 AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                      ORDER BY ts ASC, id ASC LIMIT $4)
-                 ) w ORDER BY ts ASC, id ASC",
-            )
+            sqlx::query_as(history_window!(
+                    "WHERE target = $1 AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $3",
+                    "WHERE target = $1 AND (ts, id) >= (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) ORDER BY ts ASC, id ASC LIMIT $4"
+                ))
             .bind(target)
             .bind(&msgid)
             .bind(before)
@@ -807,19 +802,9 @@ pub async fn query_history(
             newest_first: desc,
         } => {
             sqlx::query_as(if desc {
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1
-                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1)
-                 ORDER BY ts DESC, id DESC LIMIT $4"
+                history_select!("WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $4")
             } else {
-                "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body
-                 FROM messages
-                 WHERE target = $1
-                   AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1)
-                   AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1)
-                 ORDER BY ts ASC, id ASC LIMIT $4"
+                history_select!("WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1) ORDER BY ts ASC, id ASC LIMIT $4")
             })
             .bind(target)
             .bind(&after_msgid)
@@ -2106,4 +2091,38 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
     .await
     .map_err(DbError::Query)?;
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod history_sql_tests {
+    /// The macro must produce exactly the statement the queries used to spell
+    /// out, in the column order `HistoryDbRow` destructures. A silent change
+    /// here would be a runtime column-mismatch on every history read, so it is
+    /// pinned rather than trusted.
+    #[test]
+    fn history_select_expands_to_the_expected_statement() {
+        assert_eq!(
+            history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body \
+             FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"
+        );
+    }
+
+    /// The windowed form keeps the alias and the ordering columns the outer
+    /// query depends on.
+    #[test]
+    fn history_window_keeps_alias_and_ordering_columns() {
+        let sql = history_window!("WHERE a", "WHERE b");
+        assert!(
+            sql.contains("AS e"),
+            "outer query orders by the alias: {sql}"
+        );
+        assert_eq!(
+            sql.matches("ts, id").count(),
+            2,
+            "both halves carry ordering columns"
+        );
+        assert!(sql.trim_end().ends_with("ORDER BY ts ASC, id ASC"));
+        assert!(sql.contains("UNION ALL"));
+    }
 }

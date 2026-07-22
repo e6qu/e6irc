@@ -853,6 +853,34 @@ when timestamps moved from seconds to milliseconds. It wants a compile-time
 greppability, and it wants doing at the start of a sweep rather than the end of
 a long one — so it is recorded in the guard as the next target instead.
 
+Thirtieth sweep — one CHATHISTORY column contract (2026-07-22): the target
+sweep 29 recorded rather than rushed. The column list every history query
+selects was written out fifteen times across eleven variants — a contract
+between those queries and one row type, and the thing that drifted when
+timestamps moved from seconds to milliseconds: each copy was edited by hand,
+and the one that was missed stayed wrong for six sweeps until sweep 20 found
+it.
+
+It is now one `history_select!` (and `history_window!` for the two `UNION`
+forms). `concat!` rather than `format!`, because `sqlx::query_as` borrows its
+`&str`: this keeps every statement a single `&'static str` with no runtime work
+and no temporary to outlive the query, and the SQL stays greppable, which an
+interpolated string would not.
+
+The expansion is pinned by a test that spells the expected statement out in
+full rather than rebuilding it from the macro — a test that used the macro
+would assert nothing. That is also why the column list still appears once more
+in the file than strictly necessary. Verified beyond the unit test by the 32
+PostgreSQL query tests and irctest's 16 CHATHISTORY tests, since a column-order
+mistake here is a runtime failure on every history read, not a compile error.
+
+Duplication 3.48% → 3.23%, ratchet to 3.3%.
+
+What remains is mostly sqlx builder chains and per-route response shaping.
+Those are plumbing rather than a shared concept, so the guard now records that
+the number is expected to sit here — and that it should be lowered when a real
+abstraction is found, not by wrapping boilerplate to move a metric.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
