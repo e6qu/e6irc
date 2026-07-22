@@ -608,6 +608,35 @@ used for authorization (admin is still gated on the configured account list),
 and the validation endpoint requires a session and renders only its own
 caller's identity.
 
+Twenty-second sweep — bouncer audit (2026-07-22): the BNC surface is the largest
+area these sweeps had never examined, and it holds upstream credentials and
+replays stored lines to attaching clients, so it was audited end to end.
+
+**One fix.** `NetworkHandle` has two ways into the detached buffer:
+`emit_line`, which neutralizes embedded CR/LF/NUL so a bridge building a line
+from free-form remote text cannot inject a second IRC line into an attached
+client's stream, and `preload_front`, which restores persisted backlog and did
+not. Every row in `bnc_buffer` was written through the sanitizing path, so
+nothing was exploitable today — but the buffer is a replay boundary and storage
+outlives the code that wrote it. A row left by an older build, a restore, or
+anything else with database access would have been replayed verbatim. Both
+entry points now sanitize, so no reader has to know which one a line arrived
+through. The test was checked against the unfixed code, where the restored line
+still carries its break.
+
+**What held up, recorded so it need not be re-derived.** Network ownership is
+enforced by `account_id` with `UNIQUE (account_id, name)`, and the buffer
+endpoint verifies ownership before reading, both keyed on the same
+display-cased account name that the registry and the persistence task use —
+`verify_credentials`, `api_token_account` and the session lookup all return
+`a.name`, so the IRC and HTTP paths cannot disagree about who owns a buffer.
+`Registry::get` resolves the caller's own network first and falls back only to
+an ownerless (operator-configured) one, so another account's network is not
+reachable. The networks API returns `has_sasl_password` rather than the sealed
+credential. Disable and delete both stop the driver rather than leaving it
+running behind a flag, and a failed enable rolls the flag back so it cannot
+claim a state the server is not in.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
