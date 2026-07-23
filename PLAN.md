@@ -1442,6 +1442,31 @@ This closes the class the sweep-46 finding pointed at from both sides: the
 matcher no longer mishandles a metacharacter in the subject, and the subject
 (the prefix) can no longer carry a prefix-breaking one in the first place.
 
+Forty-ninth sweep — the `account=` tag was emitted unescaped (input-sanitization
+session, 1/N) (2026-07-23): opening a session dedicated to user-input
+sanitization by mapping every client-derived string to where it lands on the
+wire. The length-only fields (realname, away, topic, kick/part/quit reasons)
+all flow into *trailing* parameters, where any byte but CR/LF/NUL — already
+rejected at parse — is legal; those are fine. The exposure is in *middle*
+parameters, the source prefix, and *tag values*, which have stricter grammars.
+
+The account name is the field with the widest such exposure — it rides in the
+`account=` message tag, the `ACCOUNT`/WHOISACCOUNT/extended-join middle params,
+and SASL numerics. Account names come from a validated nick (NickServ REGISTER)
+or `sanitize_account_name` (OIDC), and *both* permit `\` — a legal nick
+character. In the middle-parameter positions a backslash is harmless, but in the
+`account=` **tag** a raw `\` is an escape introducer: a client decodes
+`account=a\b` as `ab`, and `account=a\sadmin` as `a admin`, attributing the
+message to a different account than the one that spoke — an identity that bots
+and clients make trust decisions on. `account=` is now escaped with
+`escape_tag_value`, like every other tag value; the label tag was already
+escaped at capture, and the remaining tags (`time`/`msgid`/`batch`) are
+server-generated.
+
+A regression test identifies to an account named `a\b`, then checks the relayed
+tag is `@account=a\\b` and that re-parsing recovers `a\b`. account-tag,
+message-tags and labeled-response conformance are unchanged.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

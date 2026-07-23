@@ -5430,3 +5430,48 @@ fn username_is_sanitized_so_the_source_prefix_cannot_be_spoofed() {
     let user = prefix.split('!').nth(1).and_then(|r| r.split('@').next());
     assert_eq!(user, Some("aevil.comx"), "sanitized username: {prefix}");
 }
+
+#[test]
+fn account_tag_value_is_escaped() {
+    // A nick (hence an account name) may contain `\`, a legal nick character.
+    // In an `account=` tag it must be escaped, or a client decodes `a\b` as
+    // `ab` and attributes the message to a different account.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "account-tag");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #acct");
+        s.drain(c);
+    }
+    s.drain(alice);
+    // bob identifies to an account whose name contains a backslash.
+    s.line(bob, "PRIVMSG NickServ :IDENTIFY pw");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: bob,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "a\\b".into(),
+        },
+    });
+    s.drain(bob);
+    s.drain(alice);
+
+    s.line(bob, "PRIVMSG #acct :hi");
+    let relayed = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains("PRIVMSG #acct"))
+        .expect("alice receives the tagged message");
+    // The tag carries the escaped form; re-parsing it recovers the real name.
+    assert!(
+        relayed.starts_with("@account=a\\\\b "),
+        "account tag not escaped: {relayed}"
+    );
+    let parsed = e6irc_proto::message::Message::parse(&relayed).expect("valid line");
+    let account = parsed
+        .tags
+        .iter()
+        .find(|t| t.key == "account")
+        .and_then(|t| t.value.as_deref());
+    assert_eq!(account, Some("a\\b"), "round-tripped account name");
+}
