@@ -24,6 +24,15 @@ jobs:
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
+      # `--all-features` is the union, so it never compiles a bridge on its
+      # own. Code behind `cfg(feature = "discord")` that happens to depend on
+      # something `matrix` pulls in builds there and breaks for the deployment
+      # that enables one bridge, which is the normal case.
+      - name: Each bridge feature on its own
+        run: |
+          for feature in discord matrix slack; do
+            cargo check -p e6ircd --all-targets --features "$feature"
+          done
       # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
       # deferred-work markers or unmessaged panics.
       - run: tools/check-noops.sh

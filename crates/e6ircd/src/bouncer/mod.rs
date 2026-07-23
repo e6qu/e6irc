@@ -313,6 +313,93 @@ pub(crate) fn nick_token(raw: &str) -> String {
 /// newline would otherwise let that text inject a second, forged IRC line into
 /// the client's stream. Real IRC-upstream lines never carry these bytes (the
 /// framing splits on them), so this is a no-op fast path for them.
+/// A `*bnc*` NOTICE telling the client its message was not delivered, because
+/// `target` is not a bridged channel on `platform`.
+///
+/// The point of this notice is that a drop is never silent, so the notice must
+/// itself arrive: `target` comes from the client's own line and is bounded only
+/// by the frame limit, which is several times the 512 bytes an IRC line gets.
+/// Interpolated whole — twice — it produced a line the receiving client's
+/// framing discards, and the silence came back. It is truncated to fit.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -> String {
+    let shown = truncate_on_char_boundary(target, 64);
+    format!(":*bnc* NOTICE {shown} :not delivered: no bridged {platform} {kind} for {shown}")
+}
+
+/// `s` cut to at most `max` bytes, never inside a character.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &s[..cut]
+}
+
+/// Render a bridged message as one or more IRC `PRIVMSG` lines: the sender is
+/// reduced to a safe nick token and the body is split to fit the line limit.
+///
+/// The body is free-form remote text of arbitrary length — Slack alone allows
+/// 40,000 characters — while an IRC line is [`MAX_LINE_LEN`] bytes including
+/// its CRLF. Emitting one over-long line does not merely bend the protocol: the
+/// receiving client's framing discards an over-long line *whole*, so the
+/// message vanishes with nothing said. It is split instead, because a bridged
+/// message must not disappear for being long.
+///
+/// Embedded newlines split too. They are line breaks in the source medium, and
+/// [`sanitize_upstream_line`] flattens them to spaces further down, which would
+/// turn a multi-line message into one run-on line.
+///
+/// An empty body still yields one line: a message was sent, and saying nothing
+/// about it would be the silent drop this exists to prevent.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+pub(crate) fn render_bridged_privmsg(
+    host: &str,
+    sender: &str,
+    channel: &str,
+    body: &str,
+) -> Vec<String> {
+    use e6irc_proto::message::MAX_LINE_LEN;
+    let nick = nick_token(sender);
+    let prefix = format!(":{nick}!{nick}@{host} PRIVMSG {channel} :");
+    // `nick_token` bounds the nick and `host` is one of three literals, so only
+    // a pathologically long configured channel name can exhaust the line. The
+    // floor keeps the split making progress if one ever does; the resulting
+    // lines would still be over-long, which is a configuration error and not
+    // something this function can paper over.
+    let budget = (MAX_LINE_LEN - 2).saturating_sub(prefix.len()).max(1);
+
+    let mut out = Vec::new();
+    for piece in body.split('\n') {
+        let piece = piece.strip_suffix('\r').unwrap_or(piece);
+        let mut rest = piece;
+        loop {
+            if rest.len() <= budget {
+                out.push(format!("{prefix}{rest}"));
+                break;
+            }
+            // Split on a character boundary — `budget` is a byte count, and
+            // slicing into the middle of a multi-byte character panics.
+            let mut cut = budget;
+            while cut > 0 && !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            // A single character wider than the budget: take it whole rather
+            // than emit an empty line forever.
+            if cut == 0 {
+                cut = rest.char_indices().nth(1).map_or(rest.len(), |(i, _)| i);
+            }
+            out.push(format!("{prefix}{}", &rest[..cut]));
+            rest = &rest[cut..];
+        }
+    }
+    out
+}
+
 fn sanitize_upstream_line(line: String) -> String {
     if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         line.chars()
@@ -617,6 +704,101 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn undelivered_notice_fits_the_line_limit() {
+        use e6irc_proto::message::MAX_LINE_LEN;
+        // The target comes from the client's own line, bounded only by the
+        // frame limit — several times what an IRC line gets. A notice the
+        // client's framing discards is the silent drop it exists to prevent.
+        let target = "#".to_string() + &"a".repeat(4_000);
+        let notice = unmapped_target_notice("Discord", "channel", &target);
+        assert!(notice.len() + 2 <= MAX_LINE_LEN, "{} bytes", notice.len());
+        // Still says which target, and still parses as one NOTICE.
+        assert!(notice.starts_with(":*bnc* NOTICE #aaa"));
+        let msg = e6irc_proto::message::Message::parse(&notice).expect("parses");
+        assert_eq!(msg.command, "NOTICE");
+        // A multi-byte target is cut between characters, not through one.
+        let wide = "#".to_string() + &"☃".repeat(4_000);
+        let notice = unmapped_target_notice("Matrix", "room", &wide);
+        assert!(notice.len() + 2 <= MAX_LINE_LEN);
+        assert!(e6irc_proto::message::Message::parse(&notice).is_ok());
+    }
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn bridged_message_is_split_to_fit_the_line_limit() {
+        use e6irc_proto::message::MAX_LINE_LEN;
+        // Slack allows 40,000 characters. Emitted as one line, the receiving
+        // client's framing discards it whole and the message is simply gone.
+        let body = "x".repeat(40_000);
+        let lines = render_bridged_privmsg("slack", "U1", "#general", &body);
+        assert!(lines.len() > 1, "a 40k body must not be one line");
+        for line in &lines {
+            assert!(
+                line.len() + 2 <= MAX_LINE_LEN,
+                "line of {} bytes exceeds the limit",
+                line.len()
+            );
+        }
+        // Nothing is lost and nothing is duplicated: the pieces reassemble.
+        let prefix = ":U1!U1@slack PRIVMSG #general :";
+        let rejoined: String = lines
+            .iter()
+            .map(|l| l.strip_prefix(prefix).expect("prefix"))
+            .collect();
+        assert_eq!(rejoined, body);
+    }
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn bridged_message_splits_on_newlines() {
+        // A newline is a line break in the source medium. Left in, it is
+        // flattened to a space downstream and the message reads as a run-on.
+        let lines = render_bridged_privmsg("discord", "bob", "#c", "one\ntwo\r\nthree");
+        assert_eq!(
+            lines,
+            vec![
+                ":bob!bob@discord PRIVMSG #c :one",
+                ":bob!bob@discord PRIVMSG #c :two",
+                ":bob!bob@discord PRIVMSG #c :three",
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn bridged_split_lands_on_character_boundaries() {
+        // The budget is a byte count; slicing into a multi-byte character
+        // panics, and taking the daemon down is what an upstream would want.
+        for width in [2usize, 3, 4] {
+            let ch = match width {
+                2 => 'é',
+                3 => '☃',
+                _ => '𝄞',
+            };
+            let body: String = std::iter::repeat_n(ch, 40_000).collect();
+            let lines = render_bridged_privmsg("matrix", "u", "#c", &body);
+            let prefix = ":u!u@matrix PRIVMSG #c :";
+            let rejoined: String = lines
+                .iter()
+                .map(|l| l.strip_prefix(prefix).expect("prefix"))
+                .collect();
+            assert_eq!(rejoined, body, "{width}-byte characters round-trip");
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn empty_bridged_message_still_says_something() {
+        // A message was sent. Emitting nothing would be the silent drop this
+        // whole function exists to prevent.
+        assert_eq!(
+            render_bridged_privmsg("slack", "U1", "#c", ""),
+            vec![":U1!U1@slack PRIVMSG #c :"]
+        );
+    }
 
     #[test]
     fn sanitize_neutralizes_embedded_crlf_and_nul() {

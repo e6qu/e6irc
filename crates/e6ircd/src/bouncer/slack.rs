@@ -176,7 +176,9 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 if let Some(m) = envelope.message
                     && let Some(channel) = id_to_channel.get(&m.channel)
                 {
-                    ends.emit_line(render_privmsg(&m.user, channel, &m.text));
+                    for line in super::render_bridged_privmsg("slack", &m.user, channel, &m.text) {
+                        ends.emit_line(line);
+                    }
                 }
             }
             cmd = ends.next_command() => match cmd {
@@ -194,8 +196,8 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         }
                     }
                     super::RouteResult::Unmapped(target) => {
-                        ends.emit_line(format!(
-                            ":*bnc* NOTICE {target} :not delivered: no bridged Slack channel for {target}"
+                        ends.emit_line(super::unmapped_target_notice(
+                            "Slack", "channel", &target,
                         ));
                     }
                     super::RouteResult::Ignore => {}
@@ -261,14 +263,6 @@ fn parse_envelope(text: &str) -> Envelope {
         disconnect: false,
         message,
     }
-}
-
-/// Render a Slack message as an IRC PRIVMSG line.
-fn render_privmsg(user: &str, channel: &str, text: &str) -> String {
-    // The user id is hostile-upstream input; reduce it to a safe nick token so
-    // it can't forge a source/command in the prefix position.
-    let nick = super::nick_token(user);
-    format!(":{nick}!{nick}@slack PRIVMSG {channel} :{text}")
 }
 
 /// A Slack Web API response's `ok` field is the error contract: `false`
@@ -400,8 +394,8 @@ mod tests {
     #[test]
     fn renders_and_routes() {
         assert_eq!(
-            render_privmsg("U1", "#general", "hi"),
-            ":U1!U1@slack PRIVMSG #general :hi"
+            crate::bouncer::render_bridged_privmsg("slack", "U1", "#general", "hi"),
+            vec![":U1!U1@slack PRIVMSG #general :hi"]
         );
         let mut map = HashMap::new();
         map.insert("#general".to_string(), "C1".to_string());

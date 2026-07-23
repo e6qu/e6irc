@@ -91,38 +91,45 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
 
     loop {
         tokio::select! {
-            result = sync(&session, Some(&since)) => match result {
-                Ok((next, messages)) => {
-                    since = next;
-                    for m in messages {
-                        // Skip our own echoes (the attached client already
-                        // saw what it sent).
-                        if m.sender == session.user_id {
-                            continue;
-                        }
-                        if let Some(channel) = session.room_to_channel.get(&m.room_id) {
-                            ends.emit_line(render_privmsg(&m.sender, channel, &m.body));
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("matrix: sync error: {e}");
-                    return super::SessionOutcome::Dropped;
-                }
-            },
-            cmd = ends.next_command() => match cmd {
-                Some(line) => match handle_command(&mut session, &line).await {
-                    Relayed::Ok => {}
-                    Relayed::Unmapped(target) => ends.emit_line(format!(
-                        ":*bnc* NOTICE {target} :not delivered: no bridged Matrix room for {target}"
-                    )),
-                    Relayed::Failed(room) => ends.emit_line(format!(
-                        ":*bnc* NOTICE * :not delivered: Matrix send to room {room} failed"
-                    )),
-                },
-                None => return super::SessionOutcome::Stopped, // every handle dropped
-            },
-        }
+                   result = sync(&session, Some(&since)) => match result {
+                       Ok((next, messages)) => {
+                           since = next;
+                           for m in messages {
+                               // Skip our own echoes (the attached client already
+                               // saw what it sent).
+                               if m.sender == session.user_id {
+                                   continue;
+                               }
+                               if let Some(channel) = session.room_to_channel.get(&m.room_id) {
+                                   for line in super::render_bridged_privmsg(
+                                       "matrix",
+                                       matrix_localpart(&m.sender),
+                                       channel,
+                                       &m.body,
+                                   ) {
+                                       ends.emit_line(line);
+                                   }
+                               }
+                           }
+                       }
+                       Err(e) => {
+                           eprintln!("matrix: sync error: {e}");
+                           return super::SessionOutcome::Dropped;
+                       }
+                   },
+                   cmd = ends.next_command() => match cmd {
+                       Some(line) => match handle_command(&mut session, &line).await {
+                           Relayed::Ok => {}
+                           Relayed::Unmapped(target) => ends.emit_line(super::unmapped_target_notice(
+            "Matrix", "room", &target,
+        )),
+                           Relayed::Failed(room) => ends.emit_line(format!(
+                               ":*bnc* NOTICE * :not delivered: Matrix send to room {room} failed"
+                           )),
+                       },
+                       None => return super::SessionOutcome::Stopped, // every handle dropped
+                   },
+               }
     }
 }
 
@@ -307,16 +314,14 @@ fn alias_to_channel(alias: &str) -> String {
     }
 }
 
-/// `@user:server` → nick `user`; render as an IRC PRIVMSG line.
-fn render_privmsg(sender: &str, channel: &str, body: &str) -> String {
-    let local = sender
+/// `@user:server` → `user`. The shared renderer reduces whatever this returns
+/// to a safe nick token; without the localpart the `@` and `:` of a full Matrix
+/// ID would survive as underscores and every bridged nick would change.
+fn matrix_localpart(sender: &str) -> &str {
+    sender
         .strip_prefix('@')
         .and_then(|s| s.split_once(':').map(|(l, _)| l))
-        .unwrap_or(sender);
-    // The sender is hostile-upstream input; reduce it to a safe nick token so it
-    // can't forge a source/command in the prefix position.
-    let nick = super::nick_token(local);
-    format!(":{nick}!{nick}@matrix PRIVMSG {channel} :{body}")
+        .unwrap_or(sender)
 }
 
 /// Percent-encode a path segment (room ids/aliases contain `!`, `#`, `:`).
@@ -341,9 +346,16 @@ mod tests {
     fn maps_alias_and_sender() {
         assert_eq!(alias_to_channel("#room:localhost"), "#room");
         assert_eq!(alias_to_channel("#plain"), "#plain");
+        assert_eq!(matrix_localpart("@alice:localhost"), "alice");
+        assert_eq!(matrix_localpart("plain"), "plain");
         assert_eq!(
-            render_privmsg("@alice:localhost", "#room", "hi there"),
-            ":alice!alice@matrix PRIVMSG #room :hi there"
+            super::super::render_bridged_privmsg(
+                "matrix",
+                matrix_localpart("@alice:localhost"),
+                "#room",
+                "hi there"
+            ),
+            vec![":alice!alice@matrix PRIVMSG #room :hi there"]
         );
     }
 
@@ -358,7 +370,14 @@ mod tests {
         // A malicious homeserver sets the sender to smuggle a space and IRC
         // metacharacters into the source-prefix position; the nick token must
         // neutralize them so no second source/command is forged.
-        let line = render_privmsg("@evil x!y@z NOTICE victim :hi:localhost", "#room", "body");
+        let lines = super::super::render_bridged_privmsg(
+            "matrix",
+            matrix_localpart("@evil x!y@z NOTICE victim :hi:localhost"),
+            "#room",
+            "body",
+        );
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
         let prefix = line
             .strip_prefix(':')
             .and_then(|l| l.split(' ').next())
