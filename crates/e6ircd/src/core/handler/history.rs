@@ -145,121 +145,22 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     };
     let (history, complete) = state.history_ring(&hist_key);
 
-    let position = |sel: &str| -> Option<usize> {
-        if let Some(msgid) = sel.strip_prefix("msgid=") {
-            history.iter().position(|e| e.msgid == msgid)
-        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
-            // first entry at/after the timestamp
-            let ts = e6irc_proto::time::parse_server_time_millis(ts)?;
-            history.iter().position(|e| e.ts >= ts)
-        } else {
-            None
-        }
+    // Pure resolution of the requested window against the in-memory ring;
+    // `None` is an unknown subcommand. Extracted so the arithmetic — which has
+    // carried off-by-one and paging-direction bugs — is unit- and
+    // differentially-fuzz-testable in isolation from the I/O around it.
+    let Some((entries, covered)) =
+        resolve_ring_window(&history, complete, sub, selector, selector2, limit)
+    else {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            &[sub, target],
+            &format!("Unknown subcommand {sub}"),
+        );
+        return;
     };
-
-    // Resolve to a window against the ring; `covered` is false when the
-    // request reaches older than the ring holds (its oldest entry is
-    // still inside the requested window), meaning PostgreSQL must serve.
-    // The ring answers completely only while it holds the channel's
-    // entire history; once overflowed or evicted (LRU), older rows live
-    // in Postgres and the request must fall back.
-    let (entries, covered): (Vec<crate::core::state::HistoryEntry>, bool) =
-        match sub.to_ascii_uppercase().as_str() {
-            // `*` is unbounded; any other selector restricts LATEST to
-            // messages strictly newer than it (draft/chathistory).
-            "LATEST" if selector == "*" => {
-                let skip = history.len().saturating_sub(limit);
-                let covered = complete || history.len() >= limit;
-                (history.iter().skip(skip).cloned().collect(), covered)
-            }
-            "LATEST" => match position(selector) {
-                Some(pos) => {
-                    let start = pos + 1;
-                    // Keep the newest `limit` of the bounded range, not the
-                    // oldest — LATEST is most-recent-first.
-                    let skip = start + history.len().saturating_sub(start).saturating_sub(limit);
-                    // The bound itself is in the ring, so everything newer is
-                    // too: no database round trip is needed.
-                    (history.iter().skip(skip).cloned().collect(), true)
-                }
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
-            },
-            "BEFORE" => match position(selector) {
-                Some(pos) => {
-                    let start = pos.saturating_sub(limit);
-                    let covered = complete || start > 0;
-                    (
-                        history.iter().take(pos).skip(start).cloned().collect(),
-                        covered,
-                    )
-                }
-                // reference past a full ring: only PG can resolve it
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
-            },
-            "AFTER" => match position(selector) {
-                Some(pos) => (
-                    history.iter().skip(pos + 1).take(limit).cloned().collect(),
-                    true,
-                ),
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
-            },
-            "AROUND" => match position(selector) {
-                Some(pos) => {
-                    let before = limit / 2;
-                    let start = pos.saturating_sub(before);
-                    let end = (pos + (limit - before)).min(history.len());
-                    // Only the older half can reach past the ring's start.
-                    let covered = complete || start > 0;
-                    (
-                        history.iter().take(end).skip(start).cloned().collect(),
-                        covered,
-                    )
-                }
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
-            },
-            "BETWEEN" => match (position(selector), position(selector2)) {
-                // Both endpoints in the ring: the span between them is
-                // contiguous and fully in memory.
-                (Some(a), Some(b)) => {
-                    // The argument order picks the paging direction: the
-                    // window is walked *from* the first selector *toward* the
-                    // second, so when the first is the newer bound a limit
-                    // smaller than the span keeps the newest entries, not the
-                    // oldest.
-                    let newest_first = a > b;
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    let start = lo + 1;
-                    let span = hi.saturating_sub(start);
-                    let skip = if newest_first {
-                        start + span.saturating_sub(limit)
-                    } else {
-                        start
-                    };
-                    (
-                        history
-                            .iter()
-                            .take(hi)
-                            .skip(skip)
-                            .take(limit)
-                            .cloned()
-                            .collect(),
-                        true,
-                    )
-                }
-                // An endpoint missing from the ring: only PG can resolve it.
-                _ => (Vec::new(), complete),
-            },
-            other => {
-                chathistory_fail(
-                    state,
-                    conn,
-                    "INVALID_PARAMS",
-                    &[sub, target],
-                    &format!("Unknown subcommand {other}"),
-                );
-                return;
-            }
-        };
 
     // The batch names the target the client asked for, echoed as given; the
     // replayed messages carry their own canonical addressing (history_page).
@@ -582,6 +483,129 @@ pub(crate) fn targets_page(
 /// (older rows may exist) and the selector is a timestamp we can bound
 /// on directly. A msgid absent from the ring is treated as ring-empty
 /// (returns nothing) rather than triggering an unbounded DB scan.
+/// Resolve a CHATHISTORY request against the in-memory ring, purely.
+///
+/// Returns the matching entries (oldest-first, as stored) and whether the ring
+/// *covers* the request — `false` means the window reaches older than the ring
+/// holds and PostgreSQL must serve it. `None` is an unknown subcommand. `sub` is
+/// matched case-insensitively; `selector`/`selector2` are `msgid=`/`timestamp=`
+/// references (or `*`), `limit` the requested count.
+///
+/// This is the arithmetic the whole subsystem turns on and the part that has
+/// carried bugs (paging direction, off-by-one at the bounds, same-second
+/// ordering) — kept pure so a unit test and the `chathistory_window` differential
+/// fuzz can pin it against a specification without a database or a live ring.
+pub(super) fn resolve_ring_window(
+    history: &[crate::core::state::HistoryEntry],
+    complete: bool,
+    sub: &str,
+    selector: &str,
+    selector2: &str,
+    limit: usize,
+) -> Option<(Vec<crate::core::state::HistoryEntry>, bool)> {
+    let position = |sel: &str| -> Option<usize> {
+        if let Some(msgid) = sel.strip_prefix("msgid=") {
+            history.iter().position(|e| e.msgid == msgid)
+        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
+            // first entry at/after the timestamp
+            let ts = e6irc_proto::time::parse_server_time_millis(ts)?;
+            history.iter().position(|e| e.ts >= ts)
+        } else {
+            None
+        }
+    };
+
+    let resolved: (Vec<crate::core::state::HistoryEntry>, bool) =
+        match sub.to_ascii_uppercase().as_str() {
+            // `*` is unbounded; any other selector restricts LATEST to
+            // messages strictly newer than it (draft/chathistory).
+            "LATEST" if selector == "*" => {
+                let skip = history.len().saturating_sub(limit);
+                let covered = complete || history.len() >= limit;
+                (history.iter().skip(skip).cloned().collect(), covered)
+            }
+            "LATEST" => match position(selector) {
+                Some(pos) => {
+                    let start = pos + 1;
+                    // Keep the newest `limit` of the bounded range, not the
+                    // oldest — LATEST is most-recent-first.
+                    let skip = start + history.len().saturating_sub(start).saturating_sub(limit);
+                    // The bound itself is in the ring, so everything newer is
+                    // too: no database round trip is needed.
+                    (history.iter().skip(skip).cloned().collect(), true)
+                }
+                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            },
+            "BEFORE" => match position(selector) {
+                Some(pos) => {
+                    let start = pos.saturating_sub(limit);
+                    let covered = complete || start > 0;
+                    (
+                        history.iter().take(pos).skip(start).cloned().collect(),
+                        covered,
+                    )
+                }
+                // reference past a full ring: only PG can resolve it
+                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            },
+            "AFTER" => match position(selector) {
+                Some(pos) => (
+                    history.iter().skip(pos + 1).take(limit).cloned().collect(),
+                    true,
+                ),
+                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            },
+            "AROUND" => match position(selector) {
+                Some(pos) => {
+                    let before = limit / 2;
+                    let start = pos.saturating_sub(before);
+                    let end = (pos + (limit - before)).min(history.len());
+                    // Only the older half can reach past the ring's start.
+                    let covered = complete || start > 0;
+                    (
+                        history.iter().take(end).skip(start).cloned().collect(),
+                        covered,
+                    )
+                }
+                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            },
+            "BETWEEN" => match (position(selector), position(selector2)) {
+                // Both endpoints in the ring: the span between them is
+                // contiguous and fully in memory.
+                (Some(a), Some(b)) => {
+                    // The argument order picks the paging direction: the
+                    // window is walked *from* the first selector *toward* the
+                    // second, so when the first is the newer bound a limit
+                    // smaller than the span keeps the newest entries, not the
+                    // oldest.
+                    let newest_first = a > b;
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    let start = lo + 1;
+                    let span = hi.saturating_sub(start);
+                    let skip = if newest_first {
+                        start + span.saturating_sub(limit)
+                    } else {
+                        start
+                    };
+                    (
+                        history
+                            .iter()
+                            .take(hi)
+                            .skip(skip)
+                            .take(limit)
+                            .cloned()
+                            .collect(),
+                        true,
+                    )
+                }
+                // An endpoint missing from the ring: only PG can resolve it.
+                _ => (Vec::new(), complete),
+            },
+            _ => return None,
+        };
+    Some(resolved)
+}
+
 pub(super) fn needs_db_for_missing_ref(ring_full: bool, selector: &str) -> bool {
     ring_full && selector.starts_with("timestamp=")
 }
@@ -672,4 +696,167 @@ pub(crate) fn history_page(
         state.send(conn, &line);
     }
     state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::resolve_ring_window;
+    use crate::core::MessageKind;
+    use crate::core::state::HistoryEntry;
+    use e6irc_proto::time::Millis;
+
+    fn entry(i: usize) -> HistoryEntry {
+        HistoryEntry {
+            msgid: format!("m{i}"),
+            // Entries 10ms apart so a `timestamp=` between two lands cleanly.
+            ts: Millis::from_millis(1000 + i as u64 * 10),
+            sender_prefix: "n!u@h".into(),
+            kind: MessageKind::Privmsg,
+            body: format!("b{i}"),
+        }
+    }
+
+    /// Independent specification of the window arithmetic, formulated with
+    /// direct index ranges rather than the shipped `skip`/`take` chains, so a
+    /// disagreement points at a real bug in one of them.
+    fn reference(
+        history: &[HistoryEntry],
+        complete: bool,
+        sub: &str,
+        selector: &str,
+        selector2: &str,
+        limit: usize,
+    ) -> Option<(Vec<String>, bool)> {
+        let n = history.len();
+        // Same selector→index resolution the code uses (shared on purpose: this
+        // test isolates the *window* math, not the lookup).
+        let pos = |sel: &str| -> Option<usize> {
+            if let Some(m) = sel.strip_prefix("msgid=") {
+                history.iter().position(|e| e.msgid == m)
+            } else if let Some(ts) = sel.strip_prefix("timestamp=") {
+                let ts = e6irc_proto::time::parse_server_time_millis(ts)?;
+                history.iter().position(|e| e.ts >= ts)
+            } else {
+                None
+            }
+        };
+        let ids = |lo: usize, hi: usize| -> Vec<String> {
+            let (lo, hi) = (lo.min(n), hi.min(n));
+            if lo >= hi {
+                return Vec::new();
+            }
+            history[lo..hi].iter().map(|e| e.msgid.clone()).collect()
+        };
+        // Keep at most `limit` of [start, end): the newest (right) or oldest.
+        let keep_newest = |start: usize, end: usize| (end.saturating_sub(limit).max(start), end);
+        let keep_oldest = |start: usize, end: usize| (start, (start + limit).min(end));
+        // Missing non-BETWEEN reference: PG only for a timestamp past a full ring.
+        let miss = |sel: &str| (Vec::new(), !((!complete) && sel.starts_with("timestamp=")));
+
+        let out = match sub.to_ascii_uppercase().as_str() {
+            "LATEST" if selector == "*" => {
+                let (s, e) = keep_newest(0, n);
+                (ids(s, e), complete || n >= limit)
+            }
+            "LATEST" => match pos(selector) {
+                Some(p) => {
+                    let (s, e) = keep_newest(p + 1, n);
+                    (ids(s, e), true)
+                }
+                None => miss(selector),
+            },
+            "BEFORE" => match pos(selector) {
+                Some(p) => {
+                    let (s, e) = keep_newest(0, p);
+                    (ids(s, e), complete || s > 0)
+                }
+                None => miss(selector),
+            },
+            "AFTER" => match pos(selector) {
+                Some(p) => {
+                    let (s, e) = keep_oldest(p + 1, n);
+                    (ids(s, e), true)
+                }
+                None => miss(selector),
+            },
+            "AROUND" => match pos(selector) {
+                Some(p) => {
+                    let before = limit / 2;
+                    let s = p.saturating_sub(before);
+                    let e = (p + (limit - before)).min(n);
+                    (ids(s, e), complete || s > 0)
+                }
+                None => miss(selector),
+            },
+            "BETWEEN" => match (pos(selector), pos(selector2)) {
+                (Some(a), Some(b)) => {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let (s, e) = if a > b {
+                        keep_newest(lo + 1, hi)
+                    } else {
+                        keep_oldest(lo + 1, hi)
+                    };
+                    (ids(s, e), true)
+                }
+                _ => (Vec::new(), complete),
+            },
+            _ => return None,
+        };
+        Some(out)
+    }
+
+    #[test]
+    fn ring_window_matches_the_spec_exhaustively() {
+        let st = |i: usize, delta: i64| {
+            let ms = (1000 + i as u64 * 10) as i64 + delta;
+            format!(
+                "timestamp={}",
+                e6irc_proto::time::server_time(Millis::from_millis(ms as u64))
+            )
+        };
+        for n in 0..=5usize {
+            let history: Vec<HistoryEntry> = (0..n).map(entry).collect();
+            // Selectors that resolve to each index, plus misses of each kind.
+            let mut sels: Vec<String> = vec!["*".into(), "msgid=miss".into(), st(n, 100)];
+            for i in 0..n {
+                sels.push(format!("msgid=m{i}"));
+                sels.push(st(i, 0)); // exactly on entry i
+                sels.push(st(i, -5)); // between i-1 and i → resolves to i
+            }
+            for complete in [true, false] {
+                for sub in ["LATEST", "BEFORE", "AFTER", "AROUND"] {
+                    for sel in &sels {
+                        for limit in 1..=8usize {
+                            let got = resolve_ring_window(&history, complete, sub, sel, "*", limit)
+                                .map(|(v, c)| {
+                                    (v.iter().map(|e| e.msgid.clone()).collect::<Vec<_>>(), c)
+                                });
+                            let want = reference(&history, complete, sub, sel, "*", limit);
+                            assert_eq!(
+                                got, want,
+                                "{sub} sel={sel} limit={limit} n={n} complete={complete}"
+                            );
+                        }
+                    }
+                }
+                // BETWEEN takes two selectors.
+                for a in &sels {
+                    for b in &sels {
+                        for limit in 1..=8usize {
+                            let got =
+                                resolve_ring_window(&history, complete, "BETWEEN", a, b, limit)
+                                    .map(|(v, c)| {
+                                        (v.iter().map(|e| e.msgid.clone()).collect::<Vec<_>>(), c)
+                                    });
+                            let want = reference(&history, complete, "BETWEEN", a, b, limit);
+                            assert_eq!(
+                                got, want,
+                                "BETWEEN a={a} b={b} limit={limit} n={n} complete={complete}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

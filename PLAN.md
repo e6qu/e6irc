@@ -1386,6 +1386,40 @@ exponential on an all-`*` pattern, and the fuzzer correctly flagged that as a
 O(n·m) glob DP, which is both unambiguously correct and fast, so the fuzzer
 tests the matcher rather than the oracle's pathologies.
 
+Forty-seventh sweep — the CHATHISTORY window arithmetic, extracted and pinned
+against a spec (2026-07-23): sweep 46 showed differential testing against an
+independent specification is the sharpest remaining tool. The highest-value
+target for it is the CHATHISTORY ring-window resolution — the most intricate
+pure arithmetic in the codebase and the part with the longest bug history
+(paging direction, off-by-one at the bounds, the same-second ordering that
+forced the millisecond clock).
+
+It was inlined in `cmd_chathistory`, entangled with the ring lookup and the
+error path. This sweep extracts it whole into a pure `resolve_ring_window(history,
+complete, sub, selector, selector2, limit)` — the same arithmetic, now callable
+without a database or a live ring, and with the unknown-subcommand case as a
+plain `None` the caller turns into its FAIL. The refactor is behaviour-preserving
+(the CHATHISTORY unit tests and the 32 PostgreSQL query tests pass unchanged).
+
+Then it is pinned by an *exhaustive* differential test: for every ring size 0–5,
+every subcommand, every selector that resolves to each index (by msgid and by
+timestamp, on and between entries) plus each kind of miss, every limit 1–8, both
+`complete` states, and BETWEEN's full selector×selector matrix, the extracted
+function is compared against a reference formulated with direct index ranges
+rather than the shipped `skip`/`take` chains. The space is small enough to walk
+exhaustively — stronger than fuzzing here — and a divergence names the exact
+case. They agree everywhere: the arithmetic is correct. (Verified the test
+discriminates by reintroducing a one-index shift in the AFTER arm and watching
+it fail.)
+
+No bug this time — but the logic most likely to *grow* one is now both isolated
+and locked to a specification, so a future edit that shifts a bound fails a test
+rather than silently mispaging a client's history. Worth noting the reference,
+too, had to be right: its first form panicked on an empty range where BETWEEN's
+two selectors resolve to one index — a reminder the oracle needs the same care
+as the code, which the shipped iterator-based form handles without a special
+case.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
