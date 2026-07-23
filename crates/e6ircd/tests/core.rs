@@ -5475,3 +5475,38 @@ fn account_tag_value_is_escaped() {
         .and_then(|t| t.value.as_deref());
     assert_eq!(account, Some("a\\b"), "round-tripped account name");
 }
+
+#[test]
+fn malformed_client_tag_keys_are_not_relayed() {
+    // A client-only tag key can, per the parser, hold any non-delimiter byte —
+    // a control char, an emoji. The message-tags spec restricts it to
+    // `+[vendor/]name`, and relaying a malformed key would push it to everyone
+    // in the channel. Well-formed keys pass; malformed ones are dropped.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #t");
+        s.drain(c);
+    }
+    s.drain(alice);
+
+    // A valid vendor-style tag survives; an invalid one (control char) is gone.
+    s.line(
+        alice,
+        "@+example.com/reply=abc;+bad\x02key=x PRIVMSG #t :hi",
+    );
+    let relayed = s
+        .drain(bob)
+        .into_iter()
+        .find(|l| l.contains("PRIVMSG #t"))
+        .expect("bob receives it");
+    assert!(
+        relayed.contains("+example.com/reply=abc"),
+        "valid client tag dropped: {relayed}"
+    );
+    assert!(
+        !relayed.contains("bad"),
+        "malformed client tag key relayed: {relayed}"
+    );
+}
