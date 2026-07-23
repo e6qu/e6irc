@@ -1420,6 +1420,28 @@ two selectors resolve to one index — a reminder the oracle needs the same care
 as the code, which the shipped iterator-based form handles without a special
 case.
 
+Forty-eighth sweep — the other half of the ban-evasion finding: an
+unsanitized username (2026-07-23): sweep 46 fixed the glob bug that made a `*`
+in a username evade a ban, and noted the root — usernames were length-truncated
+but never *character*-filtered. That leaves a second, independent problem the
+glob fix does not touch: `@` and `!` in a username make the `nick!user@host`
+source prefix ambiguous. A client sending `USER a@evil.com …` gets the prefix
+`nick!a@evil.com@host`, which every other client parses as host
+`evil.com@host` — a user spoofing part of their own apparent host. RFC 2812
+forbids `@` and space in a username; e6ircd allowed them.
+
+`sanitize_username` now drops `!`, `@`, space, and control bytes at intake
+(then byte-bounds to USERLEN, with a fallback so an all-`@` username cannot
+collapse to the malformed `nick!@host`). The relayed prefix always has exactly
+one `!` and one `@`. A regression test connects as `USER a@evil.com!x` and
+checks the delivered prefix carries the sanitized `aevil.comx`; WHO, WHOIS, and
+connection-registration conformance and the full irctest green list are
+unchanged (real clients send plain usernames).
+
+This closes the class the sweep-46 finding pointed at from both sides: the
+matcher no longer mishandles a metacharacter in the subject, and the subject
+(the prefix) can no longer carry a prefix-breaking one in the first place.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

@@ -5392,3 +5392,41 @@ fn echoed_tokens_never_overflow_the_reply_explaining_them() {
     let n410 = out.iter().find(|l| l.contains(" 410 ")).expect("410");
     assert!(n410.len() + 2 <= 512, "410 is {} bytes", n410.len());
 }
+
+#[test]
+fn username_is_sanitized_so_the_source_prefix_cannot_be_spoofed() {
+    // A username containing `@` or `!` would make the `nick!user@host` prefix
+    // ambiguous: a client reads `nick!a@evil@host` as host `evil@host`, letting
+    // a user spoof part of their apparent host. Such characters are dropped at
+    // intake, so the relayed prefix always has exactly one `!` and one `@`.
+    let mut s = TestServer::new();
+    let alice = s.connect(1);
+    s.line(alice, "NICK alice");
+    s.line(alice, "USER a@evil.com!x 0 * :real");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" 001 ")),
+        "alice should register"
+    );
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #c");
+    }
+    s.drain(alice);
+    s.drain(bob);
+
+    s.line(alice, "PRIVMSG #c :hi");
+    let relayed = s
+        .drain(bob)
+        .into_iter()
+        .find(|l| l.contains("PRIVMSG #c"))
+        .expect("bob receives the message");
+    let prefix = relayed
+        .strip_prefix(':')
+        .and_then(|l| l.split(' ').next())
+        .expect("source prefix");
+    assert_eq!(prefix.matches('@').count(), 1, "one @ in prefix: {prefix}");
+    assert_eq!(prefix.matches('!').count(), 1, "one ! in prefix: {prefix}");
+    // The username part carries none of the stripped characters.
+    let user = prefix.split('!').nth(1).and_then(|r| r.split('@').next());
+    assert_eq!(user, Some("aevil.comx"), "sanitized username: {prefix}");
+}
