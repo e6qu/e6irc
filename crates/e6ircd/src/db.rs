@@ -219,7 +219,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         accounts.push(sender_account);
         kinds.push(kind.db().to_string());
         bodies.push(body);
-        tss.push(ts as i64);
+        tss.push(ts.as_millis() as i64);
     }
     let result = sqlx::query(
         "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
@@ -462,7 +462,7 @@ async fn set_read_marker(
     pool: &PgPool,
     account: &str,
     target: &str,
-    marker_ms: u64,
+    marker_ms: e6irc_proto::time::Millis,
 ) -> Result<(), DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let result = sqlx::query(
@@ -473,7 +473,7 @@ async fn set_read_marker(
          DO UPDATE SET marker_ts = GREATEST(read_markers.marker_ts, EXCLUDED.marker_ts)",
     )
     .bind(target)
-    .bind(marker_ms as i64)
+    .bind(marker_ms.as_millis() as i64)
     .bind(&folded)
     .execute(pool)
     .await
@@ -675,7 +675,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts < to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
                 ))
             .bind(target)
-            .bind(before_ts as i64)
+            .bind(before_ts.as_millis() as i64)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -688,7 +688,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $3"
                 ))
             .bind(target)
-            .bind(after_ts as i64)
+            .bind(after_ts.as_millis() as i64)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -708,7 +708,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $3"
                 ))
             .bind(target)
-            .bind(after_ts as i64)
+            .bind(after_ts.as_millis() as i64)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -722,7 +722,7 @@ pub async fn query_history(
                     "WHERE target = $1 AND ts >= to_timestamp($2::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4"
                 ))
             .bind(target)
-            .bind(around_ts as i64)
+            .bind(around_ts.as_millis() as i64)
             .bind(before)
             .bind(after)
             .fetch_all(pool)
@@ -743,8 +743,8 @@ pub async fn query_history(
                 history_select!("WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4")
             })
             .bind(target)
-            .bind(after_ts as i64)
-            .bind(before_ts as i64)
+            .bind(after_ts.as_millis() as i64)
+            .bind(before_ts.as_millis() as i64)
             .bind(limit as i64)
             .fetch_all(pool)
             .await
@@ -829,7 +829,7 @@ pub async fn query_history(
             |(msgid, ts, sender_prefix, kind, body): (_, _, _, String, _)| {
                 crate::core::HistoryRow {
                     msgid,
-                    ts: ts as u64,
+                    ts: e6irc_proto::time::Millis::from_millis(ts as u64),
                     sender_prefix,
                     // The `kind` column is written only from `MessageKind::db`,
                     // so an unrecognized value is a corrupt row — fall back to
@@ -855,10 +855,10 @@ pub async fn query_targets(
     pool: &PgPool,
     channels: &[String],
     me: &str,
-    min_ts: u64,
-    max_ts: u64,
+    min_ts: e6irc_proto::time::Millis,
+    max_ts: e6irc_proto::time::Millis,
     limit: usize,
-) -> Vec<(String, u64)> {
+) -> Vec<(String, e6irc_proto::time::Millis)> {
     // A conversation is keyed by both participants, so it is reported under the
     // *other* one — and under `me` for a conversation with oneself, whose key
     // has only the single participant.
@@ -889,14 +889,17 @@ pub async fn query_targets(
          LIMIT $4",
     )
     .bind(channels)
-    .bind(min_ts as f64)
-    .bind(max_ts as f64)
+    .bind(min_ts.as_millis() as f64)
+    .bind(max_ts.as_millis() as f64)
     .bind(limit as i64)
     .bind(me)
     .fetch_all(pool)
     .await;
     match rows {
-        Ok(rows) => rows.into_iter().map(|(t, ts)| (t, ts as u64)).collect(),
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(t, ts)| (t, e6irc_proto::time::Millis::from_millis(ts as u64)))
+            .collect(),
         Err(e) => {
             eprintln!("db: targets query failed: {e}");
             Vec::new()

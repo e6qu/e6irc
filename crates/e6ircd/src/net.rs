@@ -43,11 +43,12 @@ pub struct Running {
 /// `server-time` is specified to millisecond precision — a whole-second clock
 /// would give every message in the same second an identical `time=` tag,
 /// which CHATHISTORY cannot page through.
-fn wall_clock() -> u64 {
-    std::time::SystemTime::now()
+fn wall_clock() -> e6irc_proto::time::Millis {
+    let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before 1970")
-        .as_millis() as u64
+        .as_millis() as u64;
+    e6irc_proto::time::Millis::from_millis(ms)
 }
 
 /// Select aws-lc-rs as the process-wide rustls provider exactly once.
@@ -263,7 +264,13 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?
                 .into_iter()
-                .map(|(account, target, ms)| (account, target, ms.max(0) as u64))
+                .map(|(account, target, ms)| {
+                    (
+                        account,
+                        target,
+                        e6irc_proto::time::Millis::from_millis(ms.max(0) as u64),
+                    )
+                })
                 .collect(),
         );
     }

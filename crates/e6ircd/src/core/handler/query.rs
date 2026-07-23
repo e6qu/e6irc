@@ -124,7 +124,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             s.realname.clone().expect("registered"),
                             s.account.clone(),
                             // The clock is milliseconds; WHOX `l` is seconds.
-                            now.saturating_sub(s.last_active) / 1000,
+                            now.saturating_sub(s.last_active).as_secs(),
                         )
                     })
                     .collect()
@@ -197,7 +197,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 s.account.clone(),
                 who_flags(s, ""),
                 // The clock is milliseconds; WHOX `l` is seconds.
-                now.saturating_sub(s.last_active) / 1000,
+                now.saturating_sub(s.last_active).as_secs(),
             );
             match &whox {
                 Some(req) => send_whox_row(
@@ -296,8 +296,8 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 let now = (state.config.clock)();
                 // The clock is milliseconds; RPL_WHOISIDLE reports seconds
                 // idle and a Unix-*second* signon time.
-                let idle = now.saturating_sub(s.last_active) / 1000;
-                let signon = s.signon / 1000;
+                let idle = now.saturating_sub(s.last_active).as_secs();
+                let signon = s.signon.as_secs();
                 state.numeric(
                     conn,
                     RPL_WHOISIDLE,

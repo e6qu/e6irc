@@ -334,7 +334,9 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let letter = &letter[..letter.len().min(1)];
     if letter == "u" {
         // The clock is milliseconds; STATS u reports whole seconds.
-        let uptime = (state.config.clock)().saturating_sub(state.started_at) / 1000;
+        let uptime = (state.config.clock)()
+            .saturating_sub(state.started_at)
+            .as_secs();
         let (days, rem) = (uptime / 86400, uptime % 86400);
         let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
         state.numeric(

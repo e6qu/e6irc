@@ -287,21 +287,24 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             "LATEST" => match msgid_of(selector) {
                 Some(msgid) => crate::core::HistoryQuery::LatestAfterMsgid { msgid, limit },
                 None => crate::core::HistoryQuery::LatestAfter {
-                    after_ts: selector_ts(&history, selector).unwrap_or(0),
+                    after_ts: selector_ts(&history, selector)
+                        .unwrap_or(e6irc_proto::time::Millis::from_millis(0)),
                     limit,
                 },
             },
             "BEFORE" => match msgid_of(selector) {
                 Some(msgid) => crate::core::HistoryQuery::BeforeMsgid { msgid, limit },
                 None => crate::core::HistoryQuery::Before {
-                    before_ts: selector_ts(&history, selector).unwrap_or(u64::MAX),
+                    before_ts: selector_ts(&history, selector)
+                        .unwrap_or(e6irc_proto::time::Millis::from_millis(u64::MAX)),
                     limit,
                 },
             },
             "AROUND" => match msgid_of(selector) {
                 Some(msgid) => crate::core::HistoryQuery::AroundMsgid { msgid, limit },
                 None => crate::core::HistoryQuery::Around {
-                    around_ts: selector_ts(&history, selector).unwrap_or(0),
+                    around_ts: selector_ts(&history, selector)
+                        .unwrap_or(e6irc_proto::time::Millis::from_millis(0)),
                     limit,
                 },
             },
@@ -329,8 +332,8 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
                         }
                     }
                     _ => {
-                        let a = a.unwrap_or(0);
-                        let b = b.unwrap_or(u64::MAX);
+                        let a = a.unwrap_or(e6irc_proto::time::Millis::from_millis(0));
+                        let b = b.unwrap_or(e6irc_proto::time::Millis::from_millis(u64::MAX));
                         let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
                         crate::core::HistoryQuery::Between {
                             after_ts,
@@ -344,7 +347,8 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             _ => match msgid_of(selector) {
                 Some(msgid) => crate::core::HistoryQuery::AfterMsgid { msgid, limit },
                 None => crate::core::HistoryQuery::After {
-                    after_ts: selector_ts(&history, selector).unwrap_or(0),
+                    after_ts: selector_ts(&history, selector)
+                        .unwrap_or(e6irc_proto::time::Millis::from_millis(0)),
                     limit,
                 },
             },
@@ -497,12 +501,13 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     // A buffer qualifies on its *latest* message falling inside the window,
     // not on merely containing one: newer activity means the client has
     // already moved past it.
-    let latest_in_window =
-        |state: &ServerState, key: &crate::core::state::HistoryKey| -> Option<u64> {
-            let latest = state.history.get(key)?.entries.iter().map(|e| e.ts).max()?;
-            (latest > min_ts && latest < max_ts).then_some(latest)
-        };
-    let mut targets: Vec<(String, u64)> = Vec::new();
+    let latest_in_window = |state: &ServerState,
+                            key: &crate::core::state::HistoryKey|
+     -> Option<e6irc_proto::time::Millis> {
+        let latest = state.history.get(key)?.entries.iter().map(|e| e.ts).max()?;
+        (latest > min_ts && latest < max_ts).then_some(latest)
+    };
+    let mut targets: Vec<(String, e6irc_proto::time::Millis)> = Vec::new();
     for key in &keys {
         if let Some(latest) = latest_in_window(state, &key.into())
             && let Some(chan) = state.channels.get(key)
@@ -536,7 +541,7 @@ pub(crate) fn targets_page(
     state: &mut ServerState,
     conn: ConnId,
     batch_ref: &str,
-    targets: Vec<(String, u64)>,
+    targets: Vec<(String, e6irc_proto::time::Millis)>,
     label: Option<&str>,
 ) {
     let server = state.config.server_name.clone();
@@ -585,7 +590,7 @@ pub(super) fn needs_db_for_missing_ref(ring_full: bool, selector: &str) -> bool 
 pub(super) fn selector_ts(
     history: &[crate::core::state::HistoryEntry],
     selector: &str,
-) -> Option<u64> {
+) -> Option<e6irc_proto::time::Millis> {
     if let Some(msgid) = selector.strip_prefix("msgid=") {
         history.iter().find(|e| e.msgid == msgid).map(|e| e.ts)
     } else if let Some(ts) = selector.strip_prefix("timestamp=") {

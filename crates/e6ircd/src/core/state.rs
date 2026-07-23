@@ -67,7 +67,7 @@ pub struct CoreConfig {
     /// specified to milliseconds and CHATHISTORY pages by timestamp, so a
     /// whole-second clock makes messages sent in the same second
     /// indistinguishable and unpageable.
-    pub clock: fn() -> u64,
+    pub clock: fn() -> e6irc_proto::time::Millis,
     /// Per-session command-flood bucket size; `None` disables the
     /// throttle. Registered non-oper sessions spend one token per
     /// command (PING/PONG exempt) and refill one token per second.
@@ -185,25 +185,25 @@ pub(crate) struct Session {
     /// Read markers for a client that isn't logged in: per-connection and not
     /// persisted (there is no account to key them to). A logged-in client uses
     /// the account-keyed `ServerState::read_markers` instead.
-    pub anon_read_markers: HashMap<ChanKey, u64>,
+    pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
     /// Command-flood token bucket (only used when `command_burst` is set):
     /// tokens remaining, and the clock-millisecond through which refill has
     /// already been credited (it advances by whole seconds only, so a
     /// sub-second remainder carries forward instead of being discarded).
     pub flood_tokens: u32,
-    pub flood_refilled_to_ms: u64,
+    pub flood_refilled_to_ms: e6irc_proto::time::Millis,
     /// Wall-clock millisecond of the last non-keepalive command (for WHOIS
     /// idle / WHOX `l`), and of connection open (WHOIS signon).
-    pub last_active: u64,
-    pub signon: u64,
+    pub last_active: e6irc_proto::time::Millis,
+    pub signon: e6irc_proto::time::Millis,
     /// Wall-clock millisecond the connection opened, for the registration
     /// deadline (an unregistered connection that never completes is reaped).
-    pub opened_at: u64,
+    pub opened_at: e6irc_proto::time::Millis,
     /// A server-initiated liveness PING is outstanding (set by the reaper,
     /// cleared on PONG); if still set at the pong deadline the socket is reaped.
     pub awaiting_pong: bool,
     /// Wall-clock millisecond the outstanding liveness PING was sent.
-    pub last_ping_sent: u64,
+    pub last_ping_sent: e6irc_proto::time::Millis,
     /// How many database-backed replies this connection is still waiting on,
     /// and the output withheld behind them.
     ///
@@ -348,7 +348,7 @@ pub(crate) struct HistoryEntry {
     pub msgid: String,
     /// Unix **milliseconds** (see `Config::clock`): CHATHISTORY pages by this,
     /// so second granularity would make same-second messages unorderable.
-    pub ts: u64,
+    pub ts: e6irc_proto::time::Millis,
     pub sender_prefix: String,
     /// "PRIVMSG" or "NOTICE" as sent on the wire.
     pub kind: crate::core::MessageKind,
@@ -584,14 +584,14 @@ pub(crate) struct ServerState {
     pub max_users: usize,
     /// Wall-clock millisecond the server state was created (STATS u uptime,
     /// which reports the difference in whole seconds).
-    pub started_at: u64,
+    pub started_at: e6irc_proto::time::Millis,
     /// Monotonic per-process counter for msgid uniqueness.
     pub msgid_counter: u64,
     /// MONITOR: watched nick → watching connections.
     pub monitors: HashMap<NickKey, HashSet<ConnId>>,
     /// Read markers: (account, target) → epoch millis. Mirrors the
     /// PostgreSQL table; this is the hot copy the core serves.
-    pub read_markers: HashMap<(String, ChanKey), u64>,
+    pub read_markers: HashMap<(String, ChanKey), e6irc_proto::time::Millis>,
     /// Registered channels → founder account (both casefolded). The hot
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
@@ -907,7 +907,7 @@ impl ServerState {
     /// rows at boot. The stored target is already the casefolded `ChanKey`
     /// string (it was written from `ChanKey::as_str`), so it is wrapped
     /// directly — matching the key MARKREAD builds at runtime.
-    pub fn preload_read_markers(&mut self, rows: Vec<(String, String, u64)>) {
+    pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.read_markers.clear();
         for (account, target, ms) in rows {
             self.read_markers.insert((account, ChanKey(target)), ms);
@@ -1104,14 +1104,14 @@ impl ServerState {
                 multiline: None,
                 anon_read_markers: HashMap::new(),
                 flood_tokens: 0,
-                flood_refilled_to_ms: 0,
-                last_active: 0,
-                signon: 0,
+                flood_refilled_to_ms: e6irc_proto::time::Millis::from_millis(0),
+                last_active: e6irc_proto::time::Millis::from_millis(0),
+                signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,
                 awaiting_pong: false,
                 deferred_replies: 0,
                 held: Vec::new(),
-                last_ping_sent: 0,
+                last_ping_sent: e6irc_proto::time::Millis::from_millis(0),
             },
         );
         assert!(prev.is_none(), "duplicate ConnId {conn:?} from acceptor");
@@ -1323,10 +1323,10 @@ impl ServerState {
     /// message can never be replayed by CHATHISTORY bearing a different
     /// `time=` than the one it was delivered with. Reading the clock twice
     /// for the same message is exactly the bug this exists to prevent.
-    pub fn stamp(&mut self) -> (u64, String) {
+    pub fn stamp(&mut self) -> (e6irc_proto::time::Millis, String) {
         let now = (self.config.clock)();
         self.msgid_counter += 1;
-        (now, format!("{}-{}", now, self.msgid_counter))
+        (now, format!("{}-{}", now.as_millis(), self.msgid_counter))
     }
 
     /// Unique reference for a batch (no associated event timestamp).
