@@ -266,29 +266,6 @@ pub(super) struct CallbackQuery {
     pub(super) error: Option<String>,
 }
 
-/// Reduce a provider-supplied username to a safe nick-like account name:
-/// keep ASCII letters/digits and the RFC1459 "special" nick characters, drop
-/// everything else (spaces, control chars, tag/line separators). Falls back to
-/// `user` if nothing survives, and bounds the length.
-pub(super) fn sanitize_account_name(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(
-                    c,
-                    '-' | '_' | '.' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '`'
-                )
-        })
-        .take(32)
-        .collect();
-    if cleaned.is_empty() {
-        "user".to_string()
-    } else {
-        cleaned
-    }
-}
-
 pub(super) async fn oidc_callback(
     State(state): State<Arc<AppState>>,
     Path(provider_name): Path<String>,
@@ -438,7 +415,7 @@ pub(super) async fn oidc_callback(
     // The provider-supplied name is echoed into IRC numerics/tags (WHOISACCOUNT,
     // extended-join, account= tag); strip anything that isn't a safe nick-like
     // character so a spaced/control-laden username can't split a line.
-    let preferred = sanitize_account_name(&preferred);
+    let preferred = crate::sanitize::account_name(&preferred);
     let email = claims.email().map(|value| value.as_str().to_string());
     let role = jwt_string_claim(&id_token.to_string(), "role")
         .ok()

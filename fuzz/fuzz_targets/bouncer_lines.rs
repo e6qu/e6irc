@@ -15,7 +15,7 @@
 //! no CR, LF, or NUL — the bytes that would let one upstream line become two on
 //! the client's wire. Plus the obvious no-panic.
 
-use e6ircd::bouncer::fuzz::{AttachCaps, filter_tags, sanitize_upstream_line};
+use e6ircd::bouncer::fuzz::{AttachCaps, filter_tags, upstream_line};
 use libfuzzer_sys::fuzz_target;
 
 fn injects(s: &str) -> bool {
@@ -34,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
 
     // The real pipeline: a stored upstream line is sanitized on the way in and
     // tag-filtered on the way out to a client.
-    let sanitized = sanitize_upstream_line(raw.clone());
+    let sanitized = upstream_line(raw.clone());
     assert!(!injects(&sanitized), "sanitize left an injectable byte: {sanitized:?}");
 
     let delivered = filter_tags(&sanitized, caps);

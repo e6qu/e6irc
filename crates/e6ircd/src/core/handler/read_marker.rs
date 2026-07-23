@@ -90,7 +90,9 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // The set form is the only path that grows a marker map, so bound the
     // target: a real channel or a valid nick (draft/read-marker allows both
     // channel and direct-message targets).
-    if !valid_channel_name(target) && !valid_nick(target, state.config.nicklen) {
+    if !crate::sanitize::valid_channel_name(target)
+        && !crate::sanitize::valid_nick(target, state.config.nicklen)
+    {
         markread_fail(state, conn, target, "INVALID_PARAMS", "Invalid target");
         return;
     }

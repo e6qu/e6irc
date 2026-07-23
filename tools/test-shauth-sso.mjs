@@ -25,6 +25,12 @@ const browser = await chromium.launch({
   headless: true,
   executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH || undefined,
 });
+// Hard watchdog: a wedged chromium (including a hung `browser.close()`) must
+// fail this test in seconds rather than sit until the CI job's timeout.
+const watchdog = setTimeout(() => {
+  console.error("test-shauth-sso: watchdog fired after 180s; forcing exit");
+  process.exit(1);
+}, 180_000);
 const failures = [];
 try {
   await assertCredentialBoundary(browser);
@@ -145,7 +151,11 @@ try {
   assert.deepEqual(credentialBoundary.violations, []);
   assert.deepEqual(failures, []);
 } finally {
-  await browser.close();
+  clearTimeout(watchdog);
+  await Promise.race([
+    browser.close(),
+    new Promise((resolveTimeout) => setTimeout(resolveTimeout, 10_000)),
+  ]);
 }
 
 async function assertProductIdentity(page, origin, email, role) {

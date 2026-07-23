@@ -286,37 +286,6 @@ impl Buffer {
     }
 }
 
-/// Reduce an arbitrary upstream display name to a safe IRC nick token for the
-/// source-prefix position: any character that isn't nick-legal becomes `_`, so
-/// a hostile upstream can't smuggle a space or `!@:` into the prefix and forge
-/// a different source or command on the attached client's stream. Bounded in
-/// length so an oversized name can't blow the line budget.
-#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
-pub(crate) fn nick_token(raw: &str) -> String {
-    let legal = |c: char| {
-        c.is_ascii_alphanumeric()
-            || matches!(
-                c,
-                '[' | ']' | '\\' | '`' | '_' | '^' | '{' | '|' | '}' | '-'
-            )
-    };
-    let mut out: String = raw
-        .chars()
-        .map(|c| if legal(c) { c } else { '_' })
-        .take(30)
-        .collect();
-    if out.is_empty() {
-        out.push('_');
-    }
-    out
-}
-
-/// Neutralize embedded CR/LF/NUL in a synthesized upstream line before it is
-/// buffered or broadcast to attached clients. A bridge builds lines from
-/// free-form remote text (Discord/Slack/Matrix message bodies); an embedded
-/// newline would otherwise let that text inject a second, forged IRC line into
-/// the client's stream. Real IRC-upstream lines never carry these bytes (the
-/// framing splits on them), so this is a no-op fast path for them.
 /// A `*bnc*` NOTICE telling the client its message was not delivered, because
 /// `target` is not a bridged channel on `platform`.
 ///
@@ -355,7 +324,7 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
 /// message must not disappear for being long.
 ///
 /// Embedded newlines split too. They are line breaks in the source medium, and
-/// [`sanitize_upstream_line`] flattens them to spaces further down, which would
+/// [`crate::sanitize::upstream_line`] flattens them to spaces further down, which would
 /// turn a multi-line message into one run-on line.
 ///
 /// An empty body still yields one line: a message was sent, and saying nothing
@@ -368,7 +337,7 @@ pub(crate) fn render_bridged_privmsg(
     body: &str,
 ) -> Vec<String> {
     use e6irc_proto::message::MAX_LINE_LEN;
-    let nick = nick_token(sender);
+    let nick = crate::sanitize::nick_token(sender);
     let prefix = format!(":{nick}!{nick}@{host} PRIVMSG {channel} :");
     // `nick_token` bounds the nick and `host` is one of three literals, so only
     // a pathologically long configured channel name can exhaust the line. The
@@ -404,22 +373,6 @@ pub(crate) fn render_bridged_privmsg(
     out
 }
 
-fn sanitize_upstream_line(line: String) -> String {
-    if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
-        line.chars()
-            .map(|c| {
-                if matches!(c, '\r' | '\n' | '\0') {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect()
-    } else {
-        line
-    }
-}
-
 impl NetworkHandle {
     /// Send a raw line to the upstream network.
     pub fn send(&self, line: &str) -> bool {
@@ -446,7 +399,8 @@ impl NetworkHandle {
             // access would otherwise be replayed to an attaching client verbatim.
             // Both ways into the buffer sanitize, so no reader has to ask which
             // one a line arrived through.
-            buf.lines.push_front(sanitize_upstream_line(line.clone()));
+            buf.lines
+                .push_front(crate::sanitize::upstream_line(line.clone()));
         }
     }
 
@@ -497,11 +451,11 @@ pub struct DriverEnds {
 
 impl DriverEnds {
     /// Record a line to the detached buffer and broadcast it live. The line
-    /// is neutralized first (see [`sanitize_upstream_line`]) so a bridge that
+    /// is neutralized first (see [`crate::sanitize::upstream_line`]) so a bridge that
     /// builds it from free-form remote text cannot inject a second IRC line
     /// into an attached client's stream.
     pub fn emit_line(&self, line: String) {
-        let line = sanitize_upstream_line(line);
+        let line = crate::sanitize::upstream_line(line);
         self.buffer
             .lock()
             .expect("buffer poisoned")
@@ -722,9 +676,9 @@ pub mod fuzz {
         super::filter_tags(line, caps)
     }
 
-    /// Wrapper over the private [`super::sanitize_upstream_line`].
-    pub fn sanitize_upstream_line(line: String) -> String {
-        super::sanitize_upstream_line(line)
+    /// Wrapper over [`crate::sanitize::upstream_line`].
+    pub fn upstream_line(line: String) -> String {
+        crate::sanitize::upstream_line(line)
     }
 }
 
@@ -833,12 +787,12 @@ mod tests {
         // able to inject a second IRC line into an attached client's stream.
         let injected =
             ":a!a@bridge PRIVMSG #c :hi\r\n:nickserv!s@svc PRIVMSG victim :give me your password";
-        let safe = sanitize_upstream_line(injected.to_string());
+        let safe = crate::sanitize::upstream_line(injected.to_string());
         assert!(!safe.contains('\r') && !safe.contains('\n'));
         assert!(!safe.contains('\0'));
         // A clean line is returned unchanged (fast path).
         let clean = ":a!a@irc PRIVMSG #c :hello there".to_string();
-        assert_eq!(sanitize_upstream_line(clean.clone()), clean);
+        assert_eq!(crate::sanitize::upstream_line(clean.clone()), clean);
     }
 
     #[test]
