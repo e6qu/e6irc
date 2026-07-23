@@ -96,6 +96,40 @@ These are project-wide rules, enforced in review and (where possible) CI:
     one statement — or explaining why a corner was cut — are refactor
     signals. Make the invariant real, or just do the thing properly,
     until the defense is unnecessary.
+
+  The invariants this principle has actually installed, each closing a
+  class that had bitten (a spot patch would have left the class open):
+  - `ChanKey`/`NickKey`/`HistoryKey` — casefolded map keys are a distinct
+    type from display names, constructible only via `chan_key`/`nick_key`,
+    so "index the channel table with un-casefolded input" cannot be written.
+  - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
+    carry a line*, so a driver can't route text past the CR/LF sanitizer and
+    the detached-buffer append; the bypass is a compile error, not a lint.
+  - `MessageKind` (PRIVMSG/NOTICE) — one type with `wire()`, `db()` and
+    `is_loud()`, so the uppercase verb, the lowercase storage token, and the
+    "does it auto-reply" rule cannot drift; before, the ring and the database
+    stored different casings of the same message.
+  - `StatusSigil` — the STATUSMSG `@`/`+` target sigil is `Option<enum>`, so
+    "does this enter history / narrow the audience" is `is_none()` and a
+    method, not a byte compared against `0`.
+  - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
+    `&str`, so two fields cannot be transposed at a call site.
+  - `stamp()` returns the `(ts, msgid)` pair from one clock read, so a
+    message's server-time tag and its history copy cannot disagree.
+  - The wire-length **runtime** invariant (§7.1): where a *type* is
+    impractical (every outbound line is a `String`), a debug-build assertion
+    at the one send funnel makes the class machine-checked by the test and
+    fuzz suites instead. The technique generalizes: when the value can't be
+    typed, put one check at the one choke point and let the fuzzers find
+    regressions.
+
+  Not yet closed, recorded so it is chosen deliberately: epoch time is a bare
+  `u64` in both milliseconds (the clock, message `ts`) and seconds (the coarse
+  `*_secs` display fields), guarded only by naming. A `Millis` newtype at the
+  `server_time`/clock boundary would make the two historical `server_time(x *
+  1000)` unit bugs compile errors; it is a large cross-crate refactor (~20 `ts`
+  fields, every DbRequest/DbReply variant, the SQL edge) held for a dedicated
+  pass rather than bundled where it could not land green.
 - **The boy-scout rule (hard).** Leave the code cleaner than you found
   it; if you see something broken, fix it — even when it looks unrelated.
   Everything here is one system, so nothing is truly unrelated; a defect

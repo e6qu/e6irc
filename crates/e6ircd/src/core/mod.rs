@@ -198,8 +198,7 @@ pub enum DbRequest {
         dm_peers: Vec<String>,
         sender_prefix: String,
         sender_account: Option<String>,
-        /// "privmsg" or "notice".
-        kind: &'static str,
+        kind: MessageKind,
         body: String,
         /// Unix milliseconds.
         ts: u64,
@@ -287,13 +286,62 @@ pub enum HistoryQuery {
     },
 }
 
+/// PRIVMSG or NOTICE — the only two message kinds that carry a body, are
+/// delivered to an audience, and enter history. A single type instead of a
+/// `&str` so the three forms of the name cannot drift: the uppercase wire verb
+/// ([`MessageKind::wire`]), the lowercase storage token ([`MessageKind::db`],
+/// the `messages.kind` column), and the "does it trigger automatic replies"
+/// rule ([`MessageKind::is_loud`] — NOTICE never does). Before this they were
+/// carried as a string that was uppercased in one place and lowercased in
+/// another, so the ring and the database stored different casings of the same
+/// message; now the casing exists only at the edges where it is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Privmsg,
+    Notice,
+}
+
+impl MessageKind {
+    /// The uppercase verb as it appears on the wire.
+    pub fn wire(self) -> &'static str {
+        match self {
+            MessageKind::Privmsg => "PRIVMSG",
+            MessageKind::Notice => "NOTICE",
+        }
+    }
+
+    /// The lowercase token stored in the `messages.kind` column.
+    pub fn db(self) -> &'static str {
+        match self {
+            MessageKind::Privmsg => "privmsg",
+            MessageKind::Notice => "notice",
+        }
+    }
+
+    /// PRIVMSG triggers automatic replies (error numerics, away auto-reply);
+    /// NOTICE must never trigger any (Modern IRC), so it is silent.
+    pub fn is_loud(self) -> bool {
+        matches!(self, MessageKind::Privmsg)
+    }
+
+    /// Parse the stored [`MessageKind::db`] token; `None` for anything else,
+    /// so a corrupt or unexpected `kind` column surfaces rather than defaulting.
+    pub fn from_db(token: &str) -> Option<Self> {
+        match token {
+            "privmsg" => Some(MessageKind::Privmsg),
+            "notice" => Some(MessageKind::Notice),
+            _ => None,
+        }
+    }
+}
+
 /// One rendered history row, newest-last, as the DB returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRow {
     pub msgid: String,
     pub ts: u64,
     pub sender_prefix: String,
-    pub kind: String,
+    pub kind: MessageKind,
     pub body: String,
 }
 

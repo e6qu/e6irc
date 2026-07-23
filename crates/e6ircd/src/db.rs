@@ -217,7 +217,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         peers.push((!dm_peers.is_empty()).then(|| dm_peers.join("!")));
         prefixes.push(sender_prefix);
         accounts.push(sender_account);
-        kinds.push(kind.to_string());
+        kinds.push(kind.db().to_string());
         bodies.push(body);
         tss.push(ts as i64);
     }
@@ -826,12 +826,18 @@ pub async fn query_history(
     }
     rows.into_iter()
         .map(
-            |(msgid, ts, sender_prefix, kind, body)| crate::core::HistoryRow {
-                msgid,
-                ts: ts as u64,
-                sender_prefix,
-                kind,
-                body,
+            |(msgid, ts, sender_prefix, kind, body): (_, _, _, String, _)| {
+                crate::core::HistoryRow {
+                    msgid,
+                    ts: ts as u64,
+                    sender_prefix,
+                    // The `kind` column is written only from `MessageKind::db`,
+                    // so an unrecognized value is a corrupt row — fall back to
+                    // PRIVMSG (the louder kind) rather than drop the message.
+                    kind: crate::core::MessageKind::from_db(&kind)
+                        .unwrap_or(crate::core::MessageKind::Privmsg),
+                    body,
+                }
             },
         )
         .collect()
