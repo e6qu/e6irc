@@ -23,6 +23,12 @@ discord = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
 # Mode (WebSocket) + the Web API. Off by default. (DESIGN §10.5)
 slack = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util"]
 
+[lints.rust]
+# `cargo fuzz` compiles the crate with `--cfg fuzzing`; the bouncer exposes a
+# fuzz-only re-export module behind `#[cfg(fuzzing)]`. Declare the cfg so the
+# `unexpected_cfgs` lint (denied in the CI guards) knows it is expected.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [dependencies]
 e6irc-proto = { path = "../e6irc-proto" }
 e6irc-queue = { path = "../e6irc-queue" }

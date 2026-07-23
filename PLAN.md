@@ -1323,6 +1323,41 @@ sweep to one change.
 authorization joins the set of preconditions the type system enforces rather
 than the reviewer.
 
+Forty-fifth sweep — fuzzing the bouncer, and one small hardening it found
+(2026-07-23): after auditing the OIDC callback (textbook-correct: one-time
+state, cookie binding, PKCE, nonce, `(issuer, subject)` provisioning that never
+takes over an existing account) and the config validation (thorough; secure
+cookies fail-safe to on) and finding both sound, the remaining gap in the
+*discovery* machinery was the bouncer's upstream line-processing — the code that
+turns hostile *upstream* bytes into what an attached client sees, which the
+core fuzzers (they drive the server side) never reach.
+
+`sanitize_upstream_line` and `filter_tags` are `pub(crate)`/private, and the
+repo's rule is that a fuzz target must not widen a crate's public surface. The
+`#[cfg(fuzzing)]` idiom threads that needle: a wrapper module compiled *only*
+under cargo-fuzz's `--cfg fuzzing`, invisible to every normal build, `cargo
+test`, and the shipped binary — so the real public surface is unchanged. (The
+cfg is declared in `Cargo.toml`'s `[lints.rust] check-cfg` so the denied
+`unexpected_cfgs` lint knows it is expected.)
+
+The `bouncer_lines` target asserts the security invariant: for arbitrary bytes,
+the pipeline `sanitize` → `filter_tags` never yields a line carrying CR/LF/NUL —
+the bytes that would let one upstream line become two on the client's wire.
+6.4M runs clean.
+
+It also flagged a genuine, if benign, contract gap: `filter_tags` on a leading
+`@` with no following space (a tag section with no message body) returned it
+unchanged, so a no-tags client could receive a `@`-prefixed line. No well-formed
+upstream produces that and the IRC driver parse-validates before storing, so it
+is not reachable in production — but it is a cheap defense-in-depth to close, and
+the malformed tag-only line is now dropped. Pinned by a unit test.
+
+A second thing the fuzzer surfaced was *my test*, not the code: an assertion that
+a filtered line never starts with `@` is false for a body that itself begins with
+`@` (reachable only by feeding filter_tags malformed lines the real pipeline
+never stores). Relaxed to the invariant that actually holds and matters —
+injection-prevention — with the reasoning recorded in the target.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

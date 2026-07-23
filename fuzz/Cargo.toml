@@ -84,3 +84,9 @@ name = "base64_roundtrip"
 path = "fuzz_targets/base64_roundtrip.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "bouncer_lines"
+path = "fuzz_targets/bouncer_lines.rs"
+test = false
+doc = false
