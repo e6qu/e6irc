@@ -366,7 +366,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut framing = LineBuffer::new(4096 + 510);
+    let mut framing = LineBuffer::new(e6irc_proto::message::MAX_CLIENT_FRAME_LEN);
     let mut buf = vec![0u8; 4096];
     let mut events = Vec::new();
 

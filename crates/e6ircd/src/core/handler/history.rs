@@ -126,6 +126,22 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         );
         return;
     }
+    // `*` is the open bound, meaningful *only* for LATEST. For BEFORE/AFTER/
+    // AROUND — and for either bound of BETWEEN — it is not a real selector, and
+    // accepting it silently yields the wrong window: an empty batch for the
+    // one-selector forms, or a full unbounded scan for BETWEEN (both selectors
+    // resolve to "no position", degenerating to `0 .. u64::MAX`). Reject it as
+    // INVALID_PARAMS rather than answer a malformed request with wrong data.
+    if !sub.eq_ignore_ascii_case("LATEST") && refs.contains(&"*") {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            &[sub, target],
+            "* is only a valid selector for LATEST",
+        );
+        return;
+    }
     // The limit must be a positive integer — never silently default it.
     let limit: usize = match p
         .get(if is_between { 4 } else { 3 })

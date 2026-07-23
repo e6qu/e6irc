@@ -1593,6 +1593,56 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Fifty-fourth sweep — four-front bug hunt: a silent-hang liveness leak,
+case-inconsistent bans, phantom mode broadcasts, spec gaps (2026-07-23): four
+parallel adversarial passes (connection lifecycle, byte-level I/O, IRCv3 state
+machines, channel modes/permissions) surfaced six concrete defects, all fixed
+here in one PR.
+
+1. **A deferred `REGISTER` reply leaked on transient DB failure** — a live-client
+   silent hang. `DbReply::Unavailable`/`PasswordRejected` carry no origin, so the
+   `db_reply` arm handled SASL-verify and NickServ-identify but never a deferred
+   `REGISTER`: its hold on the connection's output was never released, and the
+   client — receiving neither its `FAIL` nor even the liveness `PING` (also held)
+   — was eventually ping-timeout-reaped. A new `Session::pending_register` flag
+   routes the origin-less reply back to REGISTER, emits the owed
+   `FAIL … TEMPORARILY_UNAVAILABLE`, and releases the defer. Regression test
+   proves the hold lifts (a pipelined PING gets its PONG).
+2. **List-mode removal/dedup was case-sensitive while matching is case-
+   insensitive** (`channel.rs`). `+b/+q/+e/+I` match subjects under the
+   casemapping, but add-dedup and removal compared masks with raw `==`, so
+   `-b FOO!*@*` failed to remove a ban stored as `foo!*@*` (leaving it enforced)
+   *while broadcasting the removal as success*, and cross-case adds double-stored
+   one logical ban against `MAXLIST`. New `mask::eq` folds comparisons the same
+   way the matcher folds subjects.
+3. **No-op mode changes were broadcast as real transitions** (`channel.rs`).
+   Re-setting an already-set boolean mode, re-op-ing an existing op, re-adding a
+   present ban, or clearing an unset key/limit all emitted a phantom `MODE` that
+   desyncs state-tracking clients. Every arm now announces only a change that
+   actually happened (Solanum semantics).
+4. **`CAP LIST` omitted `draft/multiline` and `draft/account-registration`**
+   (`registration.rs`). Both are fully enabled by `CAP REQ` but tracked outside
+   `CAP_NAMES`, and only `sasl` was special-cased in LIST — so a client
+   re-syncing its negotiated set was told an enabled cap was off. Now enumerated
+   symmetrically.
+5. **CHATHISTORY accepted `*` for non-LATEST subcommands** (`history.rs`). `*` is
+   the open bound, valid only for LATEST; for BEFORE/AFTER/AROUND it silently
+   returned an empty batch, and for BETWEEN it degenerated to an unbounded full
+   scan (`0 .. u64::MAX`). Now a hard `FAIL CHATHISTORY INVALID_PARAMS`.
+6. **The WebSocket outbound path silently mutated content** (`http/ws.rs`).
+   `String::from_utf8_lossy(&bytes).trim_end()` stripped *all* trailing
+   whitespace — dropping significant trailing spaces in a `:`-prefixed trailing
+   parameter — and corrupted non-UTF-8 message bytes into U+FFFD. Now strips only
+   the exact `\r\n` terminator and sends a binary frame for non-UTF-8 rather than
+   lossily replacing it. Boy-scout: `bouncer/serve.rs` now references
+   `MAX_CLIENT_FRAME_LEN` instead of the hand-computed `4096 + 510`.
+
+The passes also cleared: `LineBuffer::feed` is provably chunk-independent and
+bounds its buffer at `limit + 1`; the send queue's backpressure/SendQ-kill is
+exact and deadlock-free; nick/account/membership/monitor indices are all cleaned
+up on close; SASL chunk reassembly, MONITOR lifecycle, and the CHATHISTORY ring
+arithmetic (exhaustive differential test) are sound.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

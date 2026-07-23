@@ -643,6 +643,71 @@ fn banned_external_cannot_speak_to_unmoderated_channel() {
 }
 
 #[test]
+fn ban_removal_is_case_insensitive_like_matching() {
+    // A ban matches subjects case-insensitively, so removing it must compare
+    // the same way: `-b` in a different case than the stored `+b` must lift it,
+    // not leave it silently enforced.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice"); // founder → op on #x
+    s.line(alice, "JOIN #x");
+    s.drain(alice);
+    s.line(alice, "MODE #x +b BOB!*@*");
+    s.drain(alice);
+    // Remove it with a different case; the ban must actually be gone.
+    s.line(alice, "MODE #x -b bob!*@*");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("MODE #x") && l.contains("-b")),
+        "the differently-cased removal is announced: {out:#?}"
+    );
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #x");
+    assert!(
+        s.drain(bob).iter().any(|l| l.contains("JOIN")),
+        "bob joins because the ban was truly removed, not just announced"
+    );
+}
+
+#[test]
+fn no_op_mode_changes_are_not_broadcast() {
+    // Re-setting a mode already in that state must not emit a phantom change —
+    // state-tracking clients desync on a transition that did not occur.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #c");
+    s.line(alice, "MODE #c +n"); // #c is +n by default; this is a no-op
+    s.drain(alice);
+    s.line(alice, "MODE #c +n"); // still a no-op
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains("MODE #c")),
+        "a no-op +n must not broadcast"
+    );
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+    s.line(alice, "MODE #c +o bob");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("+o")),
+        "the first +o is a real change and is announced"
+    );
+    s.line(alice, "MODE #c +o bob"); // bob is already op
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains("MODE #c")),
+        "re-opping an existing op must not broadcast"
+    );
+    // A duplicate ban add is likewise suppressed.
+    s.line(alice, "MODE #c +b dup!*@*");
+    s.drain(alice);
+    s.line(alice, "MODE #c +b dup!*@*");
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains("MODE #c")),
+        "adding an already-present ban must not broadcast"
+    );
+}
+
+#[test]
 fn topic_query_on_secret_channel_hidden_from_nonmembers() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
@@ -862,6 +927,30 @@ fn cap_req_ack_and_nak() {
     s.line(c, "USER c 0 * :C");
     s.line(c, "CAP END");
     assert!(has_numeric(&s.drain(c), "001"));
+}
+
+#[test]
+fn cap_list_enumerates_multiline_when_enabled() {
+    // CAP LIST must report *every* enabled capability, including the ones
+    // tracked outside CAP_NAMES (multiline, account-registration). A client
+    // re-syncing via LIST would otherwise be told an enabled cap is off.
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.line(c, "CAP REQ :draft/multiline");
+    assert!(
+        s.drain(c)
+            .iter()
+            .any(|l| l.contains("ACK") && l.contains("draft/multiline")),
+        "multiline is ACKed"
+    );
+    s.line(c, "CAP LIST");
+    let out = s.drain(c);
+    assert!(
+        out[0].contains("draft/multiline"),
+        "CAP LIST must enumerate the enabled multiline cap: {}",
+        out[0]
+    );
 }
 
 #[test]
@@ -1558,6 +1647,49 @@ fn nickserv_identify_flow() {
 }
 
 #[test]
+fn deferred_register_reply_is_released_on_transient_db_failure() {
+    // REGISTER holds the connection's output behind a deferred reply while the
+    // DB write is in flight. A transient failure (DbReply::Unavailable carries
+    // no origin) must still be routed back to REGISTER: the client gets its FAIL
+    // and the hold is released — otherwise every later line is held and the
+    // reaper eventually ping-timeouts a live client. Regression for that leak.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    s.line(alice, "REGISTER * * hunter2");
+    let req = s.db_requests();
+    assert!(
+        matches!(
+            req.as_slice(),
+            [e6ircd::core::DbRequest::CreateAccount {
+                origin: e6ircd::core::AccountOrigin::RegisterCommand,
+                ..
+            }]
+        ),
+        "REGISTER enqueues a RegisterCommand CreateAccount: {req:#?}"
+    );
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::Unavailable,
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL REGISTER TEMPORARILY_UNAVAILABLE")),
+        "the owed FAIL is delivered on a transient DB failure: {out:#?}"
+    );
+    // The hold is gone: a pipelined PING now gets its PONG instead of being
+    // held behind a leaked defer.
+    s.line(alice, "PING :liveness");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("PONG") && l.contains("liveness")),
+        "output is not stuck behind a leaked deferred reply: {out:#?}"
+    );
+}
+
+#[test]
 fn nickserv_case_insensitive_target_and_unknown_command() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
@@ -2195,6 +2327,44 @@ fn chathistory_before_msgid() {
     assert_eq!(inner.len(), 2, "{out:#?}");
     assert!(inner[0].ends_with(":m1"), "{inner:#?}");
     assert!(inner[1].ends_with(":m2"), "{inner:#?}");
+}
+
+#[test]
+fn chathistory_star_selector_is_rejected_except_for_latest() {
+    // `*` is the open bound, valid only for LATEST. For BEFORE/AFTER/AROUND and
+    // both BETWEEN bounds it must be a hard INVALID_PARAMS, not a silent empty
+    // batch (one-selector forms) or an unbounded full scan (BETWEEN).
+    let mut s = TestServer::new_no_persistence();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #hs");
+        s.drain(c);
+    }
+    for sub in ["BEFORE", "AFTER", "AROUND"] {
+        s.line(bob, &format!("CHATHISTORY {sub} #hs * 5"));
+        let out = s.drain(bob);
+        assert!(
+            out.iter()
+                .any(|l| l.contains("FAIL CHATHISTORY INVALID_PARAMS")),
+            "{sub} with a `*` selector must FAIL INVALID_PARAMS: {out:#?}"
+        );
+    }
+    // BETWEEN with `*` bounds would otherwise degenerate to a full scan.
+    s.line(bob, "CHATHISTORY BETWEEN #hs * * 5");
+    let out = s.drain(bob);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL CHATHISTORY INVALID_PARAMS")),
+        "BETWEEN with `*` bounds must FAIL INVALID_PARAMS: {out:#?}"
+    );
+    // LATEST with `*` remains valid (a plain empty-or-populated batch, no FAIL).
+    s.line(bob, "CHATHISTORY LATEST #hs * 5");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains("FAIL")),
+        "LATEST with `*` must still be accepted: {out:#?}"
+    );
 }
 
 // ---- MONITOR ------------------------------------------------------------
