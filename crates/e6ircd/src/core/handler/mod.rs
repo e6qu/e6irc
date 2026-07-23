@@ -229,9 +229,9 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     // credit only elapsed whole seconds and advance the watermark by exactly
     // what was credited — otherwise sub-second command bursts would keep
     // resetting the watermark and the bucket would never refill at all.
-    let refill = now.saturating_sub(s.flood_refilled_to_ms) / 1000;
+    let refill = now.saturating_sub(s.flood_refilled_to_ms).as_secs();
     let tokens = (u64::from(s.flood_tokens) + refill).min(burst as u64) as u32;
-    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add(refill * 1000);
+    s.flood_refilled_to_ms = s.flood_refilled_to_ms.saturating_add_millis(refill * 1000);
     if tokens == 0 {
         return false;
     }
@@ -373,19 +373,23 @@ const PONG_TIMEOUT_MS: u64 = 60_000;
 /// registered clients, closing those that don't PONG in time (dead sockets).
 /// Without it a connection that opens and then goes silent holds its `Session`
 /// and send queue forever.
-pub(crate) fn reap_idle(state: &mut ServerState, now: u64) {
+pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::Millis) {
     let mut expired: Vec<(ConnId, &'static str)> = Vec::new();
     let mut to_ping: Vec<ConnId> = Vec::new();
     for (&conn, s) in &state.sessions {
         if !s.registered {
-            if now.saturating_sub(s.opened_at) >= REGISTRATION_TIMEOUT_MS {
+            if now.saturating_sub(s.opened_at).as_millis() >= REGISTRATION_TIMEOUT_MS {
                 expired.push((conn, "Registration timeout"));
             }
         } else if s.awaiting_pong {
-            if now.saturating_sub(s.last_ping_sent) >= PONG_TIMEOUT_MS {
+            if now.saturating_sub(s.last_ping_sent).as_millis() >= PONG_TIMEOUT_MS {
                 expired.push((conn, "Ping timeout"));
             }
-        } else if now.saturating_sub(s.last_active.max(s.last_ping_sent)) >= IDLE_PING_INTERVAL_MS {
+        } else if now
+            .saturating_sub(s.last_active.max(s.last_ping_sent))
+            .as_millis()
+            >= IDLE_PING_INTERVAL_MS
+        {
             // Idle since the later of the last real activity and the last
             // liveness PING — so a client that just answered a PING isn't
             // re-pinged every tick. `last_active` stays the pure WHOIS-idle

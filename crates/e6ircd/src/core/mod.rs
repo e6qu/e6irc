@@ -36,7 +36,7 @@ pub enum Input {
     /// A periodic timer tick carrying the current wall-clock millisecond,
     /// driving the liveness reaper (registration deadline + idle PING/PONG
     /// timeout).
-    Tick { now: u64 },
+    Tick { now: e6irc_proto::time::Millis },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply { conn: ConnId, reply: DbReply },
     /// A resolved CHATHISTORY page from PostgreSQL.
@@ -54,7 +54,7 @@ pub enum Input {
     TargetsPage {
         conn: ConnId,
         batch_ref: String,
-        targets: Vec<(String, u64)>,
+        targets: Vec<(String, e6irc_proto::time::Millis)>,
         /// Labeled-response label to place on the batch, if the command that
         /// triggered this deferred page was labeled.
         label: Option<String>,
@@ -125,8 +125,8 @@ pub enum DbRequest {
         /// conversations they take part in. Their correspondents are buffers
         /// too, and a bouncer reconnecting needs them alongside channels.
         me: String,
-        min_ts: u64,
-        max_ts: u64,
+        min_ts: e6irc_proto::time::Millis,
+        max_ts: e6irc_proto::time::Millis,
         limit: usize,
         batch_ref: String,
         /// Escaped labeled-response label to carry onto the deferred batch, if
@@ -138,7 +138,7 @@ pub enum DbRequest {
         account: String,
         /// Casefolded target.
         target: String,
-        marker_ms: u64,
+        marker_ms: e6irc_proto::time::Millis,
     },
     /// Persist a registered channel's retained topic (fire-and-forget).
     /// `topic` is `(text, setter, set_at_secs)`; `None` clears it.
@@ -201,7 +201,7 @@ pub enum DbRequest {
         kind: MessageKind,
         body: String,
         /// Unix milliseconds.
-        ts: u64,
+        ts: e6irc_proto::time::Millis,
     },
 }
 
@@ -228,7 +228,7 @@ pub enum HistoryQuery {
     /// bound — the two coincide only when fewer than `limit` messages follow
     /// it, and draft/chathistory specifies LATEST as most-recent-first.
     LatestAfter {
-        after_ts: u64,
+        after_ts: e6irc_proto::time::Millis,
         limit: usize,
     },
     LatestAfterMsgid {
@@ -236,17 +236,17 @@ pub enum HistoryQuery {
         limit: usize,
     },
     Before {
-        before_ts: u64,
+        before_ts: e6irc_proto::time::Millis,
         limit: usize,
     },
     After {
-        after_ts: u64,
+        after_ts: e6irc_proto::time::Millis,
         limit: usize,
     },
     /// Up to `limit` messages centred on `around_ts` (about half older,
     /// half newer), oldest-first.
     Around {
-        around_ts: u64,
+        around_ts: e6irc_proto::time::Millis,
         limit: usize,
     },
     /// Up to `limit` messages strictly between the two timestamps, always
@@ -255,8 +255,8 @@ pub enum HistoryQuery {
     /// second, so a reversed (newer-first) request keeps the newest messages
     /// in the span rather than the oldest.
     Between {
-        after_ts: u64,
-        before_ts: u64,
+        after_ts: e6irc_proto::time::Millis,
+        before_ts: e6irc_proto::time::Millis,
         limit: usize,
         newest_first: bool,
     },
@@ -339,7 +339,7 @@ impl MessageKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRow {
     pub msgid: String,
-    pub ts: u64,
+    pub ts: e6irc_proto::time::Millis,
     pub sender_prefix: String,
     pub kind: MessageKind,
     pub body: String,
@@ -430,7 +430,7 @@ impl Core {
 
     /// Seed the read-marker mirror from persisted rows before the worker loop
     /// starts (see [`ServerState::preload_read_markers`]).
-    pub fn preload_read_markers(&mut self, rows: Vec<(String, String, u64)>) {
+    pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.state.preload_read_markers(rows);
     }
 

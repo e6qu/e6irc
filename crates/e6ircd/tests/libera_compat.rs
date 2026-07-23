@@ -79,7 +79,7 @@ fn our_isupport() -> HashMap<String, String> {
             sasl_enabled: true,
             opers: vec![],
             max_hot_channels: 8192,
-            clock: || 0,
+            clock: || e6irc_proto::time::Millis::from_millis(0),
             command_burst: None,
         },
         db_tx,

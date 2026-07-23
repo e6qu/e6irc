@@ -153,7 +153,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
             ban_exceptions: Vec::new(),
             invite_exceptions: Vec::new(),
             // The clock is milliseconds; RPL_CREATIONTIME reports seconds.
-            created_at_secs: now / 1000,
+            created_at_secs: now.as_secs(),
         });
     if chan.members.contains_key(&conn) {
         return; // already joined: JOIN is idempotent per Solanum
@@ -433,7 +433,7 @@ pub(super) struct Delivery<'a> {
     /// `msgid` by [`ServerState::stamp`]. Passed in rather than read from the
     /// clock here so the `time=` a client sees live is byte-identical to the
     /// one CHATHISTORY later replays.
-    pub(super) ts: u64,
+    pub(super) ts: e6irc_proto::time::Millis,
     /// True to bypass labeled-response capture (echo/fan-out already labeled).
     pub(super) bypass_capture: bool,
 }
@@ -609,7 +609,7 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             text: new_text.to_string(),
             set_by: prefix.clone(),
             // The clock is milliseconds; RPL_TOPICWHOTIME reports seconds.
-            set_at_secs: now / 1000,
+            set_at_secs: now.as_secs(),
         })
     };
     state.channels.get_mut(&key).expect("checked").topic = new_topic.clone();

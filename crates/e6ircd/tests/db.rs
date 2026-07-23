@@ -753,7 +753,7 @@ PING x
         .expect("clock")
         .as_millis() as u64;
     assert!(
-        reported_ms.abs_diff(now_ms) < 60 * 60 * 1000,
+        reported_ms.as_millis().abs_diff(now_ms) < 60 * 60 * 1000,
         "history timestamp {reported} is not close to now"
     );
 
@@ -960,14 +960,14 @@ async fn chathistory_pages_from_postgres_past_the_ring() {
     }
 
     // BEFORE a timestamp past the ring must be served from PG
-    let ts = e6irc_proto::time::server_time(
+    let ts = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             * 1000
             + 60_000,
-    );
+    ));
     w.write_all(format!("CHATHISTORY BEFORE #big timestamp={ts} 50\r\n").as_bytes())
         .await
         .unwrap();
@@ -1292,15 +1292,15 @@ async fn labeled_chathistory_targets_carries_label_on_db_path() {
     }
 
     // A wide timestamp window forces the DB (QueryTargets) path.
-    let lo = e6irc_proto::time::server_time(1000);
-    let hi = e6irc_proto::time::server_time(
+    let lo = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(1000));
+    let hi = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             * 1000
             + 60_000,
-    );
+    ));
     w.write_all(
         format!("@label=tt CHATHISTORY TARGETS timestamp={lo} timestamp={hi} 50\r\n").as_bytes(),
     )
@@ -1421,26 +1421,56 @@ async fn query_targets_enumerates_active_buffers() {
     // keeps #a@2000 and #b@1500; #c is not a member so never appears.
     // Result is newest-first by each target's latest in-window message.
     // Oldest activity first: #b's latest in-window message precedes #a's.
-    let targets =
-        db::query_targets(&pool, &["#a".into(), "#b".into()], "nobody", 1200, 2500, 10).await;
+    let targets = db::query_targets(
+        &pool,
+        &["#a".into(), "#b".into()],
+        "nobody",
+        e6irc_proto::time::Millis::from_millis(1200),
+        e6irc_proto::time::Millis::from_millis(2500),
+        10,
+    )
+    .await;
     assert_eq!(
         targets,
-        vec![("#b".to_string(), 1500), ("#a".to_string(), 2000)]
+        vec![
+            (
+                "#b".to_string(),
+                e6irc_proto::time::Millis::from_millis(1500)
+            ),
+            (
+                "#a".to_string(),
+                e6irc_proto::time::Millis::from_millis(2000)
+            )
+        ]
     );
 
     // A window that excludes everything yields nothing.
     assert!(
-        db::query_targets(&pool, &["#a".into()], "nobody", 5000, 6000, 10)
-            .await
-            .is_empty()
+        db::query_targets(
+            &pool,
+            &["#a".into()],
+            "nobody",
+            e6irc_proto::time::Millis::from_millis(5000),
+            e6irc_proto::time::Millis::from_millis(6000),
+            10
+        )
+        .await
+        .is_empty()
     );
 
     // A buffer matches on its *latest* message: #a has a message inside
     // (500, 1500) but its newest is at 2000, so it has been read past.
     assert!(
-        db::query_targets(&pool, &["#a".into()], "nobody", 500, 1500, 10)
-            .await
-            .is_empty(),
+        db::query_targets(
+            &pool,
+            &["#a".into()],
+            "nobody",
+            e6irc_proto::time::Millis::from_millis(500),
+            e6irc_proto::time::Millis::from_millis(1500),
+            10
+        )
+        .await
+        .is_empty(),
         "a buffer whose latest message is outside the window must not match"
     );
 }
@@ -1562,21 +1592,59 @@ async fn query_targets_includes_direct_message_correspondents() {
     }
 
     // alice sees the channel and the conversation, reported under bob's name.
-    let targets = db::query_targets(&pool, &["#room".into()], "alice", 0, 9999, 10).await;
+    let targets = db::query_targets(
+        &pool,
+        &["#room".into()],
+        "alice",
+        e6irc_proto::time::Millis::from_millis(0),
+        e6irc_proto::time::Millis::from_millis(9999),
+        10,
+    )
+    .await;
     assert_eq!(
         targets,
-        vec![("#room".to_string(), 1000), ("bob".to_string(), 2000)]
+        vec![
+            (
+                "#room".to_string(),
+                e6irc_proto::time::Millis::from_millis(1000)
+            ),
+            (
+                "bob".to_string(),
+                e6irc_proto::time::Millis::from_millis(2000)
+            )
+        ]
     );
 
     // bob is not in #room, but still sees the conversation, under alice.
-    let targets = db::query_targets(&pool, &[], "bob", 0, 9999, 10).await;
-    assert_eq!(targets, vec![("alice".to_string(), 2000)]);
+    let targets = db::query_targets(
+        &pool,
+        &[],
+        "bob",
+        e6irc_proto::time::Millis::from_millis(0),
+        e6irc_proto::time::Millis::from_millis(9999),
+        10,
+    )
+    .await;
+    assert_eq!(
+        targets,
+        vec![(
+            "alice".to_string(),
+            e6irc_proto::time::Millis::from_millis(2000)
+        )]
+    );
 
     // A stranger sees neither.
     assert!(
-        db::query_targets(&pool, &[], "mallory", 0, 9999, 10)
-            .await
-            .is_empty(),
+        db::query_targets(
+            &pool,
+            &[],
+            "mallory",
+            e6irc_proto::time::Millis::from_millis(0),
+            e6irc_proto::time::Millis::from_millis(9999),
+            10
+        )
+        .await
+        .is_empty(),
         "a non-participant must not see the conversation"
     );
 }
@@ -1609,13 +1677,13 @@ async fn query_history_around_and_between() {
         &pool,
         "#h",
         HistoryQuery::Around {
-            around_ts: 3000,
+            around_ts: e6irc_proto::time::Millis::from_millis(3000),
             limit: 4,
         },
     )
     .await;
     assert_eq!(
-        around.iter().map(|r| r.ts).collect::<Vec<_>>(),
+        around.iter().map(|r| r.ts.as_millis()).collect::<Vec<_>>(),
         vec![1000, 2000, 3000, 4000]
     );
 
@@ -1624,15 +1692,15 @@ async fn query_history_around_and_between() {
         &pool,
         "#h",
         HistoryQuery::Between {
-            after_ts: 2000,
-            before_ts: 5000,
+            after_ts: e6irc_proto::time::Millis::from_millis(2000),
+            before_ts: e6irc_proto::time::Millis::from_millis(5000),
             limit: 10,
             newest_first: false,
         },
     )
     .await;
     assert_eq!(
-        between.iter().map(|r| r.ts).collect::<Vec<_>>(),
+        between.iter().map(|r| r.ts.as_millis()).collect::<Vec<_>>(),
         vec![3000, 4000]
     );
 
@@ -1642,26 +1710,32 @@ async fn query_history_around_and_between() {
         &pool,
         "#h",
         HistoryQuery::Between {
-            after_ts: 2000,
-            before_ts: 5000,
+            after_ts: e6irc_proto::time::Millis::from_millis(2000),
+            before_ts: e6irc_proto::time::Millis::from_millis(5000),
             limit: 1,
             newest_first: false,
         },
     )
     .await;
-    assert_eq!(oldest.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![3000]);
+    assert_eq!(
+        oldest.iter().map(|r| r.ts.as_millis()).collect::<Vec<_>>(),
+        vec![3000]
+    );
     let newest = db::query_history(
         &pool,
         "#h",
         HistoryQuery::Between {
-            after_ts: 2000,
-            before_ts: 5000,
+            after_ts: e6irc_proto::time::Millis::from_millis(2000),
+            before_ts: e6irc_proto::time::Millis::from_millis(5000),
             limit: 1,
             newest_first: true,
         },
     )
     .await;
-    assert_eq!(newest.iter().map(|r| r.ts).collect::<Vec<_>>(), vec![4000]);
+    assert_eq!(
+        newest.iter().map(|r| r.ts.as_millis()).collect::<Vec<_>>(),
+        vec![4000]
+    );
 }
 
 #[tokio::test]

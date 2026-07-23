@@ -116,6 +116,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
     `&str`, so two fields cannot be transposed at a call site.
   - `stamp()` returns the `(ts, msgid)` pair from one clock read, so a
     message's server-time tag and its history copy cannot disagree.
+  - `Millis` — epoch time is a newtype, not a bare `u64`, so a seconds value
+    cannot be passed where milliseconds are meant and `server_time(ts * 1000)`
+    does not compile. Both historical unit bugs (a whole-second clock that made
+    same-second messages unpageable, and a `* 1000` that put REST timestamps a
+    thousandfold into the future for six sweeps) are now type errors; the two
+    conversions live behind `as_secs()` and the SQL edge, named and greppable.
   - The wire-length **runtime** invariant (§7.1): where a *type* is
     impractical (every outbound line is a `String`), a debug-build assertion
     at the one send funnel makes the class machine-checked by the test and
@@ -123,13 +129,6 @@ These are project-wide rules, enforced in review and (where possible) CI:
     typed, put one check at the one choke point and let the fuzzers find
     regressions.
 
-  Not yet closed, recorded so it is chosen deliberately: epoch time is a bare
-  `u64` in both milliseconds (the clock, message `ts`) and seconds (the coarse
-  `*_secs` display fields), guarded only by naming. A `Millis` newtype at the
-  `server_time`/clock boundary would make the two historical `server_time(x *
-  1000)` unit bugs compile errors; it is a large cross-crate refactor (~20 `ts`
-  fields, every DbRequest/DbReply variant, the SQL edge) held for a dedicated
-  pass rather than bundled where it could not land green.
 - **The boy-scout rule (hard).** Leave the code cleaner than you found
   it; if you see something broken, fix it — even when it looks unrelated.
   Everything here is one system, so nothing is truly unrelated; a defect

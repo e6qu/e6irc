@@ -113,7 +113,9 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             );
             return;
         }
-        let slot = markers.entry(key).or_insert(0);
+        let slot = markers
+            .entry(key)
+            .or_insert(e6irc_proto::time::Millis::from_millis(0));
         *slot = (*slot).max(new_ms);
         let current = *slot;
         state.send(
@@ -152,7 +154,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let slot = state
         .read_markers
         .entry((account.clone(), key.clone()))
-        .or_insert(0);
+        .or_insert(e6irc_proto::time::Millis::from_millis(0));
     let moved_forward = new_ms > *slot;
     if moved_forward {
         *slot = new_ms;

@@ -29,10 +29,10 @@ use libfuzzer_sys::fuzz_target;
 
 /// Advances on every read, so events get distinct timestamps and the
 /// one-stamp-per-message paths are exercised rather than collapsed.
-fn advancing_clock() -> u64 {
+fn advancing_clock() -> e6irc_proto::time::Millis {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NOW_MS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
-    NOW_MS.fetch_add(1, Ordering::Relaxed)
+    e6irc_proto::time::Millis::from_millis(NOW_MS.fetch_add(1, Ordering::Relaxed))
 }
 
 const CONNS: u64 = 3;
@@ -101,7 +101,7 @@ fuzz_target!(|data: &[u8]| {
             b'T' => {
                 // Advance far enough that timeouts can actually fire.
                 tick += 20_000;
-                core.handle(Input::Tick { now: tick });
+                core.handle(Input::Tick { now: e6irc_proto::time::Millis::from_millis(tick) });
             }
             b'X' => core.handle(Input::Closed {
                 conn: pick(rest),
@@ -114,7 +114,7 @@ fuzz_target!(|data: &[u8]| {
                 batch_ref: "b".into(),
                 rows: vec![HistoryRow {
                     msgid: "m".into(),
-                    ts: tick,
+                    ts: e6irc_proto::time::Millis::from_millis(tick),
                     sender_prefix: "n!u@h".into(),
                     kind: e6ircd::core::MessageKind::Privmsg,
                     body: rest.to_string(),
@@ -124,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
             b'G' => core.handle(Input::TargetsPage {
                 conn: pick(rest),
                 batch_ref: "b".into(),
-                targets: vec![(rest.get(1..).unwrap_or("#c").to_string(), tick)],
+                targets: vec![(rest.get(1..).unwrap_or("#c").to_string(), e6irc_proto::time::Millis::from_millis(tick))],
                 label: None,
             }),
             _ => core.handle(Input::Line {

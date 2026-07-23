@@ -1221,6 +1221,38 @@ principle now carries the catalogue of invariants it has actually installed,
 each tagged with the class it closes, plus the one still-open class (epoch time
 as a bare `u64` in two units) recorded and scoped rather than left implicit.
 
+Forty-second sweep — epoch time is a type now (`Millis`), the last open
+unrepresentable class (2026-07-23): sweep 41 catalogued the invariants that
+close bug classes and recorded one still open — epoch time carried as a bare
+`u64` in two units, milliseconds (the clock, message `ts`, `server-time`) and
+seconds (the coarse `*_secs` display fields), guarded only by the `_secs`
+naming. It had shipped two bugs: a whole-second clock that made same-second
+messages unpageable by CHATHISTORY, and a `server_time(ts * 1000)` on an
+already-millisecond value that put every REST timestamp a thousandfold into the
+future for six sweeps.
+
+`e6irc_proto::time::Millis` is now that type. `server_time` and
+`parse_server_time_millis` take/return it, the clock is `fn() -> Millis`, and
+every millisecond-bearing field — message `ts`, `HistoryEntry`/`HistoryRow`/
+`Delivery` timestamps, `signon`/`last_active`/`started_at`/`opened_at`/
+`last_ping_sent`, the flood watermark, both read-marker maps, and every
+`*_ts` bound in the CHATHISTORY `DbRequest`s — is `Millis`. The two conversions
+survive only where they belong: `as_secs()` for the coarse display fields, and
+`as_millis() as i64` at the SQL edge, both named and greppable. `server_time(ts
+* 1000)` no longer compiles.
+
+The compiler drove it: change the four boundary signatures and chase ~90 type
+errors across proto, `db.rs`, the handlers, `net.rs`, and the tests to zero.
+No behavior change — the same milliseconds flow, now wearing their unit — so
+the whole suite (including the millisecond-sensitive CHATHISTORY ordering and
+the advancing-clock double-read test) passes unchanged. The fuzz targets, a
+separate workspace, were updated in the same pass (the lesson from sweep 41's
+CI miss).
+
+`DESIGN.md` §2's invariant catalogue gains `Millis` and loses its "not yet
+closed" note: every bug class that has bitten this codebase and admits a type
+is now closed by one.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

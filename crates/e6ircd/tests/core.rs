@@ -2,6 +2,7 @@
 //! assert on per-connection output queues. No sockets, no runtime —
 //! fully deterministic.
 
+use e6irc_proto::time::Millis;
 use e6irc_queue::{Config, Policy, Receiver, queue};
 use e6ircd::core::{ConnId, Core, CoreConfig, Input, Output};
 
@@ -29,10 +30,10 @@ impl TestServer {
     /// once for a single event — the two reads simply return the same value —
     /// so tests that assert one-timestamp-per-message need this one.
     fn new_with_advancing_clock() -> Self {
-        fn advancing() -> u64 {
+        fn advancing() -> Millis {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NOW_MS: AtomicU64 = AtomicU64::new(1_000_000_000);
-            NOW_MS.fetch_add(1, Ordering::Relaxed)
+            Millis::from_millis(NOW_MS.fetch_add(1, Ordering::Relaxed))
         }
         Self::with_config(false, advancing, 256)
     }
@@ -40,14 +41,14 @@ impl TestServer {
     /// A database-backed server with a deliberately small per-connection
     /// output bound, for exercising SendQ-style limits.
     fn with_sendq(sendq: usize) -> Self {
-        Self::with_config(true, || 1_000_000_000, sendq)
+        Self::with_config(true, || Millis::from_millis(1_000_000_000), sendq)
     }
 
     fn with_persistence(sasl_enabled: bool) -> Self {
-        Self::with_config(sasl_enabled, || 1_000_000_000, 256)
+        Self::with_config(sasl_enabled, || Millis::from_millis(1_000_000_000), 256)
     }
 
-    fn with_config(sasl_enabled: bool, clock: fn() -> u64, sendq: usize) -> Self {
+    fn with_config(sasl_enabled: bool, clock: fn() -> Millis, sendq: usize) -> Self {
         let (db_tx, db_rx) = queue(Config {
             name: "test-db",
             capacity: 64,
@@ -1081,7 +1082,7 @@ fn unregistered_connection_is_reaped_after_registration_timeout() {
     // A tick past the registration deadline (the test clock is a constant
     // 1_000_000_000 ms, so `now` is supplied via the tick).
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 60_000,
+        now: Millis::from_millis(1_000_000_000 + 60_000),
     });
     assert!(
         s.drain(c)
@@ -1098,7 +1099,7 @@ fn idle_registered_client_is_pinged_then_reaped_without_pong() {
     s.drain(alice);
     // Past the idle interval (120s) → server sends a liveness PING.
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 121_000,
+        now: Millis::from_millis(1_000_000_000 + 121_000),
     });
     assert!(
         s.drain(alice).iter().any(|l| l.starts_with("PING ")),
@@ -1106,7 +1107,7 @@ fn idle_registered_client_is_pinged_then_reaped_without_pong() {
     );
     // No PONG; past the pong deadline (60s) → reaped.
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 121_000 + 61_000,
+        now: Millis::from_millis(1_000_000_000 + 121_000 + 61_000),
     });
     assert!(
         s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1120,12 +1121,12 @@ fn pong_keeps_a_client_alive_across_reaper_ticks() {
     let alice = s.register(1, "alice");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 121_000,
+        now: Millis::from_millis(1_000_000_000 + 121_000),
     });
     assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
     s.line(alice, "PONG :irc.test.example"); // client answers the ping
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 300_000,
+        now: Millis::from_millis(1_000_000_000 + 300_000),
     });
     assert!(
         !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1184,14 +1185,14 @@ fn active_client_without_pong_is_not_reaped() {
     s.line(alice, "JOIN #a");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 121_000,
+        now: Millis::from_millis(1_000_000_000 + 121_000),
     }); // liveness PING
     assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
     // The client sends a normal command instead of a literal PONG — still alive.
     s.line(alice, "PRIVMSG #a :still here");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 300_000,
+        now: Millis::from_millis(1_000_000_000 + 300_000),
     });
     assert!(
         !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1337,7 +1338,7 @@ fn idle_client_is_not_repinged_every_tick() {
     let alice = s.register(1, "alice");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 121_000,
+        now: Millis::from_millis(1_000_000_000 + 121_000),
     }); // first liveness PING
     assert_eq!(
         s.drain(alice)
@@ -1351,7 +1352,7 @@ fn idle_client_is_not_repinged_every_tick() {
     // Only ~20s later: the ping cadence is 120s from the last PING, so no
     // re-ping — the bug was pinging on every 15s tick once idle.
     s.core.handle(Input::Tick {
-        now: 1_000_000_000 + 141_000,
+        now: Millis::from_millis(1_000_000_000 + 141_000),
     });
     assert!(
         s.drain(alice).iter().all(|l| !l.starts_with("PING ")),
@@ -2739,7 +2740,7 @@ fn hot_history_ring_is_lru_evicted() {
             sasl_enabled: false,
             opers: vec![],
             max_hot_channels: 2,
-            clock: || 1_000_000_000,
+            clock: || Millis::from_millis(1_000_000_000),
             command_burst: None,
         },
         db_tx,
@@ -2961,7 +2962,10 @@ fn chathistory_targets_enumerates_buffers() {
         conn: alice,
         batch_ref: batch_ref.clone(),
         // Epoch milliseconds, as CHATHISTORY TARGETS carries them.
-        targets: vec![("#a".into(), 1_000_000_000), ("#b".into(), 999_999_000)],
+        targets: vec![
+            ("#a".into(), Millis::from_millis(1_000_000_000)),
+            ("#b".into(), Millis::from_millis(999_999_000)),
+        ],
         label: None,
     });
     let out = s.drain(alice);
@@ -3930,7 +3934,7 @@ fn history_logmessage_gated_on_database() {
                 sasl_enabled,
                 opers: vec![],
                 max_hot_channels: 8,
-                clock: || 1_000_000_000,
+                clock: || Millis::from_millis(1_000_000_000),
                 command_burst: None,
             },
             db_tx,
