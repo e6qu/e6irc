@@ -769,6 +769,12 @@ pub(super) fn deliver_multiline(
                 }
                 line_tags.extend(common.iter().cloned());
                 let tags = tag_prefix(&line_tags);
+                // Flattened lines go to a client without draft/multiline, which
+                // gets one PRIVMSG per line and holds each to the 512-byte limit
+                // — so each is trimmed to fit, exactly as a single message is.
+                // The batch form above is left full: its recipient negotiated
+                // the capability and the larger frame that comes with it.
+                let text = fit_relayed_text(&prefix, kind, target, text);
                 send_multiline_line(
                     state,
                     recipient,
@@ -812,7 +818,13 @@ pub(super) fn deliver_multiline(
                 ts,
                 sender_prefix: prefix.clone(),
                 kind,
-                body: text.clone(),
+                // CHATHISTORY replays each stored line as its own PRIVMSG, to a
+                // requester that may not have draft/multiline — so the stored
+                // body is trimmed to fit the 512-byte replay line, the same as
+                // the single-message path stores an already-fitted body. The
+                // live batch form (above) is unaffected; it reads the full
+                // in-memory lines, not this record.
+                body: fit_relayed_text(&prefix, kind, target, text).to_string(),
             },
             sender_account.clone(),
         );

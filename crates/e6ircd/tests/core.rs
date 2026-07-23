@@ -5191,3 +5191,109 @@ fn relay_trim_lands_on_a_character_boundary() {
     assert!(body.starts_with(sent_body), "trim cut through a character");
     assert!(!sent_body.is_empty());
 }
+
+#[test]
+fn multiline_flattened_line_fits_but_batch_form_stays_full() {
+    // A multiline line near the input limit relays fine inside the batch to a
+    // capable client (which negotiated the larger frame), but a client without
+    // draft/multiline gets it flattened to a standalone PRIVMSG that must hold
+    // the 512-byte wire limit — so the flattened copy is trimmed while the
+    // batch copy is left full.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/multiline message-tags");
+    let carol = register_with_caps(&mut s, 3, "carol", "message-tags");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #m");
+    }
+    for c in [alice, bob, carol] {
+        s.drain(c);
+    }
+
+    // "PRIVMSG #m :<text>" must fit the 510 traditional input limit.
+    let text = "x".repeat(490);
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(alice, &format!("@batch=7 PRIVMSG #m :{text}"));
+    s.line(alice, "BATCH -7");
+
+    // Capable recipient: the inner PRIVMSG keeps the full body (its non-tag part
+    // legitimately exceeds 512 — that is what multiline is for).
+    let capable = s.drain(bob);
+    let inner = capable
+        .iter()
+        .find(|l| l.contains("PRIVMSG #m"))
+        .expect("bob's inner line");
+    let non_tag = inner.strip_prefix('@').map_or(inner.as_str(), |r| {
+        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(inner)
+    });
+    assert!(
+        non_tag.contains(&text),
+        "the batch form must keep the full body"
+    );
+    assert!(
+        non_tag.len() > 512,
+        "the batch form is left full (non-tag {} bytes)",
+        non_tag.len()
+    );
+
+    // Non-capable recipient: flattened to a PRIVMSG whose traditional part (the
+    // non-tag portion, which the 512 limit governs) fits the wire limit.
+    let flat = s.drain(carol);
+    let line = flat
+        .iter()
+        .find(|l| l.contains("PRIVMSG #m"))
+        .expect("carol's flattened line");
+    let non_tag = line.strip_prefix('@').map_or(line.as_str(), |r| {
+        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(line)
+    });
+    assert!(
+        non_tag.len() + 2 <= 512,
+        "flattened line's traditional part is {} bytes, over the wire limit: {line}",
+        non_tag.len()
+    );
+    // Trimmed, not dropped: a prefix of the body still arrives.
+    assert!(line.contains(":xxxx"), "some of the body survived: {line}");
+}
+
+#[test]
+fn chathistory_replay_of_a_multiline_line_fits_the_wire_limit() {
+    // A multiline line is stored per-line and replayed by CHATHISTORY as its own
+    // PRIVMSG, to a requester that need not have draft/multiline. The stored
+    // body is trimmed to fit that replay line, so the replay never emits an
+    // over-long PRIVMSG the requester's framing would discard.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
+    let bob = register_with_caps(
+        &mut s,
+        2,
+        "bob",
+        "batch draft/chathistory server-time message-tags",
+    );
+    for c in [alice, bob] {
+        s.line(c, "JOIN #m");
+        s.drain(c);
+    }
+    s.drain(alice);
+
+    let text = "y".repeat(490);
+    s.line(alice, "BATCH +5 draft/multiline #m");
+    s.line(alice, &format!("@batch=5 PRIVMSG #m :{text}"));
+    s.line(alice, "BATCH -5");
+    s.drain(bob);
+
+    s.line(bob, "CHATHISTORY LATEST #m * 10");
+    let out = s.drain(bob);
+    let replayed = out
+        .iter()
+        .find(|l| l.contains("PRIVMSG #m"))
+        .expect("the multiline line is replayed");
+    let non_tag = replayed.strip_prefix('@').map_or(replayed.as_str(), |r| {
+        r.split_once(' ').map(|(_, rest)| rest).unwrap_or(replayed)
+    });
+    assert!(
+        non_tag.len() + 2 <= 512,
+        "replayed line's traditional part is {} bytes, over the wire limit",
+        non_tag.len()
+    );
+    assert!(replayed.contains(":yyyy"), "the body survived the replay");
+}
