@@ -320,6 +320,11 @@ strip = "symbols"
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL
   client/server state machines (pure, I/O-free, unit-tested).
+- Fuzz coverage also pins the byte-stream framer (`LineBuffer::feed`: every
+  emitted line fits the inbound limit, and the line sequence is independent of
+  how the stream is chunked into reads) and `base64` (decode never panics on
+  arbitrary text; encode/decode round-trips, which SASL relies on to recover the
+  exact credential).
 - `floor_char_boundary`/`truncate_on_char_boundary`: the single primitive
   under every length-cap (topic, kick, away, composer line, bridged message).
   Slicing a `str` at a byte index inside a multi-byte character panics, and that

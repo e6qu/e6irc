@@ -72,3 +72,15 @@ name = "truncate_boundary"
 path = "fuzz_targets/truncate_boundary.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "base64_roundtrip"
+path = "fuzz_targets/base64_roundtrip.rs"
+test = false
+doc = false
