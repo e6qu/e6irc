@@ -200,23 +200,7 @@ pub(super) fn resolve_message_target(
         }
         return None;
     };
-    let member = chan.members.get(&conn);
-    let may_speak = match member {
-        Some(m) if m.op || m.voice => true,
-        Some(_) => {
-            !chan.modes.moderated
-                && !chan.is_banned(state.casemap, &prefix)
-                && !chan.is_quieted(state.casemap, &prefix)
-        }
-        // An external sender (to a -n channel) is still subject to +m and to
-        // bans/quiets — being off-channel doesn't exempt a banned mask.
-        None => {
-            !chan.modes.no_external
-                && !chan.modes.moderated
-                && !chan.is_banned(state.casemap, &prefix)
-                && !chan.is_quieted(state.casemap, &prefix)
-        }
-    };
+    let may_speak = chan.may_speak(chan.members.get(&conn), state.casemap, &prefix);
     if !may_speak {
         if loud {
             state.numeric(
@@ -434,24 +418,9 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
             state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
             return;
         };
-        let member = chan.members.get(&conn);
-        // Same gate as PRIVMSG (incl. ban/quiet), so a banned or quieted member
-        // can't relay TAGMSG (typing/reaction tags) it couldn't relay as text.
-        let may_speak = match member {
-            Some(m) if m.op || m.voice => true,
-            Some(_) => {
-                !chan.modes.moderated
-                    && !chan.is_banned(state.casemap, &prefix)
-                    && !chan.is_quieted(state.casemap, &prefix)
-            }
-            None => {
-                !chan.modes.no_external
-                    && !chan.modes.moderated
-                    && !chan.is_banned(state.casemap, &prefix)
-                    && !chan.is_quieted(state.casemap, &prefix)
-            }
-        };
-        if !may_speak {
+        // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't
+        // relay TAGMSG (typing/reaction tags) it couldn't relay as text.
+        if !chan.may_speak(chan.members.get(&conn), state.casemap, &prefix) {
             state.numeric(
                 conn,
                 ERR_CANNOTSENDTOCHAN,

@@ -5036,3 +5036,40 @@ fn monitor_online_reply_splits_to_fit_the_wire_limit() {
         );
     }
 }
+
+#[test]
+fn moderated_channel_still_allows_a_regular_member_to_set_the_topic() {
+    // +m governs messages, not topic changes: a non-op/voice member of a +m,
+    // -t channel may still set the topic. This pins the deliberate difference
+    // between the TOPIC gate and Channel::may_speak — a "cleanup" that routed
+    // TOPIC through may_speak would make +m wrongly block it, and this fails.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(bob, "JOIN #c");
+    s.drain(bob);
+    // Open the topic (-t) and moderate the channel (+m).
+    s.line(alice, "MODE #c -t+m");
+    s.drain(alice);
+    s.drain(bob);
+
+    // bob (a plain member) cannot speak under +m …
+    s.line(bob, "PRIVMSG #c :hello");
+    assert!(
+        has_numeric(&s.drain(bob), "404"),
+        "a +m channel must block a regular member's PRIVMSG"
+    );
+    // … but may still set the topic.
+    s.line(bob, "TOPIC #c :bob's topic");
+    let out = s.drain(bob);
+    assert!(
+        !has_numeric(&out, "482") && !has_numeric(&out, "404"),
+        "a regular member must be able to set the topic of a +m -t channel: {out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("TOPIC #c :bob's topic")),
+        "the topic change should be broadcast: {out:#?}"
+    );
+}
