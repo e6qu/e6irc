@@ -1467,6 +1467,36 @@ A regression test identifies to an account named `a\b`, then checks the relayed
 tag is `@account=a\\b` and that re-parsing recovers `a\b`. account-tag,
 message-tags and labeled-response conformance are unchanged.
 
+Fiftieth sweep — malformed client tag keys were relayed to the channel
+(input-sanitization session, 2/N) (2026-07-23): the audit continued through the
+last client-controllable field that reaches *other* users unfiltered. Client
+input can carry no CR/LF/NUL past the parser, so the only remaining risks are
+space in a middle parameter and unescaped specials in a tag value — and the tag
+*value* is already escaped (`client_tag_string`, sweep-49's `account=`). The gap
+was the tag *key*.
+
+The parser accepts any non-delimiter byte in a tag key — a control character, an
+emoji, anything but `;`/`=`/space/CR/LF/NUL — but the message-tags spec restricts
+a client-only key to `+` followed by an optional `vendor/` and a `[A-Za-z0-9-]`
+name. `client_tag_string` relayed the key verbatim, so a client could push a tag
+whose key held a `\x02` or non-ASCII bytes to everyone in the channel (and into
+each recipient's parser). Such keys are now dropped; a well-formed
+`+example.com/reply` still rides through. Not an injection — a key structurally
+cannot hold a delimiter — but the propagation of malformed keys is exactly the
+"don't relay unsanitized input" the spec forbids.
+
+A unit test sends one valid and one control-char-keyed client tag and checks
+only the valid one is relayed; message-tags, account-tag, and echo-message
+conformance and the full irctest green list are unchanged (real client tags are
+`[A-Za-z0-9-./]`).
+
+With this the client-input map is complete: every field is validated at intake
+(nick, channel, user, host), escaped for its tag position (account, label,
+client-tag values), key-filtered (client-tag keys), or trailing-only (realname,
+away, topic, reasons — where any surviving byte is legal). The remaining
+sanitization frontier is the bridge identities, already covered by `nick_token`
+and `sanitize_upstream_line`.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
