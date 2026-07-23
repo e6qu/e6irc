@@ -1168,17 +1168,36 @@ the message as sent (their markers sit at the front, which the trim never
 reaches). Three tests: the relay fits the limit, echo and relay are identical,
 and a body of snowmen trims on a boundary.
 
-Deliberately *not* covered here: the `draft/multiline` batch. Its constituent
-lines legitimately exceed 512 for a recipient that negotiated the capability and
-larger frames (that is the point of multiline), so its stored body must stay
-full — trimming it at storage, as the single-message path does, would shorten
-what a capable client correctly receives. The flattened delivery to a
-non-capable recipient and the CHATHISTORY replay of multiline lines can still
-overflow, and closing those needs trimming applied at *those two egress points*
-while leaving the batch form full — a different shape than storage-time trimming,
-verified separately. Surfaced here rather than half-fixed.
+Deliberately *not* covered in sweep 38, closed in sweep 39: the `draft/multiline`
+egress points. Its constituent lines legitimately exceed 512 for a recipient that
+negotiated the capability and larger frames (that is the point of multiline), so
+the live batch form stays full — but the flattened delivery to a non-capable
+recipient and the CHATHISTORY replay of multiline lines still overflowed.
 
-## Phase 0 — Scaffolding ✅ (2026-07-18)
+Thirty-ninth sweep — the multiline egress overflow (2026-07-23): closing the
+follow-up sweep 38 scoped. A `draft/multiline` line the sender sent within the
+input limit still overflows 512 at two egresses that reduce it back to a plain
+PRIVMSG: the flattened delivery to a client without the capability, and the
+CHATHISTORY replay of the stored line (which is replayed per-line, to a requester
+that need not have multiline). Both now trim with the same `fit_relayed_text`
+(sweep 38): flattened delivery trims at the wire, and the stored body is trimmed
+so replay fits.
+
+The live batch form is deliberately left full — its recipient negotiated the
+capability and the larger frame, which is the whole point of multiline. So a
+capable client sees the full line live and a fitted line on replay; that
+divergence is inherent to CHATHISTORY replaying multiline as individual PRIVMSGs
+rather than reconstructing the batch, and it is the safe direction (a
+within-limit line, never a dropped one). Two tests, each verified failing with
+its egress's trim removed: the batch form keeps a >512 non-tag body while the
+flattened copy fits, and a CHATHISTORY replay of a multiline line fits.
+
+That closes the outbound-line-length class opened in sweep 33: bridges, MONITOR,
+MODE, single-message relay, and now multiline — every path that turns internal
+state into a wire line now keeps that line inside the limit, by splitting where
+the content is a list and trimming where it is one message.
+
+## Phase 0 — Scaffolding ✅ (2026-07-18)## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
   full build/test matrix: Linux, macOS, Windows × amd64, arm64).
