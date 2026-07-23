@@ -351,7 +351,7 @@ pub(crate) struct HistoryEntry {
     pub ts: u64,
     pub sender_prefix: String,
     /// "PRIVMSG" or "NOTICE" as sent on the wire.
-    pub kind: &'static str,
+    pub kind: crate::core::MessageKind,
     pub body: String,
 }
 
@@ -423,7 +423,7 @@ pub(crate) struct MultilineBatch {
     pub bytes: usize,
     /// PRIVMSG or NOTICE, taken from the first line; the batch is one message,
     /// so it cannot change kind partway through.
-    pub kind: Option<&'static str>,
+    pub kind: Option<crate::core::MessageKind>,
 }
 
 /// One target's newest-last hot history.

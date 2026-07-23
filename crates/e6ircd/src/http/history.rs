@@ -83,7 +83,7 @@ pub(super) async fn history(
                 // put every REST timestamp a thousand-fold into the future.
                 "time": e6irc_proto::time::server_time(r.ts),
                 "from": r.sender_prefix,
-                "kind": r.kind,
+                "kind": r.kind.wire(),
                 "body": r.body,
             })
         })

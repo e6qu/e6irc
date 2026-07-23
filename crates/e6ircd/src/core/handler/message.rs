@@ -27,12 +27,12 @@ pub(super) fn cmd_message(
     conn: ConnId,
     msg: &Message,
     p: &[&str],
-    kind: &'static str,
+    kind: crate::core::MessageKind,
 ) {
     let client_tags = client_tag_string(msg);
     // Per Modern IRC, NOTICE must never trigger automatic replies —
     // including error numerics. The silence below is spec-mandated.
-    let loud = kind == "PRIVMSG";
+    let loud = kind.is_loud();
     // A line tagged with an open batch belongs to that batch, not to the wire:
     // it is buffered until BATCH - and delivered as part of one message.
     if multiline_collect(state, conn, msg, p, kind) {
@@ -119,11 +119,7 @@ pub(super) fn record_history(
         dm_peers,
         sender_prefix: prefix,
         sender_account,
-        kind: if kind == "PRIVMSG" {
-            "privmsg"
-        } else {
-            "notice"
-        },
+        kind,
         body,
         ts,
     };
@@ -135,13 +131,46 @@ pub(super) fn record_history(
     }
 }
 
+/// A STATUSMSG target sigil. `PRIVMSG @#c` reaches only ops, `+#c` only ops and
+/// voiced; an ordinary channel message carries `None`. A three-value `u8`
+/// (`0`/`b'@'`/`b'+'`) before this, which made "is it a STATUSMSG" a `!= 0`
+/// test and the audience rule a byte match; the enum names both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatusSigil {
+    /// `@#channel` — ops only.
+    OpsOnly,
+    /// `+#channel` — ops and voiced.
+    Voiced,
+}
+
+impl StatusSigil {
+    /// Split a leading `@`/`+` STATUSMSG sigil off a channel target. Returns the
+    /// sigil (if any) and the bare `#channel`. A sigil on a non-channel target
+    /// is not a STATUSMSG and is left in place.
+    fn split(target: &str) -> (Option<Self>, &str) {
+        match target.as_bytes().first() {
+            Some(b'@') if target[1..].starts_with('#') => (Some(Self::OpsOnly), &target[1..]),
+            Some(b'+') if target[1..].starts_with('#') => (Some(Self::Voiced), &target[1..]),
+            _ => (None, target),
+        }
+    }
+
+    /// Whether a member with modes `m` is in this sigil's audience.
+    fn admits(self, m: &crate::core::state::MemberModes) -> bool {
+        match self {
+            Self::OpsOnly => m.op,
+            Self::Voiced => m.op || m.voice,
+        }
+    }
+}
+
 /// What a message target resolved to, once the sender was allowed to speak.
 pub(super) enum ResolvedKind {
     Channel {
         key: crate::core::state::ChanKey,
-        /// STATUSMSG sigil (`@`/`+`), or 0 — it narrows the audience and keeps
-        /// the message out of history.
-        status_prefix: u8,
+        /// STATUSMSG sigil, or `None` for an ordinary channel message — it
+        /// narrows the audience and keeps the message out of history.
+        status_prefix: Option<StatusSigil>,
     },
     User {
         peer: ConnId,
@@ -171,10 +200,7 @@ pub(super) fn resolve_message_target(
     // STATUSMSG: a leading @ or + restricts delivery to members with at
     // least that status. The prefix stays in the target echoed to
     // recipients.
-    let (status_prefix, chan_target) = match target.strip_prefix(['@', '+']) {
-        Some(rest) if rest.starts_with('#') => (target.as_bytes()[0], rest),
-        _ => (0, target),
-    };
+    let (status_prefix, chan_target) = StatusSigil::split(target);
     if !chan_target.starts_with('#') {
         let key = state.nick_key(target);
         let Some(peer) = state.registered_peer(&key) else {
@@ -227,14 +253,7 @@ pub(super) fn resolve_message_target(
     let recipients: Vec<ConnId> = chan
         .members
         .iter()
-        .filter(|(c, m)| {
-            **c != conn
-                && match status_prefix {
-                    b'@' => m.op,
-                    b'+' => m.op || m.voice,
-                    _ => true,
-                }
-        })
+        .filter(|(c, m)| **c != conn && status_prefix.is_none_or(|sig| sig.admits(m)))
         .map(|(c, _)| *c)
         .collect();
     Some(ResolvedTarget {
@@ -262,7 +281,7 @@ pub(super) fn deliver_one_message(
     conn: ConnId,
     target: &str,
     text: &str,
-    kind: &'static str,
+    kind: crate::core::MessageKind,
     client_tags: &str,
     loud: bool,
 ) {
@@ -288,8 +307,8 @@ pub(super) fn deliver_one_message(
     // discards or truncates the line. Trim the text to fit here, once, so live
     // recipients, the echo, and CHATHISTORY all carry the identical message
     // rather than each seeing a differently-cut or dropped copy.
-    let text = fit_relayed_text(&prefix, kind, target, text);
-    let line = format!(":{prefix} {kind} {target} :{text}");
+    let text = fit_relayed_text(&prefix, kind.wire(), target, text);
+    let line = format!(":{prefix} {} {target} :{text}", kind.wire());
     if let ResolvedKind::Channel { key, status_prefix } = resolved.kind {
         let recipients = resolved.recipients;
         let sender_account = state.sessions[&conn].account.clone();
@@ -312,7 +331,7 @@ pub(super) fn deliver_one_message(
         // A STATUSMSG (@#/+#) reached only ops/voiced members. It must not
         // enter the shared history ring or the messages table, or CHATHISTORY
         // would replay it to members who were excluded from the live delivery.
-        if status_prefix != 0 {
+        if status_prefix.is_some() {
             return;
         }
         record_history(
@@ -663,8 +682,8 @@ pub(super) fn deliver_multiline(
     conn: ConnId,
     batch: crate::core::state::MultilineBatch,
 ) {
-    let kind = batch.kind.unwrap_or("PRIVMSG");
-    let loud = kind == "PRIVMSG";
+    let kind = batch.kind.unwrap_or(crate::core::MessageKind::Privmsg);
+    let loud = kind.is_loud();
     if batch.lines.is_empty() {
         return; // opened and closed without content: nothing happened
     }
@@ -744,7 +763,7 @@ pub(super) fn deliver_multiline(
                     state,
                     recipient,
                     bypass,
-                    &format!("{tags}:{prefix} {kind} {target} :{text}"),
+                    &format!("{tags}:{prefix} {} {target} :{text}", kind.wire()),
                 );
             }
             send_multiline_line(
@@ -774,12 +793,12 @@ pub(super) fn deliver_multiline(
                 // — so each is trimmed to fit, exactly as a single message is.
                 // The batch form above is left full: its recipient negotiated
                 // the capability and the larger frame that comes with it.
-                let text = fit_relayed_text(&prefix, kind, target, text);
+                let text = fit_relayed_text(&prefix, kind.wire(), target, text);
                 send_multiline_line(
                     state,
                     recipient,
                     bypass,
-                    &format!("{tags}:{prefix} {kind} {target} :{text}"),
+                    &format!("{tags}:{prefix} {} {target} :{text}", kind.wire()),
                 );
                 first = false;
             }
@@ -790,7 +809,7 @@ pub(super) fn deliver_multiline(
     // one entry per non-blank line, the first carrying the message's msgid.
     let (hist_key, peers) = match &resolved.kind {
         ResolvedKind::Channel { key, status_prefix } => {
-            if *status_prefix != 0 {
+            if status_prefix.is_some() {
                 return; // STATUSMSG never enters history (see the other path)
             }
             (crate::core::state::HistoryKey::from(key), Vec::new())
@@ -824,7 +843,7 @@ pub(super) fn deliver_multiline(
                 // the single-message path stores an already-fitted body. The
                 // live batch form (above) is unaffected; it reads the full
                 // in-memory lines, not this record.
-                body: fit_relayed_text(&prefix, kind, target, text).to_string(),
+                body: fit_relayed_text(&prefix, kind.wire(), target, text).to_string(),
             },
             sender_account.clone(),
         );
@@ -863,7 +882,7 @@ pub(super) fn multiline_collect(
     conn: ConnId,
     msg: &Message,
     p: &[&str],
-    kind: &'static str,
+    kind: crate::core::MessageKind,
 ) -> bool {
     let Some(reference) = msg
         .tags

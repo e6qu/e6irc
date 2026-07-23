@@ -1197,7 +1197,31 @@ MODE, single-message relay, and now multiline — every path that turns internal
 state into a wire line now keeps that line inside the limit, by splitting where
 the content is a list and trimming where it is one message.
 
-## Phase 0 — Scaffolding ✅ (2026-07-18)## Phase 0 — Scaffolding ✅ (2026-07-18)
+Forty-first sweep — two more bug classes made unrepresentable (2026-07-23):
+answering "what else can the design make impossible?" by turning two
+stringly/bytely-typed values into types, and writing the technique down.
+
+`MessageKind` replaces the `&'static str` that carried a message's kind. It was
+literally two casings of the same fact: the hot ring stored `"PRIVMSG"`/
+`"NOTICE"`, the database stored `"privmsg"`/`"notice"`, and each was
+re-uppercased on replay — a comment on the replay path admitted it existed "so
+the same message never replays with a different verb case depending on where it
+came from." That coincidence is now structural: one enum with `wire()` (the
+uppercase verb), `db()` (the lowercase column token), and `is_loud()` (PRIVMSG
+auto-replies, NOTICE never does). A stored kind that is neither is a corrupt row
+surfaced by `from_db`, not a silent default.
+
+`StatusSigil` replaces the `u8` STATUSMSG sigil (`0`/`b'@'`/`b'+'`). "Is this a
+STATUSMSG" was a `!= 0` test and the audience a byte match; it is now
+`Option<StatusSigil>` with `is_none()` (enters history / full audience) and an
+`admits` method. Eight sites in one file, no behavior change.
+
+The systematic half is in `DESIGN.md` §2: the "make bug classes unrepresentable"
+principle now carries the catalogue of invariants it has actually installed,
+each tagged with the class it closes, plus the one still-open class (epoch time
+as a bare `u64` in two units) recorded and scoped rather than left implicit.
+
+## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
   full build/test matrix: Linux, macOS, Windows × amd64, arm64).

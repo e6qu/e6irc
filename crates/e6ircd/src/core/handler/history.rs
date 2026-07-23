@@ -390,7 +390,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             msgid: e.msgid,
             ts: e.ts,
             sender_prefix: e.sender_prefix,
-            kind: e.kind.to_string(),
+            kind: e.kind,
             body: e.body,
         })
         .collect();
@@ -651,7 +651,7 @@ pub(crate) fn history_page(
         // holds "PRIVMSG"/"NOTICE" but the DB stores lowercase, and this is the
         // one render site for both — normalize here so the same message never
         // replays with a different verb case depending on where it came from.
-        let verb = row.kind.to_ascii_uppercase();
+        let verb = row.kind.wire();
         // Fit the body against *this* line's traditional head, not the one it
         // was stored under: a DM row is re-addressed on replay (to the requester
         // or the correspondent), so its target — and thus the space left for the
