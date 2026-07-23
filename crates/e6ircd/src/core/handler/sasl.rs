@@ -260,6 +260,29 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     format!("Invalid password for \x02{nick}\x02.")
                 };
                 state.service_notice(conn, "NickServ", &text);
+            } else if state.sessions[&conn].pending_register {
+                // A deferred REGISTER whose DB write failed transiently. Without
+                // this arm the defer would never release and the connection's
+                // output would stay held until the reaper ping-timeouts it — the
+                // exact silent hang `DbReply::Unavailable` promises to avoid.
+                state
+                    .sessions
+                    .get_mut(&conn)
+                    .expect("checked")
+                    .pending_register = false;
+                let nick = state.sessions[&conn]
+                    .nick
+                    .clone()
+                    .unwrap_or_else(|| "*".into());
+                state.emit_deferred(conn, move |state| {
+                    register_fail(
+                        state,
+                        conn,
+                        "TEMPORARILY_UNAVAILABLE",
+                        &nick,
+                        "Account registration is temporarily unavailable",
+                    );
+                });
             }
         }
         crate::core::DbReply::AccountCreated { account, origin } => {
@@ -271,6 +294,11 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     &format!("\x02{account}\x02 is now registered to your connection."),
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
+                    state
+                        .sessions
+                        .get_mut(&conn)
+                        .expect("checked")
+                        .pending_register = false;
                     let server = state.config.server_name.clone();
                     let account = account.clone();
                     state.emit_deferred(conn, move |state| {
@@ -298,6 +326,11 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     &format!("\x02{nick}\x02 is already registered."),
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
+                    state
+                        .sessions
+                        .get_mut(&conn)
+                        .expect("checked")
+                        .pending_register = false;
                     state.emit_deferred(conn, |state| {
                         register_fail(
                             state,

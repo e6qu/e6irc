@@ -800,6 +800,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
 }
 
 pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
+    let casemap = state.casemap;
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
         state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
@@ -917,8 +918,13 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     'C' => &mut chan.modes.no_ctcp,
                     _ => unreachable!("outer arm matched only these mode chars"),
                 };
-                *field = adding;
-                changes.push((adding, c, None));
+                // Announce only a real transition: re-setting a mode already in
+                // that state must not broadcast a phantom `+n`/`-s` that desyncs
+                // state-tracking clients (Solanum suppresses these no-ops).
+                if *field != adding {
+                    *field = adding;
+                    changes.push((adding, c, None));
+                }
             }
             'k' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
@@ -959,11 +965,15 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     chan.modes.key = Some(k.to_string());
                     changes.push((true, 'k', Some(k.to_string())));
                 } else {
-                    chan.modes.key = None;
                     // -k conventionally carries a placeholder arg ("*");
-                    // consume it so later modes get the right params.
+                    // consume it so later modes get the right params, whether or
+                    // not a key was actually set.
                     let _ = args.next();
-                    changes.push((false, 'k', Some("*".into())));
+                    // Announce only a real removal — clearing an unset key is a
+                    // no-op and must not broadcast a phantom `-k`.
+                    if chan.modes.key.take().is_some() {
+                        changes.push((false, 'k', Some("*".into())));
+                    }
                 }
             }
             'l' => {
@@ -993,10 +1003,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                         continue;
                     };
                     let chan = state.channels.get_mut(&key).expect("checked");
-                    chan.modes.limit = Some(n);
-                    changes.push((true, 'l', Some(l.to_string())));
-                } else {
-                    chan.modes.limit = None;
+                    // Announce only a real change to the limit value.
+                    if chan.modes.limit != Some(n) {
+                        chan.modes.limit = Some(n);
+                        changes.push((true, 'l', Some(l.to_string())));
+                    }
+                } else if chan.modes.limit.take().is_some() {
                     changes.push((false, 'l', None));
                 }
             }
@@ -1022,7 +1034,13 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     'I' => &chan_ref.invite_exceptions,
                     _ => unreachable!("outer arm matched only these list-mode chars"),
                 };
-                let is_new = !list_ref.iter().any(|b| b == mask);
+                // Compare under the casemapping, the same fold the matcher
+                // uses — a case-sensitive `==` here would let `-b FOO!*@*` fail
+                // to remove a ban stored as `foo!*@*` (while still enforcing it)
+                // and would double-store one logical ban across cases.
+                let is_new = !list_ref
+                    .iter()
+                    .any(|b| e6irc_proto::mask::eq(casemap, b, mask));
                 let combined = chan_ref.bans.len()
                     + chan_ref.quiets.len()
                     + chan_ref.ban_exceptions.len()
@@ -1045,14 +1063,24 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     'I' => &mut chan.invite_exceptions,
                     _ => unreachable!("outer arm matched only these list-mode chars"),
                 };
-                if adding {
+                // Only announce a change that actually happened: a no-op add of
+                // an existing mask, or a remove that matched nothing, must not be
+                // broadcast as a real `+b`/`-b` (state-tracking clients desync on
+                // a transition that did not occur — "no silent no-ops" cuts both
+                // ways: don't drop real changes, don't invent phantom ones).
+                let changed = if adding {
                     if is_new {
                         list.push(mask.to_string());
                     }
+                    is_new
                 } else {
-                    list.retain(|b| b != mask);
+                    let before = list.len();
+                    list.retain(|b| !e6irc_proto::mask::eq(casemap, b, mask));
+                    list.len() != before
+                };
+                if changed {
+                    changes.push((adding, c, Some(mask.to_string())));
                 }
-                changes.push((adding, c, Some(mask.to_string())));
             }
             'o' | 'v' => {
                 let Some(&who) = args.next() else {
@@ -1080,12 +1108,17 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     );
                     continue;
                 };
-                if c == 'o' {
-                    member.op = adding;
+                // Suppress a no-op privilege change (op-ing an existing op, etc.)
+                // so it isn't broadcast as a real transition.
+                let field = if c == 'o' {
+                    &mut member.op
                 } else {
-                    member.voice = adding;
+                    &mut member.voice
+                };
+                if *field != adding {
+                    *field = adding;
+                    changes.push((adding, c, Some(who.to_string())));
                 }
-                changes.push((adding, c, Some(who.to_string())));
             }
             other => {
                 state.numeric(

@@ -253,6 +253,13 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         // output behind it so the reply cannot be overtaken by, say, the PONG
         // to a PING the client pipelined after REGISTER.
         state.defer_reply(conn);
+        // Mark the deferral so a transient DB failure (whose reply carries no
+        // origin) is still routed back to REGISTER and releases the hold.
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .pending_register = true;
     }
 }
 
@@ -326,8 +333,19 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .filter(|(_, get)| *get(&mut caps))
                 .map(|(n, _)| *n)
                 .collect();
+            // `sasl`, account-registration, and multiline are tracked outside
+            // CAP_NAMES (they carry LS value params), so each must be reported
+            // here too — CAP LIST must enumerate *every* enabled capability, and
+            // a client re-syncing its negotiated set via LIST would otherwise be
+            // told an enabled cap is off and mis-track it.
             if caps.sasl {
                 active.push("sasl");
+            }
+            if caps.account_registration {
+                active.push(ACCOUNT_REGISTRATION_CAP);
+            }
+            if caps.multiline {
+                active.push(MULTILINE_CAP);
             }
             state.send(
                 conn,

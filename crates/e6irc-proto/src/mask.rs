@@ -12,6 +12,20 @@ pub fn matches(casemap: CaseMapping, mask: &str, subject: &str) -> bool {
     glob(&mask, &subject)
 }
 
+/// Are two hostmasks the *same* mask under the server casemapping? List modes
+/// (`+b/+q/+e/+I`) match subjects case-insensitively via [`matches`], so their
+/// add-dedup and removal must compare masks the same way: otherwise `-b FOO!*@*`
+/// fails to remove a ban stored as `foo!*@*` (leaving it enforced) while the
+/// server still broadcasts the removal, and `+b FOO!*@*` after `+b foo!*@*`
+/// double-stores one logical ban. Length-preserving per-byte fold, so equal
+/// masks always share a length.
+pub fn eq(casemap: CaseMapping, a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| casemap.lower(x) == casemap.lower(y))
+}
+
 /// Iterative wildcard match with backtracking over the last `*`.
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0, 0);
@@ -96,6 +110,19 @@ mod tests {
         assert!(hit("*!*@*", "n!u*x@h"));
         // And it still rejects when it genuinely should not match.
         assert!(!hit("x*", "*abc"));
+    }
+
+    #[test]
+    fn eq_folds_like_the_matcher() {
+        // Same mask under rfc1459 folding, differing only in case → equal, so a
+        // `-b` removes what a differently-cased `+b` stored.
+        assert!(eq(Rfc1459, "FOO!*@*", "foo!*@*"));
+        assert!(eq(Rfc1459, "n{x}!u@h", "n[x]!u@h")); // rfc1459: {}~ ↔ []^
+        // Genuinely different masks are not equal.
+        assert!(!eq(Rfc1459, "foo!*@*", "bar!*@*"));
+        assert!(!eq(Rfc1459, "foo!*@*", "foo!*@*.net")); // length differs
+        // A wildcard is a literal here (equality, not matching): `*` != a name.
+        assert!(!eq(Rfc1459, "*!*@*", "foo!*@*"));
     }
 
     #[test]

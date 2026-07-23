@@ -163,6 +163,13 @@ pub(crate) struct Session {
     pub sasl_attempts: u32,
     /// A NickServ IDENTIFY is awaiting its DB verdict.
     pub pending_identify: bool,
+    /// A `REGISTER`-command account creation is awaiting its DB verdict, with a
+    /// deferred reply held open for it. Unlike `AccountCreated`/`AccountExists`,
+    /// the `Unavailable`/`PasswordRejected` DB replies carry no origin, so this
+    /// flag is what lets `db_reply` route a transient failure back to REGISTER —
+    /// releasing the defer and sending the owed `FAIL`, instead of leaving the
+    /// connection's output held forever until the reaper ping-timeouts it.
+    pub pending_register: bool,
     /// Away message, when set.
     pub away: Option<String>,
     /// IRC operator (umode +o).
@@ -1093,6 +1100,7 @@ impl ServerState {
                 sasl_buf: String::new(),
                 sasl_attempts: 0,
                 pending_identify: false,
+                pending_register: false,
                 away: None,
                 oper: false,
                 invisible: false,

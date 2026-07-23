@@ -70,8 +70,23 @@ pub(super) async fn ws_irc_conn(
             out = out_rx.pop() => {
                 let Some(env) = out else { break };
                 let bytes = env.payload.0;
-                let text = String::from_utf8_lossy(&bytes).trim_end().to_string();
-                if socket.send(WsMessage::text(text)).await.is_err() {
+                // The core's Output is a full wire line terminated with exactly
+                // "\r\n" (state.rs `send_bytes`). Strip only that terminator:
+                // `trim_end()` would eat significant trailing spaces in a
+                // `:`-prefixed trailing parameter, silently dropping content.
+                let line = bytes
+                    .strip_suffix(b"\r\n")
+                    .or_else(|| bytes.strip_suffix(b"\n"))
+                    .unwrap_or(&bytes);
+                // A WebSocket text frame must be valid UTF-8, but IRC message
+                // bodies may carry non-UTF-8 bytes. Send those as a binary frame
+                // rather than corrupting them with lossy U+FFFD replacement —
+                // both frame types are valid under the ircv3 WS subprotocol.
+                let sent = match std::str::from_utf8(line) {
+                    Ok(text) => socket.send(WsMessage::text(text)).await,
+                    Err(_) => socket.send(WsMessage::binary(line.to_vec())).await,
+                };
+                if sent.is_err() {
                     break;
                 }
             }
