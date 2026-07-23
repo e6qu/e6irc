@@ -1596,8 +1596,12 @@ CHATHISTORY windows are exhaustively differential-tested.
 Fifty-fifth sweep — four-front bug hunt: info-disclosure, a ban-evasion
 transport, and delivery/history fidelity (2026-07-23): four parallel adversarial
 passes (WHO/WHOIS/NAMES/LIST visibility, message routing/echo, history/DB
-persistence, config/oper/admin) surfaced twelve concrete defects, all fixed here
-in one PR.
+persistence, config/oper/admin) surfaced eleven concrete defects, all fixed here
+in one PR. (A twelfth candidate — a self-directed message "delivered twice" with
+echo-message — was investigated and found *correct*: the recipient copy plus the
+labeled echo are both required by the labeled-response spec, and irctest
+`testLabeledPrivmsgResponsesToSelf` / `testMessagesToSelf` assert exactly two
+messages with one label. No change made.)
 
 *Information disclosure.* (1) **`+i` invisible members leaked through channel
 `WHO` and `NAMES`** to a non-member of a public channel — the invisible filter
@@ -1622,21 +1626,19 @@ loudly like every other subsystem.
 *Message delivery.* (6) **The `+C` (no-CTCP) ACTION exemption was a prefix
 match**, so `\x01ACTIONX\x01` / `\x01ACTIONVERSION\x01` slipped through; it now
 requires the exact `ACTION` tag (bare, space-delimited, or `\x01`-closed).
-(7) **A self-directed message double-delivered with echo-message** (once as
-recipient, once as echo); the sender is now excluded from the primary delivery.
-(8) **A labeled multiline batch hung a client that lacked echo-message** — the
+(7) **A labeled multiline batch hung a client that lacked echo-message** — the
 label rode only the echo copy, so no response and no ACK ever arrived; a labeled
-`ACK` is now emitted on the success path (mirroring the failure path). (9)
+`ACK` is now emitted on the success path (mirroring the failure path). (8)
 **`TAGMSG @#chan` ignored the STATUSMSG sigil** and answered `ERR_NOSUCHNICK`; it
 now routes to the op/voice subset like PRIVMSG.
 
-*History / DB.* (10) **CHATHISTORY TARGETS over the PostgreSQL path emitted DM
+*History / DB.* (9) **CHATHISTORY TARGETS over the PostgreSQL path emitted DM
 correspondents as raw identities** (`~nick` / folded account) instead of display
 nicks — the no-DB path converted, the DB path did not. `targets_page` is now the
-single conversion site for both. (11) **Deleting a BNC network orphaned its
+single conversion site for both. (10) **Deleting a BNC network orphaned its
 `bnc_buffer` rows** — the delete matched the raw account while the buffer is
 keyed by the *folded* owner, so backlog leaked and a same-named network replayed
-it; the delete now binds the folded owner. (12) **A malformed `timestamp=`
+it; the delete now binds the folded owner. (11) **A malformed `timestamp=`
 CHATHISTORY selector silently defaulted the window bound** (latest-N, or an empty
 window) instead of `FAIL … INVALID_PARAMS`; it is now rejected up front.
 

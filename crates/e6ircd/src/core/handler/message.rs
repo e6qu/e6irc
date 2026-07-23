@@ -725,13 +725,11 @@ pub(super) fn deliver_multiline(
     let mut audience: Vec<(ConnId, bool)> = resolved
         .recipients
         .iter()
-        // With echo-message on, the sender's own copy is the `(conn, false)`
-        // echo pushed below; drop it from the primary set so a self-directed
-        // multiline (target == own nick) isn't delivered twice.
-        .filter(|&&c| !(echo_message && c == conn))
         .map(|&c| (c, /* bypass_capture */ true))
         .collect();
     if echo_message {
+        // A self-directed multiline correctly arrives twice with echo-message
+        // (recipient copy + captured echo); only the echo carries the label.
         audience.push((conn, false));
     }
     for (recipient, bypass) in audience {

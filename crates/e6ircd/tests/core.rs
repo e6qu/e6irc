@@ -1067,22 +1067,6 @@ fn echo_message_returns_own_privmsg() {
 }
 
 #[test]
-fn self_directed_message_with_echo_arrives_once() {
-    // `PRIVMSG yournick :hi` resolves the sender as the sole recipient. With
-    // echo-message the sender must receive exactly one copy — not one as the
-    // recipient and another as the echo.
-    let mut s = TestServer::new();
-    let alice = register_with_caps(&mut s, 1, "alice", "echo-message");
-    s.drain(alice);
-    s.line(alice, "PRIVMSG alice :note to self");
-    assert_eq!(
-        s.drain(alice),
-        vec![":alice!alice@host1.example PRIVMSG alice :note to self"],
-        "a self-directed message must arrive exactly once, not twice"
-    );
-}
-
-#[test]
 fn tagmsg_relays_client_tags_to_capable_members_only() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "message-tags");

@@ -451,22 +451,18 @@ pub(super) fn deliver_and_echo(
     recipients: &[ConnId],
     delivery: &Delivery,
 ) {
+    deliver_message(state, recipients, delivery);
     if state.sessions[&conn].caps.echo_message {
-        // Exclude the sender from the primary delivery: the captured echo below
-        // is the sender's own copy, so a self-directed message (`PRIVMSG
-        // yournick`) would otherwise arrive twice — once as a recipient, once as
-        // the echo. For channels the sender is never in `recipients`, so this is
-        // a no-op there.
-        let others: Vec<ConnId> = recipients.iter().copied().filter(|&c| c != conn).collect();
-        deliver_message(state, &others, delivery);
-        // The echo is the sender's own labeled response, so it is captured.
+        // The echo is the sender's own labeled response, so it is captured. A
+        // self-directed message (`PRIVMSG yournick`) therefore correctly arrives
+        // twice with echo-message — once as the recipient copy and once as the
+        // captured echo, and only the echo carries the label (per the
+        // labeled-response spec / irctest `testLabeledPrivmsgResponsesToSelf`).
         let echo = Delivery {
             bypass_capture: false,
             ..*delivery
         };
         deliver_message(state, &[conn], &echo);
-    } else {
-        deliver_message(state, recipients, delivery);
     }
 }
 
