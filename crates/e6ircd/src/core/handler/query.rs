@@ -455,11 +455,14 @@ pub(super) fn cmd_info(state: &mut ServerState, conn: ConnId) {
 /// VERSION.
 pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
     let nicklen = state.config.nicklen;
+    // Derive CASEMAPPING from the active mapping rather than hardcoding it, so
+    // 005 can never disagree with how the server actually folds nicks/channels.
+    let casemapping = format!("CASEMAPPING={}", state.casemap.isupport_token());
     state.numeric(
         conn,
         RPL_ISUPPORT,
         &[
-            "CASEMAPPING=rfc1459",
+            &casemapping,
             "CHANTYPES=#",
             &format!("NICKLEN={nicklen}"),
             "CHANNELLEN=50",

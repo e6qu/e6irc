@@ -261,10 +261,9 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         if let Err(e) = send_message(&http, &base, &config.token, &id, &text).await {
                             eprintln!("discord: send to {id} failed: {e}");
                             // Surface the loss to the client, like the unmapped
-                            // path — a delivery failure isn't a silent drop.
-                            ends.emit_line(format!(
-                                ":*bnc* NOTICE * :message not delivered to Discord channel {id}"
-                            ));
+                            // path — a delivery failure isn't a silent drop. The
+                            // shared helper bounds the length so the notice fits.
+                            ends.emit_line(super::undelivered_notice("Discord", "channel", &id));
                         }
                     }
                     super::RouteResult::Unmapped(target) => {

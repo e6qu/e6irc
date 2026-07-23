@@ -199,10 +199,9 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         {
                             eprintln!("slack: chat.postMessage to {id} failed: {e}");
                             // Surface the loss to the client, like the unmapped
-                            // path — a delivery failure isn't a silent drop.
-                            ends.emit_line(format!(
-                                ":*bnc* NOTICE * :message not delivered to Slack channel {id}"
-                            ));
+                            // path — a delivery failure isn't a silent drop. The
+                            // shared helper bounds the length so the notice fits.
+                            ends.emit_line(super::undelivered_notice("Slack", "channel", &id));
                         }
                     }
                     super::RouteResult::Unmapped(target) => {

@@ -917,7 +917,7 @@ pub(super) fn client_ip(
     }
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         for part in xff.rsplit(',') {
-            if let Ok(ip) = part.trim().parse::<std::net::IpAddr>()
+            if let Some(ip) = parse_forwarded_ip(part)
                 && !trusted.iter().any(|net| net.contains(&ip))
             {
                 return ip;
@@ -925,6 +925,27 @@ pub(super) fn client_ip(
         }
     }
     peer
+}
+
+/// Parse one `X-Forwarded-For` entry to an IP, tolerating the `ip:port` and
+/// bracketed-IPv6 forms some proxies emit (`203.0.113.9:443`, `[2001:db8::1]`,
+/// `[2001:db8::1]:443`). A bare `parse::<IpAddr>()` rejects all of those, which
+/// would make `client_ip` silently skip the real rightmost client and fall back
+/// to a spoofable left-hand entry or the proxy's own IP — collapsing per-IP
+/// rate limits and bans onto one key. Returns `None` only for a truly malformed
+/// entry.
+fn parse_forwarded_ip(entry: &str) -> Option<std::net::IpAddr> {
+    let s = entry.trim();
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Some(ip); // bare IPv4 or unbracketed IPv6
+    }
+    if let Ok(sock) = s.parse::<std::net::SocketAddr>() {
+        return Some(sock.ip()); // ip:port or [ip]:port
+    }
+    // `[ip]` with no port.
+    s.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .and_then(|inner| inner.parse::<std::net::IpAddr>().ok())
 }
 
 /// Spend one token from `ip`'s auth bucket. Returns `false` (rate-limited) when

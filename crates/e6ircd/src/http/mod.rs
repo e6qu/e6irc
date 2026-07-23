@@ -837,6 +837,43 @@ mod client_ip_tests {
         let got = client_ip(ip("10.0.0.1"), &xff("10.0.0.9, 10.0.0.8"), &trusted);
         assert_eq!(got, ip("10.0.0.1"));
     }
+
+    #[test]
+    fn port_annotated_and_bracketed_forwarded_entries_are_parsed() {
+        // Some proxies emit `ip:port` / `[ip6]:port`. A bare IpAddr parse would
+        // reject these and skip past the real client to a spoofable entry or the
+        // proxy IP; the resolver must recover the address.
+        let trusted = [net("10.0.0.0/8")];
+        // Rightmost non-trusted entry is a port-annotated IPv4 client.
+        assert_eq!(
+            client_ip(
+                ip("10.0.0.1"),
+                &xff("1.2.3.4, 203.0.113.7:52833, 10.0.0.2"),
+                &trusted
+            ),
+            ip("203.0.113.7"),
+        );
+        // Bracketed IPv6 with a port.
+        assert_eq!(
+            client_ip(
+                ip("10.0.0.1"),
+                &xff("[2001:db8::5]:443, 10.0.0.2"),
+                &trusted
+            ),
+            ip("2001:db8::5"),
+        );
+        // Bracketed IPv6 with no port.
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &xff("[2001:db8::9]"), &trusted),
+            ip("2001:db8::9"),
+        );
+        // A port-annotated *trusted* hop is still recognized as trusted (parsed,
+        // then matched), so it's skipped rather than mis-returned as the client.
+        assert_eq!(
+            client_ip(ip("10.0.0.1"), &xff("203.0.113.7, 10.0.0.2:9000"), &trusted),
+            ip("203.0.113.7"),
+        );
+    }
 }
 
 #[cfg(test)]

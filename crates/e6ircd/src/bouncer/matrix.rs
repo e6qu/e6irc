@@ -123,9 +123,13 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
                            Relayed::Unmapped(target) => ends.emit_line(super::unmapped_target_notice(
             "Matrix", "room", &target,
         )),
-                           Relayed::Failed(room) => ends.emit_line(format!(
-                               ":*bnc* NOTICE * :not delivered: Matrix send to room {room} failed"
-                           )),
+                           Relayed::Failed(room) => {
+                               // `room` is a homeserver-supplied id, unbounded
+                               // here; truncate so this failure notice can't
+                               // itself be discarded for length — which would
+                               // resurrect the silent-drop it exists to prevent.
+                               ends.emit_line(super::undelivered_notice("Matrix", "room", &room))
+                           }
                        },
                        None => return super::SessionOutcome::Stopped, // every handle dropped
                    },
@@ -181,8 +185,17 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
         txn: 0,
     };
     for alias in &config.rooms {
-        let room_id = join_room(&session, alias).await?;
         let channel = alias_to_channel(alias);
+        // The alias comes from config (trusted), but it lands in a PRIVMSG
+        // middle parameter, so refuse one that isn't a legal channel — a space
+        // or `:` in it would forge extra params. Fail loudly, as the Slack and
+        // Discord bridges already do for their fetched names.
+        if !crate::sanitize::valid_channel_name(&channel) {
+            return Err(format!(
+                "matrix: room alias {alias:?} maps to an unsafe IRC channel {channel:?}"
+            ));
+        }
+        let room_id = join_room(&session, alias).await?;
         session
             .channel_to_room
             .insert(channel.clone(), room_id.clone());

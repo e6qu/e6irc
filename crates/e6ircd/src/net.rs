@@ -30,6 +30,15 @@ const READ_BUF: usize = 4096;
 /// deadlines are coarse minutes, so a fine tick isn't needed.
 const REAP_TICK_SECS: u64 = 15;
 
+/// Cap on the TLS handshake. `Input::Open` only reaches the core — and thus the
+/// liveness reaper — *after* the handshake completes, so a peer that finishes
+/// the TCP connect but never sends (or dribbles) a ClientHello would otherwise
+/// hold a task, an fd, and its per-IP slot indefinitely, invisible to the
+/// reaper. A plaintext peer has no such window (it hits `serve_conn` at once).
+/// A real handshake completes in well under a second; 30s matches the
+/// registration budget a plaintext peer already gets.
+const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+
 pub struct Running {
     /// Bound IRC addresses, in listener-config order (useful with port 0).
     pub addrs: Vec<SocketAddr>,
@@ -483,10 +492,22 @@ async fn accept_loop(
             let _guard = guard; // released when this task ends
             let _ = stream.set_nodelay(true);
             match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls_stream) => serve_conn(tls_stream, conn, peer, core_tx, sendq).await,
-                    Err(e) => eprintln!("TLS handshake failed from {peer}: {e}"),
-                },
+                Some(acceptor) => {
+                    // Bound the handshake so a stalled TLS peer can't hold this
+                    // task/fd/slot forever below the reaper's line of sight.
+                    let handshake = tokio::time::timeout(
+                        std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                        acceptor.accept(stream),
+                    )
+                    .await;
+                    match handshake {
+                        Ok(Ok(tls_stream)) => {
+                            serve_conn(tls_stream, conn, peer, core_tx, sendq).await
+                        }
+                        Ok(Err(e)) => eprintln!("TLS handshake failed from {peer}: {e}"),
+                        Err(_) => eprintln!("TLS handshake from {peer} timed out"),
+                    }
+                }
                 None => serve_conn(stream, conn, peer, core_tx, sendq).await,
             }
         });

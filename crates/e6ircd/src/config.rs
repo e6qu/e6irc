@@ -425,6 +425,14 @@ impl Config {
                 "server_name must be a hostname".into(),
             ));
         }
+        // server_name is in the fixed head of every numeric; an unbounded value
+        // inflates every line's overhead and is the largest lever for pushing a
+        // reply past the 512-byte wire limit. A hostname fits well within 64.
+        if self.server_name.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "server_name must be at most 64 bytes".into(),
+            ));
+        }
         // network_name becomes the ISUPPORT `NETWORK=` token, a space-delimited
         // 005 middle param — a space (or control char) would split it into two
         // malformed tokens. Reject at load rather than emit a broken numeric.
@@ -435,6 +443,13 @@ impl Config {
         {
             return Err(ConfigError::Invalid(
                 "network_name must be a single token (no spaces or control characters)".into(),
+            ));
+        }
+        // NETWORK= is a 005 middle; `numeric` would silently clip an over-long
+        // value rather than advertise it faithfully. Bound it at load instead.
+        if self.network_name.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "network_name must be at most 64 bytes".into(),
             ));
         }
         if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 {
@@ -701,6 +716,33 @@ mod tests {
         )
         .expect("parse");
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn overlong_server_or_network_name_is_rejected() {
+        let long = "x".repeat(65);
+        let c: Config = toml::from_str(&format!(
+            "server_name = \"{long}\"\nnetwork_name = \"XNet\"\n[[listeners]]\naddr = \"0.0.0.0:6667\"\n"
+        ))
+        .expect("parse");
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("server_name"),
+            "an over-long server_name must be rejected at load"
+        );
+        let c: Config = toml::from_str(&format!(
+            "server_name = \"irc.x.example\"\nnetwork_name = \"{long}\"\n[[listeners]]\naddr = \"0.0.0.0:6667\"\n"
+        ))
+        .expect("parse");
+        assert!(
+            c.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("network_name"),
+            "an over-long network_name must be rejected at load"
+        );
     }
 
     #[test]
