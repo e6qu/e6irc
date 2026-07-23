@@ -189,13 +189,17 @@ pub struct AttachCaps {
 /// Strip from a serialized line any message tags the recipient did not
 /// negotiate. `time=` needs server-time, `account=` needs account-tag, and
 /// everything else (msgid, client-only tags) needs message-tags. A line with
-/// no tag section is returned unchanged.
+/// no tag section (no leading `@`) is returned unchanged.
 pub(crate) fn filter_tags(line: &str, caps: AttachCaps) -> String {
     let Some(rest) = line.strip_prefix('@') else {
         return line.to_string();
     };
+    // A leading `@` with no following space is a tag section with no message
+    // body — a malformed line no well-formed upstream produces, but a hostile
+    // one can, and it must not reach a client as an un-negotiated `@`-prefixed
+    // line. There is nothing deliverable in it, so it is dropped entirely.
     let Some((tags, body)) = rest.split_once(' ') else {
-        return line.to_string();
+        return String::new();
     };
     let kept: Vec<&str> = tags
         .split(';')
@@ -701,6 +705,29 @@ where
     Ok(())
 }
 
+/// Fuzzing-only re-exports of the internal line-processing functions.
+///
+/// Compiled *only* under cargo-fuzz's `--cfg fuzzing` (never in a normal build,
+/// `cargo test`, or the shipped binary), so it does not widen the crate's real
+/// public surface — it exists solely to let a fuzz target reach the functions
+/// that turn hostile *upstream* bytes into what an attached client sees. The
+/// core fuzzers drive the server side; nothing else reaches these.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    pub use super::AttachCaps;
+
+    /// Wrapper over the crate-private [`super::filter_tags`]; a thin `pub fn`
+    /// leaves the original's visibility unchanged (it is not re-exported).
+    pub fn filter_tags(line: &str, caps: AttachCaps) -> String {
+        super::filter_tags(line, caps)
+    }
+
+    /// Wrapper over the private [`super::sanitize_upstream_line`].
+    pub fn sanitize_upstream_line(line: String) -> String {
+        super::sanitize_upstream_line(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,6 +858,30 @@ mod tests {
             !snapshot[0].contains('\r') && !snapshot[0].contains('\n'),
             "restored line still carries a break: {}",
             snapshot[0]
+        );
+    }
+
+    #[test]
+    fn filter_tags_drops_a_malformed_tag_only_line() {
+        // A hostile upstream can store a line that is a leading `@` with no
+        // space — a tag section and no message. It must not reach a no-tags
+        // client as a `@`-prefixed line; there is nothing deliverable, so it is
+        // dropped. (Found by the bouncer fuzz target.)
+        assert_eq!(filter_tags("@time=x;msgid=1", AttachCaps::default()), "");
+        assert_eq!(
+            filter_tags(
+                "@time=x",
+                AttachCaps {
+                    server_time: true,
+                    ..AttachCaps::default()
+                }
+            ),
+            ""
+        );
+        // A well-formed line (tags then a space then a body) is unaffected.
+        assert_eq!(
+            filter_tags("@time=x PRIVMSG #c :hi", AttachCaps::default()),
+            "PRIVMSG #c :hi"
         );
     }
 

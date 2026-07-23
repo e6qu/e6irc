@@ -327,9 +327,13 @@ strip = "symbols"
   client/server state machines (pure, I/O-free, unit-tested).
 - Fuzz coverage also pins the byte-stream framer (`LineBuffer::feed`: every
   emitted line fits the inbound limit, and the line sequence is independent of
-  how the stream is chunked into reads) and `base64` (decode never panics on
+  how the stream is chunked into reads), `base64` (decode never panics on
   arbitrary text; encode/decode round-trips, which SASL relies on to recover the
-  exact credential).
+  exact credential), and the bouncer's upstream line-processing (`sanitize` +
+  `filter_tags`: whatever a hostile upstream sends, the line an attached client
+  receives never carries a CR/LF/NUL that would split it into two). The bouncer
+  functions are reached through a `#[cfg(fuzzing)]`-only wrapper module, so the
+  fuzz coverage does not widen the crate's real public surface.
 - `floor_char_boundary`/`truncate_on_char_boundary`: the single primitive
   under every length-cap (topic, kick, away, composer line, bridged message).
   Slicing a `str` at a byte index inside a multi-byte character panics, and that
