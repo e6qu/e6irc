@@ -46,12 +46,12 @@ pub(super) fn monitor_status(
             None => offline.push(shown.clone()),
         }
     }
-    if !online.is_empty() {
-        state.numeric(conn, RPL_MONONLINE, &[], Some(&online.join(",")));
-    }
-    if !offline.is_empty() {
-        state.numeric(conn, RPL_MONOFFLINE, &[], Some(&offline.join(",")));
-    }
+    // Split across as many lines as fit the 512-byte wire limit: a client can
+    // monitor up to MONITOR_LIMIT nicks, and a single line of that many full
+    // `nick!user@host` prefixes would be discarded whole by the client's
+    // framing, so it would never learn those nicks are online.
+    state.numeric_list(conn, RPL_MONONLINE, &[], &online, ',');
+    state.numeric_list(conn, RPL_MONOFFLINE, &[], &offline, ',');
 }
 
 pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -154,9 +154,7 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         "L" | "l" => {
             let shown: Vec<String> = state.sessions[&conn].monitoring.values().cloned().collect();
-            if !shown.is_empty() {
-                state.numeric(conn, RPL_MONLIST, &[], Some(&shown.join(",")));
-            }
+            state.numeric_list(conn, RPL_MONLIST, &[], &shown, ',');
             state.numeric(conn, RPL_ENDOFMONLIST, &[], Some("End of MONITOR list"));
         }
         "S" | "s" => {
