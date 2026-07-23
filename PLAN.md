@@ -1288,6 +1288,41 @@ already correct — but they were the two reachable public entry points with no
 coverage, and both now lock invariants a future refactor could otherwise break
 silently.
 
+Forty-fourth sweep — admin-gating is a type now, not a convention
+(2026-07-23): an audit of the OIDC device-grant and admin HTTP surface found it
+sound — 256-bit device codes, atomic one-time consume (`DELETE … RETURNING`),
+one-time approve, and every one of the five `admin_*` endpoints correctly gated.
+But "correctly gated" meant every admin handler *opened with* `if let Err(r) =
+require_admin(...) { return r; }` — a convention a sixth handler could silently
+omit, the same fragile-discipline shape as the sweep-36 speak-gate.
+
+The codebase already had the fix pattern for authentication: the `Authenticated`
+extractor makes a route authenticated by *asking for it in the signature*. This
+sweep adds the admin rung, `AdminAccount`: an axum extractor whose
+`FromRequestParts` runs `require_admin`, so an admin handler takes `_admin:
+AdminAccount` as a parameter and an ungated admin handler fails to compile for
+want of the argument. The five handlers shed their `require_admin` prologue; the
+gate now lives in the type system. It is a marker struct — the admin's name is
+discarded, because no admin *read* endpoint needs the actor (a future audited
+admin action can carry it then).
+
+Behaviour is unchanged (401 unauthenticated, 403 non-admin, 200 admin), and the
+existing gating test — extended to cover `/admin/stats`, the one endpoint it had
+missed — confirms all five across both the extractor and the router wiring.
+
+The device-flow audit's one real finding was minor and left recorded rather than
+churned: `user_code` is generated with `ALPHABET[byte % 30]`, a modulo bias
+(256 % 30 = 16, so the first sixteen letters are slightly likelier). In this
+flow the user code's entropy is nearly security-irrelevant — approval binds the
+grant to the approver's own account, so guessing another user's code gains
+nothing — and every other token (device code, API tokens, app passwords) is
+already unbiased base64 of raw `OsRng` bytes. Noted here, not fixed, to keep the
+sweep to one change.
+
+`DESIGN.md` §2's invariant catalogue gains `Authenticated`/`AdminAccount`: HTTP
+authorization joins the set of preconditions the type system enforces rather
+than the reviewer.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

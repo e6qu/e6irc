@@ -156,11 +156,8 @@ pub(super) async fn require_admin(
 /// List every account (admin only).
 pub(super) async fn admin_accounts(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    _admin: AdminAccount,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
-        return response;
-    }
     let pool = pool_of(&state);
     match crate::db::list_accounts(pool).await {
         Ok(names) => (
@@ -199,11 +196,8 @@ pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response 
 /// Aggregate server counts (admin only).
 pub(super) async fn admin_stats(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    _admin: AdminAccount,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
-        return response;
-    }
     let pool = pool_of(&state);
     match crate::db::server_stats(pool).await {
         Ok((accounts, channels, server_bans)) => admin_json(serde_json::json!({
@@ -220,11 +214,8 @@ pub(super) async fn admin_stats(
 /// List every registered channel with its founder (admin only).
 pub(super) async fn admin_channels(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    _admin: AdminAccount,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
-        return response;
-    }
     let pool = pool_of(&state);
     match crate::db::list_registered_channels(pool).await {
         Ok(rows) => admin_json(serde_json::json!({
@@ -240,11 +231,8 @@ pub(super) async fn admin_channels(
 /// List every server ban / K-line (admin only).
 pub(super) async fn admin_server_bans(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    _admin: AdminAccount,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
-        return response;
-    }
     let pool = pool_of(&state);
     match crate::db::list_server_bans(pool).await {
         Ok(rows) => admin_json(serde_json::json!({
@@ -269,12 +257,9 @@ pub(super) struct AuditQuery {
 /// Query the oper audit log, newest-first (admin only).
 pub(super) async fn admin_audit(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    _admin: AdminAccount,
     axum::extract::Query(params): axum::extract::Query<AuditQuery>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
-        return response;
-    }
     let pool = pool_of(&state);
     let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
     match crate::db::list_audit_log(pool, limit).await {

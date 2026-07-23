@@ -585,6 +585,7 @@ async fn admin_accounts_endpoint_is_gated() {
         ("/api/v1/admin/channels", "channels"),
         ("/api/v1/admin/bans", "bans"),
         ("/api/v1/admin/audit", "audit"),
+        ("/api/v1/admin/stats", "accounts"),
     ] {
         let auth = |token: &str| {
             format!(
@@ -598,8 +599,10 @@ async fn admin_accounts_endpoint_is_gated() {
         let (status, _, body) = request(http, &auth(&alice_token)).await;
         assert_eq!(status, 200, "{path}: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        // Every admin read endpoint returns its keyed payload: a non-empty
+        // array for the list endpoints, a present value for stats' counts.
         assert!(
-            v[key].as_array().is_some_and(|a| !a.is_empty()),
+            v[key].as_array().is_some_and(|a| !a.is_empty()) || v[key].is_number(),
             "{path} empty: {body}"
         );
     }

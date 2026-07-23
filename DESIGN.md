@@ -112,6 +112,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `StatusSigil` — the STATUSMSG `@`/`+` target sigil is `Option<enum>`, so
     "does this enter history / narrow the audience" is `is_none()` and a
     method, not a byte compared against `0`.
+  - `Authenticated`/`AdminAccount` — an HTTP handler is authenticated (or
+    admin-gated) because it *asks for* the extractor in its signature, which
+    runs the check as a precondition of being called. An admin route cannot
+    forget the gate: the ungated handler fails to compile for want of the
+    argument, rather than relying on every handler to open with the same line.
   - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
     `&str`, so two fields cannot be transposed at a call site.
   - `stamp()` returns the `(ts, msgid)` pair from one clock read, so a
