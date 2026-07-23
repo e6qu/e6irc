@@ -1098,6 +1098,32 @@ USERHOST/USERIP (bounded to five targets) and ISON (a single reply by RFC 2812,
 where splitting would be non-conformant) are deliberately left as one line;
 MONITOR is the case that is both unbounded and explicitly allowed to span lines.
 
+Thirty-sixth sweep — one speak-gate, and the one place it must not reach
+(2026-07-23): the channel "may this sender speak?" decision — op/voice bypass,
+otherwise subject to +m, bans, quiets, and (off-channel) +n — was copied
+verbatim, thirteen lines, into both `resolve_message_target` (PRIVMSG/NOTICE)
+and `cmd_tagmsg`. The TAGMSG copy's own comment said it had to be "the same gate
+as PRIVMSG", which is the tell: two copies that must agree are one waiting to
+disagree, and a disagreement here lets a banned or quieted user relay
+typing/reaction tags it cannot send as text. It is now one method,
+`Channel::may_speak`, and both paths call it.
+
+The interesting part was the place that looked like it should join them but must
+not. TOPIC on a `-t` channel checks ban/quiet — a quieted member setting the
+topic would deface the channel around the quiet — and its comment also said
+"same speak-gate as PRIVMSG/TAGMSG". But it deliberately omits +m: a moderated
+channel silences *messages*, not topic changes, so a regular member of a +m, -t
+channel may still set the topic. With `may_speak` now a named thing, that
+comment was an invitation to "consolidate" TOPIC into it and quietly make +m
+block topics. The comment now states the exclusion and why, and a new test pins
+it: bob is blocked from PRIVMSG under +m (404) but still sets the topic —
+routing TOPIC through `may_speak` fails it. Verified it fails against that wrong
+change.
+
+No behavior change to the message paths: the extracted gate is byte-for-byte
+what both copies computed. This is the bug *class* removed (the gates can no
+longer drift) plus the one deliberate difference made explicit and enforced.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

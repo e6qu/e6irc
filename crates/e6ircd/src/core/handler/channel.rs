@@ -560,8 +560,10 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
         return;
     }
     // A quieted or banned member can't set the topic (which would evade the
-    // quiet by defacing the channel), unless op/voice — same speak-gate as
-    // PRIVMSG/TAGMSG.
+    // quiet by defacing the channel), unless op/voice. This is deliberately
+    // only the ban/quiet part of `Channel::may_speak`, not the whole gate: +m
+    // (moderated) governs messages, not topic changes, so it must NOT be folded
+    // in here — a regular member of a +m, -t channel may still set the topic.
     let exempt = member.op || member.voice;
     if !exempt {
         let prefix = state.sessions[&conn].prefix();

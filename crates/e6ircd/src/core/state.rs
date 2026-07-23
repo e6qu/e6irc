@@ -535,6 +535,38 @@ impl Channel {
     pub fn is_invite_excepted(&self, casemap: CaseMapping, prefix: &str) -> bool {
         Self::any_match(casemap, &self.invite_exceptions, prefix)
     }
+
+    /// Whether a sender with membership `member` (its `MemberModes`, or `None`
+    /// when off-channel) and hostmask `prefix` may send to this channel.
+    ///
+    /// The single gate for text (PRIVMSG/NOTICE) and tags (TAGMSG) alike: a
+    /// client that cannot speak must not be able to relay typing/reaction tags
+    /// it could not relay as a message, and the two paths drifting apart is
+    /// exactly how that would happen. Op/voice bypass +m and bans; an ordinary
+    /// or off-channel sender is subject to +m, bans and quiets, and an
+    /// off-channel one additionally to +n. STATUSMSG/CTCP are checked by the
+    /// caller — they are message-shape concerns, not membership ones.
+    pub fn may_speak(
+        &self,
+        member: Option<&MemberModes>,
+        casemap: CaseMapping,
+        prefix: &str,
+    ) -> bool {
+        match member {
+            Some(m) if m.op || m.voice => true,
+            Some(_) => {
+                !self.modes.moderated
+                    && !self.is_banned(casemap, prefix)
+                    && !self.is_quieted(casemap, prefix)
+            }
+            None => {
+                !self.modes.no_external
+                    && !self.modes.moderated
+                    && !self.is_banned(casemap, prefix)
+                    && !self.is_quieted(casemap, prefix)
+            }
+        }
+    }
 }
 
 pub(crate) struct ServerState {
