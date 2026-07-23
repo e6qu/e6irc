@@ -158,4 +158,16 @@ mod tests {
         let got = feed_all(&mut lb, &[b"PING a\r", b"\nPING b\r\n"]);
         assert_eq!(got, vec![line("PING a"), line("PING b")]);
     }
+    #[test]
+    fn strips_only_the_terminator_cr_not_embedded_ones() {
+        // The framer removes the single CR of the CRLF terminator; an *embedded*
+        // CR is left in the line for `Message::parse` to reject as an illegal
+        // byte. So a wire line `a\r\r\n` yields the two-byte content `a\r`,
+        // not `a`. (Pinned because a fuzzer flagged a test that wrongly assumed
+        // no line could end in CR.)
+        let mut fr = LineBuffer::new(64);
+        let mut out = Vec::new();
+        fr.feed(b"a\r\r\n", &mut out);
+        assert_eq!(out, vec![LineEvent::Line(b"a\r".to_vec())]);
+    }
 }

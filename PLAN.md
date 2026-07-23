@@ -1253,6 +1253,41 @@ CI miss).
 closed" note: every bug class that has bitten this codebase and admits a type
 is now closed by one.
 
+Forty-third sweep — fuzzing the surfaces the core fuzzers can't reach
+(2026-07-23): with every type-closable class closed (sweep 42), the work shifts
+from closing known classes to discovering unknown ones — and the highest-value
+unfuzzed public surfaces are the two that sit *before* the core: the byte-stream
+framer and the base64 decoder on the SASL path.
+
+`LineBuffer::feed` splits a TCP stream into IRC lines and enforces the inbound
+length limit — the first thing to touch every byte from every connection, and
+the inbound counterpart to the outbound wire-limit class sweeps 33–40 closed.
+The new `framing` target asserts two properties over arbitrary bytes fed in
+arbitrary chunks: every emitted line fits the limit, and — the property a unit
+test cannot reach — the line sequence is *independent of chunk boundaries*, so
+the framing never shifts with however the kernel split the stream. 14.5M runs
+clean.
+
+Writing it, the fuzzer immediately flagged an assertion I had gotten wrong: it
+claimed no framed line could end in CR. It can — the framer strips only the
+single CR of the CRLF terminator and leaves an *embedded* CR for
+`Message::parse` to reject, exactly as its doc comment says. The framer was
+right and my test was wrong; the contract is now pinned by a unit test
+(`strips_only_the_terminator_cr_not_embedded_ones`) so it is documented in code,
+not just a comment. A good reminder that a fuzzer checks the oracle as much as
+the code.
+
+`base64::decode` parses the SASL `AUTHENTICATE` payload — untrusted bytes
+decoded before any credential check. The new `base64_roundtrip` target asserts
+decode never panics on arbitrary text and that encode/decode round-trips
+byte-for-byte (what SASL relies on to recover the exact credential). 35M runs
+clean.
+
+Both join the CI fuzz-smoke loop. Neither found a defect — the surfaces were
+already correct — but they were the two reachable public entry points with no
+coverage, and both now lock invariants a future refactor could otherwise break
+silently.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
