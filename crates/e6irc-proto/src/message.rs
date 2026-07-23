@@ -109,6 +109,11 @@ pub enum SerializeError {
     BadCommand,
     /// Tag key empty or containing space/`;`/`=`.
     BadTagKey,
+    /// Tag value containing a byte the wire escaping cannot represent (NUL).
+    /// Every other illegal byte in a value (`; SPACE \ CR LF`) is escaped;
+    /// NUL has no escape, so a value carrying one is rejected rather than
+    /// emitted raw — symmetric with the key/source/param checks.
+    BadTagValue,
     /// Source containing spaces or empty name.
     BadSource,
     /// A non-final parameter that is empty, starts with `:`, or contains
@@ -275,6 +280,14 @@ impl<'a> Message<'a> {
                 }
                 out.push_str(tag.key);
                 if let Some(value) = &tag.value {
+                    // `escape_tag_value` represents `; SPACE \ CR LF`; NUL has
+                    // no escape in the message-tags grammar, so a value holding
+                    // one cannot be put on the wire. Reject it loudly instead of
+                    // emitting a raw NUL — the same contract the key/source/param
+                    // paths enforce.
+                    if value.contains('\0') {
+                        return Err(SerializeError::BadTagValue);
+                    }
                     out.push('=');
                     out.push_str(&escape_tag_value(value));
                 }
@@ -644,6 +657,30 @@ mod tests {
             ..Message::new("PING", vec![])
         };
         assert_eq!(m.to_line().unwrap_err(), SerializeError::BadTagKey);
+        // tag value carrying a NUL: no escape exists for it, so serialization
+        // must fail loudly rather than emit a raw NUL — symmetric with the
+        // key/source/param illegal-byte checks. (Every escapable byte —
+        // `; SPACE \ CR LF` — serializes fine and round-trips.)
+        let m = Message {
+            tags: vec![Tag {
+                key: "a",
+                value: Some("x\0y".into()),
+            }],
+            ..Message::new("PING", vec![])
+        };
+        assert_eq!(m.to_line().unwrap_err(), SerializeError::BadTagValue);
+        assert!(
+            Message {
+                tags: vec![Tag {
+                    key: "a",
+                    value: Some("x; \\\r\ny".into()),
+                }],
+                ..Message::new("PING", vec![])
+            }
+            .to_line()
+            .is_ok(),
+            "every escapable byte serializes without error"
+        );
         // source with space
         let m = Message {
             source: Some(Source {

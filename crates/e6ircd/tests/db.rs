@@ -2444,6 +2444,70 @@ async fn device_grants_are_pruned_on_create() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn approved_device_grant_polls_to_a_working_token_then_is_consumed() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("approved_device_grant_polls_to_a_working_token_then_is_consumed").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "devacct", "pw")
+        .await
+        .expect("create account");
+    // A pre-approval poll is Pending, not consumed.
+    sqlx::query(
+        "INSERT INTO device_grants (device_code, user_code, expires_at)
+         VALUES ('dc', 'USERCODE1', now() + interval '10 minutes')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert grant");
+    assert_eq!(
+        db::poll_device_grant(&pool, "dc", "device")
+            .await
+            .expect("poll"),
+        db::DeviceStatus::Pending,
+        "unapproved grant is pending and left intact"
+    );
+    assert!(
+        db::approve_device_grant(&pool, "USERCODE1", "devacct")
+            .await
+            .expect("approve"),
+        "a fresh grant approves"
+    );
+    // Approved poll: consume + mint atomically, and the token must actually work.
+    let token = match db::poll_device_grant(&pool, "dc", "device")
+        .await
+        .expect("poll approved")
+    {
+        db::DeviceStatus::Approved(token) => token,
+        other => panic!("expected Approved, got {other:?}"),
+    };
+    assert_eq!(
+        db::api_token_account(&pool, &token)
+            .await
+            .expect("resolve token")
+            .as_deref(),
+        Some("devacct"),
+        "the minted token resolves to the approving account"
+    );
+    // The grant is gone: a replayed poll finds nothing (single-use), and no
+    // second token was minted.
+    assert_eq!(
+        db::poll_device_grant(&pool, "dc", "device")
+            .await
+            .expect("poll consumed"),
+        db::DeviceStatus::Unknown,
+        "a consumed grant is single-use"
+    );
+    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM api_tokens")
+        .fetch_one(&pool)
+        .await
+        .expect("count tokens");
+    assert_eq!(tokens, 1, "exactly one token minted for the approved grant");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_buffer_trim_is_scoped_to_one_network() {
     // An upstream decides how many lines arrive, so an untrimmed network grows
     // the table until the disk is full. Two networks here because the trim must

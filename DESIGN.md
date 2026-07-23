@@ -315,6 +315,12 @@ strip = "symbols"
 - Zero-copy parse: a received line is kept as one `Bytes` buffer; the parsed
   `Message` borrows slices into it. Tag escaping/unescaping per the
   message-tags spec (https://ircv3.net/specs/extensions/message-tags).
+  Serialization (`to_line`) fails loudly rather than emitting a byte it cannot
+  represent: keys, source parts, and params reject any illegal byte, and a tag
+  value is rejected (`SerializeError::BadTagValue`) if it holds a NUL — the one
+  byte the value escaping has no encoding for. The four field positions share
+  one contract so the "silently emit a raw control byte" class is closed
+  symmetrically instead of per-field.
 - Limits: 512-byte traditional message body; tags budget per spec (8191
   bytes total for tags on server→client, 4096 client→server as advertised
   by us); oversized input is rejected with `FAIL`/`ERR_INPUTTOOLONG`, never

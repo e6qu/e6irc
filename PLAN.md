@@ -1551,6 +1551,48 @@ The sanitization session now has, in one module: the consolidated sanitizers,
 their contracts in prose, and those contracts machine-checked — so a future edit
 that lets an unsafe character through fails a test rather than shipping.
 
+Fifty-third sweep — five-front bug hunt: DoS panic, injection, auth
+atomicity (2026-07-23): four parallel adversarial passes (core handlers, proto
+parsing, bridge gateways, DB/HTTP/OIDC) turned up five concrete defects, all
+fixed here in one PR.
+
+1. **`STATS <multibyte>` panicked the shared worker** (`chanops.rs`). The query
+   letter was taken with `&letter[..letter.len().min(1)]` — a byte slice at index
+   1, which is mid-char for any non-ASCII first character (`STATS é`). Since one
+   worker serves every connection, that panic was an unauthenticated remote DoS
+   (registration is the only prerequisite). Now takes the first *char* on a
+   boundary. Regression test added.
+2. **Bridge channel names reached a PRIVMSG middle parameter unsanitized**
+   (`discord.rs`, `slack.rs`). Every other gateway-derived field is sanitized
+   (sender via `nick_token`, body via `upstream_line`), but the REST-fetched
+   channel name was formatted straight into `PRIVMSG #name` — a self-hosted /
+   API-compatible endpoint could return `evil PRIVMSG all :spoofed` and forge
+   extra params. Both drivers now validate with `sanitize::valid_channel_name`
+   and refuse the network loudly rather than putting an unsafe target on the wire.
+3. **`Message::to_line` emitted a raw NUL in a tag value** (`e6irc-proto`). The
+   key/source/param paths all reject illegal bytes; the tag *value* went through
+   `escape_tag_value`, which escapes `; SPACE \ CR LF` but has no escape for NUL,
+   so a value carrying one serialized silently. Not reachable through `parse`
+   (inbound NUL is rejected up front), but a latent no-silent-fallout violation.
+   New `SerializeError::BadTagValue` makes it symmetric and unrepresentable.
+4. **`/auth/device/start` had no rate limit** (`http/device.rs`). Every sibling
+   unauthenticated endpoint gates on `auth_rate_ok`; this one didn't, so an
+   anonymous flood accumulated live `device_grants` rows that pruning can't touch
+   for ten minutes. Now gated per client IP like the others.
+5. **Device-grant consume/mint was non-atomic** (`db.rs`, `http/device.rs`).
+   `poll_device_grant` did `DELETE ... RETURNING account` and *then* minted the
+   token in a separate call; a transient error on the mint destroyed the approved
+   grant and forced the user to restart the whole flow. Consume and mint now run
+   in one transaction (token-insert extracted to an executor-generic
+   `insert_api_token`), so they commit or roll back together. New PG-gated test
+   proves the approved grant yields a working token, is single-use, and mints
+   exactly once.
+
+The four passes also *cleared* large areas: the proto parse/serialize surface is
+pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
+accounts (unique constraint + rollback), no auth path logs-and-continues, and the
+CHATHISTORY windows are exhaustively differential-tested.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

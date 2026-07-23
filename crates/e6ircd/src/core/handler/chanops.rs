@@ -330,8 +330,11 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    // Only the STATS letter's first char is significant.
-    let letter = &letter[..letter.len().min(1)];
+    // Only the STATS letter's first char is significant. Take it on a char
+    // boundary: a byte slice `&letter[..1]` panics when the argument's first
+    // character is multi-byte (e.g. `STATS é`), and since one worker serves
+    // every connection that panic is an unauthenticated remote DoS.
+    let letter = letter.chars().next().map(String::from).unwrap_or_default();
     if letter == "u" {
         // The clock is milliseconds; STATS u reports whole seconds.
         let uptime = (state.config.clock)()
@@ -352,7 +355,7 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.numeric(
         conn,
         RPL_ENDOFSTATS,
-        &[letter],
+        &[&letter],
         Some("End of /STATS report"),
     );
 }

@@ -105,6 +105,16 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         match fetch_channel_name(&http, &base, &config.token, id).await {
             Ok(name) => {
                 let channel = format!("#{name}");
+                // The gateway (or a self-hosted API-compatible endpoint) supplies
+                // this name; it lands in a PRIVMSG middle parameter, so a space or
+                // `:` in it would forge extra params. Refuse it loudly rather than
+                // ever putting an unsafe target on the wire.
+                if !crate::sanitize::valid_channel_name(&channel) {
+                    eprintln!(
+                        "discord: channel {id} has an unsafe name {name:?}; refusing to bridge it"
+                    );
+                    return Dropped;
+                }
                 id_to_channel.insert(id.clone(), channel.clone());
                 channel_to_id.insert(channel, id.clone());
             }
