@@ -1527,6 +1527,30 @@ Length-fitting stays separate (it is a wire-*length* concern, already centered o
 wrappers at the delivery sites); the module documents that split so the two
 concerns are not conflated.
 
+Fifty-second sweep — the sanitize contracts are machine-checked now
+(input-sanitization session, 4/N) (2026-07-23): sweep 51 consolidated the
+sanitizers into `crate::sanitize` and wrote each field's wire-position contract
+in prose. This sweep turns that prose into a test. Every sanitizer is a
+per-character filter, so its contract is provable *exhaustively* rather than
+sampled: over an adversarial twelve-character alphabet (a nick-legal letter, the
+`!`/`@` prefix separators, space, the three injection bytes CR/LF/NUL, a
+backslash, a bracket, a digit, a control char, and a multi-byte `é`), every
+string of length 0..=3 is run through each function and its output checked
+against the documented rule.
+
+`username` never emits `!`/`@`/space/control and stays within its byte budget;
+`account_name` emits only nick-charset characters; `nick_token` emits only
+nick-legal characters and never a prefix-breaker; `upstream_line` never leaves a
+CR/LF/NUL; `valid_client_tag_key` accepts only `+[vendor/]name` over the spec
+charset. Small enough to be exhaustive, wide enough to exercise every branch and
+its boundary — stronger than fuzzing for functions this shape, and deterministic.
+Verified the tests bite by relaxing `username` to permit `@` and watching the
+property fail on the input `"@"`.
+
+The sanitization session now has, in one module: the consolidated sanitizers,
+their contracts in prose, and those contracts machine-checked — so a future edit
+that lets an unsafe character through fails a test rather than shipping.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
