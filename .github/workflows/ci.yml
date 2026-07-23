@@ -115,6 +115,9 @@ jobs:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
       - name: Exercise OIDC in a real browser
+        # Bounded so a wedged chromium install/launch fails this step in minutes
+        # rather than silently consuming the whole job's timeout budget.
+        timeout-minutes: 8
         run: |
           pnpm -C web exec playwright install --with-deps chromium
           cargo build -p e6ircd --features embed-web
@@ -157,9 +160,13 @@ jobs:
           path: .test-deps/shauth
       - run: npm install --global pnpm@11.15.1
       - run: pnpm -C web install --frozen-lockfile
-      - run: pnpm -C web exec playwright install --with-deps chromium
+      - name: Install chromium for Playwright
+        # Bounded: the apt/browser download here has hung the job before.
+        timeout-minutes: 8
+        run: pnpm -C web exec playwright install --with-deps chromium
       - run: pnpm -C web build && cargo build -p e6ircd --features embed-web
       - name: Exercise exact Shauth single sign-on and global logout
+        timeout-minutes: 8
         run: SHAUTH_SOURCE_DIR="$GITHUB_WORKSPACE/.test-deps/shauth" tools/test-shauth-sso.sh
 
   # Protocol conformance against the pinned irctest suite (vendored

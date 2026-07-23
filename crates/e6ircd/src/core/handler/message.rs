@@ -10,27 +10,10 @@ pub(super) fn is_blocked_ctcp(text: &str) -> bool {
     bytes.first() == Some(&0x01) && !text.starts_with("\u{1}ACTION")
 }
 
-/// Whether a client-only tag key is well-formed enough to relay to other
-/// clients. The parser accepts any non-delimiter byte in a key (control chars,
-/// non-ASCII), but the message-tags spec restricts a key to `+` then an optional
-/// `vendor/` and a `[A-Za-z0-9-]` name — so relaying a raw key would propagate a
-/// malformed or hostile one (a control char, an emoji) to everyone in the
-/// channel. A key that does not fit the spec charset is dropped rather than
-/// relayed.
-fn valid_client_tag_key(key: &str) -> bool {
-    let Some(rest) = key.strip_prefix('+') else {
-        return false;
-    };
-    !rest.is_empty()
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'/'))
-}
-
 pub(super) fn client_tag_string(msg: &Message) -> String {
     msg.tags
         .iter()
-        .filter(|t| valid_client_tag_key(t.key))
+        .filter(|t| crate::sanitize::valid_client_tag_key(t.key))
         .map(|t| match &t.value {
             Some(v) => format!("{}={}", t.key, e6irc_proto::message::escape_tag_value(v)),
             None => t.key.to_string(),

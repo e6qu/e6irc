@@ -5,29 +5,12 @@ use super::*;
 
 // ---- registration -------------------------------------------------------
 
-pub(super) fn valid_nick(nick: &str, nicklen: usize) -> bool {
-    let mut bytes = nick.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    let special = |b: u8| {
-        matches!(
-            b,
-            b'[' | b']' | b'\\' | b'`' | b'_' | b'^' | b'{' | b'|' | b'}'
-        )
-    };
-    if !(first.is_ascii_alphabetic() || special(first)) {
-        return false;
-    }
-    nick.len() <= nicklen && bytes.all(|b| b.is_ascii_alphanumeric() || special(b) || b == b'-')
-}
-
 pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&nick) = p.first() else {
         state.numeric(conn, ERR_NONICKNAMEGIVEN, &[], Some("No nickname given"));
         return;
     };
-    if !valid_nick(nick, state.config.nicklen) {
+    if !crate::sanitize::valid_nick(nick, state.config.nicklen) {
         state.numeric(
             conn,
             ERR_ERRONEUSNICKNAME,
@@ -108,26 +91,6 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 }
 
-/// Reduce a client-supplied username to one safe for the `nick!user@host`
-/// source prefix. `!` (the nick/user separator) and `@` (the user/host one) would
-/// make the prefix ambiguous — a client parsing `nick!a@evil@host` reads the host
-/// as `evil@host`, letting a user spoof part of their apparent host — and RFC
-/// 2812 already forbids `@` and space in a username. Those and control bytes are
-/// dropped; the result is byte-bounded to USERLEN, with a fallback when nothing
-/// survives (an all-`@` username would otherwise yield the malformed `nick!@host`).
-fn sanitize_username(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|&c| !matches!(c, '!' | '@' | ' ') && !c.is_control())
-        .collect();
-    let cleaned = truncate_chars(&cleaned, USERLEN);
-    if cleaned.is_empty() {
-        "user".to_string()
-    } else {
-        cleaned.to_string()
-    }
-}
-
 pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if state.sessions[&conn].registered {
         state.numeric(
@@ -157,7 +120,7 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // lines, so an unbounded one makes every such line's fixed head unbounded
     // and no per-line fitting can save it. Truncation here is the protocol
     // norm (Solanum does the same) and USERLEN is advertised in ISUPPORT.
-    session.user = Some(sanitize_username(p[0]));
+    session.user = Some(crate::sanitize::username(p[0], USERLEN));
     session.realname = Some(truncate_chars(p[3], REALLEN).to_string());
     maybe_complete_registration(state, conn);
 }

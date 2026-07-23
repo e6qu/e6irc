@@ -57,6 +57,16 @@ for (const stream of [server.stdout, server.stderr]) {
   stream.on("data", (chunk) => serverOutput.push(chunk));
 }
 
+// Hard watchdog: a hung browser, an unresponsive `browser.close()`, or a stuck
+// navigation must fail this test in seconds, not sit until the CI job's own
+// timeout cancels it (which turned a transient hang into a 13-minute red run).
+// Every Playwright action already has a 30s default; this bounds the whole
+// script, including teardown, which those defaults do not cover.
+const watchdog = setTimeout(() => {
+  console.error("test-oidc-browser: watchdog fired after 180s; forcing exit");
+  process.exit(1);
+}, 180_000);
+
 let browser;
 try {
   await waitForHealthyServer();
@@ -119,7 +129,15 @@ try {
   );
   assert.deepEqual(browserErrors, []);
 } finally {
-  if (browser) await browser.close();
+  clearTimeout(watchdog);
+  // `browser.close()` can itself hang on a wedged chromium; bound it so teardown
+  // never becomes the thing that hangs the run.
+  if (browser) {
+    await Promise.race([
+      browser.close(),
+      new Promise((resolveTimeout) => setTimeout(resolveTimeout, 10_000)),
+    ]);
+  }
   server.kill("SIGTERM");
   await Promise.race([
     new Promise((resolveExit) => server.once("exit", resolveExit)),

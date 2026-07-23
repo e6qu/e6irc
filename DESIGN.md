@@ -112,6 +112,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `StatusSigil` — the STATUSMSG `@`/`+` target sigil is `Option<enum>`, so
     "does this enter history / narrow the audience" is `is_none()` and a
     method, not a byte compared against `0`.
+  - `crate::sanitize` — one module holds every "turn untrusted text into a
+    field safe for its wire position" function (username, account name, bridge
+    nick token, upstream CR/LF/NUL neutralization, client-tag-key validation,
+    nick/channel validators), each documented with the position it protects
+    (prefix / middle / tag / trailing). A new field gets the right rule by
+    reaching for the module rather than re-deriving a one-off filter.
   - `Authenticated`/`AdminAccount` — an HTTP handler is authenticated (or
     admin-gated) because it *asks for* the extractor in its signature, which
     runs the check as a precondition of being called. An admin route cannot

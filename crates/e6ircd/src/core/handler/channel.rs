@@ -71,13 +71,6 @@ pub(super) fn truncate_chars(s: &str, max: usize) -> &str {
     e6irc_proto::message::truncate_on_char_boundary(s, max)
 }
 
-pub(super) fn valid_channel_name(name: &str) -> bool {
-    name.starts_with('#')
-        && name.len() > 1
-        && name.len() <= 50
-        && !name.bytes().any(|b| matches!(b, b' ' | b',' | 0x07 | b':'))
-}
-
 pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&targets) = p.first() else {
         state.numeric(
@@ -108,7 +101,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 }
 
 pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<&str>) {
-    if !valid_channel_name(name) {
+    if !crate::sanitize::valid_channel_name(name) {
         state.numeric(conn, ERR_NOSUCHCHANNEL, &[name], Some("No such channel"));
         return;
     }

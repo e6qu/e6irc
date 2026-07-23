@@ -1497,6 +1497,36 @@ away, topic, reasons — where any surviving byte is legal). The remaining
 sanitization frontier is the bridge identities, already covered by `nick_token`
 and `sanitize_upstream_line`.
 
+Fifty-first sweep — one sanitization module, and a flaky CI step fixed
+(input-sanitization session, 3/N) (2026-07-23): two things, one PR.
+
+**The flaky step.** The "Exercise OIDC in a real browser" CI step hung ~13
+minutes and was canceled by the job timeout — a transient wedged chromium.
+Playwright's per-action timeouts are 30s, but nothing bounded the *whole*
+script, and `browser.close()` in the teardown had no timeout at all, so a hung
+close sat until the job died. Both browser harnesses (`test-oidc-browser.mjs`,
+`test-shauth-sso.mjs`) now carry a 180s watchdog that force-exits and a bounded
+`browser.close()`, so a hang becomes a fast, clear failure instead of a 13-minute
+red run; the three CI steps that install/launch chromium also gained
+`timeout-minutes` so even a wedged apt/download can't eat the job budget.
+
+**The consolidation.** Three sanitization sweeps had scattered the vocabulary —
+`sanitize_username` in registration, `sanitize_account_name` in http/oidc,
+`nick_token`/`sanitize_upstream_line` in the bouncer, `valid_client_tag_key` in
+message, `valid_nick`/`valid_channel_name` in their handlers. They are now one
+`crate::sanitize` module whose header states the rule each wire position imposes
+(prefix: no `!`/`@`/space; middle: no space; tag: escaped/charset-limited;
+trailing: length only) and each function names the position it protects. Callers
+reference `crate::sanitize::*`; behaviour is byte-identical (the moved bodies are
+unchanged, verified by the unchanged suites, including per-bridge-feature builds
+and the message-tags / account / who / whois conformance). A field added later
+gets the correct rule by reaching for the module rather than inventing a filter.
+
+Length-fitting stays separate (it is a wire-*length* concern, already centered on
+`e6irc_proto::message::truncate_on_char_boundary` with the `fit_*`/`clip_*`
+wrappers at the delivery sites); the module documents that split so the two
+concerns are not conflated.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
