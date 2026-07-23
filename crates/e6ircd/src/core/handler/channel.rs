@@ -56,16 +56,11 @@ pub(super) fn normalize_ban_mask(mask: &str) -> String {
     }
 }
 
-/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary.
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary. The length
+/// caps here (`TOPICLEN`, `KICKLEN`, `AWAYLEN`) are byte budgets, so this is
+/// [`e6irc_proto::message::truncate_on_char_boundary`] under a domain name.
 pub(super) fn truncate_chars(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    e6irc_proto::message::truncate_on_char_boundary(s, max)
 }
 
 pub(super) fn valid_channel_name(name: &str) -> bool {

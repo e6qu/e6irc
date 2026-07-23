@@ -245,13 +245,7 @@ pub(super) fn sanitize_composer_line(line: &str) -> String {
     let end = line.find(['\r', '\n']).unwrap_or(line.len());
     let mut line = line[..end].to_string();
     let max = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
-    if line.len() > max {
-        let mut cut = max;
-        while !line.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        line.truncate(cut);
-    }
+    line.truncate(e6irc_proto::message::floor_char_boundary(&line, max));
     line
 }
 

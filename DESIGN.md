@@ -279,6 +279,11 @@ strip = "symbols"
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL
   client/server state machines (pure, I/O-free, unit-tested).
+- `floor_char_boundary`/`truncate_on_char_boundary`: the single primitive
+  under every length-cap (topic, kick, away, composer line, bridged message).
+  Slicing a `str` at a byte index inside a multi-byte character panics, and that
+  is reachable from remote input wherever a budget meets non-ASCII text — so it
+  lives once, tested and fuzzed, rather than hand-rolled per site.
 - Fuzz targets (cargo-fuzz) for parser and tag unescaping, and for the
   stateful core: `core_dispatch` drives one connection, `core_multi` drives
   several interleaved and adds the events no client sends (the liveness tick,

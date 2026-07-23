@@ -1047,6 +1047,31 @@ The lint job now checks each of the three separately. This sweep proved the gap
 was real from the other side: a four-config local check missed two bridge test
 modules that `--all-features` caught immediately.
 
+Thirty-fourth sweep — one char-boundary primitive, not four (2026-07-23):
+"slice a string at a byte index that lands inside a multi-byte character" is a
+panic, and it is reachable from remote input anywhere a length budget meets
+non-ASCII text. This repo has met it three times — `normalize_ban_mask` and
+`cmd_batch` (sweep 24), the client fuzz harness (sweep 31), the bridge splitter
+(sweep 33) — and each site that caps a string was carrying its own hand-rolled
+boundary walk: `truncate_chars` (topics, kicks, aways), the bouncer's
+`truncate_on_char_boundary` (undelivered-target notice), the inline walk in
+`render_bridged_privmsg`, and `sanitize_composer_line`. Four copies of the same
+three lines is four places to get it wrong, and the history says it does get
+gotten wrong.
+
+They now share one primitive in `e6irc-proto`: `floor_char_boundary(s, index)`
+— the largest boundary `≤ index`, clamped to the length — with
+`truncate_on_char_boundary` on top. It mirrors the signature of the unstable
+`str::floor_char_boundary`, so it becomes a one-line delegation if that method
+stabilizes. The four sites are one call each; the bug class has one home to be
+correct in.
+
+`truncate_boundary` joins the CI fuzz loop: arbitrary string, arbitrary budget,
+assert the returned index is on a boundary and the slice is a lossless prefix —
+124M runs clean. The unit test walks every cut of one string exhaustively; the
+fuzz target walks one cut of every string. A property this load-bearing should
+be pinned from both directions.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

@@ -66,3 +66,9 @@ bench = false
 debug = 1
 
 [workspace]
+
+[[bin]]
+name = "truncate_boundary"
+path = "fuzz_targets/truncate_boundary.rs"
+test = false
+doc = false

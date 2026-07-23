@@ -29,6 +29,34 @@ pub const MAX_CLIENT_FRAME_LEN: usize = MAX_CLIENT_TAGS_LEN + MAX_LINE_LEN - 2;
 /// larger server tag budget (server-time, msgid, account, batch, …).
 pub const MAX_SERVER_FRAME_LEN: usize = MAX_SERVER_TAGS_LEN + MAX_LINE_LEN - 2;
 
+/// The largest byte index `≤ index` that lies on a UTF-8 character boundary
+/// (both ends of the string count). Clamps to `s.len()` when `index` is past
+/// the end.
+///
+/// This is the one primitive under every "cut a string to fit a byte budget"
+/// site in the codebase: length-capping a topic, a kick reason, a composer
+/// line, a bridged message. Slicing a `str` at a byte index that falls inside a
+/// multi-byte character panics, and that panic — reachable from remote input
+/// wherever the budget meets non-ASCII text — has recurred here often enough to
+/// be worth one shared, tested function instead of a hand-rolled boundary walk
+/// at each site. Mirrors the signature of the unstable `str::floor_char_boundary`
+/// so it can be replaced by the standard method if that stabilizes.
+pub fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// `s` truncated to at most `max_bytes`, never through a character.
+pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    &s[..floor_char_boundary(s, max_bytes)]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message<'a> {
     pub tags: Vec<Tag<'a>>,
@@ -351,6 +379,32 @@ pub fn escape_tag_value(value: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_char_boundary_clamps_and_never_splits() {
+        // '☃' is three bytes: indexes 1 and 2 fall inside it.
+        let s = "a☃b";
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1); // between 'a' and '☃'
+        assert_eq!(floor_char_boundary(s, 2), 1); // inside '☃' -> back to 1
+        assert_eq!(floor_char_boundary(s, 3), 1); // inside '☃' -> back to 1
+        assert_eq!(floor_char_boundary(s, 4), 4); // between '☃' and 'b'
+        // Past the end clamps to len rather than panicking.
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+        assert_eq!(floor_char_boundary("", 5), 0);
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_is_a_valid_slice_for_every_cut() {
+        // A budget landing inside every position of a multi-byte string still
+        // yields a valid prefix — the property every call site depends on.
+        let s = "αβγδε"; // five 2-byte characters
+        for max in 0..=s.len() + 2 {
+            let out = truncate_on_char_boundary(s, max);
+            assert!(s.starts_with(out));
+            assert!(out.len() <= max.min(s.len()));
+        }
+    }
 
     fn msg(line: &str) -> Message<'_> {
         Message::parse(line).expect(line)
