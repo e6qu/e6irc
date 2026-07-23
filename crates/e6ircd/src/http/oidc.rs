@@ -844,6 +844,31 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for Authenticated {
     }
 }
 
+/// The authenticated account of an **admin**. Same idea as [`Authenticated`],
+/// one rung up: a handler that asks for this in its signature cannot be reached
+/// by a non-admin, and — the point — an admin route cannot *forget* the check,
+/// because the check is the parameter, not a first line a new handler might
+/// omit. (Admin gating was a convention every `admin_*` handler had to open
+/// with; this makes the ungated admin handler fail to compile for want of an
+/// argument, the same way [`Authenticated`] did for authentication.)
+pub(crate) struct AdminAccount;
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // The gate is the point; the admin's name is discarded because no admin
+        // read endpoint needs it. A future audited admin *action* that wants the
+        // actor can carry it then.
+        require_admin(state, &parts.headers)
+            .await
+            .map(|_account| AdminAccount)
+    }
+}
+
 /// The pool, once a request has authenticated. `authenticate` fails closed when
 /// no database is configured, so reaching a handler body proves one.
 pub(super) fn pool_of(state: &AppState) -> &sqlx::PgPool {
