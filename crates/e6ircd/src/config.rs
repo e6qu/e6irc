@@ -631,6 +631,24 @@ impl Config {
                 _ => {}
             }
         }
+        // OPER blocks: an empty name or password is a dangerous silent default
+        // (an empty password would let `OPER <name> ""` succeed), and a duplicate
+        // name is ambiguous (first-match wins with no warning). Reject loudly,
+        // like every other subsystem's config.
+        let mut oper_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for oper in &self.opers {
+            if oper.name.is_empty() || oper.password.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[[oper]] requires a non-empty name and password".into(),
+                ));
+            }
+            if !oper_names.insert(oper.name.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate [[oper]] name '{}'",
+                    oper.name
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -683,6 +701,37 @@ mod tests {
         )
         .expect("parse");
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn oper_with_empty_password_or_duplicate_name_is_rejected() {
+        let base = r#"
+            server_name = "irc.x.example"
+            network_name = "XNet"
+            [[listeners]]
+            addr = "0.0.0.0:6667"
+        "#;
+        // Empty password is a dangerous silent default.
+        let c: Config = toml::from_str(&format!(
+            "{base}\n[[oper]]\nname = \"admin\"\npassword = \"\"\n"
+        ))
+        .expect("parse");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("non-empty name and password"), "{err}");
+        // Duplicate oper name is ambiguous.
+        let c: Config = toml::from_str(&format!(
+            "{base}\n[[oper]]\nname = \"admin\"\npassword = \"a\"\n\
+             [[oper]]\nname = \"admin\"\npassword = \"b\"\n"
+        ))
+        .expect("parse");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate [[oper]] name"), "{err}");
+        // A well-formed, unique oper is accepted.
+        let c: Config = toml::from_str(&format!(
+            "{base}\n[[oper]]\nname = \"admin\"\npassword = \"s3cret\"\n"
+        ))
+        .expect("parse");
+        c.validate().expect("valid oper accepted");
     }
 
     #[test]

@@ -14,13 +14,16 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    let matched = state
-        .config
-        .opers
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, pw)| constant_time_eq(pw.as_bytes(), password.as_bytes()))
-        .unwrap_or(false);
+    // Always run the constant-time compare — against a dummy secret when the
+    // operator name is unknown — so response timing is name-independent and can't
+    // be used to enumerate valid operator names. Short-circuiting on an unknown
+    // name (skipping the two SHA-256 hashes) would leak existence by timing,
+    // defeating the whole point of `constant_time_eq`.
+    let stored = state.config.opers.iter().find(|(n, _)| n == name);
+    let candidate_pw = stored
+        .map(|(_, pw)| pw.as_bytes())
+        .unwrap_or(b"\0no-such-oper\0");
+    let matched = constant_time_eq(candidate_pw, password.as_bytes()) && stored.is_some();
     if !matched {
         state.numeric(conn, ERR_PASSWDMISMATCH, &[], Some("Password incorrect"));
         return;

@@ -1614,10 +1614,12 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
     .map_err(DbError::Query)?;
     // bnc_buffer has no FK to bnc_networks (owner/network are plain text), so
     // its rows would otherwise be orphaned forever on delete. The persistence
-    // task keys the buffer by the raw (unfolded) account name it was started
-    // with, so match on that, not the folded form.
+    // task keys the buffer by the *casefolded* owner (NetworkKey folds it, and
+    // spawn_persistence writes/reads under that), so the delete must match the
+    // folded form too — binding the raw account here removed zero buffer rows,
+    // leaking backlog that a same-named network would later replay.
     sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1 AND network = $2")
-        .bind(account)
+        .bind(&folded)
         .bind(name)
         .execute(pool)
         .await

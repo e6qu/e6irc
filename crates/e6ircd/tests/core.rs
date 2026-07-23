@@ -816,6 +816,41 @@ fn who_and_whois() {
 }
 
 #[test]
+fn invisible_member_hidden_from_channel_who_and_names_by_outsider() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob"); // shares no channel with alice
+    s.line(alice, "MODE alice +i");
+    s.line(alice, "JOIN #public"); // public, not +s
+    s.drain(alice);
+    s.drain(bob);
+    // An outsider WHOing/NAMESing a public channel must not see the invisible
+    // member (the +s check alone doesn't cover a public channel).
+    s.line(bob, "WHO #public");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains("alice")),
+        "invisible alice leaked through channel WHO to a non-member: {out:#?}"
+    );
+    assert!(has_numeric(&out, "315"), "WHO still terminates");
+    s.line(bob, "NAMES #public");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains("alice")),
+        "invisible alice leaked through NAMES to a non-member: {out:#?}"
+    );
+    // A fellow member still sees the invisible user.
+    let carol = s.register(3, "carol");
+    s.line(carol, "JOIN #public");
+    s.drain(carol);
+    s.line(carol, "NAMES #public");
+    assert!(
+        s.drain(carol).iter().any(|l| l.contains("alice")),
+        "a fellow channel member must still see the invisible member"
+    );
+}
+
+#[test]
 fn overlong_line_gets_417() {
     let mut s = TestServer::new();
     let c = s.register(1, "alice");
@@ -1032,6 +1067,22 @@ fn echo_message_returns_own_privmsg() {
 }
 
 #[test]
+fn self_directed_message_with_echo_arrives_once() {
+    // `PRIVMSG yournick :hi` resolves the sender as the sole recipient. With
+    // echo-message the sender must receive exactly one copy — not one as the
+    // recipient and another as the echo.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "echo-message");
+    s.drain(alice);
+    s.line(alice, "PRIVMSG alice :note to self");
+    assert_eq!(
+        s.drain(alice),
+        vec![":alice!alice@host1.example PRIVMSG alice :note to self"],
+        "a self-directed message must arrive exactly once, not twice"
+    );
+}
+
+#[test]
 fn tagmsg_relays_client_tags_to_capable_members_only() {
     let mut s = TestServer::new();
     let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
@@ -1056,6 +1107,45 @@ fn tagmsg_relays_client_tags_to_capable_members_only() {
         "{got:#?}"
     );
     assert!(s.drain(carol).is_empty(), "no message-tags cap ⇒ no TAGMSG");
+}
+
+#[test]
+fn tagmsg_honors_statusmsg_sigil() {
+    // `TAGMSG @#chan` is a valid STATUSMSG (message-tags spec): it must reach
+    // only the ops, exactly like `PRIVMSG @#chan`, not fall through to the nick
+    // branch and answer ERR_NOSUCHNICK.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags"); // founder → op
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags"); // plain member
+    for c in [alice, bob] {
+        s.line(c, "JOIN #room");
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.drain(bob);
+    // carol is another op so we can prove ops receive it.
+    let carol = register_with_caps(&mut s, 3, "carol", "message-tags");
+    s.line(carol, "JOIN #room");
+    s.drain(carol);
+    s.line(alice, "MODE #room +o carol");
+    s.drain(alice);
+    s.drain(bob);
+    s.drain(carol);
+    s.line(alice, "@+typing=active TAGMSG @#room");
+    let out = s.drain(alice);
+    assert!(
+        !out.iter()
+            .any(|l| l.contains("NOSUCHNICK") || l.contains(" 401 ")),
+        "TAGMSG @#room must not answer ERR_NOSUCHNICK: {out:#?}"
+    );
+    assert!(
+        s.drain(carol).iter().any(|l| l.contains("TAGMSG @#room")),
+        "an op receives the STATUSMSG TAGMSG"
+    );
+    assert!(
+        s.drain(bob).is_empty(),
+        "a non-op must not receive an ops-only STATUSMSG TAGMSG"
+    );
 }
 
 // ---- SASL PLAIN ---------------------------------------------------------
@@ -2364,6 +2454,37 @@ fn chathistory_star_selector_is_rejected_except_for_latest() {
     assert!(
         !out.iter().any(|l| l.contains("FAIL")),
         "LATEST with `*` must still be accepted: {out:#?}"
+    );
+}
+
+#[test]
+fn chathistory_malformed_timestamp_is_rejected() {
+    // A `timestamp=` selector that doesn't parse must FAIL INVALID_PARAMS, not
+    // silently default the window bound (which would return the latest N or an
+    // empty window as if the client had asked for them).
+    let mut s = TestServer::new_no_persistence();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/chathistory message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #ht");
+        s.drain(c);
+    }
+    s.line(bob, "CHATHISTORY LATEST #ht timestamp=not-a-time 5");
+    let out = s.drain(bob);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL CHATHISTORY INVALID_PARAMS")),
+        "a malformed timestamp= must FAIL INVALID_PARAMS: {out:#?}"
+    );
+    // A well-formed timestamp is still accepted (no FAIL).
+    s.line(
+        bob,
+        "CHATHISTORY LATEST #ht timestamp=2020-01-01T00:00:00.000Z 5",
+    );
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains("FAIL")),
+        "a valid timestamp= must be accepted: {out:#?}"
     );
 }
 
@@ -3803,6 +3924,45 @@ fn failed_multiline_batch_answers_the_label_that_opened_it() {
         out.iter()
             .any(|l| l.starts_with("@label=abc ") && l.contains("FAIL BATCH MULTILINE_INVALID")),
         "the failure must answer the labeled BATCH: {out:#?}"
+    );
+}
+
+#[test]
+fn successful_labeled_multiline_without_echo_gets_a_labeled_ack() {
+    // A client with labeled-response + multiline but NOT echo-message completes
+    // a labeled multiline batch. The label normally rides the sender's echo
+    // copy, which doesn't exist without echo-message, so the server must send a
+    // labeled ACK — otherwise the client waits forever for its response.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/multiline message-tags labeled-response",
+    );
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #m");
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.line(alice, "@label=abc BATCH +9 draft/multiline #m");
+    assert!(
+        s.drain(alice).is_empty(),
+        "opening the batch owes nothing yet"
+    );
+    s.line(alice, "@batch=9 PRIVMSG #m :hello");
+    s.line(alice, "BATCH -9");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=abc ") && l.contains("ACK")),
+        "the completed labeled batch must be answered with a labeled ACK: {out:#?}"
+    );
+    // The message is still delivered to the other member.
+    assert!(
+        s.drain(bob).iter().any(|l| l.contains("PRIVMSG #m :hello")),
+        "the message is still delivered to members"
     );
 }
 

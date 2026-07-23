@@ -7,7 +7,17 @@ use super::*;
 /// A CTCP message is \x01-delimited; ACTION (/me) is exempt from +C.
 pub(super) fn is_blocked_ctcp(text: &str) -> bool {
     let bytes = text.as_bytes();
-    bytes.first() == Some(&0x01) && !text.starts_with("\u{1}ACTION")
+    bytes.first() == Some(&0x01) && !is_ctcp_action(text)
+}
+
+/// Whether `text` is a CTCP whose tag is exactly `ACTION`. The tag ends at the
+/// first space or the closing `\x01`, so a prefix test (`starts_with("\x01ACTION")`)
+/// would wrongly exempt `\x01ACTIONX\x01` / `\x01ACTIONVERSION\x01` — crafted CTCP
+/// that would then slip through a `+C` (no-CTCP) channel.
+fn is_ctcp_action(text: &str) -> bool {
+    text == "\u{1}ACTION"
+        || text.starts_with("\u{1}ACTION ")
+        || text.starts_with("\u{1}ACTION\u{1}")
 }
 
 pub(super) fn client_tag_string(msg: &Message) -> String {
@@ -453,8 +463,13 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         }
     };
 
-    let recipients: Vec<ConnId> = if target.starts_with('#') {
-        let key = state.chan_key(target);
+    // A STATUSMSG (`@#chan`/`+#chan`) is valid for TAGMSG too (message-tags
+    // spec): route typing/reaction tags to the same op/voice subset PRIVMSG
+    // would, rather than falling through to the nick branch and answering
+    // ERR_NOSUCHNICK. The echoed `target` keeps the sigil, like PRIVMSG.
+    let (status_prefix, chan_target) = StatusSigil::split(target);
+    let recipients: Vec<ConnId> = if chan_target.starts_with('#') {
+        let key = state.chan_key(chan_target);
         let Some(chan) = state.channels.get(&key) else {
             state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
             return;
@@ -471,9 +486,9 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
             return;
         }
         chan.members
-            .keys()
-            .copied()
-            .filter(|c| *c != conn)
+            .iter()
+            .filter(|(c, m)| **c != conn && status_prefix.is_none_or(|sig| sig.admits(m)))
+            .map(|(c, _)| *c)
             .collect()
     } else {
         let key = state.nick_key(target);
@@ -706,12 +721,17 @@ pub(super) fn deliver_multiline(
     let time = e6irc_proto::time::server_time(ts);
     let batch_ref = state.next_msgid();
 
+    let echo_message = state.sessions[&conn].caps.echo_message;
     let mut audience: Vec<(ConnId, bool)> = resolved
         .recipients
         .iter()
+        // With echo-message on, the sender's own copy is the `(conn, false)`
+        // echo pushed below; drop it from the primary set so a self-directed
+        // multiline (target == own nick) isn't delivered twice.
+        .filter(|&&c| !(echo_message && c == conn))
         .map(|&c| (c, /* bypass_capture */ true))
         .collect();
-    if state.sessions[&conn].caps.echo_message {
+    if echo_message {
         audience.push((conn, false));
     }
     for (recipient, bypass) in audience {
@@ -811,6 +831,22 @@ pub(super) fn deliver_multiline(
                 first = false;
             }
         }
+    }
+
+    // The labeled response to the BATCH that opened this multiline rides the
+    // sender's echo copy. A client that negotiated labeled-response + multiline
+    // but NOT echo-message gets no such copy, so emit the labeled ACK explicitly
+    // — otherwise it waits forever for a response (the framer was told not to ACK
+    // the deferred batch). Mirrors the guarantee multiline_fail gives the failure
+    // path. Uncaptured: it answers the opening BATCH, not the current line.
+    if let Some(label) = &batch.label
+        && !echo_message
+    {
+        let server = state.config.server_name.clone();
+        state.send_bytes_uncaptured(
+            conn,
+            bytes::Bytes::from(format!("@label={label} :{server} ACK\r\n")),
+        );
     }
 
     // History records what a client without the capability would have seen:
@@ -975,4 +1011,24 @@ pub(super) fn multiline_collect(
     batch.kind.get_or_insert(kind);
     batch.lines.push((text.to_string(), concat));
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_blocked_ctcp;
+
+    #[test]
+    fn ctcp_action_exemption_matches_the_exact_tag() {
+        // A genuine ACTION is exempt from +C: bare, with args, or empty-arg.
+        assert!(!is_blocked_ctcp("\u{1}ACTION"));
+        assert!(!is_blocked_ctcp("\u{1}ACTION waves\u{1}"));
+        assert!(!is_blocked_ctcp("\u{1}ACTION\u{1}"));
+        // A CTCP whose tag merely *starts with* ACTION is not ACTION and must
+        // stay blocked — the prefix test would have leaked these through +C.
+        assert!(is_blocked_ctcp("\u{1}ACTIONX\u{1}"));
+        assert!(is_blocked_ctcp("\u{1}ACTIONVERSION\u{1}"));
+        assert!(is_blocked_ctcp("\u{1}VERSION\u{1}"));
+        // Plain text (no CTCP delimiter) is never blocked.
+        assert!(!is_blocked_ctcp("hello ACTION"));
+    }
 }
