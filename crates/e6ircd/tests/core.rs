@@ -5121,3 +5121,73 @@ fn mode_broadcast_splits_to_fit_the_wire_limit() {
         );
     }
 }
+
+#[test]
+fn relayed_message_is_trimmed_to_the_wire_limit() {
+    // The server adds the source prefix the sender didn't, so a max-length
+    // PRIVMSG overflows 512 on relay and a strict client discards or truncates
+    // the tail. The text is trimmed to fit before delivery, and everyone —
+    // recipient and echoing sender — sees the identical trimmed message.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "echo-message");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+
+    // A body that would push "PRIVMSG #c :<body>" to the 510 traditional limit.
+    let body = "x".repeat(510 - "PRIVMSG #c :".len());
+    s.line(alice, &format!("PRIVMSG #c :{body}"));
+
+    let relayed = s
+        .drain(bob)
+        .into_iter()
+        .find(|l| l.contains("PRIVMSG #c"))
+        .expect("bob receives the message");
+    assert!(
+        relayed.len() + 2 <= 512,
+        "relayed line is {} bytes, over the wire limit",
+        relayed.len()
+    );
+    // The sender's echo must be byte-identical to what the recipient saw.
+    let echoed = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains("PRIVMSG #c"))
+        .expect("alice echoes her own message");
+    assert_eq!(
+        relayed, echoed,
+        "echo and relay must carry the same message"
+    );
+}
+
+#[test]
+fn relay_trim_lands_on_a_character_boundary() {
+    // The trim is a byte budget; a multi-byte character straddling it must not
+    // be cut through (that would emit invalid UTF-8, and would panic if it were
+    // a naive slice).
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+
+    // '☃' is three bytes; a run of them makes the budget land inside one.
+    let body = "\u{2603}".repeat(166);
+    s.line(alice, &format!("PRIVMSG #c :{body}"));
+    let relayed = s
+        .drain(bob)
+        .into_iter()
+        .find(|l| l.contains("PRIVMSG #c"))
+        .expect("bob receives the message");
+    assert!(relayed.len() + 2 <= 512, "{} bytes", relayed.len());
+    // The relayed body is a valid prefix of the original (no split character).
+    let sent_body = relayed.rsplit_once(" :").expect("trailing").1;
+    assert!(body.starts_with(sent_body), "trim cut through a character");
+    assert!(!sent_body.is_empty());
+}

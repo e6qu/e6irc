@@ -1146,6 +1146,38 @@ unsplit code.
 USER MODE (`+iwB`, `-o`) needs no such split: those modes are few and carry no
 arguments, so its announcement cannot approach the limit.
 
+Thirty-eighth sweep — the message that overflows on relay (2026-07-23): the
+same silent-discard class as the last five sweeps, now in the most-travelled
+path of all. A client may send a PRIVMSG whose whole line is within the 510-byte
+traditional limit — but the server relays it with a source prefix the sender
+never wrote (`:nick!user@host `), and that pushes the relayed line past 512. A
+max-length message relays at 537 bytes; a strict client discards or truncates
+the tail. Unlike a numeric reply this cannot be split — one PRIVMSG is one
+message — so the fix is to trim the text to fit.
+
+The trim happens once, in `deliver_one_message`, upstream of both delivery and
+history: live recipients, the sender's own echo, and CHATHISTORY all carry the
+byte-identical (possibly trimmed) message. Because the *stored* body is the
+trimmed one, CHATHISTORY replay of a single message fits automatically — the
+overhead on replay is the same prefix, and the body it reads was already cut to
+leave room for it. `fit_relayed_text` computes the budget from the sender's
+prefix, the kind and the target, then trims on a UTF-8 char boundary via the
+shared `truncate_on_char_boundary` (sweep 34) — so a multi-byte character
+straddling the limit is never cut through. Permission and CTCP checks still see
+the message as sent (their markers sit at the front, which the trim never
+reaches). Three tests: the relay fits the limit, echo and relay are identical,
+and a body of snowmen trims on a boundary.
+
+Deliberately *not* covered here: the `draft/multiline` batch. Its constituent
+lines legitimately exceed 512 for a recipient that negotiated the capability and
+larger frames (that is the point of multiline), so its stored body must stay
+full — trimming it at storage, as the single-message path does, would shorten
+what a capable client correctly receives. The flattened delivery to a
+non-capable recipient and the CHATHISTORY replay of multiline lines can still
+overflow, and closing those needs trimming applied at *those two egress points*
+while leaving the batch form full — a different shape than storage-time trimming,
+verified separately. Surfaced here rather than half-fixed.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

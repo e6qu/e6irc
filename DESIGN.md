@@ -274,7 +274,11 @@ strip = "symbols"
 - Limits: 512-byte traditional message body; tags budget per spec (8191
   bytes total for tags on server→client, 4096 client→server as advertised
   by us); oversized input is rejected with `FAIL`/`ERR_INPUTTOOLONG`, never
-  truncated silently.
+  truncated silently. On *output*, a relayed PRIVMSG/NOTICE carries a source
+  prefix the sender did not, so a within-limit message can overflow 512 once
+  relayed; the text is trimmed to fit at delivery — once, so live delivery, the
+  echo and CHATHISTORY agree — since a single message cannot be split the way a
+  list-bearing numeric can.
 - Casemapping: **`rfc1459`** (what Libera/Solanum advertises), implemented
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL

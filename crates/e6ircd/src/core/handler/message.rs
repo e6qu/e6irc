@@ -243,6 +243,20 @@ pub(super) fn resolve_message_target(
     })
 }
 
+/// Truncate `text` on a UTF-8 char boundary so the relayed line
+/// `:{prefix} {kind} {target} :{text}` fits the 512-byte wire limit (510 before
+/// its CRLF). The source prefix is the server's addition, not the sender's, so
+/// a message the sender was allowed to send can still overflow once relayed.
+/// Trimming to fit is what keeps a strict client from discarding the line; it
+/// must happen once, upstream of both delivery and history, so every observer
+/// sees the same message.
+fn fit_relayed_text<'a>(prefix: &str, kind: &str, target: &str, text: &'a str) -> &'a str {
+    // ":" + prefix + " " + kind + " " + target + " :"
+    let overhead = 1 + prefix.len() + 1 + kind.len() + 1 + target.len() + 2;
+    let budget = 510usize.saturating_sub(overhead);
+    e6irc_proto::message::truncate_on_char_boundary(text, budget)
+}
+
 pub(super) fn deliver_one_message(
     state: &mut ServerState,
     conn: ConnId,
@@ -264,10 +278,18 @@ pub(super) fn deliver_one_message(
     }
 
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} {kind} {target} :{text}");
+    // Permission/CTCP checks see the message as sent (CTCP markers and the
+    // hostmask are at the front, which truncation never touches).
     let Some(resolved) = resolve_message_target(state, conn, target, text, loud) else {
         return;
     };
+    // The server adds the source prefix the sender did not, so a max-length
+    // message overflows the 512-byte wire limit on relay — a strict client then
+    // discards or truncates the line. Trim the text to fit here, once, so live
+    // recipients, the echo, and CHATHISTORY all carry the identical message
+    // rather than each seeing a differently-cut or dropped copy.
+    let text = fit_relayed_text(&prefix, kind, target, text);
+    let line = format!(":{prefix} {kind} {target} :{text}");
     if let ResolvedKind::Channel { key, status_prefix } = resolved.kind {
         let recipients = resolved.recipients;
         let sender_account = state.sessions[&conn].account.clone();
