@@ -5073,3 +5073,51 @@ fn moderated_channel_still_allows_a_regular_member_to_set_the_topic() {
         "the topic change should be broadcast: {out:#?}"
     );
 }
+
+#[test]
+fn mode_broadcast_splits_to_fit_the_wire_limit() {
+    // Many bans set in one MODE command build a broadcast line longer than the
+    // 512-byte wire limit. The bans are applied server-side, but a recipient's
+    // framing discards the over-long announcement whole — so other members
+    // never see the bans that are now in force. State and what members observe
+    // diverge silently.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #c");
+    s.drain(alice);
+    s.line(bob, "JOIN #c");
+    s.drain(alice);
+    s.drain(bob);
+
+    // Six distinct ~80-byte masks: the input fits 510, the echoed broadcast
+    // (with the +bbbbbb prefix and the op's own hostmask) does not.
+    let masks: Vec<String> = (0..6).map(|i| format!("{}{i}", "b".repeat(78))).collect();
+    s.line(alice, &format!("MODE #c +bbbbbb {}", masks.join(" ")));
+    let out = s.drain(bob);
+
+    let mode_lines: Vec<&String> = out.iter().filter(|l| l.contains(" MODE #c ")).collect();
+    assert!(
+        !mode_lines.is_empty(),
+        "bob must see the MODE change: {out:#?}"
+    );
+    for line in &mode_lines {
+        assert!(
+            line.len() + 2 <= 512,
+            "MODE broadcast line is {} bytes, over the wire limit: {line}",
+            line.len()
+        );
+    }
+    // Every ban must appear across the (possibly split) announcement.
+    let joined = mode_lines
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for mask in &masks {
+        assert!(
+            joined.contains(mask.as_str()),
+            "ban {mask} missing from the MODE broadcast"
+        );
+    }
+}

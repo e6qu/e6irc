@@ -871,9 +871,11 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
 
     let mut adding = true;
     let mut args = rest[1..].iter();
-    let mut applied = String::new();
-    let mut applied_args: Vec<String> = Vec::new();
-    let mut last_sign = ' ';
+    // Each applied change as (adding, mode char, optional arg). Collected rather
+    // than formatted inline so the broadcast can be split across as many MODE
+    // lines as the 512-byte wire limit needs — a single line of many bans is
+    // discarded whole by a recipient's framing, hiding bans that are in force.
+    let mut changes: Vec<(bool, char, Option<String>)> = Vec::new();
 
     for c in rest[0].chars() {
         match c {
@@ -897,7 +899,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     _ => unreachable!("outer arm matched only these mode chars"),
                 };
                 *field = adding;
-                push_mode(&mut applied, &mut last_sign, adding, c);
+                changes.push((adding, c, None));
             }
             'k' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
@@ -936,15 +938,14 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                         continue;
                     }
                     chan.modes.key = Some(k.to_string());
-                    applied_args.push(k.to_string());
+                    changes.push((true, 'k', Some(k.to_string())));
                 } else {
                     chan.modes.key = None;
                     // -k conventionally carries a placeholder arg ("*");
                     // consume it so later modes get the right params.
                     let _ = args.next();
-                    applied_args.push("*".into());
+                    changes.push((false, 'k', Some("*".into())));
                 }
-                push_mode(&mut applied, &mut last_sign, adding, c);
             }
             'l' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
@@ -974,11 +975,10 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     };
                     let chan = state.channels.get_mut(&key).expect("checked");
                     chan.modes.limit = Some(n);
-                    applied_args.push(l.to_string());
-                    push_mode(&mut applied, &mut last_sign, adding, c);
+                    changes.push((true, 'l', Some(l.to_string())));
                 } else {
                     chan.modes.limit = None;
-                    push_mode(&mut applied, &mut last_sign, adding, c);
+                    changes.push((false, 'l', None));
                 }
             }
             'b' | 'q' | 'e' | 'I' => {
@@ -1033,8 +1033,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 } else {
                     list.retain(|b| b != mask);
                 }
-                applied_args.push(mask.to_string());
-                push_mode(&mut applied, &mut last_sign, adding, c);
+                changes.push((adding, c, Some(mask.to_string())));
             }
             'o' | 'v' => {
                 let Some(&who) = args.next() else {
@@ -1067,8 +1066,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 } else {
                     member.voice = adding;
                 }
-                applied_args.push(who.to_string());
-                push_mode(&mut applied, &mut last_sign, adding, c);
+                changes.push((adding, c, Some(who.to_string())));
             }
             other => {
                 state.numeric(
@@ -1081,15 +1079,70 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
         }
     }
 
-    if !applied.is_empty() {
+    if !changes.is_empty() {
         let prefix = state.sessions[&conn].prefix();
-        let mut line = format!(":{prefix} MODE {display} {applied}");
-        for a in &applied_args {
-            line.push(' ');
-            line.push_str(a);
-        }
-        state.broadcast_channel(&key, &line, None);
+        broadcast_mode_changes(state, &key, &prefix, &display, &changes);
     }
+}
+
+/// Announce applied channel-mode changes, split across as many `MODE` lines as
+/// the 512-byte wire limit needs. Emitting one line for a command that set many
+/// bans would run past the limit, and a recipient's framing discards an
+/// over-long line whole — so the modes would be applied server-side yet unseen.
+/// Sign coalescing restarts on each line (every line names its own `+`/`-`).
+fn broadcast_mode_changes(
+    state: &mut ServerState,
+    key: &ChanKey,
+    prefix: &str,
+    display: &str,
+    changes: &[(bool, char, Option<String>)],
+) {
+    let base = format!(":{prefix} MODE {display} ");
+    let mut modes = String::new();
+    let mut args: Vec<String> = Vec::new();
+    let mut last_sign = ' ';
+    for (adding, c, arg) in changes {
+        let sign = if *adding { '+' } else { '-' };
+        // What this change would add to the current line: a sign flip, the mode
+        // char, and (with an arg) a space plus the arg.
+        let sign_cost = usize::from(last_sign != sign);
+        let arg_cost = arg.as_ref().map_or(0, |a| 1 + a.len());
+        let args_len: usize = args.iter().map(|a| 1 + a.len()).sum();
+        let prospective =
+            base.len() + modes.len() + sign_cost + 1 + args_len + arg_cost + 2 /* CRLF */;
+        if !modes.is_empty() && prospective > 512 {
+            flush_mode_line(state, key, &base, &modes, &args);
+            modes.clear();
+            args.clear();
+            last_sign = ' ';
+        }
+        if last_sign != sign {
+            modes.push(sign);
+            last_sign = sign;
+        }
+        modes.push(*c);
+        if let Some(a) = arg {
+            args.push(a.clone());
+        }
+    }
+    if !modes.is_empty() {
+        flush_mode_line(state, key, &base, &modes, &args);
+    }
+}
+
+fn flush_mode_line(
+    state: &mut ServerState,
+    key: &ChanKey,
+    base: &str,
+    modes: &str,
+    args: &[String],
+) {
+    let mut line = format!("{base}{modes}");
+    for a in args {
+        line.push(' ');
+        line.push_str(a);
+    }
+    state.broadcast_channel(key, &line, None);
 }
 
 pub(super) fn push_mode(applied: &mut String, last_sign: &mut char, adding: bool, c: char) {
