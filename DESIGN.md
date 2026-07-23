@@ -334,7 +334,10 @@ strip = "symbols"
   receives never carries a CR/LF/NUL that would split it into two). The hostmask
   glob (`mask::matches`, run against untrusted ban masks) is checked
   *differentially* against a textbook glob DP: the optimized single-`*`-backtrack
-  matcher must agree with the spec on every input. The bouncer
+  matcher must agree with the spec on every input. The CHATHISTORY ring-window
+  arithmetic is extracted as a pure `resolve_ring_window` and pinned by an
+  exhaustive differential test (every ring size, subcommand, selector position
+  and limit) against an independent index-range specification. The bouncer
   functions are reached through a `#[cfg(fuzzing)]`-only wrapper module, so the
   fuzz coverage does not widen the crate's real public surface.
 - `floor_char_boundary`/`truncate_on_char_boundary`: the single primitive
