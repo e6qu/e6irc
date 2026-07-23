@@ -1124,6 +1124,28 @@ No behavior change to the message paths: the extracted gate is byte-for-byte
 what both copies computed. This is the bug *class* removed (the gates can no
 longer drift) plus the one deliberate difference made explicit and enforced.
 
+Thirty-seventh sweep — MODE changes applied but never seen (2026-07-23): the
+same silent-discard class, reached through a different door. A single MODE
+command may set many bans (`MODE #c +bbbbbb mask1 … mask6`), and the echoed
+broadcast — `:{op-prefix} MODE #c +bbbbbb mask1 … mask6` — carries every mask
+plus the op's own hostmask. Six ~80-byte masks already run it to 546 bytes; a
+recipient's framing discards the over-long line whole. The bans are in force
+server-side, but the other members never see them announced: channel state and
+what members observe diverge silently, which for bans is exactly the wrong
+direction to be quiet about.
+
+The broadcast is now split across as many MODE lines as the 512-byte limit
+needs, each a self-contained `+`/`-` announcement, none dropped. The mode loop
+was refactored to collect applied changes as `(adding, char, arg)` tuples rather
+than format them inline, so the split can pack them; the single-line common case
+is byte-for-byte what it was (the 164 existing mode tests are unchanged and
+pass). A new test sets six long bans and asserts every broadcast line fits the
+wire limit and every ban appears across them — it fails at 546 bytes against the
+unsplit code.
+
+USER MODE (`+iwB`, `-o`) needs no such split: those modes are few and carry no
+arguments, so its announcement cannot approach the limit.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
