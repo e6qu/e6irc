@@ -160,7 +160,7 @@ pub(crate) struct Session {
     /// Credential-verification attempts made on this connection, capped so a
     /// single socket can't drive unbounded argon2 work (unauth CPU DoS / online
     /// brute-force). Never reset — the budget is per connection lifetime.
-    pub sasl_attempts: u32,
+    pub credential_attempts: u32,
     /// A NickServ IDENTIFY is awaiting its DB verdict.
     pub pending_identify: bool,
     /// A `REGISTER`-command account creation is awaiting its DB verdict, with a
@@ -1098,7 +1098,7 @@ impl ServerState {
                 account: None,
                 sasl: SaslState::default(),
                 sasl_buf: String::new(),
-                sasl_attempts: 0,
+                credential_attempts: 0,
                 pending_identify: false,
                 pending_register: false,
                 away: None,
@@ -1262,7 +1262,16 @@ impl ServerState {
         }
         if let Some(t) = trailing {
             line.push_str(" :");
-            line.push_str(t);
+            // Fit the trailing to the wire limit. Each middle is individually
+            // clipped above, but a numeric like WHOX (RPL_WHOSPCRPL) packs many
+            // middles *and* a client-influenced trailing (the realname); their
+            // sum can exceed 512, and the recipient's framing then discards the
+            // whole line — the row silently vanishes. Truncating the trailing
+            // against the accumulated head bounds every numeric at one place.
+            // (A `numeric_list` page is already built to fit, so this is a no-op
+            // for it.)
+            let budget = 512usize.saturating_sub(line.len() + 2 /* CRLF */);
+            line.push_str(e6irc_proto::message::truncate_on_char_boundary(t, budget));
         }
         self.send(conn, &line);
     }

@@ -49,6 +49,29 @@ impl TestServer {
     }
 
     fn with_config(sasl_enabled: bool, clock: fn() -> Millis, sendq: usize) -> Self {
+        Self::with_full_config(sasl_enabled, clock, sendq, "irc.test.example", 16)
+    }
+
+    /// A server that advertises a long `server_name` and a large `nicklen`, to
+    /// exercise the numeric wire-length fitting (WHOX packs many middles plus a
+    /// client-influenced realname trailing, so the summed line can approach 512).
+    fn with_long_head() -> Self {
+        Self::with_full_config(
+            true,
+            || Millis::from_millis(1_000_000_000),
+            256,
+            "irc.a-rather-long-server-name.example.net",
+            30,
+        )
+    }
+
+    fn with_full_config(
+        sasl_enabled: bool,
+        clock: fn() -> Millis,
+        sendq: usize,
+        server_name: &str,
+        nicklen: usize,
+    ) -> Self {
         let (db_tx, db_rx) = queue(Config {
             name: "test-db",
             capacity: 64,
@@ -57,14 +80,14 @@ impl TestServer {
         Self {
             core: Core::new(
                 CoreConfig {
-                    server_name: "irc.test.example".into(),
+                    server_name: server_name.into(),
                     network_name: "TestNet".into(),
                     description: "test server".into(),
                     registration_before_connect: false,
                     registration_require_email: false,
                     sendq,
                     motd: vec!["Welcome to the test net".into()],
-                    nicklen: 16,
+                    nicklen,
                     sasl_enabled,
                     max_hot_channels: 8192,
                     opers: vec![("god".into(), "letmein".into())],
@@ -1764,6 +1787,32 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
 }
 
 #[test]
+fn nickserv_identify_spends_the_shared_credential_budget() {
+    // NickServ IDENTIFY drives argon2 just like SASL, so it must spend from the
+    // same per-connection budget — otherwise it can be looped to brute-force or
+    // burn CPU past the cap SASL enforces. The 9th attempt closes the link.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    for _ in 0..8 {
+        s.line(alice, "PRIVMSG NickServ :IDENTIFY wrongpw");
+    }
+    let _ = s.db_requests(); // eight VerifyPassword dispatches, within budget
+    let out = s.drain(alice);
+    assert!(
+        !out.iter().any(|l| l.contains("ERROR")),
+        "the first eight IDENTIFYs stay within budget: {out:#?}"
+    );
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY wrongpw"); // 9th
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("ERROR") && l.contains("too many authentication attempts")),
+        "the ninth credential attempt must close the connection: {out:#?}"
+    );
+}
+
+#[test]
 fn nickserv_case_insensitive_target_and_unknown_command() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
@@ -2012,6 +2061,33 @@ fn whox_full_fields_with_account() {
     assert_eq!(
         *row,
         ":irc.test.example 354 alice #wx alice host1.example irc.test.example alice H@ alice :Real alice"
+    );
+}
+
+#[test]
+fn whox_reply_never_exceeds_the_wire_limit() {
+    // WHOX packs up to 12 middles plus the realname trailing; on a server with a
+    // long name and large nicklen those sum past 512, and the recipient's
+    // framing then discards the whole 354 — the row silently vanishes. The
+    // numeric funnel must fit the trailing so the line always stays legal.
+    let mut s = TestServer::with_long_head();
+    let alice = s.connect(1);
+    s.line(alice, "NICK aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); // 30 chars (== nicklen)
+    // A maximal realname (server clamps to REALLEN); pad well past it.
+    let realname = "R".repeat(300);
+    s.line(alice, &format!("USER u 0 * :{realname}"));
+    s.drain(alice);
+    s.line(alice, "JOIN #wx");
+    s.drain(alice);
+    // Every WHOX field, plus a long client token — the worst case.
+    let token = "T".repeat(120);
+    s.line(alice, &format!("WHO #wx %tcuihsnfdlaor,{token}"));
+    let out = s.drain(alice);
+    let row = out.iter().find(|l| l.contains(" 354 ")).expect("354 row");
+    assert!(
+        row.len() + 2 <= 512,
+        "the 354 line (+CRLF) must fit 512 bytes, got {}: {row}",
+        row.len() + 2
     );
 }
 

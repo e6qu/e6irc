@@ -333,6 +333,12 @@ strip = "symbols"
   exceeds the limit, so the whole class is machine-checked by the test and fuzz
   suites rather than guarded site by site; it is compiled out of release, where
   a panic on the shared worker would be worse than the over-long line.
+  Numerics fit at their own funnel: `ServerState::numeric` clips each middle and
+  truncates the trailing against the accumulated head, so a numeric that packs
+  many middles *and* a client-influenced trailing (WHOX's `RPL_WHOSPCRPL`, a
+  realname) can't sum past 512 and be discarded whole. `server_name`/
+  `network_name` are length-bounded at config load so the fixed head they sit in
+  can't inflate that budget.
 - Casemapping: **`rfc1459`** (what Libera/Solanum advertises), implemented
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL

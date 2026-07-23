@@ -234,6 +234,13 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // Account creation runs argon2 (a full hash even for an existing account),
+    // so it spends from the shared per-connection credential budget — the same
+    // cap SASL/IDENTIFY use — so a REGISTER loop can't drive unbounded hashing.
+    // Exhausting the budget closes the connection.
+    if !credential_attempt_ok(state, conn) {
+        return;
+    }
     let request = crate::core::DbRequest::CreateAccount {
         conn,
         name: nick.clone(),

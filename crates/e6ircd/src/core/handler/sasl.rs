@@ -11,19 +11,23 @@ pub(super) fn sasl_fail(state: &mut ServerState, conn: ConnId) {
 
 /// Max credential-verification attempts per connection before the socket is
 /// closed — a single connection can't drive unbounded argon2 work.
-pub(super) const MAX_SASL_ATTEMPTS_PER_CONN: u32 = 8;
+pub(super) const MAX_CREDENTIAL_ATTEMPTS_PER_CONN: u32 = 8;
 
 /// Charge one credential-verification attempt against the connection's budget
 /// before an (expensive) argon2 verify is dispatched. Returns false — and closes
 /// the connection — once the budget is exceeded, bounding the online
 /// brute-force / CPU-exhaustion surface even when per-IP rate limits are off.
-pub(super) fn sasl_attempt_ok(state: &mut ServerState, conn: ConnId) -> bool {
+///
+/// This budget is shared across *every* command that can drive an argon2 op —
+/// SASL AUTHENTICATE, NickServ IDENTIFY, and NickServ REGISTER — so no single
+/// path can be looped to bypass the cap the others enforce.
+pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bool {
     let attempts = {
         let s = state.sessions.get_mut(&conn).expect("checked");
-        s.sasl_attempts += 1;
-        s.sasl_attempts
+        s.credential_attempts += 1;
+        s.credential_attempts
     };
-    if attempts > MAX_SASL_ATTEMPTS_PER_CONN {
+    if attempts > MAX_CREDENTIAL_ATTEMPTS_PER_CONN {
         let server = state.config.server_name.clone();
         state.send(
             conn,
@@ -146,7 +150,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     sasl_fail(state, conn);
                     return;
                 };
-                if !sasl_attempt_ok(state, conn) {
+                if !credential_attempt_ok(state, conn) {
                     return;
                 }
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
@@ -175,7 +179,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     sasl_fail(state, conn);
                     return;
                 };
-                if !sasl_attempt_ok(state, conn) {
+                if !credential_attempt_ok(state, conn) {
                     return;
                 }
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;

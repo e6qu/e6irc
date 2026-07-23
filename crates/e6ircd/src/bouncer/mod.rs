@@ -300,6 +300,18 @@ pub(crate) fn unmapped_target_notice(platform: &str, kind: &str, target: &str) -
     format!(":*bnc* NOTICE {shown} :not delivered: no bridged {platform} {kind} for {shown}")
 }
 
+/// A `*bnc*` NOTICE telling the client its message reached a bridged target but
+/// the upstream send failed. Same discipline as [`unmapped_target_notice`]: the
+/// `target` may be a homeserver-supplied room id (Matrix) bounded only by the
+/// frame limit, so it is truncated to a char boundary — an over-long line is
+/// discarded whole by the client's framing, and then the failure goes silent,
+/// the very outcome this notice exists to prevent.
+#[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+pub(crate) fn undelivered_notice(platform: &str, kind: &str, target: &str) -> String {
+    let shown = truncate_on_char_boundary(target, 64);
+    format!(":*bnc* NOTICE * :not delivered: {platform} send to {kind} {shown} failed")
+}
+
 /// `s` cut to at most `max` bytes, never inside a character.
 #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
 fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
@@ -703,6 +715,20 @@ mod tests {
         // A multi-byte target is cut between characters, not through one.
         let wide = "#".to_string() + &"☃".repeat(4_000);
         let notice = unmapped_target_notice("Matrix", "room", &wide);
+        assert!(notice.len() + 2 <= MAX_LINE_LEN);
+        assert!(e6irc_proto::message::Message::parse(&notice).is_ok());
+
+        // The delivery-failure notice carries the same discipline: a Matrix
+        // room id is homeserver-supplied and unbounded, so it must be truncated
+        // or the "not delivered" notice itself is discarded for length.
+        let room = "!".to_string() + &"a".repeat(4_000) + ":evil.example";
+        let notice = undelivered_notice("Matrix", "room", &room);
+        assert!(notice.len() + 2 <= MAX_LINE_LEN, "{} bytes", notice.len());
+        let msg = e6irc_proto::message::Message::parse(&notice).expect("parses");
+        assert_eq!(msg.command, "NOTICE");
+        // Multi-byte room id is cut on a character boundary, not through one.
+        let wide_room = "!".to_string() + &"☃".repeat(4_000);
+        let notice = undelivered_notice("Matrix", "room", &wide_room);
         assert!(notice.len() + 2 <= MAX_LINE_LEN);
         assert!(e6irc_proto::message::Message::parse(&notice).is_ok());
     }

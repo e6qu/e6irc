@@ -45,6 +45,14 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "NickServ", "You are already logged in.");
                 return;
             }
+            // Account creation runs argon2 (a full hash even when the account
+            // already exists, via ON CONFLICT), so it must spend from the shared
+            // per-connection credential budget — otherwise a loop of REGISTER
+            // drives unbounded argon2 work, bypassing the SASL cap. Closes the
+            // connection when the budget is exhausted.
+            if !credential_attempt_ok(state, conn) {
+                return;
+            }
             let name = state.sessions[&conn].nick.clone().expect("registered");
             let request = crate::core::DbRequest::CreateAccount {
                 conn,
@@ -73,6 +81,13 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     return;
                 }
             };
+            // Password verification runs argon2 (even a nonexistent account
+            // spends a dummy verify to avoid a timing oracle), so it spends from
+            // the shared per-connection credential budget — the same cap SASL
+            // enforces, so IDENTIFY can't be looped to brute-force or burn CPU.
+            if !credential_attempt_ok(state, conn) {
+                return;
+            }
             state
                 .sessions
                 .get_mut(&conn)

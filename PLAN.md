@@ -1593,6 +1593,58 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Fifty-sixth sweep — four-front bug hunt: TLS slow-loris, an argon2 DoS,
+a WHOX overflow, and bridge/proxy hardening (2026-07-23): four parallel
+adversarial passes (Matrix bridge, numerics/ISUPPORT, rate-limiting/flood, and
+TLS/net/proxy) surfaced eight concrete defects, all fixed here in one PR.
+
+1. **The TLS handshake had no timeout** (`net.rs`) — a peer that finished the TCP
+   connect but never sent (or dribbled) a ClientHello held a task, an fd, and its
+   per-IP slot indefinitely, *invisible to the reaper*: `Input::Open` only
+   reaches the core (and thus the liveness deadline) after the handshake. A
+   plaintext peer has no such window. The handshake is now bounded (30s, matching
+   the registration budget) and dropped loudly on elapse.
+2. **NickServ IDENTIFY / REGISTER (and the IRCv3 `REGISTER` command) drove
+   *uncapped* argon2 work** (`services.rs`, `registration.rs`) — SASL caps
+   credential verifications at 8/connection, but these three argon2-driving paths
+   spent from no budget, so a single connection could loop them for unbounded CPU
+   + memory (a global stall on the one core worker) and an online-brute-force
+   bypass. All now spend from one shared per-connection budget
+   (`credential_attempt_ok`, renamed from `sasl_attempt_ok`), closing the class:
+   any command that can trigger an argon2 op charges the same counter.
+3. **WHOX `RPL_WHOSPCRPL` (354) could exceed the 512-byte wire limit** — it packs
+   up to 12 middles plus a client-influenced realname trailing, and on a server
+   with a long name or large `nicklen` their sum overflowed, so the recipient's
+   framing discarded the whole row silently. The `numeric` funnel now fits the
+   *trailing* against the accumulated head, bounding every numeric at one place
+   (a `numeric_list` page is already built to fit, so it's a no-op there).
+4. **The Matrix "not delivered" NOTICE interpolated a raw, unbounded
+   homeserver room id** (`matrix.rs`), reintroducing the silent-drop class the
+   `unmapped_target_notice` path already fixed: an over-long notice is discarded
+   whole and the failure goes silent. A shared, length-bounded `undelivered_notice`
+   helper now backs the Matrix, Discord, and Slack failure notices alike.
+5. **The Matrix room-alias channel name was never validated** (`matrix.rs`),
+   unlike Slack/Discord — a misconfigured alias could put a space/`:` into a
+   PRIVMSG middle parameter. It now validates with `sanitize::valid_channel_name`
+   and refuses the network loudly.
+6. **`client_ip` silently skipped `ip:port` / bracketed-IPv6 `X-Forwarded-For`
+   entries** (`http`), so a proxy that annotates ports made the resolver skip the
+   real client and fall back to a spoofable left-hand entry or the proxy's own IP
+   — collapsing per-IP rate limits and bans onto one key. XFF parsing now
+   tolerates those forms.
+7. **`CASEMAPPING` was hardcoded in 005** (`query.rs`) instead of derived from the
+   active mapping — correct today, but it would silently lie the moment casemap
+   became configurable. Now `state.casemap.isupport_token()`.
+8. **`server_name` / `network_name` had no length bound** (`config.rs`); an
+   over-long `server_name` inflates every numeric's overhead (feeding #3) and an
+   over-long `NETWORK=` was silently clipped. Both are now bounded (≤ 64) at load.
+
+Investigated and *not* changed: the per-IP connection cap is opt-in by design
+(no global accept ceiling) — noted as a hardening candidate rather than a bug;
+the `auth_buckets` map can grow past its soft 4096 bound under a many-source
+attack (memory-only, throughput-throttled); and the Matrix reconnect re-syncs
+rather than resuming (a documented durability tradeoff, not a defect).
+
 Fifty-fifth sweep — four-front bug hunt: info-disclosure, a ban-evasion
 transport, and delivery/history fidelity (2026-07-23): four parallel adversarial
 passes (WHO/WHOIS/NAMES/LIST visibility, message routing/echo, history/DB
