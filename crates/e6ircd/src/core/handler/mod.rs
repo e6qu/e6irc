@@ -11,7 +11,7 @@ use super::state::{
 mod channel;
 mod chanops;
 mod history;
-mod message;
+pub(crate) mod message;
 mod monitor;
 mod oper;
 mod query;
@@ -100,6 +100,30 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         return;
     }
     dispatch_parsed(state, conn, &msg);
+}
+
+/// Fit a trailing parameter to the wire limit: the largest prefix of `text`
+/// such that `head` + text (+ CRLF) stays within 512 bytes, cut on a UTF-8
+/// char boundary. `head` is everything already on the line, including the
+/// `" :"` — so the budget can never drift from the line actually built.
+///
+/// The reason-bearing relays (TOPIC, KICK, PART, QUIT) need this for the same
+/// reason PRIVMSG does (`fit_relayed_text`): the sender's input was within the
+/// limit, but the relay carries a source prefix the sender never wrote, and a
+/// recipient's framing discards an over-long line whole.
+pub(crate) fn fit_trailing<'a>(head: &str, text: &'a str) -> &'a str {
+    e6irc_proto::message::truncate_on_char_boundary(text, 510usize.saturating_sub(head.len()))
+}
+
+/// Clip a client-supplied token for echoing inside a reply. Numerics that
+/// attribute an error echo the offending token (an unknown command, a bad CAP
+/// subcommand, a rejected target list); the token's length is bounded only by
+/// the input frame, so echoing it whole can push the reply past the wire limit
+/// and the recipient's framing then discards the very line explaining the
+/// error. 64 bytes identifies anything; every reply shape stays well inside
+/// the limit with room for its other, server-bounded parameters.
+pub(crate) fn clip_echo(token: &str) -> &str {
+    e6irc_proto::message::truncate_on_char_boundary(token, 64)
 }
 
 /// Inject a tag into the front of an already-serialized wire line
@@ -320,7 +344,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         _ => state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
-            &[&command],
+            &[clip_echo(&command)],
             Some("Unknown command"),
         ),
     }
@@ -394,7 +418,13 @@ fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .get(&conn)
         .map(|s| s.host.clone())
         .unwrap_or_default();
-    state.send(conn, &format!("ERROR :Closing Link: {host} ({reason})"));
+    // The reason is echoed inside this ERROR wrapper, whose overhead can push a
+    // maximal QUIT reason past the wire limit — fit it like every other relay
+    // of client text. The trailing `)` is part of the head's cost, so budget
+    // for it by including it before fitting and re-appending after.
+    let head = format!("ERROR :Closing Link: {host} (");
+    let fitted = fit_trailing(&format!("{head})"), &reason);
+    state.send(conn, &format!("{head}{fitted})"));
     state.close(conn, &reason);
 }
 

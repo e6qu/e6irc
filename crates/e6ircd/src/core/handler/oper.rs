@@ -297,7 +297,10 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     let oper_nick = state.sessions[&conn].nick.clone().expect("registered");
     // A host must be a single non-empty token without user/prefix chars.
-    if newhost.is_empty() || newhost.contains([' ', '@', '!', '\0']) {
+    // A host rides in every future prefix built for this user, so an unbounded
+    // one makes every subsequent line unfittable at the source — bound it here
+    // (63 bytes, the DNS label/hostname norm) alongside the character rules.
+    if newhost.is_empty() || newhost.len() > 63 || newhost.contains([' ', '@', '!', '\0']) {
         state.send(
             conn,
             &format!(":{server} NOTICE {oper_nick} :Invalid host: {newhost}"),
@@ -354,7 +357,10 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} WALLOPS :{text}");
+    // Relayed under the oper's prefix, so fit like every other client-text relay.
+    let head = format!(":{prefix} WALLOPS :");
+    let text = crate::core::handler::fit_trailing(&head, text);
+    let line = format!("{head}{text}");
     let recipients: Vec<ConnId> = state
         .sessions
         .iter()

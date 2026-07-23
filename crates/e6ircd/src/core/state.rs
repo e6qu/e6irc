@@ -1135,10 +1135,31 @@ impl ServerState {
         self.send_bytes_uncaptured(conn, bytes);
     }
 
+    /// Debug-build invariant: every outbound line fits what the recipient's
+    /// framing will accept. Sweeps 33–39 fixed this class site by site —
+    /// bridges, MONITOR, MODE, message relay, multiline egress — each found by
+    /// hand. This check makes the class machine-checked at the one funnel all
+    /// output passes through: any new path that builds an over-long line fails
+    /// the first test (or fuzz run — cargo-fuzz builds with debug assertions)
+    /// that exercises it, instead of shipping a line the client silently drops.
+    ///
+    /// Compiled out of release builds deliberately: one worker serves every
+    /// client, so a production panic here would be worse than the over-long
+    /// line it flags. Tests and fuzzers are where the invariant bites.
+    #[cfg(debug_assertions)]
+    fn debug_check_wire_line(&self, conn: ConnId, bytes: &Bytes) {
+        let multiline = self.sessions.get(&conn).is_some_and(|s| s.caps.multiline);
+        if let Some(violation) = wire_line_violation(bytes, multiline) {
+            panic!("{violation}: {:?}", String::from_utf8_lossy(bytes));
+        }
+    }
+
     /// Deliver bypassing labeled-response capture. Used for messages a
     /// connection *receives* (deliveries), which are never part of the
     /// labeled response to its own command — only direct replies are.
     pub fn send_bytes_uncaptured(&mut self, conn: ConnId, bytes: Bytes) {
+        #[cfg(debug_assertions)]
+        self.debug_check_wire_line(conn, &bytes);
         // Hold this line behind an in-flight deferred reply, unless it *is*
         // that reply being emitted right now. Held output is bounded exactly
         // like the queue it is waiting to enter: overflowing it is a SendQ
@@ -1200,6 +1221,18 @@ impl ServerState {
 
     /// `:<server> <code> <target> <params…>`; the last param gets the
     /// trailing `:` if given as `trailing`.
+    /// Longest middle parameter `numeric` passes through unclipped. Every
+    /// legitimate middle is a short token by construction — a nick (≤ nicklen),
+    /// a channel display name (≤ 50), a mode/ISUPPORT string, a number, a
+    /// USERLEN-bounded username or 63-byte host. Anything longer is a
+    /// client-supplied token being echoed for attribution (an unknown command,
+    /// a bad target, a rejected list), whose length is bounded only by the
+    /// input frame; unclipped it can push the reply explaining an error past
+    /// the wire limit, and the recipient's framing then discards that very
+    /// reply. Clipping at this one funnel closes the whole echo family rather
+    /// than each numeric separately.
+    const NUMERIC_MIDDLE_MAX: usize = 100;
+
     pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {
         let target = self
             .sessions
@@ -1214,7 +1247,10 @@ impl ServerState {
         );
         for p in middle {
             line.push(' ');
-            line.push_str(p);
+            line.push_str(e6irc_proto::message::truncate_on_char_boundary(
+                p,
+                Self::NUMERIC_MIDDLE_MAX,
+            ));
         }
         if let Some(t) = trailing {
             line.push_str(" :");
@@ -1385,7 +1421,13 @@ impl ServerState {
             self.record_whowas(conn);
         }
         let session = &self.sessions[&conn];
-        let quit_line = was_registered.then(|| format!(":{} QUIT :{}", session.prefix(), reason));
+        let quit_line = was_registered.then(|| {
+            // The relay adds the prefix the sender never wrote; fit the reason
+            // so the line survives every recipient's framing.
+            let head = format!(":{} QUIT :", session.prefix());
+            let reason = crate::core::handler::fit_trailing(&head, reason);
+            format!("{head}{reason}")
+        });
         let joined: Vec<ChanKey> = session.channels.iter().cloned().collect();
 
         if let Some(line) = quit_line {
@@ -1421,5 +1463,65 @@ impl ServerState {
                 super::handler::monitor_notify(self, nick, false);
             }
         }
+    }
+}
+
+/// The wire-limit rule behind [`ServerState::debug_check_wire_line`], pure so
+/// it can be pinned by unit tests: `Some(description)` when `line` (CRLF
+/// included) would be discarded by the recipient's framing. A recipient that
+/// negotiated `draft/multiline` accepts the batch form's longer inner lines —
+/// that is the capability's whole point — so its traditional-part budget grows
+/// by the multiline byte cap.
+#[cfg(debug_assertions)]
+fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
+    use e6irc_proto::message::{MAX_LINE_LEN, MAX_SERVER_TAGS_LEN};
+    let (tags_len, body) = match line.first() {
+        Some(b'@') => match line.iter().position(|&b| b == b' ') {
+            Some(sp) => (sp + 1, &line[sp + 1..]),
+            None => (0, line),
+        },
+        _ => (0, line),
+    };
+    if tags_len > MAX_SERVER_TAGS_LEN {
+        return Some(format!(
+            "outbound tag section is {tags_len} bytes (limit {MAX_SERVER_TAGS_LEN})"
+        ));
+    }
+    let budget = if multiline_capable {
+        MAX_LINE_LEN + crate::core::handler::message::MULTILINE_MAX_BYTES
+    } else {
+        MAX_LINE_LEN
+    };
+    if body.len() > budget {
+        return Some(format!(
+            "outbound line's traditional part is {} bytes (limit {budget}) — a client's \
+             framing discards over-long lines whole",
+            body.len()
+        ));
+    }
+    None
+}
+
+#[cfg(all(test, debug_assertions))]
+mod wire_line_tests {
+    use super::wire_line_violation;
+
+    #[test]
+    fn holds_the_traditional_limit_and_the_multiline_allowance() {
+        let fits = format!(":s PRIVMSG #c :{}\r\n", "x".repeat(490));
+        assert!(fits.len() <= 512);
+        assert!(wire_line_violation(fits.as_bytes(), false).is_none());
+
+        let over = format!(":s PRIVMSG #c :{}\r\n", "x".repeat(500));
+        assert!(over.len() > 512);
+        assert!(wire_line_violation(over.as_bytes(), false).is_some());
+        // The same line is legal for a recipient that negotiated multiline.
+        assert!(wire_line_violation(over.as_bytes(), true).is_none());
+
+        // Tags spend the tag budget, not the traditional one.
+        let tagged = format!("@time=x;msgid=y :s PRIVMSG #c :{}\r\n", "x".repeat(490));
+        assert!(wire_line_violation(tagged.as_bytes(), false).is_none());
+        let huge_tags = format!("@a={} :s PING\r\n", "t".repeat(9000));
+        assert!(wire_line_violation(huge_tags.as_bytes(), false).is_some());
     }
 }

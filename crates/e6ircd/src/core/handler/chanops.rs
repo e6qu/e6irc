@@ -54,10 +54,13 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let prefix = state.sessions[&conn].prefix();
     let kicker_nick = state.sessions[&conn].nick.clone().expect("registered");
     let line = match p.get(2) {
-        Some(reason) => format!(
-            ":{prefix} KICK {display} {victim_nick} :{}",
-            truncate_chars(reason, KICKLEN)
-        ),
+        Some(reason) => {
+            // KICKLEN bounds the reason itself; the relayed line also carries
+            // the kicker's prefix, so fit against the actual head too.
+            let head = format!(":{prefix} KICK {display} {victim_nick} :");
+            let reason = crate::core::handler::fit_trailing(&head, truncate_chars(reason, KICKLEN));
+            format!("{head}{reason}")
+        }
         None => format!(":{prefix} KICK {display} {victim_nick} :{kicker_nick}"),
     };
     state.broadcast_channel(&key, &line, None);

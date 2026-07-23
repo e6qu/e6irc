@@ -132,8 +132,13 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .sessions
         .get_mut(&conn)
         .expect("session checked in dispatch");
-    session.user = Some(p[0].to_string());
-    session.realname = Some(p[3].to_string());
+    // Identity fields are bounded at intake (USERLEN/REALLEN below, nick by
+    // nicklen): they ride in the source prefix or WHOIS replies of *other*
+    // lines, so an unbounded one makes every such line's fixed head unbounded
+    // and no per-line fitting can save it. Truncation here is the protocol
+    // norm (Solanum does the same) and USERLEN is advertised in ISUPPORT.
+    session.user = Some(truncate_chars(p[0], USERLEN).to_string());
+    session.realname = Some(truncate_chars(p[3], REALLEN).to_string());
     maybe_complete_registration(state, conn);
 }
 
@@ -398,7 +403,11 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
         _ => {
-            let shown = if sub.is_empty() { "*" } else { &sub };
+            let shown = if sub.is_empty() {
+                "*"
+            } else {
+                crate::core::handler::clip_echo(&sub)
+            };
             state.numeric(
                 conn,
                 ERR_INVALIDCAPCMD,

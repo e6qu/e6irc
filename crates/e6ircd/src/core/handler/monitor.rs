@@ -99,10 +99,17 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 added.push((key, nick.to_string()));
             }
             if !rejected.is_empty() {
+                // The rejected targets echo the client's own list, which is
+                // bounded only by the input frame — clipped so the refusal is
+                // never itself discarded for length.
+                let shown = rejected.join(",");
                 state.numeric(
                     conn,
                     ERR_MONLISTFULL,
-                    &[&MONITOR_LIMIT.to_string(), &rejected.join(",")],
+                    &[
+                        &MONITOR_LIMIT.to_string(),
+                        crate::core::handler::clip_echo(&shown),
+                    ],
                     Some("Monitor list is full."),
                 );
             }

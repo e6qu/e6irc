@@ -359,6 +359,7 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let prefix = state.sessions[&conn].prefix();
+    let new_name = truncate_chars(new_name, REALLEN);
     state.sessions.get_mut(&conn).expect("checked").realname = Some(new_name.to_string());
     let line = format!(":{prefix} SETNAME :{new_name}");
     state.send_timed(conn, &line);
@@ -448,6 +449,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             "CHANTYPES=#",
             &format!("NICKLEN={nicklen}"),
             "CHANNELLEN=50",
+            &format!("USERLEN={USERLEN}"),
             &format!("TOPICLEN={TOPICLEN}"),
             &format!("KICKLEN={KICKLEN}"),
             &format!("AWAYLEN={AWAYLEN}"),
@@ -530,5 +532,31 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .filter(|nick| state.registered_peer(&state.nick_key(nick)).is_some())
         .map(str::to_string)
         .collect();
-    state.numeric(conn, RPL_ISON, &[], Some(&online.join(" ")));
+    // RPL_ISON is a single reply by RFC 2812 (splitting it would be
+    // non-conformant), yet the echoed list is bounded only by the input frame
+    // and the reply adds server overhead — so it can overflow the wire limit.
+    // Match Solanum: pack nicks while they fit and drop the rest, which a
+    // client re-queries next poll anyway (ISON is a polling command).
+    let overhead = 1
+        + state.config.server_name.len()
+        + 5
+        + state.sessions[&conn].nick.as_deref().unwrap_or("*").len()
+        + 4;
+    let budget = 510usize.saturating_sub(overhead);
+    let mut shown = String::new();
+    for nick in &online {
+        let cost = if shown.is_empty() {
+            nick.len()
+        } else {
+            1 + nick.len()
+        };
+        if shown.len() + cost > budget {
+            break;
+        }
+        if !shown.is_empty() {
+            shown.push(' ');
+        }
+        shown.push_str(nick);
+    }
+    state.numeric(conn, RPL_ISON, &[], Some(&shown));
 }

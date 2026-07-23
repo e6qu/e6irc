@@ -24,7 +24,10 @@ pub(super) fn chathistory_fail(
     let mut line = format!(":{server} FAIL CHATHISTORY {code}");
     for param in context {
         line.push(' ');
-        line.push_str(param);
+        // Context params echo the client's own subcommand/target for
+        // attribution; clipped so the FAIL explaining an error is never itself
+        // discarded for length.
+        line.push_str(crate::core::handler::clip_echo(param));
     }
     line.push_str(" :");
     line.push_str(detail);
@@ -260,10 +263,14 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
 
     // The batch names the target the client asked for, echoed as given; the
     // replayed messages carry their own canonical addressing (history_page).
+    // A live channel supplies its own (≤ CHANNELLEN) display name; the fallback
+    // echoes the raw target, which for a DM correspondent or a never-joined
+    // name is bounded only by the input frame — clip it so the batch open and
+    // every replayed line stay inside the wire limit.
     let display = state
         .chan_key_if_channel(target)
         .and_then(|k| state.channels.get(&k).map(|c| c.name.clone()))
-        .unwrap_or_else(|| target.to_string());
+        .unwrap_or_else(|| crate::core::handler::clip_echo(target).to_string());
     let batch_ref = state.next_msgid();
 
     // Ring miss with a database available: page from PostgreSQL instead,
@@ -553,6 +560,11 @@ pub(crate) fn targets_page(
             .map(|c| c.name.clone())
             .unwrap_or(target);
         let time = e6irc_proto::time::server_time(ts);
+        // A legitimate target is a channel (≤ CHANNELLEN) or a correspondent
+        // nick (≤ nicklen), always short — but the value flows from a stored
+        // conversation key derived from identities, so clip it to keep this
+        // line inside the wire limit regardless of how it was produced.
+        let display = crate::core::handler::clip_echo(&display);
         state.send(
             conn,
             &format!("@batch={batch_ref} :{server} CHATHISTORY TARGETS {display} {time}"),
@@ -640,9 +652,17 @@ pub(crate) fn history_page(
         // one render site for both — normalize here so the same message never
         // replays with a different verb case depending on where it came from.
         let verb = row.kind.to_ascii_uppercase();
+        // Fit the body against *this* line's traditional head, not the one it
+        // was stored under: a DM row is re-addressed on replay (to the requester
+        // or the correspondent), so its target — and thus the space left for the
+        // body — can differ from delivery. Tags don't count toward the 512
+        // limit, so the head measured here is only the non-tag part.
+        let target = crate::core::handler::clip_echo(target);
+        let head = format!(":{} {verb} {target} :", row.sender_prefix);
+        let body = crate::core::handler::fit_trailing(&head, &row.body);
         let line = format!(
-            "@batch={batch_ref};msgid={};time={time} :{} {verb} {target} :{}",
-            row.msgid, row.sender_prefix, row.body,
+            "@batch={batch_ref};msgid={};time={time} {head}{body}",
+            row.msgid,
         );
         state.send(conn, &line);
     }

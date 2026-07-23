@@ -493,7 +493,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
 /// A client must be able to see them before it starts a batch it cannot finish.
 pub(super) const MULTILINE_CAP: &str = "draft/multiline";
 /// Total bytes of message text one multiline message may carry.
-pub(super) const MULTILINE_MAX_BYTES: usize = 4096;
+pub(crate) const MULTILINE_MAX_BYTES: usize = 4096;
 /// Lines one multiline message may carry.
 pub(super) const MULTILINE_MAX_LINES: usize = 32;
 /// Tag marking a line as continuing the previous one without a break.
