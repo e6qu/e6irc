@@ -90,3 +90,9 @@ name = "bouncer_lines"
 path = "fuzz_targets/bouncer_lines.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "mask_matching"
+path = "fuzz_targets/mask_matching.rs"
+test = false
+doc = false

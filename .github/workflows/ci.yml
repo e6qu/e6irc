@@ -360,7 +360,7 @@ jobs:
       - name: Fuzz each target briefly
         working-directory: fuzz
         run: |
-          for target in parse_message tag_escaping isupport_token core_dispatch core_multi client_messages truncate_boundary framing base64_roundtrip bouncer_lines; do
+          for target in parse_message tag_escaping isupport_token core_dispatch core_multi client_messages truncate_boundary framing base64_roundtrip bouncer_lines mask_matching; do
             cargo +nightly fuzz run "$target" -- -max_total_time=30
           done
 

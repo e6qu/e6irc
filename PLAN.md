@@ -1358,6 +1358,34 @@ a filtered line never starts with `@` is false for a body that itself begins wit
 never stores). Relaxed to the invariant that actually holds and matters —
 injection-prevention — with the reasoning recorded in the target.
 
+Forty-sixth sweep — a real ban-matching bug, found by differential fuzzing
+(2026-07-23): `mask::matches` is the hostmask glob behind every ban, quiet and
+exception — run against masks any channel operator sets. Its shipped form is the
+iterative single-`*`-backtracking matcher, whose correctness for multiple stars
+is subtle enough to prove rather than trust. The new `mask_matching` target is a
+*differential* fuzz: it compares the shipped matcher against a textbook glob
+dynamic program (the specification) on arbitrary `(mask, subject)`, and any
+disagreement is a finding.
+
+It found one on the second input: `*?` vs a subject containing a literal `*`.
+The matcher tested `pattern[p] == text[t]` *before* recognizing `pattern[p] ==
+b'*'`, so a `*` **wildcard** in the pattern matched a literal `*` byte (0x2A) in
+the subject one-to-one, as if it were an ordinary character. The wildcard check
+now comes first.
+
+This is reachable and security-relevant: a username is length-bounded at intake
+but not character-filtered, so a client connecting as `USER a*b …` has prefix
+`nick!a*b@host`, and a ban mask that should match them could silently fail to —
+ban evasion. Fixed, pinned by a regression unit test (`*?` vs `*` and friends),
+and the differential fuzz is clean over 29.7M runs post-fix; the `chmodes/ban`
+and full channel-mode conformance suites still pass.
+
+Worth recording how the reference was chosen. A naive recursive glob spec is
+exponential on an all-`*` pattern, and the fuzzer correctly flagged that as a
+*slow unit* — the reference's cost, not the code's. The specification is now the
+O(n·m) glob DP, which is both unambiguously correct and fast, so the fuzzer
+tests the matcher rather than the oracle's pathologies.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
