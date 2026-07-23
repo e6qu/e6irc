@@ -30,6 +30,14 @@ pub(super) const INVITE_LIMIT: usize = 100;
 pub(super) const TOPICLEN: usize = 390;
 pub(super) const KICKLEN: usize = 390;
 pub(super) const AWAYLEN: usize = 390;
+/// Username cap, applied at USER and advertised as `USERLEN`. Solanum uses 10;
+/// the username rides in every relayed line's source prefix, so it must be
+/// bounded for any line to be fittable.
+pub(super) const USERLEN: usize = 10;
+/// Realname cap, applied at USER and SETNAME. Not an ISUPPORT token (none is
+/// standardized), but WHOIS 311 carries it as a trailing parameter, so an
+/// unbounded one overflows that reply.
+pub(super) const REALLEN: usize = 150;
 
 /// Canonicalize a channel list-mode (+b/+q/+e/+I) mask to `nick!user@host`,
 /// filling missing components with `*` (Solanum's `clean_ban_mask`). Without
@@ -320,7 +328,11 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             && (state.channels[&key].is_banned(state.casemap, &prefix)
                 || state.channels[&key].is_quieted(state.casemap, &prefix));
         let line = match &reason {
-            Some(r) if !suppress_reason => format!(":{prefix} PART {display} :{r}"),
+            Some(r) if !suppress_reason => {
+                let head = format!(":{prefix} PART {display} :");
+                let r = crate::core::handler::fit_trailing(&head, r);
+                format!("{head}{r}")
+            }
             _ => format!(":{prefix} PART {display}"),
         };
         state.broadcast_channel(&key, &line, None);
@@ -583,6 +595,12 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     }
     let new_text = truncate_chars(p.get(1).copied().unwrap_or(""), TOPICLEN);
     let prefix = state.sessions[&conn].prefix();
+    // TOPICLEN bounds the topic itself; the *relayed* line also carries the
+    // setter's prefix, which can push it past the wire limit. Fit against the
+    // broadcast head and store the same fitted text, so the broadcast, 332
+    // replies and persisted copy all carry one identical topic.
+    let new_text =
+        crate::core::handler::fit_trailing(&format!(":{prefix} TOPIC {display} :"), new_text);
     let now = (state.config.clock)();
     let new_topic = if new_text.is_empty() {
         None

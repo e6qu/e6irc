@@ -5297,3 +5297,94 @@ fn chathistory_replay_of_a_multiline_line_fits_the_wire_limit() {
     );
     assert!(replayed.contains(":yyyy"), "the body survived the replay");
 }
+
+/// Drive every "user text relayed with a server-added prefix" path to its
+/// maximum and assert the relayed line still fits the wire limit. These are
+/// the same shape as the PRIVMSG relay overflow: the sender's input was legal,
+/// the server's added prefix pushes the relay past 512, and the recipient's
+/// framing discards it whole. The debug-build funnel invariant also fires on
+/// any violation, so this test doubles as its regression harness.
+#[test]
+fn reason_bearing_relays_fit_the_wire_limit() {
+    let mut s = TestServer::new();
+    // Longest identity this server permits (test config nicklen = 16).
+    let long_nick = "n".repeat(16);
+    let alice = s.connect(1);
+    s.line(alice, &format!("NICK {long_nick}"));
+    s.line(alice, &format!("USER {} 0 * :real", "u".repeat(32)));
+    let reg = s.drain(alice);
+    assert!(
+        reg.iter().any(|l| l.contains(" 001 ")),
+        "alice failed to register: {reg:#?}"
+    );
+    let bob = s.register(2, "bob");
+    let chan = format!("#{}", "c".repeat(49));
+    s.line(alice, &format!("JOIN {chan}"));
+    s.drain(alice);
+    s.line(bob, &format!("JOIN {chan}"));
+    s.drain(alice);
+    s.drain(bob);
+
+    let assert_fits = |out: Vec<String>, what: &str, needle: &str| {
+        let line = out
+            .into_iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{what}: no line containing {needle}"));
+        assert!(
+            line.len() + 2 <= 512,
+            "{what}: relayed line is {} bytes, over the wire limit: {line}",
+            line.len()
+        );
+    };
+
+    // TOPIC at TOPICLEN.
+    s.line(alice, &format!("TOPIC {chan} :{}", "t".repeat(390)));
+    assert_fits(s.drain(bob), "TOPIC", " TOPIC ");
+    s.drain(alice);
+
+    // KICK with a KICKLEN reason.
+    s.line(alice, &format!("KICK {chan} bob :{}", "k".repeat(390)));
+    assert_fits(s.drain(bob), "KICK", " KICK ");
+    s.drain(alice);
+    s.line(bob, &format!("JOIN {chan}"));
+    s.drain(alice);
+    s.drain(bob);
+
+    // PART with the longest reason the input limit allows.
+    let part_reason = "p".repeat(510 - format!("PART {chan} :").len());
+    s.line(alice, &format!("PART {chan} :{part_reason}"));
+    assert_fits(s.drain(bob), "PART", " PART ");
+    s.drain(alice);
+    s.line(alice, &format!("JOIN {chan}"));
+    s.drain(alice);
+    s.drain(bob);
+
+    // QUIT with the longest reason the input limit allows.
+    let quit_reason = "q".repeat(510 - "QUIT :".len());
+    s.line(alice, &format!("QUIT :{quit_reason}"));
+    assert_fits(s.drain(bob), "QUIT", " QUIT ");
+}
+
+#[test]
+fn echoed_tokens_never_overflow_the_reply_explaining_them() {
+    // Several replies echo a client-supplied token for attribution: an unknown
+    // command (421), a bad CAP subcommand (410), an over-cap MONITOR list (734).
+    // The token is bounded only by the input frame, so echoing it whole could
+    // push the very reply that explains the error past the wire limit, and the
+    // client's framing would then discard it. Each is clipped. The debug-build
+    // wire invariant would also panic on any miss, so this is its regression.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+
+    // 421 unknown command.
+    s.line(alice, &format!("{} arg", "Z".repeat(300)));
+    let out = s.drain(alice);
+    let n421 = out.iter().find(|l| l.contains(" 421 ")).expect("421");
+    assert!(n421.len() + 2 <= 512, "421 is {} bytes", n421.len());
+
+    // 410 invalid CAP subcommand.
+    s.line(alice, &format!("CAP {}", "Q".repeat(300)));
+    let out = s.drain(alice);
+    let n410 = out.iter().find(|l| l.contains(" 410 ")).expect("410");
+    assert!(n410.len() + 2 <= 512, "410 is {} bytes", n410.len());
+}

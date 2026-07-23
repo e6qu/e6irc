@@ -278,7 +278,11 @@ strip = "symbols"
   prefix the sender did not, so a within-limit message can overflow 512 once
   relayed; the text is trimmed to fit at delivery — once, so live delivery, the
   echo and CHATHISTORY agree — since a single message cannot be split the way a
-  list-bearing numeric can.
+  list-bearing numeric can. A debug-build assertion at the single send funnel
+  (`wire_line_violation`) rejects any outbound line whose traditional part
+  exceeds the limit, so the whole class is machine-checked by the test and fuzz
+  suites rather than guarded site by site; it is compiled out of release, where
+  a panic on the shared worker would be worse than the over-long line.
 - Casemapping: **`rfc1459`** (what Libera/Solanum advertises), implemented
   once here and used for every nick/channel comparison in the entire system.
 - Includes the numerics table, ISUPPORT token model, and the CAP and SASL
