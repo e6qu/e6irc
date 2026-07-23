@@ -1191,6 +1191,64 @@ impl ServerState {
         self.send(conn, &line);
     }
 
+    /// Emit `code` one or more times, packing `items` into the trailing
+    /// parameter (joined by `sep`) so that no emitted line exceeds the 512-byte
+    /// wire limit including CRLF. `middle` is the fixed parameters that precede
+    /// the list on every line.
+    ///
+    /// A reply whose trailing parameter is an unbounded list — NAMES members,
+    /// WHOIS channels, MONITOR targets — must split: the receiving client's
+    /// framing discards an over-long line *whole*, so the listed entries vanish
+    /// with nothing said. The budget arithmetic is easy to get subtly wrong, so
+    /// it lives here once rather than at each call site.
+    ///
+    /// Nothing is emitted for an empty `items`. A caller that must always send
+    /// something (an empty NAMES is still closed by its own ENDOF numeric) does
+    /// that itself.
+    pub fn numeric_list(
+        &mut self,
+        conn: ConnId,
+        code: u16,
+        middle: &[&str],
+        items: &[String],
+        sep: char,
+    ) {
+        // Measure the fixed part of every line exactly as `numeric` frames it —
+        // ":{server} {code} {target}" + each middle + " :" + CRLF — so the
+        // budget can never drift from the line actually sent.
+        let target = self
+            .sessions
+            .get(&conn)
+            .and_then(|s| s.nick.clone())
+            .unwrap_or_else(|| "*".into());
+        let mut overhead = 1
+            + self.config.server_name.len()
+            + 1
+            + e6irc_proto::numerics::code_str(code).len()
+            + 1
+            + target.len();
+        for m in middle {
+            overhead += 1 + m.len();
+        }
+        overhead += 2 /* " :" */ + 2 /* CRLF */;
+        let budget = 512usize.saturating_sub(overhead).max(1);
+
+        let mut line = String::new();
+        for item in items {
+            if !line.is_empty() && line.len() + 1 + item.len() > budget {
+                self.numeric(conn, code, middle, Some(&line));
+                line.clear();
+            }
+            if !line.is_empty() {
+                line.push(sep);
+            }
+            line.push_str(item);
+        }
+        if !line.is_empty() {
+            self.numeric(conn, code, middle, Some(&line));
+        }
+    }
+
     /// Stamp a new event: a single clock read yielding both the wall-clock
     /// millisecond and the unique msgid derived from it. Live delivery, the
     /// history ring and the `messages` row all take this one value, so a

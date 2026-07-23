@@ -4985,3 +4985,54 @@ fn monitor_reports_subset_before_limit() {
         "the nicks accepted before the cap must still get RPL_MONOFFLINE: {out:#?}"
     );
 }
+
+#[test]
+fn monitor_online_reply_splits_to_fit_the_wire_limit() {
+    // A client can monitor up to the cap, and every monitored nick can be
+    // online. Emitted as one RPL_MONONLINE the full-prefix list runs to
+    // thousands of bytes; the receiving client's framing discards an over-long
+    // line whole, so it would never learn any of them are online.
+    let mut s = TestServer::new();
+    let watcher = s.register(1, "watcher");
+    // 100 online peers (the MONITOR cap), each with a real prefix.
+    let nicks: Vec<String> = (0..100).map(|i| format!("peer{i:03}")).collect();
+    for (i, nick) in nicks.iter().enumerate() {
+        s.register(100 + i as u64, nick);
+    }
+    // Add in chunks (the MONITOR + line itself must fit the input limit), then
+    // ask for the whole status at once so the reply spans one burst.
+    for chunk in nicks.chunks(20) {
+        s.line(watcher, &format!("MONITOR + {}", chunk.join(",")));
+        s.drain(watcher);
+    }
+    s.line(watcher, "MONITOR S");
+    let out = s.drain(watcher);
+
+    let online: Vec<&String> = out.iter().filter(|l| l.contains(" 730 ")).collect();
+    // It must have split — 100 prefixes cannot fit one 512-byte line.
+    assert!(
+        online.len() > 1,
+        "expected multiple RPL_MONONLINE lines, got {}: {out:#?}",
+        online.len()
+    );
+    // Every line is a legal wire line (the content plus its CRLF).
+    for line in &online {
+        assert!(
+            line.len() + 2 <= 512,
+            "RPL_MONONLINE line is {} bytes, over the limit: {line}",
+            line.len()
+        );
+    }
+    // Nothing was lost in the split: every monitored nick is reported online.
+    let joined = online
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for nick in &nicks {
+        assert!(
+            joined.contains(&format!("{nick}!")),
+            "{nick} missing from the split reply"
+        );
+    }
+}

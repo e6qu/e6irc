@@ -1072,6 +1072,32 @@ assert the returned index is on a boundary and the slice is a lossless prefix �
 fuzz target walks one cut of every string. A property this load-bearing should
 be pinned from both directions.
 
+Thirty-fifth sweep — MONITOR replies that vanished for being long
+(2026-07-23): the same silent-discard class as the last two sweeps, this time
+in a core numeric. A client may `MONITOR` up to 100 nicks, and all 100 can be
+online; the reply put every `nick!user@host` prefix on one `RPL_MONONLINE`
+line — thousands of bytes — which the receiving client's framing discards
+whole. The client would then never learn any of them are online: MONITOR's
+entire purpose, defeated at exactly the scale it is meant for. `RPL_MONOFFLINE`
+and `RPL_MONLIST` had the same shape.
+
+NAMES (353) and WHOIS (319) already split their lists to fit — the intent was
+clearly there, just not applied to MONITOR. Rather than add a fourth hand-rolled
+budget calculation (each with its own magic-number overhead: `1 + server.len()
++ 5 + …`, easy to get subtly wrong), the packing is now one method,
+`ServerState::numeric_list`, which measures the fixed framing exactly as
+`numeric` emits it and splits on that. MONITOR is fixed by it; NAMES and WHOIS
+fold onto it and lose their bespoke arithmetic. Verified the shared overhead
+reproduces both old hand-computed budgets to the byte.
+
+The regression test monitors 100 online peers and asserts the reply spans more
+than one line, every line fits the wire limit, and no nick is lost in the split
+— it reports all 100 on a single line against the unfixed code.
+
+USERHOST/USERIP (bounded to five targets) and ISON (a single reply by RFC 2812,
+where splitting would be non-conformant) are deliberately left as one line;
+MONITOR is the case that is both unbounded and explicitly allowed to span lines.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

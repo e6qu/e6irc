@@ -381,27 +381,8 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
         "="
     };
     // Split the member list across as many RPL_NAMREPLY lines as needed so no
-    // single 353 exceeds the 512-byte wire limit on a large channel. The
-    // budget subtracts the fixed framing (prefix, numeric, requester nick,
-    // symbol, channel, " :" and CRLF) from 512.
-    let requester_nick = state.sessions[&conn].nick.clone().unwrap_or_default();
-    let overhead =
-        1 + state.config.server_name.len() + 5 + requester_nick.len() + 4 + display.len() + 4;
-    let budget = 512usize.saturating_sub(overhead).max(1);
-    let mut line = String::new();
-    for name in &names {
-        if !line.is_empty() && line.len() + 1 + name.len() > budget {
-            state.numeric(conn, RPL_NAMREPLY, &[symbol, &display], Some(&line));
-            line.clear();
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(name);
-    }
-    if !line.is_empty() {
-        state.numeric(conn, RPL_NAMREPLY, &[symbol, &display], Some(&line));
-    }
+    // single 353 exceeds the 512-byte wire limit on a large channel.
+    state.numeric_list(conn, RPL_NAMREPLY, &[symbol, &display], &names, ' ');
     state.numeric(
         conn,
         RPL_ENDOFNAMES,

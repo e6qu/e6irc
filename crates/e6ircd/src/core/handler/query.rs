@@ -276,29 +276,9 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 &[&nick, &user, &host, "*"],
                 Some(&realname),
             );
-            if !chans.is_empty() {
-                // Split across as many 319 lines as needed so none exceeds the
-                // 512-byte wire limit (the same guard send_names applies to
-                // 353): prefix, numeric, requester, target nick, " :" and CRLF
-                // are fixed overhead; the channel list fills the rest.
-                let requester_nick = state.sessions[&conn].nick.clone().unwrap_or_default();
-                let overhead = 1 + server.len() + 5 + requester_nick.len() + 1 + nick.len() + 4;
-                let budget = 512usize.saturating_sub(overhead).max(1);
-                let mut line = String::new();
-                for ch in &chans {
-                    if !line.is_empty() && line.len() + 1 + ch.len() > budget {
-                        state.numeric(conn, RPL_WHOISCHANNELS, &[&nick], Some(&line));
-                        line.clear();
-                    }
-                    if !line.is_empty() {
-                        line.push(' ');
-                    }
-                    line.push_str(ch);
-                }
-                if !line.is_empty() {
-                    state.numeric(conn, RPL_WHOISCHANNELS, &[&nick], Some(&line));
-                }
-            }
+            // Split across as many 319 lines as needed so none exceeds the
+            // 512-byte wire limit (the same guard NAMES applies to 353).
+            state.numeric_list(conn, RPL_WHOISCHANNELS, &[&nick], &chans, ' ');
             if state.sessions[&peer].bot {
                 state.numeric(conn, RPL_WHOISBOT, &[&nick], Some("is a bot"));
             }
