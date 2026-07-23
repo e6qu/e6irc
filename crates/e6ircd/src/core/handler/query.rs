@@ -108,6 +108,17 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             } else {
                 chan.members
                     .iter()
+                    // An invisible member is hidden from a WHO by someone who
+                    // shares no channel with them (and isn't them) — the same
+                    // rule the wildcard/host branch below applies. A fellow
+                    // member always shares this channel, so members still see
+                    // each other; only an outsider WHOing a public channel is
+                    // filtered. Without this, `+i` leaks through channel WHO.
+                    .filter(|(m, _)| {
+                        **m == conn
+                            || !state.sessions[m].invisible
+                            || state.share_channel(conn, **m)
+                    })
                     .map(|(m, modes)| {
                         let s = &state.sessions[m];
                         let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
@@ -174,17 +185,20 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             })
             .map(|(c, _)| *c)
             .collect();
-        // Invisible users are hidden from wildcard WHO unless the
-        // requester is themselves, shares a channel, or named them
-        // exactly.
+        // Invisible users are hidden unless the requester is themselves, shares
+        // a channel, or named them *by their exact nick*. "Named exactly" means
+        // a wildcard-free mask that matches the nick specifically: the mask is
+        // also matched against the host above, so a literal host like
+        // `WHO 10.0.0.5` (no wildcards) would otherwise reveal every `+i` user
+        // on that host, and a nick wildcard like `bo*` must still hide them.
         let is_wildcard = match_all || mask.contains('*') || mask.contains('?');
         let targets: Vec<ConnId> = targets
             .into_iter()
             .filter(|&peer| {
-                !is_wildcard
-                    || peer == conn
-                    || !state.sessions[&peer].invisible
-                    || state.share_channel(conn, peer)
+                let s = &state.sessions[&peer];
+                let named_by_nick = !is_wildcard
+                    && e6irc_proto::mask::matches(casemap, mask, s.nick.as_deref().unwrap_or(""));
+                peer == conn || !s.invisible || state.share_channel(conn, peer) || named_by_nick
             })
             .collect();
         for peer in targets {

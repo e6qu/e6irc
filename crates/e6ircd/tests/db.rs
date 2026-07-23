@@ -1319,6 +1319,85 @@ async fn labeled_chathistory_targets_carries_label_on_db_path() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
+    // Regression: over the PostgreSQL TARGETS path a DM buffer must be reported
+    // by the correspondent's display *nick*, not the raw stored identity
+    // (`~nick` / folded account) — the no-DB path already converts, and the two
+    // must agree.
+    let url =
+        support::test_db("chathistory_targets_db_path_shows_dm_correspondent_as_a_nick").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let config = Config {
+        server_name: "irc.dm.example".into(),
+        network_name: "DmNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+
+    // bob is the one who will query; alice sends him a DM.
+    let bob_stream = TcpStream::connect(running.addrs[0]).await.expect("bob");
+    let (br, mut bw) = bob_stream.into_split();
+    let mut breader = BufReader::new(br);
+    bw.write_all(
+        b"CAP LS 302\r\nCAP REQ :batch draft/chathistory message-tags server-time\r\n\
+          NICK bob\r\nUSER b 0 * :B\r\nCAP END\r\n",
+    )
+    .await
+    .unwrap();
+    expect_line(&mut breader, "001").await;
+
+    let alice_stream = TcpStream::connect(running.addrs[0]).await.expect("alice");
+    let (ar, mut aw) = alice_stream.into_split();
+    let mut areader = BufReader::new(ar);
+    aw.write_all(b"NICK alice\r\nUSER a 0 * :A\r\n")
+        .await
+        .unwrap();
+    expect_line(&mut areader, "001").await;
+    aw.write_all(b"PRIVMSG bob :hi there\r\n").await.unwrap();
+    expect_line(&mut breader, "PRIVMSG bob :hi there").await;
+
+    // Wait for the DM to land in the messages table.
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE dm_peers IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let lo = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(1000));
+    let hi = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            * 1000
+            + 60_000,
+    ));
+    bw.write_all(format!("CHATHISTORY TARGETS timestamp={lo} timestamp={hi} 50\r\n").as_bytes())
+        .await
+        .unwrap();
+    let target_line = expect_line(&mut breader, "CHATHISTORY TARGETS ").await;
+    assert!(
+        target_line.contains("CHATHISTORY TARGETS alice "),
+        "DM target must be the display nick `alice`, not a raw identity: {target_line}"
+    );
+    assert!(
+        !target_line.contains("~alice"),
+        "the raw `~`-prefixed identity must not leak: {target_line}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn bnc_networks_crud() {
     let pool = db::connect_and_migrate(&support::test_db("bnc_networks_crud").await)
         .await
@@ -1392,6 +1471,58 @@ async fn bnc_networks_crud() {
     );
     // bob's copy survives alice's delete
     assert_eq!(db::list_bnc_networks(&pool, "bob").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
+    // bnc_buffer is keyed by the *casefolded* owner (the persistence task folds
+    // it). Deleting a network by the raw account name must still remove the
+    // buffer rows — otherwise a mixed-case owner's backlog is orphaned forever
+    // and a same-named network recreated later replays it.
+    let pool = db::connect_and_migrate(
+        &support::test_db("deleting_a_bnc_network_purges_its_casefolded_buffer").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "MixedCase", "pw")
+        .await
+        .expect("acct");
+    let net = db::BncNetworkRow {
+        name: "libera".into(),
+        addr: "irc.libera.chat:6697".into(),
+        tls: true,
+        nick: "mc".into(),
+        realname: None,
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        enabled: true,
+    };
+    db::create_bnc_network(&pool, "MixedCase", &net)
+        .await
+        .expect("create");
+    // The live persistence path writes under the folded owner.
+    let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold("MixedCase");
+    for i in 0..3 {
+        db::persist_bnc_line(&pool, &folded, "libera", &format!(":s PRIVMSG #x :m{i}"))
+            .await
+            .expect("persist");
+    }
+    // Delete by the raw (display-cased) account name, as the HTTP handler does.
+    assert!(
+        db::delete_bnc_network(&pool, "MixedCase", "libera")
+            .await
+            .expect("delete")
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_buffer")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        remaining, 0,
+        "the folded-owner buffer rows must be purged on delete, not orphaned"
+    );
 }
 
 #[tokio::test]

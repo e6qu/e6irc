@@ -363,6 +363,13 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
     let mut names: Vec<String> = chan
         .members
         .iter()
+        // An invisible member is hidden from a NAMES by an outsider who shares
+        // no channel with them — the same rule WHO applies. Fellow members
+        // share this channel, so they still see each other; only a non-member
+        // listing a public channel is filtered. Without this, `+i` leaks.
+        .filter(|(m, _)| {
+            **m == conn || !state.sessions[m].invisible || state.share_channel(conn, **m)
+        })
         .map(|(m, modes)| {
             let member = &state.sessions[m];
             let shown = if requester_caps.userhost_in_names {
@@ -446,7 +453,11 @@ pub(super) fn deliver_and_echo(
 ) {
     deliver_message(state, recipients, delivery);
     if state.sessions[&conn].caps.echo_message {
-        // The echo is the sender's own labeled response, so it is captured.
+        // The echo is the sender's own labeled response, so it is captured. A
+        // self-directed message (`PRIVMSG yournick`) therefore correctly arrives
+        // twice with echo-message — once as the recipient copy and once as the
+        // captured echo, and only the echo carries the label (per the
+        // labeled-response spec / irctest `testLabeledPrivmsgResponsesToSelf`).
         let echo = Delivery {
             bypass_capture: false,
             ..*delivery

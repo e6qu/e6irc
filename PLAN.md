@@ -1593,6 +1593,60 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Fifty-fifth sweep — four-front bug hunt: info-disclosure, a ban-evasion
+transport, and delivery/history fidelity (2026-07-23): four parallel adversarial
+passes (WHO/WHOIS/NAMES/LIST visibility, message routing/echo, history/DB
+persistence, config/oper/admin) surfaced eleven concrete defects, all fixed here
+in one PR. (A twelfth candidate — a self-directed message "delivered twice" with
+echo-message — was investigated and found *correct*: the recipient copy plus the
+labeled echo are both required by the labeled-response spec, and irctest
+`testLabeledPrivmsgResponsesToSelf` / `testMessagesToSelf` assert exactly two
+messages with one label. No change made.)
+
+*Information disclosure.* (1) **`+i` invisible members leaked through channel
+`WHO` and `NAMES`** to a non-member of a public channel — the invisible filter
+existed only on the wildcard branch of WHO. Both now apply the shared rule
+(hidden from an outsider who shares no channel; fellow members still see each
+other). (2) **A literal, wildcard-free host `WHO 10.0.0.5` bypassed the `+i`
+gate**, since the mask matched host as well as nick; "named exactly" now means a
+wildcard-free *nick* match specifically.
+
+*A whole transport that evaded server bans.* (3) **Every IRC-over-WebSocket
+session was opened with the literal host `"websocket"`**, so KLINE/DLINE never
+matched and a banned user reconnected freely through `/ws/irc` (and every WS user
+shared one hostmask). It now uses the real client IP (X-Forwarded-For only via a
+trusted proxy), exactly as the raw-TCP path does.
+
+*Operator surface.* (4) **`OPER` leaked operator-name existence by timing** —
+an unknown name skipped the SHA-256 compares that a wrong password performs; the
+compare now always runs against a dummy secret. (5) **Config accepted an empty
+oper name/password or duplicate names silently**; `validate()` now rejects them
+loudly like every other subsystem.
+
+*Message delivery.* (6) **The `+C` (no-CTCP) ACTION exemption was a prefix
+match**, so `\x01ACTIONX\x01` / `\x01ACTIONVERSION\x01` slipped through; it now
+requires the exact `ACTION` tag (bare, space-delimited, or `\x01`-closed).
+(7) **A labeled multiline batch hung a client that lacked echo-message** — the
+label rode only the echo copy, so no response and no ACK ever arrived; a labeled
+`ACK` is now emitted on the success path (mirroring the failure path). (8)
+**`TAGMSG @#chan` ignored the STATUSMSG sigil** and answered `ERR_NOSUCHNICK`; it
+now routes to the op/voice subset like PRIVMSG.
+
+*History / DB.* (9) **CHATHISTORY TARGETS over the PostgreSQL path emitted DM
+correspondents as raw identities** (`~nick` / folded account) instead of display
+nicks — the no-DB path converted, the DB path did not. `targets_page` is now the
+single conversion site for both. (10) **Deleting a BNC network orphaned its
+`bnc_buffer` rows** — the delete matched the raw account while the buffer is
+keyed by the *folded* owner, so backlog leaked and a same-named network replayed
+it; the delete now binds the folded owner. (11) **A malformed `timestamp=`
+CHATHISTORY selector silently defaulted the window bound** (latest-N, or an empty
+window) instead of `FAIL … INVALID_PARAMS`; it is now rejected up front.
+
+The passes also cleared: admin-API authz (unforgeable `AdminAccount` extractor,
+fail-closed on empty admin set), TLS/startup (loud errors, no silent
+TLS-disable), the composite `(ts,id)` msgid-pivot paging, read/write casefold
+symmetry for the `messages` table, and the WHOX field parsing/order.
+
 Fifty-fourth sweep — four-front bug hunt: a silent-hang liveness leak,
 case-inconsistent bans, phantom mode broadcasts, spec gaps (2026-07-23): four
 parallel adversarial passes (connection lifecycle, byte-level I/O, IRCv3 state

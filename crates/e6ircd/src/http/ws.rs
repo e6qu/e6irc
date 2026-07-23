@@ -24,7 +24,7 @@ pub(super) async fn ws_irc(
             None,
         );
     };
-    ws.on_upgrade(move |socket| ws_irc_conn(state, socket, guard))
+    ws.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -36,6 +36,7 @@ pub(super) async fn ws_irc_conn(
     state: Arc<AppState>,
     mut socket: WebSocket,
     _conn_guard: crate::net::ConnGuard,
+    ip: std::net::IpAddr,
 ) {
     use crate::core::{ConnId, Input, Output};
     use e6irc_proto::framing::{LineBuffer, LineEvent};
@@ -53,7 +54,11 @@ pub(super) async fn ws_irc_conn(
         .push(Input::Open {
             conn,
             tx: out_tx,
-            host: "websocket".into(),
+            // The real client IP (X-Forwarded-For only via a trusted proxy),
+            // exactly as the raw-TCP path uses `peer.ip()`. A literal here would
+            // give every WS user the same hostmask, letting a banned user evade
+            // KLINE/DLINE through /ws/irc and making per-user host bans impossible.
+            host: ip.to_string(),
         })
         .await
         .is_err()

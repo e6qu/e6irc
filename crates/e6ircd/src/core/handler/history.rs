@@ -142,6 +142,23 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         );
         return;
     }
+    // A `timestamp=` selector whose value is not a valid server-time is
+    // malformed. Reject it up front instead of letting `selector_ts` silently
+    // default the bound (to 0, or `u64::MAX as i64 == -1`), which would answer a
+    // garbage request with the latest N messages or a silently-empty window.
+    if refs.iter().any(|s| {
+        s.strip_prefix("timestamp=")
+            .is_some_and(|v| e6irc_proto::time::parse_server_time_millis(v).is_none())
+    }) {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            &[sub, target],
+            "Malformed timestamp= selector",
+        );
+        return;
+    }
     // The limit must be a positive integer — never silently default it.
     let limit: usize = match p
         .get(if is_between { 4 } else { 3 })
@@ -442,7 +459,10 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         .collect();
     for (key, peer) in conversations {
         if let Some(latest) = latest_in_window(state, &key) {
-            targets.push((state.identity_nick(&peer), latest));
+            // Push the raw correspondent *identity*; `targets_page` is the single
+            // site that resolves an identity to a display nick, so this path and
+            // the DB path (which also yields identities) convert identically.
+            targets.push((peer, latest));
         }
     }
     // Oldest activity first; a limit therefore keeps the oldest buffers.
@@ -474,13 +494,17 @@ pub(crate) fn targets_page(
     };
     state.send(conn, &open);
     for (target, ts) in targets {
-        // Prefer the channel's display name while it is still in memory.
+        // A channel target: prefer its live display name. Anything else is a DM
+        // correspondent stored as an *identity* (`~nick` or a folded account) —
+        // resolve it to the display nick here, the one conversion site for both
+        // the in-memory and DB paths, so a client never receives a `~`-prefixed
+        // non-target. (identity_nick passes a channel name through unchanged, so
+        // an evicted channel still emits its own name.)
         let key = state.chan_key(&target);
-        let display = state
-            .channels
-            .get(&key)
-            .map(|c| c.name.clone())
-            .unwrap_or(target);
+        let display = match state.channels.get(&key) {
+            Some(c) => c.name.clone(),
+            None => state.identity_nick(&target),
+        };
         let time = e6irc_proto::time::server_time(ts);
         // A legitimate target is a channel (≤ CHANNELLEN) or a correspondent
         // nick (≤ nicklen), always short — but the value flows from a stored
