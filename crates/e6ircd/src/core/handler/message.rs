@@ -727,7 +727,15 @@ pub(super) fn deliver_multiline(
         if caps.account_tag
             && let Some(account) = sender_account.as_deref()
         {
-            common.push(format!("account={account}"));
+            // The account name is a nick or an OIDC-sanitized name, both of which
+            // can contain `\\` (a legal nick char) — a raw backslash in a tag value
+            // is an escape introducer, so a client would decode `a\\b` as `ab` and
+            // see a different account than the one that spoke. Escape it like any
+            // tag value.
+            common.push(format!(
+                "account={}",
+                e6irc_proto::message::escape_tag_value(account)
+            ));
         }
         if sender_is_bot && caps.message_tags {
             common.push("bot".into());
