@@ -174,6 +174,115 @@ mod tests {
         assert!(!valid_client_tag_key("noplus"));
     }
 
+    /// An adversarial alphabet: one nick-legal letter, the prefix separators,
+    /// whitespace, the three injection bytes, a backslash, a bracket, a digit, a
+    /// control char, and a multi-byte character. Every function's *output*
+    /// contract is checked against every string of length 0..=3 over it — small
+    /// enough to be exhaustive, wide enough to hit each per-character branch and
+    /// its boundaries.
+    const ALPHABET: &[char] = &[
+        'a', '@', '!', ' ', '\r', '\n', '\0', '\\', '[', '1', '\u{2}', '\u{e9}',
+    ];
+
+    fn each_input(mut check: impl FnMut(&str)) {
+        let n = ALPHABET.len();
+        for len in 0..=3usize {
+            let total = n.pow(len as u32);
+            for mut code in 0..total {
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(ALPHABET[code % n]);
+                    code /= n;
+                }
+                check(&s);
+            }
+        }
+    }
+
+    #[test]
+    fn username_output_is_prefix_safe() {
+        each_input(|raw| {
+            let out = username(raw, 8);
+            assert!(!out.is_empty(), "username empty for {raw:?}");
+            assert!(out.len() <= 8, "username over budget: {out:?}");
+            for c in out.chars() {
+                assert!(
+                    !matches!(c, '!' | '@' | ' ') && !c.is_control(),
+                    "username kept an unsafe char {c:?} from {raw:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn account_name_output_is_nick_charset() {
+        each_input(|raw| {
+            let out = account_name(raw);
+            assert!(!out.is_empty(), "account_name empty for {raw:?}");
+            assert!(out.chars().count() <= 32, "account_name too long: {out:?}");
+            for c in out.chars() {
+                assert!(
+                    c.is_ascii_alphanumeric()
+                        || matches!(
+                            c,
+                            '-' | '_' | '.' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '`'
+                        ),
+                    "account_name kept a non-nick char {c:?} from {raw:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn upstream_line_output_has_no_injection_bytes() {
+        each_input(|raw| {
+            let out = upstream_line(raw.to_string());
+            assert!(
+                !out.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)),
+                "upstream_line left an injection byte in {out:?} from {raw:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn valid_client_tag_key_accepts_only_spec_keys() {
+        each_input(|raw| {
+            if valid_client_tag_key(raw) {
+                let rest = raw.strip_prefix('+').expect("accepted key starts with +");
+                assert!(!rest.is_empty());
+                assert!(
+                    rest.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'/')),
+                    "accepted a malformed tag key {raw:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    fn nick_token_output_is_prefix_safe() {
+        each_input(|raw| {
+            let out = nick_token(raw);
+            assert!(!out.is_empty(), "nick_token empty for {raw:?}");
+            assert!(out.chars().count() <= 30, "nick_token too long: {out:?}");
+            for c in out.chars() {
+                assert!(
+                    c.is_ascii_alphanumeric()
+                        || matches!(
+                            c,
+                            '[' | ']' | '\\' | '`' | '_' | '^' | '{' | '|' | '}' | '-'
+                        ),
+                    "nick_token kept a non-nick char {c:?} from {raw:?}"
+                );
+                assert!(
+                    !matches!(c, '!' | '@' | ':' | ' ' | '\r' | '\n' | '\0'),
+                    "nick_token kept a prefix-breaking char {c:?} from {raw:?}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn upstream_line_neutralizes_injection_bytes() {
         assert_eq!(upstream_line("a\rb\nc\0d".into()), "a b c d");
