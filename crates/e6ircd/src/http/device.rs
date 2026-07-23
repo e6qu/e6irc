@@ -5,7 +5,21 @@ use super::*;
 // ---- device authorization grant (RFC 8628) ------------------------------
 
 /// Start a device grant. No auth: the client is not yet a principal.
-pub(super) async fn device_start(State(state): State<Arc<AppState>>) -> Response {
+pub(super) async fn device_start(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Rate-limit per client IP: this is unauthenticated and each call inserts a
+    // live `device_grants` row that pruning cannot touch for 10 minutes, so an
+    // anonymous flood would otherwise accumulate rows unboundedly. Gate it like
+    // every other unauthenticated work-inducing endpoint (oidc_start, etc.).
+    if !auth_rate_ok(
+        &state,
+        client_ip(peer.ip(), &headers, &state.trusted_proxies),
+    ) {
+        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
+    }
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -72,25 +86,14 @@ pub(super) async fn device_token(
         )
             .into_response()
     };
-    match crate::db::poll_device_grant(pool, &req.device_code).await {
-        Ok(crate::db::DeviceStatus::Approved(account)) => {
-            match crate::db::issue_api_token(pool, &account, "device").await {
-                Ok(token) => (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    serde_json::json!({ "access_token": token, "token_type": "bearer" })
-                        .to_string(),
-                )
-                    .into_response(),
-                Err(e) => {
-                    eprintln!("http: device token mint failed: {e}");
-                    problem(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Database unavailable",
-                        None,
-                    )
-                }
-            }
-        }
+    // The grant is consumed and the token minted in one transaction inside
+    // `poll_device_grant`, so a mint failure can't destroy an approved grant.
+    match crate::db::poll_device_grant(pool, &req.device_code, "device").await {
+        Ok(crate::db::DeviceStatus::Approved(token)) => (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "access_token": token, "token_type": "bearer" }).to_string(),
+        )
+            .into_response(),
         Ok(crate::db::DeviceStatus::Pending) => oauth_err("authorization_pending"),
         Ok(crate::db::DeviceStatus::Expired) => oauth_err("expired_token"),
         Ok(crate::db::DeviceStatus::Unknown) => oauth_err("invalid_grant"),

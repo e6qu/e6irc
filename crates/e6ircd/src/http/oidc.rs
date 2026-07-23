@@ -302,6 +302,27 @@ pub(super) async fn oidc_callback(
     let (Some(code), Some(csrf_state)) = (query.code, query.state) else {
         return problem(StatusCode::BAD_REQUEST, "Missing code or state", None);
     };
+    // Require the browser to present the binding cookie set at authorize time,
+    // constant-time-equal to the returned `state`. Without this, an attacker
+    // who completed their own login could feed the resulting callback URL to a
+    // victim and plant the attacker's session in the victim's browser.
+    //
+    // This check comes *before* the pending entry is consumed: an attacker who
+    // learns a victim's in-flight `state` but lacks the browser cookie must be
+    // turned away without burning the victim's login, or they could DoS every
+    // in-flight sign-in by racing the callback.
+    let bound =
+        cookie_value(&headers, oidc_state_cookie_name(state.secure_cookies)).is_some_and(|c| {
+            aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), csrf_state.as_bytes())
+                .is_ok()
+        });
+    if !bound {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "Login state not bound to this browser",
+            None,
+        );
+    }
     let Some(pending) = state
         .pending_auth
         .lock()
@@ -316,22 +337,6 @@ pub(super) async fn oidc_callback(
     };
     if pending.provider != provider_name || pending.started.elapsed() > Duration::from_secs(600) {
         return problem(StatusCode::UNAUTHORIZED, "Login state mismatch", None);
-    }
-    // Require the browser to present the binding cookie set at authorize time,
-    // constant-time-equal to the returned `state`. Without this, an attacker
-    // who completed their own login could feed the resulting callback URL to a
-    // victim and plant the attacker's session in the victim's browser.
-    let bound =
-        cookie_value(&headers, oidc_state_cookie_name(state.secure_cookies)).is_some_and(|c| {
-            aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), csrf_state.as_bytes())
-                .is_ok()
-        });
-    if !bound {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "Login state not bound to this browser",
-            None,
-        );
     }
     let Some(pool) = state.pool.clone() else {
         return problem(

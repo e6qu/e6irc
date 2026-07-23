@@ -1154,7 +1154,9 @@ async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> DbReply 
 pub enum DeviceStatus {
     /// Not yet approved by a user.
     Pending,
-    /// Approved; the grant is consumed and the account returned.
+    /// Approved; the grant is consumed and a freshly-minted API token returned.
+    /// Consuming the grant and minting the token happen in one transaction, so
+    /// an approved grant is never destroyed by a token-mint failure.
     Approved(String),
     /// The grant window elapsed.
     Expired,
@@ -1215,26 +1217,45 @@ pub async fn approve_device_grant(
     Ok(res.rows_affected() > 0)
 }
 
-/// Poll a grant; if approved and valid, consume it and return the account.
-pub async fn poll_device_grant(pool: &PgPool, device_code: &str) -> Result<DeviceStatus, DbError> {
+/// Poll a grant; if approved and valid, atomically consume it and mint the
+/// caller's API token (labelled `token_label`) in the same transaction,
+/// returning the token in [`DeviceStatus::Approved`].
+///
+/// Consume-and-mint is one transaction on purpose: if the mint fails (a
+/// transient DB error, or the account having been deleted between approval and
+/// poll), the transaction rolls back and the approved grant is left intact, so
+/// the client's next poll retries rather than being forced to restart the whole
+/// device flow. The `DELETE ... RETURNING` row lock still guarantees only one
+/// concurrent poll can win, so there is no double-mint.
+pub async fn poll_device_grant(
+    pool: &PgPool,
+    device_code: &str,
+    token_label: &str,
+) -> Result<DeviceStatus, DbError> {
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
     let approved: Option<String> = sqlx::query_scalar(
         "DELETE FROM device_grants
          WHERE device_code = $1 AND account IS NOT NULL AND expires_at > now()
          RETURNING account",
     )
     .bind(device_code)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?;
     if let Some(account) = approved {
-        return Ok(DeviceStatus::Approved(account));
+        // Mint in the same transaction: on any error `tx` drops without commit,
+        // rolling the DELETE back so the grant survives for the next poll.
+        let token = insert_api_token(&mut *tx, &account, token_label).await?;
+        tx.commit().await.map_err(DbError::Query)?;
+        return Ok(DeviceStatus::Approved(token));
     }
     let row: Option<(bool,)> =
         sqlx::query_as("SELECT expires_at > now() FROM device_grants WHERE device_code = $1")
             .bind(device_code)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(DbError::Query)?;
+    tx.commit().await.map_err(DbError::Query)?;
     Ok(match row {
         Some((true,)) => DeviceStatus::Pending,
         Some((false,)) => DeviceStatus::Expired,
@@ -1998,6 +2019,18 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
 /// Mint a PAT for an account. `e6p_`-prefixed opaque token shown once;
 /// SHA-256 stored. No expiry until scoped tokens land.
 pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Result<String, DbError> {
+    insert_api_token(pool, account, label).await
+}
+
+/// Mint a fresh PAT for `account` on the given executor and return the
+/// plaintext token. Executor-generic so it can run either standalone against a
+/// pool or *inside a transaction* — the device-grant path mints here in the
+/// same transaction that consumes the grant, so consume and mint commit or roll
+/// back together.
+async fn insert_api_token<'e, E>(executor: E, account: &str, label: &str) -> Result<String, DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     use argon2::password_hash::rand_core::RngCore;
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -2013,7 +2046,7 @@ pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Resul
     .bind(token_hash(&token))
     .bind(label)
     .bind(&folded)
-    .execute(pool)
+    .execute(executor)
     .await
     .map_err(DbError::Query)?;
     if inserted.rows_affected() == 0 {

@@ -1276,6 +1276,22 @@ fn stats_uptime_and_terminator() {
         "unknown STATS letter still terminates"
     );
     assert!(!has_numeric(&out, "242"), "no uptime for a non-u letter");
+
+    // A multi-byte first character must not panic the worker: the letter is
+    // taken on a char boundary, not by slicing byte index 1 (which is mid-char
+    // for any non-ASCII lead byte). Regression for an unauthenticated DoS.
+    s.line(alice, "STATS é");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "219"),
+        "STATS with a multi-byte argument still terminates without panic"
+    );
+    s.line(alice, "STATS €uro");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "219"),
+        "STATS with a leading 3-byte char still terminates without panic"
+    );
 }
 
 #[test]
