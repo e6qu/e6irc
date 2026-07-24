@@ -17,6 +17,20 @@ pub(super) fn parse_whox(arg: &str) -> Option<WhoxRequest> {
         Some((f, t)) => (f, Some(t.to_string())),
         None => (spec, None),
     };
+    // A fieldless `%` is not a WHOX request: charybdis-family servers fall
+    // back to a plain WHO (352) — and a 354 row with zero fields would be a
+    // parameterless numeric no client can interpret.
+    if fields_part.is_empty() {
+        return None;
+    }
+    // The token is echoed as a middle parameter of every 354 row, so a value
+    // that cannot stand as one corrupts the reply's framing for the
+    // requester: an empty token collapses into the adjacent space (shifting
+    // every later field left one column), and a leading `:` starts a
+    // premature trailing that swallows the rest of the row. Treat both as
+    // absent — echoed as the conventional "0", matching Solanum's
+    // empty-querytype default.
+    let token = token.filter(|t| !t.is_empty() && !t.starts_with(':'));
     Some(WhoxRequest {
         fields: fields_part.chars().collect(),
         token,
@@ -92,7 +106,15 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(conn, RPL_ENDOFWHO, &["*"], Some("End of /WHO list"));
         return;
     };
-    let whox = p.get(1).and_then(|arg| parse_whox(arg));
+    // The RFC 2812 `o` flag restricts matches to operators; Solanum also
+    // accepts it combined with a WHOX spec (`WHO * o%nf`). Anything else in
+    // the flags position is ignored, as before.
+    let arg = p.get(1).copied().unwrap_or("");
+    let (opers_only, whox_part) = match arg.strip_prefix('o') {
+        Some(rest) if rest.is_empty() || rest.starts_with('%') => (true, rest),
+        _ => (false, arg),
+    };
+    let whox = parse_whox(whox_part);
     let requester_multi_prefix = state.sessions[&conn].caps.multi_prefix;
     let server = state.config.server_name.clone();
     let now = (state.config.clock)();
@@ -119,6 +141,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             || !state.sessions[m].invisible
                             || state.share_channel(conn, **m)
                     })
+                    .filter(|(m, _)| !opers_only || state.sessions[m].oper)
                     .map(|(m, modes)| {
                         let s = &state.sessions[m];
                         let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
@@ -176,6 +199,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             .sessions
             .iter()
             .filter(|(_, s)| s.registered)
+            .filter(|(_, s)| !opers_only || s.oper)
             .filter(|(_, s)| {
                 match_all || {
                     let nick = s.nick.as_deref().unwrap_or("");
@@ -491,8 +515,10 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             "KNOCK",
             "UTF8ONLY",
             "WHOX",
-            "MONITOR=100",
-            "CHATHISTORY=500",
+            // Derived from the enforced consts (like MAXLIST/CHANLIMIT below)
+            // so the advertisement can never silently drift from enforcement.
+            &format!("MONITOR={MONITOR_LIMIT}"),
+            &format!("CHATHISTORY={CHATHISTORY_MAX}"),
             "MSGREFTYPES=msgid,timestamp",
             &format!("MAXLIST=bqeI:{MAXLIST}"),
             &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
