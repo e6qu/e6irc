@@ -2518,6 +2518,46 @@ fn overlong_ban_mask_is_clipped_and_stays_removable() {
     );
 }
 
+/// A list-mode mask with an embedded space (reachable only via the trailing
+/// form) must be rejected like a space-containing key: stored, it would split
+/// into two tokens in the MODE broadcast and the RPL_BANLIST middle — a
+/// malformed line for every state-tracking client — and copying the displayed
+/// form into `-b` could never remove it (only the first token is consumed).
+#[test]
+fn list_mode_mask_with_space_is_rejected() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #sp");
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.line(alice, "MODE #sp +b :a b");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains(" 696 ")),
+        "no ERR_INVALIDMODEPARAM for a space-containing mask: {out:?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("MODE #sp +b")),
+        "space-containing mask was applied and broadcast: {out:?}"
+    );
+    assert_eq!(s.drain(bob), Vec::<String>::new(), "peers saw a broadcast");
+    // Nothing was stored.
+    s.line(alice, "MODE #sp +b");
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains(" 367 ")),
+        "space-containing mask was stored"
+    );
+    // The other grouped list modes share the arm — spot-check one.
+    s.line(alice, "MODE #sp +I :inv ex");
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" 696 ")),
+        "+I accepted a space-containing mask"
+    );
+}
+
 #[test]
 fn away_flow() {
     let mut s = TestServer::new();
@@ -5311,6 +5351,109 @@ fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
     );
 }
 
+/// A FLAGS revocation whose requester disconnects during the DB round-trip
+/// must still be applied to the hot access map — the DB has already committed
+/// the DELETE, and dropping the reply would leave the revoked account with
+/// auto-op until restart.
+#[test]
+fn chanserv_flags_revocation_applies_after_requester_disconnect() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    // A bystander keeps the channel alive across boss's disconnect —
+    // otherwise alice's later join recreates an empty channel and her
+    // creator-op would mask the assertion.
+    let carol = s.register(3, "carol");
+    s.line(carol, "JOIN #chan");
+    s.drain(carol);
+    s.drain(boss);
+    s.db_requests();
+
+    // Grant +o to alice, DB-confirmed, so the hot map holds an entry.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelAccessSet {
+            channel: "#chan".to_string(),
+            account: "alice".to_string(),
+            flags: Some("o".to_string()),
+            applied: true,
+        },
+    });
+    s.drain(boss);
+
+    // Boss revokes, then the connection drops before the DB reply arrives.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice -o");
+    s.db_requests();
+    s.core.handle(Input::Closed {
+        conn: boss,
+        reason: "Connection reset".into(),
+    });
+    // The DB committed the DELETE and replies to the now-dead conn; removals
+    // always report applied: true.
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelAccessSet {
+            channel: "#chan".to_string(),
+            account: "alice".to_string(),
+            flags: None,
+            applied: true,
+        },
+    });
+
+    // alice joins: the revocation must have landed — no auto-op.
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #chan");
+    let names = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(
+        !names.contains("@alice"),
+        "revocation lost because the requester disconnected: {names}"
+    );
+}
+
+/// A DB fault during a FLAGS change must be reported as a service outage, not
+/// as "account is not registered" — a definitive negative the operator might
+/// act on (the same law the founder-transfer path already follows).
+#[test]
+fn chanserv_flags_db_fault_reports_unavailable_not_unregistered() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.db_requests();
+
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelAccessUnavailable {
+            channel: "#chan".to_string(),
+        },
+    });
+    let lines = s.drain(boss);
+    assert!(
+        lines.iter().any(|l| l.contains("temporarily unavailable")),
+        "no outage notice: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("is not registered")),
+        "DB fault misreported as unregistered account: {lines:?}"
+    );
+}
+
 #[test]
 fn chanserv_op_grants_op_to_member() {
     let mut s = TestServer::new();
@@ -6843,5 +6986,104 @@ fn malformed_client_tag_keys_are_not_relayed() {
     assert!(
         !relayed.contains("bad"),
         "malformed client tag key relayed: {relayed}"
+    );
+}
+
+#[test]
+fn empty_labeled_multiline_batch_still_answers_the_label() {
+    // A labeled `BATCH +` opened and then closed with no content delivers
+    // nothing — but the labeled command still owes a response. The framer was
+    // told not to ACK the opening BATCH (the batch is its deferred response),
+    // so the close must resolve the label with an ACK or a label-tracking
+    // client waits forever.
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/multiline message-tags labeled-response",
+    );
+    s.line(alice, "JOIN #m");
+    s.drain(alice);
+    s.line(alice, "@label=abc BATCH +9 draft/multiline #m");
+    assert!(s.drain(alice).is_empty());
+    s.line(alice, "BATCH -9");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=abc ") && l.contains("ACK")),
+        "an empty labeled batch must still answer the label: {out:#?}"
+    );
+}
+
+#[test]
+fn refused_labeled_multiline_batch_still_answers_the_label() {
+    // A labeled multiline batch whose delivery is refused at close time (the
+    // channel went +m after the batch opened) sends the refusal numeric — but
+    // the *opening* BATCH's label is still owed a response: no echo copy will
+    // ever carry it, so the close must resolve it explicitly.
+    let mut s = TestServer::new_no_persistence();
+    let bob = s.register(1, "bob");
+    s.line(bob, "JOIN #m");
+    s.drain(bob);
+    let alice = register_with_caps(
+        &mut s,
+        2,
+        "alice",
+        "batch draft/multiline message-tags labeled-response",
+    );
+    s.line(alice, "JOIN #m");
+    s.drain(alice);
+    s.line(bob, "MODE #m +m");
+    s.drain(bob);
+    s.drain(alice);
+    s.line(alice, "@label=abc BATCH +9 draft/multiline #m");
+    assert!(s.drain(alice).is_empty());
+    s.line(alice, "@batch=9 PRIVMSG #m :hello");
+    s.line(alice, "BATCH -9");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("Cannot send to channel")),
+        "the refusal must be loud: {out:#?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=abc ") && l.contains("ACK")),
+        "a refused labeled batch must still answer the label: {out:#?}"
+    );
+}
+
+#[test]
+fn echo_message_covers_messages_to_services() {
+    // echo-message covers every message the client sends — including one to a
+    // services pseudo-client. The echo is how an echo-message client renders
+    // its own outgoing line; without it "/msg NickServ …" silently vanishes
+    // from the sender's buffer. The echo precedes the service's reply.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "echo-message message-tags server-time");
+    s.line(alice, "PRIVMSG NickServ :HELP");
+    let out = s.drain(alice);
+    let echo_pos = out
+        .iter()
+        .position(|l| l.contains(":alice!alice@host1.example PRIVMSG NickServ :HELP"))
+        .expect("the sender's own message must be echoed");
+    assert!(
+        out[echo_pos].contains("msgid=") && out[echo_pos].contains("time="),
+        "the echo carries the usual tags: {out:#?}"
+    );
+    let reply_pos = out
+        .iter()
+        .position(|l| l.contains("NOTICE alice"))
+        .expect("the service replies");
+    assert!(
+        echo_pos < reply_pos,
+        "echo precedes the service's reply: {out:#?}"
+    );
+    // Without echo-message, nothing is echoed (spec: MUST NOT).
+    let bob = s.register(2, "bob");
+    s.line(bob, "PRIVMSG NickServ :HELP");
+    assert!(
+        !s.drain(bob).iter().any(|l| l.contains("PRIVMSG NickServ")),
+        "no echo without echo-message"
     );
 }

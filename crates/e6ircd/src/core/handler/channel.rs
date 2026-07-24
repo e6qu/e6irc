@@ -1055,6 +1055,24 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 // constant's doc for why an unclipped one is a state desync).
                 let norm = normalize_ban_mask(raw_mask);
                 let mask = truncate_chars(&norm, BANMASKLEN);
+                // A mask with an embedded space (reachable only via the
+                // trailing-parameter form, `MODE #c +b :a b`) would split into
+                // two tokens in both the MODE broadcast and the RPL_BANLIST
+                // middle — a malformed line for every state-tracking client,
+                // and an entry that copying the displayed form into `-b` can
+                // never remove (breaking the BANMASKLEN invariant above).
+                // Reject the add like the `+k` arm rejects space-containing
+                // keys; removals pass through so a legacy stored mask stays
+                // removable via the same trailing form that created it.
+                if adding && mask.contains(' ') {
+                    state.numeric(
+                        conn,
+                        ERR_INVALIDMODEPARAM,
+                        &[&display, &c.to_string(), "*"],
+                        Some("Mask contains a space"),
+                    );
+                    continue;
+                }
                 // Bound the lists: without a cap a single opped client could
                 // stream distinct masks until the core worker OOMs (and every
                 // JOIN/PRIVMSG re-scans them). `MAXLIST=bqeI:100` advertises a

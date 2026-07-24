@@ -223,7 +223,21 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
 
 pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core::DbReply) {
     use crate::core::state::SaslState;
-    if !state.sessions.contains_key(&conn) {
+    // Session-scoped replies are moot once the client is gone — but replies
+    // that carry *global* state (the hot founder map, channel access) must be
+    // applied regardless: the DB has already committed, and skipping the
+    // hot-map update would let it diverge from storage until restart. Worst
+    // case is a FLAGS revocation whose requester disconnected mid-round-trip:
+    // the DB says revoked while the hot map keeps auto-opping the revoked
+    // account. The notices inside those arms degrade safely on a dead conn.
+    if !state.sessions.contains_key(&conn)
+        && !matches!(
+            reply,
+            crate::core::DbReply::ChannelRegistered { .. }
+                | crate::core::DbReply::FounderChanged { .. }
+                | crate::core::DbReply::ChannelAccessSet { .. }
+        )
+    {
         return; // client vanished while the DB worked; nothing to do
     }
     // A verify reply (for SASL or an aborted SASL attempt) arriving clears the
@@ -521,6 +535,18 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     );
                 }
             }
+        }
+        crate::core::DbReply::ChannelAccessUnavailable { channel } => {
+            // A store fault, not a definitive "no such account" — say so, so
+            // the operator doesn't act on a false negative (e.g. telling the
+            // user to register an account that already exists).
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!(
+                    "Could not change flags on \x02{channel}\x02 — services are temporarily unavailable."
+                ),
+            );
         }
     }
 }

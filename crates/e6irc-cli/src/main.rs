@@ -26,6 +26,18 @@ fn is_send_error(command: &str) -> bool {
     )
 }
 
+/// Server-supplied text is untrusted: any channel peer (or a hostile server)
+/// can embed terminal control bytes — ESC/CSI sequences that retitle the
+/// window, clear the screen, or spoof output. The wire parser rejects only
+/// CR/LF/NUL, so everything else arrives verbatim; replace every control
+/// character (C0, DEL, and C1 — which includes the one-byte CSI 0x9B) with a
+/// visible U+FFFD before it reaches the user's terminal.
+fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 #[derive(Parser)]
 #[command(name = "e6irc", about = "Scripting-oriented IRC client", version)]
 struct Cli {
@@ -220,12 +232,19 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         "cannot join {target}: {reason}"
                     )));
                 }
+                // The server relays a channel message with the *sender's*
+                // spelling of the target, so the comparison must fold case
+                // under the server's rfc1459 mapping — a raw equality would
+                // silently miss messages sent to a differently-cased name.
                 if msg.command == "PRIVMSG"
-                    && msg.params.first().map(String::as_str) == Some(&target)
+                    && msg
+                        .params
+                        .first()
+                        .is_some_and(|t| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(t, &target))
                 {
                     let from = msg.source.as_deref().unwrap_or("?");
                     let text = msg.params.get(1).map(String::as_str).unwrap_or("");
-                    println!("{from}\t{text}");
+                    println!("{}\t{}", terminal_safe(from), terminal_safe(text));
                     seen += 1;
                     if count != 0 && seen >= count {
                         break;
@@ -327,7 +346,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                             .and_then(|s| s.split('!').next())
                             .unwrap_or("?");
                         let text = m.params.get(1).map(String::as_str).unwrap_or("");
-                        println!("{from}\t{text}");
+                        println!("{}\t{}", terminal_safe(from), terminal_safe(text));
                     }
                     "FAIL" => {
                         return Err(std::io::Error::other(format!(
