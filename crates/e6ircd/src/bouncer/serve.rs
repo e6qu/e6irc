@@ -50,20 +50,22 @@ pub struct Registry {
 }
 
 /// A registered network: its driver handle plus the persistence task that
-/// mirrors upstream lines to the database. The persistence task holds a
-/// strong handle, so it must be aborted when the network is removed or
-/// replaced — otherwise it pins the driver's command channel and the
-/// driver never stops.
+/// mirrors upstream lines to the database.
 struct Slot {
     handle: Arc<NetworkHandle>,
     persistence: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Slot {
-    /// Stop the persistence task so it releases its handle; combined with
-    /// dropping `handle`, this lets the driver observe its command channel
-    /// close and exit.
+    /// Stop the driver authoritatively and the persistence task with it.
+    ///
+    /// The driver observes `handle.shutdown()` regardless of who still holds a
+    /// command sender — an attached client clones `commands`, so relying on
+    /// refcount alone would keep the upstream connection (and its decrypted
+    /// SASL password) alive until the last client detached. The persistence
+    /// task is aborted too so it stops writing for a network that is gone.
     fn stop(self) {
+        self.handle.shutdown();
         if let Some(task) = self.persistence {
             task.abort();
         }

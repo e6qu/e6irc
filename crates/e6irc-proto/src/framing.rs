@@ -17,7 +17,9 @@ pub struct LineBuffer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineEvent {
-    /// A complete line, terminator stripped, NUL-free, non-empty.
+    /// A complete line, terminator stripped, non-empty. An embedded NUL is
+    /// **not** stripped here — it is passed through for `Message::parse` to
+    /// reject, so the framing layer never silently alters line content.
     Line(Vec<u8>),
     /// A line exceeded the limit; the overflowing content is dropped
     /// (this event fires once per over-long line, at detection time).

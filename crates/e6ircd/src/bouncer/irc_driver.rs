@@ -113,6 +113,16 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                         let _ = conn.send_line(&format!("PONG :{token}")).await;
                         continue;
                     }
+                    // The reply to our *own* keepalive PING is internal
+                    // bookkeeping, not conversation — drop it so it doesn't
+                    // fill the backlog (one junk line per idle interval,
+                    // evicting real messages) and reach attached clients.
+                    // Mirrors the local driver's keepalive discipline.
+                    if m.command == "PONG"
+                        && m.params.last().map(String::as_str) == Some("e6bnc-keepalive")
+                    {
+                        continue;
+                    }
                     // The upstream's own bytes, not a re-serialization of the
                     // parse: attached clients and the detached buffer get what
                     // the network actually sent, tags and all. `attach` strips

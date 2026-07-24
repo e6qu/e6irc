@@ -128,12 +128,22 @@ pub(crate) async fn run_with_backoff<C>(
 ) {
     let mut backoff = Backoff::new();
     loop {
+        // A stop signalled while a session runs is observed inside it (via
+        // `next_command`); one signalled while we wait to reconnect is caught
+        // here, so a removed network in backoff doesn't linger for the retry.
+        if ends.is_shutdown() {
+            return;
+        }
         let started = tokio::time::Instant::now();
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             SessionOutcome::Dropped => {
                 ends.emit(ConnectionEvent::Disconnected);
-                backoff.wait(started.elapsed()).await;
+                tokio::select! {
+                    biased;
+                    _ = ends.shutdown_signalled() => return,
+                    _ = backoff.wait(started.elapsed()) => {}
+                }
             }
         }
     }
@@ -250,6 +260,13 @@ pub enum ConnectionEvent {
 pub struct NetworkHandle {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
     commands: mpsc::UnboundedSender<String>,
+    /// Authoritative stop signal. The registry (and only the registry) holds
+    /// the `Sender`; `attach` clones `commands` but never this, so removing or
+    /// replacing a network stops its driver even while a client is attached —
+    /// which otherwise pins the command channel open (the upstream connection
+    /// and its decrypted SASL password would persist until the last client
+    /// detached, so an operator could not sever a compromised network).
+    shutdown: tokio::sync::watch::Sender<bool>,
     /// Detached buffer of recent upstream lines (newest last).
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     /// Sticky connection state: set on Connected, cleared on Disconnected.
@@ -433,21 +450,31 @@ impl NetworkHandle {
     pub fn channels(buffer_cap: usize) -> (NetworkHandle, DriverEnds) {
         let (events, _) = tokio::sync::broadcast::channel(1024);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
+            shutdown: shutdown_tx,
             buffer: buffer.clone(),
             connected: connected.clone(),
         };
         let ends = DriverEnds {
             events,
             commands: command_rx,
+            shutdown: shutdown_rx,
             buffer,
             connected,
         };
         (handle, ends)
+    }
+
+    /// Stop the network's driver authoritatively. Called by the registry when a
+    /// network is removed or replaced; the driver observes it via `next_command`
+    /// / `run_with_backoff` and tears down even while clients are attached.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
     }
 }
 
@@ -457,6 +484,10 @@ impl NetworkHandle {
 pub struct DriverEnds {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
     commands: mpsc::UnboundedReceiver<String>,
+    /// Fires (or its sender drops) when the network is stopped; the driver
+    /// observes it in `next_command` and `run_with_backoff` so it tears down
+    /// promptly on removal, not when the last client happens to detach.
+    shutdown: tokio::sync::watch::Receiver<bool>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -495,10 +526,43 @@ impl DriverEnds {
         let _ = self.events.send(broadcast);
     }
 
-    /// Await the next downstream command; `None` when every handle is
-    /// dropped (the driver should then stop).
+    /// Await the next downstream command; `None` when every handle is dropped
+    /// **or** the network is shut down. Every driver's session loop selects on
+    /// this, so an authoritative stop from the registry reaches all of them
+    /// without each having to grow its own shutdown branch.
     pub async fn next_command(&mut self) -> Option<String> {
-        self.commands.recv().await
+        tokio::select! {
+            biased;
+            // `changed()` resolves when the registry sends `true`, or errors if
+            // the sender dropped — both mean stop.
+            res = self.shutdown.changed() => {
+                if res.is_err() || *self.shutdown.borrow() {
+                    return None;
+                }
+                // Spurious (value unchanged from false); fall through to a plain
+                // command read.
+                self.commands.recv().await
+            }
+            cmd = self.commands.recv() => cmd,
+        }
+    }
+
+    /// Whether the network has been shut down (observed without consuming a
+    /// command). Lets `run_with_backoff` abandon its reconnect wait promptly.
+    pub fn is_shutdown(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    /// Resolve once the network is shut down; for racing against a driver's
+    /// reconnect backoff so removal isn't delayed by a pending retry.
+    pub async fn shutdown_signalled(&mut self) {
+        // Returns Ok on a value change and Err on sender-drop; both mean stop.
+        // If already stopped, don't wait.
+        while !*self.shutdown.borrow() {
+            if self.shutdown.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -583,6 +647,11 @@ where
     // one is not). This mirrors the persistence task's ordering.
     let commands = handle.commands.clone();
     let mut events = handle.events.subscribe();
+    // Detach the client if the network is removed. The broadcast does not close
+    // on its own (the registry's `NetworkHandle` keeps an events sender), so
+    // without this an attached client would linger on a stopped network — its
+    // upstream gone but the session still open.
+    let mut shutdown = handle.shutdown.subscribe();
 
     // Playback: everything buffered while detached, in order, with tags the
     // client didn't negotiate stripped.
@@ -597,6 +666,16 @@ where
     let mut parsed = Vec::new();
     loop {
         tokio::select! {
+            // Network removed/replaced: tell the client and detach.
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    let _ = write
+                        .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
+                        .await;
+                    let _ = write.flush().await;
+                    return Ok(());
+                }
+            }
             // Upstream -> client.
             ev = events.recv() => match ev {
                 Ok(DriverEvent::Line(line)) => {
@@ -697,6 +776,26 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driver must stop when the registry signals shutdown, even while a
+    /// command sender is outstanding (as an attached client holds). Before this,
+    /// the driver observed only all-senders-dropped, so an attached client kept
+    /// the upstream connection — and its decrypted SASL password — alive after
+    /// the network was removed.
+    #[tokio::test]
+    async fn shutdown_stops_the_driver_with_a_command_sender_outstanding() {
+        let (handle, mut ends) = NetworkHandle::channels(16);
+        let driver = tokio::spawn(async move { while ends.next_command().await.is_some() {} });
+        // Stand in for an attached client: a live clone of the command sender.
+        let held = handle.commands.clone();
+        // Removing the network stops the driver despite `held` still existing.
+        handle.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("driver did not stop on shutdown")
+            .expect("driver task panicked");
+        drop(held);
+    }
 
     #[test]
     #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]

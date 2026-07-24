@@ -81,6 +81,24 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     return;
                 }
             };
+            // A SASL verify and an IDENTIFY verify must never be in flight for
+            // one connection at once: both are offloaded and their replies
+            // routed by ambient flags, so an IDENTIFY reply landing mid-SASL
+            // would be taken for the SASL result (logging the client in as the
+            // wrong account), and vice-versa. Reject an IDENTIFY while a SASL
+            // verify is pending; the SASL verify-start likewise refuses while an
+            // IDENTIFY is pending, so the two flows are mutually exclusive. (Two
+            // overlapping IDENTIFYs are harmless by contrast — each names an
+            // account the client proved it owns — so they stay allowed, bounded
+            // by the credential budget below.)
+            if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
+                state.service_notice(
+                    conn,
+                    "NickServ",
+                    "A SASL authentication is already in progress. Try again in a moment.",
+                );
+                return;
+            }
             // Password verification runs argon2 (even a nonexistent account
             // spends a dummy verify to avoid a timing oracle), so it spends from
             // the shared per-connection credential budget — the same cap SASL
@@ -589,6 +607,24 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
             }
             if on {
                 state.keeptopic_off.remove(&key);
+                // KEEPTOPIC just became effective again; capture the current
+                // live topic so it survives the next empty→recreate cycle. The
+                // TOPIC path persists only on *change* and the earlier OFF
+                // dropped the retained copy, so without this the live topic
+                // would be silently lost. Mirrors the registration-time capture.
+                if let Some(topic) = state.channels.get(&key).and_then(|c| c.topic.clone()) {
+                    state.registered_topics.insert(key.clone(), topic.clone());
+                    let request = crate::core::DbRequest::SetChannelTopic {
+                        channel: key.as_str().to_string(),
+                        topic: Some((topic.text, topic.set_by, topic.set_at_secs)),
+                    };
+                    if state.db_tx.try_push(request).is_err() {
+                        eprintln!(
+                            "chanserv: db queue full; retained topic for {} not persisted",
+                            key.as_str()
+                        );
+                    }
+                }
             } else {
                 state.keeptopic_off.insert(key.clone());
                 // Drop any retained topic so it can't be restored later.

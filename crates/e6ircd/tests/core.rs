@@ -1755,6 +1755,71 @@ fn nickserv_identify_flow() {
     assert!(out[0].contains("Invalid password"), "{out:#?}");
 }
 
+/// A SASL verify and a NickServ IDENTIFY verify must never be in flight for one
+/// connection at once: both are offloaded and their replies routed by ambient
+/// flags, so allowing both would let an IDENTIFY reply be taken for the SASL
+/// result (or vice-versa) and log the client in as the wrong account. The two
+/// flows are mutually exclusive; a race is refused, not run.
+#[test]
+fn sasl_and_identify_verifies_are_mutually_exclusive() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    // Begin a SASL PLAIN verify: it dispatches a verify and leaves SASL in the
+    // Verifying state (no reply fed yet).
+    s.line(alice, "CAP REQ :sasl");
+    s.line(alice, "AUTHENTICATE PLAIN");
+    s.line(alice, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert_eq!(s.db_requests().len(), 1, "SASL dispatched one verify");
+    s.drain(alice);
+    // An IDENTIFY while the SASL verify is pending is refused and enqueues
+    // nothing — no concurrent second verify to cross-attribute.
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY pw");
+    assert!(
+        s.db_requests().is_empty(),
+        "IDENTIFY must not start a verify while SASL is pending"
+    );
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|l| l.contains("SASL authentication is already in progress")),
+        "the IDENTIFY must be told SASL is in progress"
+    );
+    // The SASL result still resolves normally.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+        },
+    });
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" 903 ")),
+        "the original SASL authentication still succeeds"
+    );
+}
+
+/// The converse guard: a SASL verify started while a NickServ IDENTIFY verify is
+/// pending is refused, so the two are never concurrent from either direction.
+#[test]
+fn sasl_verify_refused_while_identify_pending() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY pw");
+    assert_eq!(s.db_requests().len(), 1, "IDENTIFY dispatched one verify");
+    s.drain(alice);
+    // A SASL PLAIN verify while the IDENTIFY is pending must not dispatch.
+    s.line(alice, "CAP REQ :sasl");
+    s.line(alice, "AUTHENTICATE PLAIN");
+    s.line(alice, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert!(
+        s.db_requests().is_empty(),
+        "SASL must not start a verify while an IDENTIFY is pending"
+    );
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains(" 904 ")),
+        "the SASL attempt fails (ERR_SASLFAIL) rather than racing the IDENTIFY"
+    );
+}
+
 #[test]
 fn deferred_register_reply_is_released_on_transient_db_failure() {
     // REGISTER holds the connection's output behind a deferred reply while the
@@ -4143,6 +4208,38 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
             e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
             if channel == "#reg" && text == "back on")),
         "topic not persisted after KEEPTOPIC ON"
+    );
+}
+
+/// Turning KEEPTOPIC back ON re-captures the channel's *current* live topic
+/// immediately — the TOPIC path persists only on change and OFF dropped the
+/// retained copy, so without the recapture the live topic would be silently
+/// lost on the next empty→recreate cycle.
+#[test]
+fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg");
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC OFF");
+    s.drain(boss);
+    s.db_requests();
+    // A topic set while KEEPTOPIC is off: live, but not retained.
+    s.line(boss, "TOPIC #reg :the live topic");
+    s.drain(boss);
+    s.db_requests();
+    // Turning KEEPTOPIC back on must persist the current live topic right away,
+    // with no further TOPIC command.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC ON");
+    s.drain(boss);
+    assert!(
+        s.db_requests().into_iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
+            if channel == "#reg" && text == "the live topic")),
+        "KEEPTOPIC ON did not re-capture the current live topic"
     );
 }
 
