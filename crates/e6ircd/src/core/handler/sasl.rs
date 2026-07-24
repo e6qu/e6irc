@@ -378,6 +378,51 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 &format!("Could not transfer \x02{channel}\x02 — no such account."),
             );
         }
+        crate::core::DbReply::ChannelAccessSet {
+            channel,
+            account,
+            flags,
+            applied,
+        } => {
+            if !applied {
+                // A grant whose account isn't registered wrote nothing; leave the
+                // hot map untouched so no phantom access lingers.
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!(
+                        "\x02{account}\x02 is not registered; no flags set on \x02{channel}\x02."
+                    ),
+                );
+                return;
+            }
+            let key = state.chan_key(&channel);
+            let account_key = state.account_key(&account);
+            match &flags {
+                Some(f) => {
+                    state
+                        .channel_access
+                        .entry(key)
+                        .or_default()
+                        .insert(account_key, f.clone());
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!("Flags for \x02{account}\x02 on \x02{channel}\x02 are now +{f}."),
+                    );
+                }
+                None => {
+                    if let Some(entry) = state.channel_access.get_mut(&key) {
+                        entry.remove(&account_key);
+                    }
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!("Cleared flags for \x02{account}\x02 on \x02{channel}\x02."),
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -1593,6 +1593,31 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-third sweep — ChanServ FLAGS phantom-grant divergence (2026-07-24):
+closes the last item the sweep-60 ChanServ audit surfaced. `FLAGS <account>
++flags` updated the hot `channel_access` map **optimistically** — right after the
+persist request was queued — while the DB write was a `SELECT`-guarded
+`INSERT ... WHERE a.name_folded = $2` that writes *nothing* when the account
+isn't registered. Granting flags to a name with no account therefore created a
+hot entry the DB never held; if that name later registered and joined, it would
+be **auto-opped from access it was never actually granted** (the hot map is what
+auto-op consults on JOIN).
+
+The fix mirrors the founder-transfer round-trip (sweep 60): `set_channel_access`
+now folds channel+account internally and returns `Result<bool, DbError>` — the
+`bool` is `rows_affected() > 0` on the ADD path (false when no account matched),
+always true on the REMOVE path. The DB worker replies
+`DbReply::ChannelAccessSet { channel, account, flags, applied }`, and *only* the
+reply handler touches the hot map or notifies the founder: it inserts/removes the
+entry and confirms "are now +X" / "Cleared flags" when `applied`, and when
+`!applied` sends "is not registered; no flags set" and leaves the hot map
+untouched. No path can now diverge the running server from storage. Regression
+tests at both layers: a core test drives the full request→reply round-trip and
+proves a grant to an unregistered "ghost" leaves no phantom entry and does not
+auto-op ghost when it later registers; a PG-gated db test asserts the `applied`
+bool (true for a registered account, false for a phantom) and that the phantom
+grant leaks no row. With this every item from the sweep-60 audit is closed.
+
 Sixty-second sweep — CHATHISTORY BETWEEN pivot resolution (2026-07-24):
 the finale of the CHATHISTORY hardening arc begun in sweep 60. Sweeps 60–61
 fixed the missing-msgid pagination dead-end (Bug 1) and the ring↔DB boundary
@@ -1625,8 +1650,8 @@ irctest stays green.
 With this the CHATHISTORY arc is complete: all four bugs the sweep-60 audit found
 (pagination dead-end, ring↔DB boundary, mixed-BETWEEN bound loss, reversed-BETWEEN
 inversion) are fixed, each with tests, across three focused sweeps rather than one
-rushed rewrite. Still open from that audit: the `FLAGS <unknown-account>` hot/DB
-divergence (needs the founder-transfer round-trip).
+rushed rewrite. The one remaining item from that audit — the `FLAGS
+<unknown-account>` hot/DB divergence — was closed in sweep 63.
 
 Sixty-first sweep — CHATHISTORY ring↔DB boundary unification (2026-07-24):
 the continuation of sweep 60's scoped CHATHISTORY work. Sweep 60 fixed the
