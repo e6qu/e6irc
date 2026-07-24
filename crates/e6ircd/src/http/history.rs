@@ -15,8 +15,17 @@ pub(super) struct HistoryParams {
     pub(super) limit: Option<usize>,
 }
 
-/// Paged history for the authenticated account. Casefolds the target
-/// the same way the IRC path does, so web and IRC see one history.
+/// Paged history for the authenticated account.
+///
+/// For a **channel** target this sees exactly the IRC path's history. For a
+/// **direct-message** target the correspondent is addressed by the casefolded
+/// name as given — which matches the IRC path only when that name equals the
+/// correspondent's stored identity (their account, or, for an unauthenticated
+/// correspondent, a `~`-prefixed nick). The HTTP layer has no live session
+/// state, so it cannot resolve a current nick to the account it was speaking
+/// under; a DM whose correspondent's nick differs from their account name (or
+/// who was unauthenticated) reads empty here. This is a scope limit of the REST
+/// endpoint, not a divergence in what is stored.
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

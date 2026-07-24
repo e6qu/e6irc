@@ -351,6 +351,12 @@ pub struct HistoryRow {
     pub msgid: String,
     pub ts: e6irc_proto::time::Millis,
     pub sender_prefix: String,
+    /// The sender's account at send time (`None` if unauthenticated). Used to
+    /// re-address a replayed DM row by *identity* — which survives a nick
+    /// change — instead of by the sender's historical nick, so a requester who
+    /// renamed mid-conversation still sees their own lines addressed to the
+    /// correspondent, not to themselves.
+    pub sender_account: Option<String>,
     pub kind: MessageKind,
     pub body: String,
 }

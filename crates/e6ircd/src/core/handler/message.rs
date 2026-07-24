@@ -21,12 +21,28 @@ fn is_ctcp_action(text: &str) -> bool {
 }
 
 pub(super) fn client_tag_string(msg: &Message) -> String {
-    msg.tags
+    // De-duplicate on key, last occurrence winning — the parser's own `tag()`
+    // accessor resolves a repeated key that way, so relaying `+x=a;+x=b`
+    // verbatim would emit a duplicate-key (technically-malformed) tag section
+    // that clients could disagree about. Keep insertion order of first
+    // appearance for a stable, greppable line.
+    let mut order: Vec<&str> = Vec::new();
+    let mut value: std::collections::HashMap<&str, Option<&str>> = std::collections::HashMap::new();
+    for t in msg
+        .tags
         .iter()
         .filter(|t| crate::sanitize::valid_client_tag_key(t.key))
-        .map(|t| match &t.value {
-            Some(v) => format!("{}={}", t.key, e6irc_proto::message::escape_tag_value(v)),
-            None => t.key.to_string(),
+    {
+        if !value.contains_key(t.key) {
+            order.push(t.key);
+        }
+        value.insert(t.key, t.value.as_deref());
+    }
+    order
+        .iter()
+        .map(|&k| match value[k] {
+            Some(v) => format!("{k}={}", e6irc_proto::message::escape_tag_value(v)),
+            None => k.to_string(),
         })
         .collect::<Vec<_>>()
         .join(";")
@@ -111,10 +127,10 @@ pub(super) fn record_history(
     key: &crate::core::state::HistoryKey,
     dm_peers: Vec<String>,
     entry: crate::core::state::HistoryEntry,
-    sender_account: Option<String>,
 ) {
     let (msgid, ts) = (entry.msgid.clone(), entry.ts);
     let (prefix, body, kind) = (entry.sender_prefix.clone(), entry.body.clone(), entry.kind);
+    let sender_account = entry.sender_account.clone();
     state.push_history(key, entry);
     // Persist only when a database is configured (the same db-present proxy the
     // other DB writes use). Without one the hot ring is the entire record, so
@@ -358,10 +374,10 @@ pub(super) fn deliver_one_message(
                 msgid,
                 ts,
                 sender_prefix: prefix.clone(),
+                sender_account,
                 kind,
                 body: text.to_string(),
             },
-            sender_account,
         );
     } else {
         let ResolvedKind::User { peer } = resolved.kind else {
@@ -398,10 +414,10 @@ pub(super) fn deliver_one_message(
                 msgid,
                 ts,
                 sender_prefix: prefix.clone(),
+                sender_account,
                 kind,
                 body: text.to_string(),
             },
-            sender_account,
         );
         // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free).
         if loud && let Some(away) = state.sessions[&peer].away.clone() {
@@ -449,24 +465,32 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
     // Only client-only tags (`+` prefix) are relayed.
     let prefix = state.sessions[&conn].prefix();
     let msgid = state.next_msgid();
-    let base_tags = match client_tag_string(msg) {
-        tags if tags.is_empty() => format!("msgid={msgid}"),
-        tags => format!("msgid={msgid};{tags}"),
-    };
-    let tag_part = base_tags;
-    let make_line = |extra_time: Option<String>| {
-        let mut tags = tag_part.clone();
-        if let Some(t) = extra_time {
-            if !tags.is_empty() {
-                tags.push(';');
-            }
-            tags.push_str(&format!("time={t}"));
+    let client_tags = client_tag_string(msg);
+    // The sender's account/bot state, captured once. TAGMSG carries `account`
+    // (for account-tag recipients) and `bot` (for a bot sender) exactly like
+    // PRIVMSG/NOTICE — the IRCv3 account-tag and bot-mode specs list TAGMSG
+    // among the messages that bear them, and identity/anti-spam tooling keying
+    // on these tags would otherwise silently lose typing/reaction attribution.
+    let sender_account = state.sessions[&conn].account.clone();
+    let sender_is_bot = state.sessions[&conn].bot;
+    let make_line = |server_time: Option<String>, account_tag: bool| {
+        let mut tags = vec![format!("msgid={msgid}")];
+        if let Some(t) = server_time {
+            tags.push(format!("time={t}"));
         }
-        if tags.is_empty() {
-            format!(":{prefix} TAGMSG {target}")
-        } else {
-            format!("@{tags} :{prefix} TAGMSG {target}")
+        if account_tag && let Some(account) = &sender_account {
+            tags.push(format!(
+                "account={}",
+                e6irc_proto::message::escape_tag_value(account)
+            ));
         }
+        if sender_is_bot {
+            tags.push("bot".to_string());
+        }
+        if !client_tags.is_empty() {
+            tags.push(client_tags.clone());
+        }
+        format!("@{} :{prefix} TAGMSG {target}", tags.join(";"))
     };
 
     // A STATUSMSG (`@#chan`/`+#chan`) is valid for TAGMSG too (message-tags
@@ -517,14 +541,14 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         if !caps.message_tags {
             continue; // spec: TAGMSG must not reach cap-less clients
         }
-        let line = make_line(caps.server_time.then(|| time.clone()));
+        let line = make_line(caps.server_time.then(|| time.clone()), caps.account_tag);
         // A delivery, not a response: bypass labeled-response capture.
         let bytes = bytes::Bytes::from(format!("{line}\r\n"));
         state.send_bytes_uncaptured(recipient, bytes);
     }
     if state.sessions[&conn].caps.echo_message {
         let caps = state.sessions[&conn].caps;
-        let line = make_line(caps.server_time.then(|| time.clone()));
+        let line = make_line(caps.server_time.then(|| time.clone()), caps.account_tag);
         state.send(conn, &line); // echo is the labeled response
     }
 }
@@ -884,6 +908,7 @@ pub(super) fn deliver_multiline(
                 msgid: entry_msgid,
                 ts,
                 sender_prefix: prefix.clone(),
+                sender_account: sender_account.clone(),
                 kind,
                 // CHATHISTORY replays each stored line as its own PRIVMSG, to a
                 // requester that may not have draft/multiline — so the stored
@@ -893,7 +918,6 @@ pub(super) fn deliver_multiline(
                 // in-memory lines, not this record.
                 body: fit_relayed_text(&prefix, kind.wire(), target, text).to_string(),
             },
-            sender_account.clone(),
         );
     }
 }

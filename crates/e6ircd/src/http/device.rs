@@ -498,6 +498,12 @@ pub(super) async fn logout_sso(
     let provider_config = provider
         .as_deref()
         .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name));
+    // Coordinated logout is all-or-nothing *by design*: if the upstream provider
+    // session cannot be ended too, this fails loudly (503) and preserves BOTH
+    // the local and upstream sessions rather than tearing down the local one
+    // while silently leaving the user signed in at the identity provider. The
+    // loud failure lets the user act on it; `oidc_logout_without_end_session_...`
+    // pins this contract (a failed logout keeps /me at 200).
     let location = match (id_token, provider, provider_config) {
         (Some(hint), Some(_), Some(provider)) => {
             let Some(endpoint) = provider.end_session_endpoint.as_deref() else {
