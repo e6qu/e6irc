@@ -543,104 +543,126 @@ pub(super) fn resolve_ring_window(
     selector2: &str,
     limit: usize,
 ) -> Option<(Vec<crate::core::state::HistoryEntry>, bool)> {
-    let position = |sel: &str| -> Option<usize> {
+    let n = history.len();
+    // Start index of a *lower-exclusive* bound (AFTER / bounded-LATEST / the older
+    // end of BETWEEN): the first entry strictly newer than the pivot. A `msgid`
+    // pivot is the message *after* it; a `timestamp=T` pivot is the first entry
+    // with `ts > T` — strict, exactly as the DB (`ts > $2`), so the ring can't
+    // drop the first message after a `T` that falls between two entries. `None`
+    // means a msgid pivot absent from the ring (route to the DB).
+    let lower_start = |sel: &str| -> Option<usize> {
         if let Some(msgid) = sel.strip_prefix("msgid=") {
-            history.iter().position(|e| e.msgid == msgid)
+            history.iter().position(|e| e.msgid == msgid).map(|p| p + 1)
         } else if let Some(ts) = sel.strip_prefix("timestamp=") {
-            // first entry at/after the timestamp
-            let ts = e6irc_proto::time::parse_server_time_millis(ts)?;
-            history.iter().position(|e| e.ts >= ts)
+            e6irc_proto::time::parse_server_time_millis(ts)
+                .map(|t| history.iter().position(|e| e.ts > t).unwrap_or(n))
         } else {
             None
         }
     };
+    // End index (exclusive) of an *upper-exclusive* bound (BEFORE / the newer end
+    // of BETWEEN): the count of entries strictly older than the pivot. A `msgid`
+    // pivot excludes itself (entries before it); a `timestamp=T` pivot is the
+    // entries with `ts < T`. `None` means a msgid pivot absent from the ring.
+    let upper_end = |sel: &str| -> Option<usize> {
+        if let Some(msgid) = sel.strip_prefix("msgid=") {
+            history.iter().position(|e| e.msgid == msgid)
+        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
+            e6irc_proto::time::parse_server_time_millis(ts)
+                .map(|t| history.iter().position(|e| e.ts >= t).unwrap_or(n))
+        } else {
+            None
+        }
+    };
+    // AROUND's pivot: the index where the "newer half" begins. A `msgid` pivot is
+    // included in the newer half (DB uses `(ts,id) >= pivot`); a `timestamp=T`
+    // pivot begins at the first entry with `ts >= T` — same split the DB makes.
+    let around_pivot = upper_end;
+    // Keep at most `limit` of `history[start..end)`: the newest (right) or oldest.
+    let keep_newest = |start: usize, end: usize| -> Vec<crate::core::state::HistoryEntry> {
+        let end = end.min(n);
+        let start = end.saturating_sub(limit).max(start.min(end));
+        history[start..end].to_vec()
+    };
+    let keep_oldest = |start: usize, end: usize| -> Vec<crate::core::state::HistoryEntry> {
+        let end = end.min(n);
+        let start = start.min(end);
+        history[start..(start + limit).min(end)].to_vec()
+    };
+    let miss = |sel: &str| (Vec::new(), !needs_db_for_missing_ref(!complete, sel));
 
     let resolved: (Vec<crate::core::state::HistoryEntry>, bool) =
         match sub.to_ascii_uppercase().as_str() {
             // `*` is unbounded; any other selector restricts LATEST to
             // messages strictly newer than it (draft/chathistory).
-            "LATEST" if selector == "*" => {
-                let skip = history.len().saturating_sub(limit);
-                let covered = complete || history.len() >= limit;
-                (history.iter().skip(skip).cloned().collect(), covered)
-            }
-            "LATEST" => match position(selector) {
-                Some(pos) => {
-                    let start = pos + 1;
-                    // Keep the newest `limit` of the bounded range, not the
-                    // oldest — LATEST is most-recent-first.
-                    let skip = start + history.len().saturating_sub(start).saturating_sub(limit);
-                    // The bound itself is in the ring, so everything newer is
-                    // too: no database round trip is needed.
-                    (history.iter().skip(skip).cloned().collect(), true)
+            "LATEST" if selector == "*" => (keep_newest(0, n), complete || n >= limit),
+            "LATEST" => match lower_start(selector) {
+                // Newest `limit` of the entries after the pivot. The newest are
+                // always in the ring, so this is covered unless the whole
+                // after-set is smaller than `limit` *and* the pivot is older than
+                // the ring's oldest (start == 0), where evicted entries might
+                // belong to it.
+                Some(start) => (keep_newest(start, n), complete || start > 0 || n >= limit),
+                None => miss(selector),
+            },
+            "BEFORE" => match upper_end(selector) {
+                Some(end) => {
+                    let start = end.saturating_sub(limit);
+                    (keep_newest(0, end), complete || start > 0)
                 }
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+                None => miss(selector),
             },
-            "BEFORE" => match position(selector) {
-                Some(pos) => {
-                    let start = pos.saturating_sub(limit);
-                    let covered = complete || start > 0;
-                    (
-                        history.iter().take(pos).skip(start).cloned().collect(),
-                        covered,
-                    )
-                }
-                // reference past a full ring: only PG can resolve it
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+            "AFTER" => match lower_start(selector) {
+                // Oldest `limit` after the pivot. The result's oldest is the
+                // globally-first entry after the pivot only when the pivot sits
+                // at/after the ring's oldest (start > 0) — otherwise evicted
+                // entries may also be after it, so the DB must serve it.
+                Some(start) => (keep_oldest(start, n), complete || start > 0),
+                None => miss(selector),
             },
-            "AFTER" => match position(selector) {
-                Some(pos) => (
-                    history.iter().skip(pos + 1).take(limit).cloned().collect(),
-                    true,
-                ),
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
-            },
-            "AROUND" => match position(selector) {
-                Some(pos) => {
+            "AROUND" => match around_pivot(selector) {
+                Some(pivot) => {
                     let before = limit / 2;
-                    let start = pos.saturating_sub(before);
-                    let end = (pos + (limit - before)).min(history.len());
-                    // Only the older half can reach past the ring's start.
-                    let covered = complete || start > 0;
+                    let start = pivot.saturating_sub(before);
+                    let end = (pivot + (limit - before)).min(n);
                     (
-                        history.iter().take(end).skip(start).cloned().collect(),
-                        covered,
+                        history[start..end.max(start)].to_vec(),
+                        complete || start > 0,
                     )
                 }
-                None => (Vec::new(), !needs_db_for_missing_ref(!complete, selector)),
+                None => miss(selector),
             },
-            "BETWEEN" => match (position(selector), position(selector2)) {
-                // Both endpoints in the ring: the span between them is
-                // contiguous and fully in memory.
-                (Some(a), Some(b)) => {
-                    // The argument order picks the paging direction: the
-                    // window is walked *from* the first selector *toward* the
-                    // second, so when the first is the newer bound a limit
-                    // smaller than the span keeps the newest entries, not the
-                    // oldest.
-                    let newest_first = a > b;
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    let start = lo + 1;
-                    let span = hi.saturating_sub(start);
-                    let skip = if newest_first {
-                        start + span.saturating_sub(limit)
-                    } else {
-                        start
-                    };
-                    (
-                        history
-                            .iter()
-                            .take(hi)
-                            .skip(skip)
-                            .take(limit)
-                            .cloned()
-                            .collect(),
-                        true,
-                    )
+            "BETWEEN" => {
+                // Both endpoints must resolve in the ring; otherwise the DB does.
+                match (upper_end(selector), upper_end(selector2)) {
+                    (Some(u1), Some(u2)) => {
+                        // Order the pivots by how many entries precede each: the
+                        // smaller `upper_end` is the older bound. The window walks
+                        // *from* the first selector *toward* the second, so the
+                        // `limit` cuts from the first's end — newest-first when the
+                        // first selector is the newer bound.
+                        let newest_first = u1 > u2;
+                        let older_sel = if u1 <= u2 { selector } else { selector2 };
+                        // Lower bound: strictly after the older pivot. Upper bound:
+                        // strictly before the newer pivot (= the larger upper_end).
+                        match lower_start(older_sel) {
+                            Some(start) => {
+                                let end = u1.max(u2);
+                                let covered = complete || start > 0;
+                                let rows = if newest_first {
+                                    keep_newest(start, end)
+                                } else {
+                                    keep_oldest(start, end)
+                                };
+                                (rows, covered)
+                            }
+                            None => (Vec::new(), complete),
+                        }
+                    }
+                    // An endpoint missing from the ring: only the DB can resolve it.
+                    _ => (Vec::new(), complete),
                 }
-                // An endpoint missing from the ring: only PG can resolve it.
-                _ => (Vec::new(), complete),
-            },
+            }
             _ => return None,
         };
     Some(resolved)
@@ -774,14 +796,30 @@ mod window_tests {
         limit: usize,
     ) -> Option<(Vec<String>, bool)> {
         let n = history.len();
-        // Same selector→index resolution the code uses (shared on purpose: this
-        // test isolates the *window* math, not the lookup).
-        let pos = |sel: &str| -> Option<usize> {
+        // Independent boundary resolution, formulated directly from the message
+        // times (not the shipped `.position()` chains), and matching the DB's
+        // strict semantics: lower bounds are `ts > T` / after-the-msgid, upper
+        // bounds are `ts < T` / before-the-msgid.
+        //
+        // First entry strictly newer than the pivot (a lower-exclusive bound).
+        let after_start = |sel: &str| -> Option<usize> {
+            if let Some(m) = sel.strip_prefix("msgid=") {
+                history.iter().position(|e| e.msgid == m).map(|p| p + 1)
+            } else if let Some(ts) = sel.strip_prefix("timestamp=") {
+                let t = e6irc_proto::time::parse_server_time_millis(ts)?;
+                Some(history.iter().filter(|e| e.ts <= t).count())
+            } else {
+                None
+            }
+        };
+        // Count of entries strictly older than the pivot (an upper-exclusive
+        // bound); also AROUND's newer-half start (msgid included, `ts >= T`).
+        let older_count = |sel: &str| -> Option<usize> {
             if let Some(m) = sel.strip_prefix("msgid=") {
                 history.iter().position(|e| e.msgid == m)
             } else if let Some(ts) = sel.strip_prefix("timestamp=") {
-                let ts = e6irc_proto::time::parse_server_time_millis(ts)?;
-                history.iter().position(|e| e.ts >= ts)
+                let t = e6irc_proto::time::parse_server_time_millis(ts)?;
+                Some(history.iter().filter(|e| e.ts < t).count())
             } else {
                 None
             }
@@ -811,45 +849,52 @@ mod window_tests {
                 let (s, e) = keep_newest(0, n);
                 (ids(s, e), complete || n >= limit)
             }
-            "LATEST" => match pos(selector) {
-                Some(p) => {
-                    let (s, e) = keep_newest(p + 1, n);
-                    (ids(s, e), true)
+            "LATEST" => match after_start(selector) {
+                Some(start) => {
+                    let (s, e) = keep_newest(start, n);
+                    (ids(s, e), complete || start > 0 || n >= limit)
                 }
                 None => miss(selector),
             },
-            "BEFORE" => match pos(selector) {
-                Some(p) => {
-                    let (s, e) = keep_newest(0, p);
-                    (ids(s, e), complete || s > 0)
+            "BEFORE" => match older_count(selector) {
+                Some(end) => {
+                    let (s, e) = keep_newest(0, end);
+                    (ids(s, e), complete || end.saturating_sub(limit) > 0)
                 }
                 None => miss(selector),
             },
-            "AFTER" => match pos(selector) {
-                Some(p) => {
-                    let (s, e) = keep_oldest(p + 1, n);
-                    (ids(s, e), true)
+            "AFTER" => match after_start(selector) {
+                Some(start) => {
+                    let (s, e) = keep_oldest(start, n);
+                    (ids(s, e), complete || start > 0)
                 }
                 None => miss(selector),
             },
-            "AROUND" => match pos(selector) {
-                Some(p) => {
+            "AROUND" => match older_count(selector) {
+                Some(pivot) => {
                     let before = limit / 2;
-                    let s = p.saturating_sub(before);
-                    let e = (p + (limit - before)).min(n);
-                    (ids(s, e), complete || s > 0)
+                    let s = pivot.saturating_sub(before);
+                    let e = (pivot + (limit - before)).min(n);
+                    (ids(s, e.max(s)), complete || s > 0)
                 }
                 None => miss(selector),
             },
-            "BETWEEN" => match (pos(selector), pos(selector2)) {
-                (Some(a), Some(b)) => {
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    let (s, e) = if a > b {
-                        keep_newest(lo + 1, hi)
-                    } else {
-                        keep_oldest(lo + 1, hi)
-                    };
-                    (ids(s, e), true)
+            "BETWEEN" => match (older_count(selector), older_count(selector2)) {
+                (Some(u1), Some(u2)) => {
+                    let newest_first = u1 > u2;
+                    let older_sel = if u1 <= u2 { selector } else { selector2 };
+                    match after_start(older_sel) {
+                        Some(start) => {
+                            let end = u1.max(u2);
+                            let (s, e) = if newest_first {
+                                keep_newest(start, end)
+                            } else {
+                                keep_oldest(start, end)
+                            };
+                            (ids(s, e), complete || start > 0)
+                        }
+                        None => (Vec::new(), complete),
+                    }
                 }
                 _ => (Vec::new(), complete),
             },
@@ -911,6 +956,55 @@ mod window_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn after_a_between_messages_timestamp_uses_strict_greater_than() {
+        // Entries at ts 1000, 1010, 1020. `AFTER timestamp=1005` (between m0 and
+        // m1) must return everything with ts > 1005 → [m1, m2], not [m2]. The
+        // ring uses strict `ts > T`, matching the DB — the previous `ts >= T` +
+        // `skip(pos+1)` dropped the first message after a between-messages T.
+        let history: Vec<HistoryEntry> = (0..3).map(entry).collect();
+        let t = |ms: u64| {
+            format!(
+                "timestamp={}",
+                e6irc_proto::time::server_time(Millis::from_millis(ms))
+            )
+        };
+        let ids = |rows: Vec<HistoryEntry>| -> Vec<String> {
+            rows.into_iter().map(|e| e.msgid).collect()
+        };
+        let (rows, covered) =
+            resolve_ring_window(&history, true, "AFTER", &t(1005), "*", 10).unwrap();
+        assert_eq!(ids(rows), ["m1", "m2"]);
+        assert!(covered);
+        // Exactly on a message excludes it (strict): AFTER 1010 → [m2].
+        let (rows, _) = resolve_ring_window(&history, true, "AFTER", &t(1010), "*", 10).unwrap();
+        assert_eq!(ids(rows), ["m2"]);
+        // Bounded LATEST is strict too: LATEST timestamp=1005 → newest of ts>1005.
+        let (rows, _) = resolve_ring_window(&history, true, "LATEST", &t(1005), "*", 10).unwrap();
+        assert_eq!(ids(rows), ["m1", "m2"]);
+    }
+
+    #[test]
+    fn after_a_timestamp_older_than_the_ring_defers_to_the_database() {
+        // The ring holds [1000, 1010, 1020] but is incomplete (older evicted).
+        // AFTER a timestamp before the ring's oldest can't be answered from the
+        // ring alone — evicted messages may also be after it — so it defers.
+        let history: Vec<HistoryEntry> = (0..3).map(entry).collect();
+        let old = format!(
+            "timestamp={}",
+            e6irc_proto::time::server_time(Millis::from_millis(500))
+        );
+        let (_, covered) = resolve_ring_window(&history, false, "AFTER", &old, "*", 10).unwrap();
+        assert!(
+            !covered,
+            "AFTER older than an incomplete ring must defer to the DB"
+        );
+        // A complete ring genuinely has everything, so it stays covered.
+        let (_, covered_complete) =
+            resolve_ring_window(&history, true, "AFTER", &old, "*", 10).unwrap();
+        assert!(covered_complete);
     }
 
     #[test]
