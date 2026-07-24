@@ -242,42 +242,17 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
                     limit,
                 },
             },
-            // The two selectors may be given newest-first. That does not change
-            // the window, only which end `limit` cuts from, so the bounds are
-            // normalized to (older, newer) — passing them through reversed
-            // would make the SQL range empty — and the direction travels
-            // alongside as `newest_first`.
-            "BETWEEN" => {
-                let a = selector_ts(&history, selector);
-                let b = selector_ts(&history, selector2);
-                let newest_first = matches!((a, b), (Some(a), Some(b)) if a > b);
-                match (msgid_of(selector), msgid_of(selector2)) {
-                    (Some(first), Some(second)) => {
-                        let (after_msgid, before_msgid) = if newest_first {
-                            (second, first)
-                        } else {
-                            (first, second)
-                        };
-                        crate::core::HistoryQuery::BetweenMsgid {
-                            after_msgid,
-                            before_msgid,
-                            limit,
-                            newest_first,
-                        }
-                    }
-                    _ => {
-                        let a = a.unwrap_or(e6irc_proto::time::Millis::from_millis(0));
-                        let b = b.unwrap_or(e6irc_proto::time::Millis::from_millis(u64::MAX));
-                        let (after_ts, before_ts) = if a <= b { (a, b) } else { (b, a) };
-                        crate::core::HistoryQuery::Between {
-                            after_ts,
-                            before_ts,
-                            limit,
-                            newest_first,
-                        }
-                    }
-                }
-            }
+            // Both selectors travel to the DB as-is; it resolves each pivot's
+            // `(ts, id)` position and derives the span and paging direction
+            // there. This is the fix for the ring-only mis-resolution: a `msgid=`
+            // pivot that has scrolled out of the ring used to lose its bound
+            // (mixed with a timestamp) or collapse the direction to oldest-first
+            // (two msgids), returning the wrong or an empty (inverted) window.
+            "BETWEEN" => crate::core::HistoryQuery::BetweenSelectors {
+                first: selector_bound(selector),
+                second: selector_bound(selector2),
+                limit,
+            },
             _ => match msgid_of(selector) {
                 Some(msgid) => crate::core::HistoryQuery::AfterMsgid { msgid, limit },
                 None => crate::core::HistoryQuery::After {
@@ -676,6 +651,21 @@ pub(super) fn needs_db_for_missing_ref(ring_full: bool, selector: &str) -> bool 
     // A `timestamp=` bound likewise pages from the DB. Only `*` (open bound) can
     // never need it.
     ring_full && (selector.starts_with("timestamp=") || selector.starts_with("msgid="))
+}
+
+/// Turn a validated BETWEEN selector into a [`SelectorBound`] for the DB to
+/// resolve. By this point the selector has passed `is_valid_msgref`, the
+/// non-`*` check, and (for `timestamp=`) the parse check, so both prefixes hold.
+fn selector_bound(selector: &str) -> crate::core::SelectorBound {
+    if let Some(msgid) = selector.strip_prefix("msgid=") {
+        crate::core::SelectorBound::Msgid(msgid.to_string())
+    } else {
+        let ts = selector
+            .strip_prefix("timestamp=")
+            .and_then(e6irc_proto::time::parse_server_time_millis)
+            .unwrap_or_else(|| e6irc_proto::time::Millis::from_millis(0));
+        crate::core::SelectorBound::Timestamp(ts)
+    }
 }
 
 /// Resolve a msgid=/timestamp= selector to a timestamp for DB paging.

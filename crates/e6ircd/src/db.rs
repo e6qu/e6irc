@@ -674,6 +674,17 @@ pub async fn query_history(
     query: crate::core::HistoryQuery,
 ) -> Vec<crate::core::HistoryRow> {
     use crate::core::HistoryQuery;
+    // BETWEEN resolves each pivot's `(ts, id)` in the DB and derives its own
+    // direction, so it produces its final oldest-first order itself rather than
+    // going through the shared newest-first reversal below.
+    if let HistoryQuery::BetweenSelectors {
+        first,
+        second,
+        limit,
+    } = query
+    {
+        return query_between_selectors(pool, target, &first, &second, limit).await;
+    }
     // LATEST/BEFORE (and its msgid pivot) select newest-first and get reversed
     // below; the rest are already oldest-first. Computed before the match
     // consumes `query`.
@@ -684,14 +695,6 @@ pub async fn query_history(
             | HistoryQuery::LatestAfterMsgid { .. }
             | HistoryQuery::Before { .. }
             | HistoryQuery::BeforeMsgid { .. }
-            | HistoryQuery::Between {
-                newest_first: true,
-                ..
-            }
-            | HistoryQuery::BetweenMsgid {
-                newest_first: true,
-                ..
-            }
     );
     // Each branch selects a window, then we return it oldest-first.
     let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = match query {
@@ -762,27 +765,6 @@ pub async fn query_history(
             .fetch_all(pool)
             .await
         }
-        HistoryQuery::Between {
-            after_ts,
-            before_ts,
-            limit,
-            newest_first: desc,
-        } => {
-            // The window is the same either way; only which end `limit` cuts
-            // from differs, so the sort direction is chosen here and a
-            // newest-first result is reversed to oldest-first below.
-            sqlx::query_as(if desc {
-                history_select!("WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts DESC, id DESC LIMIT $4")
-            } else {
-                history_select!("WHERE target = $1 AND ts > to_timestamp($2::double precision / 1000) AND ts < to_timestamp($3::double precision / 1000) ORDER BY ts ASC, id ASC LIMIT $4")
-            })
-            .bind(target)
-            .bind(after_ts.as_millis() as i64)
-            .bind(before_ts.as_millis() as i64)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
         // Msgid pivots: page on the composite (ts, id) relative to the pivot
         // row so messages sharing the pivot's timestamp are not skipped.
         //
@@ -829,24 +811,8 @@ pub async fn query_history(
             .fetch_all(pool)
             .await
         }
-        HistoryQuery::BetweenMsgid {
-            after_msgid,
-            before_msgid,
-            limit,
-            newest_first: desc,
-        } => {
-            sqlx::query_as(if desc {
-                history_select!("WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1) ORDER BY ts DESC, id DESC LIMIT $4")
-            } else {
-                history_select!("WHERE target = $1 AND (ts, id) > (SELECT ts, id FROM messages WHERE msgid = $2 AND target = $1) AND (ts, id) < (SELECT ts, id FROM messages WHERE msgid = $3 AND target = $1) ORDER BY ts ASC, id ASC LIMIT $4")
-            })
-            .bind(target)
-            .bind(&after_msgid)
-            .bind(&before_msgid)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await
-        }
+        // Returned early above.
+        HistoryQuery::BetweenSelectors { .. } => unreachable!("handled before the match"),
     };
     let mut rows = match rows {
         Ok(r) => r,
@@ -858,23 +824,117 @@ pub async fn query_history(
     if newest_first {
         rows.reverse();
     }
-    rows.into_iter()
-        .map(
-            |(msgid, ts, sender_prefix, kind, body): (_, _, _, String, _)| {
-                crate::core::HistoryRow {
-                    msgid,
-                    ts: e6irc_proto::time::Millis::from_millis(ts as u64),
-                    sender_prefix,
-                    // The `kind` column is written only from `MessageKind::db`,
-                    // so an unrecognized value is a corrupt row — fall back to
-                    // PRIVMSG (the louder kind) rather than drop the message.
-                    kind: crate::core::MessageKind::from_db(&kind)
-                        .unwrap_or(crate::core::MessageKind::Privmsg),
-                    body,
-                }
-            },
+    rows.into_iter().map(history_row_from_db).collect()
+}
+
+/// Map a raw history row to a [`HistoryRow`].
+fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
+    let (msgid, ts, sender_prefix, kind, body) = row;
+    crate::core::HistoryRow {
+        msgid,
+        ts: e6irc_proto::time::Millis::from_millis(ts as u64),
+        sender_prefix,
+        // The `kind` column is written only from `MessageKind::db`, so an
+        // unrecognized value is a corrupt row — fall back to PRIVMSG (the louder
+        // kind) rather than drop the message.
+        kind: crate::core::MessageKind::from_db(&kind).unwrap_or(crate::core::MessageKind::Privmsg),
+        body,
+    }
+}
+
+/// The BETWEEN query with each endpoint resolved to a `(ts, id)` position *in the
+/// database*, so the span and the paging direction are correct even when a
+/// `msgid=` pivot has scrolled out of the in-memory ring. A `msgid=` pivot is
+/// looked up within this target (an unknown-here msgid yields an empty result,
+/// like the other msgid pivots); a `timestamp=` bound has no id, so it uses id
+/// sentinels that make its comparison ts-only. Returns rows oldest-first.
+async fn query_between_selectors(
+    pool: &PgPool,
+    target: &str,
+    first: &crate::core::SelectorBound,
+    second: &crate::core::SelectorBound,
+    limit: usize,
+) -> Vec<crate::core::HistoryRow> {
+    use crate::core::SelectorBound;
+    // Resolve a selector to `(ts_ms, ordering_id, is_timestamp)`. A missing msgid
+    // is `None` → the whole window is empty.
+    async fn marker(
+        pool: &PgPool,
+        target: &str,
+        b: &SelectorBound,
+    ) -> Result<Option<(i64, i64, bool)>, sqlx::Error> {
+        match b {
+            SelectorBound::Timestamp(t) => Ok(Some((t.as_millis() as i64, 0, true))),
+            SelectorBound::Msgid(m) => {
+                let row: Option<(i64, i64)> = sqlx::query_as(
+                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint, id \
+                     FROM messages WHERE msgid = $1 AND target = $2",
+                )
+                .bind(m)
+                .bind(target)
+                .fetch_optional(pool)
+                .await?;
+                Ok(row.map(|(ts, id)| (ts, id, false)))
+            }
+        }
+    }
+    let (m1, m2) = match (
+        marker(pool, target, first).await,
+        marker(pool, target, second).await,
+    ) {
+        (Ok(Some(a)), Ok(Some(b))) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("db: BETWEEN pivot lookup failed: {e}");
+            return Vec::new();
+        }
+        // A pivot msgid that is not in this buffer → empty (as for the other
+        // msgid pivots), not a plausible-but-wrong window.
+        _ => return Vec::new(),
+    };
+    // Order the two pivots; the first selector being the newer bound means the
+    // `limit` cuts from the newest end (CHATHISTORY walks first → second).
+    let newest_first = (m1.0, m1.1) > (m2.0, m2.1);
+    let (older, newer) = if newest_first { (m2, m1) } else { (m1, m2) };
+    // Lower bound (strictly after the older pivot): a timestamp uses id = MAX so
+    // `(ts,id) > (T, MAX)` is `ts > T`. Upper bound (strictly before the newer
+    // pivot): a timestamp uses id = MIN so `(ts,id) < (T, MIN)` is `ts < T`.
+    let (lo_ts, lo_id) = (older.0, if older.2 { i64::MAX } else { older.1 });
+    let (hi_ts, hi_id) = (newer.0, if newer.2 { i64::MIN } else { newer.1 });
+    let sql = if newest_first {
+        history_select!(
+            "WHERE target = $1 \
+             AND (ts, id) > (to_timestamp($2::double precision / 1000), $3::bigint) \
+             AND (ts, id) < (to_timestamp($4::double precision / 1000), $5::bigint) \
+             ORDER BY ts DESC, id DESC LIMIT $6"
         )
-        .collect()
+    } else {
+        history_select!(
+            "WHERE target = $1 \
+             AND (ts, id) > (to_timestamp($2::double precision / 1000), $3::bigint) \
+             AND (ts, id) < (to_timestamp($4::double precision / 1000), $5::bigint) \
+             ORDER BY ts ASC, id ASC LIMIT $6"
+        )
+    };
+    let rows: Result<Vec<HistoryDbRow>, sqlx::Error> = sqlx::query_as(sql)
+        .bind(target)
+        .bind(lo_ts)
+        .bind(lo_id)
+        .bind(hi_ts)
+        .bind(hi_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await;
+    let mut rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("db: BETWEEN query failed: {e}");
+            return Vec::new();
+        }
+    };
+    if newest_first {
+        rows.reverse(); // the batch replays oldest-first
+    }
+    rows.into_iter().map(history_row_from_db).collect()
 }
 
 /// CHATHISTORY TARGETS: among `channels` (casefolded), the buffers with a

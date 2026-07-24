@@ -1593,6 +1593,41 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-second sweep — CHATHISTORY BETWEEN pivot resolution (2026-07-24):
+the finale of the CHATHISTORY hardening arc begun in sweep 60. Sweeps 60–61
+fixed the missing-msgid pagination dead-end (Bug 1) and the ring↔DB boundary
+disagreement (Bug 2); this fixes the last two, both in the DB-path BETWEEN
+dispatch.
+
+**`BETWEEN` derived its span bounds and paging direction from a *ring-only*
+lookup** (`selector_ts`), so when a `msgid=` pivot had scrolled out of the ring:
+- a mixed `msgid=`+`timestamp=` BETWEEN **lost the msgid bound** (`selector_ts`
+  returned `None` → the code substituted a degenerate `0` / `u64::MAX`),
+  returning a wildly-wrong window; and
+- a two-`msgid` BETWEEN given newest-first **collapsed the direction to
+  oldest-first** and mis-oriented the `(after, before)` bounds into an inverted,
+  always-empty SQL range — a silent data loss on a legitimate reverse page.
+
+The two selectors now travel to the DB unresolved as a new
+`HistoryQuery::BetweenSelectors { first, second, limit }` (a `SelectorBound` is a
+`Msgid` or a `Timestamp`), and `query_between_selectors` resolves each pivot's
+`(ts, id)` position **in PostgreSQL** — a msgid via a scoped lookup, a timestamp
+via `id` sentinels (`MAX`/`MIN`) that make its bound `ts`-only. It orders the two
+pivots by their real `(ts, id)`, derives the direction from the argument order,
+and runs one composite-`(ts, id)`-bounded query, so the span and the `limit` cut
+are correct regardless of whether either pivot is still in the ring. This
+replaces the old `Between` and `BetweenMsgid` variants with the one unified path
+(the DB layer no longer duplicates a timestamp and a msgid form). A new PG-gated
+test pins the reversed-order, mixed, and unknown-pivot cases; the existing
+BETWEEN tests were rewritten onto `BetweenSelectors`; the `chathistory` services
+irctest stays green.
+
+With this the CHATHISTORY arc is complete: all four bugs the sweep-60 audit found
+(pagination dead-end, ring↔DB boundary, mixed-BETWEEN bound loss, reversed-BETWEEN
+inversion) are fixed, each with tests, across three focused sweeps rather than one
+rushed rewrite. Still open from that audit: the `FLAGS <unknown-account>` hot/DB
+divergence (needs the founder-transfer round-trip).
+
 Sixty-first sweep — CHATHISTORY ring↔DB boundary unification (2026-07-24):
 the continuation of sweep 60's scoped CHATHISTORY work. Sweep 60 fixed the
 missing-msgid pagination dead-end (Bug 1); this sweep fixes the ring-vs-DB
