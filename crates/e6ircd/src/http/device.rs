@@ -294,19 +294,28 @@ pub(super) async fn me(
             );
         };
         return match crate::db::session_identity(pool, &token).await {
-            Ok(Some(identity)) => (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({
-                    "account": identity.account,
-                    "email": identity.email,
-                    "role": identity.role,
-                    "provider": identity.provider,
-                    "release_revision": state.application_release_revision,
-                    "logout_url": format!("/api/v1/auth/logout?csrf={}", state.csrf_token(&token)),
-                })
-                .to_string(),
-            )
-                .into_response(),
+            Ok(Some(identity)) => {
+                let mut response = (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::json!({
+                        "account": identity.account,
+                        "email": identity.email,
+                        "role": identity.role,
+                        "provider": identity.provider,
+                        "release_revision": state.application_release_revision,
+                        "logout_url": format!(
+                            "/api/v1/auth/logout?csrf={}",
+                            state.csrf_token(&token)
+                        ),
+                    })
+                    .to_string(),
+                )
+                    .into_response();
+                // This body carries the session-bound CSRF token; keep it out of
+                // any shared/proxy cache.
+                no_store(response.headers_mut());
+                response
+            }
             Ok(None) => problem(StatusCode::UNAUTHORIZED, "Not logged in", None),
             Err(error) => {
                 eprintln!("http: identity lookup failed: {error}");

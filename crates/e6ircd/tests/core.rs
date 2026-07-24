@@ -1410,6 +1410,18 @@ fn version_admin_and_ison_reply() {
     assert!(ison.contains("alice"), "online nick present: {ison}");
     assert!(!ison.contains("ghost"), "offline nick absent: {ison}");
 
+    // ISON echoes the server's canonical nick, not the caller's casing.
+    s.line(alice, "ISON ALICE");
+    let ison = s
+        .drain(alice)
+        .into_iter()
+        .find(|l| l.contains(" 303 "))
+        .expect("RPL_ISON");
+    assert!(
+        ison.contains("alice") && !ison.contains("ALICE"),
+        "ISON must reply the canonical nick casing: {ison}"
+    );
+
     s.line(alice, "USERIP alice");
     assert!(has_numeric(&s.drain(alice), "340"), "USERIP → RPL_USERIP");
 
@@ -2799,6 +2811,12 @@ fn whowas_after_quit_and_nick_change() {
     assert!(
         w314.contains("bob") && w314.contains("host2.example"),
         "{w314}"
+    );
+    // The RPL_WHOISSERVER (312) carries a last-seen time, not a placeholder.
+    let w312 = out.iter().find(|l| l.contains(" 312 ")).expect("312");
+    assert!(
+        w312.contains("last seen") && !w312.contains("(unknown)"),
+        "WHOWAS 312 must show the last-seen time: {w312}"
     );
     assert!(has_numeric(&out, "369"));
 

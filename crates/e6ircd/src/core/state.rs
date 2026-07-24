@@ -673,6 +673,9 @@ pub(crate) struct WhowasEntry {
     pub user: String,
     pub host: String,
     pub realname: String,
+    /// When the entry was recorded (departure/nick-change), for the
+    /// RPL_WHOISSERVER "last seen" info field.
+    pub signoff: e6irc_proto::time::Millis,
 }
 
 pub(crate) const WHOWAS_CAP: usize = 1000;
@@ -795,6 +798,7 @@ impl ServerState {
             user: user.clone(),
             host: session.host.clone(),
             realname: realname.clone(),
+            signoff: (self.config.clock)(),
         };
         if self.whowas.len() == WHOWAS_CAP {
             self.whowas.pop_back();
