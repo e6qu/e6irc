@@ -1819,14 +1819,15 @@ async fn query_history_around_and_between() {
     );
 
     // BETWEEN (2000, 5000) exclusive → 3000, 4000.
+    let ts =
+        |ms| e6ircd::core::SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(ms));
     let between = db::query_history(
         &pool,
         "#h",
-        HistoryQuery::Between {
-            after_ts: e6irc_proto::time::Millis::from_millis(2000),
-            before_ts: e6irc_proto::time::Millis::from_millis(5000),
+        HistoryQuery::BetweenSelectors {
+            first: ts(2000),
+            second: ts(5000),
             limit: 10,
-            newest_first: false,
         },
     )
     .await;
@@ -1835,16 +1836,16 @@ async fn query_history_around_and_between() {
         vec![3000, 4000]
     );
 
-    // Same window, but a limit smaller than the span: the direction decides
-    // which end is kept, and the result stays oldest-first either way.
+    // Same window, but a limit smaller than the span: the argument order decides
+    // which end is kept, and the result stays oldest-first either way. Older
+    // selector first → keep the oldest.
     let oldest = db::query_history(
         &pool,
         "#h",
-        HistoryQuery::Between {
-            after_ts: e6irc_proto::time::Millis::from_millis(2000),
-            before_ts: e6irc_proto::time::Millis::from_millis(5000),
+        HistoryQuery::BetweenSelectors {
+            first: ts(2000),
+            second: ts(5000),
             limit: 1,
-            newest_first: false,
         },
     )
     .await;
@@ -1852,14 +1853,14 @@ async fn query_history_around_and_between() {
         oldest.iter().map(|r| r.ts.as_millis()).collect::<Vec<_>>(),
         vec![3000]
     );
+    // Newer selector first → keep the newest.
     let newest = db::query_history(
         &pool,
         "#h",
-        HistoryQuery::Between {
-            after_ts: e6irc_proto::time::Millis::from_millis(2000),
-            before_ts: e6irc_proto::time::Millis::from_millis(5000),
+        HistoryQuery::BetweenSelectors {
+            first: ts(5000),
+            second: ts(2000),
             limit: 1,
-            newest_first: true,
         },
     )
     .await;
@@ -1867,6 +1868,83 @@ async fn query_history_around_and_between() {
         newest.iter().map(|r| r.ts.as_millis()).collect::<Vec<_>>(),
         vec![4000]
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn between_selectors_resolve_pivots_in_the_db() {
+    // The DB path resolves each BETWEEN pivot's (ts, id) itself, so a msgid pivot
+    // that has scrolled out of the ring is still paged correctly — where the old
+    // ring-only resolution lost a mixed msgid bound or inverted a reversed-order
+    // two-msgid range to empty.
+    use e6ircd::core::{HistoryQuery, SelectorBound};
+    let pool = db::connect_and_migrate(
+        &support::test_db("between_selectors_resolve_pivots_in_the_db").await,
+    )
+    .await
+    .expect("connect");
+    for ts in [1000_i64, 2000, 3000, 4000, 5000] {
+        sqlx::query(
+            "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts)
+             VALUES ($1, '#b', 'x!x@h', NULL, 'privmsg', $2,
+                     to_timestamp($3::double precision / 1000))",
+        )
+        .bind(format!("m{ts}"))
+        .bind(format!("b{ts}"))
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("insert");
+    }
+    let bodies = |rows: Vec<e6ircd::core::HistoryRow>| -> Vec<String> {
+        rows.into_iter().map(|r| r.body).collect()
+    };
+    let mid = |m: &str| SelectorBound::Msgid(m.to_string());
+    let ts = |ms| SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(ms));
+
+    // Two msgids given newest-first (m4000 before m1000): the span is m2000,
+    // m3000 — the old ring-only direction collapsed this to an inverted empty
+    // range. Always oldest-first.
+    let reversed = db::query_history(
+        &pool,
+        "#b",
+        HistoryQuery::BetweenSelectors {
+            first: mid("m4000"),
+            second: mid("m1000"),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(bodies(reversed), vec!["b2000", "b3000"]);
+
+    // Mixed msgid + timestamp: between m4000 and the instant 1500 → m2000, m3000
+    // (m4000 itself excluded). The old code lost the msgid bound and returned a
+    // wrong window.
+    let mixed = db::query_history(
+        &pool,
+        "#b",
+        HistoryQuery::BetweenSelectors {
+            first: mid("m4000"),
+            second: ts(1500),
+            limit: 10,
+        },
+    )
+    .await;
+    assert_eq!(bodies(mixed), vec!["b2000", "b3000"]);
+
+    // A pivot msgid not in this buffer → empty (like the other msgid pivots),
+    // not a plausible-but-wrong window.
+    let unknown = db::query_history(
+        &pool,
+        "#b",
+        HistoryQuery::BetweenSelectors {
+            first: mid("nope"),
+            second: ts(9999),
+            limit: 10,
+        },
+    )
+    .await;
+    assert!(bodies(unknown).is_empty());
 }
 
 #[tokio::test]
@@ -1925,14 +2003,14 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     );
 
     // BETWEEN (a, e) exclusive → the interior of the same second.
+    let mid = |m: &str| e6ircd::core::SelectorBound::Msgid(m.to_string());
     let between = db::query_history(
         &pool,
         "#s",
-        HistoryQuery::BetweenMsgid {
-            after_msgid: "a".into(),
-            before_msgid: "e".into(),
+        HistoryQuery::BetweenSelectors {
+            first: mid("a"),
+            second: mid("e"),
             limit: 10,
-            newest_first: false,
         },
     )
     .await;
@@ -1941,15 +2019,15 @@ async fn query_history_msgid_paginates_within_a_single_second() {
         vec!["b", "c", "d"]
     );
 
-    // A limit shorter than the span keeps the end the direction points at.
+    // A limit shorter than the span keeps the end the argument order points at.
+    // Newer selector first → keep the newest.
     let newest = db::query_history(
         &pool,
         "#s",
-        HistoryQuery::BetweenMsgid {
-            after_msgid: "a".into(),
-            before_msgid: "e".into(),
+        HistoryQuery::BetweenSelectors {
+            first: mid("e"),
+            second: mid("a"),
             limit: 1,
-            newest_first: true,
         },
     )
     .await;

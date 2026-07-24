@@ -249,16 +249,17 @@ pub enum HistoryQuery {
         around_ts: e6irc_proto::time::Millis,
         limit: usize,
     },
-    /// Up to `limit` messages strictly between the two timestamps, always
-    /// returned oldest-first. `newest_first` selects which end `limit` cuts
-    /// from: CHATHISTORY BETWEEN walks from its first selector toward its
-    /// second, so a reversed (newer-first) request keeps the newest messages
-    /// in the span rather than the oldest.
-    Between {
-        after_ts: e6irc_proto::time::Millis,
-        before_ts: e6irc_proto::time::Millis,
+    /// Up to `limit` messages strictly between the two selectors, always
+    /// returned oldest-first. Each selector is resolved to its `(ts, id)`
+    /// position *in the database* (a `msgid=` pivot may have scrolled out of the
+    /// in-memory ring), so the span's bounds and the paging direction don't
+    /// depend on the ring holding either pivot. The window walks from `first`
+    /// toward `second`: when `first` is the newer bound the `limit` keeps the
+    /// newest messages in the span rather than the oldest.
+    BetweenSelectors {
+        first: SelectorBound,
+        second: SelectorBound,
         limit: usize,
-        newest_first: bool,
     },
     /// Msgid-pivoted variants. Timestamps are millisecond-granular, but two
     /// messages can still land in the same millisecond; paging by timestamp
@@ -277,13 +278,16 @@ pub enum HistoryQuery {
         msgid: String,
         limit: usize,
     },
-    BetweenMsgid {
-        after_msgid: String,
-        before_msgid: String,
-        limit: usize,
-        /// See [`HistoryQuery::Between::newest_first`].
-        newest_first: bool,
-    },
+}
+
+/// One resolved CHATHISTORY BETWEEN endpoint: a message id or a timestamp. The
+/// database resolves each to a `(ts, id)` position, so a `msgid=` pivot that is
+/// no longer in the ring is still paged correctly (unlike a ring-only lookup,
+/// which would lose the bound or mis-order the two).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorBound {
+    Msgid(String),
+    Timestamp(e6irc_proto::time::Millis),
 }
 
 /// PRIVMSG or NOTICE — the only two message kinds that carry a body, are
