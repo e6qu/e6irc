@@ -103,11 +103,17 @@ pub(super) async fn create_network(
 pub(super) const MAX_NETWORKS_PER_ACCOUNT: usize = 32;
 
 /// Whether `addr` (`host:port`, IPv6 bracketed) has an IP-literal host that
-/// points at an obviously-internal target the server must not be tricked into
-/// dialing. Loopback, link-local (cloud metadata), unspecified and multicast are
-/// refused; RFC-1918 private ranges are allowed (a LAN self-host is legitimate).
-/// A hostname (non-literal) returns `false` here — the concrete reported vector
-/// is the IP literal; hostname resolution lives in the dialer.
+/// points at a target that is never a legitimate IRC upstream and that the
+/// server must not be tricked into dialing: the cloud-metadata link-local range
+/// (169.254/fe80), unspecified, multicast, broadcast, and documentation ranges.
+///
+/// Loopback and RFC-1918 / unique-local *private* ranges are deliberately
+/// **allowed** — a self-hosted or LAN IRC upstream (including `127.0.0.1`) is a
+/// first-class e6irc use case, so blocking those would break real deployments;
+/// the sharp, zero-false-positive SSRF vector is the link-local metadata
+/// endpoint, which this refuses. A hostname (non-literal) returns `false` here —
+/// the concrete reported vector is the IP literal; hostname resolution lives in
+/// the dialer.
 fn upstream_addr_is_internal(addr: &str) -> bool {
     let host = if let Some(rest) = addr.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest) // [ipv6]:port
@@ -117,18 +123,16 @@ fn upstream_addr_is_internal(addr: &str) -> bool {
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
         return false; // hostname — not classifiable without DNS
     };
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+    if ip.is_unspecified() || ip.is_multicast() {
         return true;
     }
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
         }
-        // IPv6 link-local (fe80::/10) and unique-local (fc00::/7).
-        std::net::IpAddr::V6(v6) => {
-            let head = v6.segments()[0];
-            (head & 0xffc0) == 0xfe80 || (head & 0xfe00) == 0xfc00
-        }
+        // IPv6 link-local (fe80::/10). Unique-local (fc00::/7) is the private
+        // analogue of RFC-1918 and is allowed, like loopback.
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
@@ -454,21 +458,23 @@ mod tests {
 
     #[test]
     fn internal_upstream_addresses_are_refused() {
-        // Loopback, the cloud link-local metadata range, unspecified and
-        // multicast are refused so a tenant can't make the server dial them.
-        assert!(upstream_addr_is_internal("127.0.0.1:6667"));
+        // The cloud link-local metadata range, unspecified, multicast, broadcast
+        // and documentation ranges are refused so a tenant can't make the server
+        // dial them — none is ever a legitimate IRC upstream.
         assert!(upstream_addr_is_internal("169.254.169.254:80")); // cloud metadata
         assert!(upstream_addr_is_internal("0.0.0.0:6667"));
-        assert!(upstream_addr_is_internal("[::1]:6697"));
+        assert!(upstream_addr_is_internal("255.255.255.255:6667")); // broadcast
         assert!(upstream_addr_is_internal("[fe80::1]:6697")); // v6 link-local
-        assert!(upstream_addr_is_internal("[fc00::1]:6697")); // v6 unique-local
-        // A documentation range is never a real upstream, so it's refused too.
-        assert!(upstream_addr_is_internal("203.0.113.7:6697")); // TEST-NET-3
-        // A real public IP and a hostname are allowed (the dialer resolves
-        // hostnames); RFC-1918 is allowed for a legitimate LAN self-host.
-        assert!(!upstream_addr_is_internal("93.184.216.34:6697"));
-        assert!(!upstream_addr_is_internal("irc.libera.chat:6697"));
+        assert!(upstream_addr_is_internal("203.0.113.7:6697")); // TEST-NET-3 (documentation)
+        // Loopback and private ranges ARE allowed: a self-hosted / LAN IRC
+        // upstream (including 127.0.0.1) is a first-class use case.
+        assert!(!upstream_addr_is_internal("127.0.0.1:6667"));
+        assert!(!upstream_addr_is_internal("[::1]:6697"));
         assert!(!upstream_addr_is_internal("10.0.0.5:6667"));
         assert!(!upstream_addr_is_internal("192.168.1.10:6667"));
+        assert!(!upstream_addr_is_internal("[fc00::1]:6697")); // v6 unique-local (private)
+        // Real public IPs and hostnames are allowed (the dialer resolves names).
+        assert!(!upstream_addr_is_internal("93.184.216.34:6697"));
+        assert!(!upstream_addr_is_internal("irc.libera.chat:6697"));
     }
 }

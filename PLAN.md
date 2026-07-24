@@ -1614,10 +1614,13 @@ fixed here in one PR.
    not the sentinel — a first set always persists, whatever its value.
 3. **An authenticated user could make the server dial an internal address**
    (`http/networks.rs`) — the network `addr` was validated only for emptiness, so
-   any tenant could point a network at `169.254.169.254` (cloud metadata),
-   loopback, etc., which the server then dials on a reconnect loop. Create-time
-   validation now refuses loopback/link-local/unspecified/multicast/documentation
-   IP literals (RFC-1918 stays allowed for a legitimate LAN self-host).
+   any tenant could point a network at `169.254.169.254` (cloud metadata) etc.,
+   which the server then dials on a reconnect loop. Create-time validation now
+   refuses the link-local metadata range, unspecified, multicast, broadcast and
+   documentation IP literals. Loopback and RFC-1918 / unique-local private ranges
+   stay allowed, because a self-hosted or LAN IRC upstream (including
+   `127.0.0.1`) is a first-class e6irc use case — the sharp, zero-false-positive
+   vector is the metadata endpoint.
 4. **The `irc` upstream driver could wedge on a half-open peer** (`irc_driver.rs`)
    — `connect_once` bounds connect + registration, but the steady-state read
    blocked forever if the upstream half-opened (firewall drop, peer vanishes),
