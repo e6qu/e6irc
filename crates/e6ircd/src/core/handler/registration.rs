@@ -397,11 +397,26 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     }
                 }
             }
-            let verb = if all_known { "ACK" } else { "NAK" };
-            if all_known {
+            // Echo the requested caps, but never emit a line past the wire
+            // limit: `request` is client-supplied and can be ~500 bytes, so
+            // reflecting it verbatim (`:{server} CAP {target} {verb} :{request}`)
+            // overflows 512 — the recipient's framing discards such a line whole,
+            // and the debug wire check aborts the single core worker, a
+            // client-triggerable DoS reachable unauthenticated pre-registration.
+            // A REQ too long to echo in one line isn't a coherent request, so
+            // reject it (NAK, apply nothing) and echo only the fitting prefix.
+            // ACK and NAK are the same length, so the fit is verb-independent.
+            let fits = {
+                let head = format!(":{server} CAP {target} ACK :");
+                super::fit_trailing(&head, request).len() == request.len()
+            };
+            let verb = if all_known && fits { "ACK" } else { "NAK" };
+            if verb == "ACK" {
                 state.sessions.get_mut(&conn).expect("checked").caps = caps;
             }
-            state.send(conn, &format!(":{server} CAP {target} {verb} :{request}"));
+            let head = format!(":{server} CAP {target} {verb} :");
+            let echo = super::fit_trailing(&head, request);
+            state.send(conn, &format!("{head}{echo}"));
         }
         "END" => {
             let session = state.sessions.get_mut(&conn).expect("checked");

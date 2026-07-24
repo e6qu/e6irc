@@ -134,13 +134,15 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
             }
             let payload =
                 std::mem::take(&mut state.sessions.get_mut(&conn).expect("checked").sasl_buf);
-            // A NickServ IDENTIFY verify already outstanding for this connection
-            // must block a concurrent SASL verify. Each verify is offloaded and
-            // its reply routed by ambient flags, so two in flight at once would
-            // let the replies cross-attribute (an IDENTIFY result completing a
-            // SASL AUTHENTICATE, or vice versa). Keeping credential checks
-            // mutually exclusive per connection makes that unrepresentable.
-            if state.sessions[&conn].pending_identify {
+            // Only one credential verify may be outstanding per connection: each
+            // is offloaded and its reply routed by ambient flags, so two in
+            // flight would cross-attribute (an IDENTIFY or a still-pending
+            // *aborted* SASL verify completing a fresh AUTHENTICATE). Refuse if a
+            // NickServ IDENTIFY is pending, or if a prior SASL verify hasn't been
+            // answered yet — `sasl_verify_pending` survives an `AUTHENTICATE *`
+            // abort (which can't un-send the DB request), so re-auth waits for
+            // that stale reply to drain rather than racing it.
+            if state.sessions[&conn].pending_identify || state.sessions[&conn].sasl_verify_pending {
                 sasl_fail(state, conn);
                 return;
             }
@@ -163,7 +165,11 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 if !credential_attempt_ok(state, conn) {
                     return;
                 }
-                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
+                {
+                    let s = state.sessions.get_mut(&conn).expect("checked");
+                    s.sasl = SaslState::Verifying;
+                    s.sasl_verify_pending = true;
+                }
                 let request = crate::core::DbRequest::VerifyPassword {
                     conn,
                     account,
@@ -192,7 +198,11 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 if !credential_attempt_ok(state, conn) {
                     return;
                 }
-                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
+                {
+                    let s = state.sessions.get_mut(&conn).expect("checked");
+                    s.sasl = SaslState::Verifying;
+                    s.sasl_verify_pending = true;
+                }
                 let request = crate::core::DbRequest::VerifyToken { conn, token };
                 if state.db_tx.try_push(request).is_err() {
                     // DB worker unreachable: fail loudly, never hang.
@@ -215,6 +225,18 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     use crate::core::state::SaslState;
     if !state.sessions.contains_key(&conn) {
         return; // client vanished while the DB worked; nothing to do
+    }
+    // A verify reply (for SASL or an aborted SASL attempt) arriving clears the
+    // outstanding-verify marker so a queued re-auth can proceed. Harmless for a
+    // non-SASL reply (the flag is only ever set for a SASL verify).
+    if matches!(
+        reply,
+        crate::core::DbReply::PasswordVerified { .. }
+            | crate::core::DbReply::PasswordRejected
+            | crate::core::DbReply::Unavailable
+    ) && let Some(s) = state.sessions.get_mut(&conn)
+    {
+        s.sasl_verify_pending = false;
     }
     match reply {
         crate::core::DbReply::PasswordVerified { account } => {

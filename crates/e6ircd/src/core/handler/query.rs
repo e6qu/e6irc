@@ -561,27 +561,16 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // non-conformant), yet the echoed list is bounded only by the input frame
     // and the reply adds server overhead — so it can overflow the wire limit.
     // Match Solanum: pack nicks while they fit and drop the rest, which a
-    // client re-queries next poll anyway (ISON is a polling command).
-    let overhead = 1
-        + state.config.server_name.len()
-        + 5
-        + state.sessions[&conn].nick.as_deref().unwrap_or("*").len()
-        + 4;
-    let budget = 510usize.saturating_sub(overhead);
-    let mut shown = String::new();
-    for nick in &online {
-        let cost = if shown.is_empty() {
-            nick.len()
-        } else {
-            1 + nick.len()
-        };
-        if shown.len() + cost > budget {
-            break;
-        }
-        if !shown.is_empty() {
-            shown.push(' ');
-        }
-        shown.push_str(nick);
-    }
+    // client re-queries next poll anyway (ISON is a polling command). Uses the
+    // shared whole-item packer (same as USERHOST/USERIP) against the real head.
+    let target = state.sessions[&conn].nick.as_deref().unwrap_or("*");
+    let head_len = format!(
+        ":{} {} {} :",
+        state.config.server_name,
+        e6irc_proto::numerics::code_str(RPL_ISON),
+        target,
+    )
+    .len();
+    let shown = crate::core::handler::pack_trailing_list(&online, head_len);
     state.numeric(conn, RPL_ISON, &[], Some(&shown));
 }

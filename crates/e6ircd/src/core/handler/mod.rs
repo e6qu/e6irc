@@ -115,6 +115,33 @@ pub(crate) fn fit_trailing<'a>(head: &str, text: &'a str) -> &'a str {
     e6irc_proto::message::truncate_on_char_boundary(text, 510usize.saturating_sub(head.len()))
 }
 
+/// Pack space-separated `items` into a single trailing parameter that fits the
+/// wire limit, given `head_len` bytes already on the line (`:prefix CODE target
+/// :`). Whole items only: a reply like RPL_USERHOST / RPL_ISON is a single
+/// unsplittable line by spec, so an item that would overflow is dropped rather
+/// than truncated mid-token — a truncated last entry (`nick*=+user@2001:db8:`)
+/// is a corrupt token the client silently mis-parses, whereas a dropped entry a
+/// polling client simply re-queries. The caller sends the result as the trailing.
+pub(crate) fn pack_trailing_list(items: &[String], head_len: usize) -> String {
+    let budget = 510usize.saturating_sub(head_len);
+    let mut out = String::new();
+    for item in items {
+        let cost = if out.is_empty() {
+            item.len()
+        } else {
+            1 + item.len()
+        };
+        if out.len() + cost > budget {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(item);
+    }
+    out
+}
+
 /// Clip a client-supplied token for echoing inside a reply. Numerics that
 /// attribute an error echo the offending token (an unknown command, a bad CAP
 /// subcommand, a rejected target list); the token's length is bounded only by
@@ -435,6 +462,26 @@ fn cmd_quit(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_trailing_list_keeps_whole_items_and_never_truncates() {
+        // Fits: everything packed with single-space separators.
+        assert_eq!(
+            pack_trailing_list(&["aa".into(), "bb".into(), "cc".into()], 0),
+            "aa bb cc"
+        );
+        // Over budget: whole items only — the item that would overflow is
+        // dropped, never truncated mid-token into a corrupt entry.
+        let items = vec!["aaaa".into(), "bbbb".into(), "cccc".into()];
+        // head_len 500 leaves budget 10; "aaaa"(4) + " bbbb"(5) = 9 fits,
+        // " cccc"(5) would make 14 > 10 → dropped.
+        assert_eq!(pack_trailing_list(&items, 500), "aaaa bbbb");
+        // A single item larger than the whole budget yields nothing, not a
+        // partial token.
+        assert_eq!(pack_trailing_list(&["toolong".into()], 508), "");
+        // No panic when the head already exceeds the budget.
+        assert_eq!(pack_trailing_list(&["x".into()], 999), "");
+    }
 
     #[test]
     fn ban_mask_normalizes_separators_in_any_order() {

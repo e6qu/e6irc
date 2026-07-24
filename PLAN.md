@@ -1593,6 +1593,72 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-seventh sweep — four-front hunt: a client-triggerable CAP
+panic, an unremovable server ban, and a SASL abort cross-wire (2026-07-24):
+four parallel audits on the query surface (WHO/WHOIS/WHOWAS/ISON/USERHOST),
+CAP+SASL negotiation, the oper/server-ban machinery, and MONITOR/read-markers.
+Eight confirmed bugs fixed:
+
+1. **CAP ACK/NAK echoed the client's cap list verbatim** (registration.rs) —
+   a ~490-byte REQ (fits the input frame) reflected into
+   `:{server} CAP {target} {verb} :{request}` overflowed 512, which the
+   recipient's framing discards whole and, under debug assertions (as cargo-fuzz
+   runs), the wire check *panics* — a client-triggerable, unauthenticated,
+   pre-registration full-server DoS. The reply is now bounded: an un-echoable
+   REQ is NAKed (nothing applied) and only the fitting prefix is echoed.
+2. **Server-ban dedup/removal compared masks case-sensitively while enforcement
+   folds them** (oper.rs) — `KLINE Baddie@Host` then `UNKLINE baddie@host` failed
+   to remove and reported "no such ban" while the ban kept enforcing (an
+   *unremovable* ban), and two case-variants double-stored. The mask is now
+   folded at storage (via the casemap, like enforcement), with `mask::eq`
+   comparisons — the hot list, the DB `ON CONFLICT`/`DELETE` keys, and matching
+   all agree. Migration 0029 folds existing rows (dropping folded-twin
+   duplicates first).
+3. **An XLINE gecos mask with spaces was silently split** (oper.rs) —
+   `XLINE *Evil Corp* :spam` banned `*Evil` with reason `Corp*`, a different and
+   broader ban than typed. Since a middle param can never contain a space, the
+   reason (when given) is the final param and the mask is the rest rejoined;
+   removal rejoins the whole argument. KLINE/DLINE (spaceless) keep the simple
+   split.
+4. **A SASL abort-then-reauth cross-wired a stale verify reply** (sasl.rs) —
+   `AUTHENTICATE *` cleared the state machine but couldn't un-send the in-flight
+   verify, so its reply completed a *new* attempt (logging in under the aborted
+   attempt's account, or dropping a valid login). A new `sasl_verify_pending`
+   marker survives the abort and blocks a new SASL verify (and an IDENTIFY)
+   until the stale reply drains, so a reply is never attributed to a different
+   attempt. Replaces the sweep-66 `sasl == Verifying` IDENTIFY guard, which the
+   abort path slipped past.
+5. **MARKREAD sibling-sync ignored the `draft/read-marker` cap** (read_marker.rs)
+   — a logged-in device on an older client received an unsolicited MARKREAD line
+   it never negotiated. The fan-out now filters on the sibling's cap and
+   registration, like every other MARKREAD emission.
+6. **USERHOST/USERIP truncated the last entry** (chanops.rs) — the entries were
+   joined into a single unsplittable reply with no fit logic, so `numeric`'s
+   trailing truncation chopped the last entry mid-token into a corrupt string
+   (`nick*=+user@2001:db8:`). A shared `pack_trailing_list` helper now packs
+   whole entries and drops the overflow (a polling client re-queries) — ISON was
+   refactored onto the same helper, which also fixed its over-counted overhead.
+7. **Oper ban reasons were unbounded on the wire** (oper.rs) — an over-long
+   reason rode the victim's closing ERROR and the ban-list NOTICE past 512.
+   Clamped to 300 chars.
+
+Surfaced, not changed: the WHOX 354 row bounds only its trailing, not the
+summed middles (an overflow needs a pathologically long — >100 char —
+`server_name`; the fix would touch the central `numeric` funnel, so it's
+deferred over a config-pathological latent gap); and CAP LS/LIST has no `*`
+multiline continuation (the fixed server-controlled cap set fits 512 today, so
+latent until the set grows). Clean bills: the whole visibility surface
+(+s/+p/+i correctly hidden across WHO/WHOIS/WHOWAS/NAMES/LIST, casefold-safe),
+WHOX field parse/order, numeric codes and terminators, WHOWAS records; the
+all-or-nothing CAP REQ, the SASL chunking/buffer bounds and 900-series
+numerics, mechanism parsing; OPER constant-time auth, KILL teardown, DLINE-IP
+non-evasion, the registration ban choke point, audit-log attribution; and the
+MONITOR notification paths (nick-change/quit/kill/register), read-marker
+monotonicity, and `account_connections` (no stale-ConnId leak). Verified beyond
+the gate: full irctest main list (255 passed) and PG-backed services list (49
+passed); migration 0029 applies cleanly across the 38-test PG db suite; the
+fuzz crate builds under `--cfg fuzzing`.
+
 Sixty-sixth sweep — four-front hunt: a bouncer that couldn't be
 severed, proto round-trip corruption, and a concurrent-verify cross-wire
 (2026-07-24): four parallel audits on the `e6irc-proto` wire crate, the
