@@ -1593,6 +1593,51 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Fifty-ninth sweep — hardening + fidelity: OIDC config-safety, a CSRF
+cache leak, and query fidelity (2026-07-24): four deep audits (OIDC/Shauth
+token validation, async cancellation/task-lifecycle, the web frontend, and the
+load harness + low-traffic command fidelity) found the *core* sound —
+ID-token/nonce/PKCE/state validation is correct and `alg:none`-safe; the
+concurrency design has no cancellation-unsafe select, lock-across-await, or task
+leak; the web client keeps the session token out of JS and escapes all DOM
+sinks. The actionable output is six defense-in-depth / config-safety / fidelity
+fixes, all landed here in one PR.
+
+1. **Require an HTTPS OIDC issuer in production** (`config.rs`) — discovery and
+   JWKS are fetched from `issuer_url`, so a plaintext issuer lets an on-path
+   attacker inject signing keys and forge ID tokens. `Config::validate` now
+   rejects an `http` issuer when `secure_cookies` is set (a dev setup with
+   `secure_cookies = false` may still use http locally).
+2. **Reject duplicate OIDC issuers** (`config.rs`) — two providers sharing an
+   `issuer_url` would collide on the `(issuer, subject)` account key, resolving
+   one provider's subject to the other's account. Rejected at load.
+3. **Rate-limit the front-channel logout endpoint** (`http/oidc.rs`) — unlike the
+   signed back-channel path it has no token to verify and revokes a session by a
+   guessable `sid`, so it is now per-IP `auth_rate_ok`-gated like the other
+   unauthenticated OIDC endpoints, blunting `sid` brute-forcing.
+4. **`/api/v1/me` is now `no-store`** (`http/device.rs`) — its body carries the
+   session-bound CSRF token, so it must not sit in a shared/proxy cache (a
+   sibling handler already did this; `me` was missed).
+5. **ISON echoes the canonical nick casing** (`query.rs`) — `ISON AlIcE` for
+   online `alice` now replies `alice` (Solanum behaviour) instead of the caller's
+   input casing; the lookup was already casefolded, only the echoed label was raw.
+6. **WHOWAS reports a last-seen time** (`state.rs`, `query.rs`) — `RPL_WHOISSERVER`
+   carried a `(unknown)` placeholder; `WhowasEntry` now records a `signoff`
+   timestamp (from the clock) and the 312 shows it, matching Solanum/Ergo.
+
+Investigated and *not* changed (surfaced, not swallowed): the app ships only a
+`frame-ancestors 'none'` CSP, so HTML escaping is the sole XSS barrier — a real
+`script-src` needs per-response nonces for the two inline blocks (deferred rather
+than risk breaking them). The DB worker serializes argon2 verifies head-of-line,
+delaying history reads — but making them concurrent would trade that latency for
+a *memory* DoS (each argon2 is 19 MiB) without a concurrency bound, so it needs a
+bounded-parallelism design, not a naive spawn. The core queue wakes all parked
+producers per pop (a thundering herd under sustained overload) — an efficiency
+issue in the loom-verified queue primitive, left alone rather than risk a subtle
+lost-wakeup. Graceful shutdown (last DB batch dropped on kill), the OIDC
+link-flow Shauth gate / optional `typ` / unchecked `iat`/`nbf`, and the load
+harness's fan-out duplicate-delivery blind spot are all noted for later.
+
 Fifty-eighth sweep — four-front hunt: a client SASL hang, an AccountKey
 invariant, and SQL-index/robustness fixes (2026-07-24): four parallel passes
 (client crates, the `AccountKey` typed-key invariant, SQL migrations/schema, and

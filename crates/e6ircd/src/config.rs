@@ -498,6 +498,7 @@ impl Config {
                 }
             }
             let mut provider_names = std::collections::HashSet::new();
+            let mut provider_issuers = std::collections::HashSet::new();
             for provider in &self.oidc_providers {
                 if provider.name.is_empty()
                     || !provider
@@ -515,12 +516,28 @@ impl Config {
                         provider.name
                     )));
                 }
+                // Two providers sharing an issuer would collide on the
+                // `(issuer, subject)` account key — a subject at one would resolve
+                // to the other's account. Reject at load rather than cross-wire
+                // accounts at runtime.
+                if !provider_issuers.insert(provider.issuer_url.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "duplicate OIDC issuer_url '{}' — providers must have distinct issuers",
+                        provider.issuer_url
+                    )));
+                }
                 if provider.client_id.is_empty() || provider.client_secret.is_empty() {
                     return Err(ConfigError::Invalid(format!(
                         "OIDC provider '{}' requires client_id and client_secret",
                         provider.name
                     )));
                 }
+                // In production (secure cookies) the issuer must be HTTPS:
+                // discovery and JWKS are fetched from it, so plaintext lets an
+                // on-path attacker inject signing keys and forge ID tokens. A dev
+                // setup (secure_cookies = false) may still use http for a local
+                // provider.
+                let require_https = self.http.as_ref().is_some_and(|h| h.secure_cookies);
                 for (field, value) in [
                     ("issuer_url", Some(provider.issuer_url.as_str())),
                     (
@@ -529,12 +546,23 @@ impl Config {
                     ),
                 ] {
                     let Some(value) = value else { continue };
-                    let valid = openidconnect::url::Url::parse(value).is_ok_and(|url| {
+                    let parsed = openidconnect::url::Url::parse(value).ok();
+                    let valid = parsed.as_ref().is_some_and(|url| {
                         matches!(url.scheme(), "http" | "https") && url.has_host()
                     });
                     if !valid {
                         return Err(ConfigError::Invalid(format!(
                             "OIDC provider '{}' has an invalid {field}",
+                            provider.name
+                        )));
+                    }
+                    if field == "issuer_url"
+                        && require_https
+                        && parsed.is_some_and(|url| url.scheme() != "https")
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "OIDC provider '{}' issuer_url must be https when secure_cookies is set \
+                             (plaintext discovery/JWKS is forgeable by an on-path attacker)",
                             provider.name
                         )));
                     }
@@ -1026,6 +1054,46 @@ mod tests {
         assert!(
             foreign_logout.validate().is_err(),
             "accepted a Shauth logout endpoint on another origin"
+        );
+    }
+
+    #[test]
+    fn oidc_issuer_must_be_https_under_secure_cookies() {
+        // Production (secure cookies) must reject a plaintext issuer — discovery
+        // and JWKS are forgeable over http by an on-path attacker.
+        // oidc_config sets secure_cookies = true.
+        let config = oidc_config("dex", "http://auth.example", None);
+        assert!(
+            config.validate().unwrap_err().to_string().contains("https"),
+            "http issuer must be rejected under secure_cookies"
+        );
+        // A dev setup (secure_cookies = false) may still use http locally.
+        let mut dev = oidc_config("dex", "http://127.0.0.1:5556/dex", None);
+        dev.http.as_mut().unwrap().secure_cookies = false;
+        dev.validate().expect("http issuer allowed in dev");
+    }
+
+    #[test]
+    fn oidc_duplicate_issuer_is_rejected() {
+        // Two providers sharing an issuer would collide on the (issuer, subject)
+        // account key.
+        let mut config = oidc_config("dex", "https://auth.example", None);
+        config.oidc_providers.push(OidcProviderConfig {
+            name: "dex2".into(),
+            issuer_url: "https://auth.example".into(), // same issuer
+            client_id: "e6irc2".into(),
+            client_secret: "secret2".into(),
+            scopes: vec![],
+            end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
+        });
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate OIDC issuer"),
+            "duplicate issuer must be rejected"
         );
     }
 

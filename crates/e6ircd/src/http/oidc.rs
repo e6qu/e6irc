@@ -732,8 +732,20 @@ pub(super) async fn oidc_backchannel_logout(
 
 pub(super) async fn oidc_frontchannel_logout(
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<FrontchannelLogoutQuery>,
 ) -> Response {
+    // Unlike the signed back-channel path, this endpoint has no token to verify —
+    // it revokes a session by a guessable `sid`. Rate-limit per client IP so it
+    // can't be used to brute-force sids and force-logout victims, matching the
+    // other unauthenticated OIDC endpoints.
+    if !auth_rate_ok(
+        &state,
+        client_ip(peer.ip(), &headers, &state.trusted_proxies),
+    ) {
+        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
+    }
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,

@@ -421,11 +421,15 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 &[&entry.nick, &entry.user, &entry.host, "*"],
                 Some(&entry.realname),
             );
+            // The RPL_WHOISSERVER "server info" slot conventionally carries the
+            // last-seen time for a WHOWAS entry (Solanum/Ergo). Use the recorded
+            // signoff rather than a placeholder.
+            let last_seen = e6irc_proto::time::server_time(entry.signoff);
             state.numeric(
                 conn,
                 RPL_WHOISSERVER,
                 &[&entry.nick, &server],
-                Some("(unknown)"),
+                Some(&format!("last seen {last_seen}")),
             );
         }
     }
@@ -543,11 +547,15 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // trailing param); reply with just those currently online. `registered_peer`
     // (not `nicks`) so a connection that only sent NICK but never finished
     // registration isn't reported as online.
+    // Echo the server's canonical stored nick, not the caller's casing: `ISON
+    // AlIcE` for online `alice` replies `alice` (Solanum behaviour).
     let online: Vec<String> = p
         .iter()
         .flat_map(|arg| arg.split_whitespace())
-        .filter(|nick| state.registered_peer(&state.nick_key(nick)).is_some())
-        .map(str::to_string)
+        .filter_map(|nick| {
+            let peer = state.registered_peer(&state.nick_key(nick))?;
+            state.sessions[&peer].nick.clone()
+        })
         .collect();
     // RPL_ISON is a single reply by RFC 2812 (splitting it would be
     // non-conformant), yet the echoed list is bounded only by the input frame
