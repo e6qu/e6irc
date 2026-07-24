@@ -270,30 +270,53 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     format!("Invalid password for \x02{nick}\x02.")
                 };
                 state.service_notice(conn, "NickServ", &text);
-            } else if state.sessions[&conn].pending_register {
-                // A deferred REGISTER whose DB write failed transiently. Without
-                // this arm the defer would never release and the connection's
-                // output would stay held until the reaper ping-timeouts it — the
-                // exact silent hang `DbReply::Unavailable` promises to avoid.
-                state
-                    .sessions
-                    .get_mut(&conn)
-                    .expect("checked")
-                    .pending_register = false;
-                let nick = state.sessions[&conn]
-                    .nick
-                    .clone()
-                    .unwrap_or_else(|| "*".into());
-                state.emit_deferred(conn, move |state| {
-                    register_fail(
-                        state,
-                        conn,
-                        "TEMPORARILY_UNAVAILABLE",
-                        &nick,
-                        "Account registration is temporarily unavailable",
-                    );
-                });
             }
+            // Account *registration* failures no longer arrive here as a bare
+            // Unavailable — they carry their origin via
+            // `AccountRegisterUnavailable` so both the NickServ and the REGISTER
+            // command paths get a loud, correctly-shaped answer.
+        }
+        crate::core::DbReply::AccountRegisterUnavailable { origin } => {
+            // A registration whose persist failed. Answer the way the client
+            // asked rather than dropping it silently (the old bare-Unavailable
+            // path did nothing for the NickServ origin).
+            match origin {
+                crate::core::AccountOrigin::NickServ => state.service_notice(
+                    conn,
+                    "NickServ",
+                    "Services are temporarily unavailable. Try again later.",
+                ),
+                crate::core::AccountOrigin::RegisterCommand => {
+                    state
+                        .sessions
+                        .get_mut(&conn)
+                        .expect("checked")
+                        .pending_register = false;
+                    let nick = state.sessions[&conn]
+                        .nick
+                        .clone()
+                        .unwrap_or_else(|| "*".into());
+                    state.emit_deferred(conn, move |state| {
+                        register_fail(
+                            state,
+                            conn,
+                            "TEMPORARILY_UNAVAILABLE",
+                            &nick,
+                            "Account registration is temporarily unavailable",
+                        );
+                    });
+                }
+            }
+        }
+        crate::core::DbReply::ChannelRegisterUnavailable => {
+            // ChanServ REGISTER whose persist failed — previously a bare
+            // Unavailable that fell through every arm and left the founder
+            // waiting forever with no response.
+            state.service_notice(
+                conn,
+                "ChanServ",
+                "Services are temporarily unavailable. Try again later.",
+            );
         }
         crate::core::DbReply::AccountCreated { account, origin } => {
             state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
@@ -353,11 +376,37 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 }
             }
         }
-        crate::core::DbReply::ChannelRegistered { channel } => {
-            // Record ownership in the hot copy so the founder is re-opped
-            // on future joins without waiting for a restart.
-            if let Some(account) = state.sessions.get(&conn).and_then(|s| s.account.clone()) {
-                state.set_founder(&channel, &account);
+        crate::core::DbReply::ChannelRegistered {
+            channel,
+            founder_account,
+        } => {
+            // Record ownership in the hot copy so the founder is re-opped on
+            // future joins without waiting for a restart. Seed it from the
+            // account the DB row was actually written with (echoed on the
+            // reply), not the live session — a LOGOUT/IDENTIFY between the
+            // request and this reply would otherwise record the wrong founder
+            // (or none), diverging the hot map from storage until restart.
+            state.set_founder(&channel, &founder_account);
+            // If the channel already carried a topic at registration time,
+            // persist it now (KEEPTOPIC defaults on). The TOPIC command path
+            // persists only on *change*, so without this the topic the founder
+            // registered with is silently lost on the first empty→recreate
+            // cycle — breaking the retention KEEPTOPIC promises.
+            let key = state.chan_key(&channel);
+            if state.keeptopic(&key)
+                && let Some(topic) = state.channels.get(&key).and_then(|c| c.topic.clone())
+            {
+                state.registered_topics.insert(key.clone(), topic.clone());
+                let request = crate::core::DbRequest::SetChannelTopic {
+                    channel: key.as_str().to_string(),
+                    topic: Some((topic.text, topic.set_by, topic.set_at_secs)),
+                };
+                if state.db_tx.try_push(request).is_err() {
+                    eprintln!(
+                        "chanserv: db queue full; registered topic for {} not persisted",
+                        key.as_str()
+                    );
+                }
             }
             state.service_notice(
                 conn,
@@ -382,6 +431,18 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 conn,
                 "ChanServ",
                 &format!("Could not transfer \x02{channel}\x02 — no such account."),
+            );
+        }
+        crate::core::DbReply::FounderChangeUnavailable { channel } => {
+            // A store fault, not a definitive "no such account" — say so, so the
+            // founder doesn't act on a false negative (e.g. re-creating an
+            // account they were told doesn't exist).
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!(
+                    "Could not transfer \x02{channel}\x02 — services are temporarily unavailable."
+                ),
             );
         }
         crate::core::DbReply::ChannelAccessSet {

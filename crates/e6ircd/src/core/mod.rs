@@ -39,22 +39,26 @@ pub enum Input {
     Tick { now: e6irc_proto::time::Millis },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply { conn: ConnId, reply: DbReply },
-    /// A resolved CHATHISTORY page from PostgreSQL.
+    /// A resolved CHATHISTORY page from PostgreSQL. `Err` means the store
+    /// failed — the handler answers a CHATHISTORY FAIL rather than an empty
+    /// batch, so a transient DB fault is never indistinguishable from a buffer
+    /// with no history.
     HistoryPage {
         conn: ConnId,
         display: String,
         batch_ref: String,
-        rows: Vec<HistoryRow>,
+        rows: Result<Vec<HistoryRow>, ()>,
         /// Labeled-response label to place on the batch, if the command that
         /// triggered this deferred page was labeled.
         label: Option<String>,
     },
     /// Resolved CHATHISTORY TARGETS from PostgreSQL: `(target, latest ts)`
-    /// pairs for the buffers with activity in the requested window.
+    /// pairs for the buffers with activity in the requested window. `Err` means
+    /// the store failed — answered with a FAIL, not an empty batch.
     TargetsPage {
         conn: ConnId,
         batch_ref: String,
-        targets: Vec<(String, e6irc_proto::time::Millis)>,
+        targets: Result<Vec<(String, e6irc_proto::time::Millis)>, ()>,
         /// Labeled-response label to place on the batch, if the command that
         /// triggered this deferred page was labeled.
         label: Option<String>,
@@ -364,18 +368,39 @@ pub enum DbReply {
     AccountExists {
         origin: AccountOrigin,
     },
+    /// A channel was registered. `founder_account` is echoed from the request
+    /// (the account the DB row was actually written with), not re-read from the
+    /// session at reply time — a mid-flight LOGOUT/IDENTIFY would otherwise put
+    /// the wrong account (or none) into the hot founder map, diverging it from
+    /// the DB until restart.
     ChannelRegistered {
         channel: String,
+        founder_account: String,
     },
     ChannelExists,
+    /// A NickServ/REGISTER-command account registration could not be persisted
+    /// (DB down/errored). Carries the origin so the client gets the loud
+    /// failure appropriate to how it asked, never a silent hang.
+    AccountRegisterUnavailable {
+        origin: AccountOrigin,
+    },
+    /// A ChanServ channel registration could not be persisted (DB down/errored).
+    ChannelRegisterUnavailable,
     /// A founder transfer succeeded: `channel` as typed, `account`
     /// casefolded (updates the hot ownership map).
     FounderChanged {
         channel: String,
         account: String,
     },
-    /// A founder transfer failed — the target account or channel is gone.
+    /// A founder transfer failed — the target account or channel is gone (a
+    /// definitive negative, distinct from a store fault).
     FounderChangeFailed {
+        channel: String,
+    },
+    /// A founder transfer could not be attempted — the store failed. Kept
+    /// separate from `FounderChangeFailed` so a DB fault is never reported to
+    /// the founder as "no such account".
+    FounderChangeUnavailable {
         channel: String,
     },
     /// A ChanServ FLAGS change was persisted (or not). The hot access map is

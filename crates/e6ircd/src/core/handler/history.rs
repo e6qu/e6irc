@@ -308,8 +308,9 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         })
         .collect();
     // Ring path runs under labeled-response capture; frame_labeled applies the
-    // label, so history_page must not (pass None).
-    history_page(state, conn, &display, &batch_ref, rows, None);
+    // label, so history_page must not (pass None). The ring read cannot fail,
+    // so the page is always `Ok`.
+    history_page(state, conn, &display, &batch_ref, Ok(rows), None);
 }
 
 /// The correspondent in a conversation key, from `me`'s point of view, or
@@ -444,7 +445,8 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     targets.sort_by_key(|t| t.1);
     targets.truncate(limit);
     // No-DB path runs under labeled-response capture; frame_labeled applies it.
-    targets_page(state, conn, &batch_ref, targets, None);
+    // The ring enumeration cannot fail, so the page is always `Ok`.
+    targets_page(state, conn, &batch_ref, Ok(targets), None);
 }
 
 /// Emit a `draft/chathistory-targets` batch: one `CHATHISTORY TARGETS
@@ -453,9 +455,28 @@ pub(crate) fn targets_page(
     state: &mut ServerState,
     conn: ConnId,
     batch_ref: &str,
-    targets: Vec<(String, e6irc_proto::time::Millis)>,
+    targets: Result<Vec<(String, e6irc_proto::time::Millis)>, ()>,
     label: Option<&str>,
 ) {
+    // A store fault answers with a FAIL, not an empty batch — see history_page
+    // for the reasoning (an empty page is indistinguishable from "no buffers").
+    let targets = match targets {
+        Ok(targets) => targets,
+        Err(()) => {
+            let line = match label {
+                Some(label) => format!(
+                    "@label={label} :{} FAIL CHATHISTORY MESSAGE_ERROR TARGETS :History temporarily unavailable",
+                    state.config.server_name,
+                ),
+                None => format!(
+                    ":{} FAIL CHATHISTORY MESSAGE_ERROR TARGETS :History temporarily unavailable",
+                    state.config.server_name,
+                ),
+            };
+            state.send(conn, &line);
+            return;
+        }
+    };
     let server = state.config.server_name.clone();
     // `label` is set only on the async DB path (produced outside the
     // synchronous labeled-response capture), so it labels its own BATCH open;
@@ -694,9 +715,34 @@ pub(crate) fn history_page(
     conn: ConnId,
     display: &str,
     batch_ref: &str,
-    rows: Vec<crate::core::HistoryRow>,
+    rows: Result<Vec<crate::core::HistoryRow>, ()>,
     label: Option<&str>,
 ) {
+    // A store fault answers with a FAIL, not an empty batch — otherwise a
+    // transient DB error is indistinguishable from a buffer with no history,
+    // and the client would cache "nothing here" for a window that does exist.
+    // (The label, if any, still rides the FAIL so the labeled-response framer
+    // resolves the command.) The synchronous try_push-failure path emits the
+    // same MESSAGE_ERROR.
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(()) => {
+            let line = match label {
+                Some(label) => format!(
+                    "@label={label} :{} FAIL CHATHISTORY MESSAGE_ERROR {} :History temporarily unavailable",
+                    state.config.server_name,
+                    crate::core::handler::clip_echo(display),
+                ),
+                None => format!(
+                    ":{} FAIL CHATHISTORY MESSAGE_ERROR {} :History temporarily unavailable",
+                    state.config.server_name,
+                    crate::core::handler::clip_echo(display),
+                ),
+            };
+            state.send(conn, &line);
+            return;
+        }
+    };
     let server = state.config.server_name.clone();
     let open = match label {
         Some(label) => format!("@label={label} :{server} BATCH +{batch_ref} chathistory {display}"),

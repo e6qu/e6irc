@@ -281,14 +281,12 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
 /// Handle one non-history request; false = core gone, stop the worker.
 async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbRequest) -> bool {
     match request {
-        DbRequest::VerifyPassword {
-            conn,
-            account,
-            password,
-        } => {
-            let reply = handle_verify(pool, &account, &password).await;
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
-        }
+        // `run_worker` intercepts VerifyPassword and spawns it under the verify
+        // semaphore before ever reaching here (like LogMessage's batching). A
+        // duplicate inline path would silently lose that concurrency bound and
+        // the off-loop latency decoupling, so make the invariant load-bearing
+        // rather than shipping a second, unbounded copy of the logic.
+        DbRequest::VerifyPassword { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::VerifyToken { conn, token } => {
             let reply = match api_token_account(pool, &token).await {
                 Ok(Some(account)) => DbReply::PasswordVerified { account },
@@ -314,7 +312,10 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                 Err(DbError::DuplicateAccount(_)) => DbReply::AccountExists { origin },
                 Err(e) => {
                     eprintln!("db: account creation failed: {e}");
-                    DbReply::Unavailable
+                    // Origin-carrying failure so the handler answers the way the
+                    // client asked (NickServ notice vs REGISTER FAIL) instead of
+                    // dropping a bare Unavailable it can't attribute.
+                    DbReply::AccountRegisterUnavailable { origin }
                 }
             };
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
@@ -338,13 +339,16 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             channel,
             new_founder,
         } => {
-            let reply = if set_channel_founder(pool, &channel, &new_founder).await {
-                DbReply::FounderChanged {
+            let reply = match set_channel_founder(pool, &channel, &new_founder).await {
+                Ok(true) => DbReply::FounderChanged {
                     channel,
                     account: new_founder,
+                },
+                Ok(false) => DbReply::FounderChangeFailed { channel },
+                Err(e) => {
+                    eprintln!("db: founder transfer failed: {e}");
+                    DbReply::FounderChangeUnavailable { channel }
                 }
-            } else {
-                DbReply::FounderChangeFailed { channel }
             };
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
@@ -356,7 +360,12 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             query,
             label,
         } => {
-            let rows = query_history(pool, &target, query).await;
+            let rows = query_history(pool, &target, query).await.map_err(|e| {
+                // The error string is logged here; the core only needs to know
+                // it failed so it can FAIL the CHATHISTORY rather than reply
+                // with a misleading empty page.
+                eprintln!("db: history query failed: {e}");
+            });
             core_tx
                 .push(Input::HistoryPage {
                     conn,
@@ -378,7 +387,11 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             batch_ref,
             label,
         } => {
-            let targets = query_targets(pool, &channels, &me, min_ts, max_ts, limit).await;
+            let targets = query_targets(pool, &channels, &me, min_ts, max_ts, limit)
+                .await
+                .map_err(|e| {
+                    eprintln!("db: targets query failed: {e}");
+                });
             core_tx
                 .push(Input::TargetsPage {
                     conn,
@@ -683,7 +696,7 @@ pub async fn query_history(
     pool: &PgPool,
     target: &str,
     query: crate::core::HistoryQuery,
-) -> Vec<crate::core::HistoryRow> {
+) -> Result<Vec<crate::core::HistoryRow>, sqlx::Error> {
     use crate::core::HistoryQuery;
     // BETWEEN resolves each pivot's `(ts, id)` in the DB and derives its own
     // direction, so it produces its final oldest-first order itself rather than
@@ -825,17 +838,11 @@ pub async fn query_history(
         // Returned early above.
         HistoryQuery::BetweenSelectors { .. } => unreachable!("handled before the match"),
     };
-    let mut rows = match rows {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("db: history query failed: {e}");
-            return Vec::new();
-        }
-    };
+    let mut rows = rows?;
     if newest_first {
         rows.reverse();
     }
-    rows.into_iter().map(history_row_from_db).collect()
+    Ok(rows.into_iter().map(history_row_from_db).collect())
 }
 
 /// Map a raw history row to a [`HistoryRow`].
@@ -865,7 +872,7 @@ async fn query_between_selectors(
     first: &crate::core::SelectorBound,
     second: &crate::core::SelectorBound,
     limit: usize,
-) -> Vec<crate::core::HistoryRow> {
+) -> Result<Vec<crate::core::HistoryRow>, sqlx::Error> {
     use crate::core::SelectorBound;
     // Resolve a selector to `(ts_ms, ordering_id, is_timestamp)`. A missing msgid
     // is `None` → the whole window is empty.
@@ -894,13 +901,12 @@ async fn query_between_selectors(
         marker(pool, target, second).await,
     ) {
         (Ok(Some(a)), Ok(Some(b))) => (a, b),
-        (Err(e), _) | (_, Err(e)) => {
-            eprintln!("db: BETWEEN pivot lookup failed: {e}");
-            return Vec::new();
-        }
-        // A pivot msgid that is not in this buffer → empty (as for the other
-        // msgid pivots), not a plausible-but-wrong window.
-        _ => return Vec::new(),
+        // A DB fault is surfaced (Err), never folded into an empty page — the
+        // caller distinguishes "no such window" from "the store failed".
+        (Err(e), _) | (_, Err(e)) => return Err(e),
+        // A pivot msgid that is not in this buffer → genuinely empty (as for the
+        // other msgid pivots), not a plausible-but-wrong window, and not a fault.
+        _ => return Ok(Vec::new()),
     };
     // Order the two pivots; the first selector being the newer bound means the
     // `limit` cuts from the newest end (CHATHISTORY walks first → second).
@@ -935,17 +941,11 @@ async fn query_between_selectors(
         .bind(limit as i64)
         .fetch_all(pool)
         .await;
-    let mut rows = match rows {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("db: BETWEEN query failed: {e}");
-            return Vec::new();
-        }
-    };
+    let mut rows = rows?;
     if newest_first {
         rows.reverse(); // the batch replays oldest-first
     }
-    rows.into_iter().map(history_row_from_db).collect()
+    Ok(rows.into_iter().map(history_row_from_db).collect())
 }
 
 /// CHATHISTORY TARGETS: among `channels` (casefolded), the buffers with a
@@ -963,7 +963,7 @@ pub async fn query_targets(
     min_ts: e6irc_proto::time::Millis,
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
-) -> Vec<(String, e6irc_proto::time::Millis)> {
+) -> Result<Vec<(String, e6irc_proto::time::Millis)>, sqlx::Error> {
     // A conversation is keyed by both participants, so it is reported under the
     // *other* one — and under `me` for a conversation with oneself, whose key
     // has only the single participant.
@@ -1000,16 +1000,10 @@ pub async fn query_targets(
     .bind(me)
     .fetch_all(pool)
     .await;
-    match rows {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(t, ts)| (t, e6irc_proto::time::Millis::from_millis(ts as u64)))
-            .collect(),
-        Err(e) => {
-            eprintln!("db: targets query failed: {e}");
-            Vec::new()
-        }
-    }
+    Ok(rows?
+        .into_iter()
+        .map(|(t, ts)| (t, e6irc_proto::time::Millis::from_millis(ts as u64)))
+        .collect())
 }
 
 /// Upsert (or remove, when `flags` is `None`) one channel access entry by
@@ -1104,7 +1098,15 @@ pub async fn list_channel_access(pool: &PgPool) -> Result<Vec<(String, String, S
 
 /// Transfer a channel's founder to `new_founder_folded`. Returns whether
 /// a row was updated (false = no such channel or account).
-pub async fn set_channel_founder(pool: &PgPool, channel: &str, new_founder_folded: &str) -> bool {
+/// Transfer a channel's founder. `Ok(true)` = a row was updated, `Ok(false)` =
+/// no such channel/account (a definitive negative), `Err` = the store failed.
+/// The caller must keep these distinct: reporting a DB fault as "no such
+/// account" would tell the founder a lie they might act on.
+pub async fn set_channel_founder(
+    pool: &PgPool,
+    channel: &str,
+    new_founder_folded: &str,
+) -> Result<bool, DbError> {
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let res = sqlx::query(
         "UPDATE channels SET founder_account_id = a.id
@@ -1114,14 +1116,9 @@ pub async fn set_channel_founder(pool: &PgPool, channel: &str, new_founder_folde
     .bind(&channel_folded)
     .bind(new_founder_folded)
     .execute(pool)
-    .await;
-    match res {
-        Ok(r) => r.rows_affected() > 0,
-        Err(e) => {
-            eprintln!("db: founder transfer failed: {e}");
-            false
-        }
-    }
+    .await
+    .map_err(DbError::Query)?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Persist a server ban (KLINE/DLINE/XLINE). Upserts on `(mask, kind)` so
@@ -1231,6 +1228,10 @@ async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) ->
     match inserted {
         Ok(Some(_)) => DbReply::ChannelRegistered {
             channel: channel.to_string(),
+            // Echo the founder the row was actually written with, so the hot
+            // map is seeded from the persisted value rather than the session's
+            // possibly-since-changed account.
+            founder_account: founder.to_string(),
         },
         // No row: either the channel exists or the founder account
         // vanished; both leave nothing registered. Distinguish them.
@@ -1244,17 +1245,17 @@ async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) ->
                 Ok(Some(_)) => DbReply::ChannelExists,
                 Ok(None) => {
                     eprintln!("db: founder account {founder} missing during channel registration");
-                    DbReply::Unavailable
+                    DbReply::ChannelRegisterUnavailable
                 }
                 Err(e) => {
                     eprintln!("db: channel existence check failed: {e}");
-                    DbReply::Unavailable
+                    DbReply::ChannelRegisterUnavailable
                 }
             }
         }
         Err(e) => {
             eprintln!("db: channel registration failed: {e}");
-            DbReply::Unavailable
+            DbReply::ChannelRegisterUnavailable
         }
     }
 }
@@ -1294,14 +1295,22 @@ pub async fn create_device_grant(pool: &PgPool) -> Result<(String, String), DbEr
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     let device_code = e6irc_proto::base64::encode(&bytes);
-    // 8 chars from an unambiguous alphabet (no 0/O/1/I/L).
+    // 8 chars from an unambiguous alphabet (no 0/O/1/I/L). The length (31) does
+    // not divide 256, so a plain `byte % len` would make the first `256 % 31`
+    // characters more likely — a small but real bias in a human-entered
+    // approval secret for an unauthenticated flow (RFC 8628 §6.1). Reject bytes
+    // at or above the largest multiple of the length and redraw, so every
+    // character is equiprobable.
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    let mut ub = [0u8; 8];
-    OsRng.fill_bytes(&mut ub);
-    let user_code: String = ub
-        .iter()
-        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
-        .collect();
+    let unbiased_max = 256 - (256 % ALPHABET.len());
+    let mut user_code = String::with_capacity(8);
+    let mut byte = [0u8; 1];
+    while user_code.len() < 8 {
+        OsRng.fill_bytes(&mut byte);
+        if (byte[0] as usize) < unbiased_max {
+            user_code.push(ALPHABET[byte[0] as usize % ALPHABET.len()] as char);
+        }
+    }
     // Prune expired grants on write: `/device/start` is unauthenticated and a
     // grant is otherwise only removed when it is approved and polled, so a
     // flood of never-approved starts would grow the table without bound.
@@ -1434,8 +1443,8 @@ pub async fn verify_credentials(
     password: &str,
 ) -> Result<Option<String>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT a.name, c.argon2_hash FROM accounts a
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT a.name, c.argon2_hash, c.id FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
          WHERE a.name_folded = $1",
     )
@@ -1462,25 +1471,43 @@ pub async fn verify_credentials(
         return Ok(None);
     }
     let display_name = rows[0].0.clone();
-    let hashes: Vec<String> = rows.into_iter().map(|(_, h)| h).collect();
+    let creds: Vec<(i64, String)> = rows.into_iter().map(|(_, h, id)| (id, h)).collect();
     let password = password.to_string();
-    let verified = tokio::task::spawn_blocking(move || {
-        // Evaluate every credential (|=, not a short-circuiting any()) so the
-        // reject time doesn't reveal which credential matched or how early.
-        let mut matched = false;
-        for hash in &hashes {
+    // Returns the id of the credential that matched, if any — evaluated over
+    // every credential so the reject time is uniform (the id is only recorded,
+    // never short-circuited on).
+    let matched_id = tokio::task::spawn_blocking(move || {
+        // Evaluate every credential (not a short-circuiting any()) so the reject
+        // time doesn't reveal which credential matched or how early.
+        let mut matched_id: Option<i64> = None;
+        for (id, hash) in &creds {
             let ok = PasswordHash::new(hash).is_ok_and(|parsed| {
                 hasher()
                     .verify_password(password.as_bytes(), &parsed)
                     .is_ok()
             });
-            matched |= ok;
+            if ok {
+                matched_id = Some(*id);
+            }
         }
-        matched
+        matched_id
     })
     .await
     .expect("verification task panicked");
-    Ok(verified.then_some(display_name))
+    if let Some(id) = matched_id {
+        // Record the use so the credential list can show it. Best-effort: a
+        // failure here must not fail an otherwise-successful authentication, so
+        // it is logged, not propagated.
+        if let Err(e) =
+            sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+        {
+            eprintln!("db: failed to record credential last-used time: {e}");
+        }
+    }
+    Ok(matched_id.map(|_| display_name))
 }
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------
@@ -1724,15 +1751,25 @@ pub async fn list_channel_mlock(pool: &PgPool) -> Result<Vec<(String, String)>, 
 }
 
 /// Delete `account`'s network `name`. Returns whether a row was removed.
+///
+/// The network row and its buffer rows are removed in one transaction: they
+/// commit or roll back together. Done as two standalone statements, a failure
+/// (or a crash) after the network delete committed would orphan the buffer
+/// rows — and because a later same-named network for the same owner replays
+/// `recent_bnc_lines`, that stale backlog would surface in the new network. The
+/// caller would also have seen the network vanish yet gotten an `Err`, so a
+/// retry returns `Ok(false)` ("no such network") while the cleanup limped along
+/// as a side effect. One transaction removes both hazards.
 pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
     let res = sqlx::query(
         "DELETE FROM bnc_networks n USING accounts a
          WHERE n.account_id = a.id AND a.name_folded = $1 AND n.name = $2",
     )
     .bind(&folded)
     .bind(name)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
     // bnc_buffer has no FK to bnc_networks (owner/network are plain text), so
@@ -1744,9 +1781,10 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
     sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1 AND network = $2")
         .bind(&folded)
         .bind(name)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(DbError::Query)?;
+    tx.commit().await.map_err(DbError::Query)?;
     Ok(res.rows_affected() > 0)
 }
 

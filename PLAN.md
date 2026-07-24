@@ -1593,6 +1593,84 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-fifth sweep — four-front hunt: silent DB-error fallbacks, a +C
+multiline bypass, and a hot-map/DB divergence (2026-07-24): four parallel
+audits on the persistence layer, the net/framing/reaper stack, the HTTP/OIDC
+surface, and message routing/tags. Thirteen confirmed bugs, all fixed in one
+pass. The dominant theme (three audits converged on it) was **DB errors folded
+into plausible-but-wrong success answers** — the exact silent-fallback the
+design laws forbid:
+
+1. **CHATHISTORY / TARGETS / REST history answered an empty result on a store
+   fault**, indistinguishable from a buffer with no history — a bouncer-style
+   client caches "nothing here" for a window that exists. `query_history` and
+   `query_targets` now return `Result`; the IRC path answers `FAIL CHATHISTORY
+   MESSAGE_ERROR` (the same failure its enqueue-failure sibling already sent)
+   and `/api/v1/history` answers 503, both instead of a misleading empty page.
+2. **NickServ / ChanServ REGISTER silently vanished on a DB failure** — the
+   `Unavailable` reply carried no origin, so it fell through every handler arm
+   and the user's command got no response at all (a literal silent hang). The
+   account and channel registration failures now carry their origin
+   (`AccountRegisterUnavailable{origin}` / `ChannelRegisterUnavailable`) and
+   each answers with a loud "temporarily unavailable".
+3. **A founder transfer whose DB write *errored* was reported as the definitive
+   "no such account"** — a lie the founder might act on (re-registering an
+   account they were told doesn't exist). `set_channel_founder` now returns
+   `Result<bool>`, and a store fault becomes `FounderChangeUnavailable` (say so)
+   distinct from `FounderChangeFailed` (a real missing account).
+4. **Channel-registration seeded the hot founder map from the live session, not
+   the account the DB row was written with** — a LOGOUT/IDENTIFY racing the
+   round-trip recorded the wrong founder (or none), diverging the hot map from
+   the DB until restart. The reply now echoes `founder_account`; the handler
+   uses it unconditionally.
+5. **+C (no-CTCP) was bypassable via a multiline batch**: the check inspected
+   only the first byte of the `\n`-joined blob, so a CTCP on line 2+ passed and
+   re-emerged as its own PRIVMSG when the batch was flattened for non-multiline
+   recipients. Now every line is checked (a single-line body has no `\n`, so
+   it's unchanged there).
+6. **The in-process `local` bouncer session was reaped every ~3 minutes**: it
+   registers like a real session so the liveness reaper PINGs it, but it had no
+   PONG logic and no network peer to answer — so it timed out, dropped, and
+   reconnected, churning the "always-on" network. The local driver now answers
+   the reaper's PING (and keeps it out of the user's buffer).
+7. **`delete_bnc_network` was two standalone DELETEs** — a failure between them
+   orphaned buffer rows that a later same-named network would replay as stale
+   backlog. Now one transaction.
+8. **`account_credentials.last_used_at` was exposed but never written** — every
+   app password reported `null` forever, defeating a "is this credential still
+   used?" audit. A successful verify now stamps the matched credential.
+9. **The device-flow `user_code` had modulo bias** (31-char alphabet over 256):
+   A–H were 12.5% likelier. Now rejection-sampled to uniform (RFC 8628 §6.1).
+10. **A dead `VerifyPassword` arm in `handle_request`** duplicated the verify
+    logic *without* the concurrency semaphore; unreachable today, it would
+    silently lose the bound if a refactor routed through it. Now `unreachable!`,
+    matching the `LogMessage` precedent.
+11. **`audit_log_created_idx` served no query** (the reader orders by `id`) —
+    pure write-time overhead on every audited action. Dropped (migration 0028).
+12. **The OIDC callback error-path consumed the pending-auth entry before the
+    state-cookie binding check** — an attacker who learned a victim's in-flight
+    `state` could race `?error=…&state=<victim>` to burn the victim's login (a
+    login-DoS), the exact guard the success path applies. The error path now
+    binds-then-consumes too.
+
+Also a channel registered *with a topic already set* never persisted it (the
+TOPIC path persists only on change), silently breaking KEEPTOPIC for the
+founder's initial topic — now seeded on `ChannelRegistered`.
+
+Surfaced, not changed: the message-tags budget is not enforced on relay (our
+own framer tolerates over-budget tag sections and a strict recipient is rare —
+a low-value conformance gap that would touch every delivery path, deferred
+rather than rushed); and the writer-first-close ghost-session window (already
+documented in-code as a reaper-bounded tradeoff). Clean bills: ON CONFLICT ↔
+constraint pairing, casefold discipline across every `name_folded` pair,
+boot-load completeness, timestamp round-trips, transaction atomicity of the
+account/OIDC/device paths, the framer's overflow contract, TLS handshake
+timeouts, the queue waker protocol, SendQ accounting, reaper time arithmetic,
+and the entire authZ/IDOR surface of the REST API (every `/me/*` scoped to the
+caller, every `/admin/*` gated by a fail-closed extractor). Verified beyond the
+gate: full irctest main list (255 passed) and PG-backed services list (49
+passed) both green.
+
 Sixty-fourth sweep — four-front hunt: a +i bypass, client exit-code
 lies, and teardown/notify gaps (2026-07-24): four parallel audits on fronts
 without a recent deep pass — IRCv3 capability machinery, channel
