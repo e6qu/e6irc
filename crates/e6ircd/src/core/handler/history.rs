@@ -303,6 +303,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             msgid: e.msgid,
             ts: e.ts,
             sender_prefix: e.sender_prefix,
+            sender_account: e.sender_account,
             kind: e.kind,
             body: e.body,
         })
@@ -765,16 +766,29 @@ pub(crate) fn history_page(
         .then(|| state.sessions.get(&conn).and_then(|s| s.nick.clone()))
         .flatten()
         .map(|me| {
-            let my_key = state.casemap.casefold(&me);
+            // The requester's *identity* (account, or `~nick`) — stable across a
+            // nick change, unlike their current nick. A row is theirs iff its
+            // sender identity equals this, so a rename mid-conversation no longer
+            // makes their own past lines look self-addressed.
+            let my_identity = state.conn_identity(conn);
             let peer = state.display_nick(&state.casemap.casefold(display));
-            (me, my_key, peer)
+            (me, my_identity, peer)
         });
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts);
         let target = match &dm {
-            Some((me, my_key, peer)) => {
-                let sender = row.sender_prefix.split('!').next().unwrap_or_default();
-                if &state.casemap.casefold(sender) == my_key {
+            Some((me, my_identity, peer)) => {
+                // Derive the row sender's identity the same way `conn_identity`
+                // does: the stored account when present, else `~nick` from the
+                // historical sender prefix.
+                let sender_identity = match &row.sender_account {
+                    Some(account) => state.casemap.casefold(account),
+                    None => {
+                        let nick = row.sender_prefix.split('!').next().unwrap_or_default();
+                        format!("~{}", state.casemap.casefold(nick))
+                    }
+                };
+                if &sender_identity == my_identity {
                     peer.as_str()
                 } else {
                     me.as_str()
@@ -817,6 +831,7 @@ mod window_tests {
             // Entries 10ms apart so a `timestamp=` between two lands cleanly.
             ts: Millis::from_millis(1000 + i as u64 * 10),
             sender_prefix: "n!u@h".into(),
+            sender_account: None,
             kind: MessageKind::Privmsg,
             body: format!("b{i}"),
         }

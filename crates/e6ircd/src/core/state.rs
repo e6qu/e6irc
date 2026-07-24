@@ -377,6 +377,9 @@ pub(crate) struct HistoryEntry {
     /// so second granularity would make same-second messages unorderable.
     pub ts: e6irc_proto::time::Millis,
     pub sender_prefix: String,
+    /// The sender's account at send time (`None` if unauthenticated); lets DM
+    /// replay re-address by stable identity rather than by the sender's nick.
+    pub sender_account: Option<String>,
     /// "PRIVMSG" or "NOTICE" as sent on the wire.
     pub kind: crate::core::MessageKind,
     pub body: String,

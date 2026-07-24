@@ -156,9 +156,20 @@ pub(super) async fn oidc_sso_start(
 /// identity when the provider returns.
 pub(super) async fn oidc_link_start(
     State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Authenticated(account): Authenticated,
     Path(provider_name): Path<String>,
 ) -> Response {
+    // Rate-limit per client IP like oidc_start/oidc_sso_start: each call forces
+    // a discovery fetch and grows `pending_auth`. Authenticated, so not an
+    // unauthenticated vector, but gated for parity with its siblings.
+    if !auth_rate_ok(
+        &state,
+        client_ip(peer.ip(), &headers, &state.trusted_proxies),
+    ) {
+        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
+    }
     oidc_authorize(&state, &provider_name, Some(account), false).await
 }
 
@@ -497,6 +508,16 @@ pub(super) async fn oidc_callback(
                 format!(
                     "{}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{secure}",
                     session_cookie_name(state.secure_cookies)
+                ),
+            ),
+            // The state-binding cookie has done its job (the pending entry was
+            // consumed above); expire it now rather than leaving it in the
+            // browser until its Max-Age. Defense-in-depth — no stray auth state.
+            (
+                header::SET_COOKIE,
+                format!(
+                    "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}",
+                    oidc_state_cookie_name(state.secure_cookies)
                 ),
             ),
         ],

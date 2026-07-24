@@ -1276,6 +1276,42 @@ fn tagmsg_relays_client_tags_to_capable_members_only() {
     assert!(s.drain(carol).is_empty(), "no message-tags cap ⇒ no TAGMSG");
 }
 
+/// TAGMSG carries `account` (for account-tag recipients) and `bot` (for a bot
+/// sender), exactly like PRIVMSG/NOTICE — the tags were previously omitted, so
+/// identity/anti-spam tooling lost attribution for typing/reaction traffic.
+#[test]
+fn tagmsg_carries_account_and_bot_tags() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags account-tag");
+    identify(&mut s, alice, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags account-tag");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #room");
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.drain(bob);
+    // alice is identified: her TAGMSG to an account-tag recipient carries account=.
+    s.line(alice, "@+typing=active TAGMSG #room");
+    let got = s.drain(bob);
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert!(
+        got[0].contains("account=alice"),
+        "TAGMSG must carry the sender's account for account-tag recipients: {}",
+        got[0]
+    );
+    // Now make alice a bot; her TAGMSG carries the bot tag.
+    s.line(alice, "MODE alice +B");
+    s.drain(alice);
+    s.line(alice, "@+typing=active TAGMSG #room");
+    let got = s.drain(bob);
+    assert!(
+        got[0].split(' ').next().unwrap().contains(";bot"),
+        "a bot's TAGMSG must carry the bot tag: {}",
+        got[0]
+    );
+}
+
 #[test]
 fn tagmsg_honors_statusmsg_sigil() {
     // `TAGMSG @#chan` is a valid STATUSMSG (message-tags spec): it must reach
@@ -2783,6 +2819,42 @@ fn chathistory_latest_replays_from_ring() {
             "{line}"
         );
     }
+}
+
+/// A DM row is re-addressed on replay by the sender's stable *identity*, not by
+/// their historical nick — so a requester who renames mid-conversation still
+/// sees their own sent lines addressed to the correspondent, not to themselves.
+#[test]
+fn chathistory_dm_replay_survives_a_requester_rename() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    identify(&mut s, alice, "alice");
+    let bob = s.register(2, "bob");
+    identify(&mut s, bob, "bob");
+    s.drain(alice);
+    s.drain(bob);
+    // alice DMs bob; the row is recorded with sender_account = alice.
+    s.line(alice, "PRIVMSG bob :hello bob");
+    s.drain(alice);
+    s.drain(bob);
+    // alice renames — her identity (account) is unchanged.
+    s.line(alice, "NICK alice2");
+    s.drain(alice);
+    // Reading the conversation with bob, her own line must still be addressed to
+    // bob (not re-addressed to alice2 as a self-message). Limit 1 == the ring's
+    // single entry, so the read is served synchronously from the ring.
+    s.line(alice, "CHATHISTORY LATEST bob * 1");
+    let out = s.drain(alice);
+    let replayed: Vec<&String> = out.iter().filter(|l| l.contains("PRIVMSG")).collect();
+    assert!(!replayed.is_empty(), "no replayed DM: {out:#?}");
+    assert!(
+        replayed.iter().all(|l| l.contains("PRIVMSG bob :")),
+        "the requester's own line must replay addressed to bob: {replayed:#?}"
+    );
+    assert!(
+        !replayed.iter().any(|l| l.contains("PRIVMSG alice2 :")),
+        "must not re-address the requester's own line to their new nick: {replayed:#?}"
+    );
 }
 
 #[test]

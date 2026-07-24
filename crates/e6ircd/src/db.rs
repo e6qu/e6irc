@@ -673,7 +673,7 @@ pub async fn set_channel_topic(
 }
 
 /// (msgid, epoch **milliseconds**, sender prefix, kind, body) as stored.
-type HistoryDbRow = (String, i64, String, String, String);
+type HistoryDbRow = (String, i64, String, Option<String>, String, String);
 
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
 ///
@@ -689,8 +689,8 @@ type HistoryDbRow = (String, i64, String, String, String);
 macro_rules! history_select {
     ($rest:literal) => {
         concat!(
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body \
-             FROM messages ",
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, sender_account, \
+             kind, body FROM messages ",
             $rest
         )
     };
@@ -702,12 +702,12 @@ macro_rules! history_select {
 macro_rules! history_window {
     ($older:literal, $newer:literal) => {
         concat!(
-            "SELECT msgid, e, sender_prefix, kind, body FROM ( (SELECT msgid, \
-             (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix, kind, body, ts, id \
-             FROM messages ",
+            "SELECT msgid, e, sender_prefix, sender_account, kind, body FROM ( (SELECT msgid, \
+             (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix, sender_account, kind, \
+             body, ts, id FROM messages ",
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, \
-             sender_prefix, kind, body, ts, id FROM messages ",
+             sender_prefix, sender_account, kind, body, ts, id FROM messages ",
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
         )
@@ -869,11 +869,12 @@ pub async fn query_history(
 
 /// Map a raw history row to a [`HistoryRow`].
 fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
-    let (msgid, ts, sender_prefix, kind, body) = row;
+    let (msgid, ts, sender_prefix, sender_account, kind, body) = row;
     crate::core::HistoryRow {
         msgid,
         ts: e6irc_proto::time::Millis::from_millis(ts as u64),
         sender_prefix,
+        sender_account,
         // The `kind` column is written only from `MessageKind::db`, so an
         // unrecognized value is a corrupt row — fall back to PRIVMSG (the louder
         // kind) rather than drop the message.
@@ -1948,13 +1949,34 @@ pub async fn find_or_create_oidc_account(
     let Some((account_id, name)) = chosen else {
         return Err(DbError::DuplicateAccount(base));
     };
-    sqlx::query("INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)")
-        .bind(account_id)
+    let inserted = sqlx::query(
+        "INSERT INTO oidc_identities (account_id, issuer, subject) VALUES ($1, $2, $3)
+         ON CONFLICT (issuer, subject) DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(issuer)
+    .bind(subject)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    if inserted.rows_affected() == 0 {
+        // A concurrent first-login for the same (issuer, subject) committed
+        // first. Return the winner's account rather than a spurious 503, and do
+        // NOT commit our transaction — dropping it rolls back the extra account
+        // this racer just created, so the identity is provisioned exactly once.
+        // (PostgreSQL blocks our ON CONFLICT until the winner's tx resolves, so
+        // by here the winner is committed and visible on a fresh connection.)
+        let winner: String = sqlx::query_scalar(
+            "SELECT a.name FROM oidc_identities o JOIN accounts a ON a.id = o.account_id
+             WHERE o.issuer = $1 AND o.subject = $2",
+        )
         .bind(issuer)
         .bind(subject)
-        .execute(&mut *tx)
+        .fetch_one(pool)
         .await
         .map_err(DbError::Query)?;
+        return Ok(winner);
+    }
     tx.commit().await.map_err(DbError::Query)?;
     Ok(name)
 }
@@ -2348,8 +2370,8 @@ mod history_sql_tests {
     fn history_select_expands_to_the_expected_statement() {
         assert_eq!(
             history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, kind, body \
-             FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, sender_account, \
+             kind, body FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"
         );
     }
 

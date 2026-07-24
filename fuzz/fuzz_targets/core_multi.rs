@@ -116,6 +116,7 @@ fuzz_target!(|data: &[u8]| {
                     msgid: "m".into(),
                     ts: e6irc_proto::time::Millis::from_millis(tick),
                     sender_prefix: "n!u@h".into(),
+                    sender_account: None,
                     kind: e6ircd::core::MessageKind::Privmsg,
                     body: rest.to_string(),
                 }]),

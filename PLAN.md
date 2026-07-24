@@ -1593,6 +1593,74 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-ninth sweep — the CHATHISTORY rename fix + four-front hunt:
+TAGMSG missing tags, a logout that doesn't log out (2026-07-24): landed the
+CHATHISTORY DM requester-rename mis-address surfaced in sweep 68, plus four
+parallel audits (OIDC/session lifecycle, admin API + WS UI, casefold/typed-key
+discipline, and TAGMSG/tags/STATUSMSG). Eight bugs fixed:
+
+1. **CHATHISTORY re-addressed a replayed DM by the sender's historical *nick*,
+   not their identity** (MEDIUM, the sweep-68 follow-up). A requester who
+   renamed mid-conversation saw their own sent lines re-addressed to themselves
+   instead of the correspondent. `HistoryRow`/`HistoryEntry` now carry the
+   sender's `sender_account` (the DB already stored it — the two history SQL
+   macros, `HistoryDbRow`, its pinned SQL-assertion test, and the fuzz crate
+   were threaded through), and `history_page` compares each row's *identity*
+   (`account` or `~nick`) to `conn_identity` — stable across a rename.
+2. **TAGMSG omitted the `account` and `bot` tags** (MEDIUM) that PRIVMSG/NOTICE
+   attach — the account-tag and bot-mode specs list TAGMSG among the messages
+   that bear them, so identity/anti-spam tooling silently lost attribution for
+   typing/reaction traffic. Three delivery paths; two attached the tags, one
+   forgot. Now attached (per-recipient `account-tag`, `bot` for a bot sender).
+3. **TAGMSG relayed duplicate client-only tag keys verbatim** (`+x=a;+x=b`),
+   a technically-malformed tag section clients could disagree about. Client
+   tags are now de-duplicated last-wins (matching the parser's own accessor).
+4. **RP-initiated logout left the LOCAL session alive on every error path**
+   (MEDIUM) — `delete_web_session` ran only after the provider end-session URL
+   was built, so any coordination failure (provider not configured for
+   coordinated logout, unset `public_url`, unparseable endpoint, a
+   renamed/removed provider) 503'd with the session and cookie intact for the
+   full 14-day TTL: a logout button that didn't log out. The local session is
+   now ended unconditionally first; the provider redirect is best-effort, and a
+   coordination failure falls back to the signed-out page rather than stranding
+   the (now-deleted) session behind a 503.
+5. **The OIDC first-login race returned a spurious 503** — the identity `INSERT`
+   had no `ON CONFLICT`, so two concurrent first-logins for one `(issuer,
+   subject)` had the loser's insert fail the unique constraint and roll back to
+   an error. Now `ON CONFLICT (issuer, subject) DO NOTHING`; on a conflict it
+   returns the winner's account and rolls back its own spurious account — the
+   user is provisioned exactly once, retry-free.
+6. **The OIDC state-binding cookie was never cleared after callback** — it
+   lingered up to its `Max-Age`. Now expired alongside setting the session
+   cookie (defense-in-depth).
+7. **`oidc_link_start` was not rate-limited** unlike `oidc_start`/`oidc_sso_start`;
+   gated on `auth_rate_ok` for parity.
+8. **The REST history endpoint's docstring overstated DM parity with IRC** — it
+   keys a DM by the casefolded target name, which matches the IRC path only when
+   that equals the correspondent's stored identity (account, or offline `~nick`).
+   The HTTP layer has no live session state to resolve a nick→account, so the
+   docstring now documents the scope limit honestly rather than claiming full
+   parity (same `~nick`-vs-nick class as sweep 68, unfixable without core state).
+
+Surfaced, not changed: **TAGMSG ignores comma-separated target lists** (takes
+only the first token — a delivery-loop restructure with STATUSMSG/cap/may_speak
+regression risk, deferred as a focused follow-up); the OIDC **discovery cache
+can serve stale JWKS across a key rotation** (bounded 15-min availability
+tradeoff, never accepts a forged token); `create_web_session`'s non-OIDC wrapper
+has no production caller (a password web-login path is intended, or it collapses
+to the test helper); and the DB layer's hardcoded `Rfc1459` fold is coupled to
+the core's fixed casemap (latent — would diverge only if the casemap became
+configurable to Ascii). Clean bills: the admin API (authZ fail-closed extractor,
+no data exposure, no IDOR), the WS `/ws/irc` bridge (same per-IP cap + framing
+as raw TCP) and `/ws/ui` composer (CR/LF sanitization, XSS-escaped rendering,
+same-origin + CSRF), the OIDC session/cookie/back-channel-logout core (14-day
+TTL, `__Host-` attributes, jti replay guard, no fixation), and the entire
+typed-key/casefold discipline across every state map and folded DB column (only
+the one REST DM-parity scope limit found). Verified beyond the gate: full
+irctest main list (255) and PG services list (49); the 40-test PG db suite (the
+`sender_account` history column and the OIDC race fix on real PostgreSQL); the
+fuzz crate under `--cfg fuzzing`.
+
 Sixty-eighth sweep — four-front hunt: a config that bricks the
 server, a credential that deletes the account password, and a doubled
 per-IP cap (2026-07-24): four parallel audits on config/boot/shutdown, the
