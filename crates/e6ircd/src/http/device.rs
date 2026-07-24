@@ -498,11 +498,71 @@ pub(super) async fn logout_sso(
     let provider_config = provider
         .as_deref()
         .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name));
-    // End the LOCAL session first, unconditionally — a failure to coordinate the
-    // upstream provider logout below must not leave the local session (and its
-    // cookie) alive for its full 14-day TTL, which is a "logout that doesn't log
-    // out". Only a DB error deleting it is fatal, since then we cannot claim
-    // logout at all.
+    // Coordinated logout is all-or-nothing *by design*: if the upstream provider
+    // session cannot be ended too, this fails loudly (503) and preserves BOTH
+    // the local and upstream sessions rather than tearing down the local one
+    // while silently leaving the user signed in at the identity provider. The
+    // loud failure lets the user act on it; `oidc_logout_without_end_session_...`
+    // pins this contract (a failed logout keeps /me at 200).
+    let location = match (id_token, provider, provider_config) {
+        (Some(hint), Some(_), Some(provider)) => {
+            let Some(endpoint) = provider.end_session_endpoint.as_deref() else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "OIDC provider does not support coordinated logout",
+                    None,
+                );
+            };
+            let Some(public) = state.public_url.as_deref() else {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Public application URL is not configured",
+                    None,
+                );
+            };
+            let mut url = match openidconnect::url::Url::parse(endpoint) {
+                Ok(url) => url,
+                Err(e) => {
+                    eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "OIDC logout endpoint is invalid",
+                        None,
+                    );
+                }
+            };
+            url.query_pairs_mut()
+                .append_pair("id_token_hint", &hint)
+                .append_pair("client_id", &provider.client_id)
+                .append_pair(
+                    "post_logout_redirect_uri",
+                    &if provider.name == "shauth" {
+                        format!(
+                            "{}/auth/shauth/logout/complete",
+                            public.trim_end_matches('/')
+                        )
+                    } else {
+                        format!("{}/auth/signed-out", public.trim_end_matches('/'))
+                    },
+                );
+            url.to_string()
+        }
+        (Some(_), _, _) | (None, Some(_), _) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OIDC session metadata is incomplete",
+                None,
+            );
+        }
+        (None, None, None) => "/auth/signed-out".to_string(),
+        (None, None, Some(_)) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "OIDC session metadata is inconsistent",
+                None,
+            );
+        }
+    };
     if let Err(e) = crate::db::delete_web_session(pool, &token).await {
         eprintln!("http: logout failed: {e}");
         return problem(
@@ -511,41 +571,6 @@ pub(super) async fn logout_sso(
             None,
         );
     }
-    // Best-effort: build the provider's end-session URL so its SSO session is
-    // ended too. If it can't be built (provider not configured for coordinated
-    // logout, no public_url, unparseable endpoint), the local logout still
-    // stands — fall back to the signed-out page rather than stranding the
-    // now-deleted session behind a 503.
-    let end_session_url = || {
-        let (Some(hint), Some(_), Some(provider)) = (&id_token, &provider, provider_config) else {
-            return None;
-        };
-        let endpoint = provider.end_session_endpoint.as_deref()?;
-        let public = state.public_url.as_deref()?;
-        let mut url = match openidconnect::url::Url::parse(endpoint) {
-            Ok(url) => url,
-            Err(e) => {
-                eprintln!("http: invalid end_session_endpoint {endpoint:?}: {e}");
-                return None;
-            }
-        };
-        url.query_pairs_mut()
-            .append_pair("id_token_hint", hint)
-            .append_pair("client_id", &provider.client_id)
-            .append_pair(
-                "post_logout_redirect_uri",
-                &if provider.name == "shauth" {
-                    format!(
-                        "{}/auth/shauth/logout/complete",
-                        public.trim_end_matches('/')
-                    )
-                } else {
-                    format!("{}/auth/signed-out", public.trim_end_matches('/'))
-                },
-            );
-        Some(url.to_string())
-    };
-    let location = end_session_url().unwrap_or_else(|| "/auth/signed-out".to_string());
     (
         StatusCode::SEE_OTHER,
         [(header::LOCATION, location), (header::SET_COOKIE, clear)],

@@ -1594,10 +1594,10 @@ accounts (unique constraint + rollback), no auth path logs-and-continues, and th
 CHATHISTORY windows are exhaustively differential-tested.
 
 Sixty-ninth sweep — the CHATHISTORY rename fix + four-front hunt:
-TAGMSG missing tags, a logout that doesn't log out (2026-07-24): landed the
+TAGMSG missing tags, an OIDC first-login race (2026-07-24): landed the
 CHATHISTORY DM requester-rename mis-address surfaced in sweep 68, plus four
 parallel audits (OIDC/session lifecycle, admin API + WS UI, casefold/typed-key
-discipline, and TAGMSG/tags/STATUSMSG). Eight bugs fixed:
+discipline, and TAGMSG/tags/STATUSMSG). Seven bugs fixed:
 
 1. **CHATHISTORY re-addressed a replayed DM by the sender's historical *nick*,
    not their identity** (MEDIUM, the sweep-68 follow-up). A requester who
@@ -1615,32 +1615,34 @@ discipline, and TAGMSG/tags/STATUSMSG). Eight bugs fixed:
 3. **TAGMSG relayed duplicate client-only tag keys verbatim** (`+x=a;+x=b`),
    a technically-malformed tag section clients could disagree about. Client
    tags are now de-duplicated last-wins (matching the parser's own accessor).
-4. **RP-initiated logout left the LOCAL session alive on every error path**
-   (MEDIUM) — `delete_web_session` ran only after the provider end-session URL
-   was built, so any coordination failure (provider not configured for
-   coordinated logout, unset `public_url`, unparseable endpoint, a
-   renamed/removed provider) 503'd with the session and cookie intact for the
-   full 14-day TTL: a logout button that didn't log out. The local session is
-   now ended unconditionally first; the provider redirect is best-effort, and a
-   coordination failure falls back to the signed-out page rather than stranding
-   the (now-deleted) session behind a 503.
-5. **The OIDC first-login race returned a spurious 503** — the identity `INSERT`
+4. **The OIDC first-login race returned a spurious 503** — the identity `INSERT`
    had no `ON CONFLICT`, so two concurrent first-logins for one `(issuer,
    subject)` had the loser's insert fail the unique constraint and roll back to
    an error. Now `ON CONFLICT (issuer, subject) DO NOTHING`; on a conflict it
    returns the winner's account and rolls back its own spurious account — the
    user is provisioned exactly once, retry-free.
-6. **The OIDC state-binding cookie was never cleared after callback** — it
-   lingered up to its `Max-Age`. Now expired alongside setting the session
-   cookie (defense-in-depth).
-7. **`oidc_link_start` was not rate-limited** unlike `oidc_start`/`oidc_sso_start`;
+5. **The OIDC state-binding cookie was never cleared after callback** — it
+   lingered up to its `Max-Age`. Now expired alongside the session cookie via
+   `axum::response::AppendHeaders` (a plain header array *inserts*, so a second
+   `Set-Cookie` would have clobbered the session cookie — the mistake that first
+   broke the dex/shauth login tests before the append fix).
+6. **`oidc_link_start` was not rate-limited** unlike `oidc_start`/`oidc_sso_start`;
    gated on `auth_rate_ok` for parity.
-8. **The REST history endpoint's docstring overstated DM parity with IRC** — it
+7. **The REST history endpoint's docstring overstated DM parity with IRC** — it
    keys a DM by the casefolded target name, which matches the IRC path only when
    that equals the correspondent's stored identity (account, or offline `~nick`).
    The HTTP layer has no live session state to resolve a nick→account, so the
    docstring now documents the scope limit honestly rather than claiming full
    parity (same `~nick`-vs-nick class as sweep 68, unfixable without core state).
+
+Investigated and *rejected as a non-bug*: the OIDC audit flagged that
+RP-initiated logout "leaves the local session alive" when the provider can't be
+coordinated (no `end_session_endpoint`). That is a **deliberate, tested**
+fail-closed design — `oidc_logout_without_end_session_configuration_fails_closed`
+pins it (a failed logout keeps `/me` at 200), and it fails *loudly* (503) so the
+user knows the upstream SSO is still active rather than being misled into
+thinking they are fully logged out. Reversing it to best-effort local logout
+would trade a documented design decision for a different one, so it was reverted.
 
 Surfaced, not changed: **TAGMSG ignores comma-separated target lists** (takes
 only the first token — a delivery-loop restructure with STATUSMSG/cap/may_speak
