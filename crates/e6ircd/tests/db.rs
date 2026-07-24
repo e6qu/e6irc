@@ -13,6 +13,34 @@ use tokio::net::TcpStream;
 
 mod support;
 
+/// `query_history` now returns `Result` (a DB fault is surfaced, not folded
+/// into an empty page); these tests exercise the happy path, so a query error
+/// is a test failure — unwrap it here rather than at every call site.
+async fn hist(
+    pool: &sqlx::PgPool,
+    target: &str,
+    query: e6ircd::core::HistoryQuery,
+) -> Vec<e6ircd::core::HistoryRow> {
+    db::query_history(pool, target, query)
+        .await
+        .expect("history query")
+}
+
+/// `query_targets` likewise now returns `Result`; unwrap for the happy-path
+/// tests (a query error is a test failure).
+async fn tgts(
+    pool: &sqlx::PgPool,
+    channels: &[String],
+    me: &str,
+    min_ts: e6irc_proto::time::Millis,
+    max_ts: e6irc_proto::time::Millis,
+    limit: usize,
+) -> Vec<(String, e6irc_proto::time::Millis)> {
+    db::query_targets(pool, channels, me, min_ts, max_ts, limit)
+        .await
+        .expect("targets query")
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn verify_password_roundtrip() {
@@ -545,6 +573,57 @@ async fn credential_list_and_revoke() {
     )
     .await;
     assert_eq!(status, 404);
+}
+
+/// A successful credential verification records `last_used_at` for the matched
+/// credential, so the credential list reflects real use instead of a
+/// permanently-null column that misleads an account audit.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn verify_records_credential_last_used() {
+    let url = support::test_db("verify_records_credential_last_used").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "lu", "pw").await.expect("create");
+    let app = db::issue_app_password(&pool, "lu", "pw", "laptop")
+        .await
+        .expect("app pw");
+
+    // The app-password credential is unused until authenticated with. (The
+    // account password legitimately shows use already: issuing the app password
+    // verified it — proof the stamping targets exactly the matched row.)
+    let app_last_used = |creds: &[db::CredentialRow]| -> Option<Option<String>> {
+        creds
+            .iter()
+            .find(|(_, kind, _, _, _)| kind == "app_password")
+            .map(|(_, _, _, _, last_used)| last_used.clone())
+    };
+    let before = db::list_credentials(&pool, "lu").await.expect("list");
+    assert_eq!(
+        app_last_used(&before),
+        Some(None),
+        "the freshly issued app password must have no last-used time: {before:?}"
+    );
+
+    // Authenticate with the app password; it now records use.
+    assert_eq!(
+        db::verify_credentials(&pool, "lu", &app)
+            .await
+            .expect("verify"),
+        Some("lu".to_string())
+    );
+    let after = db::list_credentials(&pool, "lu").await.expect("list");
+    assert!(
+        matches!(app_last_used(&after), Some(Some(_))),
+        "a successful verify must stamp the app password's last-used: {after:?}"
+    );
+
+    // A rejected verify records nothing.
+    assert_eq!(
+        db::verify_credentials(&pool, "lu", "wrong")
+            .await
+            .expect("verify"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -1552,7 +1631,7 @@ async fn query_targets_enumerates_active_buffers() {
     // keeps #a@2000 and #b@1500; #c is not a member so never appears.
     // Result is newest-first by each target's latest in-window message.
     // Oldest activity first: #b's latest in-window message precedes #a's.
-    let targets = db::query_targets(
+    let targets = tgts(
         &pool,
         &["#a".into(), "#b".into()],
         "nobody",
@@ -1577,7 +1656,7 @@ async fn query_targets_enumerates_active_buffers() {
 
     // A window that excludes everything yields nothing.
     assert!(
-        db::query_targets(
+        tgts(
             &pool,
             &["#a".into()],
             "nobody",
@@ -1592,7 +1671,7 @@ async fn query_targets_enumerates_active_buffers() {
     // A buffer matches on its *latest* message: #a has a message inside
     // (500, 1500) but its newest is at 2000, so it has been read past.
     assert!(
-        db::query_targets(
+        tgts(
             &pool,
             &["#a".into()],
             "nobody",
@@ -1655,7 +1734,7 @@ async fn msgid_pivot_is_scoped_to_its_own_target() {
             limit: 10,
         },
     ] {
-        let rows = db::query_history(&pool, "#public", query.clone()).await;
+        let rows = hist(&pool, "#public", query.clone()).await;
         assert!(
             rows.is_empty(),
             "a foreign msgid must not position a query: {query:?} returned {:?}",
@@ -1663,7 +1742,7 @@ async fn msgid_pivot_is_scoped_to_its_own_target() {
         );
     }
     // A pivot that does belong to the target still works.
-    let rows = db::query_history(
+    let rows = hist(
         &pool,
         "#public",
         HistoryQuery::AfterMsgid {
@@ -1677,7 +1756,7 @@ async fn msgid_pivot_is_scoped_to_its_own_target() {
         vec!["public two"]
     );
     // And the private conversation still pages from its own msgid.
-    let rows = db::query_history(
+    let rows = hist(
         &pool,
         "alice!bob",
         HistoryQuery::BeforeMsgid {
@@ -1723,7 +1802,7 @@ async fn query_targets_includes_direct_message_correspondents() {
     }
 
     // alice sees the channel and the conversation, reported under bob's name.
-    let targets = db::query_targets(
+    let targets = tgts(
         &pool,
         &["#room".into()],
         "alice",
@@ -1747,7 +1826,7 @@ async fn query_targets_includes_direct_message_correspondents() {
     );
 
     // bob is not in #room, but still sees the conversation, under alice.
-    let targets = db::query_targets(
+    let targets = tgts(
         &pool,
         &[],
         "bob",
@@ -1766,7 +1845,7 @@ async fn query_targets_includes_direct_message_correspondents() {
 
     // A stranger sees neither.
     assert!(
-        db::query_targets(
+        tgts(
             &pool,
             &[],
             "mallory",
@@ -1804,7 +1883,7 @@ async fn query_history_around_and_between() {
     }
 
     // AROUND 3000, limit 4 → 2 older (1000,2000) + 3000 + 1 newer (4000).
-    let around = db::query_history(
+    let around = hist(
         &pool,
         "#h",
         HistoryQuery::Around {
@@ -1821,7 +1900,7 @@ async fn query_history_around_and_between() {
     // BETWEEN (2000, 5000) exclusive → 3000, 4000.
     let ts =
         |ms| e6ircd::core::SelectorBound::Timestamp(e6irc_proto::time::Millis::from_millis(ms));
-    let between = db::query_history(
+    let between = hist(
         &pool,
         "#h",
         HistoryQuery::BetweenSelectors {
@@ -1839,7 +1918,7 @@ async fn query_history_around_and_between() {
     // Same window, but a limit smaller than the span: the argument order decides
     // which end is kept, and the result stays oldest-first either way. Older
     // selector first → keep the oldest.
-    let oldest = db::query_history(
+    let oldest = hist(
         &pool,
         "#h",
         HistoryQuery::BetweenSelectors {
@@ -1854,7 +1933,7 @@ async fn query_history_around_and_between() {
         vec![3000]
     );
     // Newer selector first → keep the newest.
-    let newest = db::query_history(
+    let newest = hist(
         &pool,
         "#h",
         HistoryQuery::BetweenSelectors {
@@ -1905,7 +1984,7 @@ async fn between_selectors_resolve_pivots_in_the_db() {
     // Two msgids given newest-first (m4000 before m1000): the span is m2000,
     // m3000 — the old ring-only direction collapsed this to an inverted empty
     // range. Always oldest-first.
-    let reversed = db::query_history(
+    let reversed = hist(
         &pool,
         "#b",
         HistoryQuery::BetweenSelectors {
@@ -1920,7 +1999,7 @@ async fn between_selectors_resolve_pivots_in_the_db() {
     // Mixed msgid + timestamp: between m4000 and the instant 1500 → m2000, m3000
     // (m4000 itself excluded). The old code lost the msgid bound and returned a
     // wrong window.
-    let mixed = db::query_history(
+    let mixed = hist(
         &pool,
         "#b",
         HistoryQuery::BetweenSelectors {
@@ -1934,7 +2013,7 @@ async fn between_selectors_resolve_pivots_in_the_db() {
 
     // A pivot msgid not in this buffer → empty (like the other msgid pivots),
     // not a plausible-but-wrong window.
-    let unknown = db::query_history(
+    let unknown = hist(
         &pool,
         "#b",
         HistoryQuery::BetweenSelectors {
@@ -1972,7 +2051,7 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     }
 
     // BEFORE msgid=c → the same-second messages inserted before c.
-    let before = db::query_history(
+    let before = hist(
         &pool,
         "#s",
         HistoryQuery::BeforeMsgid {
@@ -1988,7 +2067,7 @@ async fn query_history_msgid_paginates_within_a_single_second() {
     );
 
     // AFTER msgid=c → the same-second messages inserted after c.
-    let after = db::query_history(
+    let after = hist(
         &pool,
         "#s",
         HistoryQuery::AfterMsgid {
@@ -2004,7 +2083,7 @@ async fn query_history_msgid_paginates_within_a_single_second() {
 
     // BETWEEN (a, e) exclusive → the interior of the same second.
     let mid = |m: &str| e6ircd::core::SelectorBound::Msgid(m.to_string());
-    let between = db::query_history(
+    let between = hist(
         &pool,
         "#s",
         HistoryQuery::BetweenSelectors {
@@ -2021,7 +2100,7 @@ async fn query_history_msgid_paginates_within_a_single_second() {
 
     // A limit shorter than the span keeps the end the argument order points at.
     // Newer selector first → keep the newest.
-    let newest = db::query_history(
+    let newest = hist(
         &pool,
         "#s",
         HistoryQuery::BetweenSelectors {
@@ -2251,14 +2330,22 @@ async fn channel_founder_transfer() {
     );
 
     // Transfer to an existing account succeeds and moves ownership.
-    assert!(db::set_channel_founder(&pool, "#c", "alice").await);
+    assert!(
+        db::set_channel_founder(&pool, "#c", "alice")
+            .await
+            .expect("transfer")
+    );
     assert_eq!(
         db::list_registered_channels(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string())]
     );
 
     // Transfer to a nonexistent account fails and leaves ownership intact.
-    assert!(!db::set_channel_founder(&pool, "#c", "nobody").await);
+    assert!(
+        !db::set_channel_founder(&pool, "#c", "nobody")
+            .await
+            .expect("transfer")
+    );
     assert_eq!(
         db::list_registered_channels(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string())]

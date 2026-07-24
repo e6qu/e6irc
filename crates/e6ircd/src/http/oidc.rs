@@ -274,12 +274,24 @@ pub(super) async fn oidc_callback(
 ) -> Response {
     use openidconnect::{AuthorizationCode, PkceCodeVerifier, TokenResponse};
     if let Some(err) = query.error {
+        // Consuming the pending entry requires the browser to present the
+        // binding cookie, constant-time-equal to the returned `state` — the
+        // same guard the success path applies below, and for the same reason:
+        // an attacker who learns a victim's in-flight `state` but lacks the
+        // cookie must not be able to race the callback with `?error=…&state=…`
+        // and burn the victim's still-pending login (a login-DoS). An unbound
+        // error callback still gets the honest refusal response; it just does
+        // not get to delete anyone's pending entry.
+        let bound_state = query.state.as_ref().filter(|s| {
+            cookie_value(&headers, oidc_state_cookie_name(state.secure_cookies)).is_some_and(|c| {
+                aws_lc_rs::constant_time::verify_slices_are_equal(c.as_bytes(), s.as_bytes())
+                    .is_ok()
+            })
+        });
         // A silent SSO probe (`prompt=none`) with no upstream session comes
         // back as `login_required`; that is expected — clear the pending
         // entry and bounce to interactive login rather than erroring.
-        let was_silent = query
-            .state
-            .as_ref()
+        let was_silent = bound_state
             .and_then(|s| state.pending_auth.lock().expect("poisoned").remove(s))
             .is_some_and(|p| p.silent);
         if was_silent {

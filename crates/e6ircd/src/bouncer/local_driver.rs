@@ -140,6 +140,25 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                     let line = String::from_utf8_lossy(&env.payload.0)
                         .trim_end_matches(['\r', '\n'])
                         .to_string();
+                    // The in-process session is a real registered session, so the
+                    // liveness reaper PINGs it after ~2 min idle. There is no
+                    // network peer to answer, so answer here — otherwise the
+                    // reaper times out and drops the session every few minutes,
+                    // churning this always-on network (spurious dis/reconnect
+                    // notices, NICK/JOIN replay). The PING is internal keepalive,
+                    // not conversation, so it is not shown in the buffer.
+                    if let Some(token) = line.strip_prefix("PING ") {
+                        let token = token.strip_prefix(':').unwrap_or(token);
+                        let _ = session
+                            .core
+                            .core_tx
+                            .push(Input::Line {
+                                conn,
+                                line: format!("PONG :{token}").into_bytes(),
+                            })
+                            .await;
+                        continue;
+                    }
                     ends.emit_line(line);
                 }
                 // Core closed our session: reconnect with a fresh ConnId (and

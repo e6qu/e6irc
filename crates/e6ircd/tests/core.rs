@@ -1758,10 +1758,11 @@ fn nickserv_identify_flow() {
 #[test]
 fn deferred_register_reply_is_released_on_transient_db_failure() {
     // REGISTER holds the connection's output behind a deferred reply while the
-    // DB write is in flight. A transient failure (DbReply::Unavailable carries
-    // no origin) must still be routed back to REGISTER: the client gets its FAIL
-    // and the hold is released — otherwise every later line is held and the
-    // reaper eventually ping-timeouts a live client. Regression for that leak.
+    // DB write is in flight. A transient failure (AccountRegisterUnavailable,
+    // carrying the RegisterCommand origin) must still be routed back to
+    // REGISTER: the client gets its FAIL and the hold is released — otherwise
+    // every later line is held and the reaper eventually ping-timeouts a live
+    // client. Regression for that leak.
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
@@ -1779,7 +1780,9 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
     );
     s.core.handle(Input::DbReply {
         conn: alice,
-        reply: e6ircd::core::DbReply::Unavailable,
+        reply: e6ircd::core::DbReply::AccountRegisterUnavailable {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
     });
     let out = s.drain(alice);
     assert!(
@@ -1875,6 +1878,7 @@ fn chanserv_register_flow() {
         conn: alice,
         reply: e6ircd::core::DbReply::ChannelRegistered {
             channel: "#mine".into(),
+            founder_account: "alice".into(),
         },
     });
     let out = s.drain(alice);
@@ -3149,6 +3153,43 @@ fn no_ctcp_mode_blocks_ctcp_except_action() {
     assert_eq!(s.drain(alice).len(), 1);
 }
 
+/// +C must block a CTCP buried on the *second* line of a multiline batch. The
+/// batch is flattened to one PRIVMSG per line for non-multiline recipients, so
+/// a CTCP on line 2+ would otherwise re-emerge as its own message and slip past
+/// the +C check, which used to inspect only the first byte of the joined blob.
+#[test]
+fn no_ctcp_mode_blocks_ctcp_buried_in_a_multiline_batch() {
+    let mut s = TestServer::new_no_persistence();
+    // alice joins first, so she is the op that can set +C.
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/multiline");
+    s.line(alice, "JOIN #cc");
+    s.drain(alice);
+    s.line(bob, "JOIN #cc");
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "MODE #cc +C");
+    s.drain(bob);
+    s.drain(alice);
+    // A batch whose first line is innocent but whose second is a CTCP VERSION.
+    s.line(bob, "BATCH +7 draft/multiline #cc");
+    s.line(bob, "@batch=7 PRIVMSG #cc :hi there");
+    s.line(bob, "@batch=7 PRIVMSG #cc :\u{1}VERSION\u{1}");
+    s.line(bob, "BATCH -7");
+    // The whole batch is refused (404), and alice (no multiline cap) receives
+    // nothing — not a flattened CTCP.
+    let out = s.drain(bob);
+    assert!(
+        out.iter().any(|l| l.contains(" 404 ")),
+        "buried CTCP not blocked by +C: {out:#?}"
+    );
+    assert!(
+        s.drain(alice).is_empty(),
+        "a CTCP on line 2 leaked past +C to a non-multiline recipient"
+    );
+}
+
 #[test]
 fn kill_requires_oper() {
     let mut s = TestServer::new();
@@ -3416,6 +3457,7 @@ fn registration_records_founder_for_later_rejoin() {
         conn: boss,
         reply: e6ircd::core::DbReply::ChannelRegistered {
             channel: "#room".to_string(),
+            founder_account: "boss".to_string(),
         },
     });
     s.drain(boss);
@@ -3442,6 +3484,150 @@ fn registration_records_founder_for_later_rejoin() {
         .find(|l| l.contains(" 353 "))
         .expect("353");
     assert!(names.contains("@boss"), "founder not re-opped: {names}");
+}
+
+/// The founder recorded in the hot map is the account the DB row was written
+/// with (echoed on the reply), not the session's account at reply time. When
+/// the session's account differs from (or is absent at) reply time — e.g. an
+/// IDENTIFY/LOGOUT raced the round-trip — the old handler read `session.account`
+/// and recorded the wrong founder, or none, diverging the hot map from the DB
+/// until restart. The echoed `founder_account` is authoritative.
+#[test]
+fn channel_registration_uses_the_echoed_founder_not_the_live_session() {
+    let mut s = TestServer::new();
+    // Boss holds the channel but this session is NOT identified — mirroring a
+    // session whose account changed between the request and this reply. The old
+    // code would record no founder (session.account is None); the new code
+    // records the echoed founder regardless.
+    let boss = s.register(1, "boss");
+    s.line(boss, "JOIN #room");
+    s.drain(boss);
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelRegistered {
+            channel: "#room".to_string(),
+            founder_account: "boss".to_string(),
+        },
+    });
+    s.drain(boss);
+    // Empty and recreate; the founder must still be re-opped on rejoin — proof
+    // the hot founder map was seeded from the echoed account, not the (absent)
+    // session account.
+    s.line(boss, "PART #room");
+    s.drain(boss);
+    let dave = s.register(2, "dave");
+    s.line(dave, "JOIN #room");
+    s.drain(dave);
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #room");
+    let names = s
+        .drain(boss)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(
+        names.contains("@boss"),
+        "founder from the echoed account not recorded: {names}"
+    );
+}
+
+/// A NickServ REGISTER whose DB write fails must tell the user, not hang. The
+/// failure reply carries the NickServ origin so the handler answers rather than
+/// dropping a bare, unattributable Unavailable.
+#[test]
+fn nickserv_register_db_unavailable_notifies() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    s.line(alice, "PRIVMSG NickServ :REGISTER hunter2");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountRegisterUnavailable {
+            origin: e6ircd::core::AccountOrigin::NickServ,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("NickServ") && l.contains("temporarily unavailable")),
+        "NickServ REGISTER DB failure was silently dropped: {out:#?}"
+    );
+}
+
+/// A ChanServ REGISTER whose DB write fails must tell the user, not hang.
+#[test]
+fn chanserv_register_db_unavailable_notifies() {
+    let mut s = TestServer::new();
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #room");
+    s.drain(boss);
+    s.line(boss, "PRIVMSG ChanServ :REGISTER #room");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelRegisterUnavailable,
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("ChanServ") && l.contains("temporarily unavailable")),
+        "ChanServ REGISTER DB failure was silently dropped: {out:#?}"
+    );
+}
+
+/// A founder transfer whose DB write *errors* must not be reported as the
+/// definitive "no such account" — that would tell the founder a falsehood they
+/// might act on. It reads as a temporary-unavailability instead.
+#[test]
+fn founder_transfer_db_error_reports_unavailable_not_missing() {
+    let mut s = TestServer::new();
+    let boss = s.register(1, "boss");
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::FounderChangeUnavailable {
+            channel: "#room".to_string(),
+        },
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|l| l.contains("temporarily unavailable")),
+        "a store fault was reported as a definitive negative: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("no such account")),
+        "a DB error must not claim the account is missing: {out:#?}"
+    );
+}
+
+/// A CHATHISTORY page that fails in the store answers with a FAIL, not an empty
+/// batch — an empty batch is indistinguishable from a buffer with no history,
+/// and a bouncer-style client would cache "nothing here" for a window that does
+/// exist.
+#[test]
+fn chathistory_db_error_fails_rather_than_empty_batch() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(alice, "JOIN #h");
+    s.drain(alice);
+    s.core.handle(Input::HistoryPage {
+        conn: alice,
+        display: "#h".into(),
+        batch_ref: "b1".into(),
+        rows: Err(()),
+        label: None,
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL CHATHISTORY MESSAGE_ERROR")),
+        "a store fault must FAIL, not send an empty batch: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("BATCH +")),
+        "no batch should open on a store fault: {out:#?}"
+    );
 }
 
 // CHATHISTORY TARGETS: enumerate the buffers a client has (DESIGN §11.2).
@@ -3487,10 +3673,10 @@ fn chathistory_targets_enumerates_buffers() {
         conn: alice,
         batch_ref: batch_ref.clone(),
         // Epoch milliseconds, as CHATHISTORY TARGETS carries them.
-        targets: vec![
+        targets: Ok(vec![
             ("#a".into(), Millis::from_millis(1_000_000_000)),
             ("#b".into(), Millis::from_millis(999_999_000)),
-        ],
+        ]),
         label: None,
     });
     let out = s.drain(alice);
@@ -4463,7 +4649,7 @@ fn output_held_behind_a_deferred_reply_is_bounded_like_the_sendq() {
         conn: alice,
         display: "#room".into(),
         batch_ref: "b1".into(),
-        rows: Vec::new(),
+        rows: Ok(Vec::new()),
         label: None,
     });
     let released = s.drain(alice).len();

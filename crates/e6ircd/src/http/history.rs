@@ -73,7 +73,20 @@ pub(super) async fn history(
         },
         (None, None) => crate::core::HistoryQuery::Latest { limit },
     };
-    let rows = crate::db::query_history(pool, &target_folded, query).await;
+    let rows = match crate::db::query_history(pool, &target_folded, query).await {
+        Ok(rows) => rows,
+        // A store fault is a 503, never a 200 with an empty list — the rest of
+        // this API fails loud on DB errors, and "no history" must not be
+        // synthesized from a transient failure.
+        Err(e) => {
+            eprintln!("http: history query failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    };
     let messages: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|r| {

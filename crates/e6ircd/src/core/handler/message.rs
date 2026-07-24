@@ -248,8 +248,14 @@ pub(super) fn resolve_message_target(
         }
         return None;
     }
-    // +C blocks CTCP (\x01-wrapped) except ACTION.
-    if chan.modes.no_ctcp && is_blocked_ctcp(text) {
+    // +C blocks CTCP (\x01-wrapped) except ACTION. `text` is a single message
+    // body on the normal path and the `\n`-joined batch on the multiline path,
+    // so the marker is checked on *every* line, not just the front of the blob:
+    // a multiline batch is flattened back into one PRIVMSG per line for
+    // non-multiline recipients, so a CTCP buried on line 2+ would otherwise
+    // re-emerge as its own message and slip past +C. A single-line body has no
+    // `\n`, so this is exactly `is_blocked_ctcp(text)` there.
+    if chan.modes.no_ctcp && text.split('\n').any(is_blocked_ctcp) {
         if loud {
             state.numeric(
                 conn,
