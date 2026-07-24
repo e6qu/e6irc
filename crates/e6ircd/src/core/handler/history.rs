@@ -450,7 +450,9 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
 }
 
 /// Emit a `draft/chathistory-targets` batch: one `CHATHISTORY TARGETS
-/// <target> <time>` line per buffer, newest-first.
+/// <target> <time>` line per buffer, ordered by last activity oldest-first (so
+/// a `limit` keeps the oldest buffers — the ones a reconnecting client is most
+/// at risk of having missed).
 pub(crate) fn targets_page(
     state: &mut ServerState,
     conn: ConnId,

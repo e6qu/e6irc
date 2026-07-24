@@ -358,7 +358,31 @@ pub(super) async fn create_api_token(
             );
         }
     };
+    if let Some(resp) = validate_label(&req.label) {
+        return resp;
+    }
     let pool = pool_of(&state);
+    // Cap per-account PATs so an authenticated account can't flood the table,
+    // mirroring the network cap. (The device-grant login path mints tokens
+    // through a different route and is not gated here.)
+    match crate::db::list_api_tokens(pool, &account).await {
+        Ok(existing) if existing.len() >= MAX_CREDENTIALS_PER_ACCOUNT => {
+            return problem(
+                StatusCode::CONFLICT,
+                "Too many tokens",
+                Some("Revoke an existing personal access token first."),
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("http: token count check failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    }
     match crate::db::issue_api_token(pool, &account, &req.label).await {
         Ok(token) => (
             StatusCode::CREATED,

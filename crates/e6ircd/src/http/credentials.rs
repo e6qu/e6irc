@@ -47,6 +47,9 @@ pub(super) async fn create_app_password(
             );
         }
     };
+    if let Some(resp) = validate_label(&req.label) {
+        return resp;
+    }
     match crate::db::issue_app_password(pool, &req.account, &req.password, &req.label).await {
         Ok(secret) => (
             StatusCode::CREATED,
@@ -63,6 +66,11 @@ pub(super) async fn create_app_password(
             StatusCode::UNAUTHORIZED,
             "Invalid account or password",
             None,
+        ),
+        Err(crate::db::DbError::TooManyCredentials) => problem(
+            StatusCode::CONFLICT,
+            "Too many app passwords",
+            Some("Revoke an existing app password first."),
         ),
         Err(e) => {
             eprintln!("http: app password issuance failed: {e}");

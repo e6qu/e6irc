@@ -114,6 +114,38 @@ impl AppState {
 }
 
 /// RFC 9457 problem+json error body.
+/// Longest label accepted for an app password or personal access token. These
+/// are stored in an unbounded `TEXT` column and shown back in the account UI, so
+/// bound them like every other client-supplied field (the network fields cap at
+/// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
+pub(super) const MAX_LABEL_LEN: usize = 64;
+
+/// Most app passwords **or** personal access tokens one account may hold. A cap
+/// like the network cap, so an authenticated account can't flood the credential
+/// tables. Does not gate the device-grant login path (a separate token mint).
+pub(super) const MAX_CREDENTIALS_PER_ACCOUNT: usize = 32;
+
+/// Validate a client-supplied credential label: bounded and free of control
+/// characters (which would corrupt the account UI / logs). Returns a ready 400
+/// response when invalid, or `None` when the label is acceptable.
+pub(super) fn validate_label(label: &str) -> Option<Response> {
+    if label.chars().count() > MAX_LABEL_LEN {
+        return Some(problem(
+            StatusCode::BAD_REQUEST,
+            "Label too long",
+            Some(&format!("Labels are at most {MAX_LABEL_LEN} characters.")),
+        ));
+    }
+    if label.chars().any(|c| c.is_control()) {
+        return Some(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid label",
+            Some("Labels must not contain control characters."),
+        ));
+    }
+    None
+}
+
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
     let mut body = serde_json::json!({
         "status": status.as_u16(),

@@ -626,6 +626,77 @@ async fn verify_records_credential_last_used() {
     );
 }
 
+/// `revoke_credential` deletes only app passwords, never the account's primary
+/// `local_password` — the endpoint is documented to revoke app passwords, and
+/// deleting the primary would silently lock the account out of password login.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn revoke_credential_cannot_delete_the_primary_password() {
+    let url = support::test_db("revoke_credential_cannot_delete_the_primary_password").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "rc", "pw").await.expect("create");
+    db::issue_app_password(&pool, "rc", "pw", "laptop")
+        .await
+        .expect("app pw");
+    let creds = db::list_credentials(&pool, "rc").await.expect("list");
+    let local_id = creds
+        .iter()
+        .find(|(_, kind, ..)| kind == "local_password")
+        .map(|(id, ..)| *id)
+        .expect("local_password present");
+    let app_id = creds
+        .iter()
+        .find(|(_, kind, ..)| kind == "app_password")
+        .map(|(id, ..)| *id)
+        .expect("app_password present");
+
+    // Attempting to revoke the primary password is a no-op.
+    assert!(
+        !db::revoke_credential(&pool, "rc", local_id)
+            .await
+            .expect("revoke"),
+        "the primary local_password must not be revocable here"
+    );
+    // ...and password login still works.
+    assert_eq!(
+        db::verify_credentials(&pool, "rc", "pw")
+            .await
+            .expect("verify"),
+        Some("rc".to_string())
+    );
+    // The app password IS revocable.
+    assert!(
+        db::revoke_credential(&pool, "rc", app_id)
+            .await
+            .expect("revoke"),
+        "an app password must be revocable"
+    );
+}
+
+/// Per-account app passwords are capped, so an authenticated account can't flood
+/// the credential table.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn app_passwords_are_capped_per_account() {
+    let url = support::test_db("app_passwords_are_capped_per_account").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "cap", "pw")
+        .await
+        .expect("create");
+    // Mint the maximum (32); each succeeds.
+    for i in 0..32 {
+        db::issue_app_password(&pool, "cap", "pw", &format!("dev{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("app pw {i} should succeed: {e}"));
+    }
+    // The 33rd is refused with the dedicated error, not silently stored.
+    let over = db::issue_app_password(&pool, "cap", "pw", "one too many").await;
+    assert!(
+        matches!(over, Err(db::DbError::TooManyCredentials)),
+        "the 33rd app password must be refused: {over:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn read_marker_persists() {

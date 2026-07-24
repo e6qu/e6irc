@@ -587,6 +587,83 @@ fn mode_partial_application_is_announced_not_silent() {
     assert!(has_numeric(&s.drain(carol), "404"), "channel must be +m");
 }
 
+/// A param-less mode *after* a param mode that ran out of arguments must still
+/// apply — the arg-exhausted mode used to `break` the whole loop, silently
+/// dropping the later mode (`+ki` with no key lost the `+i`), an order-dependent
+/// divergence from `+ik`.
+#[test]
+fn param_less_mode_after_an_argless_param_mode_still_applies() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #room"); // op as first joiner
+    s.drain(alice);
+    // +k needs a key, +i needs nothing. With no key given, +k errors but +i
+    // must still be set.
+    s.line(alice, "MODE #room +ki");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "461"),
+        "the arg-less +k must still error: {out:#?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.contains("MODE #room") && l.contains("+i")),
+        "the param-less +i after +k must be applied and broadcast: {out:#?}"
+    );
+    // The channel really is +i: a non-invited user is refused.
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #room");
+    assert!(
+        has_numeric(&s.drain(bob), "473"),
+        "channel must be +i (invite-only)"
+    );
+}
+
+/// `+o`/`+v` broadcasts the target's canonical nick, not the raw input casing,
+/// so a state-tracking client sees the same nick everywhere.
+#[test]
+fn op_mode_broadcasts_the_targets_canonical_nick() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "Bob"); // registered with capital B
+    s.line(alice, "JOIN #room");
+    s.drain(alice);
+    s.line(bob, "JOIN #room");
+    s.drain(bob);
+    s.drain(alice);
+    // Op using lowercase "bob"; the broadcast must carry canonical "Bob".
+    s.line(alice, "MODE #room +o bob");
+    let out = s.drain(alice);
+    let mode = out
+        .iter()
+        .find(|l| l.contains("MODE #room +o"))
+        .unwrap_or_else(|| panic!("no +o broadcast: {out:#?}"));
+    assert!(
+        mode.trim_end().ends_with("+o Bob"),
+        "must echo the canonical nick 'Bob', not 'bob': {mode}"
+    );
+}
+
+/// `+l` broadcasts the parsed limit value, not the raw token: `+l 007` is
+/// stored and announced as `+l 7` (what is enforced).
+#[test]
+fn limit_mode_broadcasts_the_parsed_value() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #room");
+    s.drain(alice);
+    s.line(alice, "MODE #room +l 007");
+    let out = s.drain(alice);
+    let mode = out
+        .iter()
+        .find(|l| l.contains("MODE #room +l"))
+        .unwrap_or_else(|| panic!("no +l broadcast: {out:#?}"));
+    assert!(
+        mode.trim_end().ends_with("+l 7"),
+        "must broadcast the parsed value '7', not '007': {mode}"
+    );
+}
+
 #[test]
 fn whois_channels_split_to_respect_512_byte_limit() {
     let mut s = TestServer::new();

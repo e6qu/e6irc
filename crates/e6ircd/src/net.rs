@@ -318,9 +318,11 @@ pub async fn start(config: Config) -> io::Result<Running> {
         let listener = TcpListener::bind(bnc.addr).await?;
         bnc_addr = Some(listener.local_addr()?);
         let server_name = config.server_name.clone();
-        // Same per-IP cap the IRC listeners apply, so an unauthenticated peer
-        // can't open unbounded BNC connections.
-        let bnc_limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
+        // The *same* per-IP cap the IRC listeners and the WS path share (a
+        // clone of the one counter), not a fresh one — otherwise a single IP
+        // could hold `max_connections_per_ip` IRC/WS connections *and* that many
+        // BNC connections at once, doubling the documented limit.
+        let bnc_limiter = limiter.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {

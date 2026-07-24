@@ -29,6 +29,8 @@ pub enum DbError {
     /// A write resolved to no account row for the given name.
     UnknownAccount(String),
     ReplayedLogoutToken,
+    /// The account already holds the maximum number of app passwords.
+    TooManyCredentials,
 }
 
 impl std::fmt::Display for DbError {
@@ -43,6 +45,7 @@ impl std::fmt::Display for DbError {
             Self::BadCredentials => write!(f, "invalid account or password"),
             Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
+            Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
         }
     }
 }
@@ -107,6 +110,10 @@ async fn hash_password(password: String) -> Result<String, DbError> {
     .expect("hashing task panicked")
 }
 
+/// Most app passwords one account may hold, matching the REST layer's
+/// `MAX_CREDENTIALS_PER_ACCOUNT`. Bounds authenticated storage growth.
+const MAX_APP_PASSWORDS_PER_ACCOUNT: i64 = 32;
+
 /// Verify an account password, then mint a fresh app password: 32
 /// random bytes, base64-shown once, argon2id hash stored.
 pub async fn issue_app_password(
@@ -121,6 +128,21 @@ pub async fn issue_app_password(
         _ => return Err(DbError::Query(sqlx::Error::PoolClosed)),
     }
     let folded = CaseMapping::Rfc1459.casefold(account);
+    // Cap per-account app passwords so an authenticated account can't flood the
+    // credential table (mirrors the network cap). `local_password` is excluded —
+    // this bounds only the app passwords a user mints.
+    let app_pw_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM account_credentials c
+         JOIN accounts a ON a.id = c.account_id
+         WHERE a.name_folded = $1 AND c.kind = 'app_password'",
+    )
+    .bind(&folded)
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)?;
+    if app_pw_count >= MAX_APP_PASSWORDS_PER_ACCOUNT {
+        return Err(DbError::TooManyCredentials);
+    }
     let mut secret_bytes = [0u8; 32];
     use argon2::password_hash::rand_core::RngCore;
     OsRng.fill_bytes(&mut secret_bytes);
@@ -2292,14 +2314,21 @@ pub async fn list_credentials(pool: &PgPool, account: &str) -> Result<Vec<Creden
     .map_err(DbError::Query)
 }
 
-/// Revoke one credential owned by `account`. Returns whether a row was
-/// deleted (false = not found / not owned).
+/// Revoke one *app password* owned by `account`. Returns whether a row was
+/// deleted (false = not found / not owned / not an app password).
+///
+/// Scoped to `kind = 'app_password'` so the endpoint cannot delete the
+/// account's primary `local_password` — that would silently remove password
+/// login (a self-lockout), and this endpoint is documented as revoking app
+/// passwords only. `list_credentials` still shows the primary for display, but
+/// it is not revocable here.
 pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let result = sqlx::query(
         "DELETE FROM account_credentials c
          USING accounts a
-         WHERE c.account_id = a.id AND a.name_folded = $1 AND c.id = $2",
+         WHERE c.account_id = a.id AND a.name_folded = $1 AND c.id = $2
+           AND c.kind = 'app_password'",
     )
     .bind(&folded)
     .bind(id)
