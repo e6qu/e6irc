@@ -81,6 +81,21 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Number of days in `month` of `year` (proleptic Gregorian leap rules), so a
+/// parsed date can be rejected if its day exceeds the real month length.
+/// `month` is assumed already range-checked to 1..=12.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
 /// Parse a `server-time` string to epoch **milliseconds**, preserving the
 /// optional `.mmm` fraction (padded/truncated to three digits). `None` on any
 /// format violation.
@@ -88,17 +103,27 @@ pub fn parse_server_time_millis(text: &str) -> Option<Millis> {
     let text = text.strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut date_parts = date.split('-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
+    let year_str = date_parts.next()?;
+    // `i64::parse` accepts a leading `+`/`-`; the `server-time` grammar is a
+    // plain 4-digit year, so reject any sign — `"+5-01-01T…"` must not parse.
+    if !year_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_str.parse().ok()?;
     let month: u32 = date_parts.next()?.parse().ok()?;
     let day: u32 = date_parts.next()?.parse().ok()?;
     // The `server-time` format has a 4-digit year. Bounding it here is not
     // cosmetic: it keeps the returned milliseconds small enough that the
     // `* 1000` below cannot overflow u64 — an unbounded year let a client
     // trigger that overflow (panic in debug, marker corruption in release).
+    // The day is checked against the actual length of the month (leap years
+    // included), so an impossible date (`2026-02-31`) is rejected rather than
+    // silently rolling forward into the next month.
     if date_parts.next().is_some()
         || !(0..=9999).contains(&year)
         || !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || day < 1
+        || day > days_in_month(year, month)
     {
         return None;
     }
@@ -107,7 +132,10 @@ pub fn parse_server_time_millis(text: &str) -> Option<Millis> {
     let hh: u64 = time_parts.next()?.parse().ok()?;
     let mm: u64 = time_parts.next()?.parse().ok()?;
     let ss: u64 = time_parts.next()?.parse().ok()?;
-    if time_parts.next().is_some() || hh > 23 || mm > 59 || ss > 60 {
+    // No leap seconds: server-time values are server-generated and never carry
+    // `:60`, and accepting it would silently roll a client-supplied timestamp
+    // into the next minute.
+    if time_parts.next().is_some() || hh > 23 || mm > 59 || ss > 59 {
         return None;
     }
     // Leading fraction digits become milliseconds (`.1` → 100, `.123` → 123,
@@ -257,5 +285,20 @@ mod tests {
         // A normal timestamp still round-trips, fraction preserved.
         let ms = parse_server_time_millis("2021-01-02T03:04:05.678Z").expect("valid");
         assert_eq!(server_time(ms), "2021-01-02T03:04:05.678Z");
+    }
+
+    #[test]
+    fn rejects_impossible_dates_and_times() {
+        // A day past the month's real length must not silently roll forward.
+        assert_eq!(parse_server_time_millis("2026-02-31T00:00:00Z"), None);
+        assert_eq!(parse_server_time_millis("2026-02-29T00:00:00Z"), None); // not a leap year
+        assert_eq!(parse_server_time_millis("2026-04-31T00:00:00Z"), None); // April has 30
+        assert_eq!(parse_server_time_millis("2026-01-00T00:00:00Z"), None); // day 0
+        // A genuine leap day is accepted.
+        assert!(parse_server_time_millis("2024-02-29T00:00:00Z").is_some());
+        // No leap seconds.
+        assert_eq!(parse_server_time_millis("2026-01-01T00:00:60Z"), None);
+        // A signed year is not the 4-digit grammar.
+        assert_eq!(parse_server_time_millis("+526-01-01T00:00:00Z"), None);
     }
 }

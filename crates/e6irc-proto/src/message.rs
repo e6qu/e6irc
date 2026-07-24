@@ -297,7 +297,16 @@ impl<'a> Message<'a> {
 
         if let Some(source) = &self.source {
             let parts = [Some(source.name), source.user, source.host];
+            // A `!` or `@` inside the name, or `@` inside the user, would place a
+            // structural delimiter where `parse` splits on it — so the line would
+            // re-parse to a *different* source (`name:"a!b"` → `":a!b …"` →
+            // `name:"a", user:"b"`), a silent structural corruption. Reject it at
+            // the source, mirroring the anti-ambiguity checks the params get
+            // below, rather than trusting every constructor. (`!`/`@` in the host
+            // and `!` in the user are terminal and round-trip, so they stay.)
             if source.name.is_empty()
+                || source.name.contains(['!', '@'])
+                || source.user.is_some_and(|u| u.contains('@'))
                 || parts
                     .into_iter()
                     .flatten()
@@ -691,6 +700,51 @@ mod tests {
             ..Message::new("PING", vec![])
         };
         assert_eq!(m.to_line().unwrap_err(), SerializeError::BadSource);
+    }
+
+    #[test]
+    fn source_with_structural_delimiter_is_rejected_not_corrupted() {
+        // A `!`/`@` in the name (or `@` in the user) would serialize to a wire
+        // form that re-parses to a *different* source. Reject it rather than
+        // emit a line that silently means something else.
+        for src in [
+            Source {
+                name: "a!b",
+                user: None,
+                host: None,
+            },
+            Source {
+                name: "a@b",
+                user: None,
+                host: None,
+            },
+            Source {
+                name: "n",
+                user: Some("u@x"),
+                host: None,
+            },
+        ] {
+            let m = Message {
+                source: Some(src),
+                ..Message::new("PING", vec![])
+            };
+            assert_eq!(
+                m.to_line().unwrap_err(),
+                SerializeError::BadSource,
+                "structural delimiter in source must be rejected"
+            );
+        }
+        // A `!`/`@` in the host is terminal and round-trips, so it stays legal.
+        let m = Message {
+            source: Some(Source {
+                name: "n",
+                user: Some("u"),
+                host: Some("h@x"),
+            }),
+            ..Message::new("PING", vec![])
+        };
+        let line = m.to_line().expect("host delimiters round-trip");
+        assert_eq!(Message::parse(&line).unwrap().to_line().unwrap(), line);
     }
 
     #[test]

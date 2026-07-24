@@ -53,6 +53,14 @@ pub fn decode(text: &str) -> Option<Vec<u8>> {
             };
             n = (n << 6) | u32::from(v);
         }
+        // The bits a padded group discards must be zero, or the input is
+        // non-canonical: distinct strings would decode to identical bytes
+        // (`"AB=="` and `"AA=="` both → [0]). On the untrusted SASL path that is
+        // credential malleability, so reject it. (pad==1 discards the low 8
+        // bits; pad==2 the low 16.)
+        if (pad == 1 && n & 0xFF != 0) || (pad == 2 && n & 0xFFFF != 0) {
+            return None;
+        }
         out.push((n >> 16) as u8);
         if pad < 2 {
             out.push((n >> 8) as u8);
@@ -98,6 +106,23 @@ mod tests {
     fn rejects_malformed() {
         for bad in ["A", "AB!D", "AB=D", "=ABC", "AAAA=AAA", "AA==AAAA"] {
             assert_eq!(decode(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_padding() {
+        // The bits discarded under padding must be zero, or two distinct
+        // strings decode to the same bytes — credential malleability on the
+        // SASL path. Each pair below shares a canonical decode with a
+        // canonical sibling, so only the canonical form may decode.
+        assert_eq!(decode("AA=="), Some(vec![0])); // canonical
+        assert_eq!(decode("AB=="), None); // low 16 bits set → rejected
+        assert_eq!(decode("Zm8="), Some(b"fo".to_vec())); // canonical
+        assert_eq!(decode("Zm9="), None); // low 8 bits set → rejected
+        // A genuine round-trip of every byte still decodes.
+        for b in 0u8..=255 {
+            let enc = encode(&[b]);
+            assert_eq!(decode(&enc), Some(vec![b]), "{enc}");
         }
     }
 }

@@ -134,6 +134,16 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
             }
             let payload =
                 std::mem::take(&mut state.sessions.get_mut(&conn).expect("checked").sasl_buf);
+            // A NickServ IDENTIFY verify already outstanding for this connection
+            // must block a concurrent SASL verify. Each verify is offloaded and
+            // its reply routed by ambient flags, so two in flight at once would
+            // let the replies cross-attribute (an IDENTIFY result completing a
+            // SASL AUTHENTICATE, or vice versa). Keeping credential checks
+            // mutually exclusive per connection makes that unrepresentable.
+            if state.sessions[&conn].pending_identify {
+                sasl_fail(state, conn);
+                return;
+            }
             if mechanism == SaslState::PlainPending {
                 // payload: base64(authzid \0 authcid \0 password)
                 let parsed = e6irc_proto::base64::decode(&payload).and_then(|raw| {

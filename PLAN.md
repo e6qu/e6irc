@@ -1593,6 +1593,74 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-sixth sweep — four-front hunt: a bouncer that couldn't be
+severed, proto round-trip corruption, and a concurrent-verify cross-wire
+(2026-07-24): four parallel audits on the `e6irc-proto` wire crate, the
+bouncer/BNC subsystem, the NickServ/ChanServ services surface, and the
+concurrency/queue/worker plumbing. Eight confirmed bugs fixed:
+
+1. **Removing a network did not stop its driver while a client was attached**
+   (bouncer). The driver stopped only when every command sender dropped, but
+   an attached client holds one — so an operator revoking a compromised
+   network left its upstream TCP connection *and its decrypted SASL password*
+   live until the last client detached. The registry now holds an authoritative
+   `watch` shutdown the driver observes via `next_command`/`run_with_backoff`
+   (attach never clones it), so removal severs the network regardless of
+   attached clients; `attach` observes it too and detaches the client. Unit
+   test drives shutdown with a command sender outstanding.
+2. **`to_line()` could serialize a source that re-parsed to a different one**
+   (proto). A `!`/`@` in the source name (or `@` in the user) placed a
+   structural delimiter where `parse` splits, so `name:"a!b"` round-tripped to
+   `name:"a", user:"b"` — silent structural corruption. The serializer now
+   rejects it (`BadSource`), mirroring the anti-ambiguity checks the params
+   already get; `!`/`@` in the host stay legal (they round-trip).
+3. **`base64::decode` accepted non-canonical padding** (proto). The bits a
+   padded group discards weren't checked for zero, so `"AB=="` and `"AA=="`
+   both decoded to `[0]` — credential malleability on the SASL path. Now the
+   discarded bits must be zero.
+4. **`parse_server_time_millis` accepted impossible dates/times** (proto): the
+   day was checked only `1..=31` regardless of month (`2026-02-31` rolled into
+   March), `:60` seconds were accepted, and a signed year (`+526-…`) parsed. Now
+   the day is validated against the real month length (leap years included),
+   `:60` is rejected, and the year must be unsigned digits.
+5. **The irc bouncer driver buffered its own keepalive PONG** (bouncer): the
+   reply to its idle `PING :e6bnc-keepalive` fell through to the backlog, so a
+   quiet network wrote ~720 junk lines/day, evicting real messages and showing
+   keepalive noise on replay. Now dropped, mirroring the local driver.
+6. **SET KEEPTOPIC ON did not re-capture the live topic** (services): turning
+   retention back on left `registered_topics` empty (OFF had cleared it and the
+   TOPIC path persists only on change), so the live topic was silently lost on
+   the next empty→recreate cycle. Now recaptured on ON, mirroring registration.
+7. **A SASL verify and a NickServ IDENTIFY verify could be in flight at once**
+   (concurrency): both are offloaded (the only concurrent DB replies) and routed
+   by ambient session flags, so an IDENTIFY reply landing mid-SASL was taken for
+   the SASL result — logging the client in as the wrong (but self-owned)
+   account. The two flows are now mutually exclusive: IDENTIFY refuses while
+   SASL is verifying and the SASL verify-start refuses while an IDENTIFY is
+   pending, so at most one credential check is outstanding and the reply is
+   unambiguous. (Two overlapping IDENTIFYs stay allowed — each names an account
+   the client proved it owns — bounded by the credential budget.)
+8. **Stale `LineEvent::Line` doc** (proto): claimed "NUL-free" while the framer
+   deliberately passes NUL through for `Message::parse` to reject. Comment fixed.
+
+Surfaced, not changed: a *disabled* account network silently falls through to a
+shared network of the same name on attach (resolving it needs a DB lookup in the
+hot attach path; low-value, agent rated acceptable); the ChanServ SET
+MLOCK/KEEPTOPIC and DROP hot-map updates use the same fire-and-forget-on-enqueue
+pattern as the accepted TOPIC path (a rare DB-write failure diverges hot/DB
+until restart — the high-value authoritative-answer cases were converted to the
+reply-confirmed round-trip in sweeps 63/65; converting these three is a coherent
+follow-up, not a rush alongside eight other fixes); and the deferred-reply hold
+can reorder unrelated earlier output behind a later batch (both messages still
+delivered — a minor ordering nit). Clean bills: proto mask/glob, casemapping,
+tag escape symmetry, isupport, framing length/chunk logic, truncation
+boundaries; the queue's waker protocol and no-lost-wakeup under the flagged
+schedules; ConnId monotonicity; deferred-reply accounting (no double-release);
+the verify semaphore (no permit leak); log-batch flush-before-read ordering; and
+the bouncer's backlog ordering, buffer bounding, casefold keys, injection
+sanitization, and attach authz. Verified beyond the gate: full irctest main list
+(255 passed) and PG-backed services list (49 passed).
+
 Sixty-fifth sweep — four-front hunt: silent DB-error fallbacks, a +C
 multiline bypass, and a hot-map/DB divergence (2026-07-24): four parallel
 audits on the persistence layer, the net/framing/reaper stack, the HTTP/OIDC
