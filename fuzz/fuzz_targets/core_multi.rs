@@ -112,19 +112,19 @@ fuzz_target!(|data: &[u8]| {
                 conn: pick(rest),
                 display: rest.get(1..).unwrap_or("#c").to_string(),
                 batch_ref: "b".into(),
-                rows: vec![HistoryRow {
+                rows: Ok(vec![HistoryRow {
                     msgid: "m".into(),
                     ts: e6irc_proto::time::Millis::from_millis(tick),
                     sender_prefix: "n!u@h".into(),
                     kind: e6ircd::core::MessageKind::Privmsg,
                     body: rest.to_string(),
-                }],
+                }]),
                 label: None,
             }),
             b'G' => core.handle(Input::TargetsPage {
                 conn: pick(rest),
                 batch_ref: "b".into(),
-                targets: vec![(rest.get(1..).unwrap_or("#c").to_string(), e6irc_proto::time::Millis::from_millis(tick))],
+                targets: Ok(vec![(rest.get(1..).unwrap_or("#c").to_string(), e6irc_proto::time::Millis::from_millis(tick))]),
                 label: None,
             }),
             _ => core.handle(Input::Line {
