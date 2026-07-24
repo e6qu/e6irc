@@ -499,9 +499,14 @@ pub(super) async fn oidc_callback(
         }
     };
     let secure = if state.secure_cookies { "; Secure" } else { "" };
+    // `AppendHeaders`, not a plain array: two `Set-Cookie` values with the same
+    // header name must *append*, not overwrite. A plain `[(SET_COOKIE, ..),
+    // (SET_COOKIE, ..)]` inserts, so the second (the state-cookie clear) would
+    // drop the session cookie entirely — logging the user out of the login they
+    // just completed.
     (
         StatusCode::SEE_OTHER,
-        [
+        axum::response::AppendHeaders([
             (header::LOCATION, "/".to_string()),
             (
                 header::SET_COOKIE,
@@ -520,7 +525,7 @@ pub(super) async fn oidc_callback(
                     oidc_state_cookie_name(state.secure_cookies)
                 ),
             ),
-        ],
+        ]),
     )
         .into_response()
 }
