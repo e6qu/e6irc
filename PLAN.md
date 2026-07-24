@@ -1593,6 +1593,53 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Fifty-eighth sweep — four-front hunt: a client SASL hang, an AccountKey
+invariant, and SQL-index/robustness fixes (2026-07-24): four parallel passes
+(client crates, the `AccountKey` typed-key invariant, SQL migrations/schema, and
+a whole-binary panic audit) produced one systematic invariant + four concrete
+fixes. The panic audit found no new reachable panic in the core — the prior
+sweeps plus the fuzz harness have closed that class (a documented negative).
+
+1. **The IRC client hung forever on a SASL-reject numeric** (`e6irc-client`) —
+   `await_authenticate_challenge` treated only EOF or `AUTHENTICATE` as terminal,
+   so a server that answered `AUTHENTICATE PLAIN` with `904`/`905`/`906`/`908`
+   (or a `433`-class registration refusal) and held the socket open span the loop
+   forever with no timeout. Its sibling wait loops already fail loudly on those
+   numerics; this one was missed. Now terminal, and both SASL sub-loops answer
+   PING (a strict server no longer ping-timeouts a login mid-CAP/-auth) and treat
+   an `ERROR` line as terminal. Regression test drives a hostile mock server over
+   an in-memory duplex pipe.
+2. **`AccountKey` makes the account casefold-mismatch bug class unrepresentable**
+   (`state.rs`, `read_marker.rs`, `services.rs`). Accounts were the one identity
+   with no typed key (`ChanKey`/`NickKey` already exist): `read_markers` keyed on
+   the *display*-cased account while `registered_founders`/`channel_access` keyed
+   on the *folded* one. No live bug today (every login canonicalizes the account
+   casing), but the disagreement was latent-fragile. A new `AccountKey(String)`
+   newtype, built only via `ServerState::account_key`, now types all three
+   in-core maps — folding `read_markers` into line with the others. The DB stays
+   invariant-safe at the `name_folded` edge, so no SQL churn.
+3. **`oidc_logout_tokens` had no `expires_at` index** (`migrations/0026`) — it is
+   pruned on every back-channel logout (`DELETE … WHERE expires_at <= now()`),
+   the same prune-on-write pattern migration 0021 indexed for the other tables,
+   but this one was left out, so each logout did a full seq scan on a growing
+   table. New index.
+4. **The `messages` history index didn't cover `(ts, id)`** (`migrations/0027`) —
+   CHATHISTORY orders and pivots on the composite `(ts, id)`, but the index was
+   only `(target, ts)`, forcing a sort on equal-millisecond ties. Replaced with a
+   covering `(target, ts, id)` index (the old one was a prefix, so nothing
+   regresses).
+5. **One duplicate msgid could drop a whole history batch** (`db.rs`) — the
+   batched `INSERT INTO messages` had no conflict handling, so a single
+   `UNIQUE(msgid)` violation aborted the statement and lost up to N unrelated
+   messages. Added `ON CONFLICT (msgid) DO NOTHING` so a stray duplicate only
+   drops itself.
+
+Investigated and *not* changed (surfaced): `bnc_buffer` rows orphan on account
+deletion (no FK) — but there is no runtime account-deletion path, and an FK would
+break shared ownerless (`*`) networks, so it stays latent; the client silently
+drops an over-long server line and does not neutralize BiDi/zero-width display
+spoofing (display-only, ratatui already filters control chars).
+
 Fifty-seventh sweep — four-front bug hunt: silent driver death, a
 read-marker sentinel collision, and SSRF/keepalive hardening (2026-07-24): four
 parallel adversarial passes (read-marker/CHATHISTORY, BNC irc/local drivers,

@@ -184,7 +184,18 @@ impl Connection {
                         "server refused SASL",
                     ));
                 }
-                _ => {}
+                // A server that refuses via an `ERROR` line (rather than CAP NAK)
+                // while holding the socket open would otherwise hang this loop.
+                _ if msg.command == "ERROR" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "server refused the connection during CAP",
+                    ));
+                }
+                // Answer PINGs so a strict server doesn't ping-timeout us mid-CAP.
+                _ => {
+                    self.answer_ping(&msg).await?;
+                }
             }
         }
     }
@@ -194,8 +205,26 @@ impl Connection {
     async fn await_authenticate_challenge(&mut self) -> io::Result<()> {
         loop {
             let msg = self.recv("closed during SASL").await?;
-            if msg.command == "AUTHENTICATE" {
-                return Ok(());
+            // A SASL-refusal or registration-refusal numeric here is terminal —
+            // otherwise a server that rejects the mechanism (904/905/906/908) or
+            // the nick (433, ...) and holds the socket open hangs this loop
+            // forever. The sibling wait loops already do this; this one was
+            // missed.
+            if let Some(err) = registration_refused(&msg.command) {
+                return Err(err);
+            }
+            match msg.command.as_str() {
+                "AUTHENTICATE" => return Ok(()),
+                "902" | "904" | "905" | "906" | "908" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "SASL authentication failed",
+                    ));
+                }
+                // Answer PINGs so auth can't be ping-timeout-killed.
+                _ => {
+                    self.answer_ping(&msg).await?;
+                }
             }
         }
     }
@@ -388,5 +417,51 @@ mod tests {
         let owned = OwnedMessage::from(&Message::parse(":irc.example 001 nick :Welcome").unwrap());
         assert_eq!(owned.source.as_deref(), Some("irc.example"));
         assert_eq!(owned.command, "001");
+    }
+
+    #[tokio::test]
+    async fn register_sasl_fails_loudly_on_reject_numeric() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A server that ACKs sasl, then answers the AUTHENTICATE with a 904
+        // failure numeric and holds the socket open. Without the terminal-numeric
+        // handling in `await_authenticate_challenge`, this loops forever; with it,
+        // register_sasl returns an error promptly.
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+
+        let server = tokio::spawn(async move {
+            let (sr, mut sw) = tokio::io::split(server_io);
+            sw.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+            sw.write_all(b":srv 904 * :SASL authentication failed\r\n")
+                .await
+                .unwrap();
+            // Keep draining and holding the socket open so the client can't rely
+            // on EOF to unblock — the failure must come from the numeric itself.
+            let mut reader = sr;
+            let mut buf = vec![0u8; 1024];
+            loop {
+                if reader.read(&mut buf).await.unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            conn.register_sasl("nick", "real", "acct", "pw"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "register_sasl hung on a SASL-reject numeric"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "a SASL-reject numeric must surface as an error"
+        );
+        drop(conn); // closes the client side so the server task can end
+        let _ = server.await;
     }
 }
