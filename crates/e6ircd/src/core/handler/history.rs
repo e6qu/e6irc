@@ -647,7 +647,13 @@ pub(super) fn resolve_ring_window(
 }
 
 pub(super) fn needs_db_for_missing_ref(ring_full: bool, selector: &str) -> bool {
-    ring_full && selector.starts_with("timestamp=")
+    // A `msgid=` pivot resolves in SQL against the composite `(ts, id)` position
+    // (BeforeMsgid/AfterMsgid/AroundMsgid), so a msgid absent from an *incomplete*
+    // ring must go to the database — not be treated as "no such/older history",
+    // which silently dead-ended backward pagination one page past the ring edge.
+    // A `timestamp=` bound likewise pages from the DB. Only `*` (open bound) can
+    // never need it.
+    ring_full && (selector.starts_with("timestamp=") || selector.starts_with("msgid="))
 }
 
 /// Resolve a msgid=/timestamp= selector to a timestamp for DB paging.
@@ -790,8 +796,15 @@ mod window_tests {
         // Keep at most `limit` of [start, end): the newest (right) or oldest.
         let keep_newest = |start: usize, end: usize| (end.saturating_sub(limit).max(start), end);
         let keep_oldest = |start: usize, end: usize| (start, (start + limit).min(end));
-        // Missing non-BETWEEN reference: PG only for a timestamp past a full ring.
-        let miss = |sel: &str| (Vec::new(), !((!complete) && sel.starts_with("timestamp=")));
+        // Missing non-BETWEEN reference: PG for a timestamp *or msgid* past an
+        // incomplete ring (a msgid pivots in SQL, so a missing one is not "no
+        // history" — see needs_db_for_missing_ref).
+        let miss = |sel: &str| {
+            (
+                Vec::new(),
+                !((!complete) && (sel.starts_with("timestamp=") || sel.starts_with("msgid="))),
+            )
+        };
 
         let out = match sub.to_ascii_uppercase().as_str() {
             "LATEST" if selector == "*" => {
@@ -897,6 +910,31 @@ mod window_tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn missing_msgid_on_an_incomplete_ring_defers_to_the_database() {
+        // A msgid pivot absent from an *incomplete* ring must report `covered =
+        // false` so the DB (which pivots on the msgid in SQL) is consulted —
+        // otherwise backward pagination silently dead-ends one page past the ring
+        // edge. A complete ring genuinely has no such message, so it stays
+        // covered (empty).
+        let history: Vec<HistoryEntry> = (0..3).map(entry).collect();
+        for sub in ["BEFORE", "AFTER", "AROUND", "LATEST"] {
+            let (rows, covered) =
+                resolve_ring_window(&history, false, sub, "msgid=gone", "*", 10).unwrap();
+            assert!(rows.is_empty());
+            assert!(
+                !covered,
+                "{sub} with a missing msgid on an incomplete ring must defer to the DB"
+            );
+            let (_, covered_complete) =
+                resolve_ring_window(&history, true, sub, "msgid=gone", "*", 10).unwrap();
+            assert!(
+                covered_complete,
+                "{sub} on a complete ring with no such msgid is genuinely empty"
+            );
         }
     }
 }

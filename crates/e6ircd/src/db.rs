@@ -145,28 +145,61 @@ pub async fn issue_app_password(
     Ok(secret)
 }
 
+/// Concurrent argon2 password verifications the worker allows in flight at once.
+/// Each argon2 costs ~19 MiB, so this bounds the memory a burst of `AUTHENTICATE`
+/// can pin while still decoupling auth latency from the worker's serial loop
+/// (an unbounded spawn would turn a latency issue into a memory DoS).
+const MAX_CONCURRENT_VERIFY: usize = 4;
+
 /// One worker loop; run as a task. Replies always reach the core (or
 /// the core is gone and the server is shutting down).
 pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Sender<Input>) {
     let mut log_batch: Vec<DbRequest> = Vec::new();
+    let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFY));
     while let Some(envelope) = rx.pop().await {
         let mut next = Some(envelope.payload);
         while let Some(request) = next.take() {
-            if let DbRequest::LogMessage { .. } = request {
-                log_batch.push(request);
-            } else {
-                // Any other request may *read* the messages table, so the
-                // writes queued ahead of it must land first. Without this a
-                // client that sends a message and immediately asks for its
-                // history queries a database that does not contain it yet —
-                // the buffered rows would still be sitting in `log_batch`.
-                // Consecutive messages still batch; only a read forces the
-                // flush, which is exactly the ordering the queue promises.
-                if !log_batch.is_empty() {
-                    flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+            match request {
+                DbRequest::LogMessage { .. } => log_batch.push(request),
+                // Password verification is a pure read of the accounts/credential
+                // tables (never `messages`) with no ordering dependency on any
+                // other request, and its argon2 verify is ~tens of ms. Run it off
+                // the worker loop — bounded by `verify_sem` — so a burst of
+                // logins can't head-of-line-block CHATHISTORY reads and account
+                // lookups behind one serial argon2 at a time. No flush is needed
+                // (it reads no messages).
+                DbRequest::VerifyPassword {
+                    conn,
+                    account,
+                    password,
+                } => {
+                    let pool = pool.clone();
+                    let core_tx = core_tx.clone();
+                    let sem = verify_sem.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem
+                            .acquire_owned()
+                            .await
+                            .expect("verify semaphore never closed");
+                        let reply = handle_verify(&pool, &account, &password).await;
+                        // The core being gone (push fails) just means shutdown.
+                        let _ = core_tx.push(Input::DbReply { conn, reply }).await;
+                    });
                 }
-                if !handle_request(&pool, &core_tx, request).await {
-                    return;
+                request => {
+                    // Any other request may *read* the messages table, so the
+                    // writes queued ahead of it must land first. Without this a
+                    // client that sends a message and immediately asks for its
+                    // history queries a database that does not contain it yet —
+                    // the buffered rows would still be sitting in `log_batch`.
+                    // Consecutive messages still batch; only a read forces the
+                    // flush, which is exactly the ordering the queue promises.
+                    if !log_batch.is_empty() {
+                        flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+                    }
+                    if !handle_request(&pool, &core_tx, request).await {
+                        return;
+                    }
                 }
             }
             next = rx.try_pop().map(|e| e.payload);

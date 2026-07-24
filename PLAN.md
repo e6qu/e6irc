@@ -1593,6 +1593,56 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixtieth sweep — CHATHISTORY pagination dead-end, a ChanServ DROP
+divergence, and DB-worker head-of-line blocking (2026-07-24): two deep audits
+(the CHATHISTORY PostgreSQL query path, and the ChanServ/mlock/founder
+subsystem) plus a scoped robustness fix.
+
+1. **Backward CHATHISTORY pagination silently dead-ended one page past the ring
+   edge** (`history.rs`) — `needs_db_for_missing_ref` only routed a `timestamp=`
+   pivot to the DB, so a `msgid=` pivot that had scrolled out of an incomplete
+   ring was treated as "no such/older history" and the DB was never queried,
+   even though `BeforeMsgid`/`AfterMsgid`/`AroundMsgid` pivot on it in SQL. A
+   client paging backward with successive msgid pivots hit an empty batch and
+   believed history had ended. Now a missing `msgid=` (like `timestamp=`) on an
+   incomplete ring routes to the DB. The exhaustive differential test's
+   reference was updated to match, and a focused test pins it.
+2. **ChanServ DROP orphaned the mode lock and keeptopic override in hot state**
+   (`services.rs`) — DROP cleared `registered_founders`/`registered_topics`/
+   `channel_access` but not `channel_mlock` or `keeptopic_off`, while
+   `drop_channel` deletes the whole `channels` row (both are columns on it). A
+   dropped-then-recreated channel reapplied a stale `+mlock` the DB no longer
+   held (and a member couldn't remove it, since `mlock_conflict` has no
+   `is_registered` gate), then a restart silently flipped the behavior back. Now
+   DROP clears all five registration-scoped maps. Regression test.
+3. **The DB worker serialized argon2 verifies head-of-line** (`db.rs`) — every
+   `AUTHENTICATE` awaited its ~tens-of-ms argon2 verify inline, so a burst of
+   logins queued CHATHISTORY reads and account lookups behind one verify at a
+   time (a latency cliff and a cheap DoS amplifier). Password verification is a
+   pure read with no ordering dependency, so it now runs off the worker loop
+   bounded by a 4-permit semaphore — decoupling auth latency from history reads
+   without turning it into a memory DoS (each argon2 is ~19 MiB, so an unbounded
+   spawn would be worse). Account creation (a rare write) stays inline.
+
+Investigated and *surfaced, not fixed* — three further CHATHISTORY DB-path bugs
+found by the audit that are entangled and need a coordinated ring/DB/reference
+rewrite (a botched CHATHISTORY-semantics change would be worse than the narrow
+existing bugs, so they get a dedicated pass rather than a rushed one alongside
+the DB-worker refactor): (a) ring vs DB disagree on AFTER / bounded-LATEST at a
+`timestamp=` pivot that falls *between* messages — the ring uses `ts >= T` +
+`skip(pos+1)` while the DB uses strict `ts > T`, and the "pivot older than the
+ring" case additionally drops the ring's oldest row and misses evicted rows;
+(b) a mixed `msgid=`+`timestamp=` BETWEEN silently loses the msgid bound when the
+msgid has scrolled out of the ring (`selector_ts` is ring-only → substitutes a
+degenerate `0`/`u64::MAX`); (c) a newest-first BETWEEN on two msgid pivots past
+the ring collapses `newest_first` to false (ring-only direction detection) and
+returns an inverted empty range. The shared root cause is that msgid→position
+resolution is done only against the in-memory ring; the durable fix is to let
+the DB resolve any `msgid=` pivot's `(ts, id)`. Also surfaced: a `FLAGS
+<unknown-account> +flags` creates a hot/DB divergence (hot map updated
+optimistically, DB `SELECT`-guarded INSERT writes nothing) — needs the
+founder-transfer round-trip pattern.
+
 Fifty-ninth sweep — hardening + fidelity: OIDC config-safety, a CSRF
 cache leak, and query fidelity (2026-07-24): four deep audits (OIDC/Shauth
 token validation, async cancellation/task-lifecycle, the web frontend, and the
