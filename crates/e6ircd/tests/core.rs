@@ -2681,6 +2681,32 @@ fn markread_set_query_and_broadcast() {
 }
 
 #[test]
+fn markread_first_set_to_epoch_zero_is_persisted() {
+    // The Unix epoch (1970-01-01T00:00:00.000Z → Millis(0)) is a legitimate
+    // marker value. A first-ever set to it must still persist and echo, not be
+    // swallowed as a no-op against a zero "unset" sentinel — which would leave
+    // the in-core mirror holding a marker the DB never received.
+    let mut s = TestServer::new();
+    let a1 = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, a1, "alice");
+    let _ = s.db_requests(); // drop the IDENTIFY's VerifyPassword
+    s.line(a1, "MARKREAD #room timestamp=1970-01-01T00:00:00.000Z");
+    assert_eq!(
+        s.drain(a1),
+        vec![":irc.test.example MARKREAD #room timestamp=1970-01-01T00:00:00.000Z"]
+    );
+    let reqs = s.db_requests();
+    assert!(
+        reqs.iter().any(|r| matches!(
+            r,
+            e6ircd::core::DbRequest::SetReadMarker { target, marker_ms, .. }
+                if target == "#room" && marker_ms.as_millis() == 0
+        )),
+        "a first epoch-0 set must be persisted, not silently dropped: {reqs:#?}"
+    );
+}
+
+#[test]
 fn markread_requires_cap_and_works_anonymously() {
     let mut s = TestServer::new();
     // No cap → unknown command.

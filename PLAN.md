@@ -1593,6 +1593,57 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Fifty-seventh sweep — four-front bug hunt: silent driver death, a
+read-marker sentinel collision, and SSRF/keepalive hardening (2026-07-24): four
+parallel adversarial passes (read-marker/CHATHISTORY, BNC irc/local drivers,
+HTTP REST/pages, casemapping/keys/identity) surfaced five concrete defects, all
+fixed here in one PR.
+
+1. **The `local` BNC driver had no reconnect and died silently** (`local_driver.rs`)
+   — unlike every other driver, it ran outside `run_with_backoff`, so a core-side
+   close (an operator KILLs the BNC user, or the core drops the in-process conn)
+   exited the task forever: no `Disconnected` event, no reconnect, and the sticky
+   `is_connected()` flag stuck `true`. It now reconnects with a fresh `ConnId` and
+   emits `Disconnected` like the others.
+2. **A read-marker first-set to the Unix epoch was silently not persisted**
+   (`read_marker.rs`) — the account path used `Millis(0)` as an "unset" sentinel,
+   but `0` is a legitimate marker value (`1970-01-01T00:00:00.000Z`), so a
+   first-ever set to it (`0 > 0` is false) updated the in-core mirror but skipped
+   the DB write, diverging the two (and, repeated, filling the account's marker
+   quota with un-persisted phantoms). Persistence now keys off marker *presence*,
+   not the sentinel — a first set always persists, whatever its value.
+3. **An authenticated user could make the server dial an internal address**
+   (`http/networks.rs`) — the network `addr` was validated only for emptiness, so
+   any tenant could point a network at `169.254.169.254` (cloud metadata) etc.,
+   which the server then dials on a reconnect loop. Create-time validation now
+   refuses the link-local metadata range, unspecified, multicast, broadcast and
+   documentation IP literals. Loopback and RFC-1918 / unique-local private ranges
+   stay allowed, because a self-hosted or LAN IRC upstream (including
+   `127.0.0.1`) is a first-class e6irc use case — the sharp, zero-false-positive
+   vector is the metadata endpoint.
+4. **The `irc` upstream driver could wedge on a half-open peer** (`irc_driver.rs`)
+   — `connect_once` bounds connect + registration, but the steady-state read
+   blocked forever if the upstream half-opened (firewall drop, peer vanishes),
+   starving the reconnect loop with `is_connected()` stuck true. It now sends a
+   keepalive PING on an idle gap and drops if the next gap passes unanswered.
+5. **`account_connections` compared accounts with raw `==`** (`state.rs`) — the
+   one account comparison in the core that bypassed the casemap, a latent
+   silent-no-op (a MARKREAD sibling-sync miss) if a session ever held a
+   non-canonical account label. It now folds both sides like every other account
+   comparison. Boy-scout hardening of the "make casefold bugs unrepresentable"
+   invariant; also validated network `nick`/`realname`/`autojoin` against CR/LF/NUL
+   injection and bounded their lengths.
+
+Investigated and *not* changed (surfaced, not swallowed): accounts still lack a
+typed `AccountKey` wrapper and the DB/HTTP layers fold with a hardcoded
+`Rfc1459` literal in ~25 sites rather than sourcing `state.casemap` — both are
+latent invariant-bypasses that hold today (rfc1459 is the only mapping and every
+login canonicalizes the account casing), but would become live bugs if casemap
+became configurable; a full `AccountKey` refactor is deferred rather than
+ballooned into this PR. The draft/read-marker `services` irctest cases
+(persist-across-reconnect, cross-session propagation) are not in e6irc's green
+list and fail on `main` independently of this sweep — noted for a future look.
+
 Fifty-sixth sweep — four-front bug hunt: TLS slow-loris, an argon2 DoS,
 a WHOX overflow, and bridge/proxy hardening (2026-07-23): four parallel
 adversarial passes (Matrix bridge, numerics/ISUPPORT, rate-limiting/flood, and
