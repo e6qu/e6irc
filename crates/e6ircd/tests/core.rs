@@ -6237,6 +6237,9 @@ fn isupport_advertises_whox_and_length_limits() {
         "KICKLEN=390",
         "AWAYLEN=390",
         "KICK:1",
+        // KNOCK is implemented (cmd_knock), so it must be advertised — a client
+        // that gates its /knock UI on this token was otherwise misled.
+        "KNOCK",
     ] {
         assert!(
             isupport.contains(token),

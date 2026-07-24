@@ -998,10 +998,17 @@ fn parse_forwarded_ip(entry: &str) -> Option<std::net::IpAddr> {
         .and_then(|inner| inner.parse::<std::net::IpAddr>().ok())
 }
 
+/// Hard ceiling on the auth-rate bucket map. The age-based retain below only
+/// removes *fully-refilled* (idle ≥60s) entries, so a flood from many distinct
+/// IPs (trivial with an IPv6 /64) keeps every entry below full and retains them
+/// all — the map would otherwise grow to ~request-rate × 60s. This cap bounds it.
+const MAX_AUTH_BUCKETS: usize = 4096;
+
 /// Spend one token from `ip`'s auth bucket. Returns `false` (rate-limited) when
 /// the bucket is empty; always `true` when `auth_rate_burst` is unset. The
-/// bucket refills to full over 60s; fully-refilled entries are pruned so the
-/// map can't grow without bound.
+/// bucket refills to full over 60s; fully-refilled entries are pruned, and the
+/// map is hard-capped at `MAX_AUTH_BUCKETS` so it can't grow without bound even
+/// under a distinct-IP flood.
 pub(super) fn auth_rate_ok(state: &AppState, ip: std::net::IpAddr) -> bool {
     let Some(burst) = state.auth_rate_burst else {
         return true;
@@ -1010,10 +1017,23 @@ pub(super) fn auth_rate_ok(state: &AppState, ip: std::net::IpAddr) -> bool {
     let refill_per_sec = burst / 60.0;
     let now = std::time::Instant::now();
     let mut buckets = state.auth_buckets.lock().expect("poisoned");
-    if buckets.len() > 4096 {
+    if buckets.len() > MAX_AUTH_BUCKETS {
         buckets.retain(|_, (tokens, last)| {
             *tokens + now.duration_since(*last).as_secs_f64() * refill_per_sec < burst
         });
+        // A distinct-IP flood leaves nothing for the retain to prune (every
+        // entry is below full). Evict the least-recently-seen entry to make room
+        // for a new IP — its bucket simply resets to a fresh burst next time,
+        // which is harmless — so memory stays bounded regardless of source spread.
+        if buckets.len() >= MAX_AUTH_BUCKETS
+            && !buckets.contains_key(&ip)
+            && let Some(oldest) = buckets
+                .iter()
+                .min_by_key(|(_, (_, last))| *last)
+                .map(|(k, _)| *k)
+        {
+            buckets.remove(&oldest);
+        }
     }
     let entry = buckets.entry(ip).or_insert((burst, now));
     entry.0 = (entry.0 + now.duration_since(entry.1).as_secs_f64() * refill_per_sec).min(burst);

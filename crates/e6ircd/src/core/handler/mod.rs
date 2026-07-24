@@ -252,6 +252,13 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     }
     let now = (state.config.clock)();
     let s = state.sessions.get_mut(&conn).expect("session present");
+    // A backward wall-clock step (NTP correction) would leave the refill
+    // watermark in the future, so `saturating_sub` yields 0 and the bucket never
+    // refills — flood-killing an actively-talking client through no fault of its
+    // own. Re-anchor to `now` when time has gone backward so refill resumes.
+    if now < s.flood_refilled_to_ms {
+        s.flood_refilled_to_ms = now;
+    }
     // The clock is milliseconds but the bucket refills per whole second, so
     // credit only elapsed whole seconds and advance the watermark by exactly
     // what was credited — otherwise sub-second command bursts would keep

@@ -15,6 +15,7 @@
 //! path is covered by a live-gated integration test needing real workspace
 //! tokens. This module is NOT verified against live Slack in CI.
 
+use super::BoundedJson;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -109,6 +110,15 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 if !crate::sanitize::valid_channel_name(&channel) {
                     eprintln!(
                         "slack: channel {id} has an unsafe name {name:?}; refusing to bridge it"
+                    );
+                    return Dropped;
+                }
+                // Two Slack channels named the same derive one IRC channel and
+                // would silently overwrite the mapping; refuse rather than lose it.
+                if channel_to_id.contains_key(&channel) {
+                    eprintln!(
+                        "slack: channel {id} name {name:?} collides with an already-bridged \
+                         channel {channel:?}; refusing to bridge it"
                     );
                     return Dropped;
                 }
@@ -295,9 +305,8 @@ async fn open_socket(
         .send()
         .await
         .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     check_ok(&v)?;
     v["url"]
         .as_str()
@@ -318,9 +327,8 @@ async fn fetch_channel_name(
         .send()
         .await
         .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     check_ok(&v)?;
     v["channel"]["name"]
         .as_str()
@@ -342,9 +350,8 @@ async fn post_message(
         .send()
         .await
         .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     check_ok(&v)
 }
 

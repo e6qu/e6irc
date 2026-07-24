@@ -16,6 +16,7 @@
 //! end-to-end path is covered by a live-gated integration test that needs a
 //! real bot token. This module is NOT verified against live Discord in CI.
 
+use super::BoundedJson;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -112,6 +113,15 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 if !crate::sanitize::valid_channel_name(&channel) {
                     eprintln!(
                         "discord: channel {id} has an unsafe name {name:?}; refusing to bridge it"
+                    );
+                    return Dropped;
+                }
+                // Two Discord channels named the same derive one IRC channel and
+                // would silently overwrite the mapping; refuse rather than lose it.
+                if channel_to_id.contains_key(&channel) {
+                    eprintln!(
+                        "discord: channel {id} name {name:?} collides with an already-bridged \
+                         channel {channel:?}; refusing to bridge it"
                     );
                     return Dropped;
                 }
@@ -338,9 +348,8 @@ async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, Strin
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     v["url"]
         .as_str()
         .map(str::to_string)
@@ -361,9 +370,8 @@ async fn fetch_channel_name(
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     v["name"]
         .as_str()
         .map(str::to_string)
