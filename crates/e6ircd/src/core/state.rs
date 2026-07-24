@@ -169,6 +169,13 @@ pub(crate) struct Session {
     /// Services account this connection is authenticated to.
     pub account: Option<String>,
     pub sasl: SaslState,
+    /// A SASL credential verify is genuinely outstanding (dispatched, reply not
+    /// yet seen). Unlike `sasl == Verifying`, this survives an `AUTHENTICATE *`
+    /// abort — the abort clears the state machine but cannot un-send the DB
+    /// request, so the reply still comes. It gates a *new* SASL verify and an
+    /// IDENTIFY until that stale reply is drained, so a reply can never be
+    /// attributed to a different attempt than the one that produced it.
+    pub sasl_verify_pending: bool,
     /// Accumulates 400-byte AUTHENTICATE continuation chunks (SASL spec)
     /// until a short line completes the payload.
     pub sasl_buf: String,
@@ -1140,6 +1147,7 @@ impl ServerState {
                 caps: Caps::default(),
                 account: None,
                 sasl: SaslState::default(),
+                sasl_verify_pending: false,
                 sasl_buf: String::new(),
                 credential_attempts: 0,
                 pending_identify: false,

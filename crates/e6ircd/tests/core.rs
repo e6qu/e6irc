@@ -987,6 +987,89 @@ fn cap_req_ack_and_nak() {
     assert!(has_numeric(&s.drain(c), "001"));
 }
 
+/// A CAP REQ whose reflected ACK/NAK would exceed the wire limit must not emit
+/// an over-long line — that would be discarded by the recipient's framing and,
+/// with debug assertions on (as under cargo-fuzz), abort the single core worker:
+/// a client-triggerable, unauthenticated DoS. The reply is bounded (NAK, nothing
+/// applied), and crucially never panics.
+#[test]
+fn cap_req_with_an_overlong_list_does_not_overflow_the_wire() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP LS 302");
+    s.drain(c);
+    // ~489 bytes of a valid, repeated cap: it fits the input frame, but the old
+    // code's ACK-echo (`:server CAP * ACK :<request>`) would overflow 512.
+    let big = std::iter::repeat_n("sasl", 98)
+        .collect::<Vec<_>>()
+        .join(" ");
+    s.line(c, &format!("CAP REQ :{big}"));
+    let out = s.drain(c);
+    assert_eq!(out.len(), 1, "exactly one CAP reply: {out:#?}");
+    assert!(
+        out[0].len() + 2 <= 512,
+        "CAP reply exceeds the wire limit ({} bytes)",
+        out[0].len()
+    );
+    assert!(
+        out[0].contains(" CAP * NAK "),
+        "an un-echoable REQ must be NAKed, not ACKed: {}",
+        out[0]
+    );
+    // The server is still alive and serving (no panic): a normal REQ still works.
+    s.line(c, "CAP REQ :server-time");
+    assert_eq!(s.drain(c), vec![":irc.test.example CAP * ACK :server-time"]);
+}
+
+/// Aborting a SASL exchange (`AUTHENTICATE *`) while its verify is still in
+/// flight, then starting a new one, must not let the stale reply complete the
+/// new attempt. The new AUTHENTICATE is refused until the aborted verify's reply
+/// drains, so a reply is never attributed to a different attempt.
+#[test]
+fn sasl_abort_then_reauth_does_not_cross_wire_the_stale_verify() {
+    let mut s = TestServer::new();
+    let c = s.connect(1);
+    s.line(c, "CAP REQ :sasl");
+    s.drain(c);
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert_eq!(s.db_requests().len(), 1, "first verify dispatched");
+    s.drain(c);
+    // Abort before the reply lands.
+    s.line(c, "AUTHENTICATE *");
+    s.drain(c);
+    // A new SASL exchange must not dispatch a second verify while the aborted
+    // one's reply is still outstanding.
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0bob\0pw")));
+    assert!(
+        s.db_requests().is_empty(),
+        "a re-auth must wait for the aborted verify's reply, not race it"
+    );
+    // The aborted verify's stale reply lands: it is dropped (state is not
+    // Verifying) and unblocks a fresh attempt.
+    s.core.handle(Input::DbReply {
+        conn: c,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+        },
+    });
+    let out = s.drain(c);
+    assert!(
+        !out.iter()
+            .any(|l| l.contains(" 900 ") || l.contains(" 903 ")),
+        "a stale reply for an aborted attempt must not log the client in: {out:#?}"
+    );
+    // Now a fresh SASL exchange dispatches again.
+    s.line(c, "AUTHENTICATE PLAIN");
+    s.line(c, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert_eq!(
+        s.db_requests().len(),
+        1,
+        "a fresh verify dispatches once the stale reply has drained"
+    );
+}
+
 #[test]
 fn cap_list_enumerates_multiline_when_enabled() {
     // CAP LIST must report *every* enabled capability, including the ones
@@ -2872,6 +2955,32 @@ fn markread_set_query_and_broadcast() {
     assert_eq!(
         s.drain(a2),
         vec![":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"]
+    );
+}
+
+/// The sibling MARKREAD sync only reaches connections that negotiated
+/// `draft/read-marker`. A logged-in device on an older client must not receive
+/// an unsolicited MARKREAD line it never opted into.
+#[test]
+fn markread_sync_skips_siblings_without_the_cap() {
+    let mut s = TestServer::new();
+    let a1 = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, a1, "alice");
+    // A second device on the same account that did NOT negotiate read-marker.
+    let a2 = register_with_caps(&mut s, 2, "alice2", "server-time");
+    identify(&mut s, a2, "alice");
+    s.drain(a1);
+    s.drain(a2);
+    // a1 advances a marker; only a1 (capable) is notified.
+    s.line(a1, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    assert_eq!(
+        s.drain(a1),
+        vec![":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"],
+        "the capable setter gets its confirmation"
+    );
+    assert!(
+        s.drain(a2).is_empty(),
+        "a sibling without draft/read-marker must not receive the sync"
     );
 }
 
@@ -5292,6 +5401,77 @@ fn oper_xline_bans_by_realname() {
     assert!(
         s.drain(ok).iter().any(|l| l.contains(" 001 ")),
         "clean gecos refused"
+    );
+}
+
+/// An XLINE whose gecos mask contains spaces must ban the whole (space-joined)
+/// mask, not the first token — `XLINE *Evil Corp* :spam` used to silently ban
+/// `*Evil` with reason `Corp*`, a different and broader ban than typed.
+#[test]
+fn oper_xline_mask_with_spaces_is_not_split() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "XLINE *Evil Corp* :spam bots");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added X-Line")),
+        "no xline confirmation"
+    );
+    // A realname matching the full multi-word glob is refused...
+    let banned = s.connect(2);
+    s.line(banned, "NICK sam");
+    s.line(banned, "USER sam 0 * :Totally Evil Corp Ltd");
+    assert!(
+        s.drain(banned).iter().any(|l| l.contains(" 465 ")),
+        "multi-word gecos ban did not take"
+    );
+    // ...while a realname matching only the mangled first token ("*Evil") is not.
+    let ok = s.connect(3);
+    s.line(ok, "NICK amy");
+    s.line(ok, "USER amy 0 * :Not So Evil");
+    assert!(
+        s.drain(ok).iter().any(|l| l.contains(" 001 ")),
+        "a realname matching only the split-off token was wrongly banned"
+    );
+    // And it removes by the same multi-word mask.
+    s.line(op, "UNXLINE *Evil Corp*");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Removed X-Line")),
+        "multi-word xline could not be removed by its own mask"
+    );
+}
+
+/// Server-ban removal folds like enforcement: a ban set with one casing is
+/// removable with another. Before, `UNKLINE` compared case-sensitively and
+/// reported "no such ban" while the ban kept enforcing.
+#[test]
+fn server_ban_removal_is_case_insensitive() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "KLINE Baddie@Evil.Example :out");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added K-Line")),
+        "no kline confirmation"
+    );
+    // A registration matching the ban (folded) is refused regardless of casing.
+    let banned = s.connect(2);
+    s.line(banned, "NICK v");
+    s.line(banned, "USER baddie 0 * :v");
+    // host defaults to the test host; the user part matches the folded mask.
+    // Remove using a different casing than it was added with.
+    s.line(op, "UNKLINE baddie@evil.example");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Removed K-Line")),
+        "case-variant UNKLINE failed to remove the ban"
+    );
+    // A second removal now finds nothing (it really was removed).
+    s.line(op, "UNKLINE BADDIE@EVIL.EXAMPLE");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("No K-Line found")),
+        "ban was not actually removed"
     );
 }
 

@@ -192,10 +192,22 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         e6irc_proto::time::server_time(current)
     );
     // A forward move syncs to all the account's clients; a no-op just
-    // confirms the current marker to the requester.
+    // confirms the current marker to the requester. The sync only reaches
+    // siblings that negotiated `draft/read-marker` and have finished
+    // registration — every other MARKREAD emission gates on the cap, and
+    // `account_connections` also includes sessions that set `account` during
+    // SASL but aren't registered yet, so an unfiltered fan-out would push a
+    // MARKREAD line to a connection that never opted into it. The setter itself
+    // holds the cap (checked on entry), so it still gets its confirmation.
     if moved_forward {
         for peer in state.account_connections(&account) {
-            state.send(peer, &line);
+            if state
+                .sessions
+                .get(&peer)
+                .is_some_and(|s| s.registered && s.caps.read_marker)
+            {
+                state.send(peer, &line);
+            }
         }
     } else {
         state.send(conn, &line);

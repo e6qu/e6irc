@@ -174,12 +174,38 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
         );
         return;
     };
-    let mask = ban_mask(kind, mask_arg);
-    let reason = p.get(1).copied().unwrap_or("No reason").to_string();
+    // Enforcement folds mask and subject under the casemap (`mask::matches`), so
+    // the stored mask is folded too: otherwise `KLINE Baddie@Host` then
+    // `UNKLINE baddie@host` would compare case-sensitively, fail to remove, and
+    // report "no such ban" while the ban keeps enforcing — and two case-variants
+    // would double-store. Folding at storage makes the hot list, the DB
+    // `ON CONFLICT`/`DELETE` keys, and matching all agree. (Same fix the channel
+    // `+b/+q/+e/+I` path uses via `mask::eq`; here we fold once up front.)
+    let casemap = state.casemap;
+    // XLINE targets the realname/gecos, which routinely contains spaces; IRC
+    // tokenization splits it across params, so rejoin everything before the
+    // reason. A middle param can never contain a space, so the reason (when
+    // given) is the final param and the mask is the rest. Without this,
+    // `XLINE *Evil Corp* :spam` silently banned `*Evil` with reason `Corp*` — a
+    // different, broader ban than typed. KLINE/DLINE masks never contain spaces,
+    // so they keep the plain mask=first, reason=second split.
+    let (raw_mask, reason) = match kind {
+        BanKind::Xline if p.len() >= 2 => (p[..p.len() - 1].join(" "), p[p.len() - 1].to_string()),
+        _ => (
+            mask_arg.to_string(),
+            p.get(1).copied().unwrap_or("No reason").to_string(),
+        ),
+    };
+    // Bound the oper-supplied reason: it rides the victim's closing ERROR and
+    // the ban-list NOTICE, both single lines the recipient's framing discards
+    // whole if they pass 512 bytes. 300 chars is ample and leaves room for the
+    // fixed wrapping on either line.
+    let reason = e6irc_proto::message::truncate_on_char_boundary(&reason, 300).to_string();
+    let mask = casemap.casefold(&ban_mask(kind, &raw_mask));
     // Replace any existing ban of this kind on the same mask.
     state
         .server_bans
-        .retain(|b| !(b.kind == kind && b.mask == mask));
+        .retain(|b| !(b.kind == kind && e6irc_proto::mask::eq(casemap, &b.mask, &mask)));
     state.server_bans.push(ServerBan {
         mask: mask.clone(),
         reason: reason.clone(),
@@ -198,7 +224,6 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
         }
     }
     // Disconnect any matching registered sessions.
-    let casemap = state.casemap;
     let victims: Vec<ConnId> = state
         .sessions
         .iter()
@@ -241,7 +266,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
     }
     let label = kind.label();
     let un = format!("UN{}", kind.as_str().to_uppercase());
-    let Some(&mask_arg) = p.first() else {
+    if p.is_empty() {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
@@ -249,12 +274,22 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
             Some("Not enough parameters"),
         );
         return;
+    }
+    // Fold to match the folded storage (see cmd_add_ban) so removal is
+    // case-insensitive like enforcement — a ban set as `Baddie@Host` is removed
+    // by `baddie@host`, and the DB delete key matches the stored (folded) mask.
+    // An XLINE mask has no reason, so its whole (space-containing) argument is
+    // the mask — rejoin the tokenized params to match how it was stored.
+    let casemap = state.casemap;
+    let raw_mask = match kind {
+        BanKind::Xline => p.join(" "),
+        _ => p[0].to_string(),
     };
-    let mask = ban_mask(kind, mask_arg);
+    let mask = casemap.casefold(&ban_mask(kind, &raw_mask));
     let before = state.server_bans.len();
     state
         .server_bans
-        .retain(|b| !(b.kind == kind && b.mask == mask));
+        .retain(|b| !(b.kind == kind && e6irc_proto::mask::eq(casemap, &b.mask, &mask)));
     let removed = state.server_bans.len() < before;
     if removed && state.config.sasl_enabled {
         let request = crate::core::DbRequest::RemoveServerBan {

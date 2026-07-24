@@ -91,7 +91,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             // overlapping IDENTIFYs are harmless by contrast — each names an
             // account the client proved it owns — so they stay allowed, bounded
             // by the credential budget below.)
-            if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
+            if state.sessions[&conn].sasl_verify_pending {
                 state.service_notice(
                     conn,
                     "NickServ",

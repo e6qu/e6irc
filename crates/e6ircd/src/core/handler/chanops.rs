@@ -288,7 +288,28 @@ pub(super) fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let entries = userhost_entries(state, p);
-    state.numeric(conn, RPL_USERHOST, &[], Some(&entries.join(" ")));
+    let trailing = pack_userhost_entries(state, conn, RPL_USERHOST, &entries);
+    state.numeric(conn, RPL_USERHOST, &[], Some(&trailing));
+}
+
+/// Pack USERHOST/USERIP entries into the single (unsplittable) reply's trailing,
+/// dropping any that don't fit rather than letting `numeric` truncate the last
+/// entry mid-token into a corrupt string.
+fn pack_userhost_entries(
+    state: &ServerState,
+    conn: ConnId,
+    code: u16,
+    entries: &[String],
+) -> String {
+    let target = state.sessions[&conn].nick.as_deref().unwrap_or("*");
+    let head_len = format!(
+        ":{} {} {} :",
+        state.config.server_name,
+        e6irc_proto::numerics::code_str(code),
+        target,
+    )
+    .len();
+    crate::core::handler::pack_trailing_list(entries, head_len)
 }
 
 pub(super) fn cmd_userip(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -302,7 +323,8 @@ pub(super) fn cmd_userip(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let entries = userhost_entries(state, p);
-    state.numeric(conn, RPL_USERIP, &[], Some(&entries.join(" ")));
+    let trailing = pack_userhost_entries(state, conn, RPL_USERIP, &entries);
+    state.numeric(conn, RPL_USERIP, &[], Some(&trailing));
 }
 
 pub(super) fn cmd_links(state: &mut ServerState, conn: ConnId) {
