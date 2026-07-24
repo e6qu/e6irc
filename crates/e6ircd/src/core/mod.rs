@@ -160,12 +160,14 @@ pub enum DbRequest {
         channel: String,
         mlock: Option<String>,
     },
-    /// Persist one channel access entry (fire-and-forget). `flags: None`
-    /// removes the entry.
+    /// Persist one channel access entry, then answer with `ChannelAccessSet` so
+    /// the hot map is updated only on a confirmed write (a grant to an
+    /// unregistered account writes nothing and must not become a phantom
+    /// entry). `flags: None` removes the entry. `channel`/`account` are as
+    /// typed; the worker folds them.
     SetChannelAccess {
-        /// Casefolded channel name.
+        conn: ConnId,
         channel: String,
-        /// Casefolded account name.
         account: String,
         flags: Option<String>,
     },
@@ -375,6 +377,17 @@ pub enum DbReply {
     /// A founder transfer failed — the target account or channel is gone.
     FounderChangeFailed {
         channel: String,
+    },
+    /// A ChanServ FLAGS change was persisted (or not). The hot access map is
+    /// updated only when `applied` is true, so a grant to an unregistered
+    /// account can't leave a phantom entry that would auto-op a later
+    /// registration of that name. `channel`/`account` are as typed (the reply
+    /// re-folds them for the map key and shows them in the notice).
+    ChannelAccessSet {
+        channel: String,
+        account: String,
+        flags: Option<String>,
+        applied: bool,
     },
     /// The database is unreachable or errored; the client gets a loud
     /// failure, never a silent hang.

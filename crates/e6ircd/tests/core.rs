@@ -4538,18 +4538,35 @@ fn chanserv_flags_auto_ops_on_join() {
     s.drain(boss);
     s.db_requests();
 
-    // Founder grants +o access to "alice"; it persists.
+    // Founder grants +o access to "alice"; it queues a persist request but does
+    // not touch the hot map or confirm until the DB acknowledges the write.
     s.line(boss, "PRIVMSG ChanServ :FLAGS #chan alice +o");
+    assert!(
+        !s.drain(boss).iter().any(|l| l.contains("are now +o")),
+        "flags confirmed before DB acknowledged"
+    );
+    let persisted = s.db_requests().into_iter().any(|r| {
+        matches!(r,
+            e6ircd::core::DbRequest::SetChannelAccess { channel, account, flags: Some(f), .. }
+            if channel == "#chan" && account == "alice" && f == "o")
+    });
+    assert!(persisted, "SetChannelAccess not queued");
+
+    // The DB confirms the write applied; only now is the hot map updated and
+    // the founder notified.
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelAccessSet {
+            channel: "#chan".to_string(),
+            account: "alice".to_string(),
+            flags: Some("o".to_string()),
+            applied: true,
+        },
+    });
     assert!(
         s.drain(boss).iter().any(|l| l.contains("are now +o")),
         "no flags confirmation"
     );
-    let persisted = s.db_requests().into_iter().any(|r| {
-        matches!(r,
-            e6ircd::core::DbRequest::SetChannelAccess { channel, account, flags: Some(f) }
-            if channel == "#chan" && account == "alice" && f == "o")
-    });
-    assert!(persisted, "SetChannelAccess not queued");
 
     // alice joins and is auto-opped, though neither first nor founder.
     let alice = s.register(2, "alice");
@@ -4574,6 +4591,68 @@ fn chanserv_flags_auto_ops_on_join() {
     assert!(
         s.drain(alice).iter().any(|l| l.contains("not the founder")),
         "non-founder was allowed to set flags"
+    );
+}
+
+/// Granting flags to an account that isn't registered must not create a phantom
+/// hot-map entry — the DB writes no row (`applied: false`), so a later
+/// registration of that name must not inherit auto-op it was never granted.
+#[test]
+fn chanserv_flags_unregistered_account_leaves_no_phantom_access() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#chan".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #chan");
+    s.drain(boss);
+    s.db_requests();
+
+    // Founder grants +o to "ghost", who has no account.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan ghost +o");
+    let persisted = s.db_requests().into_iter().any(|r| {
+        matches!(r,
+            e6ircd::core::DbRequest::SetChannelAccess { channel, account, .. }
+            if channel == "#chan" && account == "ghost")
+    });
+    assert!(persisted, "SetChannelAccess not queued");
+
+    // The DB reports the write did not apply (no such account).
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelAccessSet {
+            channel: "#chan".to_string(),
+            account: "ghost".to_string(),
+            flags: Some("o".to_string()),
+            applied: false,
+        },
+    });
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|l| l.contains("is not registered")),
+        "founder not told the grant was rejected"
+    );
+
+    // The access list must be empty — no phantom entry for ghost.
+    s.line(boss, "PRIVMSG ChanServ :FLAGS #chan");
+    assert!(
+        !s.drain(boss).iter().any(|l| l.contains("ghost")),
+        "phantom access entry created for unregistered account"
+    );
+
+    // If "ghost" now registers and joins, it must NOT be auto-opped.
+    let ghost = s.register(2, "ghost");
+    identify(&mut s, ghost, "ghost");
+    s.line(ghost, "JOIN #chan");
+    let names = s
+        .drain(ghost)
+        .into_iter()
+        .find(|l| l.contains(" 353 "))
+        .expect("353");
+    assert!(
+        !names.contains("@ghost"),
+        "phantom access auto-opped a freshly-registered account: {names}"
     );
 }
 

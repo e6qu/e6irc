@@ -408,7 +408,6 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         );
         return;
     };
-    let target_folded = state.casemap.casefold(target);
     let target_key = state.account_key(target);
     let current = state
         .channel_access
@@ -418,41 +417,21 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         .unwrap_or_default();
     let new_flags = apply_flag_changes(&current, changes);
 
-    // Persist first, then update the hot map only on success — so a DB outage
-    // can't leave the running server diverged from storage while telling the
-    // founder the change failed (it would otherwise be live but unpersisted).
+    // Persist first; the hot map and the confirmation are applied on the
+    // `ChannelAccessSet` reply, so a grant to an *unregistered* account (which
+    // writes no row) can't leave a phantom hot entry that would auto-op a later
+    // registration of that name.
     let request = crate::core::DbRequest::SetChannelAccess {
-        channel: key.as_str().to_string(),
-        account: target_folded.clone(),
-        flags: (!new_flags.is_empty()).then(|| new_flags.clone()),
+        conn,
+        channel: channel.to_string(),
+        account: target.to_string(),
+        flags: (!new_flags.is_empty()).then_some(new_flags),
     };
     if state.db_tx.try_push(request).is_err() {
         state.service_notice(
             conn,
             "ChanServ",
             "Services are temporarily unavailable. Try again later.",
-        );
-        return;
-    }
-    {
-        let entry = state.channel_access.entry(key.clone()).or_default();
-        if new_flags.is_empty() {
-            entry.remove(&target_key);
-        } else {
-            entry.insert(target_key.clone(), new_flags.clone());
-        }
-    }
-    if new_flags.is_empty() {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("Cleared flags for \x02{target}\x02 on \x02{channel}\x02."),
-        );
-    } else {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("Flags for \x02{target}\x02 on \x02{channel}\x02 are now +{new_flags}."),
         );
     }
 }

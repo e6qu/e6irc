@@ -2195,17 +2195,31 @@ async fn channel_access_persist_and_load() {
     .await
     .expect("channel");
 
-    db::set_channel_access(&pool, "#c", "alice", Some("ov".into()))
+    let applied = db::set_channel_access(&pool, "#c", "alice", Some("ov".into()))
         .await
         .expect("set");
+    assert!(applied, "granting a registered account must apply");
     assert_eq!(
         db::list_channel_access(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string(), "ov".to_string())]
     );
 
-    db::set_channel_access(&pool, "#c", "alice", None)
+    // Granting to an account that isn't registered writes no row and reports
+    // that nothing applied — the caller must not create a hot entry for it.
+    let phantom = db::set_channel_access(&pool, "#c", "ghost", Some("o".into()))
+        .await
+        .expect("phantom grant");
+    assert!(!phantom, "granting an unregistered account must not apply");
+    assert_eq!(
+        db::list_channel_access(&pool).await.expect("list"),
+        vec![("#c".to_string(), "alice".to_string(), "ov".to_string())],
+        "phantom grant leaked a row"
+    );
+
+    let cleared = db::set_channel_access(&pool, "#c", "alice", None)
         .await
         .expect("clear");
+    assert!(cleared, "clearing access always applies");
     assert!(
         db::list_channel_access(&pool)
             .await

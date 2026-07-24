@@ -418,14 +418,25 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             true
         }
         DbRequest::SetChannelAccess {
+            conn,
             channel,
             account,
             flags,
         } => {
-            if let Err(e) = set_channel_access(pool, &channel, &account, flags).await {
-                eprintln!("db: channel access persistence failed: {e}");
-            }
-            true
+            let applied = match set_channel_access(pool, &channel, &account, flags.clone()).await {
+                Ok(applied) => applied,
+                Err(e) => {
+                    eprintln!("db: channel access persistence failed: {e}");
+                    false
+                }
+            };
+            let reply = DbReply::ChannelAccessSet {
+                channel,
+                account,
+                flags,
+                applied,
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::AddServerBan {
             mask,
@@ -1003,34 +1014,52 @@ pub async fn query_targets(
 
 /// Upsert (or remove, when `flags` is `None`) one channel access entry by
 /// casefolded channel + account names.
+/// Upsert (`flags = Some`) or remove (`flags = None`) one channel-access entry.
+/// Returns whether the change was *applied to a real account*: the grant INSERT
+/// affects no rows when no `accounts` row matches (the account isn't
+/// registered), so the caller can refuse to record a phantom grant in its hot
+/// map. A removal is always considered applied — dropping a (possibly stale)
+/// entry is idempotent cleanup.
 pub async fn set_channel_access(
     pool: &PgPool,
-    channel_folded: &str,
-    account_folded: &str,
+    channel: &str,
+    account: &str,
     flags: Option<String>,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
+    let channel_folded = CaseMapping::Rfc1459.casefold(channel);
+    let account_folded = CaseMapping::Rfc1459.casefold(account);
     match flags {
-        Some(flags) => sqlx::query(
-            "INSERT INTO channel_access (channel_id, account_id, flags)
-             SELECT c.id, a.id, $3 FROM channels c, accounts a
-             WHERE c.name_folded = $1 AND a.name_folded = $2
-             ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
-        )
-        .bind(channel_folded)
-        .bind(account_folded)
-        .bind(flags),
-        None => sqlx::query(
-            "DELETE FROM channel_access ca USING channels c, accounts a
-             WHERE ca.channel_id = c.id AND ca.account_id = a.id
-               AND c.name_folded = $1 AND a.name_folded = $2",
-        )
-        .bind(channel_folded)
-        .bind(account_folded),
+        Some(flags) => {
+            let res = sqlx::query(
+                "INSERT INTO channel_access (channel_id, account_id, flags)
+                 SELECT c.id, a.id, $3 FROM channels c, accounts a
+                 WHERE c.name_folded = $1 AND a.name_folded = $2
+                 ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
+            )
+            .bind(&channel_folded)
+            .bind(&account_folded)
+            .bind(flags)
+            .execute(pool)
+            .await
+            .map_err(DbError::Query)?;
+            // No rows → the (channel, account) join matched nothing, i.e. the
+            // account is not registered; nothing was granted.
+            Ok(res.rows_affected() > 0)
+        }
+        None => {
+            sqlx::query(
+                "DELETE FROM channel_access ca USING channels c, accounts a
+                 WHERE ca.channel_id = c.id AND ca.account_id = a.id
+                   AND c.name_folded = $1 AND a.name_folded = $2",
+            )
+            .bind(&channel_folded)
+            .bind(&account_folded)
+            .execute(pool)
+            .await
+            .map_err(DbError::Query)?;
+            Ok(true)
+        }
     }
-    .execute(pool)
-    .await
-    .map_err(DbError::Query)?;
-    Ok(())
 }
 
 /// Whether `account` holds a registered relationship with `channel` — its
