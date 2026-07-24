@@ -212,12 +212,18 @@ impl App {
                 }
             }
             "QUIT" => {
-                // A quit affects every channel we share; note it in each.
+                // A quit affects the channels we share and any open query with
+                // the quitter. This client tracks no per-channel membership, so
+                // channel buffers are the closest honest scope — but a query
+                // buffer with an *unrelated* user must not report it: that
+                // would attribute an event to a conversation it never touched.
                 for b in &mut self.buffers {
-                    b.push(LogLine {
-                        from: "*".into(),
-                        text: format!("{sender} quit"),
-                    });
+                    if b.name.starts_with('#') || b.name.starts_with('&') || b.name == sender {
+                        b.push(LogLine {
+                            from: "*".into(),
+                            text: format!("{sender} quit"),
+                        });
+                    }
                 }
             }
             _ => {}

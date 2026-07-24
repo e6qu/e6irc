@@ -113,8 +113,11 @@ impl Connection {
     }
 
     /// Read the next server message, blocking until one arrives or the
-    /// connection closes (`None`). Over-long and malformed lines are
-    /// skipped.
+    /// connection closes (`None`). An over-long, non-UTF-8, or unparseable
+    /// line is an error: the framing layer already guarantees non-empty,
+    /// NUL-free lines, so anything that still fails to parse means the peer
+    /// is not speaking IRC — skipping it would silently drop protocol
+    /// traffic with no observable trace.
     pub async fn next_message(&mut self) -> io::Result<Option<OwnedMessage>> {
         Ok(self.next_message_with_line().await?.map(|(msg, _)| msg))
     }
@@ -129,12 +132,17 @@ impl Connection {
     /// bytes that arrived.
     pub async fn next_message_with_line(&mut self) -> io::Result<Option<(OwnedMessage, String)>> {
         loop {
-            while let Some(line) = self.pending.pop_front() {
-                if let Ok(text) = std::str::from_utf8(&line)
-                    && let Ok(msg) = Message::parse(text)
-                {
-                    return Ok(Some((OwnedMessage::from(&msg), text.to_string())));
-                }
+            if let Some(line) = self.pending.pop_front() {
+                let text = std::str::from_utf8(&line).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "server sent a non-UTF-8 line")
+                })?;
+                let msg = Message::parse(text).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("server sent an unparseable line: {e:?}"),
+                    )
+                })?;
+                return Ok(Some((OwnedMessage::from(&msg), text.to_string())));
             }
             let n = self.reader.read(&mut self.read_buf).await?;
             if n == 0 {
@@ -143,8 +151,16 @@ impl Connection {
             let mut events = Vec::new();
             self.framing.feed(&self.read_buf[..n], &mut events);
             for event in events {
-                if let LineEvent::Line(line) = event {
-                    self.pending.push_back(line);
+                match event {
+                    LineEvent::Line(line) => self.pending.push_back(line),
+                    // The framing layer's contract (framing.rs) is that the
+                    // caller must handle overflow loudly, never drop it.
+                    LineEvent::TooLong => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "server sent an over-long line",
+                        ));
+                    }
                 }
             }
         }

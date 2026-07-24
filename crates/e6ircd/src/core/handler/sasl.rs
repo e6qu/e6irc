@@ -243,6 +243,12 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 &[],
                 Some("SASL authentication successful"),
             );
+            // A registered client can re-authenticate mid-session (cap-notify
+            // allows `CAP REQ :sasl` after registration); account-notify peers
+            // must learn of the login like any other. For connect-time SASL
+            // the session isn't registered yet, and this is a no-op — the
+            // login is announced by the registration burst instead.
+            notify_account_change(state, conn, &account);
         }
         crate::core::DbReply::PasswordRejected | crate::core::DbReply::Unavailable => {
             let unavailable = matches!(reply, crate::core::DbReply::Unavailable);

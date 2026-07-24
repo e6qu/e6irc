@@ -127,35 +127,35 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let invitee_nick = state.sessions[&invitee].nick.clone().expect("registered");
-    // Bound the invitee's pending-invite set — INVITE would otherwise grow it
-    // without limit (invites to since-destroyed channels linger). Drop stale
-    // entries first; if still at the cap, evict an arbitrary old invite so the
-    // set stays bounded while the new one still lands (invites are low-value
-    // and the invitee can be re-invited).
-    if state.sessions[&invitee].invited.len() >= INVITE_LIMIT {
-        let stale: Vec<ChanKey> = state.sessions[&invitee]
+    // Bound the channel's pending-invite set — INVITE would otherwise grow it
+    // without limit (invites to since-disconnected sessions linger). Drop
+    // entries for dead connections first; if still at the cap, evict an
+    // arbitrary old invite so the set stays bounded while the new one still
+    // lands (invites are low-value and the invitee can be re-invited).
+    if state.channels[&key].invited.len() >= INVITE_LIMIT {
+        let stale: Vec<ConnId> = state.channels[&key]
             .invited
             .iter()
-            .filter(|k| !state.channels.contains_key(*k))
-            .cloned()
+            .filter(|c| !state.sessions.contains_key(*c))
+            .copied()
             .collect();
-        let invited = &mut state.sessions.get_mut(&invitee).expect("checked").invited;
-        for k in &stale {
-            invited.remove(k);
+        let invited = &mut state.channels.get_mut(&key).expect("checked").invited;
+        for c in &stale {
+            invited.remove(c);
         }
         while invited.len() >= INVITE_LIMIT {
-            let Some(victim) = invited.iter().next().cloned() else {
+            let Some(victim) = invited.iter().next().copied() else {
                 break;
             };
             invited.remove(&victim);
         }
     }
     state
-        .sessions
-        .get_mut(&invitee)
+        .channels
+        .get_mut(&key)
         .expect("checked")
         .invited
-        .insert(key.clone());
+        .insert(invitee);
     state.numeric(conn, RPL_INVITING, &[&invitee_nick, &display], None);
     let prefix = state.sessions[&conn].prefix();
     let line = format!(":{prefix} INVITE {invitee_nick} :{display}");

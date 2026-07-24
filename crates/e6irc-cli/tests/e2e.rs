@@ -81,6 +81,39 @@ async fn cli_send_reaches_a_tailing_client() {
     );
 }
 
+/// `send` to a nick nobody holds draws a 401 after the PRIVMSG; the exit code
+/// is this tool's product, so that delivery failure must be a non-zero exit —
+/// it used to be silently drained on the way out, reporting success for a
+/// message that reached no one.
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_send_to_missing_nick_exits_nonzero() {
+    let addr = start_server().await;
+    let bin = env!("CARGO_BIN_EXE_e6irc");
+    let output = tokio::task::spawn_blocking({
+        let addr = addr.to_string();
+        move || {
+            Command::new(bin)
+                .args([
+                    "--server", &addr, "--nick", "sender2", "send", "nobody", "hi",
+                ])
+                .output()
+                .expect("run cli")
+        }
+    })
+    .await
+    .expect("join");
+    assert!(
+        !output.status.success(),
+        "send to a nonexistent nick must exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot send"),
+        "stderr must say why: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn cli_sasl_login() {

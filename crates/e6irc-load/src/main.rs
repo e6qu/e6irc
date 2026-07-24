@@ -234,6 +234,10 @@ async fn client(
     // Setup phase. A failure here must NOT bypass the barrier: if a client
     // returned early with `?`, the remaining clients would block on the
     // barrier forever (the exact at-capacity scenario the harness measures).
+    // The phase is also bounded in time: a server that accepts the TCP
+    // connection but stalls before 001/366 is precisely the at-capacity
+    // behavior this harness exists to report, and an unbounded await here
+    // would wedge every client behind the barrier with zero output instead.
     let setup = async {
         let mut conn = connect(&args).await?;
         conn.register(&format!("load{id}"), "load").await?;
@@ -250,8 +254,14 @@ async fn client(
             .connect_max_ms
             .fetch_max(run_start.elapsed().as_millis() as u64, Ordering::Relaxed);
         Ok::<_, std::io::Error>(conn)
-    }
-    .await;
+    };
+    let setup = match tokio::time::timeout(Duration::from_secs(30), setup).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "setup (connect/register/join) took over 30s",
+        )),
+    };
 
     // Everyone reaches the barrier exactly once — even a client that failed
     // setup releases its slot so the survivors are never wedged. Then propagate
