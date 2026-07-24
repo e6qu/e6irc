@@ -250,11 +250,18 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 return;
             }
             // Drop the hot registration too: no more founder-op, topic
-            // retention, or access for this channel. (The DB row's
-            // channel_access cascades on the row delete.)
+            // retention, mode lock, keeptopic override, or access for this
+            // channel. `drop_channel` deletes the whole `channels` row — and the
+            // mlock/keeptopic settings are columns *on that row* — so every hot
+            // map scoped to registration must be cleared, or a later recreation
+            // of the channel reapplies a stale lock / keeptopic that the DB no
+            // longer holds (a divergence that a restart would silently flip).
+            // (The DB row's channel_access cascades on the row delete.)
             state.registered_founders.remove(&key);
             state.registered_topics.remove(&key);
             state.channel_access.remove(&key);
+            state.channel_mlock.remove(&key);
+            state.keeptopic_off.remove(&key);
             state.service_notice(
                 conn,
                 "ChanServ",

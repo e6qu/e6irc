@@ -4487,6 +4487,43 @@ fn chanserv_drop_unregisters_channel() {
     );
 }
 
+#[test]
+fn chanserv_drop_clears_the_mode_lock() {
+    // DROP deletes the whole `channels` DB row, which carries the mode lock, so
+    // the hot channel_mlock must be cleared too — otherwise recreating the
+    // channel reapplies a stale lock the DB no longer holds.
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg2".to_string(), "boss".to_string())]);
+    s.core
+        .preload_mlock(vec![("#reg2".to_string(), "+s".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+
+    // First join: the registered+mlocked channel forces +s.
+    s.line(boss, "JOIN #reg2");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|l| l.contains("MODE #reg2") && l.contains("+s")),
+        "the mode lock is applied on the registered channel"
+    );
+
+    // Drop it, empty it, then recreate it.
+    s.line(boss, "PRIVMSG ChanServ :DROP #reg2");
+    s.drain(boss);
+    s.line(boss, "PART #reg2");
+    s.drain(boss);
+    s.line(boss, "JOIN #reg2");
+    assert!(
+        !s.drain(boss)
+            .iter()
+            .any(|l| l.contains("MODE #reg2") && l.contains("+s")),
+        "a stale mode lock must not be reapplied to a dropped-and-recreated channel"
+    );
+}
+
 // ChanServ FLAGS / access (DESIGN §7.6): founder grants per-account flags
 // that auto-op / auto-voice on join.
 
