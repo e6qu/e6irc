@@ -99,9 +99,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
 
   The invariants this principle has actually installed, each closing a
   class that had bitten (a spot patch would have left the class open):
-  - `ChanKey`/`NickKey`/`HistoryKey` — casefolded map keys are a distinct
-    type from display names, constructible only via `chan_key`/`nick_key`,
-    so "index the channel table with un-casefolded input" cannot be written.
+  - `ChanKey`/`NickKey`/`HistoryKey`/`AccountKey` — casefolded map keys are a
+    distinct type from display names, constructible only via
+    `chan_key`/`nick_key`/`account_key`, so "index the channel/account table with
+    un-casefolded input" cannot be written. `AccountKey` types every in-core
+    account map (read markers, registered founders, channel access) onto the
+    folded convention; the DB enforces the same at the `name_folded` edge.
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the CR/LF sanitizer and
     the detached-buffer append; the bypass is a compile error, not a lint.

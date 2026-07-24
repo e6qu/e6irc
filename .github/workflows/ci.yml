@@ -359,7 +359,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pinned nightly: the 2026-07-24 nightly ICEs in rustc_codegen_ssa on a
+      # tokio task type under the fuzzer's ASAN+sancov instrumentation (a
+      # compiler bug, not our code). Pin to the last nightly that built the fuzz
+      # targets; bump when upstream fixes the codegen regression.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-23
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: fuzz
@@ -368,7 +374,7 @@ jobs:
         working-directory: fuzz
         run: |
           for target in parse_message tag_escaping isupport_token core_dispatch core_multi client_messages truncate_boundary framing base64_roundtrip bouncer_lines mask_matching; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            cargo +nightly-2026-07-23 fuzz run "$target" -- -max_total_time=30
           done
 
   # Informational only — no threshold (DESIGN §6).

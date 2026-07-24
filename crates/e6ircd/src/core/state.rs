@@ -33,6 +33,21 @@ impl NickKey {
     }
 }
 
+/// Casefolded account key; same rationale as [`ChanKey`]. Account names are
+/// compared case-insensitively (the DB enforces uniqueness on `name_folded`), so
+/// every in-core map keyed by an account uses this rather than a raw `String` —
+/// a display-cased account name can't index an account map, making the
+/// "markers/founder/access split across two casings" bug class unrepresentable.
+/// Build only via [`ServerState::account_key`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AccountKey(String);
+
+impl AccountKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub struct CoreConfig {
     pub server_name: String,
     pub network_name: String,
@@ -598,11 +613,11 @@ pub(crate) struct ServerState {
     pub monitors: HashMap<NickKey, HashSet<ConnId>>,
     /// Read markers: (account, target) → epoch millis. Mirrors the
     /// PostgreSQL table; this is the hot copy the core serves.
-    pub read_markers: HashMap<(String, ChanKey), e6irc_proto::time::Millis>,
+    pub read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
     /// Registered channels → founder account (both casefolded). The hot
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
-    pub registered_founders: HashMap<ChanKey, String>,
+    pub registered_founders: HashMap<ChanKey, AccountKey>,
     /// Registered channels → retained topic. Boot-loaded and kept in sync
     /// on TOPIC; restored when a registered channel is recreated so its
     /// topic survives the channel going empty.
@@ -617,7 +632,7 @@ pub(crate) struct ServerState {
     /// Per-channel access: channel → (folded account → flag chars, e.g.
     /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
     /// auto-op / auto-voice on join.
-    pub channel_access: HashMap<ChanKey, HashMap<String, String>>,
+    pub channel_access: HashMap<ChanKey, HashMap<AccountKey, String>>,
     /// Server bans (oper K/D/X-lines) refused at registration. Boot-loaded
     /// and kept in sync on KLINE/DLINE/XLINE and their removals.
     pub server_bans: Vec<ServerBan>,
@@ -819,6 +834,13 @@ impl ServerState {
         ChanKey(self.casemap.casefold(name))
     }
 
+    /// Key an account name for an in-core account map, under the server
+    /// casemapping. The one constructor for [`AccountKey`] — a raw account
+    /// string can't reach these maps without folding.
+    pub fn account_key(&self, name: &str) -> AccountKey {
+        AccountKey(self.casemap.casefold(name))
+    }
+
     /// The channel key for `target`, or `None` when it does not name a
     /// channel at all — so a caller handling both channels and users cannot
     /// accidentally casefold a nick into the channel table.
@@ -831,14 +853,14 @@ impl ServerState {
     pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
         self.registered_founders = rows
             .into_iter()
-            .map(|(name_folded, founder)| (ChanKey(name_folded), founder))
+            .map(|(name_folded, founder)| (ChanKey(name_folded), AccountKey(founder)))
             .collect();
     }
 
     /// Record a channel's founder (called when registration succeeds).
     pub fn set_founder(&mut self, channel: &str, founder_account: &str) {
         let key = self.chan_key(channel);
-        let founder = self.casemap.casefold(founder_account);
+        let founder = self.account_key(founder_account);
         self.registered_founders.insert(key, founder);
     }
 
@@ -846,7 +868,7 @@ impl ServerState {
     pub fn is_founder(&self, key: &ChanKey, account: &str) -> bool {
         self.registered_founders
             .get(key)
-            .is_some_and(|f| *f == self.casemap.casefold(account))
+            .is_some_and(|f| *f == self.account_key(account))
     }
 
     /// Whether channel `key` is registered (ownership recorded).
@@ -912,29 +934,31 @@ impl ServerState {
     /// flags)` rows into the hot access map.
     pub fn preload_access(&mut self, rows: Vec<(String, String, String)>) {
         self.channel_access.clear();
-        for (name_folded, account, flags) in rows {
+        for (name_folded, account_folded, flags) in rows {
             self.channel_access
                 .entry(ChanKey(name_folded))
                 .or_default()
-                .insert(account, flags);
+                .insert(AccountKey(account_folded), flags);
         }
     }
 
     /// Seed the read-marker mirror from persisted `(account, target, millis)`
-    /// rows at boot. The stored target is already the casefolded `ChanKey`
-    /// string (it was written from `ChanKey::as_str`), so it is wrapped
-    /// directly — matching the key MARKREAD builds at runtime.
+    /// rows at boot. The dump returns the display-cased account name, so it is
+    /// folded here into an `AccountKey` — matching the key MARKREAD builds at
+    /// runtime. The stored target is already the casefolded `ChanKey` string (it
+    /// was written from `ChanKey::as_str`), so it is wrapped directly.
     pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.read_markers.clear();
         for (account, target, ms) in rows {
+            let account = self.account_key(&account);
             self.read_markers.insert((account, ChanKey(target)), ms);
         }
     }
 
     /// The `(auto_op, auto_voice)` flags `account` holds on channel `key`.
     pub fn access_modes(&self, key: &ChanKey, account: &str) -> (bool, bool) {
-        let folded = self.casemap.casefold(account);
-        match self.channel_access.get(key).and_then(|m| m.get(&folded)) {
+        let account = self.account_key(account);
+        match self.channel_access.get(key).and_then(|m| m.get(&account)) {
             Some(flags) => (flags.contains('o'), flags.contains('v')),
             None => (false, false),
         }

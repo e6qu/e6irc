@@ -227,7 +227,8 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
                 CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END
          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                      ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x),
-                     $8::text[]) AS u(m, t, p, a, k, b, at, d)",
+                     $8::text[]) AS u(m, t, p, a, k, b, at, d)
+         ON CONFLICT (msgid) DO NOTHING",
     )
     .bind(&msgids)
     .bind(&targets)

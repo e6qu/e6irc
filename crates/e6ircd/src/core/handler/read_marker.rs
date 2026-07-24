@@ -30,7 +30,10 @@ pub(super) fn send_current_markread(
 ) {
     let account = state.sessions[&conn].account.clone();
     let ms = match &account {
-        Some(a) => state.read_markers.get(&(a.clone(), key.clone())).copied(),
+        Some(a) => state
+            .read_markers
+            .get(&(state.account_key(a), key.clone()))
+            .copied(),
         None => state.sessions[&conn].anon_read_markers.get(key).copied(),
     };
     let marker = ms
@@ -132,15 +135,18 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
     // Logged in: account-keyed marker — persisted and synced to the account's
     // other connections. An account may retain only so many markers (they
-    // outlive membership, so a membership gate would not bound the map).
+    // outlive membership, so a membership gate would not bound the map). The
+    // in-core map is keyed by the folded `AccountKey`, so a marker set as "Alice"
+    // and later queried as "alice" resolves to one entry, not two.
+    let account_key = state.account_key(&account);
     let is_new = !state
         .read_markers
-        .contains_key(&(account.clone(), key.clone()));
+        .contains_key(&(account_key.clone(), key.clone()));
     if is_new
         && state
             .read_markers
             .keys()
-            .filter(|(a, _)| a == &account)
+            .filter(|(a, _)| a == &account_key)
             .count()
             >= MAX_READ_MARKERS_PER_ACCOUNT
     {
@@ -161,13 +167,13 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // diverging the two. A first set always persists, whatever its value.
     let existing = state
         .read_markers
-        .get(&(account.clone(), key.clone()))
+        .get(&(account_key.clone(), key.clone()))
         .copied();
     let moved_forward = existing.is_none_or(|cur| new_ms > cur);
     if moved_forward {
         state
             .read_markers
-            .insert((account.clone(), key.clone()), new_ms);
+            .insert((account_key.clone(), key.clone()), new_ms);
         let persist = crate::core::DbRequest::SetReadMarker {
             account: account.clone(),
             target: key.as_str().to_string(),

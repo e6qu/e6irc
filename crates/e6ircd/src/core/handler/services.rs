@@ -377,7 +377,11 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         let mut entries: Vec<(String, String)> = state
             .channel_access
             .get(&key)
-            .map(|m| m.iter().map(|(a, f)| (a.clone(), f.clone())).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(a, f)| (a.as_str().to_string(), f.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         entries.sort();
         for (acct, flags) in &entries {
@@ -398,10 +402,11 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         return;
     };
     let target_folded = state.casemap.casefold(target);
+    let target_key = state.account_key(target);
     let current = state
         .channel_access
         .get(&key)
-        .and_then(|m| m.get(&target_folded))
+        .and_then(|m| m.get(&target_key))
         .cloned()
         .unwrap_or_default();
     let new_flags = apply_flag_changes(&current, changes);
@@ -425,9 +430,9 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
     {
         let entry = state.channel_access.entry(key.clone()).or_default();
         if new_flags.is_empty() {
-            entry.remove(&target_folded);
+            entry.remove(&target_key);
         } else {
-            entry.insert(target_folded.clone(), new_flags.clone());
+            entry.insert(target_key.clone(), new_flags.clone());
         }
     }
     if new_flags.is_empty() {
