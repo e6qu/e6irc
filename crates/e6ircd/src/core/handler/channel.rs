@@ -962,10 +962,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                             &["MODE"],
                             Some("Not enough parameters"),
                         );
-                        // Stop, but still broadcast the modes already applied
-                        // this command — returning here would mutate state
-                        // (e.g. a preceding +m) without ever announcing it.
-                        break;
+                        // Skip this mode but keep processing the string —
+                        // `break`ing would also drop any *param-less* mode after
+                        // it (`+ki` with no key silently lost the `+i`), an
+                        // order-dependent divergence. Modes already applied are
+                        // still broadcast after the loop.
+                        continue;
                     };
                     // Keys with spaces or empty are unusable on the wire.
                     if k.is_empty() || k.contains(' ') {
@@ -1012,8 +1014,9 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                             &["MODE"],
                             Some("Not enough parameters"),
                         );
-                        // Broadcast what already applied before stopping.
-                        break;
+                        // Skip, don't `break` — a later param-less mode must
+                        // still apply (see the `+k` arm).
+                        continue;
                     };
                     let n = l.parse::<u32>().ok().filter(|&n| n > 0);
                     let Some(n) = n else {
@@ -1029,10 +1032,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                         continue;
                     };
                     let chan = state.channels.get_mut(&key).expect("checked");
-                    // Announce only a real change to the limit value.
+                    // Announce only a real change to the limit value — the
+                    // canonical parsed value, not the raw token, so `+l 007`
+                    // broadcasts `+l 7` (what is actually enforced).
                     if chan.modes.limit != Some(n) {
                         chan.modes.limit = Some(n);
-                        changes.push((true, 'l', Some(l.to_string())));
+                        changes.push((true, 'l', Some(n.to_string())));
                     }
                 } else if chan.modes.limit.take().is_some() {
                     changes.push((false, 'l', None));
@@ -1119,14 +1124,23 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                         &["MODE"],
                         Some("Not enough parameters"),
                     );
-                    // Broadcast what already applied before stopping.
-                    break;
+                    // Skip, don't `break` — a later param-less mode must still
+                    // apply (see the `+k` arm).
+                    continue;
                 };
                 let nick_key = state.nick_key(who);
                 let Some(&member_conn) = state.nicks.get(&nick_key) else {
                     state.numeric(conn, ERR_NOSUCHNICK, &[who], Some("No such nick/channel"));
                     continue;
                 };
+                // Echo the target's canonical nick, not the raw input casing, so
+                // `+o bob` on member `Bob` broadcasts `+o Bob` — captured before
+                // the mutable channel borrow below.
+                let member_nick = state
+                    .sessions
+                    .get(&member_conn)
+                    .and_then(|s| s.nick.clone())
+                    .unwrap_or_else(|| who.to_string());
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let Some(member) = chan.members.get_mut(&member_conn) else {
                     state.numeric(
@@ -1146,7 +1160,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 };
                 if *field != adding {
                     *field = adding;
-                    changes.push((adding, c, Some(who.to_string())));
+                    changes.push((adding, c, Some(member_nick)));
                 }
             }
             other => {

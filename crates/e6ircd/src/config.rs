@@ -404,6 +404,14 @@ impl Config {
             if let Some(pw) = net.sasl_password.take() {
                 net.sasl_password = Some(open_secret(&pw, key.as_ref())?);
             }
+            // `sasl_account` carries the Slack driver's `xoxb-` bot token (a
+            // documented secret), so it must be unsealed too — otherwise a
+            // sealed value is handed to Slack verbatim as the token and auth
+            // fails with no hint the seal was ignored. A plaintext IRC account
+            // name passes through `open_secret` unchanged.
+            if let Some(account) = net.sasl_account.take() {
+                net.sasl_account = Some(open_secret(&account, key.as_ref())?);
+            }
         }
         for oper in &mut self.opers {
             oper.password = open_secret(&oper.password, key.as_ref())?;
@@ -455,6 +463,15 @@ impl Config {
         if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 {
             return Err(ConfigError::Invalid("limits must be nonzero".into()));
         }
+        // The advertised NICKLEN rides every relayed line's source prefix, so an
+        // unbounded nick can blow past the 512-byte wire limit (the same reason
+        // server_name/network_name are capped at 64) and inflates per-nick
+        // memory. Bound it like the other identifiers.
+        if self.nicklen > 64 {
+            return Err(ConfigError::Invalid(
+                "nicklen must be at most 64 (it rides every relayed line's prefix)".into(),
+            ));
+        }
         if self.max_hot_channels == 0 {
             return Err(ConfigError::Invalid(
                 "max_hot_channels must be nonzero (0 retains no channel history)".into(),
@@ -469,6 +486,17 @@ impl Config {
         if self.limits.auth_rate_burst == Some(0) {
             return Err(ConfigError::Invalid(
                 "limits.auth_rate_burst must be nonzero when set".into(),
+            ));
+        }
+        // `try_acquire` refuses a connection once `count >= max`, so a max of 0
+        // refuses *every* connection (a fresh IP already has count 0) — the
+        // server boots, reports "listening", and silently rejects all traffic.
+        // Reject the footgun like its command_burst/auth_rate_burst siblings.
+        if self.limits.max_connections_per_ip == Some(0) {
+            return Err(ConfigError::Invalid(
+                "limits.max_connections_per_ip must be nonzero when set (0 refuses every \
+                 connection)"
+                    .into(),
             ));
         }
         for cidr in &self.limits.trusted_proxies {
@@ -613,6 +641,15 @@ impl Config {
                     "[bnc] requires [database] to authenticate attaching clients".into(),
                 ));
             }
+        }
+        // `[registration]` policy only means anything with an account store; set
+        // without a `[database]` it silently does nothing (there are no accounts
+        // to create), so reject it loudly like [[oidc]]/[bnc] do — a no-silent
+        // no-op.
+        if self.registration != RegistrationConfig::default() && self.database.is_none() {
+            return Err(ConfigError::Invalid(
+                "[registration] requires [database] (there are no accounts without one)".into(),
+            ));
         }
         // Network selection by (owner, name) must be unambiguous: no two
         // entries may share an (owner, name), and a name cannot be both
@@ -852,6 +889,9 @@ mod tests {
     fn resolve_decrypts_network_sasl_password_via_key_file() {
         let key = crate::secret::SecretKey::generate();
         let sealed = key.seal("upstreampass");
+        // The Slack driver's bot token lives in sasl_account; a sealed value
+        // there must also be unsealed (it used to be handed to Slack verbatim).
+        let sealed_account = key.seal("xoxb-secret-token");
         let dir = std::env::temp_dir();
         let path = dir.join(format!("e6irc-key-{}.b64", std::process::id()));
         std::fs::write(&path, key.to_base64()).unwrap();
@@ -867,7 +907,7 @@ mod tests {
                 realname: None,
                 autojoin: Vec::new(),
                 buffer_cap: 1000,
-                sasl_account: Some("e6bnc".into()),
+                sasl_account: Some(sealed_account),
                 sasl_password: Some(sealed),
             }],
             secrets: Some(SecretsConfig {
@@ -880,6 +920,11 @@ mod tests {
         assert_eq!(
             cfg.networks[0].sasl_password.as_deref(),
             Some("upstreampass")
+        );
+        assert_eq!(
+            cfg.networks[0].sasl_account.as_deref(),
+            Some("xoxb-secret-token"),
+            "a sealed sasl_account (Slack bot token) must be unsealed too"
         );
     }
 
@@ -955,6 +1000,63 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "command_burst=0 flood-kills every command and must be rejected"
+        );
+    }
+
+    #[test]
+    fn zero_max_connections_per_ip_is_rejected() {
+        // `count >= 0` is always true, so a max of 0 refuses every connection —
+        // the server would boot and silently reject all traffic.
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            limits: LimitsConfig {
+                max_connections_per_ip: Some(0),
+                ..LimitsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "max_connections_per_ip=0 refuses every connection and must be rejected"
+        );
+    }
+
+    #[test]
+    fn oversized_nicklen_is_rejected() {
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            nicklen: 500,
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "an unbounded nicklen can push a relayed line past the wire limit"
+        );
+    }
+
+    #[test]
+    fn registration_without_database_is_rejected() {
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            registration: RegistrationConfig {
+                before_connect: true,
+                ..RegistrationConfig::default()
+            },
+            database: None,
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "[registration] without [database] is a silent no-op and must be rejected"
         );
     }
 

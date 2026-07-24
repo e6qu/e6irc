@@ -1593,6 +1593,82 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-eighth sweep — four-front hunt: a config that bricks the
+server, a credential that deletes the account password, and a doubled
+per-IP cap (2026-07-24): four parallel audits on config/boot/shutdown, the
+CHATHISTORY command surface, account-registration + the REST self-service API,
+and the channel MODE internals. Eleven confirmed bugs fixed:
+
+1. **`max_connections_per_ip = 0` was accepted and bricked the server**
+   (config.rs) — `try_acquire` refuses once `count >= max`, so a max of 0
+   refuses *every* connection; the server booted, reported "listening", and
+   silently rejected all traffic. Rejected at load like its command_burst /
+   auth_rate_burst siblings.
+2. **The BNC listener used a *separate* per-IP limiter** (net.rs), so one IP
+   could hold `max_connections_per_ip` IRC/WS connections *and* that many BNC
+   connections — doubling the documented cap. It now shares the one counter.
+3. **A sealed Slack bot token in `sasl_account` was never decrypted**
+   (config.rs) — `resolve_secrets` unsealed `sasl_password` but not
+   `sasl_account`, so a sealed `enc:v1:…` value was handed to Slack verbatim as
+   the token (silent auth failure). Now unsealed too.
+4. **`[registration]` without `[database]` was a silent no-op** — accepted but
+   unable to do anything (no account store). Rejected loudly like [[oidc]]/[bnc].
+5. **`nicklen` had no upper bound** — the advertised NICKLEN rides every relayed
+   line's prefix, so an unbounded value could push a line past 512. Capped at 64
+   like server_name/network_name.
+6. **`DELETE /me/credentials/{id}` could delete the account's primary
+   `local_password`** (db.rs) — the delete didn't filter `kind`, and
+   `list_credentials` exposes the primary's id, so a caller could remove their
+   own password login (self-lockout). Scoped to `kind = 'app_password'`.
+7. **App-password / PAT labels were unbounded and control-char-unchecked**
+   (http) — inconsistent with the network fields (bounded 64/128/255,
+   CR/LF/NUL-rejected). Now validated (≤64, no control chars) via a shared
+   `validate_label`.
+8. **No per-account cap on app passwords / PATs** — networks and read-markers
+   are capped, these weren't; an authenticated account could flood the
+   credential tables. Both capped at 32 (the app-password cap enforced in the DB
+   choke point, the PAT cap at the handler so the device-grant login path isn't
+   gated).
+9. **A `MODE` param mode that ran out of arguments `break`ed the whole string,
+   dropping a later param-less mode** (channel.rs) — `+ki` with no key silently
+   lost the `+i`, an order-dependent divergence from `+ik`. Now it skips the
+   arg-less mode and continues, so a later `+i`/`+m`/… still applies.
+10. **`+o`/`+v` echoed the raw input nick, not the target's canonical nick**, and
+    **`+l` echoed the raw token, not the parsed value** (`+l 007` broadcast
+    `+l 007` while enforcing `7`). Both now broadcast the canonical/parsed value
+    for state-tracking fidelity.
+11. A stale `targets_page` doc comment (said "newest-first" while emitting
+    oldest-first) was corrected.
+
+Surfaced, not changed: **no graceful shutdown / signal handling** — a SIGTERM
+under load drops DB writes still queued in the worker (already acknowledged
+in-code as the planned signal-handling work; a coordinated drain-on-signal is a
+dedicated change, not a rush alongside eleven fixes); **CHATHISTORY DM replay is
+mis-addressed after the *requester* renames** (MEDIUM) — the re-addressing
+compares the row's historical sender *nick* to the requester's *current* nick,
+so an authenticated user who renames mid-conversation sees their own sent lines
+re-addressed to themselves. The class fix (carry the sender's stable identity on
+`HistoryRow`/`HistoryEntry` — the DB already stores `sender_account` — and
+compare it to `conn_identity` in `history_page`) touches the pinned history SQL
+macros, `HistoryDbRow`, its SQL-assertion test, and the fuzz crate; it is a
+coherent dedicated follow-up, deliberately not rushed into the hardened
+CHATHISTORY path (as that arc itself was done incrementally in sweeps 60–62).
+Also surfaced: unauthenticated DM history becomes unreadable once the
+correspondent goes offline (a `~nick`-vs-`nick` identity-key asymmetry, a
+consequence of the identity model); `REGISTER` isn't gated on the
+`draft/account-registration` cap (a spec nicety — the account name is still
+forced to the held nick and the credential budget still applies); and the
+unauthenticated `POST /auth/app-passwords` has no hard credential budget when
+`auth_rate_burst` is unset (operator-configurable). Clean bills: the entire
+CHATHISTORY selector/ring/DB-routing/authorization/framing surface (only the
+requester-rename re-addressing is off), boot ordering (preloads before the
+worker, migrations before preloads), TLS loading (no plaintext fallback), the
+whole /me/* authZ surface (no IDOR), the REGISTER state machine (no nick
+hijack), and the MODE parameter-consumption model for every mixed +/- string.
+Verified beyond the gate: full irctest main list (255 passed) and PG-backed
+services list (49 passed); new PG db tests for the credential fixes; the fuzz
+crate builds under `--cfg fuzzing`.
+
 Sixty-seventh sweep — four-front hunt: a client-triggerable CAP
 panic, an unremovable server ban, and a SASL abort cross-wire (2026-07-24):
 four parallel audits on the query surface (WHO/WHOIS/WHOWAS/ISON/USERHOST),
