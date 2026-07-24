@@ -488,6 +488,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
         &[
             "EXCEPTS",
             "INVEX",
+            "KNOCK",
             "UTF8ONLY",
             "WHOX",
             "MONITOR=100",

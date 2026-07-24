@@ -8,6 +8,7 @@
 //! sender `@user:server` ⇄ nick `user`; `m.text` message body ⇄ PRIVMSG
 //! text. Non-text events and the bridge user's own echoes are dropped.
 
+use super::BoundedJson;
 use std::collections::HashMap;
 
 use super::{ConnectionEvent, DriverEnds, NetworkDriver, NetworkHandle};
@@ -160,9 +161,8 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| format!("login rejected: {e}"))?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     let token = login["access_token"]
         .as_str()
         .ok_or("no access_token in login response")?
@@ -195,6 +195,15 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
                 "matrix: room alias {alias:?} maps to an unsafe IRC channel {channel:?}"
             ));
         }
+        // Two rooms that derive the same IRC channel name would silently
+        // overwrite each other in the map — outbound reaching only one room,
+        // inbound from both collapsing under one channel. Refuse loudly, like an
+        // unsafe name, rather than lose the mapping.
+        if session.channel_to_room.contains_key(&channel) {
+            return Err(format!(
+                "matrix: two rooms map to the same IRC channel {channel:?}; rename one alias"
+            ));
+        }
         let room_id = join_room(&session, alias).await?;
         session
             .channel_to_room
@@ -216,9 +225,8 @@ async fn join_room(s: &Session, alias: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| format!("join {alias} rejected: {e}"))?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
     resp["room_id"]
         .as_str()
         .map(str::to_string)
@@ -249,9 +257,8 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
         .map_err(|e| e.to_string())?
         .error_for_status()
         .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())?;
+        .bounded_json()
+        .await?;
 
     let next = body["next_batch"]
         .as_str()

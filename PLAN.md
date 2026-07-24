@@ -1593,6 +1593,71 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventieth sweep — four-front hunt: a bridge OOM, an unbounded
+rate-limiter map, and a channel-name that could forge a param (2026-07-25):
+four parallel audits on the chat bridges (matrix/discord/slack), the
+sanitization primitives, the reaper/timers/limiters, and the registration
+burst/numerics/ISUPPORT. Seven bugs fixed:
+
+1. **`valid_channel_name` didn't reject CR/LF/NUL** (sanitize.rs, MEDIUM) — its
+   docstring promised a name "free of the bytes that would split it or the line,"
+   but the reject set was only space/comma/BEL/`:`. Client names are pre-screened
+   by `Message::parse`, but a *bridge* channel name comes from a remote API and
+   never passes the parser, so a `#foo\nEVIL` would flatten (via `upstream_line`)
+   to the multi-param forge `#foo EVIL` the space-check exists to prevent. CR/LF/
+   NUL are now rejected.
+2. **A bridge could be OOM'd by an oversized upstream response** (bouncer, MEDIUM)
+   — every `reqwest` `.json()` in the matrix/discord/slack drivers buffers the
+   whole body first, so a hostile or compromised upstream (the Matrix example
+   even permits plaintext `http://…`, MITM-able) could return a multi-GB body and
+   OOM the shared daemon — a cross-tenant DoS. All eight call sites now go through
+   a `BoundedJson` extension that reads chunk-by-chunk under a 16 MiB cap.
+3. **The auth-rate limiter map was not actually bounded** (oidc.rs, MEDIUM) — the
+   prune only removed *fully-refilled* entries, so a flood from many distinct IPs
+   (trivial with an IPv6 /64) kept every entry below full and retained them all,
+   growing the map to ~request-rate × 60s. It now hard-caps at `MAX_AUTH_BUCKETS`,
+   evicting the least-recently-seen entry (whose bucket simply resets) to make
+   room — mirroring `pending_auth`'s hard cap.
+4. **Two bridged rooms/channels deriving the same IRC name silently collapsed the
+   mapping** (matrix/discord/slack, MEDIUM) — outbound reached only one, inbound
+   from both merged under one channel, with no warning (unlike an *unsafe* name,
+   which is refused loudly). A name collision is now refused loudly too.
+5. **`valid_client_tag_key` was over-permissive and unbounded** (sanitize.rs) —
+   it accepted `.` anywhere, a leading/duplicated `/`, and any length, so a
+   malformed or multi-KB client-only tag key was relayed verbatim to every
+   recipient. It now enforces the spec `+[vendor/]name` structure and a length
+   cap.
+6. **KNOCK was implemented but never advertised in ISUPPORT** (query.rs) — a
+   client that gates its `/knock` UI on the `KNOCK` 005 token believed the server
+   couldn't do it, though `KNOCK #invite-only` works. Now advertised.
+7. **The command-flood bucket stalled on a backward wall-clock step** (handler,
+   LOW) — an NTP correction left the refill watermark in the future, so
+   `saturating_sub` yielded 0 and the bucket never refilled, flood-killing an
+   actively-talking client through no fault of its own. It now re-anchors the
+   watermark to `now` when time goes backward.
+
+Surfaced, not changed: several LOW bridge items — `route_privmsg` doesn't split
+comma-target lists or strip a STATUSMSG prefix (a delivery restructure), routing
+is case-sensitive rather than casemap-folded, a fatal auth rejection reconnects
+forever (the "always-on" policy treats it as transient), and an attachment-only
+Discord message renders nothing; the reaper/flood timers run on the wall clock
+rather than a monotonic source (the flood backstep is fixed above; the reaper's
+forward-step exposure is bounded by its ping re-anchor) and the reaper `Tick`
+stamps its `now` from `wall_clock` directly rather than the injected
+`config.clock` (benign while they are the same function); the `RPL_MYINFO` 5th
+field carries prefix modes rather than the param-taking channel modes (MYINFO is
+deprecated, essentially unparsed); and the OIDC-provisioned `account_name`
+charset diverges from `valid_nick` (account ≠ nick, no wire hazard). Clean bills:
+the whole bridge line-injection defense (`upstream_line`/`nick_token`, notices
+wire-limited, no remote-input panic), the flood-bucket refill arithmetic and
+reaper cadence at every boundary, `ConnLimiter`/credential-budget/SendQ/`doomed`
+accounting, the registration burst ordering (001→005→LUSERS→MOTD, ban-checked,
+no double-burst), the numerics table (all codes unique/in-range), and the
+ISUPPORT advertise-vs-enforce matrix (every other token matches). Verified beyond
+the gate: full irctest main list (255) and PG services list (49); the dex-backed
+`tests/oidc.rs` (4) and embed-web `tests/http.rs` (12); the bridges built under
+`--features matrix,discord,slack`; the fuzz crate under `--cfg fuzzing`.
+
 Sixty-ninth sweep — the CHATHISTORY rename fix + four-front hunt:
 TAGMSG missing tags, an OIDC first-login race (2026-07-24): landed the
 CHATHISTORY DM requester-rename mis-address surfaced in sweep 68, plus four

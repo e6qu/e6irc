@@ -107,20 +107,40 @@ pub(crate) fn upstream_line(line: String) -> String {
     }
 }
 
+/// Longest client-only tag key relayed. The whole tag section is bounded, but
+/// an oversized key is still propagated verbatim to every recipient — a vendor
+/// host plus a name never needs more than this.
+pub(crate) const MAX_TAG_KEY_LEN: usize = 100;
+
 /// Whether a client-only tag key is well-formed enough to relay to other
 /// clients. The parser accepts any non-delimiter byte in a key (control chars,
-/// non-ASCII), but the message-tags spec restricts a client-only key to `+` then
-/// an optional `vendor/` and a `[A-Za-z0-9-]` name — so relaying a raw key would
-/// propagate a malformed or hostile one to everyone in the channel. A key that
-/// does not fit the spec charset is dropped rather than relayed.
+/// non-ASCII), but the message-tags spec restricts a client-only key to `+`,
+/// then an optional dotted-hostname `vendor/`, then a `[A-Za-z0-9-]` name — so
+/// relaying a raw key would propagate a malformed, oversized, or hostile one to
+/// everyone in the channel. A key that does not fit the spec (structure, charset,
+/// or length) is dropped rather than relayed.
 pub(crate) fn valid_client_tag_key(key: &str) -> bool {
     let Some(rest) = key.strip_prefix('+') else {
         return false;
     };
-    !rest.is_empty()
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'/'))
+    if rest.is_empty() || rest.len() > MAX_TAG_KEY_LEN {
+        return false;
+    }
+    // `[vendor/]name` with at most one `/`: `split_once` keeps any further `/` in
+    // the name segment, which the name charset then rejects.
+    let (vendor, name) = match rest.split_once('/') {
+        Some((v, n)) => (Some(v), n),
+        None => (None, rest),
+    };
+    let name_ok = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    // The vendor is a hostname: alphanumerics, `-`, and `.` — but not empty
+    // (a leading `/` is malformed).
+    let vendor_ok = vendor.is_none_or(|v| {
+        !v.is_empty()
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.'))
+    });
+    name_ok && vendor_ok
 }
 
 /// Whether `nick` is a legal nickname: it starts with a letter or one of the
@@ -146,12 +166,19 @@ pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
 
 /// Whether `name` is a legal channel name: `#`-prefixed, non-empty, ≤ 50 bytes,
 /// and free of the bytes that would split it or the line (space, comma, BEL,
-/// `:`). A middle parameter, so no space is the load-bearing rule.
+/// `:`, and CR/LF/NUL). A middle parameter, so no space is the load-bearing
+/// rule — but CR/LF/NUL matter too: client names are pre-screened by
+/// `Message::parse`, yet a *bridge* channel name comes from a remote API and
+/// never passes through the parser, so a `#foo\nEVIL` would otherwise flatten
+/// (via `upstream_line`) to the multi-param forge `#foo EVIL` the space-check
+/// exists to prevent.
 pub(crate) fn valid_channel_name(name: &str) -> bool {
     name.starts_with('#')
         && name.len() > 1
         && name.len() <= 50
-        && !name.bytes().any(|b| matches!(b, b' ' | b',' | 0x07 | b':'))
+        && !name
+            .bytes()
+            .any(|b| matches!(b, b' ' | b',' | 0x07 | b':' | b'\r' | b'\n' | 0))
 }
 
 #[cfg(test)]
@@ -288,5 +315,49 @@ mod tests {
         assert_eq!(upstream_line("a\rb\nc\0d".into()), "a b c d");
         let clean = "x y z".to_string();
         assert_eq!(upstream_line(clean.clone()), clean);
+    }
+
+    #[test]
+    fn valid_client_tag_key_enforces_spec_and_length() {
+        // Legit client-only keys.
+        assert!(valid_client_tag_key("+typing"));
+        assert!(valid_client_tag_key("+draft/react"));
+        assert!(valid_client_tag_key("+example.com/reaction"));
+        // Not client-only (no `+`), empty, malformed structure.
+        assert!(!valid_client_tag_key("typing")); // no +
+        assert!(!valid_client_tag_key("+")); // empty
+        assert!(!valid_client_tag_key("+/name")); // empty vendor (leading /)
+        assert!(!valid_client_tag_key("+vendor/")); // empty name (trailing /)
+        assert!(!valid_client_tag_key("+a/b/c")); // multiple /
+        assert!(!valid_client_tag_key("+foo.bar")); // `.` only allowed in vendor
+        // Length cap — a key at the cap is fine; one over it is dropped, not
+        // relayed to everyone.
+        assert!(valid_client_tag_key(&format!(
+            "+{}",
+            "a".repeat(MAX_TAG_KEY_LEN)
+        )));
+        assert!(!valid_client_tag_key(&format!(
+            "+{}",
+            "a".repeat(MAX_TAG_KEY_LEN + 1)
+        )));
+    }
+
+    #[test]
+    fn valid_channel_name_rejects_line_and_param_breakers() {
+        assert!(valid_channel_name("#room"));
+        // Space/comma/BEL/colon (the original set).
+        for bad in ["#a b", "#a,b", "#a\x07b", "#a:b"] {
+            assert!(!valid_channel_name(bad), "{bad:?} must be rejected");
+        }
+        // CR/LF/NUL — a bridge name that never passes Message::parse. `#foo\nEVIL`
+        // would flatten to the `#foo EVIL` param forge without this.
+        for bad in ["#foo\nEVIL", "#foo\rEVIL", "#foo\0EVIL"] {
+            assert!(
+                !valid_channel_name(bad),
+                "{bad:?} must be rejected (CR/LF/NUL)"
+            );
+        }
+        assert!(!valid_channel_name("#")); // just the sigil
+        assert!(!valid_channel_name("room")); // no #
     }
 }

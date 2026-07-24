@@ -185,6 +185,41 @@ pub(crate) fn route_privmsg(
     }
 }
 
+/// Largest HTTP response body a bridge will read from an upstream before
+/// parsing it as JSON.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) const MAX_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// JSON-parse an upstream HTTP response body under a size cap. `reqwest`'s
+/// `.json()`/`.bytes()` buffer the *whole* body first, so a hostile or
+/// compromised upstream (the Matrix example config even permits plaintext
+/// `http://…`, MITM-able) can return a multi-GB body and OOM the shared daemon —
+/// a cross-tenant DoS, since one process serves every user. This reads chunk by
+/// chunk and rejects a body past `MAX_BRIDGE_RESPONSE_BYTES` before buffering it.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) trait BoundedJson {
+    async fn bounded_json<T: serde::de::DeserializeOwned>(self) -> Result<T, String>;
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl BoundedJson for reqwest::Response {
+    async fn bounded_json<T: serde::de::DeserializeOwned>(mut self) -> Result<T, String> {
+        if let Some(len) = self.content_length()
+            && len as usize > MAX_BRIDGE_RESPONSE_BYTES
+        {
+            return Err(format!("upstream response too large ({len} bytes)"));
+        }
+        let mut buf = Vec::new();
+        while let Some(chunk) = self.chunk().await.map_err(|e| e.to_string())? {
+            if buf.len() + chunk.len() > MAX_BRIDGE_RESPONSE_BYTES {
+                return Err("upstream response exceeded the size cap".to_string());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&buf).map_err(|e| e.to_string())
+    }
+}
+
 /// Which IRCv3 message-tag families an attaching client negotiated. Buffered
 /// upstream lines are stored fully tagged (server-time/msgid/account); these
 /// gate which tags each client is actually sent, since a tag a client didn't
