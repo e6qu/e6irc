@@ -1593,6 +1593,49 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-first sweep — CHATHISTORY ring↔DB boundary unification (2026-07-24):
+the continuation of sweep 60's scoped CHATHISTORY work. Sweep 60 fixed the
+missing-msgid pagination dead-end (Bug 1); this sweep fixes the ring-vs-DB
+boundary disagreement (Bug 2), the largest remaining piece.
+
+**The ring answered AFTER / bounded-LATEST / BETWEEN with different boundary
+semantics than the PostgreSQL fallback** (`history.rs`), so the two paths could
+return *different rows for the same request* — violating the design invariant
+that CHATHISTORY must not answer differently by source. The ring resolved a
+`timestamp=T` pivot to "first entry with `ts >= T`" and then did `skip(pos+1)`,
+while the DB uses strict `ts > T`:
+- `AFTER timestamp=T` where `T` fell *between* two messages dropped the first
+  message after `T` (the ring skipped it; the DB included it).
+- `AFTER`/bounded-`LATEST` with a pivot *older than the ring's oldest* not only
+  hit that off-by-one but also reported `covered = true`, so the DB was never
+  consulted and evicted messages between `T` and the ring were silently missed.
+- The `BETWEEN` lower bound had the same `skip(pos+1)` off-by-one for a
+  timestamp between messages.
+
+`resolve_ring_window` was rewritten around explicit *lower-exclusive* (`ts > T`
+/ after-the-msgid) and *upper-exclusive* (`ts < T` / before-the-msgid) boundary
+helpers that match the DB exactly, with `covered` computed correctly for the
+pivot-older-than-ring case (AFTER/LATEST/BETWEEN now defer to the DB when the
+oldest row they'd return could be evicted). The BETWEEN direction and bounds are
+derived by ordering the two pivots by how many entries precede each, not by a
+ring-only timestamp compare. The exhaustive differential test's reference impl
+was independently rewritten to the DB-strict spec (so ring == reference == DB),
+its adversarial alphabet already exercises timestamps that land between messages
+and past the ring, and focused tests pin the specific boundary cases. The
+`chathistory` services irctest (ring + DB together) stays green.
+
+Still deferred — the two BETWEEN DB-path bugs sweep 60 named (c/d), which are
+independent of the ring and need DB-side pivot resolution: a mixed
+`msgid=`+`timestamp=` BETWEEN whose msgid has scrolled out of the ring loses the
+msgid bound (`selector_ts` is ring-only), and a newest-first two-`msgid` BETWEEN
+past the ring mis-derives direction and returns an inverted empty range. Both
+require resolving a `msgid=` pivot's `(ts, id)` in SQL (a preliminary lookup or
+a self-orienting query) rather than depending on the ring — a distinct, contained
+piece with its own DB integration tests, kept separate from this
+ring-semantics rewrite rather than rushed alongside it. Also still open: the
+`FLAGS <unknown-account>` hot/DB divergence (needs the founder-transfer
+round-trip).
+
 Sixtieth sweep — CHATHISTORY pagination dead-end, a ChanServ DROP
 divergence, and DB-worker head-of-line blocking (2026-07-24): two deep audits
 (the CHATHISTORY PostgreSQL query path, and the ChanServ/mlock/founder
