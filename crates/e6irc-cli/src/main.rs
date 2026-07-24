@@ -16,6 +16,16 @@ fn is_join_error(command: &str) -> bool {
     )
 }
 
+/// IRC numerics that mean a PRIVMSG was not delivered — `send` exists to
+/// deliver one message, so any of these arriving during the post-send drain
+/// must fail the command instead of exiting 0 on a message nobody received.
+fn is_send_error(command: &str) -> bool {
+    matches!(
+        command,
+        "400" | "401" | "402" | "404" | "407" | "411" | "412"
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "e6irc", about = "Scripting-oriented IRC client", version)]
 struct Cli {
@@ -150,7 +160,16 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // wait for the join to be confirmed.
             if target.starts_with('#') {
                 conn.send_line(&format!("JOIN {target}")).await?;
-                while let Some(msg) = conn.next_message().await? {
+                loop {
+                    // A close before 366 means the message was never sent —
+                    // falling through to PRIVMSG would write into a dead
+                    // socket and exit 0 on a delivery that never happened.
+                    let Some(msg) = conn.next_message().await? else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("connection closed before the join to {target} was confirmed"),
+                        ));
+                    };
                     if msg.command == "366" {
                         break; // end of NAMES = joined
                     }
@@ -169,8 +188,18 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             conn.send_line(&format!("PRIVMSG {target} :{message}"))
                 .await?;
             conn.send_line("QUIT :done").await?;
-            // drain until the server closes so the message is flushed
-            while conn.next_message().await?.is_some() {}
+            // Drain until the server closes so the message is flushed — but a
+            // delivery-failure numeric in this window (401 no such nick, 404
+            // cannot send to channel, …) means nobody received the message,
+            // and the exit code is this tool's product.
+            while let Some(msg) = conn.next_message().await? {
+                if is_send_error(&msg.command) {
+                    let reason = msg.params.last().cloned().unwrap_or_default();
+                    return Err(std::io::Error::other(format!(
+                        "cannot send to {target}: {reason}"
+                    )));
+                }
+            }
         }
         Command::Tail { target, count } => {
             if target.starts_with('#') {
@@ -202,6 +231,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         break;
                     }
                 }
+            }
+            // A bounded tail that ends early delivered less than it promised —
+            // a script reading N lines must not see success on a truncation.
+            if count != 0 && seen < count {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("connection closed after {seen} of {count} messages"),
+                ));
             }
         }
         Command::History { target, count } => {
@@ -240,8 +277,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // CHATHISTORY requires channel membership.
             conn.send_line(&format!("JOIN {target}")).await?;
             loop {
+                // A close before 366 means no history was fetched — falling
+                // through would run CHATHISTORY on a dead socket and exit 0
+                // with empty output.
                 let Some(m) = conn.next_message().await? else {
-                    break;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("connection closed before the join to {target} was confirmed"),
+                    ));
                 };
                 if m.command == "366" {
                     break;
@@ -299,9 +342,34 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             while conn.next_message().await?.is_some() {}
         }
         Command::Raw => {
-            use std::io::BufRead;
-            for line in std::io::stdin().lock().lines() {
-                conn.send_line(&line?).await?;
+            use tokio::io::AsyncBufReadExt;
+            // Read stdin asynchronously and keep servicing the socket between
+            // lines — a blocking stdin read on this current-thread runtime
+            // would leave server PINGs unanswered while a slow producer (a
+            // pipe with pauses) feeds us, getting the session ping-timed-out
+            // and the late lines written into a dead socket.
+            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            loop {
+                tokio::select! {
+                    line = stdin.next_line() => {
+                        let Some(line) = line? else {
+                            break; // stdin exhausted
+                        };
+                        conn.send_line(&line).await?;
+                    }
+                    msg = conn.next_message() => {
+                        let Some(msg) = msg? else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "server closed the connection before stdin was exhausted",
+                            ));
+                        };
+                        if msg.command == "PING" {
+                            let token = msg.params.first().cloned().unwrap_or_default();
+                            conn.send_line(&format!("PONG :{token}")).await?;
+                        }
+                    }
+                }
             }
             conn.send_line("QUIT :done").await?;
             while conn.next_message().await?.is_some() {}

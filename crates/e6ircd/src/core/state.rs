@@ -196,8 +196,6 @@ pub(crate) struct Session {
     pub wallops: bool,
     /// Bot (umode +B).
     pub bot: bool,
-    /// Channels this session was INVITEd to (clears on join).
-    pub invited: HashSet<ChanKey>,
     /// Joined channels.
     pub channels: HashSet<ChanKey>,
     /// Nicks this session MONITORs (display form as given).
@@ -531,6 +529,13 @@ pub(crate) struct Channel {
     pub quiets: Vec<String>,
     pub ban_exceptions: Vec<String>,
     pub invite_exceptions: Vec<String>,
+    /// Connections holding a pending INVITE into this channel (consumed on
+    /// join). Lives on the channel — not the invitee's session — so channel
+    /// teardown revokes it: an invite is a grant by an op of *this* channel
+    /// incarnation, and a session-side set keyed by name would let it
+    /// authorize entry into an unrelated later channel reusing the name
+    /// (a +i bypass). Bounded by `INVITE_LIMIT` per channel.
+    pub invited: HashSet<ConnId>,
     /// Unix **seconds** — RPL_CREATIONTIME reports whole seconds, so this is
     /// deliberately coarser than the millisecond `Config::clock`.
     pub created_at_secs: u64,
@@ -1144,7 +1149,6 @@ impl ServerState {
                 invisible: false,
                 wallops: false,
                 bot: false,
-                invited: HashSet::new(),
                 channels: HashSet::new(),
                 monitoring: HashMap::new(),
                 multiline: None,
@@ -1472,6 +1476,18 @@ impl ServerState {
             return;
         };
         let was_registered = session.registered;
+        // A teardown initiated from inside a labeled command (QUIT, flood
+        // kill, credential-budget close) has its terminal `ERROR` sitting in
+        // the labeled-response capture buffer; the dispatch wrapper would only
+        // try to deliver it after this session is gone and silently drop it.
+        // Flush the capture now, while the connection can still receive the
+        // loud close those paths exist to provide.
+        if self.capture.as_ref().is_some_and(|c| c.conn == conn) {
+            let capture = self.capture.take().expect("checked");
+            for line in capture.lines {
+                self.send_bytes_uncaptured(conn, line);
+            }
+        }
         if was_registered {
             self.record_whowas(conn);
         }

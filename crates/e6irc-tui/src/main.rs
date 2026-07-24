@@ -66,14 +66,27 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                     Ok(Some(m)) => {
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
-                            let _ = conn.send_line(&format!("PONG :{token}")).await;
+                            // A failed PONG write means the connection is dying;
+                            // staying in the loop would hide that until the
+                            // server ping-times us out with no surfaced cause.
+                            if conn.send_line(&format!("PONG :{token}")).await.is_err() {
+                                let _ = net_tx.send(Ev::Disconnected).await;
+                                break;
+                            }
                         }
                         if net_tx.send(Ev::Net(m)).await.is_err() { break; }
                     }
                     _ => { let _ = net_tx.send(Ev::Disconnected).await; break; }
                 },
                 line = out_rx.recv() => match line {
-                    Some(l) => { let _ = conn.send_line(&l).await; }
+                    // A failed write must surface — the UI already echoed the
+                    // line into the buffer, so silently continuing would show
+                    // the user a message that was never sent (and drop every
+                    // later one down the same broken socket).
+                    Some(l) => if conn.send_line(&l).await.is_err() {
+                        let _ = net_tx.send(Ev::Disconnected).await;
+                        break;
+                    },
                     None => break,
                 },
             }

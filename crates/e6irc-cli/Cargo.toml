@@ -13,6 +13,7 @@ tokio = { version = "1.53.0", default-features = false, features = [
     "rt",
     "net",
     "io-util",
+    "io-std",
     "time",
     "macros",
 ] }

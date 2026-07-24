@@ -1593,6 +1593,81 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Sixty-fourth sweep — four-front hunt: a +i bypass, client exit-code
+lies, and teardown/notify gaps (2026-07-24): four parallel audits on fronts
+without a recent deep pass — IRCv3 capability machinery, channel
+membership/modes, the client-side crates, and session/identity lifecycle.
+Thirteen confirmed bugs, all fixed in one pass:
+
+1. **Stale INVITE bypassed +i on a recreated channel** (found independently by
+   two audits — the security finding of the sweep). Invites were stored on the
+   *invitee's session* keyed by channel name, and channel teardown never
+   cleared them: invite yourself via a throwaway channel, drop it, and the
+   lingering entry admitted you through +i on any later channel reusing the
+   name. Invites now live on the `Channel` (`invited: HashSet<ConnId>`,
+   bounded per channel), so teardown revokes them by construction — the
+   session-side leak is unrepresentable. Regression test drives the full
+   invite → teardown → recreate+i → refused sequence.
+2. **Unbounded list-mode masks broke the wire limit** — a ~490-byte `+b` mask
+   produced a >512-byte MODE broadcast (discarded whole by recipients'
+   framing while the ban was enforced — state desync; and an abort under the
+   debug wire check), and RPL_BANLIST's 100-byte middle clip displayed a
+   truncated mask that `-b` could never match (an unremovable ban). New
+   `BANMASKLEN = 100` clips at store time (Solanum `clean_ban_mask`
+   precedent), aligned exactly with `NUMERIC_MIDDLE_MAX`: stored = displayed
+   = broadcast = removable.
+3. **Post-registration SASL never broadcast `ACCOUNT`** to account-notify
+   peers (the IDENTIFY and AccountCreated paths did — same state change,
+   different door). `notify_account_change` now fires on the Verifying
+   success branch; its `!registered` guard keeps connect-time SASL a no-op.
+4. **A teardown from inside a labeled command swallowed the final ERROR** —
+   the terminal `ERROR :Closing Link` was diverted into the labeled-response
+   capture, and the wrapper only tried to deliver it after `close()` removed
+   the session. `close()` now flushes a capture addressed to the dying
+   connection before removal, so `@label=x QUIT` (and flood/credential
+   kills inside labeled commands) close loudly again.
+5. **Self-KILL audited with an empty actor** — `record_audit` ran after
+   `close()` had removed the oper's own session. Audit now records first.
+6. **`e6irc send` exited 0 on non-delivery** — post-PRIVMSG error numerics
+   (401/404/…) were drained and discarded, and a connection close during the
+   join-wait fell through to a PRIVMSG into a dead socket. The drain now
+   fails on delivery-error numerics and the join-wait treats EOF as an error
+   (same fix in `history`); `tail --count N` errors when the stream ends
+   early. E2E test pins the non-zero exit.
+7. **`e6irc raw` blocked the runtime on stdin** — a slow-fed pipe left server
+   PINGs unanswered until the ping-timeout killed the session and the late
+   lines went into a dead socket, exiting 0. Now async stdin `select!`ed
+   against the socket, answering PINGs, erroring on unexpected close.
+8. **TUI network task swallowed all outbound write failures** — typed
+   messages were echoed into the buffer as sent and silently dropped forever
+   on a half-broken socket. Write failures (including PONG) now surface
+   `Disconnected` and end the task.
+9. **The client library silently skipped malformed/over-long server lines**
+   (including the framing layer's explicit `TooLong` signal, against that
+   module's own contract). They are now loud `InvalidData` errors — framing
+   already guarantees non-empty NUL-free lines, so anything unparseable
+   means the peer is not speaking IRC.
+10. **Load-harness setup could wedge forever with zero output** — the
+    connect/register/join phase had no timeout, so a server that accepted
+    TCP but stalled before 001 (the exact at-capacity condition the harness
+    measures) hung every client behind the barrier. Setup is now bounded at
+    30s, timing out into the counted-failure path.
+11. **TUI attributed QUIT notices to every buffer** including queries with
+    unrelated users; now scoped to channel buffers and the quitter's query.
+
+Also surfaced, not changed: synchronous service NOTICEs are captured into a
+labeled response while DB-deferred ones arrive later unlabeled — each label
+still gets exactly one framed response, so this is a consistency observation
+against ambiguous spec, not a violation. PASS remains deliberately
+unimplemented (the irctest controller declares it). Clean bills: MONITOR
+lifecycle, cap-gated broadcast filters, ISUPPORT-vs-enforcement, casefold
+discipline (no raw-string bypasses), MODE param consumption, ban/quiet/invex
+precedence, teardown parity across QUIT/KILL/GHOST/k-line/reaper, ConnId
+monotonicity (no reuse hazards), the queue crate's waker protocol, and the
+proto crate's escape/truncate symmetry. Verified locally beyond the gate:
+the full irctest main green list (255 passed) and the PG-backed services
+list (49 passed) both green.
+
 Sixty-third sweep — ChanServ FLAGS phantom-grant divergence (2026-07-24):
 closes the last item the sweep-60 ChanServ audit surfaced. `FLAGS <account>
 +flags` updated the hot `channel_access` map **optimistically** — right after the

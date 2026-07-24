@@ -88,9 +88,12 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let oper_nick = state.sessions[&conn].nick.clone().expect("registered");
     let reason = format!("Killed ({oper_nick} ({comment}))");
     let server = state.config.server_name.clone();
+    // Audit before the close: a self-kill removes the actor's own session,
+    // and recording afterwards would resolve the actor to an empty string —
+    // an unattributed row in the log whose whole purpose is attribution.
+    record_audit(state, conn, "KILL", target, comment);
     state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
     state.close(victim, &reason);
-    record_audit(state, conn, "KILL", target, comment);
 }
 
 /// Record a privileged oper action in the audit log (best-effort; only

@@ -2173,6 +2173,86 @@ fn invite_lets_target_through_invite_only() {
     assert!(has_numeric(&s.drain(alice), "443"));
 }
 
+/// An invite is a grant by an op of a specific channel *incarnation*: when the
+/// channel empties and is destroyed, the invite dies with it. Before invites
+/// moved onto the channel, a session-side name-keyed invite survived teardown
+/// and admitted its holder through +i on an unrelated later channel that
+/// merely reused the name — a premeditated +i bypass (invite yourself via a
+/// throwaway channel, drop it, wait for the victim to create it).
+#[test]
+fn invite_does_not_survive_channel_teardown() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "JOIN #re");
+    s.drain(alice);
+    s.line(alice, "INVITE bob #re");
+    s.drain(alice);
+    s.drain(bob);
+    // The channel empties → destroyed, with bob's invite still pending.
+    s.line(alice, "PART #re");
+    s.drain(alice);
+    // An unrelated user recreates the name and locks it down.
+    let carol = s.register(3, "carol");
+    s.line(carol, "JOIN #re");
+    s.drain(carol);
+    s.line(carol, "MODE #re +i");
+    s.drain(carol);
+    // bob's stale invite must not admit into carol's channel.
+    s.line(bob, "JOIN #re");
+    assert!(
+        has_numeric(&s.drain(bob), "473"),
+        "an invite into a destroyed channel admitted into its successor"
+    );
+}
+
+/// A list-mode mask is clipped to BANMASKLEN at store time, so the stored mask
+/// always fits the RPL_BANLIST middle (what the list displays is exactly what
+/// is enforced — and thus removable by copying it into -b) and a single
+/// `MODE +b <mask>` broadcast can never exceed the wire limit (unclipped, the
+/// broadcast would be discarded whole by recipients' framing while the ban is
+/// silently enforced — and the debug wire check would abort the core worker).
+#[test]
+fn overlong_ban_mask_is_clipped_and_stays_removable() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #bm");
+        s.drain(c);
+    }
+    s.drain(alice);
+    let long_mask = format!("{}!*@*", "x".repeat(400));
+    s.line(alice, &format!("MODE #bm +b {long_mask}"));
+    // The broadcast announces the stored (clipped) form and fits the wire.
+    let out = s.drain(alice);
+    let mode = out.iter().find(|l| l.contains("MODE #bm +b")).expect("+b");
+    assert!(
+        mode.len() <= 512,
+        "broadcast exceeds the wire limit: {mode}"
+    );
+    s.drain(bob);
+    // The list shows the stored mask verbatim...
+    s.line(alice, "MODE #bm +b");
+    let list = s.drain(alice);
+    let entry = list.iter().find(|l| l.contains(" 367 ")).expect("367");
+    let shown = entry
+        .split_whitespace()
+        .nth(4)
+        .expect("367 carries the mask");
+    // ...and copying the shown mask into -b removes the ban.
+    s.line(alice, &format!("MODE #bm -b {shown}"));
+    assert!(
+        s.drain(alice).iter().any(|l| l.contains("MODE #bm -b")),
+        "the displayed mask must remove the ban it displays"
+    );
+    s.line(alice, "MODE #bm +b");
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains(" 367 ")),
+        "ban list must be empty after removing via the displayed mask"
+    );
+}
+
 #[test]
 fn away_flow() {
     let mut s = TestServer::new();
@@ -2322,6 +2402,40 @@ fn account_notify_and_tag() {
     assert_eq!(
         s.drain(alice),
         vec!["@account=bob :bob!bob@host2.example PRIVMSG #acct :tagged?"]
+    );
+}
+
+/// Post-registration SASL (cap-notify permits `CAP REQ :sasl` mid-session)
+/// must broadcast ACCOUNT to account-notify peers exactly like the NickServ
+/// IDENTIFY path — the two are the same state change through different doors,
+/// and only the IDENTIFY door used to announce it.
+#[test]
+fn account_notify_fires_on_post_registration_sasl() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "account-notify");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #acct2");
+        s.drain(c);
+    }
+    s.drain(alice);
+    // bob authenticates mid-session via SASL.
+    s.line(bob, "CAP REQ :sasl");
+    s.line(bob, "AUTHENTICATE PLAIN");
+    s.line(bob, &format!("AUTHENTICATE {}", b64("\0bob\0hunter2")));
+    s.drain(bob);
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: bob,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "bob".into(),
+        },
+    });
+    s.drain(bob);
+    assert_eq!(
+        s.drain(alice),
+        vec![":bob!bob@host2.example ACCOUNT bob"],
+        "SASL login must notify account-notify peers like IDENTIFY does"
     );
 }
 
@@ -4936,6 +5050,46 @@ fn oper_actions_are_audited() {
             .iter()
             .any(|(a, t)| a == "UNKLINE" && t == "baddie@*"),
         "UNKLINE not audited"
+    );
+}
+
+/// A self-KILL removes the actor's own session; the audit row must still name
+/// the actor — recording after the close resolved the actor to an empty string,
+/// an unattributed row in a log whose whole purpose is attribution.
+#[test]
+fn self_kill_audit_row_names_the_actor() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.db_requests();
+    s.line(op, "KILL god :cleaning up");
+    let actor = s
+        .db_requests()
+        .into_iter()
+        .find_map(|r| match r {
+            e6ircd::core::DbRequest::AuditLog { actor, action, .. } if action == "KILL" => {
+                Some(actor)
+            }
+            _ => None,
+        })
+        .expect("KILL not audited");
+    assert_eq!(actor, "god", "self-KILL audit row lost its actor");
+}
+
+/// A QUIT sent inside a labeled command tears the session down from within the
+/// labeled-response capture: the terminal ERROR used to be captured, then
+/// dropped when the wrapper tried to deliver it to the already-removed
+/// session — a silent close on the exact path that promises a loud one.
+#[test]
+fn labeled_quit_still_delivers_the_error() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response batch");
+    s.line(alice, "@label=q QUIT :bye");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("ERROR")),
+        "labeled QUIT must still deliver the closing ERROR: {out:#?}"
     );
 }
 

@@ -38,6 +38,19 @@ pub(super) const USERLEN: usize = 10;
 /// standardized), but WHOIS 311 carries it as a trailing parameter, so an
 /// unbounded one overflows that reply.
 pub(super) const REALLEN: usize = 150;
+/// List-mode (+b/+q/+e/+I) mask cap, applied at store time (Solanum's
+/// `clean_ban_mask` truncates to BANLEN the same way). The value matches the
+/// `NUMERIC_MIDDLE_MAX` clip in `numeric()`: a stored mask that fits it is
+/// shown *verbatim* by RPL_BANLIST — so copying the displayed mask into `-b`
+/// always removes it — and a single `MODE +b <mask>` broadcast can never
+/// exceed the wire limit. An unclipped mask (bounded only by the 510-byte
+/// input frame) would both desync state-tracking clients (the over-long
+/// broadcast is discarded whole by their framing while the ban is enforced)
+/// and be unremovable via the truncated form the ban list displays. Any
+/// legitimate nick!user@host fits: default nicklen 16 + USERLEN 10 + a
+/// 63-byte host is well inside. The stored (clipped) mask is what the mode
+/// echo announces, so what clients see is exactly what is enforced.
+pub(super) const BANMASKLEN: usize = 100;
 
 /// Canonicalize a channel list-mode (+b/+q/+e/+I) mask to `nick!user@host`,
 /// filling missing components with `*` (Solanum's `clean_ban_mask`). Without
@@ -145,14 +158,16 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
             quiets: Vec::new(),
             ban_exceptions: Vec::new(),
             invite_exceptions: Vec::new(),
+            invited: std::collections::HashSet::new(),
             // The clock is milliseconds; RPL_CREATIONTIME reports seconds.
             created_at_secs: now.as_secs(),
         });
     if chan.members.contains_key(&conn) {
         return; // already joined: JOIN is idempotent per Solanum
     }
-    // Admission checks, Solanum order.
-    let was_invited = state.sessions[&conn].invited.contains(&key);
+    // Admission checks, Solanum order. The invite lives on the channel, so it
+    // can only ever admit into the incarnation whose op granted it.
+    let was_invited = chan.invited.contains(&conn);
     // A registered channel's founder is opped on join, even when not the
     // first to arrive.
     let account = state.sessions[&conn].account.clone();
@@ -214,6 +229,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
             voice: access_voice,
         },
     );
+    chan.invited.remove(&conn); // an invite is consumed by the join it admitted
     let display = chan.name.clone();
 
     let session = state
@@ -221,7 +237,6 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         .get_mut(&conn)
         .expect("session checked in dispatch");
     session.channels.insert(key.clone());
-    session.invited.remove(&key);
     let prefix = session.prefix();
 
     let (account, realname) = {
@@ -1030,8 +1045,11 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 // Canonicalize to nick!user@host so a bare `+b nick` actually
                 // matches `nick!user@host` (Solanum clean_ban_mask); otherwise
                 // banning by nick — a very common op — silently never applies.
+                // Then clip to BANMASKLEN so the stored mask always fits both
+                // the RPL_BANLIST middle and the MODE broadcast (see the
+                // constant's doc for why an unclipped one is a state desync).
                 let norm = normalize_ban_mask(raw_mask);
-                let mask = norm.as_str();
+                let mask = truncate_chars(&norm, BANMASKLEN);
                 // Bound the lists: without a cap a single opped client could
                 // stream distinct masks until the core worker OOMs (and every
                 // JOIN/PRIVMSG re-scans them). `MAXLIST=bqeI:100` advertises a
