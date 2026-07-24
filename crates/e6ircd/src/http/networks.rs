@@ -102,6 +102,36 @@ pub(super) async fn create_network(
 /// outbound-connection amplifier toward a third party.
 pub(super) const MAX_NETWORKS_PER_ACCOUNT: usize = 32;
 
+/// Whether `addr` (`host:port`, IPv6 bracketed) has an IP-literal host that
+/// points at an obviously-internal target the server must not be tricked into
+/// dialing. Loopback, link-local (cloud metadata), unspecified and multicast are
+/// refused; RFC-1918 private ranges are allowed (a LAN self-host is legitimate).
+/// A hostname (non-literal) returns `false` here — the concrete reported vector
+/// is the IP literal; hostname resolution lives in the dialer.
+fn upstream_addr_is_internal(addr: &str) -> bool {
+    let host = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest) // [ipv6]:port
+    } else {
+        addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+    };
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false; // hostname — not classifiable without DNS
+    };
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
+        }
+        // IPv6 link-local (fe80::/10) and unique-local (fc00::/7).
+        std::net::IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            (head & 0xffc0) == 0xfe80 || (head & 0xfe00) == 0xfc00
+        }
+    }
+}
+
 pub(super) async fn create_network_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -122,6 +152,49 @@ pub(super) async fn create_network_core(
             StatusCode::BAD_REQUEST,
             "addr and nick are required",
             None,
+        ));
+    }
+    // `nick`/`realname`/`autojoin` are interpolated into NICK/USER/JOIN lines to
+    // the upstream; a CR/LF would inject a second command. Reject it at the
+    // boundary (this only affects the caller's own upstream, but a line-injection
+    // primitive should never be constructible). Bound every field so a caller
+    // can't store an oversized value or an unbounded autojoin list.
+    let too_long = req.name.len() > 64
+        || req.addr.len() > 255
+        || req.nick.len() > 64
+        || req.realname.as_ref().is_some_and(|r| r.len() > 128)
+        || req.autojoin.len() > 64
+        || req.autojoin.iter().any(|c| c.len() > 64);
+    if too_long {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Field too long",
+            Some("network fields exceed their length bounds"),
+        ));
+    }
+    let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+    if has_control(&req.nick)
+        || req.realname.as_deref().is_some_and(has_control)
+        || req.autojoin.iter().any(|c| has_control(c))
+    {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid character",
+            Some("nick, realname and autojoin must not contain CR, LF or NUL"),
+        ));
+    }
+    // Refuse an upstream address that points at an obviously-internal target
+    // (loopback, the cloud link-local metadata range, unspecified, multicast).
+    // Any authenticated user can create a network that the server then dials on
+    // a reconnect loop, so without this a tenant could probe 169.254.169.254 and
+    // similar. RFC-1918 private ranges are allowed, since a self-hosted upstream
+    // on a LAN is legitimate. (Hostnames are resolved by the dialer; this bounds
+    // the IP-literal vector reported.)
+    if upstream_addr_is_internal(&req.addr) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Disallowed upstream address",
+            Some("addr must not be a loopback, link-local, unspecified or multicast IP"),
         ));
     }
     // Upstream SASL is both-or-neither.
@@ -372,5 +445,30 @@ pub(super) async fn delete_network(
                 None,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upstream_addr_is_internal;
+
+    #[test]
+    fn internal_upstream_addresses_are_refused() {
+        // Loopback, the cloud link-local metadata range, unspecified and
+        // multicast are refused so a tenant can't make the server dial them.
+        assert!(upstream_addr_is_internal("127.0.0.1:6667"));
+        assert!(upstream_addr_is_internal("169.254.169.254:80")); // cloud metadata
+        assert!(upstream_addr_is_internal("0.0.0.0:6667"));
+        assert!(upstream_addr_is_internal("[::1]:6697"));
+        assert!(upstream_addr_is_internal("[fe80::1]:6697")); // v6 link-local
+        assert!(upstream_addr_is_internal("[fc00::1]:6697")); // v6 unique-local
+        // A documentation range is never a real upstream, so it's refused too.
+        assert!(upstream_addr_is_internal("203.0.113.7:6697")); // TEST-NET-3
+        // A real public IP and a hostname are allowed (the dialer resolves
+        // hostnames); RFC-1918 is allowed for a legitimate LAN self-host.
+        assert!(!upstream_addr_is_internal("93.184.216.34:6697"));
+        assert!(!upstream_addr_is_internal("irc.libera.chat:6697"));
+        assert!(!upstream_addr_is_internal("10.0.0.5:6667"));
+        assert!(!upstream_addr_is_internal("192.168.1.10:6667"));
     }
 }

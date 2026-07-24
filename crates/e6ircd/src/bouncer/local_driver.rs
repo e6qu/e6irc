@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
 
-use super::{ConnectionEvent, NetworkConfig, NetworkDriver, NetworkHandle};
+use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
 use crate::core::{ConnId, Input, Output};
 
 /// Handles into the core, so the driver can open an in-process session.
@@ -47,101 +47,132 @@ impl NetworkDriver for LocalDriver {
     }
 
     fn start(self: Box<Self>) -> NetworkHandle {
-        let (handle, mut ends) = NetworkHandle::channels(self.buffer_cap);
+        let (handle, ends) = NetworkHandle::channels(self.buffer_cap);
         let this = *self;
-        tokio::spawn(async move {
-            let conn = ConnId(this.core.next_conn.fetch_add(1, Ordering::Relaxed));
-            let (out_tx, mut out_rx) = queue::<Output>(QueueConfig {
-                name: "local-sendq",
-                capacity: this.core.sendq,
-                policy: Policy::Fifo,
-            });
-            if this
-                .core
-                .core_tx
-                .push(Input::Open {
-                    conn,
-                    tx: out_tx,
-                    host: "local".into(),
-                })
-                .await
-                .is_err()
-            {
-                return; // core shutting down
-            }
-            // Register in-process, then auto-join.
-            for line in [
-                format!("NICK {}", this.nick),
-                format!("USER {} 0 * :{}", this.nick, this.realname),
-            ] {
-                if this
-                    .core
-                    .core_tx
-                    .push(Input::Line {
-                        conn,
-                        line: line.into_bytes(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            for chan in &this.autojoin {
-                let _ = this
-                    .core
-                    .core_tx
-                    .push(Input::Line {
-                        conn,
-                        line: format!("JOIN {chan}").into_bytes(),
-                    })
-                    .await;
-            }
-            ends.emit(ConnectionEvent::Connected);
-
-            loop {
-                tokio::select! {
-                    // Core output -> buffer + broadcast (attach playback/live).
-                    out = out_rx.pop() => match out {
-                        Some(env) => {
-                            // Strip only the frame's CRLF, not all trailing
-                            // whitespace — a trailing param may end in spaces.
-                            let line = String::from_utf8_lossy(&env.payload.0)
-                                .trim_end_matches(['\r', '\n'])
-                                .to_string();
-                            ends.emit_line(line);
-                        }
-                        None => break, // core closed our session
-                    },
-                    // Downstream command -> core.
-                    cmd = ends.next_command() => match cmd {
-                        Some(line) => {
-                            if this
-                                .core
-                                .core_tx
-                                .push(Input::Line { conn, line: line.into_bytes() })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        None => {
-                            // Every handle dropped: close our core session.
-                            let _ = this
-                                .core
-                                .core_tx
-                                .push(Input::Closed {
-                                    conn,
-                                    reason: "local driver stopped".into(),
-                                })
-                                .await;
-                            break;
-                        }
-                    },
-                }
-            }
-        });
+        let session = LocalSession {
+            core: this.core,
+            nick: this.nick,
+            realname: this.realname,
+            autojoin: this.autojoin,
+        };
+        tokio::spawn(run(session, ends));
         handle
+    }
+}
+
+/// Per-session configuration for the local driver, reconnected on each drop.
+struct LocalSession {
+    core: CoreHandles,
+    nick: String,
+    realname: String,
+    autojoin: Vec<String>,
+}
+
+async fn run(session: LocalSession, mut ends: DriverEnds) {
+    // Like every other driver: a core-side close (the operator KILLs the BNC
+    // user, or the core drops the in-process conn) must reconnect with a fresh
+    // ConnId and emit `Disconnected` on the way — not exit the task silently and
+    // leave `is_connected()` stuck true, as the previous one-shot loop did.
+    super::run_with_backoff(session, &mut ends, |session, ends| {
+        Box::pin(session_once(session, ends))
+    })
+    .await;
+}
+
+async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::SessionOutcome {
+    use super::SessionOutcome::{Dropped, Stopped};
+    let conn = ConnId(session.core.next_conn.fetch_add(1, Ordering::Relaxed));
+    let (out_tx, mut out_rx) = queue::<Output>(QueueConfig {
+        name: "local-sendq",
+        capacity: session.core.sendq,
+        policy: Policy::Fifo,
+    });
+    if session
+        .core
+        .core_tx
+        .push(Input::Open {
+            conn,
+            tx: out_tx,
+            host: "local".into(),
+        })
+        .await
+        .is_err()
+    {
+        return Stopped; // core shutting down
+    }
+    // Register in-process, then auto-join.
+    for line in [
+        format!("NICK {}", session.nick),
+        format!("USER {} 0 * :{}", session.nick, session.realname),
+    ] {
+        if session
+            .core
+            .core_tx
+            .push(Input::Line {
+                conn,
+                line: line.into_bytes(),
+            })
+            .await
+            .is_err()
+        {
+            return Stopped;
+        }
+    }
+    for chan in &session.autojoin {
+        let _ = session
+            .core
+            .core_tx
+            .push(Input::Line {
+                conn,
+                line: format!("JOIN {chan}").into_bytes(),
+            })
+            .await;
+    }
+    ends.emit(ConnectionEvent::Connected);
+
+    loop {
+        tokio::select! {
+            // Core output -> buffer + broadcast (attach playback/live).
+            out = out_rx.pop() => match out {
+                Some(env) => {
+                    // Strip only the frame's CRLF, not all trailing whitespace —
+                    // a trailing param may end in spaces.
+                    let line = String::from_utf8_lossy(&env.payload.0)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string();
+                    ends.emit_line(line);
+                }
+                // Core closed our session: reconnect with a fresh ConnId (and
+                // emit Disconnected via run_with_backoff) rather than die.
+                None => return Dropped,
+            },
+            // Downstream command -> core.
+            cmd = ends.next_command() => match cmd {
+                Some(line) => {
+                    if session
+                        .core
+                        .core_tx
+                        .push(Input::Line { conn, line: line.into_bytes() })
+                        .await
+                        .is_err()
+                    {
+                        return Dropped;
+                    }
+                }
+                None => {
+                    // Every handle dropped: close our core session and stop for
+                    // good (no reconnect — the network was removed).
+                    let _ = session
+                        .core
+                        .core_tx
+                        .push(Input::Closed {
+                            conn,
+                            reason: "local driver stopped".into(),
+                        })
+                        .await;
+                    return Stopped;
+                }
+            },
+        }
     }
 }

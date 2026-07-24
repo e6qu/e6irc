@@ -91,11 +91,21 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         }
     }
 
+    // Keepalive: `connect_once` bounds connect + registration, but the
+    // steady-state read below would otherwise block forever on a half-open
+    // upstream (firewall silently drops the link, peer vanishes without RST),
+    // starving the reconnect loop while `is_connected()` stays true — the exact
+    // wedge the registration timeout guards against, just relocated. On an idle
+    // gap we send our own PING; if the next gap passes with still no traffic,
+    // the link is dead — drop and reconnect. A live server's own PINGs (which
+    // we answer) keep a quiet-but-alive connection from ever tripping this.
+    let mut awaiting_keepalive = false;
     loop {
         tokio::select! {
             // Upstream -> buffer + event.
-            msg = conn.next_message_with_line() => match msg {
-                Ok(Some((m, raw))) => {
+            msg = tokio::time::timeout(KEEPALIVE_IDLE, conn.next_message_with_line()) => match msg {
+                Ok(Ok(Some((m, raw)))) => {
+                    awaiting_keepalive = false;
                     // Answer PINGs transparently (keepalive is the
                     // driver's job, not the attached client's).
                     if m.command == "PING" {
@@ -112,7 +122,17 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                     // is always-on regardless of attach.
                     ends.emit_line(raw);
                 }
-                _ => return super::SessionOutcome::Dropped,
+                Ok(_) => return super::SessionOutcome::Dropped, // clean EOF or read error
+                Err(_) => {
+                    // Idle past the keepalive window.
+                    if awaiting_keepalive {
+                        return super::SessionOutcome::Dropped; // our PING went unanswered → dead
+                    }
+                    awaiting_keepalive = true;
+                    if conn.send_line("PING :e6bnc-keepalive").await.is_err() {
+                        return super::SessionOutcome::Dropped;
+                    }
+                }
             },
             // Downstream command -> upstream.
             cmd = ends.next_command() => match cmd {
@@ -126,6 +146,12 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         }
     }
 }
+
+/// Idle gap before the driver sends a keepalive PING (and again before it
+/// declares a silent upstream dead). A live server PINGs well within this, so a
+/// quiet-but-alive connection never trips it; a half-open one is caught within
+/// `2 × KEEPALIVE_IDLE`.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
 
 async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     if config.tls {

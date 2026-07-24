@@ -795,11 +795,21 @@ impl ServerState {
         sa.channels.intersection(&sb.channels).next().is_some()
     }
 
-    /// All connections currently identified to `account`.
+    /// All connections currently identified to `account`, compared under the
+    /// server casemapping. This is the one account comparison that must fold
+    /// rather than use raw `==`: everywhere else accounts are folded before use
+    /// (`is_founder`, `access_modes`, `identity_nick`), and a raw compare here
+    /// would silently fail to sync a sibling connection (e.g. MARKREAD) if any
+    /// session ever held a non-canonical account label.
     pub fn account_connections(&self, account: &str) -> Vec<ConnId> {
+        let want = self.casemap.casefold(account);
         self.sessions
             .iter()
-            .filter(|(_, s)| s.account.as_deref() == Some(account))
+            .filter(|(_, s)| {
+                s.account
+                    .as_deref()
+                    .is_some_and(|a| self.casemap.casefold(a) == want)
+            })
             .map(|(c, _)| *c)
             .collect()
     }

@@ -153,13 +153,21 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let slot = state
+    // Decide "moved forward" from whether a marker *exists*, not by comparing
+    // against a zero sentinel: `Millis(0)` is a legitimate marker value (the Unix
+    // epoch, which the timestamp parser accepts), so a `.or_insert(0)` sentinel
+    // would make a first-ever set to epoch-0 look like a no-op (`0 > 0` is false)
+    // — it would update the in-core mirror but skip the DB write, silently
+    // diverging the two. A first set always persists, whatever its value.
+    let existing = state
         .read_markers
-        .entry((account.clone(), key.clone()))
-        .or_insert(e6irc_proto::time::Millis::from_millis(0));
-    let moved_forward = new_ms > *slot;
+        .get(&(account.clone(), key.clone()))
+        .copied();
+    let moved_forward = existing.is_none_or(|cur| new_ms > cur);
     if moved_forward {
-        *slot = new_ms;
+        state
+            .read_markers
+            .insert((account.clone(), key.clone()), new_ms);
         let persist = crate::core::DbRequest::SetReadMarker {
             account: account.clone(),
             target: key.as_str().to_string(),
@@ -172,10 +180,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             );
         }
     }
-    let current = *state
-        .read_markers
-        .get(&(account.clone(), key))
-        .expect("just inserted");
+    let current = existing.map_or(new_ms, |cur| cur.max(new_ms));
     let line = format!(
         ":{server} MARKREAD {target} timestamp={}",
         e6irc_proto::time::server_time(current)
