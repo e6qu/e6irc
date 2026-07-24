@@ -322,6 +322,33 @@ pub(super) fn deliver_one_message(
     // automatic responses).
     let target_key = state.nick_key(target);
     if is_service_nick(target_key.as_str()) {
+        // echo-message covers *every* message the client sends, including one
+        // to a services pseudo-client — the echo is how such a client renders
+        // its own outgoing line, so without it "/msg NickServ …" silently
+        // vanishes from the sender's buffer. Echoed before the service's
+        // reply, in send order, and captured so a labeled command's echo is
+        // framed as its response like any other echo.
+        if state.sessions[&conn].caps.echo_message {
+            let prefix = state.sessions[&conn].prefix();
+            let text = fit_relayed_text(&prefix, kind.wire(), target, text);
+            let line = format!(":{prefix} {} {target} :{text}", kind.wire());
+            let sender_account = state.sessions[&conn].account.clone();
+            let sender_is_bot = state.sessions[&conn].bot;
+            let (ts, msgid) = state.stamp();
+            deliver_message(
+                state,
+                &[conn],
+                &Delivery {
+                    sender_account: sender_account.as_deref(),
+                    sender_is_bot,
+                    msgid: &msgid,
+                    client_tags,
+                    body: &line,
+                    ts,
+                    bypass_capture: false,
+                },
+            );
+        }
         if loud {
             services_dispatch(state, conn, target_key.as_str(), text);
         }
@@ -730,7 +757,12 @@ pub(super) fn deliver_multiline(
     let kind = batch.kind.unwrap_or(crate::core::MessageKind::Privmsg);
     let loud = kind.is_loud();
     if batch.lines.is_empty() {
-        return; // opened and closed without content: nothing happened
+        // Opened and closed without content: nothing happened — but if the
+        // opening BATCH was labeled, that command still owes a response (the
+        // framer was told not to ACK it when the batch opened), so the "no
+        // response" ACK is emitted here or the client waits forever.
+        ack_multiline_label(state, conn, batch.label.as_deref());
+        return;
     }
     // Permission checks see the whole message, so a CTCP or a ban cannot be
     // slipped past them by splitting it across lines.
@@ -741,6 +773,11 @@ pub(super) fn deliver_multiline(
         .collect::<Vec<_>>()
         .join("\n");
     let Some(resolved) = resolve_message_target(state, conn, &batch.target, &joined, loud) else {
+        // Refused (ban, +m, vanished channel, …): the refusal numeric was just
+        // sent, but the *opening* BATCH's label is still owed a response — no
+        // echo copy will ever carry it. Resolve it with an ACK, mirroring the
+        // guarantee multiline_fail gives the collection-time failures.
+        ack_multiline_label(state, conn, batch.label.as_deref());
         return;
     };
     let target = batch.target.as_str();
@@ -866,15 +903,9 @@ pub(super) fn deliver_multiline(
     // but NOT echo-message gets no such copy, so emit the labeled ACK explicitly
     // — otherwise it waits forever for a response (the framer was told not to ACK
     // the deferred batch). Mirrors the guarantee multiline_fail gives the failure
-    // path. Uncaptured: it answers the opening BATCH, not the current line.
-    if let Some(label) = &batch.label
-        && !echo_message
-    {
-        let server = state.config.server_name.clone();
-        state.send_bytes_uncaptured(
-            conn,
-            bytes::Bytes::from(format!("@label={label} :{server} ACK\r\n")),
-        );
+    // path.
+    if !echo_message {
+        ack_multiline_label(state, conn, batch.label.as_deref());
     }
 
     // History records what a client without the capability would have seen:
@@ -920,6 +951,23 @@ pub(super) fn deliver_multiline(
             },
         );
     }
+}
+
+/// Answer a multiline batch's *opening* label with a bare `ACK`, when no other
+/// line will carry it (empty batch, refused delivery, or no echo copy). The
+/// framer was told not to ACK the opening BATCH when it deferred to the batch,
+/// so every close-time outcome must resolve the label itself — a labeled
+/// command with no response leaves a label-tracking client waiting forever.
+/// Uncaptured: it answers the opening BATCH, not the current command.
+fn ack_multiline_label(state: &mut ServerState, conn: ConnId, label: Option<&str>) {
+    let Some(label) = label else {
+        return;
+    };
+    let server = state.config.server_name.clone();
+    state.send_bytes_uncaptured(
+        conn,
+        bytes::Bytes::from(format!("@label={label} :{server} ACK\r\n")),
+    );
 }
 
 /// `@a;b;c ` or empty — the tag prefix for a line, built once per form.

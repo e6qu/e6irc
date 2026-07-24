@@ -1593,6 +1593,81 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-first sweep — four-front hunt: a lost FLAGS revocation, labeled
+multiline hangs, and terminal escape injection in the CLI (2026-07-25): four
+parallel audits on the DB worker/persistence, MODE handling, IRCv3 response
+framing (labeled-response/batch/echo), and the client-side crates. Eight bugs
+fixed:
+
+1. **`db_reply` dropped global-state DB confirmations when the requester's
+   connection had closed** (sasl.rs, MEDIUM-HIGH) — the client-vanished guard
+   also swallowed `ChannelRegistered`, `FounderChanged`, and `ChannelAccessSet`,
+   whose payloads update *global* hot state (the founder map, channel access).
+   Worst case: a FLAGS revocation whose requester disconnected during the DB
+   round-trip — the DB says revoked while the hot map keeps auto-opping the
+   revoked account until restart. Those three replies now bypass the guard (the
+   notices inside degrade safely on a dead conn).
+2. **A DB fault during a FLAGS change was reported as "account is not
+   registered"** (db.rs/sasl.rs, MEDIUM) — `applied: false` conflated the
+   definitive negative with a store failure, the exact lie the founder-transfer
+   path documents against. New `ChannelAccessUnavailable` reply mirrors
+   `FounderChangeUnavailable`.
+3. **A labeled draft/multiline batch closed empty never answered its label**
+   (message.rs, MEDIUM) — the empty-batch early return emitted zero bytes, so a
+   label-tracking client waited forever (the framer had been told not to ACK the
+   deferred open).
+4. **A labeled multiline batch refused at close (+m, ban, vanished channel)
+   never answered its label** (message.rs, MEDIUM) — the refusal numeric went
+   out unlabeled and the label dangled. Both paths now resolve through a shared
+   `ack_multiline_label`, the same guarantee `multiline_fail` gives
+   collection-time failures.
+5. **echo-message was not honored for messages to services pseudo-clients**
+   (message.rs) — `PRIVMSG NickServ :HELP` from an echo-message client produced
+   no echo (the services intercept returned first), so the client's own line
+   never rendered in its NickServ buffer. Echo now precedes the service reply,
+   with the usual msgid/time/account tags, captured for labeled framing.
+6. **List-mode masks (+b/+q/+e/+I) accepted embedded spaces** (channel.rs,
+   MEDIUM) — `MODE #c +b :a b` (trailing form) stored a mask that splits into
+   two tokens in both the MODE broadcast and the RPL_BANLIST middle — a
+   malformed line for every state-tracking client, and an entry the displayed
+   form can never remove (only the first token is consumed on `-b`), breaking
+   the documented BANMASKLEN invariant. Adds are now rejected with
+   ERR_INVALIDMODEPARAM, like the `+k` arm rejects space-containing keys;
+   removals pass through so a legacy stored mask stays removable.
+7. **The `e6irc` CLI printed server-controlled text verbatim to the terminal**
+   (e6irc-cli, MEDIUM-HIGH) — `tail`/`history` wrote nick and message bytes
+   straight to stdout; the wire parser rejects only CR/LF/NUL, so any channel
+   peer could inject ESC/CSI sequences (retitle the window, clear the screen,
+   spoof output). Control characters are now replaced with a visible U+FFFD
+   (the TUI was already safe — ratatui filters control chars). Also: `tail`'s
+   target match was case-sensitive, silently missing messages sent to a
+   differently-cased channel name; it now folds under rfc1459.
+8. **The app-password cap was a TOCTOU** (db.rs, LOW) — the COUNT and INSERT ran
+   as separate pool statements on the concurrent REST layer, so parallel
+   requests could overshoot `MAX_APP_PASSWORDS_PER_ACCOUNT`. The check and
+   insert now run in one transaction with the account row locked FOR UPDATE
+   (argon2 hashing kept outside the lock).
+
+Surfaced, not changed: a labeled REGISTER/IDENTIFY answers the label with an
+immediate empty ACK and the deferred SUCCESS/FAIL arrives unlabeled (only
+CHATHISTORY threads labels through the deferred path — a design-level change);
+a client labeling both the multiline open and close with echo-message gets a
+duplicate-key tag line (pathological input); CAP LS 302's version isn't stored
+(harmless: the cap set is static, so CAP NEW/DEL never fire); no `MODES=`
+ISUPPORT token (clients assume the conservative default 3; the 512-byte frame
+bounds the real count); and `e6irc raw`/`api` output stays unfiltered
+(pipe-oriented by design). Clean bills: all eleven CHATHISTORY pagination
+variants against the ring differential, DbReply routing/ordering and the
+worker's flush-before-read, mode sign/param ordering and no-op suppression,
+label isolation and echo tag parity (msgid/time byte-identical across delivery,
+echo, ring, replay), proto tag escaping round-trips, client framing, and the
+TUI's bounded scrollback. Verified beyond the gate: irctest main list **258**
+(up from 255 — the labeled-multiline fixes turned three greens on) and PG
+services list (49); the dex-backed `tests/oidc.rs` (4) and embed-web
+`tests/http.rs` (12); the full PG db suite (40); the bridges under
+`--features matrix,discord,slack`; the fuzz crate under `--cfg fuzzing` (a
+`DbReply` variant was added).
+
 Seventieth sweep — four-front hunt: a bridge OOM, an unbounded
 rate-limiter map, and a channel-name that could forge a param (2026-07-25):
 four parallel audits on the chat bridges (matrix/discord/slack), the

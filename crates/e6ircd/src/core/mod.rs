@@ -420,6 +420,14 @@ pub enum DbReply {
         flags: Option<String>,
         applied: bool,
     },
+    /// A ChanServ FLAGS change could not be attempted — the store failed.
+    /// Kept separate from `applied: false` (a definitive "no such account")
+    /// for the same reason `FounderChangeUnavailable` exists: reporting a DB
+    /// fault as "account is not registered" tells the operator a lie they
+    /// might act on.
+    ChannelAccessUnavailable {
+        channel: String,
+    },
     /// The database is unreachable or errored; the client gets a loud
     /// failure, never a silent hang.
     Unavailable,

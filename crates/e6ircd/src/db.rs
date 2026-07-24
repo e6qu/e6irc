@@ -128,42 +128,55 @@ pub async fn issue_app_password(
         _ => return Err(DbError::Query(sqlx::Error::PoolClosed)),
     }
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut secret_bytes = [0u8; 32];
+    use argon2::password_hash::rand_core::RngCore;
+    OsRng.fill_bytes(&mut secret_bytes);
+    let secret = e6irc_proto::base64::encode(&secret_bytes);
+    // Hash before the transaction: argon2 takes ~100ms and must not extend the
+    // account-row lock below.
+    let hash = hash_password(secret.clone()).await?;
     // Cap per-account app passwords so an authenticated account can't flood the
     // credential table (mirrors the network cap). `local_password` is excluded —
-    // this bounds only the app passwords a user mints.
+    // this bounds only the app passwords a user mints. The count and the insert
+    // run inside one transaction with the account row locked FOR UPDATE:
+    // separate pool statements would each see a pre-insert snapshot, so two
+    // concurrent requests reading cap-1 would both insert and overshoot the
+    // cap the comment promises (this endpoint runs on the concurrent REST
+    // layer, not the serial worker).
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+    // The account row was gone (deleted since the password verify): reject
+    // rather than hand back an app password that was never stored.
+    let Some(account_id) = account_id else {
+        return Err(DbError::BadCredentials);
+    };
     let app_pw_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM account_credentials c
-         JOIN accounts a ON a.id = c.account_id
-         WHERE a.name_folded = $1 AND c.kind = 'app_password'",
+        "SELECT COUNT(*) FROM account_credentials
+         WHERE account_id = $1 AND kind = 'app_password'",
     )
-    .bind(&folded)
-    .fetch_one(pool)
+    .bind(account_id)
+    .fetch_one(&mut *tx)
     .await
     .map_err(DbError::Query)?;
     if app_pw_count >= MAX_APP_PASSWORDS_PER_ACCOUNT {
         return Err(DbError::TooManyCredentials);
     }
-    let mut secret_bytes = [0u8; 32];
-    use argon2::password_hash::rand_core::RngCore;
-    OsRng.fill_bytes(&mut secret_bytes);
-    let secret = e6irc_proto::base64::encode(&secret_bytes);
-    let hash = hash_password(secret.clone()).await?;
-    let inserted = sqlx::query(
+    sqlx::query(
         "INSERT INTO account_credentials (account_id, kind, argon2_hash, label)
-         SELECT a.id, 'app_password', $1, $2 FROM accounts a WHERE a.name_folded = $3",
+         VALUES ($1, 'app_password', $2, $3)",
     )
+    .bind(account_id)
     .bind(&hash)
     .bind(label)
-    .bind(&folded)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
-    // Guard the SELECT-INSERT like its siblings (issue_api_token,
-    // create_web_session_full): if the account row was gone, insert nothing and
-    // reject rather than hand back an app password that was never stored.
-    if inserted.rows_affected() == 0 {
-        return Err(DbError::BadCredentials);
-    }
+    tx.commit().await.map_err(DbError::Query)?;
     Ok(secret)
 }
 
@@ -458,18 +471,20 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             account,
             flags,
         } => {
-            let applied = match set_channel_access(pool, &channel, &account, flags.clone()).await {
-                Ok(applied) => applied,
+            // A store fault is not "account is not registered" — those are
+            // different replies, so the operator is never told a definitive
+            // negative that was really a transient DB failure.
+            let reply = match set_channel_access(pool, &channel, &account, flags.clone()).await {
+                Ok(applied) => DbReply::ChannelAccessSet {
+                    channel,
+                    account,
+                    flags,
+                    applied,
+                },
                 Err(e) => {
                     eprintln!("db: channel access persistence failed: {e}");
-                    false
+                    DbReply::ChannelAccessUnavailable { channel }
                 }
-            };
-            let reply = DbReply::ChannelAccessSet {
-                channel,
-                account,
-                flags,
-                applied,
             };
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
