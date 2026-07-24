@@ -1593,6 +1593,82 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-second sweep — four-front hunt: a 404 auth flow, a KILL that
+panics the core, and WHOX framing corruption (2026-07-25): four parallel
+audits on query commands/visibility, the HTTP/REST layer, the nick/session
+lifecycle, and the queue/net transport. Ten changes:
+
+1. **The RFC 8628 device flow advertised a verification URI this server
+   404s** (http, MEDIUM) — `device_start` returned `{public_url}/device`, but
+   no `/device` route existed anywhere (the e2e only checked the string's
+   suffix). The flow was uncompletable through its advertised URI. `/device`
+   is now a real server-rendered page (askama, like `/login`/`/account`):
+   cookie-authenticated, CSRF-protected form that approves the typed code via
+   the same normalize+approve helper as the JSON API; unauthenticated
+   visitors redirect to `/login`. The e2e now walks the page end-to-end.
+2. **KILL with a long comment built an over-length ERROR line** (oper.rs,
+   HIGH in debug) — the `Closing Link` wrapper's overhead pushed a legal
+   ≤510-byte KILL past 512, panicking the debug wire check (an
+   oper-triggerable core crash in any debug/fuzz build); in release the
+   victim's framing discarded the whole close notice. The reason is now
+   fitted like the QUIT path fits its own.
+3. **A close while a deferred DB reply was outstanding dropped the held
+   output** (state.rs, MEDIUM) — QUIT during a CHATHISTORY ring-miss
+   deferral pushed the terminal ERROR into the deferral hold, and `close`
+   removed the session without flushing it: the client saw nothing. `close`
+   now releases the hold and flushes, the sibling of its existing
+   labeled-capture flush.
+4. **WHOX echoed framing-breaking tokens verbatim** (query.rs) — `%tn,`
+   (empty token) emitted a collapsing empty middle that shifted every later
+   field left one column, and `%tn,:x` opened a premature trailing that
+   swallowed the rest of the row. Both now default to the conventional `0`
+   (Solanum's empty-querytype behavior); a fieldless `%` falls back to plain
+   WHO (charybdis) instead of parameterless 354 rows.
+5. **`WHO <mask> o` was silently ignored** (query.rs) — the RFC 2812
+   opers-only flag returned everyone. Now filters to opers, including the
+   Solanum-style `o%fields` combination.
+6. **`MONITOR=100`/`CHATHISTORY=500` were hardcoded ISUPPORT strings**
+   (query.rs) — the enforced caps live in separate consts, so the
+   advertisement could silently drift. Both tokens now derive from the
+   consts (a new `CHATHISTORY_MAX` also replaces the two literal clamps).
+7. **A no-op AWAY re-broadcast away-notify to channel peers** (chanops.rs)
+   — re-declaring an identical away state fanned out a phantom transition
+   (an unmetered peer-directed spam vector). The peer broadcast now gates on
+   a real state/message change; the self numeric stays unconditional.
+8. **The bnc network SASL pair escaped the field bounds** (networks.rs, LOW)
+   — `sasl_account`/`sasl_password` were the only unbounded fields (~2 MB of
+   sealed dead weight per row, ×32 networks), and a NUL — PLAIN's own field
+   separator, an injection primitive on the upstream — passed through. Both
+   now bounded (255/512) and control-checked with the other fields.
+9. **WebSocket ingress accepted 64 MiB frames** (ws.rs, LOW) — tungstenite's
+   defaults buffered the whole frame before the LineBuffer could enforce the
+   ~4.5 KB IRC frame limit, an asymmetry the raw-TCP path doesn't have.
+   Both `/ws/irc` and `/ws/ui` now cap inbound frames at 64 KiB.
+10. **The async waker protocol was not loom-checked** (e6irc-queue) — the
+    sole loom model covered only try_push/try_pop; the parked-waker
+    registration + re-check in async `push`/`pop` (where a lost wakeup wedges
+    a connection forever) ran unverified. A bounded model (preemption 2, per
+    loom's guidance) now drives two async pushers against a popping receiver
+    at capacity 1; loom's `futures` feature enabled for it.
+
+Surfaced, not changed: **graceful shutdown remains unimplemented** (DESIGN
+§18 lists it; main.rs marks it pending) — SIGTERM drops the DB worker's
+buffered log batch and RSTs clients with no ERROR; a real fix needs net.rs
+to expose worker handles and is its own work item, re-surfaced here so it
+stays visible. Also: `/api/v1/me` checks the session cookie before Bearer
+(every other route via `authenticate` checks Bearer first — inconsistent,
+not exploitable); a labeled REGISTER/IDENTIFY's deferred SUCCESS/FAIL still
+arrives unlabeled (noted in sweep 72). Clean bills: the +i/+s visibility
+matrix (WHO/NAMES/LIST/WHOIS/KNOCK), WHOWAS recording on every exit path,
+MONITOR bookkeeping through rename/close, IDOR scoping on every /me route
+(folded-name SQL joins), cookie/CSRF/XFF handling, rust-embed traversal
+safety, NICK rename propagation into every nick-keyed map, DM history keys
+under rename, queue capacity/ordering/close semantics, write-before-FIN
+ordering, ConnLimiter balance, and the accept loop's EMFILE backoff.
+Verified beyond the gate: irctest main (258) and PG services (49); the
+embed-web http suite including the new device-page e2e (12 ignored + 9
+unit); dex oidc (4); loom (2 models); bridges and fuzz crate build.
+
 Seventy-first sweep — four-front hunt: a lost FLAGS revocation, labeled
 multiline hangs, and terminal escape injection in the CLI (2026-07-25): four
 parallel audits on the DB worker/persistence, MODE handling, IRCv3 response

@@ -6,6 +6,14 @@ use super::*;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 
+/// Inbound WebSocket frame cap. The tungstenite default (64 MiB message /
+/// 16 MiB frame) is buffered whole *before* the LineBuffer can enforce the
+/// IRC frame limit — an ingress asymmetry the raw-TCP path doesn't have (it
+/// emits TooLong while streaming, never buffering megabytes). 64 KiB is
+/// generous for pipelined IRC lines or a UI command while bounding what one
+/// unauthenticated socket can pin.
+const MAX_WS_FRAME: usize = 64 * 1024;
+
 pub(super) async fn ws_irc(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -24,7 +32,9 @@ pub(super) async fn ws_irc(
             None,
         );
     };
-    ws.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip))
+    ws.max_message_size(MAX_WS_FRAME)
+        .max_frame_size(MAX_WS_FRAME)
+        .on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -170,7 +180,9 @@ pub(super) async fn ws_ui(
     let Some(handle) = registry.get(&account, &params.network) else {
         return problem(StatusCode::NOT_FOUND, "No such network", None);
     };
-    ws.on_upgrade(move |socket| ws_ui_conn(handle, socket))
+    ws.max_message_size(MAX_WS_FRAME)
+        .max_frame_size(MAX_WS_FRAME)
+        .on_upgrade(move |socket| ws_ui_conn(handle, socket))
 }
 
 pub(super) async fn ws_ui_conn(

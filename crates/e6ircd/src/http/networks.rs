@@ -168,7 +168,12 @@ pub(super) async fn create_network_core(
         || req.nick.len() > 64
         || req.realname.as_ref().is_some_and(|r| r.len() > 128)
         || req.autojoin.len() > 64
-        || req.autojoin.iter().any(|c| c.len() > 64);
+        || req.autojoin.iter().any(|c| c.len() > 64)
+        // The SASL pair is sealed and stored per network; unbounded, a caller
+        // could persist megabytes of dead secret per row. 512 accommodates
+        // long OAuth-style tokens used as SASL passwords.
+        || req.sasl_account.as_ref().is_some_and(|a| a.len() > 255)
+        || req.sasl_password.as_ref().is_some_and(|p| p.len() > 512);
     if too_long {
         return Err(problem(
             StatusCode::BAD_REQUEST,
@@ -177,14 +182,20 @@ pub(super) async fn create_network_core(
         ));
     }
     let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+    // The SASL pair is included because PLAIN uses NUL as its field separator:
+    // a NUL inside either value would shift the authzid/authcid/passwd fields
+    // the upstream parses — the same injection-primitive class as CR/LF in a
+    // command line.
     if has_control(&req.nick)
         || req.realname.as_deref().is_some_and(has_control)
         || req.autojoin.iter().any(|c| has_control(c))
+        || req.sasl_account.as_deref().is_some_and(has_control)
+        || req.sasl_password.as_deref().is_some_and(has_control)
     {
         return Err(problem(
             StatusCode::BAD_REQUEST,
             "Invalid character",
-            Some("nick, realname and autojoin must not contain CR, LF or NUL"),
+            Some("nick, realname, autojoin and SASL fields must not contain CR, LF or NUL"),
         ));
     }
     // Refuse an upstream address that points at an obviously-internal target

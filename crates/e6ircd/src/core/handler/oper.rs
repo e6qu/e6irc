@@ -92,7 +92,15 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // and recording afterwards would resolve the actor to an empty string —
     // an unattributed row in the log whose whole purpose is attribution.
     record_audit(state, conn, "KILL", target, comment);
-    state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
+    // The reason is echoed inside this ERROR wrapper, whose overhead can push
+    // a maximal KILL comment past the wire limit — fit it like the QUIT path
+    // does, or the victim's framing discards the whole close notice (and the
+    // debug wire check would abort the core worker on an oper-typed line).
+    // The trailing `)` is part of the head's cost: include it before fitting,
+    // re-append after.
+    let head = format!("ERROR :Closing Link: {server} (");
+    let fitted = fit_trailing(&format!("{head})"), &reason);
+    state.send(victim, &format!("{head}{fitted})"));
     state.close(victim, &reason);
 }
 

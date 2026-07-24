@@ -235,6 +235,30 @@ async fn bnc_network_management_lifecycle() {
     .await;
     assert_eq!(status, 201, "create should succeed");
 
+    // The SASL pair is bounded and control-checked like every other field:
+    // an oversized password (dead sealed weight per row) and a NUL — PLAIN's
+    // own field separator, an injection primitive on the upstream — are
+    // refused before anything is sealed or stored.
+    let big = "p".repeat(513);
+    let (status, _) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        &format!(
+            r#"{{"name":"big","addr":"up.example:1","nick":"n","sasl_account":"a","sasl_password":"{big}"}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "oversized sasl_password must be refused");
+    let (status, _) = post_json(
+        http,
+        "/api/v1/me/networks",
+        &token,
+        r#"{"name":"nul","addr":"up.example:1","nick":"n","sasl_account":"a\u0000b","sasl_password":"p"}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "NUL in sasl_account must be refused");
+
     // it appears in the list
     let list_req = format!(
         "GET /api/v1/me/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
@@ -786,6 +810,69 @@ async fn device_authorization_grant_flow() {
     let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body)).await;
     assert_eq!(status, 400);
     assert!(body.contains("invalid_grant"), "{body}");
+
+    // The verification page the start response advertises must actually
+    // exist (it 404'd for 72 sweeps): unauthenticated → login redirect.
+    let (status, headers, _) = request(
+        http,
+        "GET /device HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status, 303, "unauthenticated /device must redirect");
+    assert!(
+        headers.to_lowercase().contains("location: /login"),
+        "{headers}"
+    );
+
+    // Signed in: the page renders the code form with a CSRF token.
+    let (status, _, page) = request(
+        http,
+        &format!("GET /device HTTP/1.1\r\nHost: t\r\n{cookie}Connection: close\r\n\r\n"),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("name=\"user_code\""), "{page}");
+    let csrf = page
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .expect("csrf field")
+        .split('"')
+        .next()
+        .expect("csrf value")
+        .to_string();
+
+    // A second grant, approved end-to-end through the page's form (lowercase
+    // to prove the same normalization as the JSON path).
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/start", "", "")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let device_code2 = v["device_code"].as_str().unwrap().to_string();
+    let user_code2 = v["user_code"].as_str().unwrap().to_lowercase();
+    let form = format!("user_code={user_code2}&csrf={csrf}");
+    let (status, _, page) = request(
+        http,
+        &format!(
+            "POST /device HTTP/1.1\r\nHost: t\r\n{cookie}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{form}",
+            form.len()
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("Device approved"), "{page}");
+    // ...and a bad CSRF token is refused.
+    let bad = format!("user_code={user_code2}&csrf=bogus");
+    let (status, _, _) = request(
+        http,
+        &format!(
+            "POST /device HTTP/1.1\r\nHost: t\r\n{cookie}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bad}",
+            bad.len()
+        ),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let tok_body2 = format!(r#"{{"device_code":"{device_code2}"}}"#);
+    let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body2)).await;
+    assert_eq!(status, 200, "form-approved grant must mint: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

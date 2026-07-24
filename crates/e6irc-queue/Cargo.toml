@@ -14,4 +14,5 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 # in only under RUSTFLAGS="--cfg loom" (model-check runs), never in
 # normal builds. 0.7.2 published 2024-04-23 — satisfies the 24h cooldown.
 [target.'cfg(loom)'.dependencies]
-loom = "0.7.2"
+# `futures` enables loom::future::block_on, which the async-waker model needs.
+loom = { version = "0.7.2", features = ["futures"] }

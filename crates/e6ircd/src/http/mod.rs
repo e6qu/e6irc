@@ -171,6 +171,10 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
         .route("/auth.css", get(pages::auth_styles))
         .route("/account", get(pages::account))
+        .route(
+            "/device",
+            get(pages::device_page).post(pages::approve_device_form),
+        )
         .route("/account/networks", post(pages::add_network_form))
         .route(
             "/account/networks/{name}",
@@ -579,6 +583,87 @@ mod pages {
             csrf,
             networks,
             credentials,
+        })
+    }
+
+    #[derive(Template)]
+    #[template(path = "device.html")]
+    struct Device {
+        csrf: String,
+        /// Set after a POST: the outcome message shown above the form.
+        outcome: Option<String>,
+        /// Styles the outcome as success vs failure.
+        approved: bool,
+    }
+
+    /// The RFC 8628 verification page `device_start` advertises as
+    /// `verification_uri`: the signed-in user types the code shown on the
+    /// device. Cookie-authenticated; unauthenticated visitors go to `/login`
+    /// (and can come back after signing in).
+    pub async fn device_page(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(_account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        render_auth(Device {
+            csrf,
+            outcome: None,
+            approved: false,
+        })
+    }
+
+    /// The `/device` form (urlencoded): code + CSRF token as form fields
+    /// (a plain HTML form cannot set the `x-csrf-token` header htmx uses).
+    #[derive(Deserialize)]
+    pub struct DeviceFormFields {
+        user_code: String,
+        csrf: String,
+    }
+
+    /// Approve a device code from the verification page's form; re-renders
+    /// the page with the outcome.
+    pub async fn approve_device_form(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<DeviceFormFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        let Some(session) = session_token(&headers, state.secure_cookies) else {
+            return problem(StatusCode::UNAUTHORIZED, "Session required", None);
+        };
+        let axum::Form(fields) = match form {
+            Ok(f) => f,
+            Err(r) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&r.to_string())),
+        };
+        if !state.csrf_valid(&session, &fields.csrf) {
+            return problem(StatusCode::FORBIDDEN, "Bad CSRF token", None);
+        }
+        let (outcome, approved) =
+            match super::device::approve_user_code(&state, &account, &fields.user_code).await {
+                Ok(true) => ("Device approved — you can return to it now.", true),
+                Ok(false) => (
+                    "No pending device with that code — check it and try again.",
+                    false,
+                ),
+                Err(e) => {
+                    eprintln!("http: device approve failed: {e}");
+                    (
+                        "Approval storage is temporarily unavailable — try again.",
+                        false,
+                    )
+                }
+            };
+        render_auth(Device {
+            csrf: state.csrf_token(&session),
+            outcome: Some(outcome.to_string()),
+            approved,
         })
     }
 
