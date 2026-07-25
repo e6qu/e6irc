@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use e6irc_client::Connection;
+use e6irc_client::{Connection, TerminalSafe};
 
 /// IRC numerics that mean a JOIN was refused — so a `send`/`history` client
 /// bails with a clear error instead of waiting forever for a 366 that will
@@ -26,16 +26,11 @@ fn is_send_error(command: &str) -> bool {
     )
 }
 
-/// Server-supplied text is untrusted: any channel peer (or a hostile server)
-/// can embed terminal control bytes — ESC/CSI sequences that retitle the
-/// window, clear the screen, or spoof output. The wire parser rejects only
-/// CR/LF/NUL, so everything else arrives verbatim; replace every control
-/// character (C0, DEL, and C1 — which includes the one-byte CSI 0x9B) with a
-/// visible U+FFFD before it reaches the user's terminal.
-fn terminal_safe(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-        .collect()
+/// Server-supplied text is untrusted (terminal control bytes retitle the
+/// window / spoof output), so every display path runs it through the shared
+/// [`TerminalSafe`] sanitizer before it reaches the user's terminal.
+fn terminal_safe(s: &str) -> TerminalSafe {
+    TerminalSafe::from_untrusted(s)
 }
 
 #[derive(Parser)]

@@ -1270,13 +1270,21 @@ impl ServerState {
                 // post-restart reconnect storm.
                 flood_tokens: self.config.command_burst.unwrap_or(0) as u32,
                 flood_refilled_to_ms: opened_at,
-                last_active: e6irc_proto::time::MonoMillis::from_millis(0),
+                // Every monotonic watermark is seeded from the open time, never a
+                // zero `MonoMillis` sentinel. A zero would be indistinguishable
+                // from a real early reading (the mono epoch IS process start), so
+                // the first `now - 0 = uptime` read would misbehave in the first
+                // moments of uptime — the class that flood-killed fresh clients a
+                // sweep ago. Both are re-stamped before they gate anything
+                // (`last_active` at registration, `last_ping_sent` when a PING is
+                // actually sent), so open-time is a correct, sentinel-free floor.
+                last_active: opened_at,
                 signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,
                 awaiting_pong: false,
                 deferred_replies: 0,
                 held: Vec::new(),
-                last_ping_sent: e6irc_proto::time::MonoMillis::from_millis(0),
+                last_ping_sent: opened_at,
             },
         );
         assert!(prev.is_none(), "duplicate ConnId {conn:?} from acceptor");
