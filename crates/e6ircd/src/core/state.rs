@@ -1450,6 +1450,31 @@ impl ServerState {
         }
     }
 
+    /// Graceful shutdown: send every connected client a terminal `ERROR` line so
+    /// a clean close reason reaches them instead of a bare TCP reset (DESIGN §18,
+    /// "notify clients").
+    ///
+    /// Delivered straight into each send queue, deliberately bypassing both the
+    /// labeled-response capture and the deferred-reply hold: this is the last
+    /// line the session will ever see, and no later reply will arrive to release
+    /// output held behind an in-flight deferred page — so a held ERROR would
+    /// simply be lost. The sockets close when the `Core` is dropped immediately
+    /// after this call, which drops every session's `Sender<Output>`; each write
+    /// task then drains its queue — flushing this ERROR — before shutting the
+    /// socket down.
+    pub fn broadcast_shutdown(&mut self, reason: &str) {
+        let line = format!(
+            "ERROR :Closing Link: {} ({reason})",
+            self.config.server_name
+        );
+        let bytes = Bytes::from(format!("{line}\r\n"));
+        for session in self.sessions.values() {
+            // Best-effort per client: a peer already gone just means its send
+            // queue is closed, which `deliver` treats as a no-error close.
+            let _ = deliver(&session.tx, Output(bytes.clone()));
+        }
+    }
+
     /// Everyone sharing at least one channel with `conn`, deduplicated,
     /// excluding `conn` itself.
     pub fn channel_peers(&self, conn: ConnId) -> Vec<ConnId> {

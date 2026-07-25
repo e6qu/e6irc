@@ -58,6 +58,14 @@ fn genkey_seal_and_load_round_trip() {
         addr = "127.0.0.1:0"
         [secrets]
         key_file = {key_file:?}
+        # A configured [[network]] is only reachable through the BNC registry,
+        # so config validation requires [bnc] (which in turn requires
+        # [database]). Load only parses and validates — it never connects — so a
+        # placeholder database URL is enough to exercise the seal round-trip.
+        [database]
+        url = "postgres://localhost/x"
+        [bnc]
+        addr = "127.0.0.1:0"
         [[network]]
         name = "up"
         addr = "irc.example:6697"

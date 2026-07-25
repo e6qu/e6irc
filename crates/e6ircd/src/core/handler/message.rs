@@ -765,13 +765,23 @@ pub(super) fn deliver_multiline(
         return;
     }
     // Permission checks see the whole message, so a CTCP or a ban cannot be
-    // slipped past them by splitting it across lines.
-    let joined = batch
-        .lines
-        .iter()
-        .map(|(text, _)| text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    // slipped past them by splitting it across lines. Crucially the join
+    // respects `draft/multiline-concat`: a concat line is delivered joined to
+    // the previous one with *no* separator, so it must be reconstructed the
+    // same way here — otherwise a CTCP split across a concat boundary
+    // (`\x01ACTION` + concat `VERSION\x01` → the blocked `\x01ACTIONVERSION\x01`)
+    // has no single `\n`-delimited line that trips the +C check, yet a
+    // concat-capable recipient reassembles the blocked CTCP. Non-concat lines
+    // stay `\n`-separated so each is still checked as its own flattened
+    // message (what a non-multiline recipient receives). This one string thus
+    // mirrors both delivery forms.
+    let mut joined = String::new();
+    for (i, (text, concat)) in batch.lines.iter().enumerate() {
+        if i > 0 && !*concat {
+            joined.push('\n');
+        }
+        joined.push_str(text);
+    }
     let Some(resolved) = resolve_message_target(state, conn, &batch.target, &joined, loud) else {
         // Refused (ban, +m, vanished channel, …): the refusal numeric was just
         // sent, but the *opening* BATCH's label is still owed a response — no
