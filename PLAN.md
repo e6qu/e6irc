@@ -1605,11 +1605,13 @@ injection class was prevented solely upstream (parse-rejection + per-position
 sanitizers) with no funnel backstop in release for a path that builds a line from
 a non-parser source. `deliver` now takes only a `WireLine`, whose sole
 constructor neutralizes those bytes (keeping the one trailing CRLF), so no
-injection can reach a client in any build; debug/fuzz builds additionally panic
-on such a line so the unsanitized source is found in tests rather than
-silently neutralized. This closes the item the prior sweep documented as a
-debug-only check — done, not carried, and *compatible* with the documented
-no-production-panic trade-off (it neutralizes, it doesn't panic).
+injection can reach a client in any build. Unlike the over-long-line check (a
+*code* bug the debug assertion panics on to surface it in tests), an injection
+byte can ride legitimate *data* the core relays from an untrusted store or bridge
+(a history body), so it is neutralized rather than asserted against — the funnel
+must handle a dirty byte, not abort the shared worker. This closes the item the
+prior sweep documented as a debug-only check — done, not carried, and honoring
+the documented no-production-panic trade-off (DESIGN §7.1).
 
 **Server-ban masks → `MaskKey`, with display casing preserved** (state.rs,
 oper.rs, db.rs, migration 0031). Server bans stored and echoed the *folded* mask,

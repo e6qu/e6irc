@@ -119,11 +119,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
     only a `WireLine`, whose sole constructor `sanitized` neutralizes those bytes
     (leaving the one trailing CRLF terminator). Before, the funnel checked only
     line *length*, and injection was prevented solely upstream by parse-rejection
-    plus per-position sanitizers — a new path building a line from a non-parser
-    source (a DB value, a bridge) had no funnel backstop in release. Debug/fuzz
-    builds still *panic* on such a line (`wire_line_violation` now flags an
-    embedded CR/LF/NUL too), so the unsanitized source is found in tests while
-    release neutralizes rather than panicking (one worker serves all, DESIGN §7.1).
+    plus per-position sanitizers — a line carrying an injection byte from an
+    untrusted *data* source the core relays (a history body, a bridged line) had
+    no funnel backstop. Unlike an over-long line (a *code* bug the debug
+    assertion panics on), an injection byte is data the core must handle rather
+    than abort the shared worker on, so it is neutralized in all builds, not
+    asserted against.
   - `CredentialOrigin` — a credential-verify verdict (`PasswordVerified` /
     `PasswordRejected` / `Unavailable`) answers *either* a SASL `AUTHENTICATE`
     or a NickServ `IDENTIFY`; the request carries which, echoed onto the reply,

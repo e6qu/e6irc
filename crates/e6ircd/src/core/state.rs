@@ -1848,23 +1848,16 @@ fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
             body.len()
         ));
     }
-    // An embedded CR/LF/NUL in the content (everything but the terminating CRLF)
-    // splits the line into two on the wire — a forged-line injection. Release
-    // builds neutralize this at the delivery funnel (`WireLine::sanitized`);
-    // this makes a debug/fuzz build panic at the *source* instead, so the path
-    // that built the unsanitized line is found and fixed rather than shipping a
-    // silently-neutralized line.
-    let content = line.strip_suffix(b"\r\n").unwrap_or(line);
-    if let Some(pos) = content.iter().position(|&b| matches!(b, b'\r' | b'\n' | 0)) {
-        let which = match content[pos] {
-            b'\r' => "CR",
-            b'\n' => "LF",
-            _ => "NUL",
-        };
-        return Some(format!(
-            "outbound line has an embedded {which} at byte {pos} — a forged-line injection"
-        ));
-    }
+    // Injection (an embedded CR/LF/NUL in the content) is deliberately NOT a
+    // debug panic here, only a length violation is. The two differ in kind: an
+    // over-long line is a *code* bug (a formatting path lost track of the wire
+    // budget), so panicking finds it in tests. An injection byte, by contrast,
+    // can ride legitimate *data* the core relays from an untrusted store or
+    // bridge (a history body, an upstream line) — real inputs reject those bytes
+    // up front, but the core must handle a dirty one gracefully, which is to
+    // *neutralize* it, not abort the shared worker. That neutralization is the
+    // unconditional guarantee of `WireLine::sanitized` at the delivery funnel;
+    // asserting "no line ever carries one" would fire on that legitimate data.
     None
 }
 

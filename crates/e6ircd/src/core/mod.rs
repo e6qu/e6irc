@@ -485,17 +485,16 @@ pub struct Output(pub Bytes);
 ///
 /// Its one constructor, [`WireLine::sanitized`], neutralizes any CR/LF/NUL in
 /// the content — replacing each with a space, as `sanitize::upstream_line` does
-/// for bridge lines — while leaving the single trailing CRLF terminator. A
-/// well-formed line built by `ServerState::send` already has clean content
-/// (`Message::parse` rejects those bytes on input, and per-position sanitizers
-/// guard the synthesized fields), so this is a no-op fast path; the
-/// neutralization is a last-resort backstop for a path that builds a line from a
-/// non-parser source (a DB value, a bridge, future code) and forgets to
-/// sanitize. Debug builds additionally *panic* on such a line (via
-/// `debug_check_wire_line`), so tests and fuzzers catch the source loudly;
-/// release neutralizes rather than panicking, because one worker serves every
-/// client and a production panic there is worse than the line it flags
-/// (DESIGN §7.1).
+/// for bridge lines — while leaving the single trailing CRLF terminator, in
+/// every build. A well-formed line built by `ServerState::send` already has
+/// clean content (`Message::parse` rejects those bytes on input, and
+/// per-position sanitizers guard the synthesized fields), so this is a no-op
+/// fast path; the neutralization is the backstop for a line that carries an
+/// injection byte from an untrusted *data* source the core relays — a history
+/// body, a bridged line, future code. Unlike the over-long-line check (a *code*
+/// bug the debug assertion panics on to surface in tests), an injection byte is
+/// data the core must handle gracefully rather than aborting the shared worker,
+/// so it is neutralized, never asserted against.
 pub(crate) struct WireLine(Bytes);
 
 impl WireLine {
