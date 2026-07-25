@@ -64,15 +64,27 @@ use tokio::sync::mpsc;
 /// doubles per drop, caps at 30s, and resets once a session lasted long enough
 /// (≥10s) to have clearly connected — otherwise a flapping-but-reachable
 /// upstream would ratchet toward the cap forever. Jitter is a coarse
-/// deterministic function of the delay (no RNG), enough to spread reconnects.
+/// deterministic function of the delay *and* a per-driver seed (no RNG), so it
+/// spreads reconnects both across retry rounds and across concurrent drivers.
 pub(crate) struct Backoff {
     current: std::time::Duration,
+    /// Per-driver jitter offset, so drivers that drop together from one shared
+    /// upstream outage do not recompute an *identical* delay and reconnect in
+    /// lockstep. Without a per-driver term the jitter is a pure function of
+    /// `current`, which every driver advances through the same sequence — so it
+    /// spread reconnects across retry *rounds* but not across the drivers within
+    /// a round, which is the one thing jitter exists to do.
+    jitter_offset: u64,
 }
 
 impl Backoff {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             current: std::time::Duration::from_millis(200),
+            // Fibonacci-hash the stable per-driver seed into the jitter window so
+            // sequential driver ids spread across the [0,97) range rather than
+            // clustering. RNG-free: the offset is fixed for a driver's lifetime.
+            jitter_offset: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) % 97,
         }
     }
 
@@ -82,7 +94,11 @@ impl Backoff {
         if session_ran >= std::time::Duration::from_secs(10) {
             self.current = std::time::Duration::from_millis(200);
         }
-        let jitter = std::time::Duration::from_millis((self.current.as_millis() as u64) % 97);
+        // Combine the per-round delay term with the per-driver offset so both the
+        // round and the driver vary; still bounded to a coarse <97ms spread.
+        let jitter = std::time::Duration::from_millis(
+            (self.current.as_millis() as u64 + self.jitter_offset) % 97,
+        );
         tokio::time::sleep(self.current + jitter).await;
         self.current = (self.current * 2).min(std::time::Duration::from_secs(30));
     }
@@ -136,7 +152,7 @@ pub(crate) async fn run_with_backoff<C>(
     ends: &mut DriverEnds,
     session: DriverSession<C>,
 ) {
-    let mut backoff = Backoff::new();
+    let mut backoff = Backoff::new(ends.reconnect_seed);
     let mut consecutive_auth_failures: u32 = 0;
     loop {
         // A stop signalled while a session runs is observed inside it (via
@@ -249,6 +265,23 @@ pub(crate) fn route_privmsg(
 /// parsing it as JSON.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) const MAX_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Send an outbound bridge HTTP request and reject any non-2xx response. Every
+/// reverse-direction (IRC→upstream) send whose failure is signalled by HTTP
+/// status funnels through here so the raw `reqwest::Response` never reaches
+/// delivery-outcome logic: a bare `.send()` returns `Ok(Response)` for a 403 /
+/// 429 / 5xx just as for a 200, and treating that as delivered is a silent drop
+/// (DESIGN §2). Routing through this makes "send, ignore the status, report
+/// success" unwritable. (Slack signals failure in the 200 body via `ok:false`,
+/// an application-level check its `check_ok` still performs on top of this.)
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) async fn bridge_send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    req.send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())
+}
 
 /// WebSocket config for the Discord/Slack gateways: cap the inbound frame and
 /// message at the same 16 MiB the HTTP path enforces. tungstenite's defaults
@@ -577,12 +610,17 @@ impl NetworkHandle {
             buffer: buffer.clone(),
             connected: connected.clone(),
         };
+        // A process-wide counter gives each driver a distinct, stable jitter
+        // seed without an RNG — sequential ids, Fibonacci-hashed in `Backoff`.
+        static DRIVER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let reconnect_seed = DRIVER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ends = DriverEnds {
             events,
             commands: command_rx,
             shutdown: shutdown_rx,
             buffer,
             connected,
+            reconnect_seed,
         };
         (handle, ends)
     }
@@ -607,6 +645,10 @@ pub struct DriverEnds {
     shutdown: tokio::sync::watch::Receiver<bool>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Stable per-driver value seeding this driver's reconnect jitter, so
+    /// concurrent drivers de-correlate (see [`Backoff`]). Assigned once at
+    /// construction from a process-wide counter.
+    reconnect_seed: u64,
 }
 
 impl DriverEnds {

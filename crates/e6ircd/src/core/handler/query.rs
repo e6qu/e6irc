@@ -125,7 +125,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             let display = chan.name.clone();
             // A +s channel's membership is hidden from non-members: emit no
             // rows, letting the terminating RPL_ENDOFWHO stand alone.
-            let hidden = chan.modes.secret && !chan.members.contains_key(&conn);
+            let hidden = chan.hidden_from(conn).is_some();
             let rows: Vec<WhoRowData> = if hidden {
                 Vec::new()
             } else {
@@ -301,7 +301,7 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     // A +s (secret) channel is disclosed only to a requester
                     // who also shares it, so WHOIS can't enumerate hidden
                     // channels a target is in.
-                    if chan.modes.secret && !chan.members.contains_key(&conn) {
+                    if chan.hidden_from(conn).is_some() {
                         return None;
                     }
                     let sigil = if modes.op {

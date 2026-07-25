@@ -798,6 +798,36 @@ fn banned_external_cannot_speak_to_unmoderated_channel() {
 }
 
 #[test]
+fn mode_multichar_list_query_dumps_each_list() {
+    // A list-mode char given no argument inside a multi-char modestring
+    // (Solanum's `MODE #c be` views bans and exceptions together) must dump each
+    // list, not silently no-op — the char used to fall through the query gate
+    // (which only matched a single-char modestring) into the apply loop and hit
+    // a bare `continue`.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice"); // founder → op on #ml
+    s.line(alice, "JOIN #ml");
+    s.line(alice, "MODE #ml +b baddie!*@*");
+    s.line(alice, "MODE #ml +e friend!*@*");
+    s.drain(alice);
+
+    s.line(alice, "MODE #ml be");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("367") && l.contains("baddie")),
+        "ban list (367) must be dumped: {out:#?}"
+    );
+    assert!(
+        out.iter()
+            .any(|l| l.contains("348") && l.contains("friend")),
+        "exception list (348) must be dumped: {out:#?}"
+    );
+    assert!(has_numeric(&out, "368"), "end of ban list: {out:#?}");
+    assert!(has_numeric(&out, "349"), "end of exception list: {out:#?}");
+}
+
+#[test]
 fn ban_removal_is_case_insensitive_like_matching() {
     // A ban matches subjects case-insensitively, so removing it must compare
     // the same way: `-b` in a different case than the stored `+b` must lift it,
@@ -874,9 +904,16 @@ fn topic_query_on_secret_channel_hidden_from_nonmembers() {
     let bob = s.register(2, "bob"); // not a member
     s.line(bob, "TOPIC #sec");
     let out = s.drain(bob);
+    // A +s channel must look *non-existent* (403), not "you're not on it"
+    // (442): 442 confirms the channel exists, an existence oracle. This matches
+    // MODE/KNOCK, which report a hidden channel the same way.
     assert!(
-        has_numeric(&out, "442"),
-        "non-member must get ERR_NOTONCHANNEL: {out:#?}"
+        has_numeric(&out, "403"),
+        "non-member must get ERR_NOSUCHCHANNEL, not an existence-confirming 442: {out:#?}"
+    );
+    assert!(
+        !has_numeric(&out, "442"),
+        "442 would confirm the secret channel exists: {out:#?}"
     );
     assert!(
         !out.iter().any(|l| l.contains("hush")),

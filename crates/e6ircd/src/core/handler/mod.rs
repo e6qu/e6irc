@@ -164,6 +164,25 @@ pub(crate) fn clip_echo(token: &str) -> &str {
     e6irc_proto::message::truncate_on_char_boundary(token, 64)
 }
 
+/// Answer a query against a `+s` channel the requester can't see: report it as
+/// non-existent (`ERR_NOSUCHCHANNEL`), never a numeric that would confirm it
+/// exists. The [`Hidden`](crate::core::state::Hidden) proof can only come from
+/// [`Channel::hidden_from`](crate::core::state::Channel::hidden_from), so every
+/// deny surface funnels through this one numeric.
+pub(super) fn deny_hidden(
+    state: &mut ServerState,
+    conn: ConnId,
+    target: &str,
+    _proof: crate::core::state::Hidden,
+) {
+    state.numeric(
+        conn,
+        ERR_NOSUCHCHANNEL,
+        &[clip_echo(target)],
+        Some("No such channel"),
+    );
+}
+
 /// Inject a tag into the front of an already-serialized wire line
 /// (CRLF included), merging with any existing `@tags`.
 fn inject_tag(line: &[u8], tag: &str) -> bytes::Bytes {

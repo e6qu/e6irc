@@ -578,7 +578,7 @@ mod pages {
                 );
             }
         };
-        render(Account {
+        render_private(Account {
             account,
             csrf,
             networks,
@@ -667,23 +667,40 @@ mod pages {
         })
     }
 
-    /// Cookie-authenticate and verify the CSRF token for a page mutation.
-    /// Returns the account name, or an error response.
-    async fn authed_csrf(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-    ) -> Result<String, Response> {
-        let account = authenticate(state, headers).await?;
-        let session = session_token(headers, state.secure_cookies)
-            .ok_or_else(|| problem(StatusCode::UNAUTHORIZED, "Session required", None))?;
-        let token = headers
-            .get("x-csrf-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if state.csrf_valid(&session, token) {
-            Ok(account)
-        } else {
-            Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None))
+    /// A cookie-authenticated account whose request also carries a valid
+    /// `x-csrf-token` header — the CSRF precondition for an htmx form mutation,
+    /// as an extractor. A state-changing form-POST handler is CSRF-protected
+    /// because it *asks for this in its signature*, not because the author
+    /// remembered to open the body with a check — the same way [`Authenticated`]
+    /// closed the authentication class. A new `pages::*` form handler that omits
+    /// it fails to compile for want of the account argument.
+    ///
+    /// Header-based by construction: a `FromRequestParts` extractor cannot read
+    /// a form-body field, so the one plain HTML form that carries its token in
+    /// the body (`approve_device_form`, which htmx can't drive) keeps its own
+    /// explicit `csrf_valid` check.
+    pub(crate) struct CsrfVerified(pub(crate) String);
+
+    impl axum::extract::FromRequestParts<Arc<AppState>> for CsrfVerified {
+        type Rejection = Response;
+
+        async fn from_request_parts(
+            parts: &mut axum::http::request::Parts,
+            state: &Arc<AppState>,
+        ) -> Result<Self, Self::Rejection> {
+            let account = authenticate(state, &parts.headers).await?;
+            let session = session_token(&parts.headers, state.secure_cookies)
+                .ok_or_else(|| problem(StatusCode::UNAUTHORIZED, "Session required", None))?;
+            let token = parts
+                .headers
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if state.csrf_valid(&session, token) {
+                Ok(CsrfVerified(account))
+            } else {
+                Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None))
+            }
         }
     }
 
@@ -691,13 +708,10 @@ mod pages {
     /// refreshed network table fragment.
     pub async fn add_network_form(
         State(state): State<Arc<AppState>>,
+        CsrfVerified(account): CsrfVerified,
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let account = match authed_csrf(&state, &headers).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
         let Some(registry) = &state.bnc_registry else {
             return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
         };
@@ -737,13 +751,10 @@ mod pages {
     /// network table fragment.
     pub async fn delete_network_form(
         State(state): State<Arc<AppState>>,
+        CsrfVerified(account): CsrfVerified,
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let account = match authed_csrf(&state, &headers).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
         let Some(registry) = &state.bnc_registry else {
             return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
         };
@@ -773,7 +784,7 @@ mod pages {
             .unwrap_or_default();
         let pool = state.pool.as_ref().expect("checked");
         match network_views(pool, account).await {
-            Ok(networks) => render(NetworkRows { csrf, networks }),
+            Ok(networks) => render_private(NetworkRows { csrf, networks }),
             Err(r) => r,
         }
     }
@@ -790,6 +801,22 @@ mod pages {
                 problem(StatusCode::INTERNAL_SERVER_ERROR, "Template error", None)
             }
         }
+    }
+
+    /// Like [`render`], plus `Cache-Control: no-store` — for an authenticated
+    /// per-user page that carries a session-bound CSRF token and personal data
+    /// (account, network list) yet still runs scripts (htmx). It deliberately
+    /// keeps `render`'s script-permitting headers rather than `render_auth`'s
+    /// `default-src 'none'` CSP, which would block htmx; the point here is only
+    /// to keep the personalized response out of shared/bfcache, the same reason
+    /// `/me` sets `no_store` explicitly. Without this the browser's Back/bfcache
+    /// re-shows the previous user's account after logout on a shared machine.
+    fn render_private<T: Template>(template: T) -> Response {
+        let mut response = render(template);
+        if response.status().is_success() {
+            no_store(response.headers_mut());
+        }
+        response
     }
 
     fn render_auth<T: Template>(template: T) -> Response {

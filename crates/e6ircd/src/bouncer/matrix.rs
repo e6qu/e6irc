@@ -320,14 +320,15 @@ async fn handle_command(s: &mut Session, line: &str) -> Relayed {
             s.base,
             urlencode(&room_id),
         );
-        let send = s
+        let req = s
             .http
             .put(url)
             .bearer_auth(&s.token)
-            .json(&serde_json::json!({ "msgtype": "m.text", "body": text }))
-            .send()
-            .await;
-        if let Err(e) = send {
+            .json(&serde_json::json!({ "msgtype": "m.text", "body": text }));
+        // Route through the checked send: a 403 (bot no longer in the room), 429,
+        // or 5xx comes back as `Err`, not a delivered-looking `Ok(Response)`, so
+        // the message is reported undelivered instead of silently dropped.
+        if let Err(e) = super::bridge_send(req).await {
             eprintln!("matrix: send to room {room_id} failed: {e}");
             outcome = Relayed::Failed(room_id);
         }

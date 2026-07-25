@@ -1593,6 +1593,79 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-eighth sweep — four-front hunt + four more classes made
+unrepresentable (2026-07-25): four parallel hunts (DB/persistence, core
+protocol handlers, HTTP/OIDC/auth, bouncer/bridges) plus a hand review of the
+foundational crates. One HIGH, five MED, and several LOW bugs — each paired with
+the bug *class* it belongs to and, where clean, made impossible in the type
+system. Eleven items landed; two findings were investigated and deliberately
+left unchanged, surfaced with the reason.
+
+**The HIGH — a Matrix message silently dropped on any upstream error**
+(bouncer/matrix.rs). The reverse-direction send checked only the transport
+`Err`; `reqwest::send()` returns `Ok(Response)` for a 403/429/5xx too, so a
+message to a room the bridge was kicked from was reported delivered and vanished
+— the exact silent-drop DESIGN §2 forbids, and an asymmetry: Discord
+(`error_for_status`) and Slack (`check_ok`) both check. Fixed by a `bridge_send`
+choke point every outbound bridge call now funnels through, which rejects a
+non-2xx — so "send, ignore the status" is unwritable (a new §2 class).
+
+**The MEDs.**
+- *An existence oracle for secret channels* (core/handler). `TOPIC` on a `+s`
+  channel a non-member can't see returned 442 ("you're not on it") while
+  MODE/KNOCK/NAMES returned 403 ("no such channel") — so `TOPIC #x` → 442 vs a
+  non-existent `#y` → 403 probed for hidden channels. The `+s`-hidden predicate
+  was hand-copied at five surfaces, each picking its own numeric. Unified into
+  `Channel::hidden_from` returning a `Hidden` token whose only consumer is one
+  `deny_hidden` helper (403); the numeric can no longer diverge per surface.
+- *Reconnect jitter that didn't de-correlate drivers* (bouncer). The jitter was
+  `current % 97`, a pure function of the backoff delay every driver advances
+  through identically — so a shared-upstream outage reconnected all ~1k BNC
+  sessions in lockstep, the SYN burst jitter exists to prevent. Seeded with a
+  stable per-driver value (Fibonacci-hashed, RNG-free).
+- *Personalized account page cacheable* (http). The account page and its htmx
+  networks fragment rendered without `Cache-Control: no-store` while carrying a
+  session-bound CSRF token and the user's network list — bfcache/shared-cache
+  could re-show one user's account to the next. Routed through a `render_private`
+  helper (no-store, but keeping the script-permitting CSP htmx needs, unlike the
+  strict `render_auth`).
+- *A `HistoryDbRow` transposition compiled silently* (db.rs). The history read
+  decoded a positional 7-tuple with four same-typed `String` columns; a
+  reordered SELECT mis-mapped without a compile error, and its doc comment
+  already listed the wrong column count. Replaced with a name-keyed
+  `#[derive(sqlx::FromRow)]` struct (the computed millis column aliased so it
+  binds by name).
+- *A TLS-declared deployment could boot with a plaintext `public_url`* (config).
+  `secure_cookies` guarded the OIDC `issuer_url` https but not `public_url`,
+  which builds the redirect URI — so the auth round-trip could be advertised over
+  http while the `Secure`/`__Host-` cookie it needs can't ride that origin. Added
+  the symmetric guard.
+
+**The LOWs.** A `+b`/`+e`/… list char with no argument inside a multi-char
+modestring (`MODE #c be`, Solanum's "view both lists") silently no-op'd instead
+of dumping each list — closed by funnelling both the standalone and embedded
+query forms through one `emit_channel_list`. `JOIN #a,,#c k1,k2` handed `#c` the
+key that positionally belonged to the empty slot (keys now align to raw comma
+positions). A slash-less BNC attach nick was refused rather than defaulting to
+the `local` network as DESIGN §10.4 specifies. A `CsrfVerified` extractor closes
+the CSRF-on-form-mutation class the way `Authenticated` closed auth.
+
+**Investigated, deliberately unchanged (surfaced, not swallowed).** (a) A flush
+failure marking no ring incomplete looked asymmetric with the enqueue-failure
+path — but a DB-backed ring is created `complete = false` and never becomes
+complete (no `complete = true` path exists), so CHATHISTORY always has Postgres
+as its backstop and never presents a false-complete gap; marking would be a
+no-op. (b) Server-ban masks display folded rather than as the oper typed them —
+defensible ircd behaviour (matching is case-insensitive); MaskKey-ifying the
+working K-line/persistence path, plus a schema migration to preserve display
+case, is gold-plating a security path with no live bug, so it's noted for a
+dedicated pass rather than churned in here.
+
+Full gate green: workspace tests, clippy (default + `embed-web` + bridges), fmt,
+the four guard scripts, `cargo deny`, the fuzz build, the PG-backed `db` suite
+(41, which validates the new name-keyed history binding against real Postgres),
+`http`, `oidc`, irctest main (380) and the persistence-backed services list (49).
+
 Seventy-seventh sweep — backlog purge + two more bug classes made
 unrepresentable (2026-07-25): a step back to drain the entire "surfaced, not
 changed" backlog in one branch, make bug *classes* impossible rather than

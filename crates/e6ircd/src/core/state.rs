@@ -613,7 +613,26 @@ pub(crate) struct Channel {
     pub created_at_secs: u64,
 }
 
+/// Proof that a `+s` (secret) channel must look non-existent to a connection.
+/// Constructible only by [`Channel::hidden_from`] and consumed only by the
+/// handler's `deny_hidden`, which answers `ERR_NOSUCHCHANNEL`. So every surface
+/// that denies access to a hidden channel reports the *same* "no such channel"
+/// — none can hand-pick a numeric (like 442 `ERR_NOTONCHANNEL`) that would
+/// instead confirm the channel exists, which is exactly how a `TOPIC`-query
+/// existence oracle slipped in.
+pub(crate) struct Hidden(());
+
 impl Channel {
+    /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
+    /// non-members on every query surface — its existence, modes, topic, and
+    /// member lists all. The single source of that predicate: deny surfaces
+    /// (`MODE`/`KNOCK`/`TOPIC`) take the returned [`Hidden`] to `deny_hidden`;
+    /// content-listing surfaces (`NAMES`/`WHO`/`WHOIS`/`LIST`) test `.is_some()`
+    /// and simply omit the channel's rows.
+    pub(crate) fn hidden_from(&self, conn: ConnId) -> Option<Hidden> {
+        (self.modes.secret && !self.members.contains_key(&conn)).then_some(Hidden(()))
+    }
+
     fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &str) -> bool {
         masks
             .iter()

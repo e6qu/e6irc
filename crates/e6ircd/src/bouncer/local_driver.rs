@@ -11,6 +11,10 @@ use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
 use crate::core::{ConnId, Input, Output};
 
+/// The in-process network's name — the driver `kind`, the session host, and the
+/// network a slash-less BNC attach defaults to (DESIGN §10.4: bare = `local`).
+pub(crate) const LOCAL_NETWORK: &str = "local";
+
 /// Handles into the core, so the driver can open an in-process session.
 #[derive(Clone)]
 pub struct CoreHandles {
@@ -43,7 +47,7 @@ impl LocalDriver {
 
 impl NetworkDriver for LocalDriver {
     fn kind(&self) -> &'static str {
-        "local"
+        LOCAL_NETWORK
     }
 
     fn start(self: Box<Self>) -> NetworkHandle {

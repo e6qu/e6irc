@@ -262,7 +262,7 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             None => true,
         })
         .map(|(_, c)| c)
-        .filter(|c| !c.modes.secret || c.members.contains_key(&conn))
+        .filter(|c| c.hidden_from(conn).is_none())
         .map(|c| {
             (
                 c.name.clone(),
@@ -430,13 +430,8 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let display = chan.name.clone();
     // A secret channel is hidden: look non-existent to a non-member.
-    if chan.modes.secret && !chan.members.contains_key(&conn) {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+    if let Some(proof) = chan.hidden_from(conn) {
+        super::deny_hidden(state, conn, target, proof);
         return;
     }
     if chan.members.contains_key(&conn) {
