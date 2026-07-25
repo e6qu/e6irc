@@ -74,6 +74,57 @@ rule exists to override it every time.
 
 ---
 
+## The No-Deferral Rule — HARD RULE
+
+> **When you find a defect or a worthwhile fix, address it in the same
+> change — or STOP and put the decision to the human. You may not
+> unilaterally file it away to be done "later".**
+
+Deferral is the failure mode this rule exists to kill. It has shown up as
+"surfaced, not done", "deferred to a dedicated pass", "noted for a future
+sweep", "gold-plating the working", a `// TODO`, or an entry in `BUGS.md`.
+Every one of those is the same move: deciding *not to fix something now*
+and hiding that decision in prose so it reads as settled. **That decision
+is the human's to make, not the agent's.**
+
+### The only three outcomes for something you find
+
+1. **Fix it in this change.** The default. If it is worth writing down, it
+   is worth fixing — writing it down instead is the deferral.
+2. **Escalate it as an explicit question to the human** — loudly, in the
+   response, phrased as a decision ("X exists; I can fix it by Y at cost
+   Z, or leave it because W — which?"). Not a paragraph in `PLAN.md`; a
+   question the human answers before the sweep is called done.
+3. **Genuinely does not belong** (it contradicts a documented, tested
+   design decision, or is out of the repo's scope). Then say so *to the
+   human*, with the reason and the doc reference — and let them confirm.
+   "It contradicts a design decision" is a claim to be checked, not a
+   licence to file it yourself.
+
+There is no fourth outcome. "Record it for later" is not an outcome; it is
+the bug.
+
+### This is not a licence to balloon or to grovel
+
+The Boy-Scout rule's limits still hold: don't rewrite the working to your
+taste, don't leave the tree red mid-refactor. A fix that is genuinely too
+large to land green in one pass is exactly the case for outcome (2) — a
+scoped question to the human — never outcome-zero, the silent file-away.
+The point is not "do every refactor ever imagined." The point is that the
+*choice* to not do one is surfaced as a decision, not buried.
+
+### Why it's stated so strongly here
+
+Because it already regressed. Sweep after sweep, with an explicit "do not
+defer" instruction standing, the agent kept coining "surfaced, not done"
+sections and moving on — treating "surface, don't swallow" as permission
+to swallow-by-documenting. `tools/check-no-defer.sh` now fails the gate on
+the known vehicles (an open `BUGS.md` entry, a new deferral idiom added to
+`PLAN.md`), so the regression is caught mechanically and not left to
+memory.
+
+---
+
 ## Practical checklist before you stop
 
 - [ ] Builds green (default **and** every feature: `embed-web`, `matrix`).
@@ -90,8 +141,11 @@ rule exists to override it every time.
       an integration test — the cross-crate case the compiler can't see).
 - [ ] `tools/check-duplication.sh` clean (copy-paste under the ratchet; the
       fix is to extract shared logic, never to raise the threshold).
+- [ ] `tools/check-no-defer.sh` clean (no deferral vehicle in use — see the
+      No-Deferral Rule above: `BUGS.md` empty, no new "surfaced, not
+      done"-style note in `PLAN.md`).
 - [ ] Anything you moved/renamed: all references updated.
-- [ ] Anything broken you noticed on the way: fixed, or loudly surfaced
-      with the reason it wasn't.
+- [ ] Anything broken you noticed on the way: **fixed**, or escalated to the
+      human as an explicit decision — never filed away for later.
 - [ ] `DESIGN.md` / `PLAN.md` updated in the same change when behavior or
       status changed.
