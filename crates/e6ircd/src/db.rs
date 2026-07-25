@@ -294,6 +294,9 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
     // through UNNEST must be rectangular, which a ragged nesting is not.
     let mut peers: Vec<Option<String>> = Vec::with_capacity(n);
     let mut bots: Vec<bool> = Vec::with_capacity(n);
+    // NULL for an ordinary message; the encoded lines for a draft/multiline one
+    // (see `core::handler::message::encode_multiline`), authoritative on replay.
+    let mut multilines: Vec<Option<String>> = Vec::with_capacity(n);
     for request in batch {
         let DbRequest::LogMessage {
             msgid,
@@ -304,6 +307,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
             kind,
             body,
             sender_is_bot,
+            multiline,
             ts,
         } = request
         else {
@@ -317,16 +321,17 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         kinds.push(kind.db().to_string());
         bodies.push(body);
         bots.push(sender_is_bot);
+        multilines.push(multiline);
         tss.push(ts.as_millis() as i64);
     }
     let result = sqlx::query(
-        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot)
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot, multiline)
          SELECT m, t, p, a, k, b, at,
                 CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END,
-                bot
+                bot, ml
          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                      ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x),
-                     $8::text[], $9::bool[]) AS u(m, t, p, a, k, b, at, d, bot)
+                     $8::text[], $9::bool[], $10::text[]) AS u(m, t, p, a, k, b, at, d, bot, ml)
          ON CONFLICT (msgid) DO NOTHING",
     )
     .bind(&msgids)
@@ -338,6 +343,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
     .bind(&tss)
     .bind(&peers)
     .bind(&bots)
+    .bind(&multilines)
     .execute(pool)
     .await;
     if let Err(e) = result {
@@ -730,6 +736,8 @@ struct HistoryDbRow {
     kind: String,
     body: String,
     sender_is_bot: bool,
+    /// Encoded draft/multiline lines, or NULL for an ordinary message.
+    multiline: Option<String>,
 }
 
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
@@ -747,7 +755,7 @@ macro_rules! history_select {
     ($rest:literal) => {
         concat!(
             "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-             sender_account, kind, body, sender_is_bot FROM messages ",
+             sender_account, kind, body, sender_is_bot, multiline FROM messages ",
             $rest
         )
     };
@@ -759,12 +767,12 @@ macro_rules! history_select {
 macro_rules! history_window {
     ($older:literal, $newer:literal) => {
         concat!(
-            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot FROM ( (SELECT msgid, \
+            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot, multiline FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
-             body, sender_is_bot, ts, id FROM messages ",
+             body, sender_is_bot, multiline, ts, id FROM messages ",
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
-             sender_prefix, sender_account, kind, body, sender_is_bot, ts, id FROM messages ",
+             sender_prefix, sender_account, kind, body, sender_is_bot, multiline, ts, id FROM messages ",
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
         )
@@ -938,6 +946,7 @@ fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
             .unwrap_or(crate::core::MessageKind::Privmsg),
         body: row.body,
         sender_is_bot: row.sender_is_bot,
+        multiline: row.multiline,
     }
 }
 
@@ -2487,7 +2496,7 @@ mod history_sql_tests {
         assert_eq!(
             history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
             "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
-             sender_account, kind, body, sender_is_bot FROM messages WHERE target = $1 ORDER BY ts \
+             sender_account, kind, body, sender_is_bot, multiline FROM messages WHERE target = $1 ORDER BY ts \
              DESC, id DESC LIMIT $2"
         );
     }

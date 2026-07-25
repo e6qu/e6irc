@@ -453,6 +453,13 @@ pub(crate) struct HistoryEntry {
     /// The sender was a bot (+B) at send time, so replay re-emits the `bot`
     /// message tag a message-tags recipient saw live.
     pub sender_is_bot: bool,
+    /// For a `draft/multiline` message: its lines encoded as one string
+    /// (`crate::core::handler::message::encode_multiline`), so the whole message
+    /// is one history entry with one msgid — not one row per line with fresh,
+    /// never-delivered msgids. `None` for an ordinary single-line message;
+    /// `body` then holds the text. On replay a `Some` reconstructs the multiline
+    /// batch (or flattens) reusing the single msgid, as live delivery did.
+    pub multiline: Option<String>,
 }
 
 /// Ring capacity per target; older entries live only in PostgreSQL.

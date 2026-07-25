@@ -510,6 +510,7 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
                 kind: e6ircd::core::MessageKind::Privmsg,
                 body: format!("line {i}"),
                 sender_is_bot: false,
+                multiline: None,
                 ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i),
             })
             .await

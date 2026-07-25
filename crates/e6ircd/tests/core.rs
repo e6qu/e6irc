@@ -3351,6 +3351,116 @@ fn msgid_tag_on_live_delivery() {
 
 // ---- CHATHISTORY (hot ring) ---------------------------------------------
 
+/// A draft/multiline message is stored as the one message it was, so CHATHISTORY
+/// replays it under its original msgid — reconstructed as a nested batch for a
+/// capable requester and flattened for one without the capability, mirroring
+/// live delivery. Before the fix, replay minted a fresh msgid per line, so a
+/// msgid-deduplicating client saw each line as a brand-new message.
+#[test]
+fn chathistory_replays_a_multiline_message_as_one_message() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/multiline message-tags");
+    let capable = register_with_caps(
+        &mut s,
+        2,
+        "capable",
+        "batch draft/multiline draft/chathistory server-time message-tags",
+    );
+    // Same as `capable` minus draft/multiline: it still gets the CHATHISTORY
+    // batch (needs `batch`), but the message flattens to one line per line.
+    let flat = register_with_caps(
+        &mut s,
+        3,
+        "flat",
+        "batch draft/chathistory server-time message-tags",
+    );
+    for c in [alice, capable, flat] {
+        s.line(c, "JOIN #m");
+    }
+    for c in [alice, capable, flat] {
+        s.drain(c);
+    }
+    s.line(alice, "BATCH +7 draft/multiline #m");
+    s.line(alice, "@batch=7 PRIVMSG #m :hello");
+    s.line(alice, "@batch=7 PRIVMSG #m :");
+    s.line(alice, "@batch=7;draft/multiline-concat PRIVMSG #m :world");
+    s.line(alice, "BATCH -7");
+    s.drain(capable);
+    s.drain(flat);
+
+    // Capable requester: a nested draft/multiline batch, blank line kept, concat
+    // preserved, and the msgid on the inner batch open only — exactly once.
+    // `* 1` keeps the request inside the ring (the one message it holds) rather
+    // than deferring to the DB, which the non-persistent test path never answers.
+    s.line(capable, "CHATHISTORY LATEST #m * 1");
+    let out = s.drain(capable);
+    assert!(
+        out[0].contains("BATCH +") && out[0].contains("chathistory #m"),
+        "{out:#?}"
+    );
+    assert!(out.last().unwrap().contains("BATCH -"), "{out:#?}");
+    let open = out
+        .iter()
+        .find(|l| l.contains("BATCH +") && l.contains("draft/multiline #m"))
+        .unwrap_or_else(|| panic!("nested multiline batch open missing: {out:#?}"));
+    let inner_ref = open
+        .split(" BATCH +")
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .expect("inner ref")
+        .to_string();
+    let content: Vec<_> = out
+        .iter()
+        .filter(|l| l.contains(&format!("batch={inner_ref}")) && l.contains("PRIVMSG"))
+        .collect();
+    assert_eq!(content.len(), 3, "blank line kept in the batch: {out:#?}");
+    assert!(
+        content[2].contains("draft/multiline-concat"),
+        "{}",
+        content[2]
+    );
+    for l in &content {
+        assert!(!l.contains("msgid="), "content lines carry no msgid: {l}");
+    }
+    let cap_msgid = open
+        .trim_start_matches('@')
+        .split(' ')
+        .next()
+        .expect("tags")
+        .split(';')
+        .find_map(|t| t.strip_prefix("msgid="))
+        .expect("msgid on the inner batch open")
+        .to_string();
+    assert_eq!(
+        out.iter().filter(|l| l.contains("msgid=")).count(),
+        1,
+        "the message has exactly one msgid: {out:#?}"
+    );
+
+    // Flatten requester: no draft/multiline batch, blank line dropped, msgid on
+    // the first line only — and it is the SAME msgid the capable form carried.
+    s.line(flat, "CHATHISTORY LATEST #m * 1");
+    let out = s.drain(flat);
+    let lines: Vec<_> = out.iter().filter(|l| l.contains("PRIVMSG #m")).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "blank line dropped when flattened: {out:#?}"
+    );
+    assert!(lines[0].ends_with(":hello"), "{}", lines[0]);
+    assert!(lines[1].ends_with(":world"), "{}", lines[1]);
+    assert!(
+        !out.iter().any(|l| l.contains("draft/multiline")),
+        "{out:#?}"
+    );
+    assert!(
+        lines[0].contains(&format!("msgid={cap_msgid}")),
+        "same message: {}",
+        lines[0]
+    );
+    assert!(!lines[1].contains("msgid="), "{}", lines[1]);
+}
+
 #[test]
 fn chathistory_latest_replays_from_ring() {
     let mut s = TestServer::new();

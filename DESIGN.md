@@ -607,6 +607,17 @@ way to carry a line break, and a blank line would be an empty message. The
 limits (`max-bytes`, `max-lines`) are advertised as the capability's value, so a
 client can see them before starting a batch it cannot finish.
 
+The one-message property holds through **history** too. A multiline message is
+stored as a single entry under its single msgid — its lines and their concat
+flags encoded together — not one row per line, because the CHATHISTORY spec
+requires a replayed msgid to be the one originally sent, and per-line ids would
+be ids no client ever saw. CHATHISTORY reconstructs it on replay exactly as live
+delivery would send it now: a nested `draft/multiline` batch (blank lines and
+concat tags intact) for a requester that negotiated the capability, or the
+flattened non-blank lines (msgid on the first only) for one that did not —
+reusing the stored msgid in both. So the batch a client saw live and the one it
+pages back are the same event, with the same id.
+
 Every message — single-line or batched — resolves its target through one place,
 so `+m`, `+n`, `+C`, bans and quiets cannot be evaded by splitting text across a
 batch, and permission checks see the whole message rather than each fragment.
