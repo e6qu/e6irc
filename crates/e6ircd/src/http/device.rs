@@ -113,21 +113,30 @@ pub(super) struct DeviceApproveReq {
     pub(super) user_code: String,
 }
 
+/// Normalise a user-typed code (users may type it lowercase or with a
+/// separator) and approve its pending grant as `account`. Shared by the JSON
+/// API and the `/device` verification page.
+pub(super) async fn approve_user_code(
+    state: &AppState,
+    account: &str,
+    raw_code: &str,
+) -> Result<bool, crate::db::DbError> {
+    let pool = pool_of(state);
+    let code: String = raw_code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    crate::db::approve_device_grant(pool, &code, account).await
+}
+
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 pub(super) async fn device_approve(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
-    let pool = pool_of(&state);
-    // Normalise: users may type the code lowercase or with a separator.
-    let code: String = req
-        .user_code
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
-    match crate::db::approve_device_grant(pool, &code, &account).await {
+    match approve_user_code(&state, &account, &req.user_code).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem(StatusCode::NOT_FOUND, "No such pending code", None),
         Err(e) => {

@@ -189,7 +189,15 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         None => format!(":{prefix} AWAY"),
     };
     let is_away = message.is_some();
-    state.sessions.get_mut(&conn).expect("checked").away = message;
+    let session = state.sessions.get_mut(&conn).expect("checked");
+    // Announce only a real transition (state or message): re-declaring the
+    // identical away state is a no-op, and broadcasting it would hand every
+    // client an unmetered away-notify spam vector aimed at its channel peers —
+    // the same "don't invent phantom transitions" rule the MODE no-op
+    // suppression enforces. The numeric to self stays unconditional (the
+    // client asked; it always gets its answer).
+    let changed = session.away != message;
+    session.away = message;
     if is_away {
         state.numeric(
             conn,
@@ -204,6 +212,9 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             &[],
             Some("You are no longer marked as being away"),
         );
+    }
+    if !changed {
+        return;
     }
     for peer in state.channel_peers(conn) {
         if state

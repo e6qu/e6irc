@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>e6irc — approve a device</title>
+    <link rel="stylesheet" href="/auth.css" />
+  </head>
+  <body>
+    <main class="auth-shell" id="main-content">
+      <section class="auth-card" aria-labelledby="device-title">
+      <span class="brand" aria-label="e6irc">e6irc</span>
+      <p class="eyebrow">Device sign-in</p>
+      <h1 id="device-title">Approve a device</h1>
+      <p class="lede">Enter the code shown on the device you are signing in.</p>
+      {% if let Some(message) = outcome %}
+        <p class="{% if approved %}notice{% else %}none{% endif %}" role="status">{{ message }}</p>
+      {% endif %}
+      <form method="post" action="/device" class="actions">
+        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <input
+          type="text"
+          name="user_code"
+          placeholder="ABCD2345"
+          autocomplete="one-time-code"
+          autofocus
+          required
+        />
+        <button class="primary-action" type="submit">Approve</button>
+      </form>
+      </section>
+    </main>
+  </body>
+</html>

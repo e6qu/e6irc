@@ -4,6 +4,11 @@ use super::*;
 
 // ---- CHATHISTORY (draft/chathistory, hot ring) --------------------------
 
+/// Most messages one CHATHISTORY request may return. The single source for
+/// both the request clamps below and the `CHATHISTORY=` ISUPPORT token, so
+/// what is advertised can never drift from what is enforced.
+pub(super) const CHATHISTORY_MAX: usize = 500;
+
 /// A CHATHISTORY selector is a supported message reference: the open bound
 /// `*`, a `msgid=`, or a `timestamp=`. Anything else is INVALID_MSGREFTYPE.
 pub(super) fn is_valid_msgref(sel: &str) -> bool {
@@ -164,7 +169,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         .get(if is_between { 4 } else { 3 })
         .map(|l| l.parse::<usize>())
     {
-        Some(Ok(n)) if n > 0 => n.min(500),
+        Some(Ok(n)) if n > 0 => n.min(CHATHISTORY_MAX),
         _ => {
             chathistory_fail(
                 state,
@@ -361,7 +366,7 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
         .get(3)
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(100)
-        .clamp(1, 500);
+        .clamp(1, CHATHISTORY_MAX);
 
     // Visible targets are the channels the requester is on, plus every
     // conversation they take part in. (No early return on "no channels": a

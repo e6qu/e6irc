@@ -607,6 +607,48 @@ mod tests {
 mod loom_tests {
     use super::*;
 
+    /// The async backpressure path — parked-waker registration with the
+    /// post-registration re-check in `push`, and `pop`'s waker slot — under
+    /// contention: two senders block on a full capacity-1 queue while the
+    /// receiver pops both. A lost wakeup (a pop racing between a pusher's
+    /// registration and its re-check, or vice versa) parks a task forever,
+    /// which loom surfaces as a deadlocked branch; delivery stays
+    /// exactly-once. The try_push/try_pop model below can't see this: the
+    /// waker protocol only runs in the async path.
+    #[test]
+    fn async_push_pop_wakers_lose_no_wakeup_under_all_interleavings() {
+        // Bounded exploration: three threads of async machinery explode the
+        // unbounded state space past any CI budget. A preemption bound of 2
+        // is loom's own recommended setting — most real bugs (including lost
+        // wakeups, which need exactly one preemption between registration and
+        // re-check) surface within it.
+        let mut model = loom::model::Builder::new();
+        model.preemption_bound = Some(2);
+        model.check(|| {
+            let (tx, mut rx) = queue::<u32>(Config {
+                name: "loom-async",
+                capacity: 1,
+                policy: Policy::Fifo,
+            });
+            let tx2 = tx.clone();
+            let t1 = loom::thread::spawn(move || {
+                loom::future::block_on(tx.push(1)).expect("receiver alive");
+            });
+            let t2 = loom::thread::spawn(move || {
+                loom::future::block_on(tx2.push(2)).expect("receiver alive");
+            });
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                let env = loom::future::block_on(rx.pop()).expect("two pushes in flight");
+                got.push(env.payload);
+            }
+            t1.join().unwrap();
+            t2.join().unwrap();
+            got.sort_unstable();
+            assert_eq!(got, vec![1, 2]);
+        });
+    }
+
     /// Two producers race one consumer: every accepted event is delivered
     /// exactly once with a unique seq, across all interleavings.
     #[test]

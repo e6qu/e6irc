@@ -1487,6 +1487,19 @@ impl ServerState {
             return;
         };
         let was_registered = session.registered;
+        // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
+        // ring miss, say) would be dropped with the session — including the
+        // terminal ERROR a QUIT or kill path sent just before this close. The
+        // reply it was waiting on can never be delivered usefully now, so
+        // release the hold and flush what it withheld, in production order,
+        // while the connection can still receive it. The sibling of the
+        // capture flush below.
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.deferred_replies = 0;
+            for line in std::mem::take(&mut session.held) {
+                self.send_bytes_uncaptured(conn, line);
+            }
+        }
         // A teardown initiated from inside a labeled command (QUIT, flood
         // kill, credential-budget close) has its terminal `ERROR` sitting in
         // the labeled-response capture buffer; the dispatch wrapper would only

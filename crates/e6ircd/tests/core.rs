@@ -2379,6 +2379,67 @@ fn plain_who_still_works_alongside_whox() {
     assert!(has_numeric(&out, "352") && has_numeric(&out, "315"));
 }
 
+/// A WHOX token that cannot stand as a middle parameter must not be echoed
+/// verbatim: an empty token (`%tn,`) collapses into the adjacent space and
+/// shifts every later field left one column, and a leading `:` (`%tn,:x`)
+/// starts a premature trailing that swallows the rest of the row. Both are
+/// treated as absent and echoed as the conventional "0". A fieldless `%`
+/// falls back to plain WHO (charybdis behavior) instead of emitting
+/// parameterless 354 rows.
+#[test]
+fn whox_token_that_breaks_framing_is_defaulted() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #wx");
+    s.drain(alice);
+    // Empty token after the comma → "0", not a vanishing param.
+    s.line(alice, "WHO #wx %tn,");
+    let out = s.drain(alice);
+    let row = out.iter().find(|l| l.contains(" 354 ")).expect("354");
+    assert!(row.ends_with(" 0 alice"), "empty token mis-echoed: {row}");
+    assert!(!row.contains("  "), "collapsed empty param: {row}");
+    // A token opening a premature trailing → "0".
+    s.line(alice, "WHO #wx %tn,:x");
+    let out = s.drain(alice);
+    let row = out.iter().find(|l| l.contains(" 354 ")).expect("354");
+    assert!(row.ends_with(" 0 alice"), "colon token mis-echoed: {row}");
+    // Fieldless % → plain WHO.
+    s.line(alice, "WHO #wx %");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "352") && !out.iter().any(|l| l.contains(" 354 ")),
+        "fieldless WHOX must fall back to plain WHO: {out:#?}"
+    );
+}
+
+/// The RFC 2812 `o` flag (`WHO <mask> o`) restricts matches to operators —
+/// previously it was silently ignored and returned everyone.
+#[test]
+fn who_o_flag_restricts_to_opers() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "OPER god letmein");
+    s.drain(alice);
+    s.line(bob, "WHO * o");
+    let out = s.drain(bob);
+    // Exactly one row — the oper (the requester nick after 352 is bob; the
+    // listed nick column is what matters).
+    let rows: Vec<_> = out.iter().filter(|l| l.contains(" 352 ")).collect();
+    assert_eq!(rows.len(), 1, "only the oper must be listed: {out:#?}");
+    assert!(
+        rows[0].contains(" alice "),
+        "the oper must be the one listed: {}",
+        rows[0]
+    );
+    // Combined with a WHOX spec, Solanum-style.
+    s.line(bob, "WHO * o%nf");
+    let out = s.drain(bob);
+    let rows: Vec<_> = out.iter().filter(|l| l.contains(" 354 ")).collect();
+    assert_eq!(rows.len(), 1, "only the oper: {out:#?}");
+    assert!(rows[0].contains("alice"));
+}
+
 // ---- KICK / INVITE / AWAY / LIST / USERHOST -----------------------------
 
 #[test]
@@ -2679,6 +2740,42 @@ fn away_notify_broadcasts_to_peers() {
     s.line(bob, "AWAY");
     s.drain(bob);
     assert_eq!(s.drain(alice), vec![":bob!bob@host2.example AWAY"]);
+}
+
+/// Re-declaring an identical away state is a no-op and must not re-broadcast:
+/// away-notify announces *transitions*, and an unconditional fan-out hands
+/// every client an unmetered spam vector aimed at its channel peers (the same
+/// "no phantom transitions" rule MODE no-op suppression enforces). The numeric
+/// to self stays unconditional; a *changed* message while already away is a
+/// real transition and still broadcasts.
+#[test]
+fn away_noop_is_not_rebroadcast() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "away-notify");
+    let bob = s.register(2, "bob");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #an");
+        s.drain(c);
+    }
+    s.drain(alice);
+    s.line(bob, "AWAY :brb");
+    assert!(has_numeric(&s.drain(bob), "306"));
+    s.drain(alice);
+    // Identical away again: self numeric yes, peer broadcast no.
+    s.line(bob, "AWAY :brb");
+    assert!(has_numeric(&s.drain(bob), "306"));
+    assert_eq!(s.drain(alice), Vec::<String>::new());
+    // A changed message is a real transition.
+    s.line(bob, "AWAY :lunch");
+    s.drain(bob);
+    assert_eq!(s.drain(alice), vec![":bob!bob@host2.example AWAY :lunch"]);
+    // Unset once: broadcast; unset again: no phantom AWAY.
+    s.line(bob, "AWAY");
+    s.drain(bob);
+    assert_eq!(s.drain(alice), vec![":bob!bob@host2.example AWAY"]);
+    s.line(bob, "AWAY");
+    assert!(has_numeric(&s.drain(bob), "305"));
+    assert_eq!(s.drain(alice), Vec::<String>::new());
 }
 
 #[test]
@@ -3589,6 +3686,59 @@ fn kill_requires_oper() {
     // killing an unknown nick → 401
     s.line(alice, "KILL ghost :x");
     assert!(has_numeric(&s.drain(alice), "401"));
+}
+
+/// A KILL comment near the input-line limit must not build an over-length
+/// ERROR line: the `Closing Link` wrapper's overhead pushed it past 512 bytes,
+/// which panics the debug wire check (an oper-triggerable core crash in any
+/// debug/fuzz build) and is discarded whole by the victim's framing in
+/// release — the killed client was told nothing. The reason must be fitted
+/// like the QUIT path fits its own.
+#[test]
+fn kill_with_maximal_comment_fits_the_error_line() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    s.line(alice, "OPER god letmein");
+    s.drain(alice);
+    // A legal input line (well under 512) whose ERROR wrapping would overflow.
+    let comment = "x".repeat(460);
+    s.line(alice, &format!("KILL bob :{comment}"));
+    let bob_out = s.drain(bob);
+    let error = bob_out
+        .iter()
+        .find(|l| l.starts_with("ERROR :"))
+        .expect("victim must still receive the close notice");
+    assert!(
+        error.len() + 2 <= 512,
+        "ERROR line exceeds the wire limit ({} bytes)",
+        error.len() + 2
+    );
+}
+
+/// A QUIT that arrives while a deferred DB reply is outstanding must still
+/// deliver its terminal ERROR: the close path dropped the session together
+/// with the output held behind the deferral — the ERROR included — so the
+/// quitting client saw nothing at all.
+#[test]
+fn quit_while_reply_deferred_still_delivers_the_error() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.line(alice, "JOIN #room");
+    s.drain(alice);
+    // Defer: the CHATHISTORY page goes to the (undrained) DB queue, so the
+    // connection's later output is held behind the pending reply.
+    s.line(alice, "CHATHISTORY LATEST #room * 5");
+    assert!(
+        s.drain(alice).is_empty(),
+        "the page should be deferred, not answered"
+    );
+    s.line(alice, "QUIT :bye");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.starts_with("ERROR :Closing Link")),
+        "terminal ERROR dropped behind the deferred hold: {out:#?}"
+    );
 }
 
 #[test]
