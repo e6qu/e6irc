@@ -139,6 +139,8 @@ numerics! {
     RPL_MONLIST = 732,
     RPL_ENDOFMONLIST = 733,
     ERR_MONLISTFULL = 734,
+    // Atheme/Solanum-family: a MODE change refused by a ChanServ mode lock.
+    ERR_MLOCKRESTRICTED = 742,
     RPL_LOGGEDIN = 900,
     RPL_LOGGEDOUT = 901,
     ERR_NICKLOCKED = 902,

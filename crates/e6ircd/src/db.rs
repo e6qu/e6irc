@@ -1046,14 +1046,11 @@ async fn query_between_selectors(
     Ok(rows.into_iter().map(history_row_from_db).collect())
 }
 
-/// CHATHISTORY TARGETS: among `channels` (casefolded), the buffers with a
-/// message in `[min_ts, max_ts]`, each with its most recent message time,
-/// most-recent first. Empty on a query error (logged loudly).
-/// Buffers with activity strictly between `min_ts` and `max_ts`: the
-/// `channels` the requester
-/// can see, plus every direct-message conversation `me` takes part in, reported
-/// as the correspondent's casefolded nick. Oldest activity first, so a `limit`
-/// keeps the oldest buffers.
+/// CHATHISTORY TARGETS: buffers whose latest message falls strictly between
+/// `min_ts` and `max_ts` — among the `channels` (casefolded) the requester can
+/// see, plus every direct-message conversation `me` takes part in, reported as
+/// the correspondent's casefolded nick. Oldest activity first, so a `limit` keeps
+/// the oldest buffers. Empty on a query error (logged loudly).
 pub async fn query_targets(
     pool: &PgPool,
     channels: &[String],

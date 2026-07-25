@@ -657,12 +657,22 @@ async fn serve_conn<S>(
         // The client closed/errored, or the core queue is gone: the read side
         // is done — stop the (possibly parked) writer.
         () = read_loop(read_half, conn, &core_tx) => writer.abort(),
-        // The core closed this session (its `Sender<Output>` dropped, so the
-        // sendq closed and write_loop returned). Cancel the read future so a
-        // dead or partitioned peer's read task — and its per-IP ConnGuard — are
-        // freed now, not only when the OS TCP timeout eventually fires. The
-        // session is already gone core-side, so no Input::Closed is needed.
-        _ = &mut writer => {}
+        // The writer returned. Two causes: the core dropped this session's
+        // `Sender<Output>` (session already gone core-side), OR a *write error*
+        // on a still-present session (broken pipe / RST while output was queued).
+        // Cancelling the read future frees a dead peer's read task and per-IP
+        // ConnGuard now rather than at the OS TCP timeout — but it also cancels
+        // the only other path that would push `Input::Closed`, so we must push it
+        // here. `close` is idempotent, so the already-gone case is a harmless
+        // no-op; the write-error case is cleaned up now instead of lingering as a
+        // ghost session (silently black-holing messages sent to it) until the
+        // reaper collects it ~180s later.
+        reason = &mut writer => {
+            let reason = reason.unwrap_or("Write task panicked");
+            let _ = core_tx
+                .push(Input::Closed { conn, reason: reason.to_string() })
+                .await;
+        }
     }
 }
 
@@ -694,7 +704,11 @@ where
     let _ = core_tx.push(Input::Closed { conn, reason }).await;
 }
 
-async fn write_loop<W>(mut write_half: W, mut rx: Receiver<Output>)
+/// Drain the sendq to the socket. Returns the reason it stopped, which the
+/// caller turns into the session's `Input::Closed` — distinguishing a core-side
+/// close (sender dropped) from a write error (peer gone) so neither is conflated
+/// nor silently skipped.
+async fn write_loop<W>(mut write_half: W, mut rx: Receiver<Output>) -> &'static str
 where
     W: AsyncWrite + Unpin,
 {
@@ -702,7 +716,7 @@ where
         let Some(envelope) = rx.pop().await else {
             // Core dropped the session (sender gone): flush and close.
             let _ = write_half.shutdown().await;
-            return;
+            return "Connection closed";
         };
         // Coalesce everything currently queued into one syscall.
         let mut batch: Vec<u8> = Vec::new();
@@ -711,7 +725,7 @@ where
             batch.extend_from_slice(&e.payload.0);
         }
         if write_half.write_all(&batch).await.is_err() {
-            return; // broken pipe: reader half will surface the close
+            return "Write error"; // broken pipe / RST: the session is still live
         }
         let _ = write_half.flush().await;
     }

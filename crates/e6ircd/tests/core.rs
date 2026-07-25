@@ -928,6 +928,36 @@ fn topic_query_on_secret_channel_hidden_from_nonmembers() {
     );
 }
 
+/// A +s channel's RPL_ENDOFNAMES to a non-member must echo the caller's input
+/// casing, not the channel's canonical name — otherwise `NAMES #secret` on an
+/// existing `#Secret` returns a different casing than a non-existent channel,
+/// letting an outsider confirm the secret channel exists.
+#[test]
+fn names_on_secret_channel_does_not_leak_existence_via_casing() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #Secret"); // canonical casing
+    s.line(alice, "MODE #Secret +s");
+    s.drain(alice);
+
+    let bob = s.register(2, "bob"); // not a member
+    s.line(bob, "NAMES #secret"); // deliberately different casing
+    let out = s.drain(bob);
+    let end = out
+        .iter()
+        .find(|l| l.contains(" 366 "))
+        .expect("RPL_ENDOFNAMES");
+    assert!(
+        end.contains("#secret") && !end.contains("#Secret"),
+        "the +s NAMES terminator must echo the caller's input, not the canonical \
+         casing (an existence oracle): {end}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains(" 353 ")),
+        "a non-member must not receive a +s channel's member list: {out:#?}"
+    );
+}
+
 #[test]
 fn service_nicks_are_reserved() {
     let mut s = TestServer::new();
@@ -2445,6 +2475,63 @@ fn labeled_register_reply_carries_the_label() {
         out.iter()
             .any(|l| l.starts_with("@label=reg2 ") && l.contains("FAIL REGISTER ACCOUNT_EXISTS")),
         "labeled REGISTER FAIL carries the label: {out:#?}"
+    );
+}
+
+/// Like REGISTER, a labeled NickServ IDENTIFY's verdict comes from a DB round
+/// trip. The labeled client must get its label back on the async verdict —
+/// before, IDENTIFY answered the label with an empty ACK and the verdict NOTICE
+/// arrived unlabeled, so a label-tracking client couldn't correlate it.
+#[test]
+fn labeled_identify_verdict_carries_the_label() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response");
+    s.drain(alice);
+    s.db_requests();
+
+    // A labeled IDENTIFY is not ACKed empty — the verdict is still in flight.
+    s.line(alice, "@label=id7 PRIVMSG NickServ :IDENTIFY pw");
+    assert!(
+        s.drain(alice).is_empty(),
+        "a labeled IDENTIFY is held for its async verdict, not ACKed empty"
+    );
+
+    // Success verdict carries the label.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=id7 ") && l.contains("identified")),
+        "the labeled IDENTIFY verdict carries the label: {out:#?}"
+    );
+}
+
+/// The failure verdict is labeled too (not just success).
+#[test]
+fn labeled_identify_failure_carries_the_label() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "labeled-response");
+    s.drain(alice);
+    s.db_requests();
+    s.line(alice, "@label=id8 PRIVMSG NickServ :IDENTIFY wrong");
+    assert!(s.drain(alice).is_empty(), "held for the async verdict");
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=id8 ") && l.contains("Invalid password")),
+        "the labeled IDENTIFY failure carries the label: {out:#?}"
     );
 }
 
@@ -5610,16 +5697,27 @@ fn chanserv_set_mlock_enforces_modes() {
         "mlock not persisted"
     );
 
-    // Changing a locked mode the wrong way is refused (no MODE echo).
+    // Changing a locked mode the wrong way is refused (no MODE echo) AND the
+    // refusal is loud — ERR_MLOCKRESTRICTED (742), not a silent no-op (DESIGN §2).
     s.line(boss, "MODE #reg -m");
+    let out = s.drain(boss);
     assert!(
-        !s.drain(boss).iter().any(|l| l.contains(" MODE ")),
-        "locked -m was allowed"
+        !out.iter().any(|l| l.contains(" MODE ")),
+        "locked -m was allowed: {out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains(" 742 ") && l.contains("-m")),
+        "locked -m must be refused loudly with ERR_MLOCKRESTRICTED: {out:#?}"
     );
     s.line(boss, "MODE #reg +t");
+    let out = s.drain(boss);
     assert!(
-        !s.drain(boss).iter().any(|l| l.contains(" MODE ")),
-        "locked +t was allowed"
+        !out.iter().any(|l| l.contains(" MODE ")),
+        "locked +t was allowed: {out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains(" 742 ") && l.contains("+t")),
+        "locked +t must be refused loudly: {out:#?}"
     );
 
     // A mixed change applies only the unlocked part (+C), not the locked -m.
@@ -5785,6 +5883,55 @@ fn successful_labeled_multiline_without_echo_gets_a_labeled_ack() {
     assert!(
         s.drain(bob).iter().any(|l| l.contains("PRIVMSG #m :hello")),
         "the message is still delivered to members"
+    );
+}
+
+/// A client with echo-message that labels the BATCH *close* separately from the
+/// open must not get two `label=` tags on its multiline echo. The echo carries
+/// the open's label inline; before the fix the close command's capture swallowed
+/// it and injected its own label too, corrupting the response and robbing the
+/// close of its own ACK.
+#[test]
+fn labeled_batch_close_with_echo_does_not_double_label_the_echo() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "batch draft/multiline message-tags labeled-response echo-message",
+    );
+    s.line(alice, "JOIN #m");
+    s.drain(alice);
+
+    s.line(alice, "@label=1 BATCH +9 draft/multiline #m");
+    assert!(
+        s.drain(alice).is_empty(),
+        "opening the batch owes nothing yet"
+    );
+    s.line(alice, "@batch=9 PRIVMSG #m :hi");
+    s.line(alice, "@label=2 BATCH -9");
+    let out = s.drain(alice);
+
+    // The echoed batch-open (the labeled response to the OPEN) carries exactly
+    // one label tag — the open's `label=1` — never `label=2;label=1`.
+    let echo_open = out
+        .iter()
+        .find(|l| l.contains("BATCH +") && l.contains("draft/multiline"))
+        .expect("echoed multiline batch open");
+    assert_eq!(
+        echo_open.matches("label=").count(),
+        1,
+        "the multiline echo must carry one label, not the close's too: {echo_open}"
+    );
+    assert!(
+        echo_open.contains("label=1"),
+        "it carries the OPEN's label: {echo_open}"
+    );
+    // The CLOSE command gets its own labeled ACK.
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=2 ") && l.contains("ACK")),
+        "the labeled close gets its own ACK: {out:#?}"
     );
 }
 

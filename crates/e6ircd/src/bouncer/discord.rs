@@ -86,9 +86,12 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
 
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Dropped;
-    // Bound REST calls so a hung request can't stall the gateway loop.
+    // Bound REST calls so a hung request can't stall the gateway loop. Don't
+    // follow redirects: a hostile/compromised API response must not be able to
+    // 3xx a call to an internal address (SSRF).
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -222,7 +225,23 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         let _ = write.send(Ws::Pong(p)).await;
                         continue;
                     }
-                    Some(Ok(Ws::Close(_))) | None => return Dropped,
+                    Some(Ok(Ws::Close(frame))) => {
+                        // Discord close code 4004 = authentication failed (bad
+                        // token); 4013/4014 = invalid/disallowed gateway intents.
+                        // These are permanent config errors — stop re-dialing (like
+                        // the IRC driver on a rejected password) rather than
+                        // reconnecting forever with the same bad token.
+                        let code = frame.as_ref().map(|f| u16::from(f.code));
+                        if matches!(code, Some(4004 | 4013 | 4014)) {
+                            eprintln!(
+                                "discord: gateway closed with fatal auth/intents code {code:?}; \
+                                 will stop retrying"
+                            );
+                            return super::SessionOutcome::AuthRejected;
+                        }
+                        return Dropped;
+                    }
+                    None => return Dropped,
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => {
                         eprintln!("discord: gateway read error: {e}");

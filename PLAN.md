@@ -1593,6 +1593,77 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-fourth sweep — the escalated backlog, done, plus a four-front hunt
+(2026-07-26): the four items the previous sweep escalated as decisions are all
+resolved here (the user chose "fix them"), and four fresh parallel audits
+(net/registration, modes/channel, persistence/worker, caps/labels/batch) found
+six more genuine defects — all in one PR.
+
+**Backlog from sweep 83, now closed.**
+- *IDENTIFY threads its labeled-response label through the deferred verdict*
+  (services.rs, sasl.rs, state.rs). Like REGISTER, a labeled `PRIVMSG NickServ
+  :IDENTIFY` used to answer the label with an empty ACK and deliver the verdict
+  NOTICE unlabeled, so a label-tracking client couldn't correlate it. It now
+  stashes the escaped label (`pending_identify: Option<Option<String>>`, mirroring
+  `pending_register`) and frames the async verdict under it. Unlike REGISTER it
+  takes *no* output hold (`emit_labeled_unheld`): a NickServ verdict interleaves
+  with the client's other output the way a real server sends it, rather than
+  gating every later reply on the DB round trip.
+- *Bridges stop reconnecting on a fatal credential rejection* (matrix/discord/
+  slack). Only the IRC driver returned `AuthRejected` (which `run_with_backoff`
+  counts to stop after five in a row); the chat bridges returned `Dropped` for
+  everything, so a revoked/mistyped token retried every ≤30s forever. Each bridge
+  now surfaces its auth-rejection signal — Matrix login 401/403, Slack `ok:false`
+  `invalid_auth`/`token_revoked`/…, Discord gateway close 4004/4013/4014 — via a
+  shared `ConnectFail`, so the existing stop-retrying backstop applies to them
+  too. Bridge REST clients also stopped following redirects (a hostile/compromised
+  upstream can no longer 3xx a call to an internal address).
+- *Back-channel OIDC logout's `RateLimited` exemption is now documented in code*
+  as a deliberate decision (a per-IP limit would drop a legitimate IdP mass-logout
+  burst, a worse outcome than the marginal DoS it prevents), not a silent gap.
+
+**Four hunt-found defects.**
+1. **A write-error socket close leaked a ghost session** (net.rs, MED,
+   client-triggerable). `serve_conn`'s writer-completion arm pushed no
+   `Input::Closed`, on the false assumption the session was "already gone
+   core-side" — true when the core dropped the sender, but NOT when `write_loop`
+   returned on a *write error* (broken pipe/RST) for a still-present session. That
+   session lingered up to ~180s until the reaper, silently black-holing messages
+   sent to it. `write_loop` now returns a reason and both teardown arms notify the
+   core (`close` is idempotent), so neither cause is conflated or skipped.
+2. **A mode-lock-refused MODE change was a silent no-op** (channel.rs, MED §2).
+   `MODE #reg -m` against a ChanServ `MLOCK +m` did `continue` with no reply — the
+   client couldn't tell rejected from lost. It now answers ERR_MLOCKRESTRICTED
+   (742) naming the mode and the active lock.
+3. **A +s channel's existence leaked through NAMES casing** (channel.rs, LOW).
+   `NAMES #secret` on an existing `#Secret` terminated with the *canonical* name,
+   while a non-existent channel echoed the input — so the casing of the 366
+   confirmed the secret channel exists. The hidden-channel terminator now echoes
+   the caller's input, like every other hidden-channel surface.
+4. **A labeled BATCH close + echo-message double-labeled the multiline echo**
+   (message.rs, MED). The echo carries the *open's* label inline, but the *close*
+   command's labeled-response capture swallowed it and injected its own label too
+   (`@label=close;label=open …`), corrupting the response and denying the close its
+   ACK. The close's capture is now parked across delivery, so the echo goes out
+   with only its inline label and the close gets its own ACK.
+
+Boy-scout: a stale/self-contradicting `query_targets` doc block deleted; a comment
+explaining why CHATHISTORY replay emits `time`/`msgid` ungated by caps (deliberate
+— a paged reply is meaningless without them) while `account`/`bot` stay gated.
+
+Escalated as a decision (not filed away): full **dial-time resolved-IP vetting for
+bridge upstreams** — the IRC driver vets every resolved IP at dial time; the
+bridges now refuse redirects but still don't vet the resolved address of their
+configured host. It is operator-scoped (bridge config is operator-only, not a
+tenant SSRF vector) and closing it fully needs a custom reqwest/tungstenite
+resolver; raised for a decision rather than built speculatively.
+
+Verified: full workspace suite + new tests (labeled IDENTIFY verdict carries the
+label ×2, ERR_MLOCKRESTRICTED, NAMES +s casing, double-label multiline echo); PG
+db suite; embed-web `http` + dex `oidc`; irctest main + services; bridges under
+`--features matrix,discord,slack` (98 lib tests); `core_multi`/`serialize_message`
+fuzz; all `tools/check-*` gates clean.
+
 Eighty-third sweep — five-front hunt: an unauthenticated argon2 DoS, an
 OIDC login lockout, TOCTOU cap bypasses, and two silent drops (2026-07-25): five
 parallel adversarial audits (core/CHATHISTORY, proto/sanitize, persistence/auth,

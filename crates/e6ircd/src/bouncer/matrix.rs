@@ -74,10 +74,7 @@ async fn run(config: MatrixConfig, mut ends: DriverEnds) {
 async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     let mut session = match connect(config).await {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("matrix: connect failed: {e}");
-            return super::SessionOutcome::Dropped;
-        }
+        Err(e) => return e.into_outcome("matrix"),
     };
     ends.emit(ConnectionEvent::Connected);
 
@@ -127,17 +124,21 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
 }
 
 /// Log in and join the configured rooms.
-async fn connect(config: &MatrixConfig) -> Result<Session, String> {
+async fn connect(config: &MatrixConfig) -> Result<Session, super::ConnectFail> {
     // A timeout longer than the /sync long-poll (20s) so a black-holed
     // connection fails the request — otherwise the future never resolves,
     // `session_once` never returns, and the reconnect loop never runs.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
+        // Don't follow redirects: a compromised/hostile homeserver could 3xx an
+        // API call to an internal address (SSRF). The API never legitimately
+        // redirects, and the OIDC client takes the same stance.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
     let base = config.homeserver.trim_end_matches('/').to_string();
 
-    let login: serde_json::Value = http
+    let resp = http
         .post(format!("{base}/_matrix/client/v3/login"))
         .json(&serde_json::json!({
             "type": "m.login.password",
@@ -146,11 +147,21 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
         }))
         .send()
         .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| format!("login rejected: {e}"))?
-        .bounded_json()
-        .await?;
+        .map_err(|e| e.to_string())?;
+    // A 401/403 here is a rejected password/user — permanent, so surface it as an
+    // auth rejection that stops the reconnect loop rather than a transient drop.
+    let status = resp.status();
+    let login: serde_json::Value = match resp.error_for_status() {
+        Ok(r) => r.bounded_json().await?,
+        Err(e) => {
+            let msg = format!("login rejected: {e}");
+            return Err(if super::is_http_auth_rejection(Some(status)) {
+                super::ConnectFail::Auth(msg)
+            } else {
+                super::ConnectFail::Transient(msg)
+            });
+        }
+    };
     let token = login["access_token"]
         .as_str()
         .ok_or("no access_token in login response")?
@@ -179,9 +190,9 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
         // or `:` in it would forge extra params. Fail loudly, as the Slack and
         // Discord bridges already do for their fetched names.
         if !crate::sanitize::valid_channel_name(&channel) {
-            return Err(format!(
+            return Err(super::ConnectFail::Transient(format!(
                 "matrix: room alias {alias:?} maps to an unsafe IRC channel {channel:?}"
-            ));
+            )));
         }
         // Two rooms that derive the same IRC channel name — *under the
         // casemapping* — would silently overwrite each other in the map:
@@ -191,9 +202,9 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
         // correctly; the reverse map keeps the display casing.
         let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
         if session.channel_to_room.contains_key(&folded) {
-            return Err(format!(
+            return Err(super::ConnectFail::Transient(format!(
                 "matrix: two rooms map to the same IRC channel {channel:?}; rename one alias"
-            ));
+            )));
         }
         let room_id = join_room(&session, alias).await?;
         session.channel_to_room.insert(folded, room_id.clone());

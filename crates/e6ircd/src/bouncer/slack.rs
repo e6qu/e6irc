@@ -83,9 +83,12 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
 
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Dropped;
-    // Bound REST calls so a hung request can't stall the socket loop.
+    // Bound REST calls so a hung request can't stall the socket loop. Don't
+    // follow redirects: a hostile/compromised API response must not be able to
+    // 3xx a call to an internal address (SSRF).
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -129,8 +132,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                 channel_to_id.insert(folded, id.clone());
             }
             Err(e) => {
-                eprintln!("slack: channel {id} lookup failed: {e}");
-                return Dropped;
+                return slack_failure(&format!("channel {id} lookup failed"), &e);
             }
         }
     }
@@ -138,8 +140,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     let ws_url = match open_socket(&http, &base, &config.app_token).await {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("slack: apps.connections.open failed: {e}");
-            return Dropped;
+            return slack_failure("apps.connections.open failed", &e);
         }
     };
     // Bound the WS handshake so a black-holed socket can't wedge the driver.
@@ -314,6 +315,29 @@ fn check_ok(v: &serde_json::Value) -> Result<(), String> {
         Ok(())
     } else {
         Err(v["error"].as_str().unwrap_or("slack api error").to_string())
+    }
+}
+
+/// Turn a Slack REST failure into a session outcome. Slack signals auth failures
+/// with HTTP 200 + `ok:false` and an `error` naming a bad/revoked/expired token;
+/// those are permanent, so stop re-dialing (like the IRC driver on a rejected
+/// password) rather than reconnecting forever. Anything else is transient.
+fn slack_failure(context: &str, err: &str) -> super::SessionOutcome {
+    const AUTH_ERRORS: &[&str] = &[
+        "invalid_auth",
+        "not_authed",
+        "account_inactive",
+        "token_revoked",
+        "token_expired",
+        "invalid_token",
+        "no_permission",
+    ];
+    if AUTH_ERRORS.contains(&err) {
+        eprintln!("slack: {context}: {err} (auth rejected; will stop retrying)");
+        super::SessionOutcome::AuthRejected
+    } else {
+        eprintln!("slack: {context}: {err}");
+        super::SessionOutcome::Dropped
     }
 }
 
