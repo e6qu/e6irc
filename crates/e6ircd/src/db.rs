@@ -318,6 +318,11 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
     .await;
     if let Err(e) = result {
         eprintln!("db: history flush of {n} messages failed: {e}");
+        // Best-effort persistence (see the doc above): the messages were
+        // delivered live but not stored. No ring is marked incomplete here — a
+        // DB-backed ring is *already* created `complete = false` (a target may
+        // have older rows in `messages`), so CHATHISTORY always has Postgres as
+        // its backstop and never presents the hot ring as a gap-free record.
     }
 }
 
@@ -698,8 +703,25 @@ pub async fn set_channel_topic(
     Ok(())
 }
 
-/// (msgid, epoch **milliseconds**, sender prefix, kind, body) as stored.
-type HistoryDbRow = (String, i64, String, Option<String>, String, String, bool);
+/// One history row decoded from PostgreSQL. `#[derive(sqlx::FromRow)]` binds
+/// each field to the column of the **same name**, not by position — so the
+/// SELECT column order no longer has to line up with a positional tuple. Four
+/// of these are `String` (`msgid`/`sender_prefix`/`kind`/`body`); as a 7-tuple
+/// a transposition of any two compiled cleanly and silently mis-mapped (a
+/// replayed message showing its body as the source prefix, etc.). Keyed by
+/// name, a reordered or mis-typed column fails to bind instead. `ts_millis` is
+/// the `(EXTRACT(EPOCH FROM ts) * 1000)` bigint, aliased in the SELECT so it has
+/// a name to bind to.
+#[derive(sqlx::FromRow)]
+struct HistoryDbRow {
+    msgid: String,
+    ts_millis: i64,
+    sender_prefix: String,
+    sender_account: Option<String>,
+    kind: String,
+    body: String,
+    sender_is_bot: bool,
+}
 
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
 ///
@@ -715,8 +737,8 @@ type HistoryDbRow = (String, i64, String, Option<String>, String, String, bool);
 macro_rules! history_select {
     ($rest:literal) => {
         concat!(
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, sender_account, \
-             kind, body, sender_is_bot FROM messages ",
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
+             sender_account, kind, body, sender_is_bot FROM messages ",
             $rest
         )
     };
@@ -728,11 +750,11 @@ macro_rules! history_select {
 macro_rules! history_window {
     ($older:literal, $newer:literal) => {
         concat!(
-            "SELECT msgid, e, sender_prefix, sender_account, kind, body, sender_is_bot FROM ( (SELECT msgid, \
-             (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix, sender_account, kind, \
+            "SELECT msgid, ts_millis, sender_prefix, sender_account, kind, body, sender_is_bot FROM ( (SELECT msgid, \
+             (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, sender_account, kind, \
              body, sender_is_bot, ts, id FROM messages ",
             $older,
-            ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, \
+            ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, \
              sender_prefix, sender_account, kind, body, sender_is_bot, ts, id FROM messages ",
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
@@ -895,18 +917,18 @@ pub async fn query_history(
 
 /// Map a raw history row to a [`HistoryRow`].
 fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
-    let (msgid, ts, sender_prefix, sender_account, kind, body, sender_is_bot) = row;
     crate::core::HistoryRow {
-        msgid,
-        ts: e6irc_proto::time::Millis::from_millis(ts as u64),
-        sender_prefix,
-        sender_account,
+        msgid: row.msgid,
+        ts: e6irc_proto::time::Millis::from_millis(row.ts_millis as u64),
+        sender_prefix: row.sender_prefix,
+        sender_account: row.sender_account,
         // The `kind` column is written only from `MessageKind::db`, so an
         // unrecognized value is a corrupt row — fall back to PRIVMSG (the louder
         // kind) rather than drop the message.
-        kind: crate::core::MessageKind::from_db(&kind).unwrap_or(crate::core::MessageKind::Privmsg),
-        body,
-        sender_is_bot,
+        kind: crate::core::MessageKind::from_db(&row.kind)
+            .unwrap_or(crate::core::MessageKind::Privmsg),
+        body: row.body,
+        sender_is_bot: row.sender_is_bot,
     }
 }
 
@@ -2411,16 +2433,17 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
 #[cfg(test)]
 mod history_sql_tests {
     /// The macro must produce exactly the statement the queries used to spell
-    /// out, in the column order `HistoryDbRow` destructures. A silent change
-    /// here would be a runtime column-mismatch on every history read, so it is
-    /// pinned rather than trusted.
+    /// out. `HistoryDbRow` now binds by column *name* (`sqlx::FromRow`), so the
+    /// `ts_millis` alias is load-bearing — the computed column needs a name to
+    /// bind to. A silent change here would be a runtime bind failure on every
+    /// history read, so it is pinned rather than trusted.
     #[test]
     fn history_select_expands_to_the_expected_statement() {
         assert_eq!(
             history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
-            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, sender_account, \
-             kind, body, sender_is_bot FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC \
-             LIMIT $2"
+            "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, sender_prefix, \
+             sender_account, kind, body, sender_is_bot FROM messages WHERE target = $1 ORDER BY ts \
+             DESC, id DESC LIMIT $2"
         );
     }
 
@@ -2430,8 +2453,8 @@ mod history_sql_tests {
     fn history_window_keeps_alias_and_ordering_columns() {
         let sql = history_window!("WHERE a", "WHERE b");
         assert!(
-            sql.contains("AS e"),
-            "outer query orders by the alias: {sql}"
+            sql.contains("AS ts_millis"),
+            "the millis column is aliased so FromRow can bind it by name: {sql}"
         );
         assert_eq!(
             sql.matches("ts, id").count(),

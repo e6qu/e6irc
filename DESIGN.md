@@ -142,6 +142,31 @@ These are project-wide rules, enforced in review and (where possible) CI:
     argument, rather than relying on every handler to open with the same line.
   - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
     `&str`, so two fields cannot be transposed at a call site.
+  - `HistoryDbRow` — the history read binds columns by **name**
+    (`#[derive(sqlx::FromRow)]`), not by position. As a 7-tuple with four
+    same-typed `String` columns, transposing any two compiled cleanly and
+    silently mis-mapped (a replayed message showing its body as the source
+    prefix); the computed `ts_millis` column is aliased so it has a name to bind
+    to. Same class as `WhoxRow`, closed at the SQL edge.
+  - `Hidden` — a `+s` (secret) channel is invisible to non-members on *every*
+    query surface. The predicate lives once in `Channel::hidden_from`, and the
+    deny surfaces (MODE/KNOCK/TOPIC) take the returned `Hidden` token to the one
+    `deny_hidden` helper, which answers `ERR_NOSUCHCHANNEL`. No surface can
+    hand-pick a different numeric (a `TOPIC` query once returned 442, confirming
+    the channel exists — an existence oracle); the token has no other consumer.
+  - `CsrfVerified` — a cookie-authenticated request whose `x-csrf-token` header
+    validates, as a `FromRequestParts` extractor. An htmx form-POST handler is
+    CSRF-checked because it *asks for* the type in its signature, not because
+    the author opened the body with a manual check — the same shape as
+    `Authenticated`/`AdminAccount`, one rung over (a new `pages::*` form handler
+    that omits it fails to compile for want of the account argument).
+  - `bridge_send` — every reverse-direction (IRC→upstream) bridge HTTP send
+    whose failure is an HTTP status funnels through one checked helper that
+    rejects a non-2xx. The raw `reqwest::Response` from a bare `.send()` never
+    reaches delivery-outcome logic, so "send, ignore the status, report
+    delivered" — a silent drop — is unwritable (the Matrix bridge had exactly
+    that against a 403/429/5xx). The same choke-point shape as the inbound
+    `BoundedJson` body cap.
   - `stamp()` returns the `(ts, msgid)` pair from one clock read, so a
     message's server-time tag and its history copy cannot disagree.
   - `Millis` — epoch time is a newtype, not a bare `u64`, so a seconds value

@@ -412,15 +412,14 @@ async fn post_message(
     channel_id: &str,
     text: &str,
 ) -> Result<(), String> {
-    let v: serde_json::Value = http
+    let req = http
         .post(format!("{base}/chat.postMessage"))
         .header("Authorization", format!("Bearer {bot_token}"))
-        .json(&serde_json::json!({ "channel": channel_id, "text": text }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .bounded_json()
-        .await?;
+        .json(&serde_json::json!({ "channel": channel_id, "text": text }));
+    // Checked send catches a transport error or non-2xx (e.g. a 429/5xx whose
+    // body isn't the usual JSON); `check_ok` then catches Slack's in-body
+    // `ok:false` on an otherwise-200 response.
+    let v: serde_json::Value = super::bridge_send(req).await?.bounded_json().await?;
     check_ok(&v)
 }
 

@@ -457,17 +457,15 @@ where
 
     let raw = nick.expect("checked");
     let account = account.expect("checked");
-    let Some((_user, network)) = raw.split_once('/') else {
-        let _ = write
-            .write_all(
-                format!(
-                    ":{server_name} NOTICE * :Connect as <nick>/<network>; known networks are listed in the server config.\r\n"
-                )
-                .as_bytes(),
-            )
-            .await;
-        return Ok(Registered::Closed);
-    };
+    // ZNC/soju `<nick>/<network>` addressing; a slash-less nick selects the
+    // in-process `local` network (DESIGN §10.4: bare `alice` = `local`), so a
+    // client that doesn't know the convention still reaches a working network
+    // rather than being turned away.
+    let network = raw
+        .split_once('/')
+        .map_or(super::local_driver::LOCAL_NETWORK, |(_user, network)| {
+            network
+        });
     Ok(Registered::Ok {
         account,
         network: network.to_string(),

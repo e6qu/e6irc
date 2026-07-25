@@ -418,14 +418,11 @@ async fn send_message(
     channel_id: &str,
     text: &str,
 ) -> Result<(), String> {
-    http.post(format!("{base}/channels/{channel_id}/messages"))
+    let req = http
+        .post(format!("{base}/channels/{channel_id}/messages"))
         .header("Authorization", format!("Bot {token}"))
-        .json(&serde_json::json!({ "content": text }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
+        .json(&serde_json::json!({ "content": text }));
+    super::bridge_send(req).await?;
     Ok(())
 }
 

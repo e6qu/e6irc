@@ -665,6 +665,26 @@ impl Config {
                 "http.admin_accounts requires [database] (admin names resolve against the account store)".into(),
             ));
         }
+        // `secure_cookies` declares a TLS deployment: the session cookie is
+        // `Secure`/`__Host-` and won't ride a plaintext origin, and `public_url`
+        // builds the OIDC `redirect_uri`/`post_logout_redirect_uri`. A
+        // `secure_cookies = true` with an `http://` public_url is contradictory
+        // — it advertises the auth round-trip over plaintext while the cookie it
+        // needs can't be sent — and boots silently today. Reject it, symmetric
+        // to the OIDC `issuer_url` https-under-secure-cookies guard above.
+        if let Some(h) = &self.http
+            && h.secure_cookies
+            && h.public_url.as_deref().is_some_and(|value| {
+                openidconnect::url::Url::parse(value).is_ok_and(|url| url.scheme() != "https")
+            })
+        {
+            return Err(ConfigError::Invalid(
+                "http.public_url must be https when secure_cookies is set (a Secure/__Host- \
+                 cookie cannot ride a plaintext origin, and the OIDC redirect_uri would be \
+                 advertised over http)"
+                    .into(),
+            ));
+        }
         // Configured `[[network]]`s are only ever reached through the BNC
         // registry (net.rs starts them, the BNC listener attaches to them),
         // and that registry is created only when `[bnc]` is present. Without

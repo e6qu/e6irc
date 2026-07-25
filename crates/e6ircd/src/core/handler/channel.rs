@@ -124,7 +124,13 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let keys: Vec<&str> = p.get(1).map(|k| k.split(',').collect()).unwrap_or_default();
-    for (i, target) in targets.split(',').filter(|t| !t.is_empty()).enumerate() {
+    // Keys align to the *raw* comma positions of the target list, so an empty
+    // target slot still consumes its key slot: `JOIN #a,,#c k1,k2` gives `#a`
+    // k1 and `#c` no key (k2 belonged to the empty slot), never `#c`←k2.
+    for (i, target) in targets.split(',').enumerate() {
+        if target.is_empty() {
+            continue;
+        }
         join_one(state, conn, target, keys.get(i).copied());
     }
 }
@@ -420,7 +426,7 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
     let display = chan.name.clone();
     // A +s (secret) channel hides its membership from non-members: they get
     // only the terminating numeric, never the member list.
-    if chan.modes.secret && !chan.members.contains_key(&conn) {
+    if chan.hidden_from(conn).is_some() {
         state.numeric(
             conn,
             RPL_ENDOFNAMES,
@@ -626,13 +632,11 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     if p.len() == 1 && !msg.has_trailing {
         // A +s channel's topic — and its very existence — is hidden from
         // non-members, like every other query surface (NAMES/WHO/WHOIS/LIST).
-        if chan.modes.secret && !chan.members.contains_key(&conn) {
-            state.numeric(
-                conn,
-                ERR_NOTONCHANNEL,
-                &[target],
-                Some("You're not on that channel"),
-            );
+        // It must look *non-existent* (403), not "you're not on it" (442) —
+        // the latter confirms the channel exists, an existence oracle. The
+        // shared `deny_hidden` funnels every deny surface to the one numeric.
+        if let Some(proof) = chan.hidden_from(conn) {
+            super::deny_hidden(state, conn, target, proof);
             return;
         }
         match &chan.topic {
@@ -900,6 +904,77 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
     }
 }
 
+/// Outcome of a MODE list-mode query for one mode char.
+enum ListQuery {
+    /// The list was emitted (its `RPL_*LIST` rows plus terminator).
+    Dumped,
+    /// A channel list mode, but viewing it needs chanop here (`e`/`I` non-op).
+    Forbidden,
+    /// Not a channel list mode at all.
+    NotAList,
+}
+
+/// Emit a channel list mode's `RPL_*LIST` (bans/quiets/exceptions/invex) and its
+/// terminating numeric. The single source both the standalone query form
+/// (`MODE #c b`) and a no-argument list char inside a longer modestring
+/// (`MODE #c be`) funnel through — so a list char with no mask can never fall
+/// through to the mode-apply loop and be silently dropped (the bug this closes).
+/// `e`/`I` viewing is a chanop privilege (Solanum); a non-op gets `Forbidden`,
+/// which the standalone form turns into the usual `ERR_CHANOPRIVSNEEDED`.
+fn emit_channel_list(
+    state: &mut ServerState,
+    conn: ConnId,
+    key: &ChanKey,
+    display: &str,
+    mode: char,
+    is_op: bool,
+) -> ListQuery {
+    let chan = &state.channels[key];
+    let (masks, item_code, end_code, infix, end_text) = match mode {
+        'b' => (
+            chan.bans.clone(),
+            RPL_BANLIST,
+            RPL_ENDOFBANLIST,
+            None,
+            "End of Channel Ban List",
+        ),
+        'q' => (
+            chan.quiets.clone(),
+            RPL_QUIETLIST,
+            RPL_ENDOFQUIETLIST,
+            Some("q"),
+            "End of Channel Quiet List",
+        ),
+        'e' | 'I' if !is_op => return ListQuery::Forbidden,
+        'e' => (
+            chan.ban_exceptions.clone(),
+            RPL_EXCEPTLIST,
+            RPL_ENDOFEXCEPTLIST,
+            None,
+            "End of Channel Exception List",
+        ),
+        'I' => (
+            chan.invite_exceptions.clone(),
+            RPL_INVITELIST,
+            RPL_ENDOFINVITELIST,
+            None,
+            "End of Channel Invite Exception List",
+        ),
+        _ => return ListQuery::NotAList,
+    };
+    for mask in masks {
+        match infix {
+            Some(ch) => state.numeric(conn, item_code, &[display, ch, mask.as_str()], None),
+            None => state.numeric(conn, item_code, &[display, mask.as_str()], None),
+        }
+    }
+    match infix {
+        Some(ch) => state.numeric(conn, end_code, &[display, ch], Some(end_text)),
+        None => state.numeric(conn, end_code, &[display], Some(end_text)),
+    }
+    ListQuery::Dumped
+}
+
 pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
     let casemap = state.casemap;
     let key = state.chan_key(target);
@@ -920,13 +995,8 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     // MODE, whose mode string, creation time, and +b/+q mask lists would all
     // otherwise confirm the channel and disclose its state. Look non-existent,
     // like NAMES/WHO/LIST do.
-    if chan.modes.secret && !is_member {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+    if let Some(proof) = chan.hidden_from(conn) {
+        super::deny_hidden(state, conn, target, proof);
         return;
     }
 
@@ -941,57 +1011,24 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     // A lone "+b"/"+q" is a public list query; "+e"/"+I" list viewing is a
     // chanop privilege (matching Solanum), so a non-op falls through to the
     // ERR_CHANOPRIVSNEEDED gate below rather than reading the exception lists.
-    if rest.len() == 1 {
-        let chan = &state.channels[&key];
-        let query = match rest[0] {
-            "+b" | "b" => Some((
-                chan.bans.clone(),
-                RPL_BANLIST,
-                RPL_ENDOFBANLIST,
-                None,
-                "End of Channel Ban List",
-            )),
-            "+q" | "q" => Some((
-                chan.quiets.clone(),
-                RPL_QUIETLIST,
-                RPL_ENDOFQUIETLIST,
-                Some("q"),
-                "End of Channel Quiet List",
-            )),
-            "+e" | "e" if is_op => Some((
-                chan.ban_exceptions.clone(),
-                RPL_EXCEPTLIST,
-                RPL_ENDOFEXCEPTLIST,
-                None,
-                "End of Channel Exception List",
-            )),
-            "+I" | "I" if is_op => Some((
-                chan.invite_exceptions.clone(),
-                RPL_INVITELIST,
-                RPL_ENDOFINVITELIST,
-                None,
-                "End of Channel Invite Exception List",
-            )),
-            _ => None,
-        };
-        if let Some((masks, item_code, end_code, infix, end_text)) = query {
-            for mask in masks {
-                match infix {
-                    Some(ch) => {
-                        state.numeric(conn, item_code, &[&display, ch, mask.as_str()], None)
-                    }
-                    None => state.numeric(conn, item_code, &[&display, mask.as_str()], None),
-                }
+    // One mode char with an optional leading '+' and no argument.
+    if let [token] = rest {
+        let bare = token.strip_prefix('+').unwrap_or(token);
+        let mut chars = bare.chars();
+        if let Some(mode) = chars.next()
+            && chars.next().is_none()
+        {
+            match emit_channel_list(state, conn, &key, &display, mode, is_op) {
+                ListQuery::Dumped => return,
+                // `e`/`I` as a non-op, or a non-list mode: fall through to the
+                // op gate (ERR_CHANOPRIVSNEEDED) / apply loop as before.
+                ListQuery::Forbidden | ListQuery::NotAList => {}
             }
-            match infix {
-                Some(ch) => state.numeric(conn, end_code, &[&display, ch], Some(end_text)),
-                None => state.numeric(conn, end_code, &[&display], Some(end_text)),
-            }
-            return;
         }
     }
 
-    let is_op = chan.members.get(&conn).is_some_and(|m| m.op);
+    // `is_op` was computed above; a re-read here would extend `chan`'s borrow
+    // past the list-query call that needs `&mut state`.
     if !is_op {
         state.numeric(
             conn,
@@ -1132,7 +1169,11 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             }
             'b' | 'q' | 'e' | 'I' => {
                 let Some(&raw_mask) = args.next() else {
-                    continue; // handled above for the query form
+                    // No mask: a list *query* for this mode (e.g. `MODE #c be`
+                    // views bans and exceptions), not a silent no-op. Op context
+                    // here (the apply loop is op-gated), so `e`/`I` are viewable.
+                    emit_channel_list(state, conn, &key, &display, c, true);
+                    continue;
                 };
                 // Canonicalize to nick!user@host so a bare `+b nick` actually
                 // matches `nick!user@host` (Solanum clean_ban_mask); otherwise
