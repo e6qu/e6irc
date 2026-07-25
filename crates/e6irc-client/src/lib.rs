@@ -166,6 +166,54 @@ impl Connection {
         }
     }
 
+    /// Steady-state read for a *relay* (a bouncer): tolerant of lines it must
+    /// forward rather than act on. Returns the raw line text with a
+    /// *best-effort* parse — a non-UTF-8 or otherwise unparseable line comes
+    /// back as `(None, lossy_text)` rather than an error, because a bouncer must
+    /// forward the bytes the network sent and keep the link, never tear it down
+    /// over one bad line. IRC message bodies are arbitrary bytes (Latin-1,
+    /// Shift-JIS, … are routine on real networks), so a single high-byte channel
+    /// message must not disconnect the whole session — which any channel member
+    /// could then use to keep a victim's bouncer flapping.
+    ///
+    /// The distinct outcomes make the "a recoverable per-line error is a fatal
+    /// stream error" conflation unrepresentable at the call site: `Ok(Some(_))`
+    /// is always a line to relay (parsed or not), `Ok(None)` is a genuine EOF,
+    /// and `Err` is a real I/O error — only the last two end the stream. An
+    /// over-long line, which cannot be relayed within the wire limit anyway, is
+    /// skipped (the framing layer has already discarded its tail) without ending
+    /// the stream. Kept separate from [`Connection::next_message_with_line`],
+    /// whose strict error-on-bad-line contract the handshake relies on.
+    pub async fn next_line_relayable(
+        &mut self,
+    ) -> io::Result<Option<(Option<OwnedMessage>, String)>> {
+        loop {
+            if let Some(line) = self.pending.pop_front() {
+                // Lossy: an invalid byte sequence becomes U+FFFD instead of
+                // failing the whole read (mirrors the in-process local driver).
+                let text = String::from_utf8_lossy(&line).into_owned();
+                // Best-effort parse; `None` means "relay only, don't act on it".
+                let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
+                return Ok(Some((parsed, text)));
+            }
+            let n = self.reader.read(&mut self.read_buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let mut events = Vec::new();
+            self.framing.feed(&self.read_buf[..n], &mut events);
+            for event in events {
+                match event {
+                    LineEvent::Line(line) => self.pending.push_back(line),
+                    // Un-relayable within the wire limit; the framing already
+                    // dropped its tail, so skip it and keep the link — never
+                    // drop the whole connection over one over-long line.
+                    LineEvent::TooLong => {}
+                }
+            }
+        }
+    }
+
     /// Receive the next message, or fail loudly if the peer closed the socket
     /// mid-handshake instead of hanging on a stream that will never speak.
     async fn recv(&mut self, context: &'static str) -> io::Result<OwnedMessage> {

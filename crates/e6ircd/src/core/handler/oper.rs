@@ -407,7 +407,9 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let Some(&text) = p.first() else {
+    // Empty text (`WALLOPS :`) is ERR_NEEDMOREPARAMS, not an empty broadcast to
+    // every +w oper.
+    let Some(&text) = p.first().filter(|t| !t.is_empty()) else {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,

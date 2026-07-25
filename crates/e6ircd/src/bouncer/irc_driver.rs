@@ -103,36 +103,44 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
     loop {
         tokio::select! {
             // Upstream -> buffer + event.
-            msg = tokio::time::timeout(KEEPALIVE_IDLE, conn.next_message_with_line()) => match msg {
-                Ok(Ok(Some((m, raw)))) => {
+            msg = tokio::time::timeout(KEEPALIVE_IDLE, conn.next_line_relayable()) => match msg {
+                Ok(Ok(Some((parsed, raw)))) => {
                     awaiting_keepalive = false;
-                    // Answer PINGs transparently (keepalive is the
-                    // driver's job, not the attached client's).
-                    if m.command == "PING" {
-                        let token = m.params.first().cloned().unwrap_or_default();
-                        let _ = conn.send_line(&format!("PONG :{token}")).await;
-                        continue;
+                    // Keepalive filtering applies only to lines we could parse;
+                    // a line that didn't parse (a non-UTF-8 body, say) is never
+                    // a PING and is simply relayed. A bad line must not drop the
+                    // link — it is delivered, not fatal.
+                    if let Some(m) = &parsed {
+                        // Answer PINGs transparently (keepalive is the
+                        // driver's job, not the attached client's).
+                        if m.command == "PING" {
+                            let token = m.params.first().cloned().unwrap_or_default();
+                            let _ = conn.send_line(&format!("PONG :{token}")).await;
+                            continue;
+                        }
+                        // The reply to our *own* keepalive PING is internal
+                        // bookkeeping, not conversation — drop it so it doesn't
+                        // fill the backlog (one junk line per idle interval,
+                        // evicting real messages) and reach attached clients.
+                        // Mirrors the local driver's keepalive discipline.
+                        if m.command == "PONG"
+                            && m.params.last().map(String::as_str) == Some("e6bnc-keepalive")
+                        {
+                            continue;
+                        }
                     }
-                    // The reply to our *own* keepalive PING is internal
-                    // bookkeeping, not conversation — drop it so it doesn't
-                    // fill the backlog (one junk line per idle interval,
-                    // evicting real messages) and reach attached clients.
-                    // Mirrors the local driver's keepalive discipline.
-                    if m.command == "PONG"
-                        && m.params.last().map(String::as_str) == Some("e6bnc-keepalive")
-                    {
-                        continue;
-                    }
-                    // The upstream's own bytes, not a re-serialization of the
-                    // parse: attached clients and the detached buffer get what
-                    // the network actually sent, tags and all. `attach` strips
-                    // the tags a client did not negotiate.
+                    // The upstream's own line: attached clients and the detached
+                    // buffer get what the network sent, tags and all. `attach`
+                    // strips the tags a client did not negotiate.
                     //
                     // A send with zero subscribers is fine — the driver
                     // is always-on regardless of attach.
                     ends.emit_line(raw);
                 }
-                Ok(_) => return super::SessionOutcome::Dropped, // clean EOF or read error
+                // Only a genuine EOF or a real I/O error ends the session — a
+                // recoverable per-line error is now `Ok(Some((None, _)))` above,
+                // never conflated with the stream ending.
+                Ok(Ok(None)) | Ok(Err(_)) => return super::SessionOutcome::Dropped,
                 Err(_) => {
                     // Idle past the keepalive window.
                     if awaiting_keepalive {

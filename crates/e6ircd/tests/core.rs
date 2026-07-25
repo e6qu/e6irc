@@ -273,6 +273,42 @@ fn commands_require_registration() {
     assert!(has_numeric(&s.drain(c), "451"));
 }
 
+/// An empty first parameter must not be a silent no-op: `JOIN :`, `PART :`,
+/// and `WALLOPS :` were passing the presence check, then the comma-split /
+/// empty-body left nothing to do and *no reply was sent*. Treat empty as
+/// absent (the same class sweep 75 fixed for NICK/WHO). `NAMES :` must still
+/// send its terminating 366, or a client waiting on it hangs.
+#[test]
+fn empty_first_param_is_not_a_silent_noop() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+
+    for (cmd, expected) in [("JOIN :", "461"), ("PART :", "461"), ("JOIN ,", "461")] {
+        s.line(alice, cmd);
+        let out = s.drain(alice);
+        assert!(
+            has_numeric(&out, expected),
+            "`{cmd}` must reply {expected}, not nothing: {out:#?}"
+        );
+    }
+    // NAMES with an empty target falls back to the no-arg form: a 366.
+    s.line(alice, "NAMES :");
+    assert!(
+        has_numeric(&s.drain(alice), "366"),
+        "`NAMES :` must still send its ENDOFNAMES terminator"
+    );
+
+    // WALLOPS needs oper; an empty text is 461, not an empty broadcast.
+    s.line(alice, "OPER god letmein");
+    s.drain(alice);
+    s.line(alice, "WALLOPS :");
+    assert!(
+        has_numeric(&s.drain(alice), "461"),
+        "empty WALLOPS must be 461, not an empty broadcast"
+    );
+}
+
 #[test]
 fn unknown_command_is_421() {
     let mut s = TestServer::new();
@@ -3101,6 +3137,43 @@ fn chathistory_latest_replays_from_ring() {
             "{line}"
         );
     }
+}
+
+/// account-tag: a replayed message from an identified sender must carry
+/// `account=` for a requester that negotiated account-tag, exactly as live
+/// delivery does — otherwise the replay loses the sender attribution the live
+/// line carried, breaking the byte-identical-to-live invariant.
+#[test]
+fn chathistory_replay_carries_the_account_tag() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    let bob = register_with_caps(
+        &mut s,
+        2,
+        "bob",
+        "batch draft/chathistory server-time message-tags account-tag",
+    );
+    for c in [alice, bob] {
+        s.line(c, "JOIN #hist");
+        s.drain(c);
+    }
+    s.drain(alice);
+    for i in 1..=5 {
+        s.line(alice, &format!("PRIVMSG #hist :msg {i}"));
+    }
+    s.drain(bob);
+
+    s.line(bob, "CHATHISTORY LATEST #hist * 3");
+    let out = s.drain(bob);
+    let row = out
+        .iter()
+        .find(|l| l.contains("PRIVMSG #hist :msg 5"))
+        .unwrap_or_else(|| panic!("replayed message missing: {out:#?}"));
+    assert!(
+        row.contains("account=alice"),
+        "replayed line must carry the sender's account: {row}"
+    );
 }
 
 /// A DM row is re-addressed on replay by the sender's stable *identity*, not by

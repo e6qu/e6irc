@@ -148,6 +148,78 @@ async fn driver_reconnects_after_upstream_drop() {
     assert!(disconnected, "expected a Disconnected event");
 }
 
+/// A single non-UTF-8 (or over-long, or unparseable) line from the upstream
+/// must be relayed lossily and the session kept alive — never treated as EOF
+/// and used to tear down the whole link. IRC message bodies are arbitrary bytes
+/// (Latin-1 etc. are routine), so without this any channel member could keep a
+/// victim's bouncer flapping by sending one high-byte message.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_non_utf8_line_is_relayed_not_fatal() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        // The driver's handshake is small and fits the socket buffer, so its
+        // writes never block before we start reading.
+        sock.write_all(b":up 001 bncbot :welcome\r\n")
+            .await
+            .unwrap();
+        // A non-UTF-8 channel-message body (0xE9 = Latin-1 'e-acute').
+        sock.write_all(b":speaker!s@h PRIVMSG #bnc :caf\xe9\r\n")
+            .await
+            .unwrap();
+        // A following, ordinary line — its arrival on the SAME connection proves
+        // the bad line did not drop the session.
+        sock.write_all(b":speaker!s@h PRIVMSG #bnc :after the bad line\r\n")
+            .await
+            .unwrap();
+        // Keep the connection open and drain anything the driver sends, so no
+        // EOF is observed (which would legitimately reconnect).
+        let mut buf = [0u8; 1024];
+        while sock.read(&mut buf).await.unwrap_or(0) != 0 {}
+    });
+
+    let handle = IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "bncbot".into(),
+        realname: "bnc".into(),
+        autojoin: vec![],
+        ..NetworkConfig::default()
+    });
+    let mut events = handle.subscribe();
+
+    // Collect events until the post-bad-line message arrives; assert no
+    // Disconnected (reconnect) happened in between.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut saw_bad_line = false;
+        let mut disconnected_before_after = false;
+        loop {
+            match events.recv().await {
+                Ok(DriverEvent::Line(l)) if l.contains("PRIVMSG #bnc :caf") => {
+                    // The non-UTF-8 body was relayed, lossily decoded.
+                    saw_bad_line = true;
+                }
+                Ok(DriverEvent::Line(l)) if l.contains("after the bad line") => {
+                    return (saw_bad_line, disconnected_before_after);
+                }
+                Ok(DriverEvent::Disconnected) => disconnected_before_after = true,
+                Ok(_) => {}
+                Err(_) => panic!("driver stopped"),
+            }
+        }
+    })
+    .await
+    .expect("the ordinary line after the bad one must still arrive");
+
+    assert!(outcome.0, "the non-UTF-8 line must be relayed, not dropped");
+    assert!(
+        !outcome.1,
+        "the bad line must not disconnect/reconnect the session"
+    );
+}
+
 /// Provision a fresh single-account database and return its URL. `test` is the
 /// calling test's name — a shared helper must not name the database after
 /// itself, or every test it serves would share one.

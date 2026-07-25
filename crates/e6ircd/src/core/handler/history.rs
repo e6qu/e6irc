@@ -779,8 +779,27 @@ pub(crate) fn history_page(
             let peer = state.display_nick(&state.casemap.casefold(display));
             (me, my_identity, peer)
         });
+    // account-tag: live delivery stamps `account=` on a message from an
+    // identified sender for a recipient that negotiated the cap, so a replay
+    // must too — otherwise the replayed line loses the sender-account
+    // attribution the live one carried, breaking this function's own
+    // byte-identical-to-live invariant. The requester's cap is constant across
+    // rows; the per-row account comes from the stored `sender_account`.
+    let want_account_tag = state
+        .sessions
+        .get(&conn)
+        .is_some_and(|s| s.caps.account_tag);
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts);
+        let account_tag = match (want_account_tag, &row.sender_account) {
+            (true, Some(account)) => {
+                format!(
+                    ";account={}",
+                    e6irc_proto::message::escape_tag_value(account)
+                )
+            }
+            _ => String::new(),
+        };
         let target = match &dm {
             Some((me, my_identity, peer)) => {
                 // Derive the row sender's identity the same way `conn_identity`
@@ -815,7 +834,7 @@ pub(crate) fn history_page(
         let head = format!(":{} {verb} {target} :", row.sender_prefix);
         let body = crate::core::handler::fit_trailing(&head, &row.body);
         let line = format!(
-            "@batch={batch_ref};msgid={};time={time} {head}{body}",
+            "@batch={batch_ref};msgid={};time={time}{account_tag} {head}{body}",
             row.msgid,
         );
         state.send(conn, &line);
