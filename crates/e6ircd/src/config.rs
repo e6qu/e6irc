@@ -651,6 +651,18 @@ impl Config {
                 "[registration] requires [database] (there are no accounts without one)".into(),
             ));
         }
+        // Configured `[[network]]`s are only ever reached through the BNC
+        // registry (net.rs starts them, the BNC listener attaches to them),
+        // and that registry is created only when `[bnc]` is present. Without
+        // it every configured network is parsed, secret-resolved, and then
+        // silently dropped — the server boots and runs as if they weren't
+        // there. Reject it loudly like the sibling feature guards above, so a
+        // forgotten `[bnc]` fails at load instead of vanishing at runtime.
+        if !self.networks.is_empty() && self.bnc.is_none() {
+            return Err(ConfigError::Invalid(
+                "[[network]] entries require [bnc] — without it they are unreachable".into(),
+            ));
+        }
         // Network selection by (owner, name) must be unambiguous: no two
         // entries may share an (owner, name), and a name cannot be both
         // shared and owned (an authenticated client resolves one network).
@@ -944,6 +956,22 @@ mod tests {
         }
     }
 
+    /// Configured `[[network]]`s are only reachable through the BNC registry,
+    /// which needs `[bnc]` (and `[bnc]` needs `[database]`). Tests about
+    /// network selection must satisfy those so they exercise the selection
+    /// rules, not the "networks require [bnc]" guard.
+    fn bnc() -> Option<BncConfig> {
+        Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        })
+    }
+
+    fn db() -> Option<DatabaseConfig> {
+        Some(DatabaseConfig {
+            url: "postgres://localhost/x".into(),
+        })
+    }
+
     #[test]
     fn same_network_name_across_distinct_owners_is_ok() {
         let cfg = Config {
@@ -952,6 +980,8 @@ mod tests {
                 tls: None,
             }],
             networks: vec![net("libera", Some("alice")), net("libera", Some("bob"))],
+            bnc: bnc(),
+            database: db(),
             ..Config::default()
         };
         cfg.validate().expect("distinct owners may reuse a name");
@@ -965,6 +995,8 @@ mod tests {
                 tls: None,
             }],
             networks: vec![net("libera", Some("alice")), net("libera", Some("alice"))],
+            bnc: bnc(),
+            database: db(),
             ..Config::default()
         };
         assert!(cfg.validate().is_err());
@@ -978,10 +1010,29 @@ mod tests {
                 tls: None,
             }],
             networks: vec![net("libera", None), net("libera", Some("alice"))],
+            bnc: bnc(),
+            database: db(),
             ..Config::default()
         };
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("both shared and owned"), "{err}");
+    }
+
+    #[test]
+    fn networks_without_bnc_are_rejected() {
+        // The only consumer of `config.networks` is gated behind `bnc.is_some()`,
+        // so a `[[network]]` without `[bnc]` would parse and then be silently
+        // dropped at runtime. Reject it at load instead.
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            networks: vec![net("libera", None)],
+            ..Config::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("require [bnc]"), "{err}");
     }
 
     #[test]

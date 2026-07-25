@@ -39,6 +39,13 @@ const REAP_TICK_SECS: u64 = 15;
 /// registration budget a plaintext peer already gets.
 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
 
+/// How long graceful shutdown waits for the DB worker to drain and flush its
+/// buffered history before giving up. A healthy flush is a single batched
+/// INSERT (milliseconds); this bound only bites if PostgreSQL is wedged, in
+/// which case we exit with a non-success code rather than hang a service
+/// restart forever.
+const SHUTDOWN_DB_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct Running {
     /// Bound IRC addresses, in listener-config order (useful with port 0).
     pub addrs: Vec<SocketAddr>,
@@ -46,6 +53,68 @@ pub struct Running {
     pub http_addr: Option<SocketAddr>,
     /// Bound BNC listener address, when configured.
     pub bnc_addr: Option<SocketAddr>,
+    /// Drives the graceful-shutdown sequence (stop accepting, notify clients,
+    /// flush the PG write queue). Held by `main` and consumed on a signal.
+    pub shutdown: ShutdownHandle,
+}
+
+/// Everything `main` needs to shut the server down cleanly on SIGTERM/SIGINT.
+/// Built by [`start`]; see [`ShutdownHandle::run`] for the sequence.
+pub struct ShutdownHandle {
+    /// Accept-loop tasks (IRC listeners, the HTTP server, the BNC listener).
+    /// Aborted first so no new connection is admitted mid-shutdown.
+    listeners: Vec<tokio::task::AbortHandle>,
+    /// The core worker's input sender. Pushing [`Input::Shutdown`] makes the
+    /// core notify clients and then stop, which drops the DB request sender.
+    core_tx: Sender<Input>,
+    /// The DB worker task, awaited (bounded) so its buffered `log_batch` reaches
+    /// PostgreSQL before exit. `None` when no `[database]` is configured (there
+    /// is then no worker and nothing buffered to lose).
+    db_worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// How graceful shutdown ended, so `main` can pick an honest exit code.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// The DB worker drained and flushed (or there was no database).
+    Flushed,
+    /// The flush did not finish within [`SHUTDOWN_DB_FLUSH_TIMEOUT`]; buffered
+    /// history may have been lost, so the caller must not report success.
+    FlushTimedOut,
+    /// The DB worker task panicked while draining.
+    WorkerPanicked,
+}
+
+impl ShutdownHandle {
+    /// Run the graceful-shutdown sequence (DESIGN §18): stop accepting new
+    /// connections, ask the core to notify clients and stop, then wait for the
+    /// DB worker to flush its buffered history. Returns once the worker has
+    /// drained or the bounded timeout elapses.
+    pub async fn run(self) -> ShutdownOutcome {
+        // 1. Stop accepting: abort every listener task up front so nothing new
+        //    is admitted while we drain.
+        for listener in &self.listeners {
+            listener.abort();
+        }
+        // 2. Tell the core to notify clients (terminal ERROR) and stop. A push
+        //    failure can only mean the core queue is already closed, i.e. the
+        //    core is already gone — nothing more to ask of it.
+        let _ = self.core_tx.push(Input::Shutdown).await;
+        // Drop our own sender clone so it isn't left keeping the core queue's
+        // producer count up. (The core breaks on the Shutdown event regardless;
+        // this just keeps the shutdown intent honest.)
+        drop(self.core_tx);
+        // 3. Wait for the DB worker to observe its now-dropped sender, drain,
+        //    and flush. Bounded so a wedged database can't hang the shutdown.
+        let Some(worker) = self.db_worker else {
+            return ShutdownOutcome::Flushed;
+        };
+        match tokio::time::timeout(SHUTDOWN_DB_FLUSH_TIMEOUT, worker).await {
+            Ok(Ok(())) => ShutdownOutcome::Flushed,
+            Ok(Err(_join_err)) => ShutdownOutcome::WorkerPanicked,
+            Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
+        }
+    }
 }
 
 /// Unix-epoch milliseconds. Message timestamps are stamped from this, and
@@ -90,12 +159,19 @@ pub async fn start(config: Config) -> io::Result<Running> {
     // SASL is only advertised when a database exists to answer
     // verification requests.
     let mut pool = None;
+    // Kept so graceful shutdown can await the worker and guarantee its buffered
+    // `log_batch` is flushed before the process exits (DESIGN §18).
+    let mut db_worker = None;
     let sasl_enabled = match &config.database {
         Some(db_config) => {
             let p = crate::db::connect_and_migrate(&db_config.url)
                 .await
                 .map_err(io::Error::other)?;
-            tokio::spawn(crate::db::run_worker(p.clone(), db_rx, core_tx.clone()));
+            db_worker = Some(tokio::spawn(crate::db::run_worker(
+                p.clone(),
+                db_rx,
+                core_tx.clone(),
+            )));
             pool = Some(p);
             true
         }
@@ -104,6 +180,9 @@ pub async fn start(config: Config) -> io::Result<Running> {
             false
         }
     };
+
+    // Accept-loop tasks, collected so shutdown can stop admitting connections.
+    let mut listeners: Vec<tokio::task::AbortHandle> = Vec::new();
 
     let next_conn = Arc::new(AtomicU64::new(1));
 
@@ -197,7 +276,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
                 conn_limiter: limiter.clone(),
             });
-            tokio::spawn(async move {
+            let http_task = tokio::spawn(async move {
                 // `ConnectInfo<SocketAddr>` so handlers can see the socket peer
                 // (for rate limiting / X-Forwarded-For client-IP resolution).
                 let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -205,6 +284,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
                     eprintln!("http server exited: {e}");
                 }
             });
+            listeners.push(http_task.abort_handle());
             Some(bound)
         }
         None => None,
@@ -323,7 +403,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
         // could hold `max_connections_per_ip` IRC/WS connections *and* that many
         // BNC connections at once, doubling the documented limit.
         let bnc_limiter = limiter.clone();
-        tokio::spawn(async move {
+        let bnc_task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
@@ -351,6 +431,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 }
             }
         });
+        listeners.push(bnc_task.abort_handle());
     }
 
     let mut addrs = Vec::new();
@@ -361,7 +442,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
             Some(tls) => Some(tls_acceptor(tls)?),
             None => None,
         };
-        tokio::spawn(accept_loop(
+        let accept_task = tokio::spawn(accept_loop(
             listener,
             acceptor,
             core_tx.clone(),
@@ -369,11 +450,17 @@ pub async fn start(config: Config) -> io::Result<Running> {
             config.sendq,
             limiter.clone(),
         ));
+        listeners.push(accept_task.abort_handle());
     }
     Ok(Running {
         addrs,
         http_addr,
         bnc_addr,
+        shutdown: ShutdownHandle {
+            listeners,
+            core_tx,
+            db_worker,
+        },
     })
 }
 
@@ -397,7 +484,15 @@ fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
 
 async fn core_worker(mut core: Core, mut rx: Receiver<Input>) {
     while let Some(envelope) = rx.pop().await {
+        // `Shutdown` is handled (clients are notified) and then ends the loop.
+        // Returning drops `core` — and with it the sole `Sender<DbRequest>` and
+        // every session's `Sender<Output>` — which is what lets the DB worker
+        // drain/flush and the write tasks deliver the ERROR before we exit.
+        let stop = matches!(envelope.payload, Input::Shutdown);
         core.handle(envelope.payload);
+        if stop {
+            return;
+        }
     }
 }
 
@@ -667,5 +762,103 @@ mod tests {
             .await
             .expect("serve_conn must return promptly after the core closes the session")
             .expect("serve_conn task panicked");
+    }
+
+    /// Minimal core config for the shutdown wiring test — no PostgreSQL needed.
+    fn test_core_config() -> CoreConfig {
+        CoreConfig {
+            server_name: "irc.test".into(),
+            network_name: "TestNet".into(),
+            description: "test".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
+            sendq: 64,
+            motd: vec!["hi".into()],
+            nicklen: 30,
+            sasl_enabled: false,
+            max_hot_channels: 64,
+            opers: Vec::new(),
+            clock: wall_clock,
+            command_burst: None,
+        }
+    }
+
+    /// The graceful-shutdown chain that guarantees no buffered history is lost:
+    /// an `Input::Shutdown` must (1) end the core worker so the `Core` is
+    /// dropped, which (2) drops the sole `Sender<DbRequest>` and closes the DB
+    /// worker's queue (its cue to drain and flush), and (3) delivers a terminal
+    /// `ERROR` to every connected client on the way out.
+    #[tokio::test]
+    async fn shutdown_stops_core_notifies_clients_and_closes_db_queue() {
+        let (core_tx, core_rx) = queue::<Input>(e6irc_queue::Config {
+            name: "t-core",
+            capacity: 16,
+            policy: Policy::Fifo,
+        });
+        let (db_tx, mut db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
+            name: "t-db",
+            capacity: 16,
+            policy: Policy::Fifo,
+        });
+        let core = Core::new(test_core_config(), db_tx);
+        let worker = tokio::spawn(core_worker(core, core_rx));
+
+        // Register one client so there is a session to notify. Its send queue's
+        // receiver is held here to observe the ERROR.
+        let (out_tx, mut out_rx) = queue::<Output>(e6irc_queue::Config {
+            name: "t-sendq",
+            capacity: 64,
+            policy: Policy::Fifo,
+        });
+        core_tx
+            .push(Input::Open {
+                conn: ConnId(1),
+                tx: out_tx,
+                host: "host.test".into(),
+            })
+            .await
+            .expect("open");
+        core_tx
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"NICK alice".to_vec(),
+            })
+            .await
+            .expect("nick");
+        core_tx
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"USER alice 0 * :Alice".to_vec(),
+            })
+            .await
+            .expect("user");
+
+        core_tx.push(Input::Shutdown).await.expect("shutdown");
+
+        // The worker must return promptly (dropping the Core, hence db_tx).
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("core worker exits on Shutdown")
+            .expect("core worker task");
+
+        // db_tx dropped with the Core → the DB worker's queue is now closed,
+        // which is precisely the "receiver closed → drain → flush" trigger.
+        assert!(
+            db_rx.pop().await.is_none(),
+            "dropping the core must close the DB queue so the worker can flush"
+        );
+
+        // The client received a terminal ERROR line.
+        let mut saw_error = false;
+        while let Some(env) = out_rx.try_pop() {
+            let line = String::from_utf8_lossy(&env.payload.0);
+            if line.starts_with("ERROR :Closing Link:") {
+                saw_error = true;
+            }
+        }
+        assert!(
+            saw_error,
+            "every client must be notified with an ERROR on shutdown"
+        );
     }
 }

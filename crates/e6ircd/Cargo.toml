@@ -44,6 +44,8 @@ tokio = { version = "1.53.0", default-features = false, features = [
     "io-util",
     "time",
     "macros",
+    # SIGTERM/SIGINT handling for graceful shutdown (main.rs, DESIGN §18).
+    "signal",
 ] }
 rustls = { version = "0.23.42", default-features = false, features = [
     "aws_lc_rs",

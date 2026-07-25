@@ -461,6 +461,70 @@ async fn channel_messages_are_persisted() {
     assert_ne!(rows[0].0, rows[1].0, "msgids must be unique");
 }
 
+/// The correctness heart of graceful shutdown (DESIGN §18): buffered history
+/// must never be lost when the server stops. On shutdown the core is dropped,
+/// which drops the sole `Sender<DbRequest>` and closes the worker's queue; the
+/// worker's job is then to drain and flush its buffered `log_batch` before its
+/// task ends. This test drives exactly that contract at the worker boundary —
+/// enqueue rows, drop the sender, *await the worker's JoinHandle*, and require
+/// every row to be in PostgreSQL — so a regression that abandons the buffer
+/// (or exits before flushing) fails here rather than silently losing chat.
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn buffered_history_flushes_when_the_sender_is_dropped() {
+    let pool = db::connect_and_migrate(&support::test_db("shutdown_flush").await)
+        .await
+        .expect("connect");
+
+    let (req_tx, req_rx) = queue::<DbRequest>(QueueConfig {
+        name: "t-db",
+        capacity: 64,
+        policy: Policy::Fifo,
+    });
+    // The worker also holds a core sender; keep its receiver alive so pushes it
+    // makes (none are expected for LogMessage) never fail for the wrong reason.
+    let (core_tx, _core_rx) = queue::<Input>(QueueConfig {
+        name: "t-core",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let worker = tokio::spawn(db::run_worker(pool.clone(), req_rx, core_tx));
+
+    for i in 0..5 {
+        req_tx
+            .push(DbRequest::LogMessage {
+                msgid: format!("shutdown-msg-{i}"),
+                target: "#shutdown".into(),
+                dm_peers: Vec::new(),
+                sender_prefix: "alice!a@host".into(),
+                sender_account: None,
+                kind: e6ircd::core::MessageKind::Privmsg,
+                body: format!("line {i}"),
+                ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i),
+            })
+            .await
+            .expect("enqueue log");
+    }
+
+    // Drop the sender (what dropping the core does) and wait for the worker to
+    // finish. Awaiting the JoinHandle is the guarantee shutdown depends on.
+    drop(req_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+        .await
+        .expect("worker drains and flushes before the timeout")
+        .expect("worker task");
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE target = $1")
+        .bind("#shutdown")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(
+        count, 5,
+        "all buffered history rows must be flushed on shutdown"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn credential_list_and_revoke() {

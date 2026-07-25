@@ -1593,6 +1593,73 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-third sweep — graceful shutdown implemented, plus a +C bypass, a
+silent config no-op, and an auto-op state desync (2026-07-25): one
+implementation task and three bug hunts (PRIVMSG/NOTICE delivery, config &
+startup, JOIN/PART lifecycle). Four changes:
+
+1. **Graceful shutdown, implemented** (DESIGN §18; surfaced unimplemented in
+   the previous sweep) — `main` installs a SIGTERM/SIGINT handler
+   (`tokio::signal`, with a `ctrl_c`-only fallback under `cfg(not(unix))` so
+   the non-Unix CI targets still compile and stop cleanly), and `net::start`
+   now returns a `ShutdownHandle`. On a signal it (a) aborts every accept loop
+   (IRC/HTTP/BNC) so nothing new is admitted, (b) pushes `Input::Shutdown` so
+   the core sends every client a terminal `ERROR :Closing Link` and then ends
+   its worker loop — dropping the `Core`, hence the *sole* `Sender<DbRequest>`
+   and every session's `Sender<Output>` — and (c) awaits the DB worker's
+   `JoinHandle` with a bounded 30s timeout so its buffered `log_batch` reaches
+   PostgreSQL before exit. The exit code is honest: success only on a
+   confirmed flush, `FAILURE` on flush timeout or worker panic. The
+   correctness point (buffered history is never lost) rests on the DB sender
+   being single-owner: dropping the core closes the worker's queue, which is
+   its existing drain-and-flush trigger, now *awaited* instead of raced by
+   process exit. Tests: PG-gated `buffered_history_flushes_when_the_sender_is_dropped`
+   in tests/db.rs (enqueue → drop sender → await worker → all rows present),
+   and a non-PG wiring test in net.rs (Shutdown → core exits → DB queue closed
+   + ERROR delivered). Client-ERROR delivery stays best-effort (as all network
+   delivery is); only the flush is deterministically awaited. SIGHUP config
+   reload remains a separate deferred item.
+2. **A `+C` (no-CTCP) bypass via `draft/multiline-concat`** (message.rs,
+   MEDIUM) — the moderation gate split the batch on `\n` and checked each
+   line, but a concat continuation is delivered joined to the previous line
+   with *no* separator: `\x01ACTION` (an exempt ACTION alone) + concat
+   `VERSION\x01` reconstructs to the blocked `\x01ACTIONVERSION\x01`, and no
+   single `\n`-line tripped the check while a concat-capable recipient
+   reassembled the blocked CTCP. The permission-check string is now built
+   respecting concat (concat lines joined with no separator, others `\n`),
+   so it mirrors both delivery forms — catching the concat vector *and* still
+   catching a CTCP on its own flattened line.
+3. **`[[network]]` without `[bnc]` was silently ignored** (config.rs, MEDIUM)
+   — configured networks are only reachable through the BNC registry, which
+   `net.rs` creates only when `[bnc]` is present; without it every network was
+   parsed, secret-resolved, and dropped, the server booting as if they weren't
+   there. `validate()` now rejects it loudly like the sibling
+   `[registration]`/`[bnc]`/`[[oidc]]` guards. (The concurrent shutdown agent
+   caught that this broke tests/secret_cli.rs and fixed its TOML — boy-scout.)
+4. **Founder/access auto-op on JOIN wasn't broadcast to existing members**
+   (channel.rs, MEDIUM) — a registered founder or `o`/`v` access holder
+   joining a populated channel had the privilege written into `members` but
+   the peers saw only a plain JOIN, so their client state-tracking showed the
+   newcomer as an ordinary user while the server treated them as an operator
+   (a silent membership desync). A granting `MODE +o`/`+v` is now broadcast
+   after the JOIN (as the explicit `ChanServ OP` path already did); the
+   channel creator needs none (nobody else is present).
+
+Surfaced, not changed: a labeled REGISTER/IDENTIFY still answers with an
+immediate empty ACK and its deferred SUCCESS/FAIL arrives unlabeled (design
+item, sweep 72); `admin_accounts` without `[database]` is inert per-request
+(weaker than a startup guard warrants); no `RPL_AWAY` on a *multiline*
+PRIVMSG to an away user (single-line path sends it; not spec-mandated for
+multiline). Clean bills: TARGMAX enforcement and dedup, `fit_relayed_text`
+byte math at the wire boundary, one-msgid-per-message across recipients/echo/
+history, STATUSMSG admission, the +i/+s visibility matrix, JOIN admission
+(+k/+l/+i/+b with +e/+I exceptions), empty-channel reaping vs registered-state
+restore, invite bounds, topic change/clear persistence, secret/key loading and
+seal round-trip, and TLS/bind error paths (loud at startup). Verified beyond
+the gate: irctest main (258) and PG services (49); the PG db suite now 41 (new
+shutdown-flush test); embed-web http (12) and dex oidc (4); bridges under
+`--features matrix,discord,slack`; fuzz crate under `--cfg fuzzing`.
+
 Seventy-second sweep — four-front hunt: a 404 auth flow, a KILL that
 panics the core, and WHOX framing corruption (2026-07-25): four parallel
 audits on query commands/visibility, the HTTP/REST layer, the nick/session
@@ -1655,7 +1722,8 @@ Surfaced, not changed: **graceful shutdown remains unimplemented** (DESIGN
 §18 lists it; main.rs marks it pending) — SIGTERM drops the DB worker's
 buffered log batch and RSTs clients with no ERROR; a real fix needs net.rs
 to expose worker handles and is its own work item, re-surfaced here so it
-stays visible. Also: `/api/v1/me` checks the session cookie before Bearer
+stays visible. **Implemented in sweep 74** (see that entry). Also:
+`/api/v1/me` checks the session cookie before Bearer
 (every other route via `authenticate` checks Bearer first — inconsistent,
 not exploitable); a labeled REGISTER/IDENTIFY's deferred SUCCESS/FAIL still
 arrives unlabeled (noted in sweep 72). Clean bills: the +i/+s visibility

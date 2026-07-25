@@ -271,6 +271,37 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         }
     }
 
+    // A founder / access-flag holder is auto-opped or auto-voiced the moment
+    // they join, but the privilege was only written into `members` above — the
+    // peers saw a plain JOIN. Broadcast the granting MODE too (as the explicit
+    // `ChanServ OP` path does), or every other member's state-tracking shows
+    // the newcomer as an ordinary user while the server treats them as an
+    // operator: a silent membership-state desync. The channel creator (`first`)
+    // needs no broadcast — nobody else is present to desync.
+    if !first && (is_founder || access_op || access_voice) {
+        let nick = state.sessions[&conn]
+            .nick
+            .clone()
+            .expect("registered joiner has a nick");
+        let mut letters = String::from("+");
+        let mut args = String::new();
+        // A founder without an explicit access flag still gets +o.
+        if is_founder || access_op {
+            letters.push('o');
+            args.push_str(&format!(" {nick}"));
+        }
+        if access_voice {
+            letters.push('v');
+            args.push_str(&format!(" {nick}"));
+        }
+        let server = state.config.server_name.clone();
+        state.broadcast_channel(
+            &key,
+            &format!(":{server} MODE {display} {letters}{args}"),
+            None,
+        );
+    }
+
     // topic, if set
     if let Some(chan) = state.channels.get(&key)
         && let Some(topic) = &chan.topic

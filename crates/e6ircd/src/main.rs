@@ -93,10 +93,27 @@ fn run(args: &[String]) -> ExitCode {
                 for addr in &running.addrs {
                     println!("listening on {addr}");
                 }
-                // Run until killed; graceful shutdown arrives with the
-                // signal-handling work.
-                std::future::pending::<()>().await;
-                ExitCode::SUCCESS
+                // Run until a termination signal arrives, then shut down
+                // gracefully: stop accepting, notify clients, flush the PG write
+                // queue (DESIGN §18). The flush is the correctness point — the
+                // DB worker's buffered history must reach PostgreSQL, never be
+                // dropped by an abrupt process exit.
+                wait_for_shutdown_signal().await;
+                eprintln!("e6ircd: shutting down");
+                match running.shutdown.run().await {
+                    net::ShutdownOutcome::Flushed => ExitCode::SUCCESS,
+                    net::ShutdownOutcome::FlushTimedOut => {
+                        eprintln!(
+                            "e6ircd: DB flush did not complete before timeout; \
+                             buffered history may be lost"
+                        );
+                        ExitCode::FAILURE
+                    }
+                    net::ShutdownOutcome::WorkerPanicked => {
+                        eprintln!("e6ircd: DB worker panicked during shutdown");
+                        ExitCode::FAILURE
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("e6ircd: failed to start: {e}");
@@ -104,4 +121,28 @@ fn run(args: &[String]) -> ExitCode {
             }
         }
     })
+}
+
+/// Resolve once a shutdown signal is received. On Unix that is SIGTERM (what a
+/// service manager or `docker stop` sends) or SIGINT (Ctrl-C). Elsewhere only
+/// Ctrl-C is portable — Windows has no SIGTERM — and `ctrl_c` also covers the
+/// Windows console close events, so the daemon still shuts down cleanly there
+/// and, crucially, the workspace still compiles on the non-Unix CI targets.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // A failure to install a handler is a startup-class fault, not something
+        // to swallow: without it we could never shut down cleanly.
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("install SIGTERM handler for graceful shutdown");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

@@ -3650,6 +3650,54 @@ fn no_ctcp_mode_blocks_ctcp_buried_in_a_multiline_batch() {
     );
 }
 
+/// The +C (no-CTCP) gate must reconstruct `draft/multiline-concat` the way a
+/// capable recipient does: a CTCP split across a concat boundary has no single
+/// `\n`-delimited line that trips the check, yet reassembles into a blocked
+/// CTCP. `\x01ACTION` (an exempt ACTION on its own) + a concat continuation
+/// `VERSION\x01` reconstructs to `\x01ACTIONVERSION\x01`, which must be blocked.
+#[test]
+fn no_ctcp_mode_blocks_ctcp_split_across_a_concat_boundary() {
+    let mut s = TestServer::new_no_persistence();
+    let alice = s.register(1, "alice");
+    let bob = register_with_caps(&mut s, 2, "bob", "batch draft/multiline message-tags");
+    s.line(alice, "JOIN #cc");
+    s.drain(alice);
+    s.line(bob, "JOIN #cc");
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "MODE #cc +C");
+    s.drain(bob);
+    s.drain(alice);
+    // First line is a bare ACTION tag (exempt on its own); the concat
+    // continuation extends it past ACTION into a blocked CTCP.
+    s.line(bob, "BATCH +7 draft/multiline #cc");
+    s.line(bob, "@batch=7 PRIVMSG #cc :\u{1}ACTION");
+    s.line(
+        bob,
+        "@batch=7;draft/multiline-concat PRIVMSG #cc :VERSION\u{1}",
+    );
+    s.line(bob, "BATCH -7");
+    let out = s.drain(bob);
+    assert!(
+        out.iter().any(|l| l.contains(" 404 ")),
+        "concat-reconstructed CTCP not blocked by +C: {out:#?}"
+    );
+    assert!(
+        s.drain(alice).is_empty(),
+        "a concat-split CTCP leaked past +C"
+    );
+    // A genuine multi-line ACTION (no concat trickery) is still allowed.
+    s.line(bob, "BATCH +8 draft/multiline #cc");
+    s.line(bob, "@batch=8 PRIVMSG #cc :\u{1}ACTION waves\u{1}");
+    s.line(bob, "BATCH -8");
+    let out = s.drain(bob);
+    assert!(
+        !out.iter().any(|l| l.contains(" 404 ")),
+        "a legitimate ACTION was wrongly blocked: {out:#?}"
+    );
+}
+
 #[test]
 fn kill_requires_oper() {
     let mut s = TestServer::new();
@@ -3928,6 +3976,7 @@ fn preloaded_founder_is_opped_on_join() {
         "first joiner not opped: {names}"
     );
 
+    s.drain(alice);
     // The founder identifies and joins second, yet is opped.
     let bob = s.register(2, "bob");
     identify(&mut s, bob, "boss");
@@ -3938,6 +3987,14 @@ fn preloaded_founder_is_opped_on_join() {
         .find(|l| l.contains(" 353 "))
         .expect("353");
     assert!(names.contains("@bob"), "founder not opped on join: {names}");
+    // The pre-existing member must be *told* bob is now an op — otherwise her
+    // client tracks him as an ordinary user while the server treats him as an
+    // operator (a silent membership desync).
+    let alice_saw = s.drain(alice);
+    assert!(
+        alice_saw.iter().any(|l| l.contains("MODE #chan +o bob")),
+        "peer never told the auto-opped founder is an op: {alice_saw:#?}"
+    );
 
     // A third, non-founder user is not opped.
     let carol = s.register(3, "carol");

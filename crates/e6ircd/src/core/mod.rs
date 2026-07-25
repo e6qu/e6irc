@@ -63,6 +63,12 @@ pub enum Input {
         /// triggered this deferred page was labeled.
         label: Option<String>,
     },
+    /// Graceful-shutdown request, injected by the signal handler. The core
+    /// notifies every connected client with a terminal `ERROR`, after which the
+    /// worker loop stops and the `Core` is dropped — dropping the sole
+    /// `Sender<DbRequest>` and letting the DB worker drain and flush its
+    /// buffered history before the process exits (DESIGN §18).
+    Shutdown,
 }
 
 /// Work the core asks the DB worker to do. The worker answers by
@@ -531,6 +537,10 @@ impl Core {
                     handler::targets_page(state, conn, &batch_ref, targets, label.as_deref());
                 });
             }
+            // Notify clients; the worker loop breaks right after this event
+            // (see `net::core_worker`), which drops the `Core` and closes the
+            // DB write path so the buffered history flushes.
+            Input::Shutdown => self.state.broadcast_shutdown("Server shutting down"),
         }
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast
