@@ -263,7 +263,15 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
     }
-    state.numeric(conn, RPL_ENDOFWHO, &[mask], Some("End of /WHO list"));
+    // The mask is raw client input (`WHO :` → empty, `WHO ::x` → ':'-leading);
+    // clip_echo renders those as the safe "*" placeholder so the terminating
+    // numeric's middle can't break the reply's framing.
+    state.numeric(
+        conn,
+        RPL_ENDOFWHO,
+        &[clip_echo(mask)],
+        Some("End of /WHO list"),
+    );
 }
 
 pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -357,13 +365,11 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(conn, RPL_ENDOFWHOIS, &[&nick], Some("End of /WHOIS list"));
         }
         None => {
-            state.numeric(
-                conn,
-                ERR_NOSUCHNICK,
-                &[target],
-                Some("No such nick/channel"),
-            );
-            state.numeric(conn, RPL_ENDOFWHOIS, &[target], Some("End of /WHOIS list"));
+            // `target` is raw client input; clip_echo keeps an empty or
+            // ':'-leading value from breaking the echo's framing.
+            let shown = clip_echo(target);
+            state.numeric(conn, ERR_NOSUCHNICK, &[shown], Some("No such nick/channel"));
+            state.numeric(conn, RPL_ENDOFWHOIS, &[shown], Some("End of /WHOIS list"));
         }
     }
 }
@@ -431,10 +437,12 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .cloned()
         .collect();
     if matches.is_empty() {
+        // Raw client input; keep an empty/':'-leading target from breaking the
+        // echo's framing.
         state.numeric(
             conn,
             ERR_WASNOSUCHNICK,
-            &[target],
+            &[clip_echo(target)],
             Some("There was no such nickname"),
         );
     } else {
@@ -457,7 +465,12 @@ pub(super) fn cmd_whowas(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             );
         }
     }
-    state.numeric(conn, RPL_ENDOFWHOWAS, &[target], Some("End of WHOWAS"));
+    state.numeric(
+        conn,
+        RPL_ENDOFWHOWAS,
+        &[clip_echo(target)],
+        Some("End of WHOWAS"),
+    );
 }
 
 // ---- TIME / INFO --------------------------------------------------------

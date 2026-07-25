@@ -1593,6 +1593,99 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-fourth sweep — make a bug class unrepresentable, plus four bugs it
+and the hunts surfaced (2026-07-25): a step back to attack recurring bug
+*classes* (a meta-analysis of sweeps 54–73) alongside three fresh hunts
+(SASL/CAP state machine, BNC driver lifecycle, oper/STATS/server-query).
+
+**Unrepresentability — numeric middle-parameter framing, closed at the
+funnel.** The single most-repeated shape in the sweep log is wire-framing
+corruption: untrusted or variable text placed in a wire position where it
+can't structurally stand (the WHOX empty/`:`-leading token in sweep 73, the
+list-mode space in 72, the channel-name forge in 71). Length overflow of the
+same class was already machine-checked at the `send()` funnel by
+`wire_line_violation`; the *structural* half was closed nowhere. This sweep
+closes it at the `numeric()` funnel: a middle segment that can't stand as a
+wire parameter — empty (collapses into the separator, shifting every later
+field a column), `:`-leading (opens the trailing early), or carrying CR/LF/NUL
+(breaks or injects a line) — is now rendered as the conventional `*`
+placeholder instead of shipping a mis-framed reply. This is the same
+wire-safety normalization as the over-length clip right beside it, and it
+makes the whole class unrepresentable at one choke point rather than one echo
+site at a time. (An internal space is deliberately preserved: a mode-string
+joined to its space-validated args, as `RPL_CHANNELMODEIS` passes, frames
+correctly.)
+
+The mechanism began as a debug-only *panic* at the funnel — and immediately
+earned its keep. It surfaced a latent shipping bug on the first suite run
+(`NICK :` echoed the empty nick into `ERR_ERRONEUSNICKNAME`'s `<nick>`,
+emitting a malformed `432 *  :Erroneous nickname`; irctest's `testEmptyNick`
+never noticed, checking only that no 001 follows), and then the **core fuzzer
+found the class was pervasive** — every error numeric that echoes a raw client
+token (`WHO :` → 315, `CAP ::` → 410, an unresolved target → 401/441, a `:`
+mode char → 472, …) could break framing. Rather than fix a dozen echo sites by
+hand and risk missing one, the fix moved from *catch* to *guarantee*: the
+funnel now sanitizes in all builds, so no present or future call site can
+corrupt framing. `core_dispatch` and `core_multi` were each fuzzed to
+convergence (~900k / ~800k execs, clean) to confirm. `NICK :` is additionally
+routed to `ERR_NONICKNAMEGIVEN` (431, no nick parameter) — the semantically
+correct code for an absent nick, independent of the framing fix. (The
+meta-analysis also proposed a `parse→serialize` round-trip check at `send()`
+for the broadcast half of the class; on inspection it would *miss* the
+empty/`:`-leading cases — they bake into bytes that re-parse cleanly — so the
+corruption is only reachable at the construction funnel, which is where this
+fix sits. The fuller class roadmap — a `DbOutcome<T>` for DB-reply conflation,
+a `#[must_use] DeferGuard` for unresolved defers, a `MaskKey` for
+casefold-in-lists — is recorded for future sweeps.)
+
+Four bugs fixed:
+
+1. **SASL verify-pending lockout under DB backpressure** (sasl.rs, MEDIUM) —
+   `sasl_verify_pending` was set *before* the verify was enqueued, but if the
+   DB request queue was full the push failed and nothing ever cleared the flag
+   (only a `DbReply` does, and none was produced). The connection was then
+   refused every future AUTHENTICATE/IDENTIFY as "already in progress",
+   permanently. Fixed unrepresentably-by-construction: the flag is set *only
+   after* a successful push, so it can never outlive a request that was never
+   sent (the IDENTIFY path already cleared its own flag on push failure). New
+   test fills the queue and proves auth recovers.
+2. **Web-UI client dangled forever when its network was removed** (ws.rs /
+   bouncer, MEDIUM-HIGH) — `ws_ui_conn` watched only the event broadcast,
+   which never closes while the task holds an `Arc<NetworkHandle>` (the handle
+   keeps a sender), so removing/disabling/replacing the network left the socket
+   open on a dead network, leaking the task and handle. The raw-IRC `attach`
+   path guards this by watching the stop signal; the web path now does too (new
+   `watch_shutdown()` accessor). New PG-gated e2e: create network → attach →
+   delete → the socket detaches.
+3. **A self-matching server ban dropped its confirmation and audit
+   attribution** (oper.rs, LOW) — `cmd_add_ban` recorded the audit and sent the
+   "Added K-Line" NOTICE *after* the victims loop, so a `KLINE *@*` (or any
+   mask covering the oper's own host) closed the oper's session first, leaving
+   `record_audit` to resolve the actor to `""` and the NOTICE a silent no-op on
+   the gone connection. Reordered before the loop, mirroring the self-kill
+   guard `cmd_kill` already documents.
+4. **`NICK :` malformed 432** — see the unrepresentability paragraph above; the
+   empty-nick framing bug surfaced by the new check.
+
+Surfaced, not changed: registration isn't held for an in-flight SASL verify,
+so a non-conformant client that sends `CAP END` mid-verify gets 900/903 after
+the 001 burst (spec says clients wait; irctest does, so it's a MAY-hold
+decision); the BNC upstream reconnect re-joins only the *configured* autojoin
+list and re-uses the *configured* nick, not the client's runtime JOINs/NICK —
+a DESIGN §10.3 "state resync" divergence to decide (implement membership
+tracking or downgrade the claim); a fatal upstream auth rejection still
+re-dials every ~30s forever (soju/ZNC-style, defensible but undocumented);
+KNOCK doesn't consult the `+b` ban list. Clean bills (this sweep): base64/NUL
+SASL decode, CAP all-or-nothing, the SASL numerics; the BNC buffer ring,
+subscribe-before-snapshot ordering, registry keying, and CR/LF upstream
+injection defense; OPER constant-time compare and no-enumeration, server-ban
+fold-consistency, STATS gating, the numerics table (macro-generated,
+uniqueness/range unit-tested), and the remaining ISUPPORT advertise-vs-enforce
+tokens (CHANNELLEN/CHANMODES/PREFIX/TARGMAX all match). Verified beyond the
+gate: irctest main (258) and PG services (49); PG db (41), embed-web http (12),
+dex oidc (4), ws_ui (3, incl. the new detach e2e), bouncer (7); bridges under
+`--features matrix,discord,slack`; fuzz crate under `--cfg fuzzing`.
+
 Seventy-third sweep — graceful shutdown implemented, plus a +C bypass, a
 silent config no-op, and an auto-op state desync (2026-07-25): one
 implementation task and three bug hunts (PRIVMSG/NOTICE delivery, config &

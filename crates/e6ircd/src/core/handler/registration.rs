@@ -6,7 +6,11 @@ use super::*;
 // ---- registration -------------------------------------------------------
 
 pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let Some(&nick) = p.first() else {
+    // An empty nick (`NICK :`) is "no nickname given", not an erroneous one:
+    // ERR_NONICKNAMEGIVEN carries no nick parameter, whereas echoing the empty
+    // nick into ERR_ERRONEUSNICKNAME's `<nick>` middle would emit an empty
+    // parameter that collapses on the wire (a malformed `432 *  :…`).
+    let Some(&nick) = p.first().filter(|n| !n.is_empty()) else {
         state.numeric(conn, ERR_NONICKNAMEGIVEN, &[], Some("No nickname given"));
         return;
     };
@@ -426,15 +430,12 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
         }
         _ => {
-            let shown = if sub.is_empty() {
-                "*"
-            } else {
-                crate::core::handler::clip_echo(&sub)
-            };
+            // clip_echo renders an empty or ':'-leading subcommand as the
+            // safe "*" placeholder, so the echo can't break the reply's framing.
             state.numeric(
                 conn,
                 ERR_INVALIDCAPCMD,
-                &[shown],
+                &[crate::core::handler::clip_echo(&sub)],
                 Some("Invalid CAP command"),
             );
         }

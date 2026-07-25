@@ -165,19 +165,29 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 if !credential_attempt_ok(state, conn) {
                     return;
                 }
-                {
-                    let s = state.sessions.get_mut(&conn).expect("checked");
-                    s.sasl = SaslState::Verifying;
-                    s.sasl_verify_pending = true;
-                }
+                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = crate::core::DbRequest::VerifyPassword {
                     conn,
                     account,
                     password,
                 };
                 if state.db_tx.try_push(request).is_err() {
-                    // DB worker unreachable: fail loudly, never hang.
+                    // DB worker unreachable: fail loudly, never hang. No verify
+                    // was enqueued, so no `DbReply` will ever arrive to clear a
+                    // pending flag — which is why the flag is set only on a
+                    // successful push below, never before it.
                     sasl_fail(state, conn);
+                } else {
+                    // The verify is now in flight; mark it pending so a queued
+                    // re-auth waits for its reply (`db_reply` clears it). Setting
+                    // it only *after* the push means the flag can never outlive a
+                    // request that was never sent — the state that otherwise
+                    // locked the connection out of auth for good.
+                    state
+                        .sessions
+                        .get_mut(&conn)
+                        .expect("checked")
+                        .sasl_verify_pending = true;
                 }
             } else {
                 // RFC 7628: gs2-header then \x01-separated key=value fields;

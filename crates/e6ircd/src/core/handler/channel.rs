@@ -115,7 +115,12 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<&str>) {
     if !crate::sanitize::valid_channel_name(name) {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[name], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(name)],
+            Some("No such channel"),
+        );
         return;
     }
     let key = state.chan_key(name);
@@ -457,7 +462,12 @@ pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 if state.channels.contains_key(&key) {
                     send_names(state, conn, &key);
                 } else {
-                    state.numeric(conn, RPL_ENDOFNAMES, &[target], Some("End of /NAMES list"));
+                    state.numeric(
+                        conn,
+                        RPL_ENDOFNAMES,
+                        &[clip_echo(target)],
+                        Some("End of /NAMES list"),
+                    );
                 }
             }
         }
@@ -575,7 +585,12 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     };
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     };
     let display = chan.name.clone();
@@ -860,7 +875,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     let casemap = state.casemap;
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     };
     let display = chan.name.clone();
@@ -872,7 +892,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     // otherwise confirm the channel and disclose its state. Look non-existent,
     // like NAMES/WHO/LIST do.
     if chan.modes.secret && !is_member {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     }
 
@@ -1179,7 +1204,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 };
                 let nick_key = state.nick_key(who);
                 let Some(&member_conn) = state.nicks.get(&nick_key) else {
-                    state.numeric(conn, ERR_NOSUCHNICK, &[who], Some("No such nick/channel"));
+                    state.numeric(
+                        conn,
+                        ERR_NOSUCHNICK,
+                        &[clip_echo(who)],
+                        Some("No such nick/channel"),
+                    );
                     continue;
                 };
                 // Echo the target's canonical nick, not the raw input casing, so
@@ -1213,10 +1243,13 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 }
             }
             other => {
+                // A mode char echoed as a middle; a ':' mode char (reachable
+                // via `MODE #c ::x`) would open the trailing early, so route it
+                // through the framing-safe echo like the other client echoes.
                 state.numeric(
                     conn,
                     ERR_UNKNOWNMODE,
-                    &[&other.to_string()],
+                    &[clip_echo(&other.to_string())],
                     Some("is unknown mode char to me"),
                 );
             }

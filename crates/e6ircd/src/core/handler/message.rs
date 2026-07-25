@@ -248,7 +248,12 @@ pub(super) fn resolve_message_target(
     let key = state.chan_key(chan_target);
     let Some(chan) = state.channels.get(&key) else {
         if loud {
-            state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+            state.numeric(
+                conn,
+                ERR_NOSUCHCHANNEL,
+                &[clip_echo(target)],
+                Some("No such channel"),
+            );
         }
         return None;
     };
@@ -528,7 +533,12 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
     let recipients: Vec<ConnId> = if chan_target.starts_with('#') {
         let key = state.chan_key(chan_target);
         let Some(chan) = state.channels.get(&key) else {
-            state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+            state.numeric(
+                conn,
+                ERR_NOSUCHCHANNEL,
+                &[clip_echo(target)],
+                Some("No such channel"),
+            );
             return;
         };
         // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't

@@ -176,3 +176,118 @@ async fn ws_ui_requires_authentication() {
     let result = tokio_tungstenite::connect_async(format!("ws://{http}/ws/ui?network=up")).await;
     assert!(result.is_err(), "unauthenticated ws/ui must be refused");
 }
+
+/// One raw HTTP/1.1 request/response over a fresh socket; returns (status, body).
+async fn http_req(addr: std::net::SocketAddr, req: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    s.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.expect("read");
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let (head, body) = text.split_once("\r\n\r\n").expect("split");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|c| c.parse().ok())
+        .expect("status");
+    (status, body.to_string())
+}
+
+/// When a network the web UI is attached to is removed, the socket must be told
+/// and detach — not dangle forever on a dead network (the handle keeps the
+/// event broadcast open, so `Closed` alone never fires). Regression: `ws_ui_conn`
+/// now watches the stop signal, mirroring the raw-IRC `attach` path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn ws_ui_detaches_when_its_network_is_removed() {
+    let url = support::test_db("ws_ui_detaches_when_its_network_is_removed").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "s3cr3t")
+        .await
+        .expect("acct");
+    let token = e6ircd::db::issue_api_token(&pool, "alice", "web")
+        .await
+        .expect("token");
+    drop(pool);
+
+    let up = upstream().await;
+    let config = Config {
+        server_name: "irc.web.example".into(),
+        network_name: "Web".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Create the network via REST (a config network has no DB row and can't be
+    // deleted; a REST-created one can).
+    let body = format!(r#"{{"name":"up","addr":"{up}","nick":"alicebnc"}}"#);
+    let (status, _) = http_req(
+        http,
+        &format!(
+            "POST /api/v1/me/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "network create");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Attach the web UI to it.
+    let mut req = format!("ws://{http}/ws/ui?network=up")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("ws/ui connect");
+    // Drain the initial status/backlog fragments.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await;
+
+    // Remove the network.
+    let (status, _) = http_req(
+        http,
+        &format!(
+            "DELETE /api/v1/me/networks/up HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 204, "network delete");
+
+    // The socket must detach promptly — either a "network removed" fragment or a
+    // clean close — not hang open forever.
+    let detached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Text(t))) if t.contains("network removed") => return true,
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => return true, // socket closed
+            }
+        }
+    })
+    .await
+    .expect("ws/ui must detach, not dangle on the removed network");
+    assert!(detached);
+}

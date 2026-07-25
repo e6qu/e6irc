@@ -197,6 +197,13 @@ pub(super) async fn ws_ui_conn(
     // gap between the two (a duplicated backlog line is harmless; a lost one is
     // not). This mirrors attach()'s ordering — the same invariant over WS.
     let mut events = handle.subscribe();
+    // Watch the stop signal too. The event broadcast never closes while this
+    // task holds an `Arc<NetworkHandle>` (the handle keeps a sender), so
+    // `RecvError::Closed` alone can never fire — without this, removing or
+    // disabling the network would leave the web socket open forever on a dead
+    // network, leaking the task and its handle. attach() over raw IRC guards
+    // the same way.
+    let mut shutdown = handle.watch_shutdown();
 
     // Send the current connection status up front: a driver is always-on, so a
     // client attaching to an already-connected network would otherwise see no
@@ -227,6 +234,18 @@ pub(super) async fn ws_ui_conn(
     }
     loop {
         tokio::select! {
+            // Network removed/replaced/disabled: tell the client and detach,
+            // instead of dangling on a stopped network forever.
+            res = shutdown.changed() => {
+                if res.is_err() || *shutdown.borrow() {
+                    let _ = socket
+                        .send(WsMessage::text(render_line_fragment(
+                            ":*bnc* NOTICE * :network removed; detaching",
+                        )))
+                        .await;
+                    break;
+                }
+            }
             ev = events.recv() => match ev {
                 Ok(DriverEvent::Line(line)) => {
                     if socket

@@ -1308,6 +1308,22 @@ impl ServerState {
         );
         for p in middle {
             line.push(' ');
+            // A middle that can't stand as a wire parameter would corrupt the
+            // reply's framing — an empty one collapses into the separator, a
+            // ':'-leading one opens the trailing early, CR/LF/NUL break the line
+            // (the WHOX-token class, and every error numeric that echoes a raw
+            // client target/nick/mode-char). Since one worker serves every
+            // client, the funnel renders such a segment as the conventional "*"
+            // placeholder rather than ship a line the client misparses — the
+            // same wire-safety normalization as the length clip right below it,
+            // and it makes the whole framing-corruption class unrepresentable at
+            // this single choke point instead of one echo site at a time. A
+            // segment carrying a mode-string joined to its (space-validated)
+            // args is unaffected: only the leading byte and control bytes matter.
+            if numeric_middle_violation(p).is_some() {
+                line.push('*');
+                continue;
+            }
             line.push_str(e6irc_proto::message::truncate_on_char_boundary(
                 p,
                 Self::NUMERIC_MIDDLE_MAX,
@@ -1586,6 +1602,43 @@ impl ServerState {
     }
 }
 
+/// The structural rule for a numeric *middle* segment, pure so it can be pinned
+/// by unit tests: `Some(reason)` when `middle` cannot stand where `numeric`
+/// places it and would corrupt the reply's framing. [`ServerState::numeric`]
+/// consults it to render such a segment safely (as `*`) rather than emit a
+/// mis-framed line — making the framing-corruption class unrepresentable at
+/// that one funnel.
+///
+/// A middle precedes the trailing and is space-delimited, so it must be
+/// **non-empty** (an empty one collapses into the adjacent separator, shifting
+/// every later field left a column — the WHOX empty-token bug), must **not begin
+/// with `:`** (which starts the trailing early, swallowing the rest of the line —
+/// the WHOX `:`-leading-token bug), and must carry **no CR/LF/NUL** (which break
+/// the line or inject a second one). These are exactly the numeric-framing
+/// corruptions found and fixed by hand across the sweeps; the funnel now closes
+/// the class for every present and future echo site at once.
+///
+/// An internal space is deliberately *allowed*: a few replies pass a
+/// mode-string joined to its space-separated arguments as one segment
+/// (`RPL_CHANNELMODEIS` "+ntk sekrit", `RPL_MYINFO`), which frames correctly —
+/// each sub-argument is itself space-validated at its own ingress (a `+k` key or
+/// `+l` limit with a space is refused). Forbidding the space would only force a
+/// join-then-resplit at those call sites for no framing benefit. Callers with
+/// genuine free text (a realname, a message, a reason) pass it as the
+/// *trailing*, which has none of these restrictions.
+fn numeric_middle_violation(middle: &str) -> Option<&'static str> {
+    if middle.is_empty() {
+        return Some("numeric middle parameter is empty (collapses into the field separator)");
+    }
+    if middle.starts_with(':') {
+        return Some("numeric middle parameter starts with ':' (starts the trailing early)");
+    }
+    if middle.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Some("numeric middle parameter contains CR/LF/NUL (breaks or injects a line)");
+    }
+    None
+}
+
 /// The wire-limit rule behind [`ServerState::debug_check_wire_line`], pure so
 /// it can be pinned by unit tests: `Some(description)` when `line` (CRLF
 /// included) would be discarded by the recipient's framing. A recipient that
@@ -1620,6 +1673,36 @@ fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
         ));
     }
     None
+}
+
+#[cfg(test)]
+mod numeric_middle_tests {
+    use super::numeric_middle_violation;
+
+    #[test]
+    fn accepts_ordinary_middles_and_rejects_frame_breakers() {
+        // Ordinary middle parameters pass.
+        for ok in ["alice", "#chan", "+o", "0", "255.255.255.255", "H@", "*"] {
+            assert!(
+                numeric_middle_violation(ok).is_none(),
+                "rejected a valid middle: {ok:?}"
+            );
+        }
+        // A pre-joined modestring+args segment is allowed — it frames correctly.
+        assert!(
+            numeric_middle_violation("+ntk sekrit").is_none(),
+            "a pre-joined modestring+args segment must be allowed"
+        );
+        // The frame-breaking shapes each fail — the exact WHOX-token class.
+        assert!(numeric_middle_violation("").is_some(), "empty must fail");
+        assert!(
+            numeric_middle_violation(":x").is_some(),
+            "leading colon must fail"
+        );
+        assert!(numeric_middle_violation("a\rb").is_some());
+        assert!(numeric_middle_violation("a\nb").is_some());
+        assert!(numeric_middle_violation("a\0b").is_some());
+    }
 }
 
 #[cfg(all(test, debug_assertions))]
