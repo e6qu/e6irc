@@ -179,14 +179,37 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
 
 async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
+    // SSRF control: resolve the upstream address ourselves and dial a *vetted*
+    // resolved IP directly, rather than handing the hostname to the OS resolver
+    // inside `TcpStream::connect`. The creation-time literal check
+    // (`upstream_addr_is_internal`) can't see where a *hostname* resolves, and a
+    // bare `TcpStream::connect(host)` re-resolves — so a hostname pointing at
+    // `169.254.169.254` (or a DNS rebind between creation and now) would reach an
+    // internal target. Connecting to the specific vetted socket address closes
+    // both: resolution can't differ between the check and the connect.
+    let resolved: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host(&config.addr).await?.collect();
+    let Some(vetted) = resolved
+        .into_iter()
+        .find(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "upstream address resolves only to blocked/internal targets",
+        ));
+    };
+    let vetted = vetted.to_string();
     if config.tls {
+        // Dial the vetted IP but validate the certificate against the configured
+        // hostname (SNI + cert name), so IP-pinning the connection doesn't weaken
+        // TLS identity.
         let name = config
             .addr
             .rsplit_once(':')
             .map(|(h, _)| h.to_string())
             .unwrap_or_else(|| config.addr.clone());
-        Connection::connect_tls(&config.addr, &name, e6irc_client::webpki_root_store()).await
+        Connection::connect_tls(&vetted, &name, e6irc_client::webpki_root_store()).await
     } else {
-        Connection::connect(&config.addr).await
+        Connection::connect(&vetted).await
     }
 }

@@ -57,6 +57,18 @@ impl<'a> IsupportToken<'a> {
 
     /// Wire form of this token (value re-escaped as needed).
     pub fn serialize(&self) -> String {
+        // `parse` validates the name, but the fields are public, so a
+        // hand-constructed token could carry a space or `=` in `name` and
+        // serialize to a split/merged, invalid 005 token. The daemon only ever
+        // *parses* tokens (it builds ISUPPORT as raw strings), so this is
+        // untriggerable in production — but assert it in debug/test/fuzz, where
+        // the construct→serialize path is exercised, matching the wire-length
+        // invariant's debug-assertion approach.
+        debug_assert!(
+            valid_name(self.name),
+            "IsupportToken serialized with an invalid name: {:?}",
+            self.name
+        );
         let mut out = String::new();
         if self.negated {
             out.push('-');
