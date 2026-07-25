@@ -132,6 +132,7 @@ pub(super) fn record_history(
     let (prefix, body, kind) = (entry.sender_prefix.clone(), entry.body.clone(), entry.kind);
     let sender_account = entry.sender_account.clone();
     let sender_is_bot = entry.sender_is_bot;
+    let multiline = entry.multiline.clone();
     state.push_history(key, entry);
     // Persist only when a database is configured (the same db-present proxy the
     // other DB writes use). Without one the hot ring is the entire record, so
@@ -149,6 +150,7 @@ pub(super) fn record_history(
         kind,
         body,
         sender_is_bot,
+        multiline,
         ts,
     };
     if state.db_tx.try_push(log).is_err() {
@@ -412,6 +414,7 @@ pub(super) fn deliver_one_message(
                 kind,
                 body: text.to_string(),
                 sender_is_bot,
+                multiline: None,
             },
         );
     } else {
@@ -453,6 +456,7 @@ pub(super) fn deliver_one_message(
                 kind,
                 body: text.to_string(),
                 sender_is_bot,
+                multiline: None,
             },
         );
         // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free).
@@ -958,33 +962,60 @@ pub(super) fn deliver_multiline(
             (key, peers)
         }
     };
-    let mut msgid = Some(msgid);
-    for (text, _) in batch.lines.iter().filter(|(t, _)| !t.is_empty()) {
-        let entry_msgid = match msgid.take() {
-            Some(id) => id,
-            None => state.stamp().1,
-        };
-        record_history(
-            state,
-            &hist_key,
-            peers.clone(),
-            crate::core::state::HistoryEntry {
-                msgid: entry_msgid,
-                ts,
-                sender_prefix: prefix.clone(),
-                sender_account: sender_account.clone(),
-                kind,
-                // CHATHISTORY replays each stored line as its own PRIVMSG, to a
-                // requester that may not have draft/multiline — so the stored
-                // body is trimmed to fit the 512-byte replay line, the same as
-                // the single-message path stores an already-fitted body. The
-                // live batch form (above) is unaffected; it reads the full
-                // in-memory lines, not this record.
-                body: fit_relayed_text(&prefix, kind.wire(), target, text).to_string(),
-                sender_is_bot,
-            },
-        );
-    }
+    // A multiline message is ONE history entry carrying its single (live)
+    // msgid and its lines encoded together, so CHATHISTORY reconstructs the
+    // whole message under the id it was delivered with (per the CHATHISTORY
+    // spec: "msgid MUST be the msgid as originally sent") — rather than one row
+    // per line with fresh, never-delivered ids that a msgid-deduplicating client
+    // would replay as brand-new messages. `body` holds a plain-line fallback (a
+    // reader without the multiline field); `multiline` is authoritative on
+    // replay. All lines are kept, blanks included, so the reconstructed batch
+    // matches the live one; the flattened replay drops blanks as live does.
+    let fallback = batch
+        .lines
+        .iter()
+        .map(|(t, _)| t.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    record_history(
+        state,
+        &hist_key,
+        peers,
+        crate::core::state::HistoryEntry {
+            msgid,
+            ts,
+            sender_prefix: prefix.clone(),
+            sender_account: sender_account.clone(),
+            kind,
+            body: fallback,
+            sender_is_bot,
+            multiline: Some(encode_multiline(&batch.lines)),
+        },
+    );
+}
+
+/// Encode a multiline message's `(text, concat)` lines into one string for
+/// history storage: each line is `0`/`1` (its concat flag) followed by its
+/// text, lines joined by `\n`. A stored line's text never contains `\n` or NUL
+/// (the parser rejects both on input), so the split is unambiguous and the
+/// result is safe for a Postgres `TEXT` column. Inverse: [`decode_multiline`].
+pub(super) fn encode_multiline(lines: &[(String, bool)]) -> String {
+    lines
+        .iter()
+        .map(|(text, concat)| format!("{}{text}", if *concat { '1' } else { '0' }))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Decode what [`encode_multiline`] produced back into `(text, concat)` lines.
+pub(super) fn decode_multiline(encoded: &str) -> Vec<(String, bool)> {
+    encoded
+        .split('\n')
+        .map(|line| {
+            let concat = line.starts_with('1');
+            (line.get(1..).unwrap_or_default().to_string(), concat)
+        })
+        .collect()
 }
 
 /// Answer a multiline batch's *opening* label with a bare `ACK`, when no other

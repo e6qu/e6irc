@@ -221,6 +221,10 @@ pub enum DbRequest {
         body: String,
         /// The sender was a bot (+B) at send time (replayed as the `bot` tag).
         sender_is_bot: bool,
+        /// Encoded `draft/multiline` lines, or `None` for a single-line message
+        /// (see `HistoryEntry::multiline`). Persisted so replay reconstructs the
+        /// multiline message under its one msgid.
+        multiline: Option<String>,
         /// Unix milliseconds.
         ts: e6irc_proto::time::Millis,
     },
@@ -391,6 +395,10 @@ pub struct HistoryRow {
     pub body: String,
     /// The sender was a bot (+B) at send time; replay re-emits the `bot` tag.
     pub sender_is_bot: bool,
+    /// Encoded `draft/multiline` lines (see `HistoryEntry::multiline`); `None`
+    /// for a single-line message. Reconstructed into a multiline batch (or
+    /// flattened) on replay, reusing this row's single msgid.
+    pub multiline: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1593,6 +1593,39 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-second sweep — a multiline message replayed as one message
+(2026-07-25): CHATHISTORY reconstruction of a `draft/multiline` message was the
+last place the codebase minted message ids it never delivered.
+
+**Multiline CHATHISTORY replay minted undelivered per-line msgids** (MEDIUM;
+`core/handler/message.rs`, `history.rs`, `core/mod.rs`, `state.rs`, `db.rs`,
+migration 0032). A `draft/multiline` message is one message — one msgid, several
+lines each with a concat flag — and the CHATHISTORY spec is explicit that a
+replayed msgid "MUST be the msgid as originally sent by the IRC server." But
+history *storage* flattened the batch into one row per line, keeping the real
+msgid only on the first and **minting a fresh `state.stamp()` id for every line
+after it**. Those ids were never on the wire, so a client that deduplicates by
+msgid (or correlates reactions/edits/read-markers to it) saw each continuation
+line as a brand-new, unknown message on replay. The design was checked against a
+popular reference server (Ergo, `SplitMessage`/`AddSplitMessageFromClient`),
+which stores a multiline message as one record under its single msgid and
+reconstructs it on read: a nested `draft/multiline` batch for a capable
+requester, or the flattened lines (msgid on the first only) for one without the
+capability — graceful degradation the IRCv3 batch spec guarantees. This sweep
+matches that model. `HistoryEntry`/`HistoryRow`/`DbRequest::LogMessage` gained a
+`multiline: Option<String>` carrying the lines and their concat flags encoded
+together (`encode_multiline`/`decode_multiline`, `\n`-joined `0`/`1`-prefixed
+lines — safe because a stored line can contain neither `\n` nor NUL); storage
+now writes **one** entry under the message's real msgid instead of a loop that
+minted ids. Replay (`history_page`) reconstructs from that field: a nested batch
+byte-identical to live delivery for a `draft/multiline`+`batch` requester, the
+flattened form otherwise, reusing the stored msgid in both. Sanitization is
+undisturbed — the reconstructed lines pass through the same `WireLine` funnel and
+`fit_trailing`/`fit_relayed_text` fitting as every other replayed line. A new
+ring test drives both requester shapes through one stored message and asserts the
+single-msgid, blank-line, and concat invariants; the migration adds a nullable
+`multiline TEXT` column (existing rows read back as ordinary messages).
+
 Eighty-first sweep — the open backlog, done, plus two hunt-found bugs
 (2026-07-25): the first sweep under the No-Deferral Rule, so the two items the
 old habit had left open are fixed here rather than carried, and a services/query

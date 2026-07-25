@@ -312,6 +312,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             kind: e.kind,
             body: e.body,
             sender_is_bot: e.sender_is_bot,
+            multiline: e.multiline,
         })
         .collect();
     // Ring path runs under labeled-response capture; frame_labeled applies the
@@ -796,6 +797,15 @@ pub(crate) fn history_page(
         .sessions
         .get(&conn)
         .is_some_and(|s| s.caps.message_tags);
+    // A multiline row is reconstructed as the whole message it was: a nested
+    // draft/multiline batch for a requester that negotiated the capability (as
+    // live delivery would send it), or the same flattened lines otherwise. The
+    // concat tag rides only when message-tags was negotiated, exactly as live.
+    let want_multiline_batch = state
+        .sessions
+        .get(&conn)
+        .is_some_and(|s| s.caps.multiline && s.caps.batch);
+    let want_message_tags = want_bot_tag;
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts);
         let bot_tag = if want_bot_tag && row.sender_is_bot {
@@ -843,6 +853,68 @@ pub(crate) fn history_page(
         // body — can differ from delivery. Tags don't count toward the 512
         // limit, so the head measured here is only the non-tag part.
         let target = crate::core::handler::clip_echo(target);
+        // A multiline message was stored as one row (its single msgid, its lines
+        // and per-line concat flags); reconstruct it here rather than replay a
+        // synthetic single line. Non-multiline rows take the ordinary path below.
+        if let Some(encoded) = &row.multiline {
+            let lines = super::message::decode_multiline(encoded);
+            if want_multiline_batch {
+                let inner_ref = state.next_msgid();
+                // The nested BATCH open/close are part of the CHATHISTORY batch,
+                // so they carry `batch={batch_ref}`; the message's msgid rides the
+                // open line, as live delivery puts it there. The content lines
+                // belong to the inner batch and carry `batch={inner_ref}`.
+                state.send(
+                    conn,
+                    &format!(
+                        "@batch={batch_ref};msgid={};time={time}{account_tag}{bot_tag} \
+                         :{} BATCH +{inner_ref} {} {target}",
+                        row.msgid,
+                        row.sender_prefix,
+                        super::message::MULTILINE_CAP,
+                    ),
+                );
+                for (text, concat) in &lines {
+                    let concat_tag = if *concat && want_message_tags {
+                        format!(";{}", super::message::MULTILINE_CONCAT_TAG)
+                    } else {
+                        String::new()
+                    };
+                    state.send(
+                        conn,
+                        &format!(
+                            "@batch={inner_ref}{concat_tag};time={time}{account_tag}{bot_tag} \
+                             :{} {verb} {target} :{text}",
+                            row.sender_prefix,
+                        ),
+                    );
+                }
+                state.send(
+                    conn,
+                    &format!("@batch={batch_ref} :{server} BATCH -{inner_ref}"),
+                );
+            } else {
+                // Flattened for a client without the capability: one line per
+                // non-blank line, the msgid on the first only — the rest are the
+                // same message continuing, exactly as live flattening sends it.
+                let mut first = true;
+                for (text, _) in lines.iter().filter(|(t, _)| !t.is_empty()) {
+                    let head = format!(":{} {verb} {target} :", row.sender_prefix);
+                    let body = crate::core::handler::fit_trailing(&head, text);
+                    let msgid_tag = if first {
+                        format!(";msgid={}", row.msgid)
+                    } else {
+                        String::new()
+                    };
+                    state.send(
+                        conn,
+                        &format!("@batch={batch_ref}{msgid_tag};time={time}{account_tag}{bot_tag} {head}{body}"),
+                    );
+                    first = false;
+                }
+            }
+            continue;
+        }
         let head = format!(":{} {verb} {target} :", row.sender_prefix);
         let body = crate::core::handler::fit_trailing(&head, &row.body);
         let line = format!(
@@ -871,6 +943,7 @@ mod window_tests {
             kind: MessageKind::Privmsg,
             body: format!("b{i}"),
             sender_is_bot: false,
+            multiline: None,
         }
     }
 
