@@ -120,6 +120,7 @@ fuzz_target!(|data: &[u8]| {
                     sender_account: None,
                     kind: e6ircd::core::MessageKind::Privmsg,
                     body: rest.to_string(),
+                    sender_is_bot: false,
                 }]),
                 label: None,
             }),

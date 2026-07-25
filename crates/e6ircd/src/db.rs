@@ -123,9 +123,9 @@ pub async fn issue_app_password(
     label: &str,
 ) -> Result<String, DbError> {
     match handle_verify(pool, account, password).await {
-        DbReply::PasswordVerified { .. } => {}
-        DbReply::PasswordRejected => return Err(DbError::BadCredentials),
-        _ => return Err(DbError::Query(sqlx::Error::PoolClosed)),
+        VerifyOutcome::Verified(_) => {}
+        VerifyOutcome::Rejected => return Err(DbError::BadCredentials),
+        VerifyOutcome::Unavailable => return Err(DbError::Query(sqlx::Error::PoolClosed)),
     }
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut secret_bytes = [0u8; 32];
@@ -207,6 +207,7 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                     conn,
                     account,
                     password,
+                    origin,
                 } => {
                     let pool = pool.clone();
                     let core_tx = core_tx.clone();
@@ -216,7 +217,9 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                             .acquire_owned()
                             .await
                             .expect("verify semaphore never closed");
-                        let reply = handle_verify(&pool, &account, &password).await;
+                        let reply = handle_verify(&pool, &account, &password)
+                            .await
+                            .into_reply(origin);
                         // The core being gone (push fails) just means shutdown.
                         let _ = core_tx.push(Input::DbReply { conn, reply }).await;
                     });
@@ -266,6 +269,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
     // conversation has one or two participants, and Postgres arrays passed
     // through UNNEST must be rectangular, which a ragged nesting is not.
     let mut peers: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut bots: Vec<bool> = Vec::with_capacity(n);
     for request in batch {
         let DbRequest::LogMessage {
             msgid,
@@ -275,6 +279,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
             sender_account,
             kind,
             body,
+            sender_is_bot,
             ts,
         } = request
         else {
@@ -287,15 +292,17 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         accounts.push(sender_account);
         kinds.push(kind.db().to_string());
         bodies.push(body);
+        bots.push(sender_is_bot);
         tss.push(ts.as_millis() as i64);
     }
     let result = sqlx::query(
-        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+        "INSERT INTO messages (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers, sender_is_bot)
          SELECT m, t, p, a, k, b, at,
-                CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END
+                CASE WHEN d IS NULL THEN NULL ELSE string_to_array(d, '!') END,
+                bot
          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
                      ARRAY(SELECT to_timestamp(x / 1000.0) FROM UNNEST($7::bigint[]) x),
-                     $8::text[]) AS u(m, t, p, a, k, b, at, d)
+                     $8::text[], $9::bool[]) AS u(m, t, p, a, k, b, at, d, bot)
          ON CONFLICT (msgid) DO NOTHING",
     )
     .bind(&msgids)
@@ -306,6 +313,7 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
     .bind(&bodies)
     .bind(&tss)
     .bind(&peers)
+    .bind(&bots)
     .execute(pool)
     .await;
     if let Err(e) = result {
@@ -323,14 +331,17 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
         // rather than shipping a second, unbounded copy of the logic.
         DbRequest::VerifyPassword { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::VerifyToken { conn, token } => {
-            let reply = match api_token_account(pool, &token).await {
-                Ok(Some(account)) => DbReply::PasswordVerified { account },
-                Ok(None) => DbReply::PasswordRejected,
+            // A bearer token is only ever presented by SASL OAUTHBEARER.
+            let origin = crate::core::CredentialOrigin::Sasl;
+            let outcome = match api_token_account(pool, &token).await {
+                Ok(Some(account)) => VerifyOutcome::Verified(account),
+                Ok(None) => VerifyOutcome::Rejected,
                 Err(e) => {
                     eprintln!("db: token lookup failed: {e}");
-                    DbReply::Unavailable
+                    VerifyOutcome::Unavailable
                 }
             };
+            let reply = outcome.into_reply(origin);
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::CreateAccount {
@@ -688,7 +699,7 @@ pub async fn set_channel_topic(
 }
 
 /// (msgid, epoch **milliseconds**, sender prefix, kind, body) as stored.
-type HistoryDbRow = (String, i64, String, Option<String>, String, String);
+type HistoryDbRow = (String, i64, String, Option<String>, String, String, bool);
 
 /// A CHATHISTORY statement: the column list, then whatever narrows it.
 ///
@@ -705,7 +716,7 @@ macro_rules! history_select {
     ($rest:literal) => {
         concat!(
             "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, sender_account, \
-             kind, body FROM messages ",
+             kind, body, sender_is_bot FROM messages ",
             $rest
         )
     };
@@ -717,12 +728,12 @@ macro_rules! history_select {
 macro_rules! history_window {
     ($older:literal, $newer:literal) => {
         concat!(
-            "SELECT msgid, e, sender_prefix, sender_account, kind, body FROM ( (SELECT msgid, \
+            "SELECT msgid, e, sender_prefix, sender_account, kind, body, sender_is_bot FROM ( (SELECT msgid, \
              (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, sender_prefix, sender_account, kind, \
-             body, ts, id FROM messages ",
+             body, sender_is_bot, ts, id FROM messages ",
             $older,
             ") UNION ALL (SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS e, \
-             sender_prefix, sender_account, kind, body, ts, id FROM messages ",
+             sender_prefix, sender_account, kind, body, sender_is_bot, ts, id FROM messages ",
             $newer,
             ") ) w ORDER BY ts ASC, id ASC"
         )
@@ -884,7 +895,7 @@ pub async fn query_history(
 
 /// Map a raw history row to a [`HistoryRow`].
 fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
-    let (msgid, ts, sender_prefix, sender_account, kind, body) = row;
+    let (msgid, ts, sender_prefix, sender_account, kind, body, sender_is_bot) = row;
     crate::core::HistoryRow {
         msgid,
         ts: e6irc_proto::time::Millis::from_millis(ts as u64),
@@ -895,6 +906,7 @@ fn history_row_from_db(row: HistoryDbRow) -> crate::core::HistoryRow {
         // kind) rather than drop the message.
         kind: crate::core::MessageKind::from_db(&kind).unwrap_or(crate::core::MessageKind::Privmsg),
         body,
+        sender_is_bot,
     }
 }
 
@@ -1298,13 +1310,34 @@ async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) ->
     }
 }
 
-async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> DbReply {
+/// The three outcomes of a credential check, before an origin is attached.
+/// Kept distinct from [`DbReply`] so `handle_verify` can be reused by callers
+/// that are not a SASL/IDENTIFY round trip (e.g. `issue_app_password`) without
+/// inventing a bogus [`CredentialOrigin`]; the worker maps it to the
+/// origin-carrying reply at the one place that knows which command asked.
+enum VerifyOutcome {
+    Verified(String),
+    Rejected,
+    Unavailable,
+}
+
+impl VerifyOutcome {
+    fn into_reply(self, origin: crate::core::CredentialOrigin) -> DbReply {
+        match self {
+            Self::Verified(account) => DbReply::PasswordVerified { account, origin },
+            Self::Rejected => DbReply::PasswordRejected { origin },
+            Self::Unavailable => DbReply::Unavailable { origin },
+        }
+    }
+}
+
+async fn handle_verify(pool: &PgPool, account: &str, password: &str) -> VerifyOutcome {
     match verify_credentials(pool, account, password).await {
-        Ok(Some(account)) => DbReply::PasswordVerified { account },
-        Ok(None) => DbReply::PasswordRejected,
+        Ok(Some(account)) => VerifyOutcome::Verified(account),
+        Ok(None) => VerifyOutcome::Rejected,
         Err(e) => {
             eprintln!("db: credential lookup failed: {e}");
-            DbReply::Unavailable
+            VerifyOutcome::Unavailable
         }
     }
 }
@@ -2386,7 +2419,8 @@ mod history_sql_tests {
         assert_eq!(
             history_select!("WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"),
             "SELECT msgid, (EXTRACT(EPOCH FROM ts) * 1000)::bigint, sender_prefix, sender_account, \
-             kind, body FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC LIMIT $2"
+             kind, body, sender_is_bot FROM messages WHERE target = $1 ORDER BY ts DESC, id DESC \
+             LIMIT $2"
         );
     }
 

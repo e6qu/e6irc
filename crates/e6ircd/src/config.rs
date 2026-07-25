@@ -651,6 +651,20 @@ impl Config {
                 "[registration] requires [database] (there are no accounts without one)".into(),
             ));
         }
+        // `admin_accounts` grants the admin REST surface to named accounts —
+        // which are resolved against the account store. Without `[database]`
+        // every admin request fails per-request and no one can ever be admin, so
+        // the grant is silently inert. Reject it loudly, like the guards above.
+        if self
+            .http
+            .as_ref()
+            .is_some_and(|h| !h.admin_accounts.is_empty())
+            && self.database.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "http.admin_accounts requires [database] (admin names resolve against the account store)".into(),
+            ));
+        }
         // Configured `[[network]]`s are only ever reached through the BNC
         // registry (net.rs starts them, the BNC listener attaches to them),
         // and that registry is created only when `[bnc]` is present. Without

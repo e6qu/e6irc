@@ -176,6 +176,7 @@ fn identify(s: &mut TestServer, conn: ConnId, account: &str) {
         conn,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: account.into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     s.drain(conn);
@@ -1183,6 +1184,7 @@ fn sasl_abort_then_reauth_does_not_cross_wire_the_stale_verify() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
     let out = s.drain(c);
@@ -1450,11 +1452,13 @@ fn sasl_plain_success_flow() {
         conn,
         account,
         password,
+        origin,
     } = &req[0]
     else {
         panic!("expected VerifyPassword, got {:?}", req[0]);
     };
     assert_eq!(*conn, c);
+    assert_eq!(*origin, e6ircd::core::CredentialOrigin::Sasl);
     assert_eq!(account, "alice");
     assert_eq!(password, "hunter2");
 
@@ -1463,6 +1467,7 @@ fn sasl_plain_success_flow() {
         conn: c,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
     let out = s.drain(c);
@@ -1487,7 +1492,9 @@ fn sasl_rejected_password_is_904() {
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: c,
-        reply: e6ircd::core::DbReply::PasswordRejected,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
     });
     assert!(has_numeric(&s.drain(c), "904"));
 }
@@ -1508,7 +1515,9 @@ fn sasl_verification_attempts_are_capped_per_connection() {
         assert_eq!(s.db_requests().len(), 1, "attempt should dispatch a verify");
         s.core.handle(Input::DbReply {
             conn: c,
-            reply: e6ircd::core::DbReply::PasswordRejected,
+            reply: e6ircd::core::DbReply::PasswordRejected {
+                origin: e6ircd::core::CredentialOrigin::Sasl,
+            },
         });
         s.drain(c);
     }
@@ -2027,12 +2036,14 @@ fn nickserv_identify_flow() {
             conn: alice,
             account: "alice".into(),
             password: "hunter2".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         }]
     );
     s.core.handle(Input::DbReply {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     let out = s.drain(alice);
@@ -2046,10 +2057,54 @@ fn nickserv_identify_flow() {
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: alice,
-        reply: e6ircd::core::DbReply::PasswordRejected,
+        reply: e6ircd::core::DbReply::PasswordRejected {
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
     });
     let out = s.drain(alice);
     assert!(out[0].contains("Invalid password"), "{out:#?}");
+}
+
+#[test]
+fn credential_verdict_routes_on_its_own_origin_not_session_flags() {
+    // The verdict routes on the origin the *request* carried, never on the
+    // session's `sasl`/`pending_identify` flags. A stray SASL-origin verdict
+    // arriving while a NickServ IDENTIFY is outstanding must NOT complete that
+    // IDENTIFY — the old flag-inference would have logged the client in as the
+    // SASL verdict's account. This pins the routing as unrepresentable-by-origin
+    // even if the single-outstanding-verify invariant were ever violated.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY pw"); // pending_identify = true
+    s.db_requests();
+    // A SASL verdict for a different account lands while IDENTIFY is pending.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "eve".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        !out.iter()
+            .any(|l| l.contains("identified") || l.contains("eve")),
+        "a SASL-origin verdict must not complete a NickServ IDENTIFY: {out:#?}"
+    );
+    // The real IDENTIFY verdict still completes it — for alice, not eve.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("identified for \x02alice\x02")),
+        "the IDENTIFY completes on its own origin's verdict: {out:#?}"
+    );
 }
 
 /// A SASL verify and a NickServ IDENTIFY verify must never be in flight for one
@@ -2086,6 +2141,7 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
     assert!(
@@ -2212,6 +2268,75 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
 }
 
 #[test]
+fn labeled_register_reply_carries_the_label() {
+    // REGISTER's answer comes back from a database round trip, so the deferred
+    // SUCCESS/FAIL is emitted long after the command was dispatched. A client
+    // that labeled the REGISTER must still get that label back on the reply —
+    // otherwise labeled-response is silently broken for the one command whose
+    // answer is always asynchronous, and the client can never correlate it.
+    let mut s = TestServer::new();
+    let alice = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "labeled-response draft/account-registration",
+    );
+    s.drain(alice);
+
+    // A labeled REGISTER must not be ACKed synchronously as empty — the answer
+    // is still in flight. Nothing should come back until the DB replies.
+    s.line(alice, "@label=reg1 REGISTER * * hunter2");
+    let out = s.drain(alice);
+    assert!(
+        out.is_empty(),
+        "a labeled REGISTER is held for its async reply, not ACKed empty: {out:#?}"
+    );
+
+    // Success lands: the deferred REGISTER SUCCESS carries the label.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountCreated {
+            account: "alice".into(),
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=reg1 ") && l.contains("REGISTER SUCCESS alice")),
+        "labeled REGISTER SUCCESS carries the label: {out:#?}"
+    );
+
+    // And the failure branch, on a fresh connection (alice is now logged in):
+    // a labeled REGISTER whose DB verdict is a duplicate must return a FAIL
+    // tagged with that request's label.
+    let bob = register_with_caps(
+        &mut s,
+        2,
+        "bob",
+        "labeled-response draft/account-registration",
+    );
+    s.drain(bob);
+    s.line(bob, "@label=reg2 REGISTER * * hunter2");
+    assert!(
+        s.drain(bob).is_empty(),
+        "labeled REGISTER is held for its async reply"
+    );
+    s.core.handle(Input::DbReply {
+        conn: bob,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    let out = s.drain(bob);
+    assert!(
+        out.iter()
+            .any(|l| l.starts_with("@label=reg2 ") && l.contains("FAIL REGISTER ACCOUNT_EXISTS")),
+        "labeled REGISTER FAIL carries the label: {out:#?}"
+    );
+}
+
+#[test]
 fn nickserv_identify_spends_the_shared_credential_budget() {
     // NickServ IDENTIFY drives argon2 just like SASL, so it must spend from the
     // same per-connection budget — otherwise it can be looped to brute-force or
@@ -2271,6 +2396,7 @@ fn chanserv_register_flow() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     s.drain(alice);
@@ -2346,6 +2472,7 @@ fn chanserv_register_requires_op() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     s.drain(bob);
@@ -2508,6 +2635,7 @@ fn whox_full_fields_with_account() {
         conn: alice,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     s.drain(alice);
@@ -2976,6 +3104,7 @@ fn account_notify_and_tag() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     s.drain(bob);
@@ -3012,6 +3141,7 @@ fn account_notify_fires_on_post_registration_sasl() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "bob".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
         },
     });
     s.drain(bob);
@@ -3173,6 +3303,42 @@ fn chathistory_replay_carries_the_account_tag() {
     assert!(
         row.contains("account=alice"),
         "replayed line must carry the sender's account: {row}"
+    );
+}
+
+/// A replayed message from a bot (+B) must carry the `bot` tag for a
+/// message-tags requester, exactly as live delivery does.
+#[test]
+fn chathistory_replay_carries_the_bot_tag() {
+    let mut s = TestServer::new();
+    let botc = register_with_caps(&mut s, 1, "botnick", "message-tags");
+    s.line(botc, "MODE botnick +B");
+    s.drain(botc);
+    let bob = register_with_caps(
+        &mut s,
+        2,
+        "bob",
+        "batch draft/chathistory server-time message-tags",
+    );
+    for c in [botc, bob] {
+        s.line(c, "JOIN #hist");
+        s.drain(c);
+    }
+    s.drain(botc);
+    for i in 1..=5 {
+        s.line(botc, &format!("PRIVMSG #hist :beep {i}"));
+    }
+    s.drain(bob);
+
+    s.line(bob, "CHATHISTORY LATEST #hist * 3");
+    let out = s.drain(bob);
+    let row = out
+        .iter()
+        .find(|l| l.contains("PRIVMSG #hist :beep 5"))
+        .unwrap_or_else(|| panic!("replayed message missing: {out:#?}"));
+    assert!(
+        row.contains(";bot") || row.contains("@bot"),
+        "replayed line from a bot must carry the bot tag: {row}"
     );
 }
 
@@ -7381,6 +7547,7 @@ fn account_tag_value_is_escaped() {
         conn: bob,
         reply: e6ircd::core::DbReply::PasswordVerified {
             account: "a\\b".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
         },
     });
     s.drain(bob);

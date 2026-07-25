@@ -294,15 +294,15 @@ pub(super) async fn me(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Some(token) = session_token(&headers, state.secure_cookies) {
-        let Some(pool) = &state.pool else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No database configured",
-                None,
-            );
-        };
-        return match crate::db::session_identity(pool, &token).await {
+    // A *valid* session cookie yields the rich OIDC identity (email/role/
+    // provider/logout URL). A stale or absent cookie falls through to Bearer —
+    // the precedence every other route uses — so a valid PAT still works
+    // alongside a stale cookie (previously that combination returned 401). A DB
+    // fault is the one case that does not fall through: it is reported, not
+    // masked as "no session".
+    if let (Some(token), Some(pool)) = (session_token(&headers, state.secure_cookies), &state.pool)
+    {
+        match crate::db::session_identity(pool, &token).await {
             Ok(Some(identity)) => {
                 let mut response = (
                     [(header::CONTENT_TYPE, "application/json")],
@@ -323,18 +323,18 @@ pub(super) async fn me(
                 // This body carries the session-bound CSRF token; keep it out of
                 // any shared/proxy cache.
                 no_store(response.headers_mut());
-                response
+                return response;
             }
-            Ok(None) => problem(StatusCode::UNAUTHORIZED, "Not logged in", None),
+            Ok(None) => {} // stale cookie: fall through to Bearer
             Err(error) => {
                 eprintln!("http: identity lookup failed: {error}");
-                problem(
+                return problem(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Database unavailable",
                     None,
-                )
+                );
             }
-        };
+        }
     }
     match authenticate(&state, &headers).await {
         Ok(account) => (

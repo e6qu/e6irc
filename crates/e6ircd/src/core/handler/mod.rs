@@ -186,7 +186,12 @@ fn inject_tag(line: &[u8], tag: &str) -> bytes::Bytes {
 
 /// Frame captured direct responses per the labeled-response spec:
 /// zero lines → ACK; one → label-tagged; many → labeled batch.
-fn frame_labeled(state: &mut ServerState, conn: ConnId, label: &str, lines: Vec<bytes::Bytes>) {
+pub(crate) fn frame_labeled(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: &str,
+    lines: Vec<bytes::Bytes>,
+) {
     let server = state.config.server_name.clone();
     match lines.len() {
         0 => state.send(conn, &format!("@label={label} :{server} ACK")),

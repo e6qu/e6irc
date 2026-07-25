@@ -131,6 +131,7 @@ pub(super) fn record_history(
     let (msgid, ts) = (entry.msgid.clone(), entry.ts);
     let (prefix, body, kind) = (entry.sender_prefix.clone(), entry.body.clone(), entry.kind);
     let sender_account = entry.sender_account.clone();
+    let sender_is_bot = entry.sender_is_bot;
     state.push_history(key, entry);
     // Persist only when a database is configured (the same db-present proxy the
     // other DB writes use). Without one the hot ring is the entire record, so
@@ -147,6 +148,7 @@ pub(super) fn record_history(
         sender_account,
         kind,
         body,
+        sender_is_bot,
         ts,
     };
     if state.db_tx.try_push(log).is_err() {
@@ -409,6 +411,7 @@ pub(super) fn deliver_one_message(
                 sender_account,
                 kind,
                 body: text.to_string(),
+                sender_is_bot,
             },
         );
     } else {
@@ -449,6 +452,7 @@ pub(super) fn deliver_one_message(
                 sender_account,
                 kind,
                 body: text.to_string(),
+                sender_is_bot,
             },
         );
         // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free).
@@ -928,6 +932,17 @@ pub(super) fn deliver_multiline(
         ack_multiline_label(state, conn, batch.label.as_deref());
     }
 
+    // Away auto-reply, PRIVMSG only — same as the single-line path (a multiline
+    // DM to an away user must tell the sender they're away, once, just like an
+    // ordinary PRIVMSG does; NOTICE stays reply-free).
+    if loud
+        && let ResolvedKind::User { peer } = &resolved.kind
+        && let Some(away) = state.sessions[peer].away.clone()
+    {
+        let peer_nick = state.sessions[peer].nick.clone().expect("registered");
+        state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
+    }
+
     // History records what a client without the capability would have seen:
     // one entry per non-blank line, the first carrying the message's msgid.
     let (hist_key, peers) = match &resolved.kind {
@@ -938,8 +953,6 @@ pub(super) fn deliver_multiline(
             (crate::core::state::HistoryKey::from(key), Vec::new())
         }
         ResolvedKind::User { peer } => {
-            let peer_nick = state.sessions[peer].nick.clone().expect("registered");
-            let _ = peer_nick;
             let (key, peers) =
                 state.dm_conversation(&state.conn_identity(conn), &state.conn_identity(*peer));
             (key, peers)
@@ -968,6 +981,7 @@ pub(super) fn deliver_multiline(
                 // live batch form (above) is unaffected; it reads the full
                 // in-memory lines, not this record.
                 body: fit_relayed_text(&prefix, kind.wire(), target, text).to_string(),
+                sender_is_bot,
             },
         );
     }

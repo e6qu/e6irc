@@ -744,7 +744,10 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
 // ---- MODE ---------------------------------------------------------------
 
 pub(super) fn cmd_mode(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let Some(&target) = p.first() else {
+    // An empty target (`MODE :`) is ERR_NEEDMOREPARAMS, not the wrong
+    // ERR_USERSDONTMATCH the empty string would otherwise trip in user_mode
+    // (`nick_key("") != own`). Treat empty as absent.
+    let Some(&target) = p.first().filter(|t| !t.is_empty()) else {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
@@ -974,8 +977,10 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
         if let Some((masks, item_code, end_code, infix, end_text)) = query {
             for mask in masks {
                 match infix {
-                    Some(ch) => state.numeric(conn, item_code, &[&display, ch, &mask], None),
-                    None => state.numeric(conn, item_code, &[&display, &mask], None),
+                    Some(ch) => {
+                        state.numeric(conn, item_code, &[&display, ch, mask.as_str()], None)
+                    }
+                    None => state.numeric(conn, item_code, &[&display, mask.as_str()], None),
                 }
             }
             match infix {
@@ -1160,6 +1165,10 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 // JOIN/PRIVMSG re-scans them). `MAXLIST=bqeI:100` advertises a
                 // *combined* total across the four grouped modes (Libera
                 // semantics), so cap on their sum, not per list.
+                // The folding key: equality/dedup/removal against the list now
+                // fold *by construction* (the matcher folds too), so a case
+                // variant can't double-store or fail to remove — see `MaskKey`.
+                let mask_key = crate::core::state::MaskKey::new(mask, casemap);
                 let chan_ref = state.channels.get(&key).expect("checked");
                 let list_ref = match c {
                     'b' => &chan_ref.bans,
@@ -1168,13 +1177,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     'I' => &chan_ref.invite_exceptions,
                     _ => unreachable!("outer arm matched only these list-mode chars"),
                 };
-                // Compare under the casemapping, the same fold the matcher
-                // uses — a case-sensitive `==` here would let `-b FOO!*@*` fail
-                // to remove a ban stored as `foo!*@*` (while still enforcing it)
-                // and would double-store one logical ban across cases.
-                let is_new = !list_ref
-                    .iter()
-                    .any(|b| e6irc_proto::mask::eq(casemap, b, mask));
+                let is_new = !list_ref.contains(&mask_key);
                 let combined = chan_ref.bans.len()
                     + chan_ref.quiets.len()
                     + chan_ref.ban_exceptions.len()
@@ -1204,12 +1207,12 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 // ways: don't drop real changes, don't invent phantom ones).
                 let changed = if adding {
                     if is_new {
-                        list.push(mask.to_string());
+                        list.push(mask_key);
                     }
                     is_new
                 } else {
                     let before = list.len();
-                    list.retain(|b| !e6irc_proto::mask::eq(casemap, b, mask));
+                    list.retain(|b| *b != mask_key);
                     list.len() != before
                 };
                 if changed {

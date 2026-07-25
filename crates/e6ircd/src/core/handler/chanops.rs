@@ -452,8 +452,21 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"));
         return;
     }
+    // A banned user cannot knock (Solanum refuses with ERR_CANNOTSENDTOCHAN):
+    // otherwise +b is no barrier to spamming the channel's ops with knock
+    // requests they can't act on.
+    let casemap = state.casemap;
+    let user_prefix = state.sessions[&conn].prefix();
+    if chan.is_banned(casemap, &user_prefix) {
+        state.numeric(
+            conn,
+            ERR_CANNOTSENDTOCHAN,
+            &[&display],
+            Some("Cannot knock on channel (+b)"),
+        );
+        return;
+    }
     // Deliver the knock to the channel's operators, then confirm to the knocker.
-    let prefix = state.sessions[&conn].prefix();
     let ops: Vec<ConnId> = chan
         .members
         .iter()
@@ -464,7 +477,7 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(
             op,
             RPL_KNOCK,
-            &[&display, &prefix],
+            &[&display, &user_prefix],
             Some("has asked for an invite"),
         );
     }

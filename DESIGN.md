@@ -105,6 +105,20 @@ These are project-wide rules, enforced in review and (where possible) CI:
     un-casefolded input" cannot be written. `AccountKey` types every in-core
     account map (read markers, registered founders, channel access) onto the
     folded convention; the DB enforces the same at the `name_folded` edge.
+  - `MaskKey` — the casefold-key discipline extended from map keys to *list*
+    elements: a channel's ban/quiet/exception `Vec`s hold `MaskKey`, which folds
+    once in its constructor and carries the display form alongside, so a
+    `push`/`contains`/`retain` cannot compare an un-folded mask and let a ban
+    silently fail to match. The one place map keys couldn't reach — a folded
+    comparison over a `Vec` — is now closed the same way.
+  - `CredentialOrigin` — a credential-verify verdict (`PasswordVerified` /
+    `PasswordRejected` / `Unavailable`) answers *either* a SASL `AUTHENTICATE`
+    or a NickServ `IDENTIFY`; the request carries which, echoed onto the reply,
+    so `db_reply` routes on the origin the request *was* rather than inferring
+    it from `sasl == Verifying` / `pending_identify` session flags. The old
+    inference conflated "which command asked" with "is the attempt still live";
+    a verdict routed under the wrong flag logged the client in as the wrong
+    account. The flag now gates only liveness (drop a superseded verdict).
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the CR/LF sanitizer and
     the detached-buffer append; the bypass is a compile error, not a lint.
@@ -763,9 +777,13 @@ one implementation shared with the external-network path.
 - Full IRCv3 *client* implementation reusing `e6irc-proto` + the same SASL
   machinery; requests `server-time`, `message-tags`, `away-notify`, etc.
   from upstream when available (Libera: yes).
-- Auto-reconnect with exponential backoff + jitter; state resync (rejoin
-  channels, replay nick) on reconnect; upstream SASL PLAIN with credentials
-  stored encrypted (§15).
+- Auto-reconnect with exponential backoff + jitter, bounded so a repeatedly
+  rejected upstream credential stops re-dialing rather than hammering the
+  upstream forever. On reconnect the driver re-registers and re-joins the
+  *configured* autojoin channels under the configured nick; resyncing the
+  client's *runtime* channel/nick changes (a JOIN or NICK it issued this
+  session) is a planned enhancement, not yet implemented. Upstream SASL PLAIN
+  with credentials stored encrypted (§15).
 - Primary interop target: Libera (tested against the §7.7 docker stack).
 
 ### 10.4 Attach addressing

@@ -311,6 +311,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             sender_account: e.sender_account,
             kind: e.kind,
             body: e.body,
+            sender_is_bot: e.sender_is_bot,
         })
         .collect();
     // Ring path runs under labeled-response capture; frame_labeled applies the
@@ -789,8 +790,19 @@ pub(crate) fn history_page(
         .sessions
         .get(&conn)
         .is_some_and(|s| s.caps.account_tag);
+    // `bot`: live delivery stamps it for message-tags recipients when the sender
+    // was a bot, so replay must too (same byte-identical invariant).
+    let want_bot_tag = state
+        .sessions
+        .get(&conn)
+        .is_some_and(|s| s.caps.message_tags);
     for row in rows {
         let time = e6irc_proto::time::server_time(row.ts);
+        let bot_tag = if want_bot_tag && row.sender_is_bot {
+            ";bot"
+        } else {
+            ""
+        };
         let account_tag = match (want_account_tag, &row.sender_account) {
             (true, Some(account)) => {
                 format!(
@@ -834,7 +846,7 @@ pub(crate) fn history_page(
         let head = format!(":{} {verb} {target} :", row.sender_prefix);
         let body = crate::core::handler::fit_trailing(&head, &row.body);
         let line = format!(
-            "@batch={batch_ref};msgid={};time={time}{account_tag} {head}{body}",
+            "@batch={batch_ref};msgid={};time={time}{account_tag}{bot_tag} {head}{body}",
             row.msgid,
         );
         state.send(conn, &line);
@@ -858,6 +870,7 @@ mod window_tests {
             sender_account: None,
             kind: MessageKind::Privmsg,
             body: format!("b{i}"),
+            sender_is_bot: false,
         }
     }
 

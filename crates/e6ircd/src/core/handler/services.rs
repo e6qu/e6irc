@@ -115,6 +115,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 conn,
                 account,
                 password: password.to_string(),
+                origin: crate::core::CredentialOrigin::NickServIdentify,
             };
             if state.db_tx.try_push(request).is_err() {
                 state
@@ -169,11 +170,25 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 &format!("\x02{nick}\x02 has been ghosted."),
             );
         }
+        "LOGOUT" => {
+            // De-identify: clear the account and tell account-notify peers the
+            // session is now unauthenticated (`ACCOUNT *`). Founder/access
+            // authority is checked live against `account`, so it is revoked at
+            // once; a client can now drop its identity without reconnecting.
+            if state.sessions[&conn].account.is_none() {
+                state.service_notice(conn, "NickServ", "You are not logged in.");
+                return;
+            }
+            state.sessions.get_mut(&conn).expect("checked").account = None;
+            super::sasl::notify_account_change(state, conn, "*");
+            state.service_notice(conn, "NickServ", "You are now logged out.");
+        }
         "HELP" => {
             for line in [
                 "***** NickServ Help *****",
                 "REGISTER <password> [email] - Register your current nick",
                 "IDENTIFY [account] <password> - Log in to your account",
+                "LOGOUT - Log out of your account (de-identify)",
                 "GHOST <nick> - Disconnect a lingering session on your nick",
                 "***** End of Help *****",
             ] {
@@ -762,6 +777,12 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
             || session.cap_negotiating
             || session.nick.is_none()
             || session.user.is_none()
+            // Hold registration while a SASL credential verify is in flight, so
+            // its 900/903 (or 904) can't arrive *after* the 001 welcome burst:
+            // a client that sends CAP END before the verdict lands must still
+            // see the login result during registration, not out of order. The
+            // verify reply re-invokes this once it resolves (`db_reply`).
+            || session.sasl_verify_pending
         {
             return;
         }
