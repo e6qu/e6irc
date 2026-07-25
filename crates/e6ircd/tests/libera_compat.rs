@@ -80,6 +80,7 @@ fn our_isupport() -> HashMap<String, String> {
             opers: vec![],
             max_hot_channels: 8192,
             clock: || e6irc_proto::time::Millis::from_millis(0),
+            mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
             command_burst: None,
         },
         db_tx,

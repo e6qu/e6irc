@@ -53,6 +53,53 @@ impl Millis {
     }
 }
 
+/// Milliseconds from a **monotonic** source, for timer decisions only.
+///
+/// A distinct type from [`Millis`] for the same reason `Millis` is distinct
+/// from a bare `u64`: wall-clock time and monotonic time must not be mixed. A
+/// deadline decision — the ping/registration reaper, the flood-bucket refill —
+/// stamped against the wall clock breaks whenever the wall clock steps: an NTP
+/// correction or a VM resume that jumps the clock forward mass-reaps every live
+/// connection at once (every registration "times out", every idle client is
+/// pinged in the same tick), and a backward step freezes the reaper entirely
+/// (nothing ever times out) until the clock climbs back. A monotonic clock
+/// never steps, so a timer keyed on `MonoMillis` cannot exhibit either.
+/// Because the type differs, a `MonoMillis` deadline cannot be compared against
+/// a wall-clock [`Millis`] `now` (it does not compile), so the class of
+/// "timer decision on wall-clock time" is unrepresentable. Wall-clock `Millis`
+/// stays the source for what genuinely needs real time — `server-time`, msgids,
+/// signon/last-seen timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct MonoMillis(u64);
+
+impl MonoMillis {
+    /// Wrap a raw monotonic millisecond count (a monotonic clock reading).
+    pub const fn from_millis(ms: u64) -> Self {
+        Self(ms)
+    }
+
+    /// The raw millisecond count, for the flood-bucket arithmetic.
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+
+    /// Truncate an *elapsed* count to whole seconds (the WHOIS/WHOX idle field).
+    pub const fn as_secs(self) -> u64 {
+        self.0 / 1000
+    }
+
+    /// `self - other`, saturating at zero — an elapsed monotonic duration (idle
+    /// time, time since a ping was sent), read by the caller in its own unit.
+    pub const fn saturating_sub(self, other: MonoMillis) -> MonoMillis {
+        MonoMillis(self.0.saturating_sub(other.0))
+    }
+
+    /// Advance by a raw millisecond amount (the flood-bucket refill watermark).
+    pub const fn saturating_add_millis(self, ms: u64) -> MonoMillis {
+        MonoMillis(self.0.saturating_add(ms))
+    }
+}
+
 /// Format milliseconds since the Unix epoch as `server-time` requires.
 pub fn server_time(at: Millis) -> String {
     let epoch_millis = at.as_millis();
@@ -96,6 +143,19 @@ fn days_in_month(year: i64, month: u32) -> u32 {
     }
 }
 
+/// Parse one unsigned `server-time` numeric field, rejecting a leading `+`/`-`
+/// (or any non-digit). Rust's integer `FromStr` accepts a leading `+`, but the
+/// grammar is plain digits, so without this `2024-+2-+29T+1:+2:+3Z` would parse
+/// to the same instant as `2024-02-29T01:02:03Z` — two strings for one instant.
+/// Every field (year included) goes through this one gate, so the sign-accepting
+/// class cannot reappear on a field a future edit forgets to guard.
+fn parse_time_field<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Parse a `server-time` string to epoch **milliseconds**, preserving the
 /// optional `.mmm` fraction (padded/truncated to three digits). `None` on any
 /// format violation.
@@ -103,15 +163,11 @@ pub fn parse_server_time_millis(text: &str) -> Option<Millis> {
     let text = text.strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut date_parts = date.split('-');
-    let year_str = date_parts.next()?;
-    // `i64::parse` accepts a leading `+`/`-`; the `server-time` grammar is a
-    // plain 4-digit year, so reject any sign — `"+5-01-01T…"` must not parse.
-    if !year_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let year: i64 = year_str.parse().ok()?;
-    let month: u32 = date_parts.next()?.parse().ok()?;
-    let day: u32 = date_parts.next()?.parse().ok()?;
+    // Every field goes through the strict digit-only parser, which rejects the
+    // leading `+`/`-` that Rust's integer `FromStr` would otherwise accept.
+    let year: i64 = parse_time_field(date_parts.next()?)?;
+    let month: u32 = parse_time_field(date_parts.next()?)?;
+    let day: u32 = parse_time_field(date_parts.next()?)?;
     // The `server-time` format has a 4-digit year. Bounding it here is not
     // cosmetic: it keeps the returned milliseconds small enough that the
     // `* 1000` below cannot overflow u64 — an unbounded year let a client
@@ -129,9 +185,9 @@ pub fn parse_server_time_millis(text: &str) -> Option<Millis> {
     }
     let (hms, frac) = time.split_once('.').map_or((time, ""), |(t, f)| (t, f));
     let mut time_parts = hms.split(':');
-    let hh: u64 = time_parts.next()?.parse().ok()?;
-    let mm: u64 = time_parts.next()?.parse().ok()?;
-    let ss: u64 = time_parts.next()?.parse().ok()?;
+    let hh: u64 = parse_time_field(time_parts.next()?)?;
+    let mm: u64 = parse_time_field(time_parts.next()?)?;
+    let ss: u64 = parse_time_field(time_parts.next()?)?;
     // No leap seconds: server-time values are server-generated and never carry
     // `:60`, and accepting it would silently roll a client-supplied timestamp
     // into the next minute.
@@ -300,5 +356,15 @@ mod tests {
         assert_eq!(parse_server_time_millis("2026-01-01T00:00:60Z"), None);
         // A signed year is not the 4-digit grammar.
         assert_eq!(parse_server_time_millis("+526-01-01T00:00:00Z"), None);
+        // ...and neither is a sign on ANY other field: Rust's integer FromStr
+        // accepts a leading '+', so without a strict digit gate on every field
+        // these would map to the same instant as the canonical form.
+        assert_eq!(parse_server_time_millis("2024-+2-29T01:02:03Z"), None);
+        assert_eq!(parse_server_time_millis("2024-02-+9T01:02:03Z"), None);
+        assert_eq!(parse_server_time_millis("2024-02-29T+1:02:03Z"), None);
+        assert_eq!(parse_server_time_millis("2024-02-29T01:+2:03Z"), None);
+        assert_eq!(parse_server_time_millis("2024-02-29T01:02:+3Z"), None);
+        // The canonical form still parses.
+        assert!(parse_server_time_millis("2024-02-29T01:02:03Z").is_some());
     }
 }

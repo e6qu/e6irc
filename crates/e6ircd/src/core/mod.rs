@@ -33,10 +33,11 @@ pub enum Input {
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
     Closed { conn: ConnId, reason: String },
-    /// A periodic timer tick carrying the current wall-clock millisecond,
+    /// A periodic timer tick carrying the current **monotonic** millisecond,
     /// driving the liveness reaper (registration deadline + idle PING/PONG
-    /// timeout).
-    Tick { now: e6irc_proto::time::Millis },
+    /// timeout). Monotonic, not wall-clock, so an NTP step can't make the reaper
+    /// mass-close live connections or freeze.
+    Tick { now: e6irc_proto::time::MonoMillis },
     /// An answer from the DB worker to an earlier [`DbRequest`].
     DbReply { conn: ConnId, reply: DbReply },
     /// A resolved CHATHISTORY page from PostgreSQL. `Err` means the store

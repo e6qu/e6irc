@@ -58,6 +58,7 @@ fuzz_target!(|data: &[u8]| {
             opers: vec![("o".into(), "p".into())],
             max_hot_channels: 2,
             clock: advancing_clock,
+            mono_clock: || e6irc_proto::time::MonoMillis::from_millis(1_000_000_000),
             command_burst: None,
             registration_before_connect: false,
             registration_require_email: false,
@@ -101,7 +102,7 @@ fuzz_target!(|data: &[u8]| {
             b'T' => {
                 // Advance far enough that timeouts can actually fire.
                 tick += 20_000;
-                core.handle(Input::Tick { now: e6irc_proto::time::Millis::from_millis(tick) });
+                core.handle(Input::Tick { now: e6irc_proto::time::MonoMillis::from_millis(tick) });
             }
             b'X' => core.handle(Input::Closed {
                 conn: pick(rest),

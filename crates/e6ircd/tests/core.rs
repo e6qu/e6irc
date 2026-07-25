@@ -2,8 +2,15 @@
 //! assert on per-connection output queues. No sockets, no runtime —
 //! fully deterministic.
 
-use e6irc_proto::time::Millis;
+use e6irc_proto::time::{Millis, MonoMillis};
 use e6irc_queue::{Config, Policy, Receiver, queue};
+
+/// Fixed monotonic clock for the deterministic tests, sharing the same base as
+/// the default fixed wall clock (1_000_000_000) so a `Tick` at base+Δ yields a
+/// Δ-millisecond elapsed time against a session opened/active at the base.
+fn test_mono() -> MonoMillis {
+    MonoMillis::from_millis(1_000_000_000)
+}
 use e6ircd::core::{ConnId, Core, CoreConfig, Input, Output};
 
 struct TestServer {
@@ -92,6 +99,7 @@ impl TestServer {
                     max_hot_channels: 8192,
                     opers: vec![("god".into(), "letmein".into())],
                     clock,
+                    mono_clock: test_mono,
                     command_burst: None,
                 },
                 db_tx,
@@ -1493,7 +1501,7 @@ fn unregistered_connection_is_reaped_after_registration_timeout() {
     // A tick past the registration deadline (the test clock is a constant
     // 1_000_000_000 ms, so `now` is supplied via the tick).
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 60_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 60_000),
     });
     assert!(
         s.drain(c)
@@ -1510,7 +1518,7 @@ fn idle_registered_client_is_pinged_then_reaped_without_pong() {
     s.drain(alice);
     // Past the idle interval (120s) → server sends a liveness PING.
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 121_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000),
     });
     assert!(
         s.drain(alice).iter().any(|l| l.starts_with("PING ")),
@@ -1518,7 +1526,7 @@ fn idle_registered_client_is_pinged_then_reaped_without_pong() {
     );
     // No PONG; past the pong deadline (60s) → reaped.
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 121_000 + 61_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000 + 61_000),
     });
     assert!(
         s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1532,16 +1540,44 @@ fn pong_keeps_a_client_alive_across_reaper_ticks() {
     let alice = s.register(1, "alice");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 121_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000),
     });
     assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
     s.line(alice, "PONG :irc.test.example"); // client answers the ping
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 300_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 300_000),
     });
     assert!(
         !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
         "a client that PONGs must not be reaped"
+    );
+}
+
+/// Any inbound line — including the client's own keepalive PING — proves the
+/// socket is alive and must answer an outstanding liveness PING. A client whose
+/// only traffic is its own PINGs (a real class of minimal bots) was reaped as a
+/// ping timeout despite a demonstrably live, actively-sending socket.
+#[test]
+fn inbound_ping_answers_the_liveness_ping_and_prevents_reaping() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    // Idle interval → the server sends its liveness PING (awaiting_pong set).
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000),
+    });
+    assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
+    // The client sends its OWN PING (never a literal PONG) — the socket is
+    // alive, so this must clear the outstanding liveness PING.
+    s.line(alice, "PING :keepalive");
+    s.drain(alice); // consume the PONG the server sends back
+    // Past the pong deadline: a live, PINGing client must NOT be reaped.
+    s.core.handle(Input::Tick {
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000 + 61_000),
+    });
+    assert!(
+        !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
+        "a client actively sending its own PINGs must not be ping-timeout reaped"
     );
 }
 
@@ -1596,14 +1632,14 @@ fn active_client_without_pong_is_not_reaped() {
     s.line(alice, "JOIN #a");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 121_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000),
     }); // liveness PING
     assert!(s.drain(alice).iter().any(|l| l.starts_with("PING ")));
     // The client sends a normal command instead of a literal PONG — still alive.
     s.line(alice, "PRIVMSG #a :still here");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 300_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 300_000),
     });
     assert!(
         !s.drain(alice).iter().any(|l| l.contains("Ping timeout")),
@@ -1777,7 +1813,7 @@ fn idle_client_is_not_repinged_every_tick() {
     let alice = s.register(1, "alice");
     s.drain(alice);
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 121_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 121_000),
     }); // first liveness PING
     assert_eq!(
         s.drain(alice)
@@ -1791,7 +1827,7 @@ fn idle_client_is_not_repinged_every_tick() {
     // Only ~20s later: the ping cadence is 120s from the last PING, so no
     // re-ping — the bug was pinging on every 15s tick once idle.
     s.core.handle(Input::Tick {
-        now: Millis::from_millis(1_000_000_000 + 141_000),
+        now: MonoMillis::from_millis(1_000_000_000 + 141_000),
     });
     assert!(
         s.drain(alice).iter().all(|l| !l.starts_with("PING ")),
@@ -2224,6 +2260,38 @@ fn chanserv_register_flow() {
         out.iter()
             .any(|l| l.starts_with(":ChanServ!") && l.contains("registered")),
         "{out:#?}"
+    );
+}
+
+/// An account may register only up to a cap of channels: each registration
+/// adds a permanent, restart-surviving founder-map entry and runs no argon2, so
+/// without a cap a REGISTER loop grows that map without bound. At the cap, a new
+/// registration is refused (nothing enqueued); re-registering an already-owned
+/// channel stays a no-op path, not gated.
+#[test]
+fn chanserv_register_is_capped_per_account() {
+    let mut s = TestServer::new();
+    // Seed alice at the cap (MAX_CHANNELS_PER_ACCOUNT = 200 founder entries).
+    let preloaded: Vec<(String, String)> = (0..200)
+        .map(|i| (format!("#owned{i}"), "alice".to_string()))
+        .collect();
+    s.core.preload_founders(preloaded);
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #one-too-many");
+    s.drain(alice);
+    s.db_requests();
+
+    // A new registration at the cap is refused, and nothing is enqueued.
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #one-too-many");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("too many channels")),
+        "over-cap registration must be refused: {out:#?}"
+    );
+    assert!(
+        s.db_requests().is_empty(),
+        "over-cap registration must not enqueue a RegisterChannel"
     );
 }
 
@@ -3945,6 +4013,7 @@ fn hot_history_ring_is_lru_evicted() {
             opers: vec![],
             max_hot_channels: 2,
             clock: || Millis::from_millis(1_000_000_000),
+            mono_clock: test_mono,
             command_burst: None,
         },
         db_tx,
@@ -5364,6 +5433,7 @@ fn history_logmessage_gated_on_database() {
                 opers: vec![],
                 max_hot_channels: 8,
                 clock: || Millis::from_millis(1_000_000_000),
+                mono_clock: test_mono,
                 command_burst: None,
             },
             db_tx,

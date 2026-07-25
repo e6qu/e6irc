@@ -261,12 +261,12 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
             return true;
         }
     }
-    let now = (state.config.clock)();
+    let now = (state.config.mono_clock)();
     let s = state.sessions.get_mut(&conn).expect("session present");
-    // A backward wall-clock step (NTP correction) would leave the refill
-    // watermark in the future, so `saturating_sub` yields 0 and the bucket never
-    // refills — flood-killing an actively-talking client through no fault of its
-    // own. Re-anchor to `now` when time has gone backward so refill resumes.
+    // The refill watermark is monotonic, so it can never end up ahead of `now`
+    // (that was the wall-clock NTP-backstep hazard sweep 70 re-anchored around);
+    // the guard remains as defense in depth should the monotonic source ever
+    // report non-monotonically.
     if now < s.flood_refilled_to_ms {
         s.flood_refilled_to_ms = now;
     }
@@ -300,16 +300,18 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         return;
     }
 
-    // Track activity for WHOIS idle / WHOX `l` (keepalive doesn't count).
-    if command != "PING"
-        && command != "PONG"
-        && let Some(session) = state.sessions.get_mut(&conn)
-    {
-        session.last_active = (state.config.clock)();
-        // Any client line proves liveness, so it also answers an outstanding
-        // liveness PING — the reaper mustn't close an actively-talking client
-        // just because it didn't send a literal PONG.
+    // Any inbound line — *including* a keepalive PING/PONG — proves the socket
+    // is alive, so it answers an outstanding liveness PING: the reaper must not
+    // close an actively-sending client merely because its traffic happened to
+    // be its own PINGs and never a literal PONG (a real class of minimal bots).
+    if let Some(session) = state.sessions.get_mut(&conn) {
         session.awaiting_pong = false;
+        // WHOIS idle / WHOX `l`, on the other hand, measures time since real
+        // activity, so a keepalive must not reset it — only a non-keepalive
+        // command bumps `last_active`.
+        if command != "PING" && command != "PONG" {
+            session.last_active = (state.config.mono_clock)();
+        }
     }
 
     // Commands legal before registration.
@@ -418,7 +420,7 @@ const PONG_TIMEOUT_MS: u64 = 60_000;
 /// registered clients, closing those that don't PONG in time (dead sockets).
 /// Without it a connection that opens and then goes silent holds its `Session`
 /// and send queue forever.
-pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::Millis) {
+pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::MonoMillis) {
     let mut expired: Vec<(ConnId, &'static str)> = Vec::new();
     let mut to_ping: Vec<ConnId> = Vec::new();
     for (&conn, s) in &state.sessions {

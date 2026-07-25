@@ -117,7 +117,8 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let whox = parse_whox(whox_part);
     let requester_multi_prefix = state.sessions[&conn].caps.multi_prefix;
     let server = state.config.server_name.clone();
-    let now = (state.config.clock)();
+    // Monotonic: idle is elapsed time since `last_active` (also monotonic).
+    let now = (state.config.mono_clock)();
     if mask.starts_with('#') {
         let key = state.chan_key(mask);
         if let Some(chan) = state.channels.get(&key) {
@@ -339,10 +340,12 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             state.numeric(conn, RPL_WHOISSERVER, &[&nick, &server], Some(&network));
             {
                 let s = &state.sessions[&peer];
-                let now = (state.config.clock)();
-                // The clock is milliseconds; RPL_WHOISIDLE reports seconds
-                // idle and a Unix-*second* signon time.
-                let idle = now.saturating_sub(s.last_active).as_secs();
+                // RPL_WHOISIDLE reports seconds idle (elapsed monotonic time
+                // since last activity) and a Unix-*second* signon *timestamp*
+                // (wall clock) — the two clocks the type split keeps separate.
+                let idle = (state.config.mono_clock)()
+                    .saturating_sub(s.last_active)
+                    .as_secs();
                 let signon = s.signon.as_secs();
                 state.numeric(
                     conn,

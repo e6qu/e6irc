@@ -21,6 +21,16 @@ pub(super) const TARGMAX: usize = 4;
 /// without a cap a client could seed the marker map without bound.
 pub(super) const MAX_READ_MARKERS_PER_ACCOUNT: usize = 256;
 
+/// Cap on channels a single account may register (found). A channel
+/// registration inserts a permanent `registered_founders` (and possibly
+/// `registered_topics`) entry that survives disconnect *and* restart — the maps
+/// are reloaded into RAM at boot — and, unlike account REGISTER, it runs no
+/// argon2 so the per-connection credential budget never throttles it. Without a
+/// cap one authenticated account could register channels in a loop (JOIN → CS
+/// REGISTER → PART) and grow those maps without bound, forever. Enforced in the
+/// ChanServ REGISTER handler against the count the account already founds.
+pub(super) const MAX_CHANNELS_PER_ACCOUNT: usize = 200;
+
 /// Cap on a session's pending-invite set, bounding INVITE-driven growth.
 pub(super) const INVITE_LIMIT: usize = 100;
 
