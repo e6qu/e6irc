@@ -224,6 +224,30 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                         let _ = core_tx.push(Input::DbReply { conn, reply }).await;
                     });
                 }
+                // Account creation carries the same ~100ms argon2 hash as a
+                // verify; offload it under the same semaphore so a cheap one-line
+                // REGISTER can't monopolize the single worker for the full hash
+                // and stall every queued read/login behind it. It writes only the
+                // accounts table (never `messages`), so — like VerifyPassword —
+                // no log-batch flush is needed and there is no ordering hazard.
+                DbRequest::CreateAccount {
+                    conn,
+                    name,
+                    password,
+                    origin,
+                } => {
+                    let pool = pool.clone();
+                    let core_tx = core_tx.clone();
+                    let sem = verify_sem.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem
+                            .acquire_owned()
+                            .await
+                            .expect("verify semaphore never closed");
+                        let reply = handle_create_account(&pool, name, &password, origin).await;
+                        let _ = core_tx.push(Input::DbReply { conn, reply }).await;
+                    });
+                }
                 request => {
                     // Any other request may *read* the messages table, so the
                     // writes queued ahead of it must land first. Without this a
@@ -349,28 +373,10 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             let reply = outcome.into_reply(origin);
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        DbRequest::CreateAccount {
-            conn,
-            name,
-            password,
-            origin,
-        } => {
-            let reply = match create_account(pool, &name, &password).await {
-                Ok(_) => DbReply::AccountCreated {
-                    account: name,
-                    origin,
-                },
-                Err(DbError::DuplicateAccount(_)) => DbReply::AccountExists { origin },
-                Err(e) => {
-                    eprintln!("db: account creation failed: {e}");
-                    // Origin-carrying failure so the handler answers the way the
-                    // client asked (NickServ notice vs REGISTER FAIL) instead of
-                    // dropping a bare Unavailable it can't attribute.
-                    DbReply::AccountRegisterUnavailable { origin }
-                }
-            };
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
-        }
+        // `run_worker` intercepts CreateAccount and spawns it under the verify
+        // semaphore (like VerifyPassword) so its argon2 hash never runs on the
+        // serial worker loop. A duplicate inline path would silently lose that.
+        DbRequest::CreateAccount { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::RegisterChannel {
             conn,
             channel,
@@ -1349,6 +1355,35 @@ impl VerifyOutcome {
             Self::Verified(account) => DbReply::PasswordVerified { account, origin },
             Self::Rejected => DbReply::PasswordRejected { origin },
             Self::Unavailable => DbReply::Unavailable { origin },
+        }
+    }
+}
+
+/// Create an account (hashing its password with argon2) and build the
+/// origin-carrying reply. Runs off the serial worker loop (spawned under the
+/// verify semaphore in `run_worker`) so its ~100ms hash can't head-of-line-block
+/// CHATHISTORY reads and other logins — the same treatment `handle_verify` gets,
+/// closing the "an argon2 op runs on the serial worker" class for the write path
+/// too. A create writes only the accounts table (never `messages`), so it needs
+/// no log-batch flush and has no ordering dependency on buffered history.
+async fn handle_create_account(
+    pool: &PgPool,
+    name: String,
+    password: &str,
+    origin: crate::core::AccountOrigin,
+) -> DbReply {
+    match create_account(pool, &name, password).await {
+        Ok(_) => DbReply::AccountCreated {
+            account: name,
+            origin,
+        },
+        Err(DbError::DuplicateAccount(_)) => DbReply::AccountExists { origin },
+        Err(e) => {
+            eprintln!("db: account creation failed: {e}");
+            // Origin-carrying failure so the handler answers the way the client
+            // asked (NickServ notice vs REGISTER FAIL) instead of dropping a
+            // bare Unavailable it can't attribute.
+            DbReply::AccountRegisterUnavailable { origin }
         }
     }
 }

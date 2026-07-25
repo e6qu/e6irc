@@ -291,6 +291,13 @@ async fn client(
     let sender_prefix = format!("load{chan_idx}!");
     let base = chan_idx * args.burst;
     let mut count = 0u64;
+    // Elapsed at the *last message actually counted*, not at loop exit: an
+    // incomplete run exits via the 30s timeout, and recording that deadline
+    // would pin the fan-out duration (the throughput denominator, a `fetch_max`
+    // across receivers) to ~30s and understate msg/s — exactly in the
+    // near-capacity regime the harness exists to measure. This tracks the real
+    // delivery time instead.
+    let mut last_delivery_ms = 0u64;
     let mut latencies = Vec::with_capacity(args.burst);
     let _ = tokio::time::timeout(Duration::from_secs(30), async {
         while count < args.burst as u64 {
@@ -316,6 +323,7 @@ async fn client(
                         }
                     }
                     count += 1;
+                    last_delivery_ms = fanout_start.elapsed().as_millis() as u64;
                 }
                 Ok(Some(_)) => {}
                 _ => break,
@@ -326,7 +334,7 @@ async fn client(
     if count > 0 {
         metrics
             .fanout_max_ms
-            .fetch_max(fanout_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .fetch_max(last_delivery_ms, Ordering::Relaxed);
     }
     metrics.received.fetch_add(count, Ordering::Relaxed);
     metrics

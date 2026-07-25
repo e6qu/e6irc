@@ -273,8 +273,8 @@ fn batch_ref_after(line: &str, sign: char) -> Option<&str> {
 /// proceed, `false` if the bucket is empty (the caller closes the link).
 /// No-op (always `true`) when the throttle is off, or for pre-registered
 /// and oper sessions. Refills one token per elapsed second up to the
-/// configured burst; a zero `flood_refilled_to_ms` (fresh session) refills
-/// to full on the first command.
+/// configured burst; a fresh session is seeded full at `open()` (with its
+/// watermark at the open time), so it starts with the whole burst available.
 fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     let Some(burst) = state.config.command_burst else {
         return true;

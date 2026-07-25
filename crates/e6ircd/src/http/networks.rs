@@ -121,8 +121,26 @@ fn upstream_addr_is_internal(addr: &str) -> bool {
         addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
     };
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false; // hostname — not classifiable without DNS
+        return false; // hostname — not classifiable without DNS (vetted at dial)
     };
+    is_blocked_upstream_ip(ip)
+}
+
+/// Is `ip` an SSRF-blocked upstream target — link-local (incl. the cloud
+/// metadata endpoint `169.254.169.254`), broadcast, documentation, unspecified,
+/// or multicast? Loopback and RFC-1918 / unique-local are deliberately *allowed*
+/// (a self-hosted or LAN upstream is a first-class use case).
+///
+/// The address is canonicalized first: a V4-mapped V6 literal like
+/// `::ffff:169.254.169.254` connects, at the kernel, to the V4 address, so it
+/// must be classified by the V4 rules — the V6-only link-local test
+/// (`fe80::/10`) is `false` for a mapped form and would otherwise wave the
+/// metadata endpoint straight through. Used both on the creation-time literal
+/// and, crucially, on every *resolved* address at dial time (`irc_driver`), so a
+/// hostname that resolves — now or after a DNS rebind — to an internal target
+/// cannot be reached.
+pub(crate) fn is_blocked_upstream_ip(ip: std::net::IpAddr) -> bool {
+    let ip = ip.to_canonical();
     if ip.is_unspecified() || ip.is_multicast() {
         return true;
     }
@@ -130,8 +148,9 @@ fn upstream_addr_is_internal(addr: &str) -> bool {
         std::net::IpAddr::V4(v4) => {
             v4.is_link_local() || v4.is_broadcast() || v4.is_documentation()
         }
-        // IPv6 link-local (fe80::/10). Unique-local (fc00::/7) is the private
-        // analogue of RFC-1918 and is allowed, like loopback.
+        // Unique-local (fc00::/7) is the private analogue of RFC-1918 and is
+        // allowed, like loopback; `to_canonical` has already mapped any
+        // V4-in-V6 form to V4, so what reaches here is a genuine V6 address.
         std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
@@ -186,7 +205,8 @@ pub(super) async fn create_network_core(
     // a NUL inside either value would shift the authzid/authcid/passwd fields
     // the upstream parses — the same injection-primitive class as CR/LF in a
     // command line.
-    if has_control(&req.nick)
+    if has_control(&req.addr)
+        || has_control(&req.nick)
         || req.realname.as_deref().is_some_and(has_control)
         || req.autojoin.iter().any(|c| has_control(c))
         || req.sasl_account.as_deref().is_some_and(has_control)
@@ -477,6 +497,15 @@ mod tests {
         assert!(upstream_addr_is_internal("255.255.255.255:6667")); // broadcast
         assert!(upstream_addr_is_internal("[fe80::1]:6697")); // v6 link-local
         assert!(upstream_addr_is_internal("203.0.113.7:6697")); // TEST-NET-3 (documentation)
+        // V4-mapped V6 literals connect to the V4 address at the kernel, so the
+        // mapped spelling of a blocked target must be caught too — the metadata
+        // endpoint written as `::ffff:169.254.169.254` was the SSRF bypass.
+        assert!(upstream_addr_is_internal("[::ffff:169.254.169.254]:80"));
+        assert!(upstream_addr_is_internal("[::ffff:0.0.0.0]:6667"));
+        // The mapped form of an *allowed* address stays allowed (canonicalized to
+        // the V4 loopback/private rules, not the V6 ones).
+        assert!(!upstream_addr_is_internal("[::ffff:127.0.0.1]:6667"));
+        assert!(!upstream_addr_is_internal("[::ffff:10.0.0.5]:6667"));
         // Loopback and private ranges ARE allowed: a self-hosted / LAN IRC
         // upstream (including 127.0.0.1) is a first-class use case.
         assert!(!upstream_addr_is_internal("127.0.0.1:6667"));

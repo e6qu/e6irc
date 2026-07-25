@@ -1593,6 +1593,82 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-ninth sweep — five-front hunt: an SSRF bypass, a flood-kill of fresh
+clients, an argon2 head-of-line stall (2026-07-25): four parallel hunts
+(proto parse/serialize, connection lifecycle/timers, adversarial security, the
+client/tooling crates) plus a hand review of MONITOR/read-marker/close-cleanup.
+One HIGH, two MED, three LOW; three bug *classes* closed at a choke point.
+
+**The HIGH — SSRF metadata-endpoint bypass, two ways** (http/networks.rs,
+bouncer/irc_driver.rs). The only SSRF control on a user-created BNC upstream
+(loopback/RFC-1918 are deliberately allowed; the sharp vector is the cloud
+link-local metadata endpoint `169.254.169.254`) was defeated by both of an
+attacker's natural inputs. (a) An IPv4-mapped IPv6 *literal*,
+`[::ffff:169.254.169.254]`, parsed to a V6 address the classifier tested only
+against `fe80::/10` — `false` for a mapped form — and the kernel then connects
+it to the real V4 metadata IP. (b) A *hostname* returned `false` by design
+("resolution lives in the dialer") but the dialer did a bare
+`TcpStream::connect` and never re-checked the resolved IP, so a name resolving
+(or DNS-rebinding) to an internal target sailed through. An authenticated tenant
+could thus make the always-on driver dial internal services and read their
+banners back over the attach. Closed by `is_blocked_upstream_ip`, which
+`to_canonical()`-unmaps before classifying (so a mapped spelling can't slip the
+V4 rules), used *both* on the creation-time literal and — the authoritative
+check — on every *resolved* address at dial time: the driver now resolves,
+vets, and connects to a specific vetted socket address (validating TLS against
+the original hostname), so resolution can't differ between the check and the
+connect.
+
+**The MEDs.**
+- *Fresh sessions flood-killed for the first `command_burst` seconds after a
+  restart* (core/state.rs, handler/mod.rs). `open()` seeded the flood bucket
+  `flood_tokens = 0`, `flood_refilled_to_ms = MonoMillis(0)`. The monotonic
+  clock's epoch is process start, so the first refill credited `now − 0 =
+  uptime` seconds — within the first `burst` seconds a bucket started at only
+  `min(uptime, burst)` tokens and a client pipelining a legitimate burst got
+  `ERROR … Excess Flood`, worst exactly during a post-restart reconnect storm.
+  A zero-`MonoMillis` sentinel meaning both "unset" and "process-start" was the
+  trap; seeded full at `open()` with the watermark at the open time.
+- *An argon2 head-of-line stall on the serial DB worker* (db.rs). `VerifyPassword`
+  was deliberately offloaded off the worker loop under a semaphore, but
+  `CreateAccount` — carrying the same ~100ms argon2 hash — ran on the serial
+  path, so a cheap one-line REGISTER monopolized the single worker for the full
+  hash and queued every CHATHISTORY read and login behind it. Offloaded under the
+  same semaphore; the inline arm is now `unreachable!`, making "an argon2 op on
+  the serial loop" a structural impossibility.
+
+**The LOWs.** The load generator recorded the 30s *timeout deadline* (not the
+last actual delivery) as the fan-out duration on an incomplete run, pinning the
+throughput denominator and understating msg/s exactly in the near-capacity
+regime it exists to measure. `create_network_core` applied the CR/LF/NUL guard
+to every upstream field *except* `addr`. `escape_tag_value` passed a raw NUL
+through (the guard lived only in `to_line`) — now dropped at the escaper, the
+one tag-value wire-safety choke point; and `IsupportToken::serialize` gained a
+debug-assertion on its name (untriggerable in production — the daemon only
+parses tokens — but the construct→serialize path is fuzzed).
+
+**Hand-reviewed and clean** (not re-touched): MONITOR add/remove/clear and the
+`monitors` map cleanup on close; the read-marker account/anon paths and their
+registration gating; the liveness reaper, SendQ/`doomed` sweep, and
+`deferred_replies`/`held` balance; and — from the security hunt — secret
+sealing (ChaCha20-Poly1305, per-seal random nonce), the constant-time OPER
+compare, token generation (32-byte OsRng, hashed at rest), and the SASL
+cross-attribution defenses.
+
+**Surfaced, not done** (large defensive refactors, no live bug — deferred to
+dedicated passes rather than ballooned in here): a `WireLine` newtype to give
+the outbound line-injection invariant a release-time backstop (today it is a
+debug-assertion at the one send funnel plus parse-time rejection); a
+`TerminalSafe` newtype so the CLI's per-call-site `terminal_safe` and the TUI's
+implicit reliance on ratatui's control-char filter become one typed boundary;
+and `Option<MonoMillis>` for the remaining not-yet-stamped timer watermarks
+(`last_ping_sent`/`last_active`, harmless today).
+
+Full gate green: workspace tests, clippy (default + `embed-web` + bridges), fmt,
+the four guard scripts, `cargo deny`, the fuzz build, the PG-backed `db` suite
+(41, which exercises account creation after the offload), `http`, `oidc`,
+irctest main (380) and the persistence-backed services list (49).
+
 Seventy-eighth sweep — four-front hunt + four more classes made
 unrepresentable (2026-07-25): four parallel hunts (DB/persistence, core
 protocol handlers, HTTP/OIDC/auth, bouncer/bridges) plus a hand review of the

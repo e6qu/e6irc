@@ -18,7 +18,7 @@ use crate::config::OidcProviderConfig;
 mod credentials;
 mod device;
 mod history;
-mod networks;
+pub(crate) mod networks;
 mod oidc;
 mod openapi;
 mod ws;

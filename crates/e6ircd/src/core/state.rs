@@ -1260,8 +1260,16 @@ impl ServerState {
                 monitoring: HashMap::new(),
                 multiline: None,
                 anon_read_markers: HashMap::new(),
-                flood_tokens: 0,
-                flood_refilled_to_ms: e6irc_proto::time::MonoMillis::from_millis(0),
+                // Seed the flood bucket full, with its refill watermark at the
+                // open time — NOT a zero `MonoMillis` sentinel. The monotonic
+                // clock's epoch is process start, so a zero watermark makes the
+                // first refill credit `now - 0 = uptime` seconds: within the
+                // first `command_burst` seconds of uptime the bucket would start
+                // at only `min(uptime, burst)` tokens and wrongly kill a client
+                // that pipelines a legitimate burst — worst exactly during a
+                // post-restart reconnect storm.
+                flood_tokens: self.config.command_burst.unwrap_or(0) as u32,
+                flood_refilled_to_ms: opened_at,
                 last_active: e6irc_proto::time::MonoMillis::from_millis(0),
                 signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,

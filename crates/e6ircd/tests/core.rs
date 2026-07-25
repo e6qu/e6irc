@@ -4267,6 +4267,86 @@ fn bot_mode_tags_and_whois() {
 }
 
 #[test]
+fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
+    // The monotonic clock's epoch is process start, so a session opened a few
+    // seconds into uptime must STILL start with the full command burst — not
+    // `min(uptime_seconds, burst)`. Regression for a fresh bucket under-filled
+    // during the first `command_burst` seconds after a restart, which would
+    // wrongly Excess-Flood-kill a client pipelining a legitimate burst — the
+    // worst case being a post-restart reconnect storm. A fixed clock only 3s
+    // into "uptime" reproduces it (the usual 1e9-ms test clock masks it, since
+    // uptime then dwarfs any burst).
+    fn early_mono() -> MonoMillis {
+        MonoMillis::from_millis(3_000)
+    }
+    let (db_tx, _db_rx) = queue(Config {
+        name: "d",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let mut core = Core::new(
+        CoreConfig {
+            server_name: "irc.test.example".into(),
+            network_name: "T".into(),
+            description: "test server".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
+            sendq: 256,
+            motd: vec![],
+            nicklen: 16,
+            sasl_enabled: false,
+            opers: vec![],
+            max_hot_channels: 8,
+            clock: || Millis::from_millis(1_000_000_000),
+            mono_clock: early_mono,
+            command_burst: Some(10),
+        },
+        db_tx,
+    );
+    let conn = ConnId(1);
+    let (tx, mut rx) = queue(Config {
+        name: "s",
+        capacity: 512,
+        policy: Policy::Fifo,
+    });
+    core.handle(Input::Open {
+        conn,
+        tx,
+        host: "h".into(),
+    });
+    for line in ["NICK alice", "USER a 0 * :A"] {
+        core.handle(Input::Line {
+            conn,
+            line: line.as_bytes().to_vec(),
+        });
+    }
+    while rx.try_pop().is_some() {}
+
+    // Send exactly `command_burst` floodable commands in the same tick. With a
+    // full fresh bucket all ten are credited; with the old uptime-seeded bucket
+    // (3 tokens) the fourth would be dropped with Excess Flood.
+    for _ in 0..10 {
+        core.handle(Input::Line {
+            conn,
+            line: b"AWAY :busy".to_vec(),
+        });
+    }
+    let out: Vec<String> = std::iter::from_fn(|| {
+        rx.try_pop().map(|e| {
+            String::from_utf8(e.payload.0.to_vec())
+                .unwrap()
+                .trim_end()
+                .to_string()
+        })
+    })
+    .collect();
+    assert!(
+        !out.iter().any(|l| l.contains("Excess Flood")),
+        "a fresh session must start with the full burst, not min(uptime, burst): {out:#?}"
+    );
+}
+
+#[test]
 fn hot_history_ring_is_lru_evicted() {
     // A server with room for only 2 hot channels: activity in a third
     // must evict the least-recently-active channel's ring.

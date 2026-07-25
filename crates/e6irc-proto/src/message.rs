@@ -376,11 +376,19 @@ pub fn unescape_tag_value(raw: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Escape a tag value for the wire.
+/// Escape a tag value for the wire. The output is wire-safe **by
+/// construction**: `;`/space/`\`/CR/LF get their `\`-escapes, and a NUL — which
+/// has no tag escape and cannot legally appear in a message at all — is dropped
+/// rather than passed through. This is the single choke point for tag-value wire
+/// safety, so a caller that reaches the escaper directly (bypassing
+/// `Message::to_line`, which also rejects NUL) can never put a raw NUL on the
+/// wire and truncate the line. Today no caller can supply a NUL (relayed values
+/// come from `parse`, which forbids it; account names are server-validated), so
+/// the NUL branch is defense in depth.
 pub fn escape_tag_value(value: &str) -> Cow<'_, str> {
     if !value
         .bytes()
-        .any(|b| matches!(b, b';' | b' ' | b'\\' | b'\r' | b'\n'))
+        .any(|b| matches!(b, b';' | b' ' | b'\\' | b'\r' | b'\n' | 0))
     {
         return Cow::Borrowed(value);
     }
@@ -392,6 +400,9 @@ pub fn escape_tag_value(value: &str) -> Cow<'_, str> {
             '\\' => out.push_str("\\\\"),
             '\r' => out.push_str("\\r"),
             '\n' => out.push_str("\\n"),
+            // No tag escape exists for NUL and it cannot ride a wire line; drop
+            // it so the escaper's output is always wire-safe.
+            '\0' => {}
             _ => out.push(c),
         }
     }
@@ -528,6 +539,17 @@ mod tests {
         assert_eq!(escaped, r"a\:b\sc\\d\r\n");
         assert_eq!(unescape_tag_value(&escaped), value);
         assert!(matches!(escape_tag_value("plain"), Cow::Borrowed("plain")));
+    }
+
+    #[test]
+    fn escape_drops_nul_so_output_is_wire_safe() {
+        // NUL has no tag escape and cannot ride a wire line; the escaper — the
+        // single tag-value wire-safety choke point — drops it rather than
+        // emitting a raw NUL that would truncate the line. A NUL-only value must
+        // take the neutralizing slow path, not the borrow fast path.
+        assert_eq!(escape_tag_value("a\0b"), "ab");
+        assert_eq!(escape_tag_value("\0"), "");
+        assert!(!escape_tag_value("x\0;y").contains('\0'));
     }
 
     #[test]

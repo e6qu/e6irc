@@ -160,6 +160,19 @@ These are project-wide rules, enforced in review and (where possible) CI:
     the author opened the body with a manual check — the same shape as
     `Authenticated`/`AdminAccount`, one rung over (a new `pages::*` form handler
     that omits it fails to compile for want of the account argument).
+  - `escape_tag_value` — the tag-value escaper's output is wire-safe *by
+    construction*: `;`/space/`\`/CR/LF get their escapes and a NUL (which has no
+    tag escape and cannot ride a wire line) is dropped, so a caller that reaches
+    the escaper directly — bypassing `Message::to_line`, which also rejects NUL —
+    cannot put a raw NUL on the wire and truncate the line. The single choke
+    point for tag-value wire safety, rather than a guard one call path can skip.
+  - *No argon2 on the serial DB-worker loop* — both credential-verifying and
+    account-creating requests are intercepted in `run_worker` and spawned under
+    the `verify_sem` bound; their inline `handle_request` arms are `unreachable!`.
+    So the ~100ms hash never runs on the one serial worker, where a cheap
+    one-line REGISTER/AUTHENTICATE could otherwise head-of-line-block every
+    queued CHATHISTORY read and login behind it. The structural guard (offload +
+    `unreachable!`) makes "an argon2 op on the serial loop" unwritable.
   - `bridge_send` — every reverse-direction (IRC→upstream) bridge HTTP send
     whose failure is an HTTP status funnels through one checked helper that
     rejects a non-2xx. The raw `reqwest::Response` from a bare `.send()` never
