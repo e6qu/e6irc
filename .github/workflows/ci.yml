@@ -44,6 +44,14 @@ jobs:
       - run: tools/check-dead-pub.sh
       # Copy-paste guard: fail if duplicated Rust source exceeds the ratchet.
       - run: tools/check-duplication.sh
+      # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
+      # file-it-for-later idiom may be added to PLAN.md. The checkout is
+      # shallow, so fetch main to diff the PLAN.md additions against; the guard
+      # still checks BUGS.md if the fetch is unavailable.
+      - name: No-deferral guard
+        run: |
+          git fetch --no-tags --depth=1 origin main 2>/dev/null || true
+          tools/check-no-defer.sh FETCH_HEAD
 
   deny:
     runs-on: ubuntu-24.04
