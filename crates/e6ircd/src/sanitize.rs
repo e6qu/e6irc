@@ -169,9 +169,14 @@ pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
     nick.len() <= nicklen && bytes.all(|b| b.is_ascii_alphanumeric() || special(b) || b == b'-')
 }
 
-/// Whether `name` is a legal channel name: `#`-prefixed, non-empty, ≤ 50 bytes,
-/// and free of the bytes that would split it or the line (space, comma, BEL,
-/// `:`, and CR/LF/NUL). A middle parameter, so no space is the load-bearing
+/// Maximum channel-name length in bytes. Enforced by [`valid_channel_name`] and
+/// advertised as ISUPPORT `CHANNELLEN`; the advertisement reads this const so the
+/// two can never drift (the class the ISUPPORT builder is written to prevent).
+pub(crate) const CHANNELLEN: usize = 50;
+
+/// Whether `name` is a legal channel name: `#`-prefixed, non-empty, ≤ CHANNELLEN
+/// bytes, and free of the bytes that would split it or the line (space, comma,
+/// BEL, `:`, and CR/LF/NUL). A middle parameter, so no space is the load-bearing
 /// rule — but CR/LF/NUL matter too: client names are pre-screened by
 /// `Message::parse`, yet a *bridge* channel name comes from a remote API and
 /// never passes through the parser, so a `#foo\nEVIL` would otherwise flatten
@@ -180,7 +185,7 @@ pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
 pub(crate) fn valid_channel_name(name: &str) -> bool {
     name.starts_with('#')
         && name.len() > 1
-        && name.len() <= 50
+        && name.len() <= CHANNELLEN
         && !name
             .bytes()
             .any(|b| matches!(b, b' ' | b',' | 0x07 | b':' | b'\r' | b'\n' | 0))

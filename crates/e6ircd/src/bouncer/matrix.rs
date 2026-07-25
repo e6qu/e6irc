@@ -125,17 +125,13 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
 
 /// Log in and join the configured rooms.
 async fn connect(config: &MatrixConfig) -> Result<Session, super::ConnectFail> {
-    // A timeout longer than the /sync long-poll (20s) so a black-holed
-    // connection fails the request — otherwise the future never resolves,
-    // `session_once` never returns, and the reconnect loop never runs.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        // Don't follow redirects: a compromised/hostile homeserver could 3xx an
-        // API call to an internal address (SSRF). The API never legitimately
-        // redirects, and the OIDC client takes the same stance.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Vets every resolved IP and refuses redirects (SSRF control; see
+    // `bridge_http_client`). The 60s timeout is longer than the /sync long-poll
+    // (20s) so a black-holed connection fails the request — otherwise the future
+    // never resolves, `session_once` never returns, and the reconnect loop never
+    // runs.
+    let http =
+        super::bridge_http_client(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
     let base = config.homeserver.trim_end_matches('/').to_string();
 
     let resp = http

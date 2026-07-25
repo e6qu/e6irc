@@ -509,7 +509,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             &casemapping,
             "CHANTYPES=#",
             &format!("NICKLEN={nicklen}"),
-            "CHANNELLEN=50",
+            &format!("CHANNELLEN={}", crate::sanitize::CHANNELLEN),
             &format!("USERLEN={USERLEN}"),
             &format!("TOPICLEN={TOPICLEN}"),
             &format!("KICKLEN={KICKLEN}"),
@@ -538,7 +538,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             "MSGREFTYPES=msgid,timestamp",
             &format!("MAXLIST=bqeI:{MAXLIST}"),
             &format!("CHANLIMIT=#:{MAX_CHANNELS_PER_SESSION}"),
-            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},KICK:1"),
+            &format!("TARGMAX=PRIVMSG:{TARGMAX},NOTICE:{TARGMAX},KICK:{TARGMAX}"),
         ],
         Some("are supported by this server"),
     );

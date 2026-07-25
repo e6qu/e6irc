@@ -364,6 +364,88 @@ pub(crate) async fn relay_routed<F, Fut>(
     }
 }
 
+/// A reqwest DNS resolver that vets every resolved address and drops the ones a
+/// bridge must never dial — the same SSRF control the IRC driver applies at
+/// connect time (`is_blocked_upstream_ip`: cloud-metadata link-local, multicast,
+/// broadcast, documentation, unspecified). Resolution happens per request, so a
+/// host that resolves to an internal address — now or after a DNS rebind — is
+/// refused at dial time, not just at config time.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+struct VettingResolver;
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl reqwest::dns::Resolve for VettingResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let vetted: Vec<std::net::SocketAddr> = resolved
+                .filter(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
+                .collect();
+            if vetted.is_empty() {
+                // Either DNS returned nothing or every address was blocked; both
+                // are a refusal, not a silent fall-through to the OS resolver.
+                return Err(format!(
+                    "{host}: no permitted address (all resolved addresses are SSRF-blocked)"
+                )
+                .into());
+            }
+            Ok(Box::new(vetted.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The HTTP client every bridge uses for its REST calls. Bounds each request by
+/// `timeout`, refuses redirects (an upstream 3xx can't re-target an internal
+/// address), and vets every resolved IP via [`VettingResolver`] — so a bridge's
+/// configured host can't point an HTTP call at a cloud-metadata endpoint. One
+/// constructor so all three bridges share the discipline rather than each
+/// rebuilding it (and drifting).
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn bridge_http_client(timeout: std::time::Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(VettingResolver))
+        .build()
+}
+
+/// Open a bridge gateway WebSocket to `url`, vetting the resolved IP the same way
+/// [`VettingResolver`] vets HTTP dials. The gateway URL comes from an upstream
+/// REST response, so a hostile/compromised provider could point it at an internal
+/// address; `connect_async` would resolve and dial it blind. Instead we resolve
+/// the host ourselves, dial a *vetted* address directly, and hand that stream to
+/// tungstenite for the TLS handshake (validated against the URL's hostname, not
+/// the IP) — closing the SSRF vector with no resolve-then-dial TOCTOU.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn bridge_ws_connect(
+    url: &str,
+    config: tokio_tungstenite::tungstenite::protocol::WebSocketConfig,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let request = url.into_client_request().map_err(|e| e.to_string())?;
+    let uri = request.uri();
+    let host = uri.host().ok_or("gateway url has no host")?.to_string();
+    // Gateways are always wss:// (TLS); default to 443 when the URL omits a port.
+    let port = uri.port_u16().unwrap_or(443);
+    let vetted = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| e.to_string())?
+        .find(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
+        .ok_or_else(|| format!("{host}: no permitted address (SSRF-blocked)"))?;
+    let tcp = tokio::net::TcpStream::connect(vetted)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (ws, _response) =
+        tokio_tungstenite::client_async_tls_with_config(request, tcp, Some(config), None)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(ws)
+}
+
 /// Largest HTTP response body a bridge will read from an upstream before
 /// parsing it as JSON.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -1063,6 +1145,22 @@ mod tests {
     /// This is the fold-into-one silent drop the Matrix bridge had before
     /// `relay_routed` was shared: `#a` delivers, `#b`'s upstream send fails, `#c`
     /// is unmapped — the client must see both problems, once each.
+    /// The gateway WS dialer refuses a URL that resolves to an SSRF-blocked
+    /// address (here a cloud-metadata link-local literal), before opening any
+    /// socket — the same control the IRC driver applies. This is the upstream-
+    /// controlled vector: the gateway URL comes from a REST response.
+    #[tokio::test]
+    #[cfg(any(feature = "discord", feature = "slack"))]
+    async fn bridge_ws_connect_refuses_an_ssrf_blocked_gateway() {
+        let err = bridge_ws_connect("wss://169.254.169.254/gateway", bridge_ws_config())
+            .await
+            .expect_err("a link-local gateway must be refused");
+        assert!(
+            err.contains("permitted") || err.contains("SSRF"),
+            "refusal must name the SSRF block, got: {err}"
+        );
+    }
+
     #[tokio::test]
     #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
     async fn relay_routed_surfaces_every_target_outcome() {

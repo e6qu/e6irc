@@ -1593,6 +1593,61 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-fifth sweep — the last escalated item, done, plus an ISUPPORT drift
+that unmasked a KICK gap (2026-07-26): the single remaining escalation from sweep
+84 is resolved, and three fresh audits (WS/admin, time/clock, config/ISUPPORT)
+found one real drift — which, once fixed, revealed an incomplete KICK from a
+prior sweep. All in one PR; the WS/admin and time/clock surfaces came back clean.
+
+**Backlog: bridge upstream dials are now IP-vetted at dial time** (bouncer). The
+IRC driver already vetted every resolved IP against `is_blocked_upstream_ip`
+(cloud-metadata link-local, multicast, …) before dialing; the chat bridges did
+not. A shared `bridge_http_client` now installs a custom reqwest DNS resolver
+(`VettingResolver`) that drops blocked addresses, so every Matrix/Discord/Slack
+REST call refuses a host that resolves — now or via a DNS rebind — to an internal
+target (redirects already refused). The Discord/Slack **gateway WebSocket** dials
+(whose URL comes from an upstream REST response) are vetted at the stream level by
+`bridge_ws_connect`: it resolves the host, dials a vetted IP directly, and hands
+that stream to tungstenite for the TLS handshake — closing the SSRF vector with no
+resolve-then-dial TOCTOU. The three bridge client builders collapsed into the one
+shared constructor. New test drives an SSRF-blocked gateway URL to the refusal.
+
+**ISUPPORT advertised `KICK:1` but the handler enforced `TARGMAX` (=4)** (LOW→MED,
+`query.rs`). Sweep 84 made KICK multi-user (bounded by TARGMAX) but left the 005
+advertisement at the old `KICK:1` — the one hardcoded numeric literal in
+`send_isupport` that didn't derive from the const it enforces, so it drifted the
+moment the handler changed. Now `KICK:{TARGMAX}`. To make the *class*
+unrepresentable rather than fix the instance, the last remaining bare limit
+literal (`CHANNELLEN=50`) was also lifted into a `sanitize::CHANNELLEN` const that
+both `valid_channel_name` and the advertisement read — no numeric limit in
+`send_isupport` is a literal that can silently diverge from enforcement any more.
+
+**…which unmasked an incomplete KICK grammar** (`chanops.rs`). Fixing the
+advertisement un-skipped irctest's `testDoubleKickMessages[multiple_targets=True]`
+(it self-skips while `KICK` TARGMAX is 1), which then failed: sweep 84's KICK
+handled only the single-channel `KICK #c a,b` form, not the RFC2812/Modern matched
+multi-channel `KICK #a,#b u,v`. KICK now pairs the channel and user lists per the
+grammar — one channel kicks each listed user; equal-length lists pair positionally;
+any other multi-channel shape is refused loudly (461) — with per-channel op checks
+(`kick_pair`) and the removals still deduped and TARGMAX-bounded. irctest kick.py
+now passes all 7 (both multi-target variants); a new unit test pins the matched
+form and the unequal-list refusal.
+
+Clean bills: the WebSocket surfaces (frame↔line boundary, teardown both
+directions, Origin/CSRF, composer CRLF), the admin/audit routes (all
+`AdminAccount`-gated, no hand-rolled authz), and the whole time subsystem
+(`Millis`/`MonoMillis` newtype split, every timer on the monotonic clock, presence
+propagation cap-gated and membership-scoped) were audited and found sound. One
+noted-not-changed observation: `/ws/ui` (a cookie-authenticated UI socket) takes
+no per-IP `conn_limiter`, but neither does any other `Authenticated` route — it is
+consistent with the design, cheap per socket, and authenticated-only, so it is a
+design stance, not a defect.
+
+Verified: workspace suite + new tests (bridge WS SSRF refusal, matched-list KICK,
+ISUPPORT KICK:4); each bridge feature built alone under `-Dwarnings`; irctest main
+**382** (+2, the KICK multi-target tests now run and pass); bridges (99 lib tests);
+all `tools/check-*` gates + `cargo deny` clean.
+
 Eighty-fourth sweep — the escalated backlog, done, plus a four-front hunt
 (2026-07-26): the four items the previous sweep escalated as decisions are all
 resolved here (the user chose "fix them"), and four fresh parallel audits
