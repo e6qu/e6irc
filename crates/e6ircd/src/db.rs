@@ -29,8 +29,10 @@ pub enum DbError {
     /// A write resolved to no account row for the given name.
     UnknownAccount(String),
     ReplayedLogoutToken,
-    /// The account already holds the maximum number of app passwords.
+    /// The account already holds the maximum number of app passwords / PATs.
     TooManyCredentials,
+    /// The account already holds the maximum number of BNC networks.
+    TooManyNetworks,
 }
 
 impl std::fmt::Display for DbError {
@@ -46,6 +48,7 @@ impl std::fmt::Display for DbError {
             Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
             Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
+            Self::TooManyNetworks => write!(f, "account holds too many networks"),
         }
     }
 }
@@ -96,9 +99,28 @@ fn hasher() -> Argon2<'static> {
     Argon2::default()
 }
 
+/// Concurrent argon2 operations allowed in flight across the WHOLE process.
+/// Each argon2 costs ~19 MiB, so this bounds the memory any burst of hashing
+/// can pin. It is deliberately global: hashing and verification happen on three
+/// paths — the DB worker (`VerifyPassword`/`CreateAccount`), SASL, and the REST
+/// credential endpoints (`create_app_password`, which calls `issue_app_password`
+/// directly, *not* through the worker) — and a per-path bound leaves any path
+/// that forgets it able to spawn unbounded argon2 and exhaust memory (tokio's
+/// blocking pool is ~512 threads ⇒ ~10 GiB). Enforced at the two choke points
+/// below (`hash_password`, `verify_credentials`) so no caller can bypass it.
+const MAX_CONCURRENT_ARGON2: usize = 4;
+
+/// The single gate every argon2 op passes through (see [`MAX_CONCURRENT_ARGON2`]).
+static ARGON2_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_ARGON2);
+
 /// argon2id via the blocking pool — hashing is deliberately slow and
-/// must not stall the async runtime.
+/// must not stall the async runtime. Bounded by [`ARGON2_PERMITS`].
 async fn hash_password(password: String) -> Result<String, DbError> {
+    let _permit = ARGON2_PERMITS
+        .acquire()
+        .await
+        .expect("argon2 semaphore never closed");
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
         hasher()
@@ -180,17 +202,10 @@ pub async fn issue_app_password(
     Ok(secret)
 }
 
-/// Concurrent argon2 password verifications the worker allows in flight at once.
-/// Each argon2 costs ~19 MiB, so this bounds the memory a burst of `AUTHENTICATE`
-/// can pin while still decoupling auth latency from the worker's serial loop
-/// (an unbounded spawn would turn a latency issue into a memory DoS).
-const MAX_CONCURRENT_VERIFY: usize = 4;
-
 /// One worker loop; run as a task. Replies always reach the core (or
 /// the core is gone and the server is shutting down).
 pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Sender<Input>) {
     let mut log_batch: Vec<DbRequest> = Vec::new();
-    let verify_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VERIFY));
     while let Some(envelope) = rx.pop().await {
         let mut next = Some(envelope.payload);
         while let Some(request) = next.take() {
@@ -199,10 +214,12 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                 // Password verification is a pure read of the accounts/credential
                 // tables (never `messages`) with no ordering dependency on any
                 // other request, and its argon2 verify is ~tens of ms. Run it off
-                // the worker loop — bounded by `verify_sem` — so a burst of
-                // logins can't head-of-line-block CHATHISTORY reads and account
-                // lookups behind one serial argon2 at a time. No flush is needed
-                // (it reads no messages).
+                // the worker loop so a burst of logins can't head-of-line-block
+                // CHATHISTORY reads and account lookups behind one serial argon2 at
+                // a time. The argon2 memory bound lives at the choke point
+                // (`verify_credentials`, gated by `ARGON2_PERMITS`), so no
+                // per-caller semaphore is needed here. No flush is needed (it reads
+                // no messages).
                 DbRequest::VerifyPassword {
                     conn,
                     account,
@@ -211,12 +228,7 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                 } => {
                     let pool = pool.clone();
                     let core_tx = core_tx.clone();
-                    let sem = verify_sem.clone();
                     tokio::spawn(async move {
-                        let _permit = sem
-                            .acquire_owned()
-                            .await
-                            .expect("verify semaphore never closed");
                         let reply = handle_verify(&pool, &account, &password)
                             .await
                             .into_reply(origin);
@@ -225,11 +237,12 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                     });
                 }
                 // Account creation carries the same ~100ms argon2 hash as a
-                // verify; offload it under the same semaphore so a cheap one-line
-                // REGISTER can't monopolize the single worker for the full hash
-                // and stall every queued read/login behind it. It writes only the
-                // accounts table (never `messages`), so — like VerifyPassword —
-                // no log-batch flush is needed and there is no ordering hazard.
+                // verify; offload it (its `hash_password` is gated by the same
+                // `ARGON2_PERMITS` choke point) so a cheap one-line REGISTER can't
+                // monopolize the single worker for the full hash and stall every
+                // queued read/login behind it. It writes only the accounts table
+                // (never `messages`), so — like VerifyPassword — no log-batch flush
+                // is needed and there is no ordering hazard.
                 DbRequest::CreateAccount {
                     conn,
                     name,
@@ -238,12 +251,7 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                 } => {
                     let pool = pool.clone();
                     let core_tx = core_tx.clone();
-                    let sem = verify_sem.clone();
                     tokio::spawn(async move {
-                        let _permit = sem
-                            .acquire_owned()
-                            .await
-                            .expect("verify semaphore never closed");
                         let reply = handle_create_account(&pool, name, &password, origin).await;
                         let _ = core_tx.push(Input::DbReply { conn, reply }).await;
                     });
@@ -359,11 +367,11 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
 /// Handle one non-history request; false = core gone, stop the worker.
 async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbRequest) -> bool {
     match request {
-        // `run_worker` intercepts VerifyPassword and spawns it under the verify
-        // semaphore before ever reaching here (like LogMessage's batching). A
-        // duplicate inline path would silently lose that concurrency bound and
-        // the off-loop latency decoupling, so make the invariant load-bearing
-        // rather than shipping a second, unbounded copy of the logic.
+        // `run_worker` intercepts VerifyPassword and spawns it off the loop before
+        // ever reaching here (like LogMessage's batching). A duplicate inline path
+        // would silently lose the off-loop latency decoupling (the argon2 memory
+        // bound lives at the `ARGON2_PERMITS` choke point regardless), so make the
+        // invariant load-bearing rather than shipping a second copy of the logic.
         DbRequest::VerifyPassword { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::VerifyToken { conn, token } => {
             // A bearer token is only ever presented by SASL OAUTHBEARER.
@@ -379,9 +387,9 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             let reply = outcome.into_reply(origin);
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        // `run_worker` intercepts CreateAccount and spawns it under the verify
-        // semaphore (like VerifyPassword) so its argon2 hash never runs on the
-        // serial worker loop. A duplicate inline path would silently lose that.
+        // `run_worker` intercepts CreateAccount and spawns it off the loop (like
+        // VerifyPassword) so its argon2 hash never runs on the serial worker loop.
+        // A duplicate inline path would silently lose that off-loop decoupling.
         DbRequest::CreateAccount { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::RegisterChannel {
             conn,
@@ -1379,9 +1387,9 @@ impl VerifyOutcome {
 }
 
 /// Create an account (hashing its password with argon2) and build the
-/// origin-carrying reply. Runs off the serial worker loop (spawned under the
-/// verify semaphore in `run_worker`) so its ~100ms hash can't head-of-line-block
-/// CHATHISTORY reads and other logins — the same treatment `handle_verify` gets,
+/// origin-carrying reply. Runs off the serial worker loop (spawned by
+/// `run_worker`) so its ~100ms hash can't head-of-line-block CHATHISTORY reads
+/// and other logins — the same treatment `handle_verify` gets,
 /// closing the "an argon2 op runs on the serial worker" class for the write path
 /// too. A create writes only the accounts table (never `messages`), so it needs
 /// no log-batch flush and has no ordering dependency on buffered history.
@@ -1607,6 +1615,10 @@ pub async fn verify_credentials(
         // minor timing signal of "has app passwords", inherent to checking each
         // stored credential; it never reveals the password itself.)
         let password = password.to_string();
+        let _permit = ARGON2_PERMITS
+            .acquire()
+            .await
+            .expect("argon2 semaphore never closed");
         tokio::task::spawn_blocking(move || {
             let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
             // Always fails (the password never matches); we run it only to
@@ -1623,6 +1635,10 @@ pub async fn verify_credentials(
     // Returns the id of the credential that matched, if any — evaluated over
     // every credential so the reject time is uniform (the id is only recorded,
     // never short-circuited on).
+    let _permit = ARGON2_PERMITS
+        .acquire()
+        .await
+        .expect("argon2 semaphore never closed");
     let matched_id = tokio::task::spawn_blocking(move || {
         // Evaluate every credential (not a short-circuiting any()) so the reject
         // time doesn't reveal which credential matched or how early.
@@ -1701,13 +1717,28 @@ pub async fn create_bnc_network(
     net: &BncNetworkRow,
 ) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let account_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
-        .bind(&folded)
-        .fetch_optional(pool)
+    // Cap the count and insert in one transaction with the account row locked
+    // FOR UPDATE. A count-then-insert across two pool statements (which is what
+    // the REST handler used to do) lets two concurrent creates each read cap-1
+    // and both insert, overshooting the cap — and each network spawns an
+    // always-on outbound driver, the very amplifier this cap exists to bound.
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?
+            .ok_or(DbError::BadCredentials)?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bnc_networks WHERE account_id = $1")
+        .bind(account_id)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(DbError::Query)?
-        .ok_or(DbError::BadCredentials)?;
-    sqlx::query_scalar(
+        .map_err(DbError::Query)?;
+    if count >= MAX_BNC_NETWORKS_PER_ACCOUNT {
+        return Err(DbError::TooManyNetworks);
+    }
+    let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
             sasl_account, sasl_password_sealed)
@@ -1724,11 +1755,18 @@ pub async fn create_bnc_network(
     .bind(&net.autojoin)
     .bind(&net.sasl_account)
     .bind(&net.sasl_password_sealed)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?
-    .ok_or_else(|| DbError::DuplicateNetwork(net.name.clone()))
+    .ok_or_else(|| DbError::DuplicateNetwork(net.name.clone()))?;
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(id)
 }
+
+/// Most BNC networks one account may hold, matching the REST layer's
+/// `MAX_NETWORKS_PER_ACCOUNT`. Each network runs an always-on outbound driver,
+/// so this bounds an account's outbound-connection amplification.
+const MAX_BNC_NETWORKS_PER_ACCOUNT: i64 = 32;
 
 /// List the networks owned by `account`, ordered by name.
 pub async fn list_bnc_networks(
@@ -2349,8 +2387,42 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
 
 /// Mint a PAT for an account. `e6p_`-prefixed opaque token shown once;
 /// SHA-256 stored. No expiry until scoped tokens land.
+/// Most PATs one account may hold via the REST create endpoint, matching the
+/// REST layer's `MAX_CREDENTIALS_PER_ACCOUNT`. Bounds authenticated storage
+/// growth. (The device-grant login path mints through `insert_api_token`
+/// directly; each of those requires an interactive approval, so it is not a
+/// flood vector and is intentionally not gated here.)
+const MAX_API_TOKENS_PER_ACCOUNT: i64 = 32;
+
 pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Result<String, DbError> {
-    insert_api_token(pool, account, label).await
+    // Cap and insert in one transaction with the account row locked FOR UPDATE.
+    // A count-then-insert across two pool statements (which is what the REST
+    // handler used to do) lets two concurrent requests each read cap-1 and both
+    // insert, overshooting the cap — the same TOCTOU `issue_app_password` closes.
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+    let Some(account_id) = account_id else {
+        return Err(DbError::BadCredentials);
+    };
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE account_id = $1")
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+    if count >= MAX_API_TOKENS_PER_ACCOUNT {
+        return Err(DbError::TooManyCredentials);
+    }
+    // The account row is locked in this tx, so `insert_api_token`'s own
+    // name-folded lookup resolves the same row under the lock.
+    let token = insert_api_token(&mut *tx, account, label).await?;
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(token)
 }
 
 /// Mint a fresh PAT for `account` on the given executor and return the

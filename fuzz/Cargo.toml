@@ -28,6 +28,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "serialize_message"
+path = "fuzz_targets/serialize_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tag_escaping"
 path = "fuzz_targets/tag_escaping.rs"
 test = false

@@ -493,7 +493,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         );
         return;
     }
-    let Some(&target) = p.first() else {
+    let Some(&targets) = p.first() else {
         state.numeric(
             conn,
             ERR_NORECIPIENT,
@@ -503,14 +503,43 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
         return;
     };
     // Only client-only tags (`+` prefix) are relayed.
+    let client_tags = client_tag_string(msg);
+    // A comma-separated target list delivers to each recipient, deduped and
+    // bounded by TARGMAX — exactly as PRIVMSG/NOTICE do. TAGMSG previously took
+    // only the first target, so `TAGMSG #a,#b` failed with ERR_NOSUCHCHANNEL for
+    // the whole (unsplit) string while the identical PRIVMSG syntax worked.
+    let mut seen = std::collections::HashSet::new();
+    let mut delivered = 0usize;
+    for target in targets.split(',').filter(|t| !t.is_empty()) {
+        if !seen.insert(state.casemap.casefold(target)) {
+            continue;
+        }
+        if delivered >= TARGMAX {
+            state.numeric(
+                conn,
+                ERR_TOOMANYTARGETS,
+                &[target],
+                Some("Too many targets; message not delivered"),
+            );
+            break;
+        }
+        delivered += 1;
+        deliver_one_tagmsg(state, conn, target, &client_tags);
+    }
+}
+
+/// Relay a TAGMSG to a single already-split `target` (channel, STATUSMSG-prefixed
+/// channel, or nick). Mirrors `deliver_one_message`: an unknown/forbidden target
+/// answers its own error numeric and delivers nothing, so one bad target in a
+/// comma list does not stop the others.
+fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, client_tags: &str) {
     let prefix = state.sessions[&conn].prefix();
     let msgid = state.next_msgid();
-    let client_tags = client_tag_string(msg);
-    // The sender's account/bot state, captured once. TAGMSG carries `account`
-    // (for account-tag recipients) and `bot` (for a bot sender) exactly like
-    // PRIVMSG/NOTICE — the IRCv3 account-tag and bot-mode specs list TAGMSG
-    // among the messages that bear them, and identity/anti-spam tooling keying
-    // on these tags would otherwise silently lose typing/reaction attribution.
+    // The sender's account/bot state. TAGMSG carries `account` (for account-tag
+    // recipients) and `bot` (for a bot sender) exactly like PRIVMSG/NOTICE — the
+    // IRCv3 account-tag and bot-mode specs list TAGMSG among the messages that
+    // bear them, and identity/anti-spam tooling keying on these tags would
+    // otherwise silently lose typing/reaction attribution.
     let sender_account = state.sessions[&conn].account.clone();
     let sender_is_bot = state.sessions[&conn].bot;
     let make_line = |server_time: Option<String>, account_tag: bool| {
@@ -528,7 +557,7 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
             tags.push("bot".to_string());
         }
         if !client_tags.is_empty() {
-            tags.push(client_tags.clone());
+            tags.push(client_tags.to_string());
         }
         format!("@{} :{prefix} TAGMSG {target}", tags.join(";"))
     };

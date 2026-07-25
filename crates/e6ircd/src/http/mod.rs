@@ -120,11 +120,6 @@ impl AppState {
 /// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
 pub(super) const MAX_LABEL_LEN: usize = 64;
 
-/// Most app passwords **or** personal access tokens one account may hold. A cap
-/// like the network cap, so an authenticated account can't flood the credential
-/// tables. Does not gate the device-grant login path (a separate token mint).
-pub(super) const MAX_CREDENTIALS_PER_ACCOUNT: usize = 32;
-
 /// Validate a client-supplied credential label: bounded and free of control
 /// characters (which would corrupt the account UI / logs). Returns a ready 400
 /// response when invalid, or `None` when the label is acceptable.

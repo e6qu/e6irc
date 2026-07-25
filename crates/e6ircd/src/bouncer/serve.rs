@@ -20,10 +20,10 @@ use e6irc_proto::message::Message;
 /// The account is stored casefolded. Every caller happens to pass the stored
 /// `accounts.name` today, so raw strings would match — but a key that is only
 /// correct while every producer remembers to spell it the same way is the wrong
-/// kind of correct. A miss here does not error: `get` falls through to the
-/// shared network, so a mismatch would silently attach a client to the
-/// operator's network instead of its own. [`NetworkKey::new`] is the only way
-/// to build one, so that cannot drift.
+/// kind of correct. A miss on the owned key would let a client fall through to a
+/// shared network of the same name, so a casing mismatch would silently attach
+/// it to the operator's network instead of its own. [`NetworkKey::new`] is the
+/// only way to build one, so that cannot drift.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NetworkKey {
     owner: Option<String>,
@@ -214,14 +214,27 @@ impl Registry {
         }
     }
 
-    /// Resolve a network the authenticated `account` may attach to: its
-    /// own network of that name, else a shared (ownerless) one. A network
-    /// owned by a different account is not visible and returns `None`.
-    pub fn get(&self, account: &str, name: &str) -> Option<Arc<NetworkHandle>> {
-        let networks = self.networks.lock().expect("registry poisoned");
-        networks
+    /// The account's OWN active network of that name, if any. Deliberately does
+    /// NOT fall through to a shared network: a disabled owned network is removed
+    /// from the registry, so a blind fall-through would silently attach the
+    /// client to an operator's shared network of the same name (DESIGN §2). The
+    /// caller (`bnc_serve`) distinguishes "you own it but it's disabled" from
+    /// "you don't own one" via the database, then decides whether the shared
+    /// network is an acceptable target.
+    pub fn get_owned(&self, account: &str, name: &str) -> Option<Arc<NetworkHandle>> {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
             .get(&NetworkKey::new(Some(account), name))
-            .or_else(|| networks.get(&NetworkKey::new(None, name)))
+            .map(|slot| slot.handle.clone())
+    }
+
+    /// A shared (ownerless) network of that name, if any.
+    pub fn get_shared(&self, name: &str) -> Option<Arc<NetworkHandle>> {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
+            .get(&NetworkKey::new(None, name))
             .map(|slot| slot.handle.clone())
     }
 }
@@ -330,7 +343,27 @@ where
         Err(_) => return Ok(()), // handshake timed out
     };
 
-    let Some(handle) = registry.get(&account, &network) else {
+    // Resolve the target network without silently substituting one for another:
+    // the account's own active network wins; if it owns a network of that name
+    // that is *not* active (disabled), say so rather than falling through to a
+    // shared network of the same name; only a name the account does not own at
+    // all falls through to a shared (ownerless) network.
+    let handle = if let Some(handle) = registry.get_owned(&account, &network) {
+        handle
+    } else if matches!(
+        crate::db::get_bnc_network(pool, &account, &network).await,
+        Ok(Some(_))
+    ) {
+        let _ = write
+            .write_all(
+                format!(":{server_name} NOTICE * :Your network '{network}' is disabled.\r\n")
+                    .as_bytes(),
+            )
+            .await;
+        return Ok(());
+    } else if let Some(handle) = registry.get_shared(&network) {
+        handle
+    } else {
         let _ = write
             .write_all(
                 format!(":{server_name} NOTICE * :Unknown network '{network}'.\r\n").as_bytes(),

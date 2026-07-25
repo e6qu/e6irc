@@ -261,6 +261,46 @@ pub(crate) fn route_privmsg(
     out
 }
 
+/// Deliver one already-routed batch of PRIVMSG targets and surface the outcome
+/// of **each** one to the attached client. `route_privmsg` yields one
+/// `RouteResult` per comma-separated target; this consumes the whole list, so a
+/// mapped target that fails to send and an unmapped target both produce their
+/// own `*bnc*` NOTICE — a multi-target line can't have all-but-one target's
+/// non-delivery silently dropped. That fold-N-outcomes-into-one silent drop
+/// (DESIGN §2) is exactly what the Matrix bridge did before this was shared:
+/// every bridge now routes its per-target outcome through one definition that
+/// cannot collapse the list. `deliver` performs the platform's upstream send for
+/// a mapped `(id, text)` and returns `Ok(())` or an error string; it does its
+/// session-touching work synchronously and moves owned data into the returned
+/// future, so no borrow of the caller's session outlives a single send.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) async fn relay_routed<F, Fut>(
+    ends: &DriverEnds,
+    routed: Vec<RouteResult>,
+    platform: &str,
+    kind: &str,
+    mut deliver: F,
+) where
+    F: FnMut(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    for routed in routed {
+        match routed {
+            RouteResult::Deliver(id, text) => {
+                if let Err(e) = deliver(id.clone(), text).await {
+                    eprintln!("{platform}: send to {id} failed: {e}");
+                    // A delivery failure is not a silent drop (DESIGN §2).
+                    ends.emit_line(undelivered_notice(platform, kind, &id));
+                }
+            }
+            RouteResult::Unmapped(target) => {
+                ends.emit_line(unmapped_target_notice(platform, kind, &target));
+            }
+            RouteResult::Ignore => {}
+        }
+    }
+}
+
 /// Largest HTTP response body a bridge will read from an upstream before
 /// parsing it as JSON.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
@@ -954,6 +994,54 @@ mod tests {
             .expect("driver did not stop on shutdown")
             .expect("driver task panicked");
         drop(held);
+    }
+
+    /// A multi-target line surfaces EVERY target's outcome, not just the last.
+    /// This is the fold-into-one silent drop the Matrix bridge had before
+    /// `relay_routed` was shared: `#a` delivers, `#b`'s upstream send fails, `#c`
+    /// is unmapped — the client must see both problems, once each.
+    #[tokio::test]
+    #[cfg(any(feature = "discord", feature = "matrix", feature = "slack"))]
+    async fn relay_routed_surfaces_every_target_outcome() {
+        let (handle, ends) = NetworkHandle::channels(64);
+        let mut map = std::collections::HashMap::new();
+        map.insert("#a".to_string(), "id_a".to_string());
+        map.insert("#b".to_string(), "id_b".to_string());
+        // #c is deliberately absent from the map (unmapped).
+        let routed = route_privmsg("PRIVMSG #a,#b,#c :hi", &map);
+        relay_routed(&ends, routed, "Test", "channel", |id, _text| {
+            let failed = id == "id_b"; // #b's upstream send fails; #a succeeds.
+            async move {
+                if failed {
+                    Err("boom".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        let lines = handle.buffer_snapshot();
+        assert!(
+            !lines.iter().any(|l| l.contains("id_a")),
+            "a delivered target gets no notice: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("not delivered") && l.contains("id_b")),
+            "the failed send is surfaced: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("no bridged") && l.contains("#c")),
+            "the unmapped target is surfaced: {lines:#?}"
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "exactly one notice per problem target — earlier problems not dropped: {lines:#?}"
+        );
     }
 
     #[test]

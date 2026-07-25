@@ -280,30 +280,17 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 }
             }
             cmd = ends.next_command() => match cmd {
-                // One line may resolve to several targets (a comma list).
+                // One line may resolve to several targets (a comma list); each
+                // target's outcome is surfaced independently by `relay_routed`.
                 Some(line) => {
-                    for routed in super::route_privmsg(&line, &channel_to_id) {
-                        match routed {
-                            super::RouteResult::Deliver(id, text) => {
-                                if let Err(e) =
-                                    send_message(&http, &base, &config.token, &id, &text).await
-                                {
-                                    eprintln!("discord: send to {id} failed: {e}");
-                                    // Surface the loss to the client, like the unmapped
-                                    // path — a delivery failure isn't a silent drop.
-                                    ends.emit_line(super::undelivered_notice(
-                                        "Discord", "channel", &id,
-                                    ));
-                                }
-                            }
-                            super::RouteResult::Unmapped(target) => {
-                                ends.emit_line(super::unmapped_target_notice(
-                                    "Discord", "channel", &target,
-                                ));
-                            }
-                            super::RouteResult::Ignore => {}
-                        }
-                    }
+                    let routed = super::route_privmsg(&line, &channel_to_id);
+                    super::relay_routed(ends, routed, "Discord", "channel", |id, text| {
+                        let http = http.clone();
+                        let base = base.clone();
+                        let token = config.token.clone();
+                        async move { send_message(&http, &base, &token, &id, &text).await }
+                    })
+                    .await;
                 }
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },

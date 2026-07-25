@@ -344,9 +344,14 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
     }
 }
 
-/// Apply a `+ov`/`-o`-style change string to a current flag set, keeping
-/// only the recognised flags (`o` auto-op, `v` auto-voice), sorted.
-pub(super) fn apply_flag_changes(current: &str, changes: &str) -> String {
+/// Apply a `+ov`/`-o`-style change string to a current flag set, keeping only
+/// the recognised flags (`o` auto-op, `v` auto-voice), sorted. Returns the first
+/// unrecognised flag character as `Err` so the caller can reject the whole change
+/// loudly: silently dropping an unknown flag (the previous behaviour) turned
+/// `FLAGS #c bob +q` into an empty set — a *revoke* the caller never asked for,
+/// reported back as success. Every other ChanServ token parser errors on an
+/// unknown token; this is that same contract (DESIGN §2, no silent no-ops).
+pub(super) fn apply_flag_changes(current: &str, changes: &str) -> Result<String, char> {
     let mut flags: std::collections::BTreeSet<char> =
         current.chars().filter(|c| matches!(c, 'o' | 'v')).collect();
     let mut adding = true;
@@ -361,10 +366,10 @@ pub(super) fn apply_flag_changes(current: &str, changes: &str) -> String {
                     flags.remove(&c);
                 }
             }
-            _ => {}
+            other => return Err(other),
         }
     }
-    flags.into_iter().collect()
+    Ok(flags.into_iter().collect())
 }
 
 /// ChanServ FLAGS: list a registered channel's access entries, or (founder
@@ -465,7 +470,17 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
         .and_then(|m| m.get(&target_key))
         .cloned()
         .unwrap_or_default();
-    let new_flags = apply_flag_changes(&current, changes);
+    let new_flags = match apply_flag_changes(&current, changes) {
+        Ok(flags) => flags,
+        Err(bad) => {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!("Unknown flag \x02{bad}\x02. Valid flags: o (auto-op), v (auto-voice)."),
+            );
+            return;
+        }
+    };
 
     // Persist first; the hot map and the confirmation are applied on the
     // `ChannelAccessSet` reply, so a grant to an *unregistered* account (which

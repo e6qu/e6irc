@@ -177,7 +177,9 @@ pub(super) async fn ws_ui(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let Some(handle) = registry.get(&account, &params.network) else {
+    // The UI only lists the account's own networks, so resolve the owned network
+    // directly — never fall through to a shared network of the same name.
+    let Some(handle) = registry.get_owned(&account, &params.network) else {
         return problem(StatusCode::NOT_FOUND, "No such network", None);
     };
     ws.max_message_size(MAX_WS_FRAME)

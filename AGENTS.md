@@ -125,6 +125,51 @@ memory.
 
 ---
 
+## The One-PR Rule — HARD RULE
+
+> **There is at most ONE open pull request at any time. Never open a second.
+> Every fix — however unrelated — goes into the single open PR's branch.**
+
+Two PRs for the same body of work fork it into diverging branches that then
+fight to merge: conflicts, rebases, and churn spent re-integrating code that
+should never have been split. That cost is real and it has already happened
+here (a fix landed on a fresh branch off `main` while related work sat on
+another open PR).
+
+### What this obligates you to do
+
+- **Before starting any work, find the open PR.** `gh pr list --state open`.
+  If one exists, check out its branch and add your commits there. Do not
+  branch from `main` for a "clean" separate change — that is how a second PR
+  is born.
+- **One branch, one PR, everything on it.** The Boy-Scout and No-Deferral
+  rules mean a sweep fixes many things at once; all of them land on the same
+  branch as the one open PR. "This fix is unrelated, so it deserves its own
+  PR" is the rationalization this rule exists to kill — unrelated fixes still
+  share the one PR.
+- **Only open a PR when there is none open.** If `gh pr list` shows zero open
+  PRs, open exactly one and keep using it. If it shows one, you already have
+  your PR — push to it, never create another.
+
+### What it does NOT mean
+
+- It does not mean ask permission. If there is **no** open PR, just open the
+  one — do not stop to ask "is it OK to create a PR?"; that wastes a turn.
+  The only forbidden act is opening a *second* PR while one is open.
+- It does not mean cram a genuinely separate long-lived effort into an
+  unrelated PR forever. If work truly cannot share the open PR (a different
+  release train, a reverting change), that is a decision to put *to the
+  human* — never a licence to unilaterally open PR number two.
+
+### Why it's stated so strongly here
+
+Because the default instinct — "start clean, branch from `main`, open a tidy
+focused PR" — directly manufactures the second PR. When the standing task is
+"fix everything on the one open PR," a new branch off `main` is already the
+mistake, before a single line changes.
+
+---
+
 ## Practical checklist before you stop
 
 - [ ] Builds green (default **and** every feature: `embed-web`, `matrix`).
@@ -149,3 +194,6 @@ memory.
       human as an explicit decision — never filed away for later.
 - [ ] `DESIGN.md` / `PLAN.md` updated in the same change when behavior or
       status changed.
+- [ ] Exactly one open PR (see the One-PR Rule above): `gh pr list --state
+      open` shows ≤ 1, and this work is committed on that PR's branch — never a
+      second branch off `main`.

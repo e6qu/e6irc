@@ -233,28 +233,16 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             cmd = ends.next_command() => match cmd {
                 // One line may resolve to several targets (a comma list).
                 Some(line) => {
-                    for routed in super::route_privmsg(&line, &channel_to_id) {
-                        match routed {
-                            super::RouteResult::Deliver(id, text) => {
-                                if let Err(e) =
-                                    post_message(&http, &base, &config.bot_token, &id, &text).await
-                                {
-                                    eprintln!("slack: chat.postMessage to {id} failed: {e}");
-                                    // Surface the loss to the client, like the unmapped
-                                    // path — a delivery failure isn't a silent drop.
-                                    ends.emit_line(super::undelivered_notice(
-                                        "Slack", "channel", &id,
-                                    ));
-                                }
-                            }
-                            super::RouteResult::Unmapped(target) => {
-                                ends.emit_line(super::unmapped_target_notice(
-                                    "Slack", "channel", &target,
-                                ));
-                            }
-                            super::RouteResult::Ignore => {}
-                        }
-                    }
+                    // One line may resolve to several targets (a comma list); each
+                    // target's outcome is surfaced independently by `relay_routed`.
+                    let routed = super::route_privmsg(&line, &channel_to_id);
+                    super::relay_routed(ends, routed, "Slack", "channel", |id, text| {
+                        let http = http.clone();
+                        let base = base.clone();
+                        let bot_token = config.bot_token.clone();
+                        async move { post_message(&http, &base, &bot_token, &id, &text).await }
+                    })
+                    .await;
                 }
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },

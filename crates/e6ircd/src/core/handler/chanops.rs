@@ -5,7 +5,7 @@ use super::*;
 // ---- KICK / INVITE / AWAY / LIST / USERHOST -----------------------------
 
 pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let (Some(&target), Some(&who)) = (p.first(), p.get(1)) else {
+    let (Some(&target), Some(&users)) = (p.first(), p.get(1)) else {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
@@ -43,22 +43,75 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    let prefix = state.sessions[&conn].prefix();
+    let kicker_nick = state.sessions[&conn].nick.clone().expect("registered");
+    let reason = p.get(2).copied();
+    // Modern IRC KICK is one channel with a comma-separated *user* list; each
+    // user is removed and the removal broadcast independently, deduped and
+    // bounded by TARGMAX — like PRIVMSG's target list. Previously only the first
+    // user was kicked and the rest silently ignored.
+    let mut seen = std::collections::HashSet::new();
+    let mut kicked = 0usize;
+    for who in users.split(',').filter(|u| !u.is_empty()) {
+        if !seen.insert(state.casemap.casefold(who)) {
+            continue;
+        }
+        // The channel is gone once the last member is kicked; nothing left to do.
+        if !state.channels.contains_key(&key) {
+            break;
+        }
+        if kicked >= TARGMAX {
+            state.numeric(
+                conn,
+                ERR_TOOMANYTARGETS,
+                &[who],
+                Some("Too many targets; not kicked"),
+            );
+            break;
+        }
+        kicked += 1;
+        kick_one_user(
+            state,
+            conn,
+            &key,
+            &display,
+            &prefix,
+            &kicker_nick,
+            who,
+            reason,
+        );
+    }
+}
+
+/// Remove one already-split `who` from channel `key` (the caller has verified the
+/// kicker is an opped member). An unknown user or one not on the channel answers
+/// ERR_USERNOTINCHANNEL and removes no one, so one bad name in a comma list does
+/// not stop the others.
+#[allow(clippy::too_many_arguments)]
+fn kick_one_user(
+    state: &mut ServerState,
+    conn: ConnId,
+    key: &crate::core::state::ChanKey,
+    display: &str,
+    prefix: &str,
+    kicker_nick: &str,
+    who: &str,
+    reason: Option<&str>,
+) {
     let who_key = state.nick_key(who);
     let victim = state.nicks.get(&who_key).copied();
-    let victim_on = victim.is_some_and(|v| state.channels[&key].members.contains_key(&v));
+    let victim_on = victim.is_some_and(|v| state.channels[key].members.contains_key(&v));
     let Some(victim) = victim.filter(|_| victim_on) else {
         state.numeric(
             conn,
             ERR_USERNOTINCHANNEL,
-            &[who, &display],
+            &[who, display],
             Some("They aren't on that channel"),
         );
         return;
     };
     let victim_nick = state.sessions[&victim].nick.clone().expect("registered");
-    let prefix = state.sessions[&conn].prefix();
-    let kicker_nick = state.sessions[&conn].nick.clone().expect("registered");
-    let line = match p.get(2) {
+    let line = match reason {
         Some(reason) => {
             // KICKLEN bounds the reason itself; the relayed line also carries
             // the kicker's prefix, so fit against the actual head too.
@@ -68,19 +121,19 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         None => format!(":{prefix} KICK {display} {victim_nick} :{kicker_nick}"),
     };
-    state.broadcast_channel(&key, &line, None);
-    let chan = state.channels.get_mut(&key).expect("checked");
+    state.broadcast_channel(key, &line, None);
+    let chan = state.channels.get_mut(key).expect("checked");
     chan.members.remove(&victim);
     let empty = chan.members.is_empty();
     if empty {
-        state.remove_channel(&key);
+        state.remove_channel(key);
     }
     state
         .sessions
         .get_mut(&victim)
         .expect("member")
         .channels
-        .remove(&key);
+        .remove(key);
 }
 
 pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {

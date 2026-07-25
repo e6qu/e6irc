@@ -92,49 +92,37 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
 
     loop {
         tokio::select! {
-                   result = sync(&session, Some(&since)) => match result {
-                       Ok((next, messages)) => {
-                           since = next;
-                           for m in messages {
-                               // Skip our own echoes (the attached client already
-                               // saw what it sent).
-                               if m.sender == session.user_id {
-                                   continue;
-                               }
-                               if let Some(channel) = session.room_to_channel.get(&m.room_id) {
-                                   for line in super::render_bridged_privmsg(
-                                       "matrix",
-                                       matrix_localpart(&m.sender),
-                                       channel,
-                                       &m.body,
-                                   ) {
-                                       ends.emit_line(line);
-                                   }
-                               }
-                           }
-                       }
-                       Err(e) => {
-                           eprintln!("matrix: sync error: {e}");
-                           return super::SessionOutcome::Dropped;
-                       }
-                   },
-                   cmd = ends.next_command() => match cmd {
-                       Some(line) => match handle_command(&mut session, &line).await {
-                           Relayed::Ok => {}
-                           Relayed::Unmapped(target) => ends.emit_line(super::unmapped_target_notice(
-            "Matrix", "room", &target,
-        )),
-                           Relayed::Failed(room) => {
-                               // `room` is a homeserver-supplied id, unbounded
-                               // here; truncate so this failure notice can't
-                               // itself be discarded for length — which would
-                               // resurrect the silent-drop it exists to prevent.
-                               ends.emit_line(super::undelivered_notice("Matrix", "room", &room))
-                           }
-                       },
-                       None => return super::SessionOutcome::Stopped, // every handle dropped
-                   },
-               }
+            result = sync(&session, Some(&since)) => match result {
+                Ok((next, messages)) => {
+                    since = next;
+                    for m in messages {
+                        // Skip our own echoes (the attached client already
+                        // saw what it sent).
+                        if m.sender == session.user_id {
+                            continue;
+                        }
+                        if let Some(channel) = session.room_to_channel.get(&m.room_id) {
+                            for line in super::render_bridged_privmsg(
+                                "matrix",
+                                matrix_localpart(&m.sender),
+                                channel,
+                                &m.body,
+                            ) {
+                                ends.emit_line(line);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("matrix: sync error: {e}");
+                    return super::SessionOutcome::Dropped;
+                }
+            },
+            cmd = ends.next_command() => match cmd {
+                Some(line) => handle_command(&mut session, ends, &line).await,
+                None => return super::SessionOutcome::Stopped, // every handle dropped
+            },
+        }
     }
 }
 
@@ -290,29 +278,16 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
 
 /// Deliver a downstream PRIVMSG to Matrix. Returns `Some(target)` when a
 /// PRIVMSG could not be delivered because no bridged room maps to it, so the
-/// caller can surface the loss rather than dropping it silently.
-/// Outcome of relaying a downstream command to Matrix, so the caller can
-/// surface a loss (unmapped target or a failed upstream send) instead of
-/// dropping it silently.
-enum Relayed {
-    Ok,
-    Unmapped(String),
-    Failed(String),
-}
-
-async fn handle_command(s: &mut Session, line: &str) -> Relayed {
-    // One line may resolve to several targets (a comma list); deliver each and
-    // report the last problem, if any.
-    let mut outcome = Relayed::Ok;
-    for routed in super::route_privmsg(line, &s.channel_to_room) {
-        let (room_id, text) = match routed {
-            super::RouteResult::Deliver(room_id, text) => (room_id, text),
-            super::RouteResult::Unmapped(target) => {
-                outcome = Relayed::Unmapped(target);
-                continue;
-            }
-            super::RouteResult::Ignore => continue,
-        };
+/// Relay one downstream command line to Matrix. A comma list resolves to several
+/// targets; each is delivered and its outcome surfaced independently through the
+/// shared [`super::relay_routed`], so an unmapped target or a failed send is
+/// never dropped — not even when it is one of several on the line.
+async fn handle_command(s: &mut Session, ends: &super::DriverEnds, line: &str) {
+    let routed = super::route_privmsg(line, &s.channel_to_room);
+    super::relay_routed(ends, routed, "Matrix", "room", |room_id, text| {
+        // Build the request synchronously (touching `s.txn`/`s.http`); only the
+        // owned request moves into the returned future, so nothing borrows `s`
+        // across the await.
         s.txn += 1;
         let txn = s.txn;
         let url = format!(
@@ -325,15 +300,11 @@ async fn handle_command(s: &mut Session, line: &str) -> Relayed {
             .put(url)
             .bearer_auth(&s.token)
             .json(&serde_json::json!({ "msgtype": "m.text", "body": text }));
-        // Route through the checked send: a 403 (bot no longer in the room), 429,
-        // or 5xx comes back as `Err`, not a delivered-looking `Ok(Response)`, so
-        // the message is reported undelivered instead of silently dropped.
-        if let Err(e) = super::bridge_send(req).await {
-            eprintln!("matrix: send to room {room_id} failed: {e}");
-            outcome = Relayed::Failed(room_id);
-        }
-    }
-    outcome
+        // The checked send: a 403 (bot no longer in the room), 429, or 5xx comes
+        // back as `Err`, not a delivered-looking `Ok(Response)`.
+        async move { super::bridge_send(req).await.map(|_| ()) }
+    })
+    .await;
 }
 
 /// `#name:server` → IRC channel `#name`.

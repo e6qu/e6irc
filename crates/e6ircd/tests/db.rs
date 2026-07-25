@@ -774,6 +774,63 @@ async fn app_passwords_are_capped_per_account() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn api_tokens_are_capped_per_account() {
+    let url = support::test_db("api_tokens_are_capped_per_account").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "tcap", "pw")
+        .await
+        .expect("create");
+    // Mint the maximum (32) through the capped REST path; each succeeds.
+    for i in 0..32 {
+        db::issue_api_token(&pool, "tcap", &format!("cli{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("token {i} should succeed: {e}"));
+    }
+    // The 33rd is refused with the dedicated error — the cap is enforced
+    // atomically in the DB layer, not by a racy list-then-insert in the handler.
+    let over = db::issue_api_token(&pool, "tcap", "one too many").await;
+    assert!(
+        matches!(over, Err(db::DbError::TooManyCredentials)),
+        "the 33rd PAT must be refused: {over:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_networks_are_capped_per_account() {
+    let url = support::test_db("bnc_networks_are_capped_per_account").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "ncap", "pw")
+        .await
+        .expect("create");
+    let row = |i: usize| db::BncNetworkRow {
+        name: format!("net{i}"),
+        addr: "irc.example:6697".into(),
+        tls: true,
+        nick: "ncap".into(),
+        realname: None,
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        enabled: true,
+    };
+    // Mint the maximum (32); each succeeds.
+    for i in 0..32 {
+        db::create_bnc_network(&pool, "ncap", &row(i))
+            .await
+            .unwrap_or_else(|e| panic!("network {i} should succeed: {e}"));
+    }
+    // The 33rd is refused with the dedicated error, enforced atomically — each
+    // network spawns an always-on driver, so an overshoot is real amplification.
+    let over = db::create_bnc_network(&pool, "ncap", &row(99)).await;
+    assert!(
+        matches!(over, Err(db::DbError::TooManyNetworks)),
+        "the 33rd network must be refused: {over:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn read_marker_persists() {
     let url = support::test_db("read_marker_persists").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
