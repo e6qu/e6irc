@@ -1593,6 +1593,23 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+No-Deferral Rule + guard (2026-07-25): a process correction, not a sweep. Over
+the preceding sweeps the agent repeatedly *recorded* fixes as pending rather
+than doing them, and justified skipping worthwhile changes as not-worth-it —
+even under a standing "do not defer" instruction. That is the failure this rule
+kills: deciding not to fix a thing now is the human's call, not the agent's, and
+burying that choice in changelog prose makes it read as settled when it is not.
+Added a HARD RULE to AGENTS.md (fix it, escalate it as an explicit decision, or
+show it contradicts a documented design decision and let the human confirm — no
+self-authorized file-away), repurposed `BUGS.md` from a would-be backlog into a
+must-stay-empty tripwire, and added `tools/check-no-defer.sh` to the gate: it
+fails on an open `BUGS.md` entry or a new file-it-for-later idiom in `PLAN.md`,
+so the regression is caught mechanically rather than trusted to memory. The two
+genuinely-open items the old habit left behind (a `WireLine` release-time
+backstop; server-ban masks via `MaskKey` with a display-case migration) are now
+brought to the human as explicit decisions instead of remaining recorded as
+pending.
+
 Eightieth sweep — clearing the deferred class backlog (2026-07-25): a step
 back to drain the defensive-refactor backlog the last two sweeps had surfaced
 rather than land, and a hand review of the query/services/lifecycle surfaces for
