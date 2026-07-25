@@ -14,6 +14,49 @@ use tokio::net::TcpStream;
 type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
+/// Server-supplied text with every terminal control byte neutralized — the only
+/// form untrusted text may take once it reaches the user's terminal.
+///
+/// The wire parser rejects only CR/LF/NUL, so every other control byte (the rest
+/// of C0, DEL, and C1 — which includes the one-byte CSI `0x9B`) arrives verbatim
+/// and could retitle the window, clear the screen, or spoof output. This newtype
+/// is constructible only via [`TerminalSafe::from_untrusted`], which replaces
+/// each control character with a visible `U+FFFD`; a field or display path typed
+/// as `TerminalSafe` therefore cannot hold raw server text with a live escape
+/// sequence. Shared by the CLI and the TUI so the sanitizer has one definition
+/// rather than a per-crate copy (the TUI previously leaned on ratatui's internal
+/// control-char filter — an upstream implementation detail, not a project
+/// guarantee).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalSafe(String);
+
+impl TerminalSafe {
+    /// Neutralize control bytes in untrusted (server-supplied) text.
+    pub fn from_untrusted(s: &str) -> Self {
+        Self(
+            s.chars()
+                .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                .collect(),
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TerminalSafe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<&str> for TerminalSafe {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// One connection to an IRC server (plaintext or TLS).
 pub struct Connection {
     reader: BoxRead,
@@ -460,6 +503,22 @@ pub fn webpki_root_store() -> rustls::RootCertStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_safe_neutralizes_control_bytes() {
+        // ESC (C0), the one-byte CSI (C1, 0x9B), DEL, and a bare BEL all become
+        // U+FFFD; ordinary text and non-ASCII pass through untouched.
+        let s = TerminalSafe::from_untrusted("a\x1b[2Jb\u{9b}c\x7f\x07d\u{00e9}");
+        assert_eq!(
+            s.as_str(),
+            "a\u{fffd}[2Jb\u{fffd}c\u{fffd}\u{fffd}d\u{00e9}"
+        );
+        assert!(!s.as_str().chars().any(|c| c.is_control()));
+        assert_eq!(
+            TerminalSafe::from_untrusted("plain #chan").as_str(),
+            "plain #chan"
+        );
+    }
 
     #[test]
     fn owned_message_flattens_source_and_tags() {

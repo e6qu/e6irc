@@ -6,13 +6,28 @@
 //! network multiplexing is the BNC's job server-side — a client attaches
 //! to one network and opens buffers within it.
 
-use e6irc_client::OwnedMessage;
+use e6irc_client::{OwnedMessage, TerminalSafe};
 
-/// One rendered line in a buffer's scrollback.
+/// One rendered line in a buffer's scrollback. Both fields are
+/// [`TerminalSafe`], so a line can only ever hold server text with its terminal
+/// control bytes already neutralized — a render path cannot be handed a raw
+/// escape sequence, and the client's terminal safety is a project guarantee
+/// rather than a reliance on the TUI framework's internal filtering. Build one
+/// only via [`LogLine::new`], which sanitizes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
-    pub from: String,
-    pub text: String,
+    pub from: TerminalSafe,
+    pub text: TerminalSafe,
+}
+
+impl LogLine {
+    /// Neutralize control bytes in the (untrusted) sender and text.
+    fn new(from: &str, text: &str) -> Self {
+        Self {
+            from: TerminalSafe::from_untrusted(from),
+            text: TerminalSafe::from_untrusted(text),
+        }
+    }
 }
 
 /// One conversation: a channel or a query (PM) with its own scrollback.
@@ -187,7 +202,7 @@ impl App {
                     self.note_buffer_limit();
                     return;
                 };
-                self.buffers[idx].push(LogLine { from: sender, text });
+                self.buffers[idx].push(LogLine::new(&sender, &text));
             }
             "JOIN" => {
                 if let Some(chan) = msg.params.first().cloned() {
@@ -195,20 +210,14 @@ impl App {
                         self.note_buffer_limit();
                         return;
                     };
-                    self.buffers[idx].push(LogLine {
-                        from: "*".into(),
-                        text: format!("{sender} joined"),
-                    });
+                    self.buffers[idx].push(LogLine::new("*", &format!("{sender} joined")));
                 }
             }
             "PART" => {
                 if let Some(chan) = msg.params.first()
                     && let Some(idx) = self.buffer_index(chan)
                 {
-                    self.buffers[idx].push(LogLine {
-                        from: "*".into(),
-                        text: format!("{sender} left"),
-                    });
+                    self.buffers[idx].push(LogLine::new("*", &format!("{sender} left")));
                 }
             }
             "QUIT" => {
@@ -219,10 +228,7 @@ impl App {
                 // would attribute an event to a conversation it never touched.
                 for b in &mut self.buffers {
                     if b.name.starts_with('#') || b.name.starts_with('&') || b.name == sender {
-                        b.push(LogLine {
-                            from: "*".into(),
-                            text: format!("{sender} quit"),
-                        });
+                        b.push(LogLine::new("*", &format!("{sender} quit")));
                     }
                 }
             }
@@ -245,10 +251,7 @@ impl App {
 
     /// Note a local status line in the current buffer.
     pub fn status(&mut self, text: impl Into<String>) {
-        self.current_mut().push(LogLine {
-            from: "*".into(),
-            text: text.into(),
-        });
+        self.current_mut().push(LogLine::new("*", &text.into()));
     }
 
     pub fn on_char(&mut self, c: char) {
@@ -295,10 +298,7 @@ impl App {
         }
         let target = self.current().name.clone();
         let from = self.nick.clone();
-        self.current_mut().push(LogLine {
-            from,
-            text: line.clone(),
-        });
+        self.current_mut().push(LogLine::new(&from, &line));
         Action::Send(format!("PRIVMSG {target} :{line}"))
     }
 }
@@ -323,8 +323,22 @@ mod tests {
         assert_eq!(buf.log.len(), SCROLLBACK_LINES);
         // The oldest lines went, not the newest: a scrollback that dropped the
         // live tail would be worse than one that grew.
-        assert!(buf.log.last().expect("a line").text.ends_with("line 5499"));
-        assert!(buf.log.first().expect("a line").text.ends_with("line 500"));
+        assert!(
+            buf.log
+                .last()
+                .expect("a line")
+                .text
+                .as_str()
+                .ends_with("line 5499")
+        );
+        assert!(
+            buf.log
+                .first()
+                .expect("a line")
+                .text
+                .as_str()
+                .ends_with("line 500")
+        );
     }
 
     #[test]
@@ -342,14 +356,18 @@ mod tests {
         let before: Vec<String> = app.buffers[idx]
             .visible(5)
             .iter()
-            .map(|l| l.text.clone())
+            .map(|l| l.text.as_str().to_string())
             .collect();
         // Now push past the cap, so every new line drains one from the front.
         for i in 0..50 {
             app.on_message(&msg(&format!(":a!u@h PRIVMSG #c :more {i}")));
         }
         let buf = &app.buffers[idx];
-        let after: Vec<String> = buf.visible(5).iter().map(|l| l.text.clone()).collect();
+        let after: Vec<String> = buf
+            .visible(5)
+            .iter()
+            .map(|l| l.text.as_str().to_string())
+            .collect();
         // The user is looking at the same lines. Without the `scroll` fixup the
         // drain would slide the viewport forward by one line per arrival.
         assert_eq!(before, after);
@@ -371,7 +389,7 @@ mod tests {
         let said = app.buffers[0]
             .log
             .iter()
-            .filter(|l| l.text.contains("not opening more than"))
+            .filter(|l| l.text.as_str().contains("not opening more than"))
             .count();
         assert_eq!(said, 1, "the limit is reported exactly once");
     }
@@ -385,7 +403,7 @@ mod tests {
         assert_eq!(app.buffers[0].log[0].text, "hello");
         assert_eq!(
             app.buffer_index("#other")
-                .map(|i| app.buffers[i].log[0].text.clone()),
+                .map(|i| app.buffers[i].log[0].text.as_str().to_string()),
             Some("elsewhere".into())
         );
     }

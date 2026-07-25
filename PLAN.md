@@ -1593,6 +1593,54 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eightieth sweep — clearing the deferred class backlog (2026-07-25): a step
+back to drain the defensive-refactor backlog the last two sweeps had surfaced
+rather than land, and a hand review of the query/services/lifecycle surfaces for
+new bugs. The mature codebase yielded no new *live* bug in the areas re-read
+(MONITOR + its close-cleanup, read-marker, WHOIS secret-channel + wire-length,
+SETNAME, WHOWAS were all confirmed correct — not manufactured into findings), so
+this sweep's work is the two class refactors that were genuinely worth doing.
+
+**`TerminalSafe` — the client terminal-safety class made a project invariant**
+(e6irc-client, e6irc-cli, e6irc-tui). Untrusted server text can embed terminal
+control bytes (C0/C1/DEL/CSI — the wire parser rejects only CR/LF/NUL), which
+retitle the window or spoof output. The CLI already sanitized at each display
+site via a local `terminal_safe`; the TUI sanitized *nowhere* — it was safe only
+because ratatui's renderer happens to strip control chars internally, an upstream
+implementation detail, not a guarantee this project owns. Introduced a
+`TerminalSafe` newtype in the shared client lib whose sole constructor
+neutralizes control bytes; the TUI's `LogLine.from`/`.text` are now typed
+`TerminalSafe` (so a line *cannot* hold a raw escape sequence and a render path
+can't be handed one), buffer-name display is sanitized at the boundary, and the
+CLI reuses the same one sanitizer. The class — "untrusted text reaches the
+terminal unsanitized" — is closed by type in the TUI and by one shared definition
+across both crates.
+
+**The `MonoMillis(0)` sentinel removed from session init** (core/state.rs). A
+session's `last_active`/`last_ping_sent` were initialized to `MonoMillis(0)` —
+the same zero-vs-real-reading ambiguity that flood-killed fresh clients last
+sweep (the mono epoch *is* process start, so `now − 0 = uptime`). They are
+harmless today (re-stamped before they gate anything), but seeding them from the
+open time — as the flood watermark now is — removes the sentinel entirely, so the
+class can't recur on a future watermark field. The ceremony-free form of the
+`Option<MonoMillis>` idea, without threading an Option through the reaper.
+
+**Surfaced, not done — and now with a firmer reason.** The third deferred item, a
+`WireLine` newtype to give the outbound line-injection invariant a *release*-time
+backstop, is deliberately not taken: the wire-length/CR-LF/NUL check is a
+`#[cfg(debug_assertions)]` assertion at the one send funnel, and DESIGN §7.1
+documents that as a *chosen* trade-off (one worker serves every client, so a
+production panic there would be worse than the malformed line it flags). The
+invariant is machine-checked at that funnel by every test and fuzz run; a full
+`WireLine` would be a hundreds-of-call-site rewrite of `send(&str)` for a class
+with no live bug and no failing test. Recorded as a considered non-change, not a
+lingering to-do.
+
+Full gate green: workspace tests, clippy (default + `embed-web` + bridges), fmt,
+the four guard scripts, `cargo deny`, the fuzz build, the PG-backed `db` suite
+(41), `http`, `oidc`, irctest main (380) and the persistence-backed services
+list (49).
+
 Seventy-ninth sweep — five-front hunt: an SSRF bypass, a flood-kill of fresh
 clients, an argon2 head-of-line stall (2026-07-25): four parallel hunts
 (proto parse/serialize, connection lifecycle/timers, adversarial security, the

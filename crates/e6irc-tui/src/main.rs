@@ -162,8 +162,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .iter()
         .map(|l| Line::from(format!("<{}> {}", l.from, l.text)))
         .collect();
-    // Title shows the buffer and its position; flags scrollback.
-    let mut title = format!("{} ({}/{})", buf.name, app.current + 1, app.buffers.len());
+    // Title shows the buffer and its position; flags scrollback. The buffer
+    // name is a server-supplied channel/nick, so neutralize its control bytes
+    // for display (the name stays raw in the model for identity/lookup).
+    let mut title = format!(
+        "{} ({}/{})",
+        e6irc_client::TerminalSafe::from_untrusted(&buf.name),
+        app.current + 1,
+        app.buffers.len()
+    );
     if buf.scrolled_back() {
         title.push_str(" [scrollback — PgDn to resume]");
     }
@@ -176,10 +183,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, b)| {
+            let name = e6irc_client::TerminalSafe::from_untrusted(&b.name);
             if i == app.current {
-                format!("[{}]", b.name)
+                format!("[{name}]")
             } else {
-                format!(" {} ", b.name)
+                format!(" {name} ")
             }
         })
         .collect::<Vec<_>>()

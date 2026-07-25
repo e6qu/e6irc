@@ -173,6 +173,22 @@ These are project-wide rules, enforced in review and (where possible) CI:
     one-line REGISTER/AUTHENTICATE could otherwise head-of-line-block every
     queued CHATHISTORY read and login behind it. The structural guard (offload +
     `unreachable!`) makes "an argon2 op on the serial loop" unwritable.
+  - `TerminalSafe` — untrusted server text that reaches the user's terminal
+    (in `e6irc-cli` and `e6irc-tui`) can only take this form, and its sole
+    constructor `from_untrusted` neutralizes every terminal control byte (the
+    C0/C1/DEL/CSI escapes the wire parser lets through, since it rejects only
+    CR/LF/NUL). The TUI's `LogLine` fields are typed `TerminalSafe`, so a render
+    path cannot be handed a raw escape sequence — the client's terminal safety
+    is a project invariant rather than a reliance on the TUI framework's internal
+    control-char filtering. One shared definition across both client crates.
+  - *Monotonic watermarks are seeded, never a zero sentinel* — a session's
+    `flood_refilled_to_ms`/`last_active`/`last_ping_sent` are all initialized
+    from the open-time `MonoMillis`, never `MonoMillis(0)`. Because the mono
+    clock's epoch is process start, a zero is indistinguishable from a real early
+    reading, so a `now − 0 = uptime` computation misbehaves in the first moments
+    of uptime — the class that flood-killed fresh clients (sweep 79). Seeding
+    from the open time removes the sentinel so the class cannot recur on a new
+    watermark field.
   - `bridge_send` — every reverse-direction (IRC→upstream) bridge HTTP send
     whose failure is an HTTP status funnels through one checked helper that
     rejects a non-2xx. The raw `reqwest::Response` from a bare `.send()` never
