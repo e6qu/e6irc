@@ -16,7 +16,12 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     };
     let display = chan.name.clone();
@@ -90,7 +95,12 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     };
     let display = chan.name.clone();
@@ -114,7 +124,12 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     let who_key = state.nick_key(who);
     let Some(invitee) = state.registered_peer(&who_key) else {
-        state.numeric(conn, ERR_NOSUCHNICK, &[who], Some("No such nick/channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHNICK,
+            &[clip_echo(who)],
+            Some("No such nick/channel"),
+        );
         return;
     };
     if state.channels[&key].members.contains_key(&invitee) {
@@ -405,13 +420,23 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     };
     let display = chan.name.clone();
     // A secret channel is hidden: look non-existent to a non-member.
     if chan.modes.secret && !chan.members.contains_key(&conn) {
-        state.numeric(conn, ERR_NOSUCHCHANNEL, &[target], Some("No such channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
         return;
     }
     if chan.members.contains_key(&conn) {

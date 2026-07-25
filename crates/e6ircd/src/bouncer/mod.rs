@@ -473,6 +473,15 @@ impl NetworkHandle {
         self.events.subscribe()
     }
 
+    /// Watch the authoritative stop signal, so an out-of-module attach path
+    /// (the web-UI socket) can detach when the network is removed/replaced.
+    /// The event broadcast does not close while a `NetworkHandle` is held, so
+    /// an attacher that only watches `subscribe()` would linger forever on a
+    /// stopped network — this is the signal `attach` uses to avoid exactly that.
+    pub fn watch_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown.subscribe()
+    }
+
     /// The current upstream connection state. Unlike the `Connected` event
     /// this is not lost to subscribe timing — safe to poll after `start`.
     pub fn is_connected(&self) -> bool {

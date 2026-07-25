@@ -150,6 +150,17 @@ pub(crate) fn pack_trailing_list(items: &[String], head_len: usize) -> String {
 /// error. 64 bytes identifies anything; every reply shape stays well inside
 /// the limit with room for its other, server-bounded parameters.
 pub(crate) fn clip_echo(token: &str) -> &str {
+    // A client token echoed back into a reply lands in a *middle* parameter
+    // position, so it must be able to stand as one: an empty token collapses
+    // into the field separator, and a ':'-leading token opens the trailing
+    // early and swallows the rest of the line (the numeric-middle framing
+    // class — e.g. a fuzzer's `CAP :` echoed into ERR_INVALIDCAPCMD). Show the
+    // conventional "*" placeholder for both, and clip the rest to bound the
+    // echo. A single parsed parameter cannot contain a space or CR/LF/NUL, so
+    // those need no handling here.
+    if token.is_empty() || token.starts_with(':') {
+        return "*";
+    }
     e6irc_proto::message::truncate_on_char_boundary(token, 64)
 }
 

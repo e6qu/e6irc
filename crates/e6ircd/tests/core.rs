@@ -241,6 +241,16 @@ fn nick_collision_and_validation() {
     );
     s.line(c2, "NICK");
     assert!(has_numeric(&s.drain(c2), "431"));
+    // An empty nick (`NICK :`) is "no nickname given" (431), not an erroneous
+    // one: echoing the empty nick into a 432 middle would emit a collapsing
+    // empty parameter (`432 *  :…`), which the numeric funnel now rejects.
+    s.line(c2, "NICK :");
+    let out = s.drain(c2);
+    assert!(has_numeric(&out, "431"), "empty nick must be 431: {out:#?}");
+    assert!(
+        !has_numeric(&out, "432"),
+        "empty nick must not be a 432: {out:#?}"
+    );
     s.line(c2, "NICK this-nick-is-way-too-long-for-us");
     assert!(has_numeric(&s.drain(c2), "432"), "over nicklen");
 }
@@ -1190,6 +1200,25 @@ fn invalid_cap_subcommand_is_410() {
     assert!(has_numeric(&s.drain(c), "410"));
 }
 
+/// A `:`-leading CAP subcommand (`CAP ::` parses the subcommand as ":") must
+/// not be echoed verbatim into ERR_INVALIDCAPCMD's middle — a ':'-leading
+/// middle opens the trailing early and corrupts the reply's framing (found by
+/// the core fuzzer once the numeric-middle check went in). It renders as the
+/// safe "*" placeholder instead.
+#[test]
+fn invalid_cap_subcommand_with_leading_colon_is_safe() {
+    let mut s = TestServer::new();
+    let c = s.register(1, "alice");
+    s.line(c, "CAP ::");
+    let out = s.drain(c);
+    let line = out.iter().find(|l| l.contains(" 410 ")).expect("410");
+    // The middle after the target is the placeholder, not a bare ":".
+    assert!(
+        line.contains(" 410 alice * :"),
+        "colon subcommand not rendered safely: {line}"
+    );
+}
+
 fn register_with_caps(s: &mut TestServer, id: u64, nick: &str, caps: &str) -> ConnId {
     let c = s.connect(id);
     s.line(c, "CAP LS 302");
@@ -2013,6 +2042,54 @@ fn sasl_verify_refused_while_identify_pending() {
     assert!(
         s.drain(alice).iter().any(|l| l.contains(" 904 ")),
         "the SASL attempt fails (ERR_SASLFAIL) rather than racing the IDENTIFY"
+    );
+}
+
+/// A SASL verify that can't be enqueued because the DB request queue is full
+/// must not lock the connection out of authentication for good. The
+/// verify-pending flag is set only *after* a successful push, so a failed push
+/// leaves it clear and a later AUTHENTICATE (once the queue drains) proceeds —
+/// where a set-then-maybe-fail order left the flag stuck true, and every
+/// subsequent AUTHENTICATE/IDENTIFY was refused as "already in progress".
+#[test]
+fn sasl_survives_a_full_db_queue_and_can_retry() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #flood");
+    s.drain(alice);
+    s.db_requests(); // clear registration/join enqueues
+
+    // Fill the DB request queue (capacity 64) with channel LogMessages, without
+    // draining, so the next push fails.
+    for i in 0..80 {
+        s.line(alice, &format!("PRIVMSG #flood :m{i}"));
+        s.drain(alice);
+    }
+
+    // The verify push now fails on the full queue → 904, flag left clear.
+    s.line(alice, "CAP REQ :sasl");
+    s.drain(alice);
+    s.line(alice, "AUTHENTICATE PLAIN");
+    s.drain(alice);
+    s.line(alice, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert!(
+        has_numeric(&s.drain(alice), "904"),
+        "a full queue should fail the SASL attempt"
+    );
+
+    // Drain the queue and retry: the connection is NOT locked out.
+    s.db_requests();
+    s.line(alice, "AUTHENTICATE PLAIN");
+    assert_eq!(
+        s.drain(alice),
+        vec!["AUTHENTICATE +"],
+        "auth must not be locked out after a full-queue failure"
+    );
+    s.line(alice, &format!("AUTHENTICATE {}", b64("\0alice\0pw")));
+    assert_eq!(
+        s.db_requests().len(),
+        1,
+        "the retry must dispatch a verify once the queue has room"
     );
 }
 
@@ -5823,6 +5900,31 @@ fn oper_kline_bans_disconnects_and_refuses() {
     assert!(
         s.drain(plain).iter().any(|l| l.contains(" 481 ")),
         "non-oper was allowed to KLINE"
+    );
+}
+
+/// A ban that matches the setting oper's own session must still confirm and
+/// audit before the self-disconnect: the confirmation NOTICE and `record_audit`
+/// run ahead of the victims loop, so a self-matching `KLINE *@*` doesn't close
+/// the oper's session and then send its confirmation into a gone connection
+/// (a silent no-op) or record an actor-less audit row — the same self-close
+/// ordering `cmd_kill` guards.
+#[test]
+fn self_matching_kline_confirms_before_disconnecting_the_setter() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    // A mask that matches everyone, including the oper's own user@host.
+    s.line(op, "KLINE *@* :cleanup");
+    let out = s.drain(op);
+    assert!(
+        out.iter().any(|l| l.contains("Added K-Line")),
+        "the setter must receive the confirmation before being disconnected: {out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l.starts_with("ERROR :")),
+        "the self-matching setter is still disconnected: {out:#?}"
     );
 }
 

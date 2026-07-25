@@ -231,7 +231,18 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
             eprintln!("{command}: db queue full or closed; {label} for {mask} not persisted");
         }
     }
-    // Disconnect any matching registered sessions.
+    // Audit and confirm *before* the disconnect loop: a self-matching ban
+    // (`KLINE *@*`, or a mask covering the oper's own host) closes `conn`'s own
+    // session inside the loop, after which `record_audit` would resolve the
+    // actor to an empty string (an unattributed row) and the confirmation NOTICE
+    // would be a silent no-op on the gone session. This is the same ordering
+    // `cmd_kill` documents for a self-kill.
+    record_audit(state, conn, &command, &mask, &reason);
+    state.send(
+        conn,
+        &format!(":{server} NOTICE {nick} :Added {label} for {mask}"),
+    );
+    // Disconnect any matching registered sessions (possibly including `conn`).
     let victims: Vec<ConnId> = state
         .sessions
         .iter()
@@ -253,11 +264,6 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
         );
         state.close(victim, &format!("{label}d: {reason}"));
     }
-    record_audit(state, conn, &command, &mask, &reason);
-    state.send(
-        conn,
-        &format!(":{server} NOTICE {nick} :Added {label} for {mask}"),
-    );
 }
 
 /// UNKLINE/UNDLINE/UNXLINE <mask> — oper-only. Remove a server ban of the
@@ -358,7 +364,12 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     let nk = state.nick_key(nick);
     let Some(target) = state.registered_peer(&nk) else {
-        state.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
+        state.numeric(
+            conn,
+            ERR_NOSUCHNICK,
+            &[clip_echo(nick)],
+            Some("No such nick/channel"),
+        );
         return;
     };
     let (user, old_prefix) = {
