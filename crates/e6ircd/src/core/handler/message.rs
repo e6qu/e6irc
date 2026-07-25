@@ -773,7 +773,17 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
                 .multiline
                 .take()
                 .expect("checked");
+            // The sender's multiline echo answers the *opening* BATCH's label,
+            // which `deliver_multiline` applies to the echo inline. If the client
+            // also labeled *this* close command, `dispatch` has a capture open for
+            // that label — and the echo would be swallowed into it, producing a
+            // line with two `label=` tags (the open's inline one plus the close's
+            // injected one) and robbing the close of its own ACK. Park the close's
+            // capture across delivery so the echo goes out uncaptured with only its
+            // inline label; restore it (empty) so the close still gets its own ACK.
+            let close_capture = state.capture.take();
             deliver_multiline(state, conn, batch);
+            state.capture = close_capture;
         }
         _ => multiline_fail(
             state,

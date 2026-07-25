@@ -91,7 +91,9 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             // IDENTIFY racing a SASL verify (an earlier comment wrongly called
             // overlapping IDENTIFYs harmless). Refuse a second while either is
             // pending; the SASL verify-start refuses symmetrically.
-            if state.sessions[&conn].sasl_verify_pending || state.sessions[&conn].pending_identify {
+            if state.sessions[&conn].sasl_verify_pending
+                || state.sessions[&conn].pending_identify.is_some()
+            {
                 state.service_notice(
                     conn,
                     "NickServ",
@@ -106,11 +108,6 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             if !credential_attempt_ok(state, conn) {
                 return;
             }
-            state
-                .sessions
-                .get_mut(&conn)
-                .expect("checked")
-                .pending_identify = true;
             let request = crate::core::DbRequest::VerifyPassword {
                 conn,
                 account,
@@ -118,16 +115,31 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 origin: crate::core::CredentialOrigin::NickServIdentify,
             };
             if state.db_tx.try_push(request).is_err() {
-                state
-                    .sessions
-                    .get_mut(&conn)
-                    .expect("checked")
-                    .pending_identify = false;
+                // Synchronous failure: the normal dispatch capture frames this
+                // under the command's label, so no deferred hold is set up.
                 state.service_notice(
                     conn,
                     "NickServ",
                     "Services are temporarily unavailable. Try again later.",
                 );
+            } else {
+                // The verdict arrives asynchronously from the DB worker. If the
+                // IDENTIFY was labeled, tell the synchronous framer not to ACK it
+                // as an empty response and stash the label, so the deferred verdict
+                // NOTICE carries it (`emit_labeled_unheld` at reply time). Unlike
+                // REGISTER, no `defer_reply` hold is taken: a NickServ verdict
+                // interleaves with the client's other output the way a real server
+                // sends it, rather than gating every later reply on the verify.
+                let label = state.capture.as_mut().and_then(|cap| {
+                    cap.label.clone().inspect(|_| {
+                        cap.deferred = true;
+                    })
+                });
+                state
+                    .sessions
+                    .get_mut(&conn)
+                    .expect("checked")
+                    .pending_identify = Some(label);
             }
         }
         "GHOST" => {

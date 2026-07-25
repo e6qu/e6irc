@@ -126,6 +126,61 @@ pub(crate) enum SessionOutcome {
 /// parks until the network is reconfigured (which drops the handle and ends it).
 pub(crate) const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
 
+/// Whether an HTTP status from a bridge's auth/login call means the *credentials*
+/// were rejected (401/403) — a permanent failure retrying won't fix, so the
+/// caller returns [`SessionOutcome::AuthRejected`] rather than `Dropped`. Gives
+/// the chat bridges the same "stop hammering the upstream with a bad token"
+/// backstop the IRC driver already has, instead of reconnecting forever.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) fn is_http_auth_rejection(status: Option<reqwest::StatusCode>) -> bool {
+    matches!(
+        status,
+        Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
+    )
+}
+
+/// Why a bridge failed to establish a session. Distinguishes a credential
+/// rejection ([`SessionOutcome::AuthRejected`] — stop re-dialing) from any other
+/// failure ([`SessionOutcome::Dropped`] — retry with backoff). The `From<String>`
+/// / `From<&str>` conversions make every ordinary `?` in a bridge's `connect`
+/// fall through as `Transient`, so only the one credential-rejection site has to
+/// name `Auth` explicitly.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) enum ConnectFail {
+    Auth(String),
+    Transient(String),
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl ConnectFail {
+    pub(crate) fn into_outcome(self, who: &str) -> SessionOutcome {
+        match self {
+            Self::Auth(e) => {
+                eprintln!("{who}: authentication rejected, will stop retrying: {e}");
+                SessionOutcome::AuthRejected
+            }
+            Self::Transient(e) => {
+                eprintln!("{who}: connect failed: {e}");
+                SessionOutcome::Dropped
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl From<String> for ConnectFail {
+    fn from(e: String) -> Self {
+        Self::Transient(e)
+    }
+}
+
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+impl From<&str> for ConnectFail {
+    fn from(e: &str) -> Self {
+        Self::Transient(e.to_string())
+    }
+}
+
 /// Run `session` forever, reconnecting with backoff whenever it drops.
 ///
 /// Every always-on driver needs exactly this: a transient failure must

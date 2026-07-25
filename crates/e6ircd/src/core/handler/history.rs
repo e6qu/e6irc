@@ -781,6 +781,15 @@ pub(crate) fn history_page(
             let peer = state.display_nick(&state.casemap.casefold(display));
             (me, my_identity, peer)
         });
+    // `time=` and `msgid=` are emitted on every replayed line UNCONDITIONALLY,
+    // unlike `account`/`bot` below which are gated on the requester's caps. This
+    // is deliberate, not an oversight: a CHATHISTORY reply is meaningless without
+    // per-message timestamps and ids (a client pages and de-duplicates by them),
+    // the `batch`+`draft/chathistory` caps this command requires are defined on
+    // top of the message-tags framework, and other servers do the same. `account`
+    // and `bot` are attribution a capless client simply wouldn't have negotiated
+    // to see live, so replay mirrors that per-cap gating for them specifically.
+    //
     // account-tag: live delivery stamps `account=` on a message from an
     // identified sender for a recipient that negotiated the cap, so a replay
     // must too — otherwise the replayed line loses the sender-account

@@ -245,8 +245,16 @@ pub(crate) struct Session {
     /// single socket can't drive unbounded argon2 work (unauth CPU DoS / online
     /// brute-force). Never reset — the budget is per connection lifetime.
     pub credential_attempts: u32,
-    /// A NickServ IDENTIFY is awaiting its DB verdict.
-    pub pending_identify: bool,
+    /// A NickServ IDENTIFY is awaiting its DB verdict, with a deferred reply held
+    /// open for it — same shape and meaning as [`Self::pending_register`]: `Some`
+    /// while the verdict is outstanding, the inner value the escaped
+    /// labeled-response label the `PRIVMSG NickServ :IDENTIFY` carried (`Some` for
+    /// a labeled command, `None` for an unlabeled one). The deferred
+    /// success/failure NOTICE is then framed under the same label a synchronous
+    /// reply would carry, so a label-tracking client can correlate the verdict —
+    /// matching REGISTER rather than answering the label with a bare empty ACK and
+    /// leaving the verdict unlabeled.
+    pub pending_identify: Option<Option<String>>,
     /// A `REGISTER`-command account creation is awaiting its DB verdict, with a
     /// deferred reply held open for it. `Some` while that reply is outstanding;
     /// the inner value is the escaped labeled-response label the command carried
@@ -1269,7 +1277,7 @@ impl ServerState {
                 sasl_verify_pending: false,
                 sasl_buf: String::new(),
                 credential_attempts: 0,
-                pending_identify: false,
+                pending_identify: None,
                 pending_register: None,
                 away: None,
                 oper: false,
@@ -1428,6 +1436,43 @@ impl ServerState {
         super::handler::frame_labeled(self, conn, &label, captured);
         self.emitting_deferred = previous;
         self.release_deferred(conn);
+    }
+
+    /// Emit an async reply framed under `label` (if any) that was NOT held behind
+    /// a [`Self::defer_reply`] — so it consumes no deferred slot and does not gate
+    /// the connection's other output on itself. Used for a NickServ verdict, which
+    /// (unlike a REGISTER `SUCCESS`) interleaves with the client's other output the
+    /// way a real server sends it, while still carrying the label of the
+    /// `PRIVMSG NickServ :IDENTIFY` that triggered it so a labeled client can
+    /// correlate the result. The `emitting_deferred` bypass keeps it from being
+    /// withheld behind any *unrelated* deferred reply (e.g. a pending CHATHISTORY)
+    /// without touching that reply's hold count.
+    pub fn emit_labeled_unheld(
+        &mut self,
+        conn: ConnId,
+        label: Option<String>,
+        emit: impl FnOnce(&mut Self),
+    ) {
+        let previous = self.emitting_deferred.replace(conn);
+        match label {
+            None => emit(self),
+            Some(label) => {
+                debug_assert!(
+                    self.capture.is_none(),
+                    "labeled verdict nested in a capture"
+                );
+                self.capture = Some(Capture {
+                    conn,
+                    lines: Vec::new(),
+                    label: Some(label.clone()),
+                    deferred: false,
+                });
+                emit(self);
+                let captured = self.capture.take().map(|c| c.lines).unwrap_or_default();
+                super::handler::frame_labeled(self, conn, &label, captured);
+            }
+        }
+        self.emitting_deferred = previous;
     }
 
     /// One deferred reply has been emitted: release the output withheld behind

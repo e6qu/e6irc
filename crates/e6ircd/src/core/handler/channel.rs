@@ -347,7 +347,9 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     if state.sessions[&conn].caps.read_marker {
         send_current_markread(state, conn, &key, &display);
     }
-    send_names(state, conn, &key);
+    // The joiner is a member, so the hidden-outsider branch never fires; the
+    // canonical display is the right echo for the member NAMES terminator.
+    send_names(state, conn, &key, &display);
 
     // A registered channel with a mode lock enforces it the moment it is
     // (re)created, so its locked modes survive the channel going empty.
@@ -419,18 +421,23 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 }
 
-pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
+pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, echo: &str) {
     let Some(chan) = state.channels.get(key) else {
         return;
     };
     let display = chan.name.clone();
-    // A +s (secret) channel hides its membership from non-members: they get
-    // only the terminating numeric, never the member list.
+    // A +s (secret) channel hides its membership from non-members: they get only
+    // the terminating numeric, never the member list. That numeric must echo the
+    // caller's *input* token (`echo`), not the channel's canonical name — a
+    // non-existent channel's 366 echoes the input (`cmd_names`), so returning the
+    // canonical casing here would let an outsider probing `NAMES #secret` learn
+    // that `#Secret` exists from the casing of the reply. Every other hidden-
+    // channel surface avoids exactly this existence oracle.
     if chan.hidden_from(conn).is_some() {
         state.numeric(
             conn,
             RPL_ENDOFNAMES,
-            &[&display],
+            &[clip_echo(echo)],
             Some("End of /NAMES list"),
         );
         return;
@@ -492,7 +499,7 @@ pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             for target in targets.split(',').filter(|t| !t.is_empty()) {
                 let key = state.chan_key(target);
                 if state.channels.contains_key(&key) {
-                    send_names(state, conn, &key);
+                    send_names(state, conn, &key, target);
                 } else {
                     state.numeric(
                         conn,
@@ -1052,10 +1059,30 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             '+' => adding = true,
             '-' => adding = false,
             'i' | 'm' | 'n' | 's' | 't' | 'C' => {
-                // A ChanServ mode lock forbids changing a locked mode the
-                // wrong way; such a change is refused (not echoed), leaving
-                // the locked state in place.
+                // A ChanServ mode lock forbids changing a locked mode the wrong
+                // way. Refuse it *loudly* (DESIGN §2): a bare `continue` left the
+                // client unable to tell its command was rejected from lost —
+                // ERR_MLOCKRESTRICTED names the mode and the active lock.
                 if state.mlock_conflict(&key, c, adding) {
+                    let display = state
+                        .channels
+                        .get(&key)
+                        .map(|ch| ch.name.clone())
+                        .unwrap_or_default();
+                    let locked = state
+                        .channel_mlock
+                        .get(&key)
+                        .map(crate::core::state::MlockModes::render)
+                        .unwrap_or_default();
+                    let modestr = format!("{}{c}", if adding { '+' } else { '-' });
+                    state.numeric(
+                        conn,
+                        ERR_MLOCKRESTRICTED,
+                        &[&display, &modestr, &locked],
+                        Some(
+                            "MODE cannot be set due to channel having an active MLOCK restriction policy",
+                        ),
+                    );
                     continue;
                 }
                 let chan = state.channels.get_mut(&key).expect("checked");

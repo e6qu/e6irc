@@ -29,14 +29,15 @@ fn verify_denied(
             // else: stale reply for an aborted SASL attempt — drop it.
         }
         crate::core::CredentialOrigin::NickServIdentify => {
-            if !state.sessions[&conn].pending_identify {
-                return; // stale IDENTIFY reply (superseded/aborted)
-            }
-            state
+            let Some(label) = state
                 .sessions
                 .get_mut(&conn)
                 .expect("checked")
-                .pending_identify = false;
+                .pending_identify
+                .take()
+            else {
+                return; // stale IDENTIFY reply (superseded/aborted)
+            };
             let text = if unavailable {
                 "Services are temporarily unavailable. Try again later.".to_string()
             } else {
@@ -46,7 +47,11 @@ fn verify_denied(
                     .unwrap_or_else(|| "*".into());
                 format!("Invalid password for \x02{nick}\x02.")
             };
-            state.service_notice(conn, "NickServ", &text);
+            // Frame the failure under the IDENTIFY's label; unheld, like the
+            // success path.
+            state.emit_labeled_unheld(conn, label, move |state| {
+                state.service_notice(conn, "NickServ", &text);
+            });
         }
     }
 }
@@ -184,7 +189,9 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
             // answered yet — `sasl_verify_pending` survives an `AUTHENTICATE *`
             // abort (which can't un-send the DB request), so re-auth waits for
             // that stale reply to drain rather than racing it.
-            if state.sessions[&conn].pending_identify || state.sessions[&conn].sasl_verify_pending {
+            if state.sessions[&conn].pending_identify.is_some()
+                || state.sessions[&conn].sasl_verify_pending
+            {
                 sasl_fail(state, conn);
                 return;
             }
@@ -372,17 +379,27 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             account,
             origin: crate::core::CredentialOrigin::NickServIdentify,
         } => {
-            if !state.sessions[&conn].pending_identify {
+            let Some(label) = state
+                .sessions
+                .get_mut(&conn)
+                .expect("checked")
+                .pending_identify
+                .take()
+            else {
                 return; // stale IDENTIFY reply (superseded/aborted)
-            }
-            let session = state.sessions.get_mut(&conn).expect("checked");
-            session.pending_identify = false;
-            session.account = Some(account.clone());
-            state.service_notice(
-                conn,
-                "NickServ",
-                &format!("You are now identified for \x02{account}\x02."),
-            );
+            };
+            state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
+            // Frame the verdict under the IDENTIFY's label (if any) so a labeled
+            // client can correlate the result; an unlabeled one just gets the
+            // NOTICE. Unheld — it interleaves with other output like a real server.
+            let account_for_notice = account.clone();
+            state.emit_labeled_unheld(conn, label, move |state| {
+                state.service_notice(
+                    conn,
+                    "NickServ",
+                    &format!("You are now identified for \x02{account_for_notice}\x02."),
+                );
+            });
             notify_account_change(state, conn, &account);
         }
         crate::core::DbReply::PasswordRejected { origin } => {

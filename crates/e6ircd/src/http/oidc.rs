@@ -710,6 +710,14 @@ pub(super) fn verify_logout_token_with_metadata(
     Ok(claims)
 }
 
+// Deliberately NOT `RateLimited` (unlike its front-channel sibling): this
+// endpoint is called server-to-server by the IdP, from a single source IP, and a
+// mass-logout event legitimately bursts many tokens at once — a per-IP limit
+// would DROP real logout notifications (leaving sessions alive that should end),
+// a worse outcome than the marginal DoS it would prevent. The work an unsigned
+// request induces is already bounded: signature verification is fast, discovery
+// is cached (900s), and a DB row is written only for a validly-signed token an
+// attacker cannot forge. See the front-channel handler for the contrasting case.
 pub(super) async fn oidc_backchannel_logout(
     State(state): State<Arc<AppState>>,
     form: Result<Form<BackchannelLogoutForm>, axum::extract::rejection::FormRejection>,
