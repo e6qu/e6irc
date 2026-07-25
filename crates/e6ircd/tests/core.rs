@@ -2062,6 +2062,48 @@ fn nickserv_register_duplicate_and_syntax() {
 }
 
 #[test]
+fn overlapping_identify_is_refused_not_silently_dropped() {
+    // Two IDENTIFYs in flight would share the single `pending_identify` flag;
+    // the first verdict to land clears it, so the second (possibly the *valid*
+    // one) would hit the stale-reply guard and be silently dropped — no login,
+    // no notice. A second IDENTIFY must be refused while one is pending.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    let _ = s.db_requests(); // clear any registration-time requests
+
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY first");
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY second");
+    // Only ONE verify was dispatched — the second was refused, not queued behind
+    // a shared flag.
+    let reqs = s.db_requests();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a second IDENTIFY while one is pending must not dispatch a second verify: {reqs:#?}"
+    );
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("already in progress")),
+        "the second IDENTIFY must be told it's refused, not silently dropped: {out:#?}"
+    );
+
+    // The first (still-pending) verify completes normally.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("identified")),
+        "the first IDENTIFY still completes: {out:#?}"
+    );
+}
+
+#[test]
 fn nickserv_identify_flow() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
@@ -2170,8 +2212,8 @@ fn sasl_and_identify_verifies_are_mutually_exclusive() {
     assert!(
         s.drain(alice)
             .iter()
-            .any(|l| l.contains("SASL authentication is already in progress")),
-        "the IDENTIFY must be told SASL is in progress"
+            .any(|l| l.contains("authentication is already in progress")),
+        "the IDENTIFY must be told an authentication is in progress"
     );
     // The SASL result still resolves normally.
     s.core.handle(Input::DbReply {
@@ -2378,18 +2420,29 @@ fn nickserv_identify_spends_the_shared_credential_budget() {
     // NickServ IDENTIFY drives argon2 just like SASL, so it must spend from the
     // same per-connection budget — otherwise it can be looped to brute-force or
     // burn CPU past the cap SASL enforces. The 9th attempt closes the link.
+    // Only one verify may be in flight at a time (see
+    // `overlapping_identify_is_refused_not_silently_dropped`), so each attempt's
+    // verdict is injected before the next — the serial flow a real client sees.
     let mut s = TestServer::new();
     let alice = s.register(1, "alice");
     s.drain(alice);
     for _ in 0..8 {
         s.line(alice, "PRIVMSG NickServ :IDENTIFY wrongpw");
+        let _ = s.db_requests(); // this attempt's VerifyPassword
+        // Verdict lands, clearing `pending_identify` so the next attempt is not
+        // refused as "already in progress".
+        s.core.handle(Input::DbReply {
+            conn: alice,
+            reply: e6ircd::core::DbReply::PasswordRejected {
+                origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+            },
+        });
+        let out = s.drain(alice);
+        assert!(
+            !out.iter().any(|l| l.contains("ERROR")),
+            "the first eight IDENTIFYs stay within budget: {out:#?}"
+        );
     }
-    let _ = s.db_requests(); // eight VerifyPassword dispatches, within budget
-    let out = s.drain(alice);
-    assert!(
-        !out.iter().any(|l| l.contains("ERROR")),
-        "the first eight IDENTIFYs stay within budget: {out:#?}"
-    );
     s.line(alice, "PRIVMSG NickServ :IDENTIFY wrongpw"); // 9th
     let out = s.drain(alice);
     assert!(
@@ -2409,6 +2462,38 @@ fn nickserv_case_insensitive_target_and_unknown_command() {
     s.line(alice, "PRIVMSG NickServ :FROB");
     let out = s.drain(alice);
     assert!(out[0].contains("Invalid command"), "{out:#?}");
+}
+
+#[test]
+fn channel_access_reply_for_unregistered_channel_is_not_phantom_inserted() {
+    // A ChannelAccessSet grant reply for a channel that is no longer registered
+    // (a DROP landed between the write and this reply; the DB cascade already
+    // removed the access row) must NOT re-insert a hot access entry — that
+    // phantom would silently auto-op the account if the name were later
+    // re-registered by anyone. The grant is reported void instead.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    // `#ghost` is not in `registered_founders` (models the dropped channel).
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::ChannelAccessSet {
+            channel: "#ghost".into(),
+            account: "bob".into(),
+            flags: Some("o".into()),
+            applied: true,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("no longer registered")),
+        "a grant reply for an unregistered channel must be reported void, not \
+         phantom-inserted: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("are now +o")),
+        "it must not confirm a grant on a channel that no longer exists: {out:#?}"
+    );
 }
 
 #[test]
@@ -6326,6 +6411,47 @@ fn oper_kline_bans_disconnects_and_refuses() {
     assert!(
         s.drain(plain).iter().any(|l| l.contains(" 481 ")),
         "non-oper was allowed to KLINE"
+    );
+}
+
+/// A server ban preserves the operator's original mask casing for STATS/the
+/// confirmation (a `MaskKey`, like the channel `+b` lists), while still removing
+/// case-insensitively — the display-fidelity the folded-`String` form lost.
+#[test]
+fn server_ban_preserves_display_case_and_removes_case_insensitively() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+
+    // A mixed-case KLINE mask.
+    s.line(op, "KLINE Baddie@Host :spam");
+    let out = s.drain(op);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("Added K-Line for Baddie@Host")),
+        "confirmation must echo the operator's casing: {out:#?}"
+    );
+
+    // STATS-style list (KLINE with no argument) shows the original casing, not
+    // the folded form.
+    s.line(op, "KLINE");
+    let out = s.drain(op);
+    assert!(
+        out.iter().any(|l| l.contains("Baddie@Host")),
+        "the ban list must show the original casing: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.contains("baddie@host")),
+        "the ban list must not show the folded casing: {out:#?}"
+    );
+
+    // A differently-cased UNKLINE still lifts it (folded comparison).
+    s.line(op, "UNKLINE baddie@HOST");
+    let out = s.drain(op);
+    assert!(
+        out.iter().any(|l| l.contains("Removed K-Line")),
+        "a differently-cased UNKLINE must remove the ban: {out:#?}"
     );
 }
 

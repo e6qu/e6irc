@@ -512,11 +512,14 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
         }
         DbRequest::AddServerBan {
             mask,
+            mask_display,
             reason,
             set_by,
             kind,
         } => {
-            if let Err(e) = add_server_ban(pool, &mask, &reason, &set_by, &kind).await {
+            if let Err(e) =
+                add_server_ban(pool, &mask, &mask_display, &reason, &set_by, &kind).await
+            {
                 eprintln!("db: server-ban persistence failed: {e}");
             }
             true
@@ -1204,15 +1207,18 @@ pub async fn set_channel_founder(
 pub async fn add_server_ban(
     pool: &PgPool,
     mask: &str,
+    mask_display: &str,
     reason: &str,
     set_by: &str,
     kind: &str,
 ) -> Result<(), DbError> {
     sqlx::query(
-        "INSERT INTO server_bans (mask, reason, set_by, kind) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (mask, kind) DO UPDATE SET reason = EXCLUDED.reason, set_by = EXCLUDED.set_by",
+        "INSERT INTO server_bans (mask, mask_display, reason, set_by, kind) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (mask, kind) DO UPDATE
+            SET mask_display = EXCLUDED.mask_display, reason = EXCLUDED.reason, set_by = EXCLUDED.set_by",
     )
     .bind(mask)
+    .bind(mask_display)
     .bind(reason)
     .bind(set_by)
     .bind(kind)
@@ -1269,15 +1275,19 @@ pub async fn list_audit_log(
     .map_err(DbError::Query)
 }
 
-/// Every server ban as `(mask, reason, set_by, kind)` — boot-loaded into
-/// the hot server-ban list.
+/// Every server ban as `(mask_display, reason, set_by, kind)` — boot-loaded
+/// into the hot server-ban list. The first field is the display casing
+/// (`COALESCE(mask_display, mask)` so a row predating the display column falls
+/// back to its folded mask); `MaskKey::new` re-derives the fold for comparison.
 pub async fn list_server_bans(
     pool: &PgPool,
 ) -> Result<Vec<(String, String, String, String)>, DbError> {
-    sqlx::query_as("SELECT mask, reason, set_by, kind FROM server_bans ORDER BY id")
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::Query)
+    sqlx::query_as(
+        "SELECT COALESCE(mask_display, mask), reason, set_by, kind FROM server_bans ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
 }
 
 /// Unregister a channel by its casefolded name (ChanServ DROP).

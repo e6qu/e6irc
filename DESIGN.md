@@ -106,11 +106,24 @@ These are project-wide rules, enforced in review and (where possible) CI:
     account map (read markers, registered founders, channel access) onto the
     folded convention; the DB enforces the same at the `name_folded` edge.
   - `MaskKey` — the casefold-key discipline extended from map keys to *list*
-    elements: a channel's ban/quiet/exception `Vec`s hold `MaskKey`, which folds
-    once in its constructor and carries the display form alongside, so a
-    `push`/`contains`/`retain` cannot compare an un-folded mask and let a ban
-    silently fail to match. The one place map keys couldn't reach — a folded
-    comparison over a `Vec` — is now closed the same way.
+    elements: a channel's ban/quiet/exception `Vec`s and the **server-ban list**
+    hold `MaskKey`, which folds once in its constructor and carries the display
+    form alongside, so a `push`/`contains`/`retain` cannot compare an un-folded
+    mask and let a ban silently fail to match, while STATS still shows the
+    operator's original casing. The one place map keys couldn't reach — a folded
+    comparison over a `Vec` — is now closed the same way, and the by-hand
+    `mask::eq` it replaced is gone.
+  - `WireLine` — the injection class (an embedded CR/LF/NUL in a line's content,
+    which would split it into a second forged line on the wire) is
+    unrepresentable *at the delivery funnel*, in every build: `deliver` takes
+    only a `WireLine`, whose sole constructor `sanitized` neutralizes those bytes
+    (leaving the one trailing CRLF terminator). Before, the funnel checked only
+    line *length*, and injection was prevented solely upstream by parse-rejection
+    plus per-position sanitizers — a new path building a line from a non-parser
+    source (a DB value, a bridge) had no funnel backstop in release. Debug/fuzz
+    builds still *panic* on such a line (`wire_line_violation` now flags an
+    embedded CR/LF/NUL too), so the unsanitized source is found in tests while
+    release neutralizes rather than panicking (one worker serves all, DESIGN §7.1).
   - `CredentialOrigin` — a credential-verify verdict (`PasswordVerified` /
     `PasswordRejected` / `Unavailable`) answers *either* a SASL `AUTHENTICATE`
     or a NickServ `IDENTIFY`; the request carries which, echoed onto the reply,

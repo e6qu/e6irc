@@ -588,6 +588,24 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             let account_key = state.account_key(&account);
             match &flags {
                 Some(f) => {
+                    // A DROP between the write and this reply unregisters the
+                    // channel and cascade-deletes its access rows synchronously
+                    // (`registered_founders`/`channel_access` cleared). Re-inserting
+                    // here would leave a phantom hot entry for a channel the DB no
+                    // longer has — and if that name is later re-registered by
+                    // anyone, the phantom silently auto-ops this account, a grant
+                    // the new founder never made. Skip the insert and say so.
+                    if !state.is_registered(&key) {
+                        state.service_notice(
+                            conn,
+                            "ChanServ",
+                            &format!(
+                                "\x02{channel}\x02 is no longer registered; the flags change \
+                                 did not take effect."
+                            ),
+                        );
+                        return;
+                    }
                     state
                         .channel_access
                         .entry(key)
