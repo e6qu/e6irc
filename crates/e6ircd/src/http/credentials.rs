@@ -14,22 +14,11 @@ pub(super) struct AppPasswordRequest {
 /// web session flow is the primary way accounts authenticate.
 pub(super) async fn create_app_password(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
+    // Verifies a password, so it's an online brute-force target throttled only by
+    // argon2 cost without a per-IP rate cap.
+    _rl: RateLimited,
     body: Result<axum::Json<AppPasswordRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    // Rate-limit per client IP: this verifies a password, so it's an online
-    // brute-force target throttled only by argon2 cost without this.
-    if !auth_rate_ok(
-        &state,
-        client_ip(peer.ip(), &headers, &state.trusted_proxies),
-    ) {
-        return problem(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many requests",
-            Some("Auth rate limit exceeded; retry shortly."),
-        );
-    }
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,

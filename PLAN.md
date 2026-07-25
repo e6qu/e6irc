@@ -1675,6 +1675,45 @@ clippy (default + `embed-web` + bridges), fmt, the five guard scripts,
 migration 0031 and round-trips a server ban), `http`, `oidc`, irctest main (380)
 and the persistence-backed services list (49).
 
+Eighty-second sweep — a rate-limit gap closed as a class + an escalated
+history finding (2026-07-25): a message/history hunt and an HTTP/auth hunt. The
+HTTP hunt's finding is fixed here as its whole class; the history hunt found a
+CHATHISTORY issue whose only correct fix is a large, spec-underspecified change
+to a heavily-tested path, so its design is put to the maintainer as an open
+decision (a question to answer, not a paragraph filed away) rather than guessed
+at in this PR.
+
+**`RateLimited` — the per-IP throttle made an extractor, closing a live gap**
+(http). `POST /api/v1/auth/device/token` was unauthenticated but, unlike every
+sibling, carried no `auth_rate_ok` gate — and `poll_device_grant` opens a DB
+transaction *before* validating the code, so an anonymous flood of bogus codes
+could saturate the shared connection pool and 503 every endpoint. The root is
+that rate-limiting was a by-hand prologue (`client_ip` + `auth_rate_ok`, pulling
+in `ConnectInfo` + `HeaderMap`) each unauthenticated route had to remember;
+`device_token` forgot. Added a `RateLimited` `FromRequestParts` extractor (the
+gap the `Authenticated`/`AdminAccount`/`CsrfVerified` extractors didn't cover)
+and routed every unauthenticated work-inducing handler through it, so the gate
+is declared in one place and `auth_rate_ok` has a single caller. `device_token`
+is now throttled like the rest.
+
+**Put to the maintainer as an open decision.** The history hunt found that a
+multiline message replays through CHATHISTORY as per-line rows with fresh
+per-line msgids that were never delivered live (live gives the message one
+msgid), so a msgid-deduplicating client re-renders every line after the first.
+The only faithful fix is to replay a stored multiline as a single message
+reusing its one msgid — which needs a group marker on stored rows (a schema
+column) plus nested-batch reconstruction on the CHATHISTORY replay path, a
+large change to a differentially-fuzzed, irctest-covered surface where the
+IRCv3 multiline↔chathistory interaction is itself underspecified (nested-batch
+replay behaviour with real clients is not settled). That design choice is the
+maintainer's, so it is a live question in the sweep report, to be implemented
+the moment it is answered.
+
+Full gate green on what landed, incl. `tools/check-no-defer.sh`: workspace
+tests, clippy (default + `embed-web` + bridges), fmt, the five guard scripts,
+`cargo deny`, the fuzz build, `http` and `oidc` PG suites (which exercise the
+extractor on every converted route), and irctest main (380).
+
 No-Deferral Rule + guard (2026-07-25): a process correction, not a sweep. Over
 the preceding sweeps the agent repeatedly *recorded* fixes as pending rather
 than doing them, and justified skipping worthwhile changes as not-worth-it —
