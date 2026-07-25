@@ -5,7 +5,7 @@ use super::*;
 // ---- KICK / INVITE / AWAY / LIST / USERHOST -----------------------------
 
 pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let (Some(&target), Some(&users)) = (p.first(), p.get(1)) else {
+    let (Some(&channels_param), Some(&users_param)) = (p.first(), p.get(1)) else {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
@@ -14,51 +14,53 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
+    let reason = p.get(2).copied();
+    let channels: Vec<&str> = channels_param
+        .split(',')
+        .filter(|c| !c.is_empty())
+        .collect();
+    let users: Vec<&str> = users_param.split(',').filter(|u| !u.is_empty()).collect();
+    if channels.is_empty() || users.is_empty() {
         state.numeric(
             conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
+            ERR_NEEDMOREPARAMS,
+            &["KICK"],
+            Some("Not enough parameters"),
+        );
+        return;
+    }
+    // Pair channels with users per the RFC2812/Modern KICK grammar: one channel
+    // kicks each listed user from it (`KICK #c a,b`); equal-length lists pair
+    // positionally (`KICK #a,#b u,v` — u from #a, v from #b). Any other
+    // multi-channel shape (unequal, non-1 counts) is malformed and refused loudly
+    // rather than guessing. Each removal is one KICK line to clients, never a
+    // multi-target one (Modern: the server MUST NOT send those).
+    let pairs: Vec<(&str, &str)> = if channels.len() == 1 {
+        users.iter().map(|&u| (channels[0], u)).collect()
+    } else if channels.len() == users.len() {
+        channels
+            .iter()
+            .copied()
+            .zip(users.iter().copied())
+            .collect()
+    } else {
+        state.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &["KICK"],
+            Some("Channel and user lists must be one channel or of equal length"),
         );
         return;
     };
-    let display = chan.name.clone();
-    if !chan.members.contains_key(&conn) {
-        state.numeric(
-            conn,
-            ERR_NOTONCHANNEL,
-            &[target],
-            Some("You're not on that channel"),
-        );
-        return;
-    }
-    if !chan.members[&conn].op {
-        state.numeric(
-            conn,
-            ERR_CHANOPRIVSNEEDED,
-            &[target],
-            Some("You're not a channel operator"),
-        );
-        return;
-    }
     let prefix = state.sessions[&conn].prefix();
     let kicker_nick = state.sessions[&conn].nick.clone().expect("registered");
-    let reason = p.get(2).copied();
-    // Modern IRC KICK is one channel with a comma-separated *user* list; each
-    // user is removed and the removal broadcast independently, deduped and
-    // bounded by TARGMAX — like PRIVMSG's target list. Previously only the first
-    // user was kicked and the rest silently ignored.
+    // Dedup identical (channel, user) pairs; bound the total number of kicks by
+    // TARGMAX (the advertised per-KICK target cap), like PRIVMSG's target list.
     let mut seen = std::collections::HashSet::new();
     let mut kicked = 0usize;
-    for who in users.split(',').filter(|u| !u.is_empty()) {
-        if !seen.insert(state.casemap.casefold(who)) {
+    for (channel, who) in pairs {
+        if !seen.insert((state.casemap.casefold(channel), state.casemap.casefold(who))) {
             continue;
-        }
-        // The channel is gone once the last member is kicked; nothing left to do.
-        if !state.channels.contains_key(&key) {
-            break;
         }
         if kicked >= TARGMAX {
             state.numeric(
@@ -70,17 +72,63 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             break;
         }
         kicked += 1;
-        kick_one_user(
-            state,
-            conn,
-            &key,
-            &display,
-            &prefix,
-            &kicker_nick,
-            who,
-            reason,
-        );
+        kick_pair(state, conn, channel, who, &prefix, &kicker_nick, reason);
     }
+}
+
+/// Resolve `channel`, verify the caller is an opped member of it, and remove
+/// `who`. Each error (unknown channel, not on channel, not an operator) is
+/// answered with its own numeric, so one bad pair in a multi-target KICK does not
+/// stop the others.
+#[allow(clippy::too_many_arguments)]
+fn kick_pair(
+    state: &mut ServerState,
+    conn: ConnId,
+    channel: &str,
+    who: &str,
+    prefix: &str,
+    kicker_nick: &str,
+    reason: Option<&str>,
+) {
+    let key = state.chan_key(channel);
+    let Some(chan) = state.channels.get(&key) else {
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(channel)],
+            Some("No such channel"),
+        );
+        return;
+    };
+    let display = chan.name.clone();
+    if !chan.members.contains_key(&conn) {
+        state.numeric(
+            conn,
+            ERR_NOTONCHANNEL,
+            &[channel],
+            Some("You're not on that channel"),
+        );
+        return;
+    }
+    if !chan.members[&conn].op {
+        state.numeric(
+            conn,
+            ERR_CHANOPRIVSNEEDED,
+            &[channel],
+            Some("You're not a channel operator"),
+        );
+        return;
+    }
+    kick_one_user(
+        state,
+        conn,
+        &key,
+        &display,
+        prefix,
+        kicker_nick,
+        who,
+        reason,
+    );
 }
 
 /// Remove one already-split `who` from channel `key` (the caller has verified the

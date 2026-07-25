@@ -83,14 +83,9 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
 
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Dropped;
-    // Bound REST calls so a hung request can't stall the socket loop. Don't
-    // follow redirects: a hostile/compromised API response must not be able to
-    // 3xx a call to an internal address (SSRF).
-    let http = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    // Bound REST calls so a hung request can't stall the socket loop; vet every
+    // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
+    let http = match super::bridge_http_client(Duration::from_secs(30)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("slack: http client build failed: {e}");
@@ -144,17 +139,13 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         }
     };
     // Bound the WS handshake so a black-holed socket can't wedge the driver.
-    let (ws, _) = match tokio::time::timeout(
+    let ws = match tokio::time::timeout(
         Duration::from_secs(30),
-        tokio_tungstenite::connect_async_with_config(
-            &ws_url,
-            Some(super::bridge_ws_config()),
-            false,
-        ),
+        super::bridge_ws_connect(&ws_url, super::bridge_ws_config()),
     )
     .await
     {
-        Ok(Ok(x)) => x,
+        Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
             eprintln!("slack: socket connect failed: {e}");
             return Dropped;

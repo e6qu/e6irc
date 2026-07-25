@@ -3104,6 +3104,48 @@ fn kick_removes_a_comma_user_list() {
     }
 }
 
+/// The RFC2812/Modern matched multi-channel form: `KICK #a,#b u,v` kicks u from
+/// #a and v from #b (equal-length lists pair positionally). A single-channel list
+/// against many users kicks all from it; unequal multi-channel lists are refused.
+#[test]
+fn kick_pairs_matched_channel_and_user_lists() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let carol = s.register(3, "carol");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #a");
+        s.line(c, "JOIN #b");
+    }
+    for c in [alice, bob, carol] {
+        s.drain(c);
+    }
+    // Matched lists: bob from #a, carol from #b.
+    s.line(alice, "KICK #a,#b bob,carol :bye");
+    let seen = s.drain(alice);
+    assert!(
+        seen.iter().any(|l| l.contains("KICK #a bob")),
+        "bob kicked from #a: {seen:#?}"
+    );
+    assert!(
+        seen.iter().any(|l| l.contains("KICK #b carol")),
+        "carol kicked from #b: {seen:#?}"
+    );
+    // bob is still in #b (only kicked from #a); carol still in #a.
+    s.line(bob, "PRIVMSG #b :hi");
+    assert!(
+        !has_numeric(&s.drain(bob), "404"),
+        "bob was only kicked from #a, not #b"
+    );
+
+    // Unequal multi-channel/user lists are refused loudly (461), not guessed.
+    s.line(alice, "KICK #a,#b bob :bye");
+    assert!(
+        has_numeric(&s.drain(alice), "461"),
+        "an unequal multi-channel KICK must be refused"
+    );
+}
+
 #[test]
 fn invite_lets_target_through_invite_only() {
     let mut s = TestServer::new();
@@ -7616,7 +7658,11 @@ fn isupport_advertises_whox_and_length_limits() {
         "TOPICLEN=390",
         "KICKLEN=390",
         "AWAYLEN=390",
-        "KICK:1",
+        // KICK's advertised TARGMAX must equal the enforced limit (TARGMAX=4);
+        // KICK became multi-user in an earlier sweep but the advertisement stayed
+        // at the old `KICK:1`, telling a state-tracking client a limit the server
+        // does not keep. It now matches PRIVMSG/NOTICE.
+        "TARGMAX=PRIVMSG:4,NOTICE:4,KICK:4",
         // KNOCK is implemented (cmd_knock), so it must be advertised — a client
         // that gates its /knock UI on this token was otherwise misled.
         "KNOCK",

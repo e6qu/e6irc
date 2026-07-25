@@ -86,14 +86,9 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
 
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::Dropped;
-    // Bound REST calls so a hung request can't stall the gateway loop. Don't
-    // follow redirects: a hostile/compromised API response must not be able to
-    // 3xx a call to an internal address (SSRF).
-    let http = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    // Bound REST calls so a hung request can't stall the gateway loop; vet every
+    // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
+    let http = match super::bridge_http_client(Duration::from_secs(30)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("discord: http client build failed: {e}");
@@ -152,13 +147,13 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     // Bound the WS handshake so a black-holed gateway (accepts the connection
     // then goes silent) can't wedge the driver — the same guard irc_driver and
     // matrix already have.
-    let (ws, _) = match tokio::time::timeout(
+    let ws = match tokio::time::timeout(
         Duration::from_secs(30),
-        tokio_tungstenite::connect_async_with_config(&url, Some(super::bridge_ws_config()), false),
+        super::bridge_ws_connect(&url, super::bridge_ws_config()),
     )
     .await
     {
-        Ok(Ok(x)) => x,
+        Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
             eprintln!("discord: gateway connect failed: {e}");
             return Dropped;
