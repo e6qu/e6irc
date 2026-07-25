@@ -40,6 +40,7 @@ fuzz_target!(|data: &[u8]| {
             opers: vec![("o".into(), "p".into())],
             max_hot_channels: 4,
             clock: || e6irc_proto::time::Millis::from_millis(1_000_000_000),
+            mono_clock: || e6irc_proto::time::MonoMillis::from_millis(1_000_000_000),
             command_burst: None,
             registration_before_connect: false,
             registration_require_email: false,

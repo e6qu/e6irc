@@ -129,6 +129,20 @@ fn wall_clock() -> e6irc_proto::time::Millis {
     e6irc_proto::time::Millis::from_millis(ms)
 }
 
+/// Monotonic milliseconds since the process started, for timer decisions (the
+/// reaper deadlines and flood-bucket refill). Unlike [`wall_clock`] this never
+/// steps — an NTP correction or a VM resume cannot move it — so a reaper keyed
+/// on it can neither mass-close live connections on a forward jump nor freeze
+/// on a backward one. The epoch is arbitrary (process start); only differences
+/// are meaningful, which is all the timers ever take.
+fn mono_clock() -> e6irc_proto::time::MonoMillis {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    e6irc_proto::time::MonoMillis::from_millis(ms)
+}
+
 /// Select aws-lc-rs as the process-wide rustls provider exactly once.
 /// Anything in the dependency tree may enable rustls's `ring` feature
 /// (test HTTP clients did), which breaks auto-selection — pinning here
@@ -308,6 +322,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .map(|o| (o.name.clone(), o.password.clone()))
                 .collect(),
             clock: wall_clock,
+            mono_clock,
             command_burst: config.limits.command_burst,
         },
         db_tx,
@@ -374,7 +389,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
             loop {
                 ticker.tick().await;
                 if core_tx
-                    .push(Input::Tick { now: wall_clock() })
+                    .push(Input::Tick { now: mono_clock() })
                     .await
                     .is_err()
                 {
@@ -779,6 +794,7 @@ mod tests {
             max_hot_channels: 64,
             opers: Vec::new(),
             clock: wall_clock,
+            mono_clock,
             command_burst: None,
         }
     }

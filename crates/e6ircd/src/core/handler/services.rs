@@ -219,6 +219,23 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 );
                 return;
             }
+            // Cap the channels one account may register: each adds a permanent,
+            // restart-surviving founder-map entry and runs no argon2, so the
+            // credential budget can't throttle a REGISTER loop. Re-registering a
+            // channel the account already founds is a harmless no-op (the DB
+            // ON CONFLICT and the ChannelExists reply handle it), so only a
+            // genuinely new registration is gated.
+            if !state.is_founder(&key, &account)
+                && state.channels_founded_by(&account)
+                    >= crate::core::handler::channel::MAX_CHANNELS_PER_ACCOUNT
+            {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "You have registered too many channels; drop one before registering another.",
+                );
+                return;
+            }
             let display = state.channels[&key].name.clone();
             let request = crate::core::DbRequest::RegisterChannel {
                 conn,
@@ -772,12 +789,16 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
             return;
         }
     }
-    let now = (state.config.clock)();
+    // `signon` is a real timestamp (WHOIS reports the wall-clock time the
+    // client connected); `last_active` seeds the idle/reaper clock and is
+    // monotonic.
+    let signon = (state.config.clock)();
+    let active = (state.config.mono_clock)();
     {
         let session = state.sessions.get_mut(&conn).expect("checked");
         session.registered = true;
-        session.signon = now;
-        session.last_active = now;
+        session.signon = signon;
+        session.last_active = active;
     }
     let registered_now = state.sessions.values().filter(|s| s.registered).count();
     state.max_users = state.max_users.max(registered_now);

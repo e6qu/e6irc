@@ -1593,6 +1593,82 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-fifth sweep — make the wall-clock-timer class unrepresentable, plus
+three more live bugs the hunts surfaced (2026-07-25): a second step-back on
+recurring classes, with four fresh hunts (reaper/flood timing, CHATHISTORY ring
+internals, an adversarial resource-exhaustion audit, and the proto crate).
+
+**Unrepresentability — timer decisions on wall-clock time, closed by a type.**
+The reaper's deadline comparisons (registration timeout, idle-ping cadence,
+pong timeout) and the flood-bucket refill were all stamped from and compared
+against the *wall* clock — so a forward wall-clock step (NTP correction, VM
+resume-from-suspend) mass-reaps every connection at once (every in-flight
+registration "times out", every idle client is pinged in the same tick, any
+awaiting-pong client is killed), and a backward step freezes the reaper
+entirely (nothing ever times out) until the clock climbs back. Sweep 70 patched
+the *flood* half by re-anchoring on a backward step; this closes the whole class
+by construction. A new `MonoMillis` type (sibling to the existing `Millis`
+newtype, and for the same "don't mix two kinds of time" reason) carries
+monotonic milliseconds, injected as a separate `mono_clock` and used for every
+*timer* field and decision — `opened_at`, `last_active`, `last_ping_sent`,
+`flood_refilled_to_ms`, the reaper `Tick`, and the WHOIS/WHOX idle duration.
+Wall-clock `Millis` stays the source only for real timestamps (`server-time`,
+msgids, WHOIS *signon*). Because the types differ, a monotonic timer deadline
+*cannot* be compared against a wall-clock now — it doesn't compile — so "a timer
+decision on wall-clock time" is unrepresentable. A monotonic clock never steps,
+so neither the mass-reap nor the freeze can occur; the flood backstep re-anchor
+is now provably unreachable and kept only as defense in depth. (The type split
+made the compiler enumerate every timer-vs-timestamp site across the core — the
+refactor was mechanical, guided site by site.)
+
+Three more bugs fixed (all CONFIRMED live):
+
+1. **Unbounded per-account channel registration** (services.rs, MEDIUM) —
+   a channel REGISTER adds a permanent `registered_founders` (and possibly
+   `registered_topics`) entry that survives disconnect *and* restart (the maps
+   reload into RAM at boot), and unlike account REGISTER it runs no argon2, so
+   the per-connection credential budget never throttles it. One authenticated
+   account could loop JOIN → CS REGISTER → PART and grow those maps forever,
+   with no ceiling and no reclamation short of a manual DROP. Now capped at
+   `MAX_CHANNELS_PER_ACCOUNT` (200), checked against the count the account
+   already founds — mirroring the read-marker per-account cap.
+2. **A live client sending only its own PING keepalives was ping-timeout
+   reaped** (handler/mod.rs, LOW) — the "any inbound line proves liveness, so
+   it answers an outstanding liveness PING" clear was bundled inside the
+   *non-keepalive* guard, so an inbound PING cleared neither `last_active` nor
+   `awaiting_pong`. A minimal bot whose sole traffic is its own PINGs (server
+   dutifully PONGing each) was killed at the pong deadline despite a
+   demonstrably live socket. Split the two concerns: *any* inbound line now
+   clears `awaiting_pong`; only a non-keepalive command bumps `last_active`
+   (preserving WHOIS-idle semantics).
+3. **`parse_server_time_millis` accepted a `+` sign on five of six datetime
+   fields** (proto time.rs, LOW) — the year had a digit-only guard, the
+   month/day/hour/minute/second did not, and Rust's integer `FromStr` accepts a
+   leading `+`, so `2024-+2-+29T+1:+2:+3Z` mapped to the same instant as the
+   canonical form (two strings, one instant) — reachable from CHATHISTORY
+   `timestamp=`, MARKREAD, and the HTTP history API. A shared strict
+   `parse_time_field` now gates *every* field, so the sign-accepting class
+   can't reappear on a field a future edit forgets to guard.
+
+Surfaced, not changed: the reaper `Tick` still fires on a coarse 15s cadence
+(deadlines are minutes; documented as intentional); an unauthenticated `~nick`
+DM ring is not rekeyed on rename nor freed on disconnect, so a later reuser of
+the same unclaimed nick can read the prior occupant's DM ring until LRU
+eviction (inherent to the unclaimable-identity model — the authenticated path
+is stable and tested). Clean bills (this sweep): the CHATHISTORY hot ring
+(eviction vs pagination, selector inclusivity, per-target scoping, BETWEEN
+tie-breaks — pinned by an exhaustive differential test and re-checked against
+the DB queries); the flood-bucket boundary arithmetic and the TLS-handshake
+timeout (both already monotonic); every other per-connection/per-channel/global
+collection's growth bound (only the channel-registration map was uncapped); and
+the proto parse/serialize, tag-escape, mask, base64, and casemap surfaces. The
+"fuzz crate is a separate gate" memory earned its keep: the `Input::Tick` type
+change broke the fuzz `CoreConfig`/`Tick` literals, caught before push.
+Verified beyond the gate: irctest main (258) and PG services (49); PG db (41),
+embed-web http (12), dex oidc (4); `core_dispatch`/`core_multi` fuzz-smoke
+clean; bridges under `--features matrix,discord,slack`; fuzz crate under
+`--cfg fuzzing`.
+
 Seventy-fourth sweep — make a bug class unrepresentable, plus four bugs it
 and the hunts surfaced (2026-07-25): a step back to attack recurring bug
 *classes* (a meta-analysis of sweeps 54–73) alongside three fresh hunts

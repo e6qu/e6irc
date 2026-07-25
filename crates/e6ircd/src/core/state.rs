@@ -83,6 +83,15 @@ pub struct CoreConfig {
     /// whole-second clock makes messages sent in the same second
     /// indistinguishable and unpageable.
     pub clock: fn() -> e6irc_proto::time::Millis,
+    /// **Monotonic**-milliseconds clock, injected separately from the wall
+    /// clock above and used for every *timer* decision — the ping/registration
+    /// reaper deadlines and the flood-bucket refill. Kept distinct (in source
+    /// and in type, [`e6irc_proto::time::MonoMillis`]) so a timer can never be
+    /// compared against wall-clock time, which an NTP step or VM resume can
+    /// jump forward (mass-reaping every connection) or backward (freezing the
+    /// reaper). The wall clock stays the source only for real timestamps
+    /// (`server-time`, msgids, signon).
+    pub mono_clock: fn() -> e6irc_proto::time::MonoMillis,
     /// Per-session command-flood bucket size; `None` disables the
     /// throttle. Registered non-oper sessions spend one token per
     /// command (PING/PONG exempt) and refill one token per second.
@@ -218,19 +227,21 @@ pub(crate) struct Session {
     /// already been credited (it advances by whole seconds only, so a
     /// sub-second remainder carries forward instead of being discarded).
     pub flood_tokens: u32,
-    pub flood_refilled_to_ms: e6irc_proto::time::Millis,
-    /// Wall-clock millisecond of the last non-keepalive command (for WHOIS
-    /// idle / WHOX `l`), and of connection open (WHOIS signon).
-    pub last_active: e6irc_proto::time::Millis,
+    /// Monotonic — the flood refill is a timer, not a timestamp.
+    pub flood_refilled_to_ms: e6irc_proto::time::MonoMillis,
+    /// Monotonic millisecond of the last non-keepalive command — the elapsed
+    /// idle duration since it (WHOIS idle / WHOX `l`) and the reaper's idle-ping
+    /// cadence both read it. (WHOIS *signon*, a real timestamp, is `signon`.)
+    pub last_active: e6irc_proto::time::MonoMillis,
     pub signon: e6irc_proto::time::Millis,
-    /// Wall-clock millisecond the connection opened, for the registration
+    /// Monotonic millisecond the connection opened, for the registration
     /// deadline (an unregistered connection that never completes is reaped).
-    pub opened_at: e6irc_proto::time::Millis,
+    pub opened_at: e6irc_proto::time::MonoMillis,
     /// A server-initiated liveness PING is outstanding (set by the reaper,
     /// cleared on PONG); if still set at the pong deadline the socket is reaped.
     pub awaiting_pong: bool,
-    /// Wall-clock millisecond the outstanding liveness PING was sent.
-    pub last_ping_sent: e6irc_proto::time::Millis,
+    /// Monotonic millisecond the outstanding liveness PING was sent.
+    pub last_ping_sent: e6irc_proto::time::MonoMillis,
     /// How many database-backed replies this connection is still waiting on,
     /// and the output withheld behind them.
     ///
@@ -895,6 +906,16 @@ impl ServerState {
         self.registered_founders.contains_key(key)
     }
 
+    /// How many channels `account` currently founds — the cap check for
+    /// ChanServ REGISTER, which otherwise grows the founder map without bound.
+    pub fn channels_founded_by(&self, account: &str) -> usize {
+        let account_key = self.account_key(account);
+        self.registered_founders
+            .values()
+            .filter(|f| **f == account_key)
+            .count()
+    }
+
     /// Load persisted channel topics as `(name_folded, text, setter,
     /// set_at_secs)` rows into the hot retained-topic map.
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
@@ -1136,7 +1157,7 @@ impl ServerState {
     }
 
     pub fn open(&mut self, conn: ConnId, tx: Sender<Output>, host: String) {
-        let opened_at = (self.config.clock)();
+        let opened_at = (self.config.mono_clock)();
         let prev = self.sessions.insert(
             conn,
             Session {
@@ -1165,14 +1186,14 @@ impl ServerState {
                 multiline: None,
                 anon_read_markers: HashMap::new(),
                 flood_tokens: 0,
-                flood_refilled_to_ms: e6irc_proto::time::Millis::from_millis(0),
-                last_active: e6irc_proto::time::Millis::from_millis(0),
+                flood_refilled_to_ms: e6irc_proto::time::MonoMillis::from_millis(0),
+                last_active: e6irc_proto::time::MonoMillis::from_millis(0),
                 signon: e6irc_proto::time::Millis::from_millis(0),
                 opened_at,
                 awaiting_pong: false,
                 deferred_replies: 0,
                 held: Vec::new(),
-                last_ping_sent: e6irc_proto::time::Millis::from_millis(0),
+                last_ping_sent: e6irc_proto::time::MonoMillis::from_millis(0),
             },
         );
         assert!(prev.is_none(), "duplicate ConnId {conn:?} from acceptor");
