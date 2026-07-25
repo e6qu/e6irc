@@ -131,7 +131,13 @@ pub(crate) const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
 /// caller returns [`SessionOutcome::AuthRejected`] rather than `Dropped`. Gives
 /// the chat bridges the same "stop hammering the upstream with a bad token"
 /// backstop the IRC driver already has, instead of reconnecting forever.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+///
+/// Gated on `matrix` because that is the only bridge whose auth rejection is an
+/// HTTP status; Slack signals it in a 200 body (`slack_failure`) and Discord via
+/// a gateway close code, each handled inline. The `lint` CI job builds each
+/// bridge feature on its own with `-Dwarnings`, so a helper compiled but unused
+/// under a single feature is a hard error — hence the narrow gate.
+#[cfg(feature = "matrix")]
 pub(crate) fn is_http_auth_rejection(status: Option<reqwest::StatusCode>) -> bool {
     matches!(
         status,
@@ -144,14 +150,16 @@ pub(crate) fn is_http_auth_rejection(status: Option<reqwest::StatusCode>) -> boo
 /// failure ([`SessionOutcome::Dropped`] — retry with backoff). The `From<String>`
 /// / `From<&str>` conversions make every ordinary `?` in a bridge's `connect`
 /// fall through as `Transient`, so only the one credential-rejection site has to
-/// name `Auth` explicitly.
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+/// name `Auth` explicitly. Gated on `matrix` — the only bridge with a `connect`
+/// that returns a `Result` (see `is_http_auth_rejection` for why the gate is
+/// narrow).
+#[cfg(feature = "matrix")]
 pub(crate) enum ConnectFail {
     Auth(String),
     Transient(String),
 }
 
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[cfg(feature = "matrix")]
 impl ConnectFail {
     pub(crate) fn into_outcome(self, who: &str) -> SessionOutcome {
         match self {
@@ -167,14 +175,14 @@ impl ConnectFail {
     }
 }
 
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[cfg(feature = "matrix")]
 impl From<String> for ConnectFail {
     fn from(e: String) -> Self {
         Self::Transient(e)
     }
 }
 
-#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+#[cfg(feature = "matrix")]
 impl From<&str> for ConnectFail {
     fn from(e: &str) -> Self {
         Self::Transient(e.to_string())
