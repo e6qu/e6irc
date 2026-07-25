@@ -113,18 +113,11 @@ pub(super) async fn discover_metadata(
 
 pub(super) async fn oidc_start(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
+    // Each login start forces an outbound discovery fetch and grows
+    // `pending_auth`, so throttle the unauthenticated flood per client IP.
+    _rl: RateLimited,
     Path(provider_name): Path<String>,
 ) -> Response {
-    // Rate-limit login starts per client IP: each forces an outbound discovery
-    // fetch and grows pending_auth, so an unauthenticated flood is throttled.
-    if !auth_rate_ok(
-        &state,
-        client_ip(peer.ip(), &headers, &state.trusted_proxies),
-    ) {
-        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
-    }
     oidc_authorize(&state, &provider_name, None, false).await
 }
 
@@ -137,16 +130,9 @@ pub(super) async fn oidc_start(
 /// without a second explicit login.
 pub(super) async fn oidc_sso_start(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
+    _rl: RateLimited,
     Path(provider_name): Path<String>,
 ) -> Response {
-    if !auth_rate_ok(
-        &state,
-        client_ip(peer.ip(), &headers, &state.trusted_proxies),
-    ) {
-        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
-    }
     oidc_authorize(&state, &provider_name, None, true).await
 }
 
@@ -156,20 +142,13 @@ pub(super) async fn oidc_sso_start(
 /// identity when the provider returns.
 pub(super) async fn oidc_link_start(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
+    // Authenticated, so not an unauthenticated vector, but each call forces a
+    // discovery fetch and grows `pending_auth` — gated for parity with its
+    // siblings.
+    _rl: RateLimited,
     Authenticated(account): Authenticated,
     Path(provider_name): Path<String>,
 ) -> Response {
-    // Rate-limit per client IP like oidc_start/oidc_sso_start: each call forces
-    // a discovery fetch and grows `pending_auth`. Authenticated, so not an
-    // unauthenticated vector, but gated for parity with its siblings.
-    if !auth_rate_ok(
-        &state,
-        client_ip(peer.ip(), &headers, &state.trusted_proxies),
-    ) {
-        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
-    }
     oidc_authorize(&state, &provider_name, Some(account), false).await
 }
 
@@ -770,20 +749,12 @@ pub(super) async fn oidc_backchannel_logout(
 
 pub(super) async fn oidc_frontchannel_logout(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
-    Query(query): Query<FrontchannelLogoutQuery>,
-) -> Response {
     // Unlike the signed back-channel path, this endpoint has no token to verify —
     // it revokes a session by a guessable `sid`. Rate-limit per client IP so it
-    // can't be used to brute-force sids and force-logout victims, matching the
-    // other unauthenticated OIDC endpoints.
-    if !auth_rate_ok(
-        &state,
-        client_ip(peer.ip(), &headers, &state.trusted_proxies),
-    ) {
-        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
-    }
+    // can't be used to brute-force sids and force-logout victims.
+    _rl: RateLimited,
+    Query(query): Query<FrontchannelLogoutQuery>,
+) -> Response {
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -898,6 +869,46 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
         require_admin(state, &parts.headers)
             .await
             .map(|_account| AdminAccount)
+    }
+}
+
+/// A request that has spent one token from the per-IP auth-rate budget. Every
+/// unauthenticated, work-inducing route asks for this in its signature instead
+/// of opening with the `client_ip` + `auth_rate_ok` prologue (and pulling in
+/// `ConnectInfo` + `HeaderMap`) by hand — so the throttle is declared in one
+/// visible place, a `_: RateLimited` argument, and a route that induces work
+/// without it is a conspicuous omission rather than a forgotten first line the
+/// way `device_token` once was. Rejects `429` when the budget is exhausted.
+pub(crate) struct RateLimited;
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for RateLimited {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        // The server installs `ConnectInfo` (net.rs serves with
+        // `into_make_service_with_connect_info`); if it is somehow absent, fall
+        // back to the unspecified address so the limit still applies (fail
+        // closed) rather than skipping the gate.
+        let peer =
+            <axum::extract::ConnectInfo<std::net::SocketAddr> as axum::extract::FromRequestParts<
+                Arc<AppState>,
+            >>::from_request_parts(parts, state)
+            .await
+            .map(|ci| ci.0.ip())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let ip = client_ip(peer, &parts.headers, &state.trusted_proxies);
+        if auth_rate_ok(state, ip) {
+            Ok(RateLimited)
+        } else {
+            Err(problem(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests",
+                None,
+            ))
+        }
     }
 }
 

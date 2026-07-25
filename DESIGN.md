@@ -174,6 +174,14 @@ These are project-wide rules, enforced in review and (where possible) CI:
     the author opened the body with a manual check — the same shape as
     `Authenticated`/`AdminAccount`, one rung over (a new `pages::*` form handler
     that omits it fails to compile for want of the account argument).
+  - `RateLimited` — a request that has spent one token from the per-IP
+    auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
+    work-inducing route declares the throttle by asking for `_: RateLimited`
+    instead of opening with the `client_ip` + `auth_rate_ok` prologue (and
+    pulling in `ConnectInfo` + `HeaderMap`) by hand — so the gate lives in one
+    place and an ungated route is a conspicuous omission rather than a forgotten
+    first line, which is how `device_token` came to lack it. Same shape as the
+    other extractors, for the throttle rather than the auth check.
   - `escape_tag_value` — the tag-value escaper's output is wire-safe *by
     construction*: `;`/space/`\`/CR/LF get their escapes and a NUL (which has no
     tag escape and cannot ride a wire line) is dropped, so a caller that reaches

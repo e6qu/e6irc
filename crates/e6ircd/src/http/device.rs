@@ -4,22 +4,11 @@ use super::*;
 
 // ---- device authorization grant (RFC 8628) ------------------------------
 
-/// Start a device grant. No auth: the client is not yet a principal.
-pub(super) async fn device_start(
-    State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
-) -> Response {
-    // Rate-limit per client IP: this is unauthenticated and each call inserts a
-    // live `device_grants` row that pruning cannot touch for 10 minutes, so an
-    // anonymous flood would otherwise accumulate rows unboundedly. Gate it like
-    // every other unauthenticated work-inducing endpoint (oidc_start, etc.).
-    if !auth_rate_ok(
-        &state,
-        client_ip(peer.ip(), &headers, &state.trusted_proxies),
-    ) {
-        return problem(StatusCode::TOO_MANY_REQUESTS, "Too many requests", None);
-    }
+/// Start a device grant. No auth: the client is not yet a principal, but each
+/// call inserts a live `device_grants` row that pruning cannot touch for 10
+/// minutes — `RateLimited` caps the per-IP rate so an anonymous flood can't
+/// accumulate rows unboundedly.
+pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLimited) -> Response {
     let Some(pool) = &state.pool else {
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -69,6 +58,10 @@ pub(super) struct DeviceTokenReq {
 /// Poll for the token. RFC 8628 error codes on the not-yet-ready cases.
 pub(super) async fn device_token(
     State(state): State<Arc<AppState>>,
+    // Unauthenticated and each poll opens a DB transaction in `poll_device_grant`
+    // *before* validating the code, so an anonymous flood of bogus codes would
+    // saturate the connection pool. Rate-limit per client IP like every sibling.
+    _rl: RateLimited,
     JsonBody(req): JsonBody<DeviceTokenReq>,
 ) -> Response {
     let Some(pool) = &state.pool else {
