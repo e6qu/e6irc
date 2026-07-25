@@ -169,7 +169,9 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
             .map(|b| {
                 format!(
                     ":{server} NOTICE {nick} :{label} {} (by {}) :{}",
-                    b.mask, b.set_by, b.reason
+                    b.mask.as_str(),
+                    b.set_by,
+                    b.reason
                 )
             })
             .collect();
@@ -183,12 +185,13 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
         return;
     };
     // Enforcement folds mask and subject under the casemap (`mask::matches`), so
-    // the stored mask is folded too: otherwise `KLINE Baddie@Host` then
-    // `UNKLINE baddie@host` would compare case-sensitively, fail to remove, and
-    // report "no such ban" while the ban keeps enforcing — and two case-variants
-    // would double-store. Folding at storage makes the hot list, the DB
-    // `ON CONFLICT`/`DELETE` keys, and matching all agree. (Same fix the channel
-    // `+b/+q/+e/+I` path uses via `mask::eq`; here we fold once up front.)
+    // the stored mask must fold for comparison too: otherwise `KLINE Baddie@Host`
+    // then `UNKLINE baddie@host` would compare case-sensitively, fail to remove,
+    // and report "no such ban" while the ban keeps enforcing — and two
+    // case-variants would double-store. A `MaskKey` folds for equality while
+    // keeping the display casing, so the hot list, the DB `ON CONFLICT`/`DELETE`
+    // keys, and matching all agree — the same discipline the channel
+    // `+b/+q/+e/+I` lists use.
     let casemap = state.casemap;
     // XLINE targets the realname/gecos, which routinely contains spaces; IRC
     // tokenization splits it across params, so rejoin everything before the
@@ -209,11 +212,14 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     // whole if they pass 512 bytes. 300 chars is ample and leaves room for the
     // fixed wrapping on either line.
     let reason = e6irc_proto::message::truncate_on_char_boundary(&reason, 300).to_string();
-    let mask = casemap.casefold(&ban_mask(kind, &raw_mask));
-    // Replace any existing ban of this kind on the same mask.
+    // A MaskKey folds for comparison (so a differently-cased UN*LINE removes it)
+    // while keeping the operator's casing for STATS and the confirmation — the
+    // same discipline the channel ban lists use.
+    let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
+    // Replace any existing ban of this kind on the same mask (folded equality).
     state
         .server_bans
-        .retain(|b| !(b.kind == kind && e6irc_proto::mask::eq(casemap, &b.mask, &mask)));
+        .retain(|b| !(b.kind == kind && b.mask == mask));
     state.server_bans.push(ServerBan {
         mask: mask.clone(),
         reason: reason.clone(),
@@ -222,13 +228,19 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     });
     if state.config.sasl_enabled {
         let request = crate::core::DbRequest::AddServerBan {
-            mask: mask.clone(),
+            // The folded form is the storage/uniqueness key; the display form is
+            // persisted alongside so the original casing survives a restart.
+            mask: mask.folded().to_string(),
+            mask_display: mask.as_str().to_string(),
             reason: reason.clone(),
             set_by: nick.clone(),
             kind: kind.as_str().to_string(),
         };
         if state.db_tx.try_push(request).is_err() {
-            eprintln!("{command}: db queue full or closed; {label} for {mask} not persisted");
+            eprintln!(
+                "{command}: db queue full or closed; {label} for {} not persisted",
+                mask.as_str()
+            );
         }
     }
     // Audit and confirm *before* the disconnect loop: a self-matching ban
@@ -237,10 +249,13 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     // actor to an empty string (an unattributed row) and the confirmation NOTICE
     // would be a silent no-op on the gone session. This is the same ordering
     // `cmd_kill` documents for a self-kill.
-    record_audit(state, conn, &command, &mask, &reason);
+    record_audit(state, conn, &command, mask.as_str(), &reason);
     state.send(
         conn,
-        &format!(":{server} NOTICE {nick} :Added {label} for {mask}"),
+        &format!(
+            ":{server} NOTICE {nick} :Added {label} for {}",
+            mask.as_str()
+        ),
     );
     // Disconnect any matching registered sessions (possibly including `conn`).
     let victims: Vec<ConnId> = state
@@ -254,7 +269,7 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
                 &s.host,
                 s.realname.as_deref().unwrap_or(""),
             );
-            e6irc_proto::mask::matches(casemap, &mask, &subject).then_some(c)
+            e6irc_proto::mask::matches(casemap, mask.as_str(), &subject).then_some(c)
         })
         .collect();
     for victim in victims {
@@ -299,30 +314,34 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         BanKind::Xline => p.join(" "),
         _ => p[0].to_string(),
     };
-    let mask = casemap.casefold(&ban_mask(kind, &raw_mask));
+    let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
     let before = state.server_bans.len();
     state
         .server_bans
-        .retain(|b| !(b.kind == kind && e6irc_proto::mask::eq(casemap, &b.mask, &mask)));
+        .retain(|b| !(b.kind == kind && b.mask == mask));
     let removed = state.server_bans.len() < before;
     if removed && state.config.sasl_enabled {
         let request = crate::core::DbRequest::RemoveServerBan {
-            mask: mask.clone(),
+            // The folded form is the DB delete key (see cmd_add_ban).
+            mask: mask.folded().to_string(),
             kind: kind.as_str().to_string(),
         };
         if state.db_tx.try_push(request).is_err() {
-            eprintln!("{un}: db queue full or closed; removal of {mask} not persisted");
+            eprintln!(
+                "{un}: db queue full or closed; removal of {} not persisted",
+                mask.as_str()
+            );
         }
     }
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn].nick.clone().expect("registered");
     let msg = if removed {
-        format!("Removed {label} for {mask}")
+        format!("Removed {label} for {}", mask.as_str())
     } else {
-        format!("No {label} found for {mask}")
+        format!("No {label} found for {}", mask.as_str())
     };
     if removed {
-        record_audit(state, conn, &un, &mask, "");
+        record_audit(state, conn, &un, mask.as_str(), "");
     }
     state.send(conn, &format!(":{server} NOTICE {nick} :{msg}"));
 }

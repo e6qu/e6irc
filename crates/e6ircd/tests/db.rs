@@ -2504,14 +2504,21 @@ async fn server_bans_persist_and_load() {
         .await
         .expect("connect");
 
-    db::add_server_ban(&pool, "baddie@*", "spam", "god", "kline")
+    db::add_server_ban(&pool, "baddie@*", "baddie@*", "spam", "god", "kline")
         .await
         .expect("add1");
-    db::add_server_ban(&pool, "203.0.113.0", "netblock", "god", "dline")
-        .await
-        .expect("add2");
+    db::add_server_ban(
+        &pool,
+        "203.0.113.0",
+        "203.0.113.0",
+        "netblock",
+        "god",
+        "dline",
+    )
+    .await
+    .expect("add2");
     // Same textual mask as the K-line but a different kind coexists.
-    db::add_server_ban(&pool, "baddie@*", "gecos", "god", "xline")
+    db::add_server_ban(&pool, "baddie@*", "baddie@*", "gecos", "god", "xline")
         .await
         .expect("add3");
     let mut list = db::list_server_bans(&pool).await.expect("list");
@@ -2541,7 +2548,7 @@ async fn server_bans_persist_and_load() {
     );
 
     // Re-banning the same (mask, kind) upserts (new reason/setter, no dup).
-    db::add_server_ban(&pool, "baddie@*", "spam again", "root", "kline")
+    db::add_server_ban(&pool, "baddie@*", "baddie@*", "spam again", "root", "kline")
         .await
         .expect("upsert");
     let list = db::list_server_bans(&pool).await.expect("list");

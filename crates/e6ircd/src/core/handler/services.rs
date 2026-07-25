@@ -81,21 +81,21 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     return;
                 }
             };
-            // A SASL verify and an IDENTIFY verify must never be in flight for
-            // one connection at once: both are offloaded and their replies
-            // routed by ambient flags, so an IDENTIFY reply landing mid-SASL
-            // would be taken for the SASL result (logging the client in as the
-            // wrong account), and vice-versa. Reject an IDENTIFY while a SASL
-            // verify is pending; the SASL verify-start likewise refuses while an
-            // IDENTIFY is pending, so the two flows are mutually exclusive. (Two
-            // overlapping IDENTIFYs are harmless by contrast — each names an
-            // account the client proved it owns — so they stay allowed, bounded
-            // by the credential budget below.)
-            if state.sessions[&conn].sasl_verify_pending {
+            // At most one credential verify (SASL *or* IDENTIFY) may be in flight
+            // for one connection: both are offloaded and their verdicts routed by
+            // the single `pending_identify` / `sasl_verify_pending` flags, so a
+            // second verify in flight shares a flag the first verdict to land
+            // clears — the later, possibly-*valid* verdict then hits the "flag
+            // already cleared → stale, drop" guard and is silently discarded (no
+            // login, no notice). This holds for two IDENTIFYs just as for an
+            // IDENTIFY racing a SASL verify (an earlier comment wrongly called
+            // overlapping IDENTIFYs harmless). Refuse a second while either is
+            // pending; the SASL verify-start refuses symmetrically.
+            if state.sessions[&conn].sasl_verify_pending || state.sessions[&conn].pending_identify {
                 state.service_notice(
                     conn,
                     "NickServ",
-                    "A SASL authentication is already in progress. Try again in a moment.",
+                    "An authentication is already in progress. Try again in a moment.",
                 );
                 return;
             }

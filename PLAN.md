@@ -1593,6 +1593,55 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-first sweep — the open backlog, done, plus two hunt-found bugs
+(2026-07-25): the first sweep under the No-Deferral Rule, so the two items the
+old habit had left open are fixed here rather than carried, and a services/query
+hunt surfaced two more live bugs — all in one change.
+
+**`WireLine` — wire-line injection made unrepresentable at the delivery funnel**
+(core/mod.rs, state.rs). An embedded CR/LF/NUL in a line's content splits it into
+a second forged line on the wire; the funnel checked only line *length*, so the
+injection class was prevented solely upstream (parse-rejection + per-position
+sanitizers) with no funnel backstop in release for a path that builds a line from
+a non-parser source. `deliver` now takes only a `WireLine`, whose sole
+constructor neutralizes those bytes (keeping the one trailing CRLF), so no
+injection can reach a client in any build. Unlike the over-long-line check (a
+*code* bug the debug assertion panics on to surface it in tests), an injection
+byte can ride legitimate *data* the core relays from an untrusted store or bridge
+(a history body), so it is neutralized rather than asserted against — the funnel
+must handle a dirty byte, not abort the shared worker. This closes the item the
+prior sweep documented as a debug-only check — done, not carried, and honoring
+the documented no-production-panic trade-off (DESIGN §7.1).
+
+**Server-ban masks → `MaskKey`, with display casing preserved** (state.rs,
+oper.rs, db.rs, migration 0031). Server bans stored and echoed the *folded* mask,
+so `KLINE Baddie@Host` showed as `baddie@host` in STATS — unlike a channel `+b`,
+which keeps the setter's casing. `ServerBan.mask` is now a `MaskKey` (folded
+equality, display casing kept), a new `mask_display` column persists the casing
+across a restart (the folded `mask` stays the storage key), and the by-hand
+`mask::eq` the path used is deleted (its last caller gone). Removal stays
+case-insensitive; STATS shows the original.
+
+**Two hunt-found MED bugs.** (1) *Overlapping NickServ IDENTIFY dropped the
+second, possibly-valid, verdict* (services.rs): the handler refused a new
+IDENTIFY only while a *SASL* verify was pending, not while another IDENTIFY was —
+so two shared the one `pending_identify` flag, the first verdict to land cleared
+it, and the second hit the stale-reply guard and vanished with no login and no
+notice (an earlier comment wrongly called overlapping IDENTIFYs harmless). Now a
+second is refused while either verify is pending, symmetric with SASL. (2) *A
+FLAGS grant reply after a DROP left a phantom access entry* (sasl.rs): DROP clears
+`registered_founders`/`channel_access` and cascade-deletes the DB rows
+synchronously, but the `ChannelAccessSet` reply re-inserted into the hot map
+unconditionally — a phantom for a channel the DB no longer had, which would
+auto-op that account if the name were ever re-registered. The insert now skips
+when the channel is no longer registered and reports the grant void.
+
+Full gate green, including the new `tools/check-no-defer.sh`: workspace tests,
+clippy (default + `embed-web` + bridges), fmt, the five guard scripts,
+`cargo deny`, the fuzz build, the PG-backed `db` suite (41, which applies
+migration 0031 and round-trips a server ban), `http`, `oidc`, irctest main (380)
+and the persistence-backed services list (49).
+
 No-Deferral Rule + guard (2026-07-25): a process correction, not a sweep. Over
 the preceding sweeps the agent repeatedly *recorded* fixes as pending rather
 than doing them, and justified skipping worthwhile changes as not-worth-it —

@@ -540,7 +540,7 @@ async fn admin_accounts_endpoint_is_gated() {
         .await
         .expect("tok");
     // Seed data for the other admin read endpoints.
-    e6ircd::db::add_server_ban(&pool, "spammer@*", "spam", "alice", "kline")
+    e6ircd::db::add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
         .await
         .expect("kline");
     e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")

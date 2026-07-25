@@ -186,8 +186,11 @@ pub enum DbRequest {
         flags: Option<String>,
     },
     /// Persist a server ban (oper KLINE/DLINE/XLINE). Fire-and-forget.
+    /// `mask` is the casefolded storage/uniqueness key; `mask_display` preserves
+    /// the operator's original casing for STATS across a restart.
     AddServerBan {
         mask: String,
+        mask_display: String,
         reason: String,
         set_by: String,
         kind: String,
@@ -475,6 +478,43 @@ pub enum DbReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output(pub Bytes);
 
+/// A wire line whose content carries no injection bytes (embedded CR/LF/NUL).
+/// [`deliver`] takes only this, so a client's stream can never be handed a line
+/// that smuggles a second, forged line — the injection class is *unrepresentable
+/// at the delivery funnel*, in every build (not merely a debug assertion).
+///
+/// Its one constructor, [`WireLine::sanitized`], neutralizes any CR/LF/NUL in
+/// the content — replacing each with a space, as `sanitize::upstream_line` does
+/// for bridge lines — while leaving the single trailing CRLF terminator, in
+/// every build. A well-formed line built by `ServerState::send` already has
+/// clean content (`Message::parse` rejects those bytes on input, and
+/// per-position sanitizers guard the synthesized fields), so this is a no-op
+/// fast path; the neutralization is the backstop for a line that carries an
+/// injection byte from an untrusted *data* source the core relays — a history
+/// body, a bridged line, future code. Unlike the over-long-line check (a *code*
+/// bug the debug assertion panics on to surface in tests), an injection byte is
+/// data the core must handle gracefully rather than aborting the shared worker,
+/// so it is neutralized, never asserted against.
+pub(crate) struct WireLine(Bytes);
+
+impl WireLine {
+    pub(crate) fn sanitized(bytes: Bytes) -> Self {
+        // Only the content before the terminating CRLF is scanned; the
+        // terminator itself is the one legitimate CRLF in the line.
+        let end = bytes.len() - if bytes.ends_with(b"\r\n") { 2 } else { 0 };
+        if !bytes[..end].iter().any(|&b| matches!(b, b'\r' | b'\n' | 0)) {
+            return WireLine(bytes); // fast path: content already injection-free
+        }
+        let mut out = bytes.to_vec();
+        for b in &mut out[..end] {
+            if matches!(*b, b'\r' | b'\n' | 0) {
+                *b = b' ';
+            }
+        }
+        WireLine(Bytes::from(out))
+    }
+}
+
 pub struct Core {
     state: ServerState,
 }
@@ -586,8 +626,8 @@ impl Core {
 /// Deliver one output event; a full/closed send queue means the client
 /// is too slow (or gone) and the connection must die — the classic
 /// SendQ-exceeded kill. Never silently dropped.
-fn deliver(tx: &Sender<Output>, out: Output) -> Result<(), SendqExceeded> {
-    match tx.try_push(out) {
+fn deliver(tx: &Sender<Output>, line: WireLine) -> Result<(), SendqExceeded> {
+    match tx.try_push(Output(line.0)) {
         Ok(_) => Ok(()),
         Err(PushError::Full(_)) => Err(SendqExceeded),
         // Receiver gone: the I/O task is already dead. On the common
@@ -601,3 +641,27 @@ fn deliver(tx: &Sender<Output>, out: Output) -> Result<(), SendqExceeded> {
 }
 
 struct SendqExceeded;
+
+#[cfg(test)]
+mod wire_line_tests {
+    use super::{Bytes, WireLine};
+
+    #[test]
+    fn sanitized_neutralizes_injection_and_keeps_terminator() {
+        // Embedded CR/LF in the content (a forged second line) become spaces;
+        // the single trailing CRLF terminator is preserved.
+        let injected = Bytes::from(&b"PRIVMSG #c :hi\r\nQUIT :forged\r\n"[..]);
+        assert_eq!(
+            &WireLine::sanitized(injected).0[..],
+            &b"PRIVMSG #c :hi  QUIT :forged\r\n"[..]
+        );
+        // An embedded NUL becomes a space too.
+        assert_eq!(
+            &WireLine::sanitized(Bytes::from(&b"a\0b\r\n"[..])).0[..],
+            b"a b\r\n"
+        );
+        // A clean line is returned unchanged (fast path).
+        let clean = Bytes::from(&b"PING :token\r\n"[..]);
+        assert_eq!(WireLine::sanitized(clean.clone()).0, clean);
+    }
+}

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_queue::Sender;
 
-use super::{Output, deliver};
+use super::{Output, WireLine, deliver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId(pub u64);
@@ -36,11 +36,12 @@ impl NickKey {
 /// A channel list-mode mask (`+b`/`+q`/`+e`/`+I`), carrying both the casefolded
 /// form used for equality and the original casing used for display and matching.
 ///
-/// Extends the key-newtype discipline to the one place identities live in a
-/// `Vec` rather than a map key: without it, dedup and removal fold *by hand*
-/// (`mask::eq`) while enforcement folds too, and a single site that forgets the
-/// fold silently double-stores a ban or fails to remove one the matcher still
-/// enforces — the class sweeps 54/67 fixed by hand. `PartialEq`/`Eq`/`Hash`
+/// Extends the key-newtype discipline to the two places identities live in a
+/// `Vec` rather than a map key (channel `+b`/`+q`/`+e`/`+I` lists and the
+/// server-ban list): without it, dedup and removal fold *by hand* while
+/// enforcement folds too, and a single site that forgets the fold silently
+/// double-stores a ban or fails to remove one the matcher still enforces — the
+/// class sweeps 54/67 fixed by hand. `PartialEq`/`Eq`/`Hash`
 /// compare the folded form, so `#foo` and `#FOO` are one entry *by construction*
 /// and `contains`/`retain` can't get it wrong; [`MaskKey::as_str`] returns the
 /// original casing for `RPL_BANLIST` and for `mask::matches` (which folds the
@@ -63,6 +64,13 @@ impl MaskKey {
     /// `mask::matches`, which applies the casemapping to the mask itself.
     pub fn as_str(&self) -> &str {
         &self.display
+    }
+
+    /// The casefolded form — the identity key. Used where a mask is persisted
+    /// with its fold as the storage/uniqueness key (server bans), so the DB key
+    /// and the in-core equality agree.
+    pub fn folded(&self) -> &str {
+        &self.folded
     }
 }
 
@@ -582,10 +590,14 @@ impl BanKind {
 }
 
 /// A server ban: a glob `mask` and its `reason`, tested against the
-/// session field named by `kind`.
+/// session field named by `kind`. `mask` is a [`MaskKey`], so removal compares
+/// the folded form (a `KLINE Baddie@Host` is lifted by `UNKLINE baddie@host`)
+/// by construction, while STATS and the confirmation show the operator's
+/// original casing — the same discipline the channel `+b`/`+q`/`+e`/`+I` lists
+/// use, rather than a fold-by-hand `String` plus a `mask::eq` at each site.
 #[derive(Clone)]
 pub struct ServerBan {
-    pub mask: String,
+    pub mask: MaskKey,
     pub reason: String,
     pub set_by: String,
     pub kind: BanKind,
@@ -1084,12 +1096,13 @@ impl ServerState {
             .into_iter()
             .filter_map(
                 |(mask, reason, set_by, kind)| match BanKind::from_token(&kind) {
-                    // Fold the loaded mask, so a legacy or externally-inserted
-                    // unfolded row (`Baddie@Host`) can't enforce-but-resist a
-                    // folded `UNKLINE`'s removal — memory is kept consistent with
-                    // the fold the matcher and every write path already apply.
+                    // `mask` is the stored *display* form (`COALESCE(mask_display,
+                    // mask)`); `MaskKey::new` folds it for comparison, so removal
+                    // matches regardless of casing while STATS shows the original.
+                    // A legacy/externally-inserted row surfaces its stored casing;
+                    // its fold still governs enforcement and `UNKLINE`.
                     Some(kind) => Some(ServerBan {
-                        mask: casemap.casefold(&mask),
+                        mask: MaskKey::new(&mask, casemap),
                         reason,
                         set_by,
                         kind,
@@ -1120,7 +1133,7 @@ impl ServerState {
     pub fn ban_match(&self, user: &str, host: &str, realname: &str) -> Option<(BanKind, String)> {
         self.server_bans.iter().find_map(|b| {
             let subject = Self::ban_subject(b.kind, user, host, realname);
-            e6irc_proto::mask::matches(self.casemap, &b.mask, &subject)
+            e6irc_proto::mask::matches(self.casemap, b.mask.as_str(), &subject)
                 .then(|| (b.kind, b.reason.clone()))
         })
     }
@@ -1354,7 +1367,7 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return; // events may race a close; the session is gone
         };
-        if deliver(&session.tx, Output(bytes)).is_err() {
+        if deliver(&session.tx, WireLine::sanitized(bytes)).is_err() {
             self.doomed.push(conn);
         }
     }
@@ -1632,7 +1645,7 @@ impl ServerState {
         for session in self.sessions.values() {
             // Best-effort per client: a peer already gone just means its send
             // queue is closed, which `deliver` treats as a no-error close.
-            let _ = deliver(&session.tx, Output(bytes.clone()));
+            let _ = deliver(&session.tx, WireLine::sanitized(bytes.clone()));
         }
     }
 
@@ -1835,6 +1848,16 @@ fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
             body.len()
         ));
     }
+    // Injection (an embedded CR/LF/NUL in the content) is deliberately NOT a
+    // debug panic here, only a length violation is. The two differ in kind: an
+    // over-long line is a *code* bug (a formatting path lost track of the wire
+    // budget), so panicking finds it in tests. An injection byte, by contrast,
+    // can ride legitimate *data* the core relays from an untrusted store or
+    // bridge (a history body, an upstream line) — real inputs reject those bytes
+    // up front, but the core must handle a dirty one gracefully, which is to
+    // *neutralize* it, not abort the shared worker. That neutralization is the
+    // unconditional guarantee of `WireLine::sanitized` at the delivery funnel;
+    // asserting "no line ever carries one" would fire on that legitimate data.
     None
 }
 
