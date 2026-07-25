@@ -82,6 +82,13 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
     };
     match tokio::time::timeout(Duration::from_secs(30), register_fut).await {
         Ok(Ok(_)) => {}
+        // A terminal auth/registration refusal (bad password, banned) surfaces
+        // as `PermissionDenied` from the client — distinct from a transient
+        // connection error, so the reconnect loop can stop re-dialing rather
+        // than hammer the upstream with the same rejected credentials forever.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return super::SessionOutcome::AuthRejected;
+        }
         Ok(Err(_)) | Err(_) => return super::SessionOutcome::Dropped,
     }
     ends.emit(ConnectionEvent::Connected);

@@ -195,19 +195,20 @@ async fn connect(config: &MatrixConfig) -> Result<Session, String> {
                 "matrix: room alias {alias:?} maps to an unsafe IRC channel {channel:?}"
             ));
         }
-        // Two rooms that derive the same IRC channel name would silently
-        // overwrite each other in the map — outbound reaching only one room,
-        // inbound from both collapsing under one channel. Refuse loudly, like an
-        // unsafe name, rather than lose the mapping.
-        if session.channel_to_room.contains_key(&channel) {
+        // Two rooms that derive the same IRC channel name — *under the
+        // casemapping* — would silently overwrite each other in the map:
+        // outbound reaching only one room, inbound from both collapsing under one
+        // channel. The forward map is keyed by the folded name so a case variant
+        // (`#General` vs `#general`) is caught by this guard and routes
+        // correctly; the reverse map keeps the display casing.
+        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
+        if session.channel_to_room.contains_key(&folded) {
             return Err(format!(
                 "matrix: two rooms map to the same IRC channel {channel:?}; rename one alias"
             ));
         }
         let room_id = join_room(&session, alias).await?;
-        session
-            .channel_to_room
-            .insert(channel.clone(), room_id.clone());
+        session.channel_to_room.insert(folded, room_id.clone());
         session.room_to_channel.insert(room_id, channel);
     }
     Ok(session)
@@ -300,30 +301,38 @@ enum Relayed {
 }
 
 async fn handle_command(s: &mut Session, line: &str) -> Relayed {
-    let (room_id, text) = match super::route_privmsg(line, &s.channel_to_room) {
-        super::RouteResult::Deliver(room_id, text) => (room_id, text),
-        super::RouteResult::Unmapped(target) => return Relayed::Unmapped(target),
-        super::RouteResult::Ignore => return Relayed::Ok,
-    };
-    s.txn += 1;
-    let txn = s.txn;
-    let url = format!(
-        "{}/_matrix/client/v3/rooms/{}/send/m.room.message/e6{txn}",
-        s.base,
-        urlencode(&room_id),
-    );
-    let send = s
-        .http
-        .put(url)
-        .bearer_auth(&s.token)
-        .json(&serde_json::json!({ "msgtype": "m.text", "body": text }))
-        .send()
-        .await;
-    if let Err(e) = send {
-        eprintln!("matrix: send to room {room_id} failed: {e}");
-        return Relayed::Failed(room_id);
+    // One line may resolve to several targets (a comma list); deliver each and
+    // report the last problem, if any.
+    let mut outcome = Relayed::Ok;
+    for routed in super::route_privmsg(line, &s.channel_to_room) {
+        let (room_id, text) = match routed {
+            super::RouteResult::Deliver(room_id, text) => (room_id, text),
+            super::RouteResult::Unmapped(target) => {
+                outcome = Relayed::Unmapped(target);
+                continue;
+            }
+            super::RouteResult::Ignore => continue,
+        };
+        s.txn += 1;
+        let txn = s.txn;
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/e6{txn}",
+            s.base,
+            urlencode(&room_id),
+        );
+        let send = s
+            .http
+            .put(url)
+            .bearer_auth(&s.token)
+            .json(&serde_json::json!({ "msgtype": "m.text", "body": text }))
+            .send()
+            .await;
+        if let Err(e) = send {
+            eprintln!("matrix: send to room {room_id} failed: {e}");
+            outcome = Relayed::Failed(room_id);
+        }
     }
-    Relayed::Ok
+    outcome
 }
 
 /// `#name:server` → IRC channel `#name`.

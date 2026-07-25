@@ -1593,6 +1593,77 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-seventh sweep — backlog purge + two more bug classes made
+unrepresentable (2026-07-25): a step back to drain the entire "surfaced, not
+changed" backlog in one branch, make bug *classes* impossible rather than
+patching instances, and hunt for more on the way. Seventeen items landed
+together (client crates, bridges, the DB worker, the account/label state
+machine); every one green under the full local gate before the PR.
+
+**Two classes made unrepresentable this sweep.**
+
+1. **`MaskKey` — casefold-in-lists can't be forgotten** (`core/state.rs`,
+   channel.rs). The typed-key newtypes (`ChanKey`/`NickKey`/…) had already made
+   casefold bugs unrepresentable for *map* keys, but a channel's ban/quiet/
+   exception lists are `Vec`s, and every push/contains/retain re-folded by hand
+   — one missed fold is a ban that silently doesn't match. A new `MaskKey`
+   folding newtype carries the folded form for comparison and the display form
+   for RPL_BANLIST; the lists are now `Vec<MaskKey>` and the fold happens once,
+   in the constructor. The same class the map keys closed, now closed for the
+   list elements.
+
+2. **`CredentialOrigin` — a verify verdict routes on its own origin, never on
+   ambient flags** (`core/mod.rs`, sasl.rs, db.rs). `PasswordVerified` /
+   `PasswordRejected` / `Unavailable` are the shared answer to *either* a SASL
+   `AUTHENTICATE` or a NickServ `IDENTIFY`, and `db_reply` used to pick the flow
+   by inspecting the session's `sasl == Verifying` / `pending_identify` flags.
+   That inference conflates "which command asked" with "is the attempt still
+   live": the two flag-states can coexist in principle, and a verdict arriving
+   under the wrong one logs the client in as the wrong account. Today a
+   single-outstanding-verify invariant (AUTHENTICATE refuses while an IDENTIFY
+   is pending, and vice-versa) makes the mis-route unreachable — but correctness
+   rested on a guard enforced three functions away. The verify request now
+   carries a `CredentialOrigin`, echoed onto the reply, and routing matches on
+   it; the session flag is consulted only for liveness (drop a verdict for an
+   aborted/superseded attempt). A `handle_verify` that used to return a
+   `DbReply` — misused as an internal helper by `issue_app_password` — now
+   returns a domain `VerifyOutcome` the worker maps to the origin-carrying reply
+   at the one place that knows the origin. New unit test injects a cross-origin
+   verdict and proves it cannot complete the other flow.
+
+**Labeled REGISTER, and a dead flag it exposed** (registration.rs, sasl.rs,
+core/state.rs, handler/mod.rs). REGISTER's answer always comes from a database
+round trip, so a client that labeled the command got its `SUCCESS`/`FAIL` back
+*unlabeled* — labeled-response silently broken for the one command whose answer
+is never synchronous. Fixing it exposed that `pending_register: bool` was dead
+write-only state: the routing it once enabled was replaced by the origin-carrying
+`AccountCreated`/`AccountExists`/`AccountRegisterUnavailable` replies, and nothing
+read the flag anymore (its doc-comment still described the vanished routing).
+Repurposed into `pending_register: Option<Option<String>>` carrying the escaped
+label; a new `emit_deferred_labeled` reuses the exact synchronous framer so the
+deferred reply gets the `@label` tag (or a labeled batch) identically. New test
+covers both the labeled SUCCESS and FAIL branches.
+
+**The rest of the backlog, drained.** MODE with an empty target now answers 461
+instead of silently no-oping; KNOCK consults the `+b` list; `/api/v1/me` tries
+Bearer auth before the cookie path; a startup guard rejects `http.admin_accounts`
+without `[database]`; an unauthenticated `~nick` DM ring is freed on disconnect
+instead of leaking; multiline PRIVMSG to an away user now emits RPL_AWAY;
+NickServ gained LOGOUT; registration is held through a SASL verify; the CHATHISTORY
+replay path carries the `bot` tag (new `sender_is_bot` column + migration 0030);
+the CLI wraps error reasons in `terminal_safe`; the bridges route comma-lists /
+STATUSMSG prefixes / case-folded targets correctly, cap the WS frame size, render
+attachment-only messages, and resolve Slack display names; the BNC parks after
+five consecutive auth rejections instead of hot-looping; and the OAUTHBEARER
+verify-pending lockout (the same class fixed for PLAIN in sweep 75, missed in the
+token branch) is closed.
+
+Full gate green: workspace tests, clippy (default + `embed-web` + bridges), fmt,
+the four guard scripts, `cargo deny`, the fuzz build (a `HistoryRow` site the bot
+column touched — the separate-gate rule earning its keep again), the PG-backed
+`db` suite (41, incl. migration 0030), `http`, `oidc`, irctest main (380) and the
+persistence-backed services green list (49).
+
 Seventy-sixth sweep — a bouncer that flaps on one bad upstream byte, plus
 three more live bugs (2026-07-25): four hunts (casefold/identity-comparison
 consistency, command dispatch/arity, the account/identity state machine, and

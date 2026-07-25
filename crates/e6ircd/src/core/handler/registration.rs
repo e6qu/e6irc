@@ -264,13 +264,21 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         // output behind it so the reply cannot be overtaken by, say, the PONG
         // to a PING the client pipelined after REGISTER.
         state.defer_reply(conn);
-        // Mark the deferral so a transient DB failure (whose reply carries no
-        // origin) is still routed back to REGISTER and releases the hold.
+        // If this REGISTER was labeled, the answer is produced asynchronously,
+        // so tell the synchronous framer not to ACK it as an empty response —
+        // and stash the label so the deferred SUCCESS/FAIL is framed under it.
+        // `None` (unlabeled) still marks the register pending; the inner option
+        // distinguishes "labeled" from "unlabeled", both from "not pending".
+        let label = state.capture.as_mut().and_then(|cap| {
+            cap.label.clone().inspect(|_| {
+                cap.deferred = true;
+            })
+        });
         state
             .sessions
             .get_mut(&conn)
             .expect("checked")
-            .pending_register = true;
+            .pending_register = Some(label);
     }
 }
 

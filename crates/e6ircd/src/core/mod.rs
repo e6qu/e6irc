@@ -81,9 +81,12 @@ pub enum DbRequest {
         conn: ConnId,
         account: String,
         password: String,
+        /// Which command asked, echoed onto the reply so it routes itself.
+        origin: CredentialOrigin,
     },
     /// Verify a bearer token (SASL OAUTHBEARER); answered with the same
-    /// `PasswordVerified`/`PasswordRejected` replies as a password.
+    /// `PasswordVerified`/`PasswordRejected` replies as a password. A token is
+    /// only ever presented by SASL, so its reply origin is always `Sasl`.
     VerifyToken { conn: ConnId, token: String },
     CreateAccount {
         conn: ConnId,
@@ -213,6 +216,8 @@ pub enum DbRequest {
         sender_account: Option<String>,
         kind: MessageKind,
         body: String,
+        /// The sender was a bot (+B) at send time (replayed as the `bot` tag).
+        sender_is_bot: bool,
         /// Unix milliseconds.
         ts: e6irc_proto::time::Millis,
     },
@@ -227,6 +232,21 @@ pub enum DbRequest {
 pub enum AccountOrigin {
     NickServ,
     RegisterCommand,
+}
+
+/// Which command asked for a credential verification. The reply carries this
+/// back so `db_reply` routes on the origin the request *was*, not on session
+/// flags that guess it: `sasl == Verifying` and `pending_identify` can both be
+/// set at once (a registered client may interleave `AUTHENTICATE` with a
+/// NickServ `IDENTIFY`), and inferring the origin from them mis-routed an
+/// IDENTIFY verdict as a SASL one. The origin routes; the session flag only
+/// says whether that path is still live (not aborted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialOrigin {
+    /// A SASL `AUTHENTICATE` — PLAIN password or OAUTHBEARER token.
+    Sasl,
+    /// A NickServ `IDENTIFY`.
+    NickServIdentify,
 }
 
 /// A resolved CHATHISTORY window.
@@ -366,14 +386,19 @@ pub struct HistoryRow {
     pub sender_account: Option<String>,
     pub kind: MessageKind,
     pub body: String,
+    /// The sender was a bot (+B) at send time; replay re-emits the `bot` tag.
+    pub sender_is_bot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbReply {
     PasswordVerified {
         account: String,
+        origin: CredentialOrigin,
     },
-    PasswordRejected,
+    PasswordRejected {
+        origin: CredentialOrigin,
+    },
     AccountCreated {
         account: String,
         origin: AccountOrigin,
@@ -435,9 +460,13 @@ pub enum DbReply {
     ChannelAccessUnavailable {
         channel: String,
     },
-    /// The database is unreachable or errored; the client gets a loud
-    /// failure, never a silent hang.
-    Unavailable,
+    /// A credential verification could not be attempted — the database is
+    /// unreachable or errored. Carries the origin so the client gets the loud
+    /// failure appropriate to how it asked (SASL FAIL vs NickServ notice),
+    /// never a silent hang, and never a verdict routed to the wrong command.
+    Unavailable {
+        origin: CredentialOrigin,
+    },
 }
 
 /// One wire line out to a connection I/O task, CRLF included. Socket

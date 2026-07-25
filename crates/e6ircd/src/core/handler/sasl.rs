@@ -9,6 +9,48 @@ pub(super) fn sasl_fail(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_SASLFAIL, &[], Some("SASL authentication failed"));
 }
 
+/// A credential verification was denied — either a definitive rejection
+/// (`unavailable == false`) or a store fault (`unavailable == true`). Routed by
+/// the verdict's own `origin` so a SASL denial fails the SASL attempt and a
+/// NickServ IDENTIFY denial answers NickServ, never the reverse. The session
+/// flag is consulted only for liveness: a denial for an attempt already aborted
+/// or superseded is dropped rather than answered twice.
+fn verify_denied(
+    state: &mut ServerState,
+    conn: ConnId,
+    origin: crate::core::CredentialOrigin,
+    unavailable: bool,
+) {
+    match origin {
+        crate::core::CredentialOrigin::Sasl => {
+            if state.sessions[&conn].sasl == crate::core::state::SaslState::Verifying {
+                sasl_fail(state, conn);
+            }
+            // else: stale reply for an aborted SASL attempt — drop it.
+        }
+        crate::core::CredentialOrigin::NickServIdentify => {
+            if !state.sessions[&conn].pending_identify {
+                return; // stale IDENTIFY reply (superseded/aborted)
+            }
+            state
+                .sessions
+                .get_mut(&conn)
+                .expect("checked")
+                .pending_identify = false;
+            let text = if unavailable {
+                "Services are temporarily unavailable. Try again later.".to_string()
+            } else {
+                let nick = state.sessions[&conn]
+                    .nick
+                    .clone()
+                    .unwrap_or_else(|| "*".into());
+                format!("Invalid password for \x02{nick}\x02.")
+            };
+            state.service_notice(conn, "NickServ", &text);
+        }
+    }
+}
+
 /// Max credential-verification attempts per connection before the socket is
 /// closed — a single connection can't drive unbounded argon2 work.
 pub(super) const MAX_CREDENTIAL_ATTEMPTS_PER_CONN: u32 = 8;
@@ -170,6 +212,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     conn,
                     account,
                     password,
+                    origin: crate::core::CredentialOrigin::Sasl,
                 };
                 if state.db_tx.try_push(request).is_err() {
                     // DB worker unreachable: fail loudly, never hang. No verify
@@ -208,15 +251,22 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                 if !credential_attempt_ok(state, conn) {
                     return;
                 }
-                {
-                    let s = state.sessions.get_mut(&conn).expect("checked");
-                    s.sasl = SaslState::Verifying;
-                    s.sasl_verify_pending = true;
-                }
+                state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = crate::core::DbRequest::VerifyToken { conn, token };
                 if state.db_tx.try_push(request).is_err() {
-                    // DB worker unreachable: fail loudly, never hang.
+                    // DB worker unreachable: fail loudly, never hang. The verify
+                    // was never enqueued, so no reply will clear a pending flag —
+                    // which is why the flag is set only on a successful push
+                    // below (the same fix the PLAIN arm carries; this OAUTHBEARER
+                    // arm had the set-then-maybe-fail order that stuck the flag
+                    // true and locked the connection out of all auth for good).
                     sasl_fail(state, conn);
+                } else {
+                    state
+                        .sessions
+                        .get_mut(&conn)
+                        .expect("checked")
+                        .sasl_verify_pending = true;
                 }
             }
         }
@@ -250,33 +300,45 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     {
         return; // client vanished while the DB worked; nothing to do
     }
-    // A verify reply (for SASL or an aborted SASL attempt) arriving clears the
-    // outstanding-verify marker so a queued re-auth can proceed. Harmless for a
-    // non-SASL reply (the flag is only ever set for a SASL verify).
-    if matches!(
+    // Any credential-verify verdict (SASL or NickServ IDENTIFY, verified or
+    // denied) may have been the last thing connect-time registration was
+    // waiting on; noted here before the match consumes `reply`.
+    let was_verify_reply = matches!(
         reply,
         crate::core::DbReply::PasswordVerified { .. }
-            | crate::core::DbReply::PasswordRejected
-            | crate::core::DbReply::Unavailable
+            | crate::core::DbReply::PasswordRejected { .. }
+            | crate::core::DbReply::Unavailable { .. }
+    );
+    // A SASL verify reply (even one for an aborted attempt) clears the
+    // outstanding-verify marker so a queued re-auth can proceed. Only SASL
+    // sets the flag, so gate the clear on the SASL origin — a NickServ IDENTIFY
+    // verdict must not touch it.
+    if matches!(
+        reply,
+        crate::core::DbReply::PasswordVerified {
+            origin: crate::core::CredentialOrigin::Sasl,
+            ..
+        } | crate::core::DbReply::PasswordRejected {
+            origin: crate::core::CredentialOrigin::Sasl,
+        } | crate::core::DbReply::Unavailable {
+            origin: crate::core::CredentialOrigin::Sasl,
+        }
     ) && let Some(s) = state.sessions.get_mut(&conn)
     {
         s.sasl_verify_pending = false;
     }
     match reply {
-        crate::core::DbReply::PasswordVerified { account } => {
+        // The verdict routes on the origin the *request* carried, never on the
+        // session flags: `sasl == Verifying` and `pending_identify` can both be
+        // set at once (interleaved AUTHENTICATE + NickServ IDENTIFY), and the
+        // old flag-inference could fire an IDENTIFY success off a SASL reply, or
+        // vice versa. The flag now only says whether that path is still live.
+        crate::core::DbReply::PasswordVerified {
+            account,
+            origin: crate::core::CredentialOrigin::Sasl,
+        } => {
             if state.sessions[&conn].sasl != SaslState::Verifying {
-                if state.sessions[&conn].pending_identify {
-                    let session = state.sessions.get_mut(&conn).expect("checked");
-                    session.pending_identify = false;
-                    session.account = Some(account.clone());
-                    state.service_notice(
-                        conn,
-                        "NickServ",
-                        &format!("You are now identified for \x02{account}\x02."),
-                    );
-                    notify_account_change(state, conn, &account);
-                }
-                return; // otherwise: stale reply (e.g. after abort)
+                return; // stale SASL reply (the attempt was aborted)
             }
             {
                 let session = state.sessions.get_mut(&conn).expect("checked");
@@ -306,31 +368,28 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             // login is announced by the registration burst instead.
             notify_account_change(state, conn, &account);
         }
-        crate::core::DbReply::PasswordRejected | crate::core::DbReply::Unavailable => {
-            let unavailable = matches!(reply, crate::core::DbReply::Unavailable);
-            if state.sessions[&conn].sasl == SaslState::Verifying {
-                sasl_fail(state, conn);
-            } else if state.sessions[&conn].pending_identify {
-                state
-                    .sessions
-                    .get_mut(&conn)
-                    .expect("checked")
-                    .pending_identify = false;
-                let text = if unavailable {
-                    "Services are temporarily unavailable. Try again later.".to_string()
-                } else {
-                    let nick = state.sessions[&conn]
-                        .nick
-                        .clone()
-                        .unwrap_or_else(|| "*".into());
-                    format!("Invalid password for \x02{nick}\x02.")
-                };
-                state.service_notice(conn, "NickServ", &text);
+        crate::core::DbReply::PasswordVerified {
+            account,
+            origin: crate::core::CredentialOrigin::NickServIdentify,
+        } => {
+            if !state.sessions[&conn].pending_identify {
+                return; // stale IDENTIFY reply (superseded/aborted)
             }
-            // Account *registration* failures no longer arrive here as a bare
-            // Unavailable — they carry their origin via
-            // `AccountRegisterUnavailable` so both the NickServ and the REGISTER
-            // command paths get a loud, correctly-shaped answer.
+            let session = state.sessions.get_mut(&conn).expect("checked");
+            session.pending_identify = false;
+            session.account = Some(account.clone());
+            state.service_notice(
+                conn,
+                "NickServ",
+                &format!("You are now identified for \x02{account}\x02."),
+            );
+            notify_account_change(state, conn, &account);
+        }
+        crate::core::DbReply::PasswordRejected { origin } => {
+            verify_denied(state, conn, origin, false);
+        }
+        crate::core::DbReply::Unavailable { origin } => {
+            verify_denied(state, conn, origin, true);
         }
         crate::core::DbReply::AccountRegisterUnavailable { origin } => {
             // A registration whose persist failed. Answer the way the client
@@ -343,16 +402,18 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     "Services are temporarily unavailable. Try again later.",
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
-                    state
+                    let label = state
                         .sessions
                         .get_mut(&conn)
                         .expect("checked")
-                        .pending_register = false;
+                        .pending_register
+                        .take()
+                        .flatten();
                     let nick = state.sessions[&conn]
                         .nick
                         .clone()
                         .unwrap_or_else(|| "*".into());
-                    state.emit_deferred(conn, move |state| {
+                    state.emit_deferred_labeled(conn, label, move |state| {
                         register_fail(
                             state,
                             conn,
@@ -383,14 +444,16 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     &format!("\x02{account}\x02 is now registered to your connection."),
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
-                    state
+                    let label = state
                         .sessions
                         .get_mut(&conn)
                         .expect("checked")
-                        .pending_register = false;
+                        .pending_register
+                        .take()
+                        .flatten();
                     let server = state.config.server_name.clone();
                     let account = account.clone();
-                    state.emit_deferred(conn, move |state| {
+                    state.emit_deferred_labeled(conn, label, move |state| {
                         state.send(
                             conn,
                             &format!(
@@ -415,12 +478,14 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     &format!("\x02{nick}\x02 is already registered."),
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
-                    state
+                    let label = state
                         .sessions
                         .get_mut(&conn)
                         .expect("checked")
-                        .pending_register = false;
-                    state.emit_deferred(conn, |state| {
+                        .pending_register
+                        .take()
+                        .flatten();
+                    state.emit_deferred_labeled(conn, label, |state| {
                         register_fail(
                             state,
                             conn,
@@ -558,6 +623,14 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 ),
             );
         }
+    }
+    // A connect-time SASL verify that resolved may have been the last thing
+    // registration was waiting on (the client sent CAP END before the verdict).
+    // Now that the pending flag is cleared and the 900/903/904 have been sent in
+    // order, let registration complete — a no-op if it already did or isn't
+    // ready. Only a verify reply can unblock it, so other replies skip this.
+    if was_verify_reply {
+        super::services::maybe_complete_registration(state, conn);
     }
 }
 

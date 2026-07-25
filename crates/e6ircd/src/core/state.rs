@@ -33,6 +33,51 @@ impl NickKey {
     }
 }
 
+/// A channel list-mode mask (`+b`/`+q`/`+e`/`+I`), carrying both the casefolded
+/// form used for equality and the original casing used for display and matching.
+///
+/// Extends the key-newtype discipline to the one place identities live in a
+/// `Vec` rather than a map key: without it, dedup and removal fold *by hand*
+/// (`mask::eq`) while enforcement folds too, and a single site that forgets the
+/// fold silently double-stores a ban or fails to remove one the matcher still
+/// enforces — the class sweeps 54/67 fixed by hand. `PartialEq`/`Eq`/`Hash`
+/// compare the folded form, so `#foo` and `#FOO` are one entry *by construction*
+/// and `contains`/`retain` can't get it wrong; [`MaskKey::as_str`] returns the
+/// original casing for `RPL_BANLIST` and for `mask::matches` (which folds the
+/// mask itself). Build only via [`MaskKey::new`].
+#[derive(Debug, Clone)]
+pub struct MaskKey {
+    folded: String,
+    display: String,
+}
+
+impl MaskKey {
+    pub fn new(mask: &str, casemap: CaseMapping) -> Self {
+        Self {
+            folded: casemap.casefold(mask),
+            display: mask.to_string(),
+        }
+    }
+
+    /// The mask in its stored (original) casing — for display and for
+    /// `mask::matches`, which applies the casemapping to the mask itself.
+    pub fn as_str(&self) -> &str {
+        &self.display
+    }
+}
+
+impl PartialEq for MaskKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.folded == other.folded
+    }
+}
+impl Eq for MaskKey {}
+impl std::hash::Hash for MaskKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.folded.hash(state);
+    }
+}
+
 /// Casefolded account key; same rationale as [`ChanKey`]. Account names are
 /// compared case-insensitively (the DB enforces uniqueness on `name_folded`), so
 /// every in-core map keyed by an account uses this rather than a raw `String` —
@@ -195,12 +240,15 @@ pub(crate) struct Session {
     /// A NickServ IDENTIFY is awaiting its DB verdict.
     pub pending_identify: bool,
     /// A `REGISTER`-command account creation is awaiting its DB verdict, with a
-    /// deferred reply held open for it. Unlike `AccountCreated`/`AccountExists`,
-    /// the `Unavailable`/`PasswordRejected` DB replies carry no origin, so this
-    /// flag is what lets `db_reply` route a transient failure back to REGISTER —
-    /// releasing the defer and sending the owed `FAIL`, instead of leaving the
-    /// connection's output held forever until the reaper ping-timeouts it.
-    pub pending_register: bool,
+    /// deferred reply held open for it. `Some` while that reply is outstanding;
+    /// the inner value is the escaped labeled-response label the command carried
+    /// (`Some` for a labeled REGISTER, `None` for an unlabeled one), so the
+    /// deferred `SUCCESS`/`FAIL` that lands later is framed under the same label
+    /// as a synchronous command would be. Routing the reply back to REGISTER no
+    /// longer needs this flag — `CreateAccount` only ever yields the
+    /// origin-carrying `AccountCreated`/`AccountExists`/`AccountRegisterUnavailable`
+    /// replies (never a bare `Unavailable`), so the origin alone routes it.
+    pub pending_register: Option<Option<String>>,
     /// Away message, when set.
     pub away: Option<String>,
     /// IRC operator (umode +o).
@@ -394,6 +442,9 @@ pub(crate) struct HistoryEntry {
     /// "PRIVMSG" or "NOTICE" as sent on the wire.
     pub kind: crate::core::MessageKind,
     pub body: String,
+    /// The sender was a bot (+B) at send time, so replay re-emits the `bot`
+    /// message tag a message-tags recipient saw live.
+    pub sender_is_bot: bool,
 }
 
 /// Ring capacity per target; older entries live only in PostgreSQL.
@@ -546,10 +597,10 @@ pub(crate) struct Channel {
     pub topic: Option<Topic>,
     pub members: HashMap<ConnId, MemberModes>,
     pub modes: ChanModes,
-    pub bans: Vec<String>,
-    pub quiets: Vec<String>,
-    pub ban_exceptions: Vec<String>,
-    pub invite_exceptions: Vec<String>,
+    pub bans: Vec<MaskKey>,
+    pub quiets: Vec<MaskKey>,
+    pub ban_exceptions: Vec<MaskKey>,
+    pub invite_exceptions: Vec<MaskKey>,
     /// Connections holding a pending INVITE into this channel (consumed on
     /// join). Lives on the channel — not the invitee's session — so channel
     /// teardown revokes it: an invite is a grant by an op of *this* channel
@@ -563,10 +614,10 @@ pub(crate) struct Channel {
 }
 
 impl Channel {
-    fn any_match(casemap: CaseMapping, masks: &[String], subject: &str) -> bool {
+    fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &str) -> bool {
         masks
             .iter()
-            .any(|m| e6irc_proto::mask::matches(casemap, m, subject))
+            .any(|m| e6irc_proto::mask::matches(casemap, m.as_str(), subject))
     }
 
     pub fn is_banned(&self, casemap: CaseMapping, prefix: &str) -> bool {
@@ -1009,12 +1060,17 @@ impl ServerState {
     /// security-critical, so a corrupt kind must not silently become a
     /// default that bans (or fails to ban) the wrong sessions.
     pub fn preload_server_bans(&mut self, rows: Vec<(String, String, String, String)>) {
+        let casemap = self.casemap;
         self.server_bans = rows
             .into_iter()
             .filter_map(
                 |(mask, reason, set_by, kind)| match BanKind::from_token(&kind) {
+                    // Fold the loaded mask, so a legacy or externally-inserted
+                    // unfolded row (`Baddie@Host`) can't enforce-but-resist a
+                    // folded `UNKLINE`'s removal — memory is kept consistent with
+                    // the fold the matcher and every write path already apply.
                     Some(kind) => Some(ServerBan {
-                        mask,
+                        mask: casemap.casefold(&mask),
                         reason,
                         set_by,
                         kind,
@@ -1175,7 +1231,7 @@ impl ServerState {
                 sasl_buf: String::new(),
                 credential_attempts: 0,
                 pending_identify: false,
-                pending_register: false,
+                pending_register: None,
                 away: None,
                 oper: false,
                 invisible: false,
@@ -1282,6 +1338,39 @@ impl ServerState {
     pub fn emit_deferred(&mut self, conn: ConnId, emit: impl FnOnce(&mut Self)) {
         let previous = self.emitting_deferred.replace(conn);
         emit(self);
+        self.emitting_deferred = previous;
+        self.release_deferred(conn);
+    }
+
+    /// Emit a deferred reply that must be framed under `label` if the command
+    /// that triggered it was labeled. Reuses the same labeled-response framer a
+    /// synchronous command uses, so the async `SUCCESS`/`FAIL` gets the `@label`
+    /// tag (single line) or a labeled batch (many) — identical framing whether
+    /// the answer came back inline or from a database round trip. With no label
+    /// this is exactly `emit_deferred`.
+    pub fn emit_deferred_labeled(
+        &mut self,
+        conn: ConnId,
+        label: Option<String>,
+        emit: impl FnOnce(&mut Self),
+    ) {
+        let Some(label) = label else {
+            return self.emit_deferred(conn, emit);
+        };
+        let previous = self.emitting_deferred.replace(conn);
+        // Capture the emitted lines (they route to `capture` because it targets
+        // this conn) so the framer can tag/batch them, exactly as a synchronous
+        // labeled command's direct replies are captured in `dispatch`.
+        debug_assert!(self.capture.is_none(), "deferred reply nested in a capture");
+        self.capture = Some(Capture {
+            conn,
+            lines: Vec::new(),
+            label: Some(label.clone()),
+            deferred: false,
+        });
+        emit(self);
+        let captured = self.capture.take().map(|c| c.lines).unwrap_or_default();
+        super::handler::frame_labeled(self, conn, &label, captured);
         self.emitting_deferred = previous;
         self.release_deferred(conn);
     }
@@ -1618,6 +1707,24 @@ impl ServerState {
             self.nicks.remove(&nick_key);
             if was_registered {
                 super::handler::monitor_notify(self, nick, false);
+            }
+            // Free the direct-message history rings keyed on this connection's
+            // *unauthenticated* identity (`~nick`). That identity is unclaimable
+            // and reusable: the moment this connection leaves, the next person to
+            // take the nick derives the same `~nick`, and would otherwise read
+            // the prior occupant's DM rings until LRU eviction — a privacy leak.
+            // An authenticated identity is an account (stable, DB-backed) and is
+            // deliberately retained.
+            if session.account.is_none() {
+                let my_identity = format!("~{}", self.casemap.casefold(nick));
+                self.history
+                    .retain(|k, _| match k.as_str().split_once('!') {
+                        // A DM key is `lo!hi`; keep it only if neither side is us.
+                        Some((lo, hi)) => lo != my_identity && hi != my_identity,
+                        // A channel key has no `!` — never a DM, always kept.
+                        None => true,
+                    });
+                self.hot_history.retain(|k| self.history.contains_key(k));
             }
         }
     }

@@ -116,9 +116,12 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     );
                     return Dropped;
                 }
-                // Two Discord channels named the same derive one IRC channel and
-                // would silently overwrite the mapping; refuse rather than lose it.
-                if channel_to_id.contains_key(&channel) {
+                // Two Discord channels whose IRC names collide *under the
+                // casemapping* derive one IRC channel and would silently
+                // overwrite the mapping; the forward map is folded-keyed so a
+                // case variant is caught here and routed correctly.
+                let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
+                if channel_to_id.contains_key(&folded) {
                     eprintln!(
                         "discord: channel {id} name {name:?} collides with an already-bridged \
                          channel {channel:?}; refusing to bridge it"
@@ -126,7 +129,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     return Dropped;
                 }
                 id_to_channel.insert(id.clone(), channel.clone());
-                channel_to_id.insert(channel, id.clone());
+                channel_to_id.insert(folded, id.clone());
             }
             Err(e) => {
                 eprintln!("discord: channel {id} lookup failed: {e}");
@@ -148,7 +151,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     // matrix already have.
     let (ws, _) = match tokio::time::timeout(
         Duration::from_secs(30),
-        tokio_tungstenite::connect_async(&url),
+        tokio_tungstenite::connect_async_with_config(&url, Some(super::bridge_ws_config()), false),
     )
     .await
     {
@@ -248,15 +251,26 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                             return Dropped;
                         }
                     }
-                    Event::Message { channel_id, author_id, author, content } => {
-                        // Skip our own messages (the attached client already
-                        // saw what it sent) and empty/non-bridged channels.
-                        if author_id == our_id || content.is_empty() {
+                    Event::Message { channel_id, author_id, author, content, attachments } => {
+                        // Skip our own messages (the attached client already saw
+                        // what it sent).
+                        if author_id == our_id {
                             continue;
                         }
+                        // Render the text, or the attachment URLs when there is no
+                        // text body — an image/file-only message must not silently
+                        // vanish on the IRC side. A message with neither (e.g. a
+                        // bare embed we don't render) is skipped.
+                        let body = if !content.is_empty() {
+                            content
+                        } else if !attachments.is_empty() {
+                            attachments.join(" ")
+                        } else {
+                            continue;
+                        };
                         if let Some(channel) = id_to_channel.get(&channel_id) {
                             for line in super::render_bridged_privmsg(
-                                "discord", &author, channel, &content,
+                                "discord", &author, channel, &body,
                             ) {
                                 ends.emit_line(line);
                             }
@@ -266,23 +280,31 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 }
             }
             cmd = ends.next_command() => match cmd {
-                Some(line) => match super::route_privmsg(&line, &channel_to_id) {
-                    super::RouteResult::Deliver(id, text) => {
-                        if let Err(e) = send_message(&http, &base, &config.token, &id, &text).await {
-                            eprintln!("discord: send to {id} failed: {e}");
-                            // Surface the loss to the client, like the unmapped
-                            // path — a delivery failure isn't a silent drop. The
-                            // shared helper bounds the length so the notice fits.
-                            ends.emit_line(super::undelivered_notice("Discord", "channel", &id));
+                // One line may resolve to several targets (a comma list).
+                Some(line) => {
+                    for routed in super::route_privmsg(&line, &channel_to_id) {
+                        match routed {
+                            super::RouteResult::Deliver(id, text) => {
+                                if let Err(e) =
+                                    send_message(&http, &base, &config.token, &id, &text).await
+                                {
+                                    eprintln!("discord: send to {id} failed: {e}");
+                                    // Surface the loss to the client, like the unmapped
+                                    // path — a delivery failure isn't a silent drop.
+                                    ends.emit_line(super::undelivered_notice(
+                                        "Discord", "channel", &id,
+                                    ));
+                                }
+                            }
+                            super::RouteResult::Unmapped(target) => {
+                                ends.emit_line(super::unmapped_target_notice(
+                                    "Discord", "channel", &target,
+                                ));
+                            }
+                            super::RouteResult::Ignore => {}
                         }
                     }
-                    super::RouteResult::Unmapped(target) => {
-                        ends.emit_line(super::unmapped_target_notice(
-                            "Discord", "channel", &target,
-                        ));
-                    }
-                    super::RouteResult::Ignore => {}
-                },
+                }
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -304,6 +326,9 @@ enum Event {
         author_id: String,
         author: String,
         content: String,
+        /// Attachment URLs — rendered when there is no text `content`, so an
+        /// image/file-only message doesn't vanish on the IRC side.
+        attachments: Vec<String>,
     },
     HeartbeatRequest,
     Ack,
@@ -331,6 +356,14 @@ fn parse_frame(text: &str) -> Frame {
                     author_id: d["author"]["id"].as_str().unwrap_or("").to_string(),
                     author: d["author"]["username"].as_str().unwrap_or("?").to_string(),
                     content: d["content"].as_str().unwrap_or("").to_string(),
+                    attachments: d["attachments"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x["url"].as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 }
             }
             _ => Event::Ignore,
@@ -424,6 +457,7 @@ mod tests {
                 author_id,
                 author,
                 content,
+                attachments: _,
             } => {
                 assert_eq!(channel_id, "42");
                 assert_eq!(author_id, "7");
@@ -454,20 +488,42 @@ mod tests {
             crate::bouncer::render_bridged_privmsg("discord", "alice", "#general", "hi there"),
             vec![":alice!alice@discord PRIVMSG #general :hi there"]
         );
+        // The map is keyed by the *folded* channel name (as the driver inserts).
         let mut map = HashMap::new();
         map.insert("#general".to_string(), "42".to_string());
         use crate::bouncer::{RouteResult, route_privmsg};
         assert_eq!(
             route_privmsg("PRIVMSG #general :hello", &map),
-            RouteResult::Deliver("42".to_string(), "hello".to_string())
+            vec![RouteResult::Deliver("42".to_string(), "hello".to_string())]
+        );
+        // Case-insensitive: a differently-cased target still routes.
+        assert_eq!(
+            route_privmsg("PRIVMSG #General :hi", &map),
+            vec![RouteResult::Deliver("42".to_string(), "hi".to_string())]
+        );
+        // A STATUSMSG prefix is stripped before the lookup.
+        assert_eq!(
+            route_privmsg("PRIVMSG @#general :ops", &map),
+            vec![RouteResult::Deliver("42".to_string(), "ops".to_string())]
+        );
+        // A comma target list routes each independently.
+        assert_eq!(
+            route_privmsg("PRIVMSG #general,#other :x", &map),
+            vec![
+                RouteResult::Deliver("42".to_string(), "x".to_string()),
+                RouteResult::Unmapped("#other".to_string()),
+            ]
         );
         // A PRIVMSG to a non-bridged channel is surfaced, not silently dropped.
         assert_eq!(
             route_privmsg("PRIVMSG #other :x", &map),
-            RouteResult::Unmapped("#other".to_string())
+            vec![RouteResult::Unmapped("#other".to_string())]
         );
         // A non-message command is ignored quietly.
-        assert_eq!(route_privmsg("JOIN #general", &map), RouteResult::Ignore);
+        assert_eq!(
+            route_privmsg("JOIN #general", &map),
+            vec![RouteResult::Ignore]
+        );
     }
 
     #[test]

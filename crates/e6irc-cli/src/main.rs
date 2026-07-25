@@ -186,7 +186,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         break; // end of NAMES = joined
                     }
                     if is_join_error(&msg.command) {
-                        let reason = msg.params.last().cloned().unwrap_or_default();
+                        let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                         return Err(std::io::Error::other(format!(
                             "cannot join {target}: {reason}"
                         )));
@@ -206,7 +206,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // and the exit code is this tool's product.
             while let Some(msg) = conn.next_message().await? {
                 if is_send_error(&msg.command) {
-                    let reason = msg.params.last().cloned().unwrap_or_default();
+                    let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                     return Err(std::io::Error::other(format!(
                         "cannot send to {target}: {reason}"
                     )));
@@ -227,7 +227,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 // A refused JOIN must be reported, not waited on forever — the
                 // same loud failure Send and History give.
                 if target.starts_with('#') && is_join_error(&msg.command) {
-                    let reason = msg.params.last().cloned().unwrap_or_default();
+                    let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                     return Err(std::io::Error::other(format!(
                         "cannot join {target}: {reason}"
                     )));
@@ -309,7 +309,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     break;
                 }
                 if is_join_error(&m.command) {
-                    let reason = m.params.last().cloned().unwrap_or_default();
+                    let reason = terminal_safe(&m.params.last().cloned().unwrap_or_default());
                     return Err(std::io::Error::other(format!(
                         "cannot join {target}: {reason}"
                     )));
@@ -351,7 +351,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     "FAIL" => {
                         return Err(std::io::Error::other(format!(
                             "CHATHISTORY failed: {}",
-                            m.params.join(" ")
+                            terminal_safe(&m.params.join(" "))
                         )));
                     }
                     _ => {}

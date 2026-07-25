@@ -77,6 +77,7 @@ async fn verify_password_roundtrip() {
             conn,
             account: "ALICE".into(),
             password: "correct horse".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
         })
         .await
         .expect("push");
@@ -94,7 +95,8 @@ async fn verify_password_roundtrip() {
     assert_eq!(
         reply,
         DbReply::PasswordVerified {
-            account: "Alice".into()
+            account: "Alice".into(),
+            origin: e6ircd::core::CredentialOrigin::Sasl,
         }
     );
 
@@ -105,6 +107,7 @@ async fn verify_password_roundtrip() {
                 conn,
                 account: account.into(),
                 password: password.into(),
+                origin: e6ircd::core::CredentialOrigin::Sasl,
             })
             .await
             .expect("push");
@@ -114,7 +117,13 @@ async fn verify_password_roundtrip() {
         let Input::DbReply { reply, .. } = env.payload else {
             panic!("unexpected")
         };
-        assert_eq!(reply, DbReply::PasswordRejected, "{account}/{password}");
+        assert_eq!(
+            reply,
+            DbReply::PasswordRejected {
+                origin: e6ircd::core::CredentialOrigin::Sasl,
+            },
+            "{account}/{password}"
+        );
     }
 }
 
@@ -500,6 +509,7 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
                 sender_account: None,
                 kind: e6ircd::core::MessageKind::Privmsg,
                 body: format!("line {i}"),
+                sender_is_bot: false,
                 ts: e6irc_proto::time::Millis::from_millis(1_700_000_000_000 + i),
             })
             .await

@@ -113,9 +113,12 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     );
                     return Dropped;
                 }
-                // Two Slack channels named the same derive one IRC channel and
-                // would silently overwrite the mapping; refuse rather than lose it.
-                if channel_to_id.contains_key(&channel) {
+                // Two Slack channels whose IRC names collide *under the
+                // casemapping* derive one IRC channel and would silently
+                // overwrite the mapping; the forward map is folded-keyed so a
+                // case variant is caught here and routed correctly.
+                let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
+                if channel_to_id.contains_key(&folded) {
                     eprintln!(
                         "slack: channel {id} name {name:?} collides with an already-bridged \
                          channel {channel:?}; refusing to bridge it"
@@ -123,7 +126,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     return Dropped;
                 }
                 id_to_channel.insert(id.clone(), channel.clone());
-                channel_to_id.insert(channel, id.clone());
+                channel_to_id.insert(folded, id.clone());
             }
             Err(e) => {
                 eprintln!("slack: channel {id} lookup failed: {e}");
@@ -142,7 +145,11 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     // Bound the WS handshake so a black-holed socket can't wedge the driver.
     let (ws, _) = match tokio::time::timeout(
         Duration::from_secs(30),
-        tokio_tungstenite::connect_async(&ws_url),
+        tokio_tungstenite::connect_async_with_config(
+            &ws_url,
+            Some(super::bridge_ws_config()),
+            false,
+        ),
     )
     .await
     {
@@ -158,6 +165,9 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     };
     let (mut write, mut read) = ws.split();
     ends.emit(ConnectionEvent::Connected);
+
+    // User-id → display-name cache, populated lazily via users.info.
+    let mut user_names: HashMap<String, String> = HashMap::new();
 
     // Slack sends pings and disconnect envelopes regularly; no data for well
     // over a minute means the socket is black-holed — reconnect, don't hang.
@@ -194,33 +204,58 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     return Dropped; // Slack asked us to reconnect.
                 }
                 if let Some(m) = envelope.message
-                    && let Some(channel) = id_to_channel.get(&m.channel)
+                    && let Some(channel) = id_to_channel.get(&m.channel).cloned()
                 {
-                    for line in super::render_bridged_privmsg("slack", &m.user, channel, &m.text) {
+                    // Resolve the opaque user id to a display name once, cached;
+                    // fall back to the raw id if the lookup fails (better an ugly
+                    // nick than a dropped message).
+                    let sender = match user_names.get(&m.user) {
+                        Some(name) => name.clone(),
+                        None => {
+                            let name =
+                                match fetch_user_name(&http, &base, &config.bot_token, &m.user).await
+                                {
+                                    Ok(name) => name,
+                                    Err(e) => {
+                                        eprintln!("slack: users.info for {} failed: {e}", m.user);
+                                        m.user.clone()
+                                    }
+                                };
+                            user_names.insert(m.user.clone(), name.clone());
+                            name
+                        }
+                    };
+                    for line in super::render_bridged_privmsg("slack", &sender, &channel, &m.text) {
                         ends.emit_line(line);
                     }
                 }
             }
             cmd = ends.next_command() => match cmd {
-                Some(line) => match super::route_privmsg(&line, &channel_to_id) {
-                    super::RouteResult::Deliver(id, text) => {
-                        if let Err(e) =
-                            post_message(&http, &base, &config.bot_token, &id, &text).await
-                        {
-                            eprintln!("slack: chat.postMessage to {id} failed: {e}");
-                            // Surface the loss to the client, like the unmapped
-                            // path — a delivery failure isn't a silent drop. The
-                            // shared helper bounds the length so the notice fits.
-                            ends.emit_line(super::undelivered_notice("Slack", "channel", &id));
+                // One line may resolve to several targets (a comma list).
+                Some(line) => {
+                    for routed in super::route_privmsg(&line, &channel_to_id) {
+                        match routed {
+                            super::RouteResult::Deliver(id, text) => {
+                                if let Err(e) =
+                                    post_message(&http, &base, &config.bot_token, &id, &text).await
+                                {
+                                    eprintln!("slack: chat.postMessage to {id} failed: {e}");
+                                    // Surface the loss to the client, like the unmapped
+                                    // path — a delivery failure isn't a silent drop.
+                                    ends.emit_line(super::undelivered_notice(
+                                        "Slack", "channel", &id,
+                                    ));
+                                }
+                            }
+                            super::RouteResult::Unmapped(target) => {
+                                ends.emit_line(super::unmapped_target_notice(
+                                    "Slack", "channel", &target,
+                                ));
+                            }
+                            super::RouteResult::Ignore => {}
                         }
                     }
-                    super::RouteResult::Unmapped(target) => {
-                        ends.emit_line(super::unmapped_target_notice(
-                            "Slack", "channel", &target,
-                        ));
-                    }
-                    super::RouteResult::Ignore => {}
-                },
+                }
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }
@@ -336,6 +371,40 @@ async fn fetch_channel_name(
         .ok_or_else(|| format!("conversations.info for {id} had no name"))
 }
 
+/// Resolve a Slack user id (`U12345678`) to a human display name via
+/// `users.info`. The `message` event carries only the opaque id, so without
+/// this every Slack message on IRC would come from a nick like `U12345678`
+/// instead of the sender's actual name. Prefers the display name, then the
+/// real name, then the handle.
+async fn fetch_user_name(
+    http: &reqwest::Client,
+    base: &str,
+    bot_token: &str,
+    id: &str,
+) -> Result<String, String> {
+    let v: serde_json::Value = http
+        .get(format!("{base}/users.info"))
+        .header("Authorization", format!("Bearer {bot_token}"))
+        .query(&[("user", id)])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .bounded_json()
+        .await?;
+    check_ok(&v)?;
+    let u = &v["user"];
+    ["profile.display_name", "profile.real_name"]
+        .iter()
+        .filter_map(|path| {
+            let (a, b) = path.split_once('.').unwrap();
+            u[a][b].as_str().filter(|s| !s.is_empty())
+        })
+        .next()
+        .or_else(|| u["name"].as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("users.info for {id} had no name"))
+}
+
 async fn post_message(
     http: &reqwest::Client,
     base: &str,
@@ -418,12 +487,17 @@ mod tests {
         use crate::bouncer::{RouteResult, route_privmsg};
         assert_eq!(
             route_privmsg("PRIVMSG #general :hello", &map),
-            RouteResult::Deliver("C1".to_string(), "hello".to_string())
+            vec![RouteResult::Deliver("C1".to_string(), "hello".to_string())]
+        );
+        // Case-insensitive routing.
+        assert_eq!(
+            route_privmsg("PRIVMSG #GENERAL :hi", &map),
+            vec![RouteResult::Deliver("C1".to_string(), "hi".to_string())]
         );
         // A PRIVMSG to a non-bridged channel is surfaced, not silently dropped.
         assert_eq!(
             route_privmsg("PRIVMSG #nope :x", &map),
-            RouteResult::Unmapped("#nope".to_string())
+            vec![RouteResult::Unmapped("#nope".to_string())]
         );
     }
 

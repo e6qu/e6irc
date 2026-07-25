@@ -98,7 +98,17 @@ impl Backoff {
 pub(crate) enum SessionOutcome {
     Stopped,
     Dropped,
+    /// The upstream rejected the credentials (a terminal auth/registration
+    /// numeric), which — unlike a transient drop — will not succeed on a plain
+    /// retry. [`run_with_backoff`] counts these and stops re-dialing after a few
+    /// in a row, so a mistyped or revoked upstream password can't hammer the
+    /// upstream forever every ~30s.
+    AuthRejected,
 }
+
+/// Consecutive upstream auth rejections before a driver stops re-dialing and
+/// parks until the network is reconfigured (which drops the handle and ends it).
+pub(crate) const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
 
 /// Run `session` forever, reconnecting with backoff whenever it drops.
 ///
@@ -127,6 +137,7 @@ pub(crate) async fn run_with_backoff<C>(
     session: DriverSession<C>,
 ) {
     let mut backoff = Backoff::new();
+    let mut consecutive_auth_failures: u32 = 0;
     loop {
         // A stop signalled while a session runs is observed inside it (via
         // `next_command`); one signalled while we wait to reconnect is caught
@@ -137,7 +148,32 @@ pub(crate) async fn run_with_backoff<C>(
         let started = tokio::time::Instant::now();
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
+            SessionOutcome::AuthRejected => {
+                consecutive_auth_failures += 1;
+                ends.emit(ConnectionEvent::Disconnected);
+                if consecutive_auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES {
+                    // Stop hammering an upstream that keeps rejecting the
+                    // credentials; a bad/revoked password won't fix itself on
+                    // retry. Park until the network is reconfigured (which drops
+                    // the handle and returns from `shutdown_signalled`).
+                    ends.emit_line(
+                        ":*bnc* NOTICE * :upstream rejected authentication repeatedly; \
+                         not reconnecting until this network is reconfigured"
+                            .to_string(),
+                    );
+                    ends.shutdown_signalled().await;
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = ends.shutdown_signalled() => return,
+                    _ = backoff.wait(started.elapsed()) => {}
+                }
+            }
             SessionOutcome::Dropped => {
+                // A transient (non-auth) drop: a connection-level failure that
+                // may well recover, so keep retrying and reset the auth counter.
+                consecutive_auth_failures = 0;
                 ends.emit(ConnectionEvent::Disconnected);
                 tokio::select! {
                     biased;
@@ -164,31 +200,68 @@ pub(crate) enum RouteResult {
 
 /// Classify a downstream client line for a bridge: the single choke point all
 /// three bridges share (Discord/Slack/Matrix), so the routing policy lives in
-/// one place. `targets` maps a bridged channel name to its upstream id.
+/// one place. `targets` maps a **casefolded** bridged channel name to its
+/// upstream id (the drivers insert folded keys), so lookup here folds too.
+///
+/// Returns one result per resolved target: a `PRIVMSG` may carry a
+/// comma-separated target list (`#a,#b`), which real clients send and a normal
+/// server splits — so this splits it and routes each independently. A single
+/// STATUSMSG prefix (`@#chan`/`+#chan`) is stripped before the lookup: a bridge
+/// has no op/voice-only concept, so it delivers to the channel itself. An empty
+/// or non-PRIVMSG line yields a single `Ignore`.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) fn route_privmsg(
     line: &str,
     targets: &std::collections::HashMap<String, String>,
-) -> RouteResult {
+) -> Vec<RouteResult> {
     let Ok(msg) = e6irc_proto::message::Message::parse(line) else {
-        return RouteResult::Ignore;
+        return vec![RouteResult::Ignore];
     };
     if !msg.command.eq_ignore_ascii_case("PRIVMSG") {
-        return RouteResult::Ignore;
+        return vec![RouteResult::Ignore];
     }
     let (Some(target), Some(text)) = (msg.params.first(), msg.params.get(1)) else {
-        return RouteResult::Ignore;
+        return vec![RouteResult::Ignore];
     };
-    match targets.get(*target) {
-        Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
-        None => RouteResult::Unmapped(target.to_string()),
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    let mut out: Vec<RouteResult> = target
+        .split(',')
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            // Strip one STATUSMSG prefix; fold for the case-insensitive lookup.
+            let bare = t
+                .strip_prefix('@')
+                .or_else(|| t.strip_prefix('+'))
+                .unwrap_or(t);
+            match targets.get(&casemap.casefold(bare)) {
+                Some(id) => RouteResult::Deliver(id.clone(), text.to_string()),
+                None => RouteResult::Unmapped(bare.to_string()),
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push(RouteResult::Ignore);
     }
+    out
 }
 
 /// Largest HTTP response body a bridge will read from an upstream before
 /// parsing it as JSON.
 #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
 pub(crate) const MAX_BRIDGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// WebSocket config for the Discord/Slack gateways: cap the inbound frame and
+/// message at the same 16 MiB the HTTP path enforces. tungstenite's defaults
+/// (64 MiB message / 16 MiB frame) are *larger* than that deliberate cap, so a
+/// hostile or compromised gateway could push a bigger allocation over the socket
+/// than the HTTP path allows — one process serves every tenant, so the socket
+/// path must share the discipline.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) fn bridge_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_BRIDGE_RESPONSE_BYTES))
+        .max_frame_size(Some(MAX_BRIDGE_RESPONSE_BYTES))
+}
 
 /// JSON-parse an upstream HTTP response body under a size cap. `reqwest`'s
 /// `.json()`/`.bytes()` buffer the *whole* body first, so a hostile or
