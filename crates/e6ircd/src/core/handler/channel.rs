@@ -95,7 +95,13 @@ pub(super) fn truncate_chars(s: &str, max: usize) -> &str {
 }
 
 pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let Some(&targets) = p.first() else {
+    // A target list with no non-empty entry (`JOIN`, `JOIN :`, `JOIN ,`) must be
+    // ERR_NEEDMOREPARAMS, not a silent no-op: a bare presence check passes an
+    // empty or comma-only list, then the comma-split filters every token and the
+    // loop never runs, sending nothing back. Guard on the *filtered* list so
+    // both the missing and the empty/degenerate forms reply.
+    let targets = p.first().copied().unwrap_or("");
+    if targets.split(',').all(str::is_empty) {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
@@ -103,7 +109,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("Not enough parameters"),
         );
         return;
-    };
+    }
     // Modern IRC: "JOIN 0" is a special form meaning "part every channel".
     if targets == "0" {
         let names: Vec<String> = state.sessions[&conn]
@@ -345,7 +351,10 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
 }
 
 pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let Some(&targets) = p.first() else {
+    // No non-empty target (`PART`, `PART :`, `PART ,`) is ERR_NEEDMOREPARAMS,
+    // not a silent no-op — see cmd_join.
+    let targets = p.first().copied().unwrap_or("");
+    if targets.split(',').all(str::is_empty) {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
@@ -353,7 +362,7 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("Not enough parameters"),
         );
         return;
-    };
+    }
     let reason = p.get(1).map(|r| r.to_string());
     for target in targets.split(',').filter(|t| !t.is_empty()) {
         let key = state.chan_key(target);
@@ -465,7 +474,14 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey) {
 }
 
 pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    match p.first() {
+    // A target list with no non-empty entry (`NAMES :`, `NAMES ,`) is treated as
+    // the no-argument form: it must still send the terminating RPL_ENDOFNAMES,
+    // not fall into the comma-split and send nothing — a client waiting for its
+    // 366 would hang forever.
+    let has_target = p
+        .first()
+        .is_some_and(|t| t.split(',').any(|s| !s.is_empty()));
+    match p.first().filter(|_| has_target) {
         Some(&targets) => {
             for target in targets.split(',').filter(|t| !t.is_empty()) {
                 let key = state.chan_key(target);

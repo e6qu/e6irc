@@ -1593,6 +1593,74 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Seventy-sixth sweep — a bouncer that flaps on one bad upstream byte, plus
+three more live bugs (2026-07-25): four hunts (casefold/identity-comparison
+consistency, command dispatch/arity, the account/identity state machine, and
+the BNC upstream IRC driver).
+
+**The centerpiece — one non-UTF-8 line no longer tears down the bouncer**
+(irc_driver.rs / e6irc-client, HIGH). The upstream driver's read arm collapsed
+three distinct outcomes into one: `Ok(Ok(Some(_)))` was a line, and `Ok(_)`
+caught *both* a genuine EOF (`Ok(Ok(None))`) and a recoverable per-line error
+(`Ok(Err(_))` — a non-UTF-8 body, an unparseable line, an over-long line),
+returning `Dropped` for all of them. IRC message bodies are arbitrary bytes
+(Latin-1/Shift-JIS are routine on real networks), so a single `PRIVMSG #chan
+:café` from a Latin-1 client tore down the whole BNC link, forcing a full
+reconnect+re-register+re-join — and any channel member could keep a victim's
+bouncer flapping by sending one high-byte message, an easy targeted DoS. The
+sibling in-process `local_driver` already relays lossily and never tears down;
+the upstream driver diverged. Fixed by giving the client a tolerant
+steady-state read (`next_line_relayable`) whose *distinct* outcomes make the
+conflation unrepresentable at the call site: `Ok(Some((parse, raw)))` is always
+a line to relay — a non-UTF-8/unparseable one comes back with `parse: None`
+(relay-only) rather than an error, and an over-long line is skipped without
+ending the stream — while only a real EOF (`Ok(None)`) or I/O error (`Err`)
+returns `Dropped`. The strict `next_message_with_line` the handshake relies on
+is untouched. New e2e (raw-TCP upstream sends `caf\xe9`, then an ordinary line)
+proves the bad line is relayed lossily and the session survives.
+
+Three more bugs fixed (all CONFIRMED live):
+
+1. **CHATHISTORY replay dropped the `account=` tag** (history.rs, LOW) — live
+   delivery stamps `account=` on a message from an identified sender for an
+   account-tag recipient, but the replay render hardcoded `batch;msgid;time`
+   and never emitted it, so a replayed line lost the sender attribution the
+   live one carried — violating the function's own "byte-identical to live"
+   invariant. The stored `sender_account` is now emitted for account-tag
+   requesters. (The `bot` tag is dropped the same way but would need a new
+   `HistoryRow`/DB column, so it's left as a follow-up.)
+2. **JOIN/PART/NAMES/WALLOPS with an empty (or comma-only) first parameter were
+   silent no-ops** (channel.rs/oper.rs, LOW) — `JOIN :`, `JOIN ,`, `PART :`,
+   `NAMES :`, `WALLOPS :` passed a bare presence check, then the comma-split /
+   empty-body left nothing to do and *no reply was sent* (`NAMES :` never sent
+   its terminating 366, hanging a client that waits for it). The same
+   presence-without-emptiness class sweep 75 fixed for NICK/WHO; JOIN/PART now
+   reply ERR_NEEDMOREPARAMS on a target list with no non-empty entry, NAMES
+   falls back to its 366 terminator, WALLOPS rejects empty text.
+3. *(covered above — the empty-param class instances.)*
+
+Surfaced, not changed: there is no LOGOUT / de-identify path (documented in
+DESIGN §7.6 — `session.account` only ever goes None→Some→Some'; benign, a
+client de-identifies by reconnecting); `preload_server_bans` stores masks raw
+while every write path folds them, so a *legacy* unfolded DB row would enforce
+but resist a folded `UNKLINE`'s DB delete and resurrect on restart
+(migration-only; no live path produces one — the proper close is the roadmap
+`MaskKey`); an unauthenticated `~nick` DM ring is reusable across sessions
+(sweep-75 note). Clean bills (this sweep): the **entire identity-comparison
+surface** — the casefold hunt confirmed every nick/channel/account/mask
+compare, dedup, and removal folds consistently with its enforcement site (the
+key newtypes + `mask::eq` discipline hold uniformly), so there is *no* live
+casefold-in-list bug and `MaskKey` would be pure regression-prevention; the
+command dispatch table (case-insensitive dispatch, the pre-registration
+allow-list, `ERR_NOTREGISTERED`/`ERR_UNKNOWNCOMMAND` gates, and the
+re-entrancy/use-after-close paths — no reachable panic, no gate bypass); and
+the account/identity propagation (set+notify on all three login paths,
+account-tag escaping, extended-join/WHOIS-330/WHOX-`a` live reads, account
+surviving NICK, failed-SASL leaving account unchanged). Verified beyond the
+gate: irctest main (258) and PG services (49); PG db (41), embed-web http (12),
+dex oidc (4), bouncer + ws_ui e2e; bridges under `--features
+matrix,discord,slack`; fuzz crate under `--cfg fuzzing`.
+
 Seventy-fifth sweep — make the wall-clock-timer class unrepresentable, plus
 three more live bugs the hunts surfaced (2026-07-25): a second step-back on
 recurring classes, with four fresh hunts (reaper/flood timing, CHATHISTORY ring
