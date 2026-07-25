@@ -38,8 +38,11 @@ pub(super) async fn list_networks(
                 .into_iter()
                 .map(|n| {
                     // Live upstream state from the always-on driver, if the
-                    // registry is holding a handle for this network.
-                    let connected = registry.get(&account, &n.name).map(|h| h.is_connected());
+                    // registry is holding a handle for this account's own network
+                    // (never a shared network of the same name).
+                    let connected = registry
+                        .get_owned(&account, &n.name)
+                        .map(|h| h.is_connected());
                     serde_json::json!({
                         "name": n.name,
                         "addr": n.addr,
@@ -93,14 +96,6 @@ pub(super) async fn create_network(
         Err(response) => response,
     }
 }
-
-/// The one create path: validate, seal the upstream secret, persist, and
-/// start the driver. Used by both the JSON API and the account form.
-/// Cap on BNC networks per account. Each network spawns an always-on driver
-/// (which dials a caller-supplied address on a reconnect loop) plus a
-/// persistence task, so an unbounded count is task/socket exhaustion and an
-/// outbound-connection amplifier toward a third party.
-pub(super) const MAX_NETWORKS_PER_ACCOUNT: usize = 32;
 
 /// Whether `addr` (`host:port`, IPv6 bracketed) has an IP-literal host that
 /// points at a target that is never a legitimate IRC upstream and that the
@@ -271,27 +266,19 @@ pub(super) async fn create_network_core(
         enabled: true,
     };
     let pool = state.pool.as_ref().expect("caller checked the pool");
-    // Bound networks per account before spawning anything.
-    match crate::db::list_bnc_networks(pool, account).await {
-        Ok(existing) if existing.len() >= MAX_NETWORKS_PER_ACCOUNT => {
+    // The per-account network cap is enforced atomically inside
+    // `create_bnc_network` (count + insert in one FOR UPDATE transaction), so
+    // there is no racy list-then-insert here — two concurrent creates can't both
+    // slip past cap-1 and each spawn an always-on driver.
+    match crate::db::create_bnc_network(pool, account, &row).await {
+        Ok(_) => {}
+        Err(crate::db::DbError::TooManyNetworks) => {
             return Err(problem(
                 StatusCode::CONFLICT,
                 "Network limit reached",
                 Some("this account has reached its maximum number of networks"),
             ));
         }
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("http: network count query failed: {e}");
-            return Err(problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
-    }
-    match crate::db::create_bnc_network(pool, account, &row).await {
-        Ok(_) => {}
         Err(crate::db::DbError::DuplicateNetwork(_)) => {
             return Err(problem(
                 StatusCode::CONFLICT,

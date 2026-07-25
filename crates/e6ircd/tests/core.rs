@@ -1463,6 +1463,39 @@ fn tagmsg_honors_statusmsg_sigil() {
     );
 }
 
+/// TAGMSG takes a comma-separated target list, exactly like PRIVMSG/NOTICE.
+/// Before the fix it read only the first target, so `TAGMSG #a,#b` failed with
+/// ERR_NOSUCHCHANNEL for the whole (unsplit) string.
+#[test]
+fn tagmsg_splits_a_comma_target_list() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "message-tags");
+    let bob = register_with_caps(&mut s, 2, "bob", "message-tags");
+    for c in [alice, bob] {
+        s.line(c, "JOIN #a");
+        s.line(c, "JOIN #b");
+    }
+    for c in [alice, bob] {
+        s.drain(c);
+    }
+    s.line(alice, "@+typing=active TAGMSG #a,#b");
+    let got = s.drain(bob);
+    assert!(
+        got.iter().any(|l| l.ends_with("TAGMSG #a")),
+        "bob must receive the TAGMSG to #a: {got:#?}"
+    );
+    assert!(
+        got.iter().any(|l| l.ends_with("TAGMSG #b")),
+        "bob must receive the TAGMSG to #b (not just the first target): {got:#?}"
+    );
+    assert!(
+        s.drain(alice)
+            .iter()
+            .all(|l| !l.contains("No such channel")),
+        "neither target is unknown, so no ERR_NOSUCHCHANNEL"
+    );
+}
+
 // ---- SASL PLAIN ---------------------------------------------------------
 
 fn b64(s: &str) -> String {
@@ -2547,6 +2580,58 @@ fn chanserv_register_flow() {
     );
 }
 
+/// ChanServ FLAGS must reject an unrecognized flag char loudly. Before the fix
+/// `apply_flag_changes` silently dropped unknown flags, so `FLAGS #c bob +q`
+/// produced an empty set — a *revoke* the founder never asked for — and reported
+/// it back as success (DESIGN §2, no silent no-ops).
+#[test]
+fn chanserv_flags_rejects_an_unknown_flag() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "PRIVMSG NickServ :IDENTIFY pw");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    s.drain(alice);
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
+    s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::ChannelRegistered {
+            channel: "#mine".into(),
+            founder_account: "alice".into(),
+        },
+    });
+    s.drain(alice);
+
+    // Unknown flag `q`: rejected loudly, and nothing is written.
+    s.line(alice, "PRIVMSG ChanServ :FLAGS #mine bob +q");
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|l| l.contains("Unknown flag")),
+        "an unknown flag must be rejected loudly: {out:#?}"
+    );
+    assert!(
+        s.db_requests().is_empty(),
+        "a rejected flag must write nothing (no silent revoke)"
+    );
+
+    // A recognized flag still works — proving the reject is specific, not blanket.
+    s.line(alice, "PRIVMSG ChanServ :FLAGS #mine bob +o");
+    assert!(
+        matches!(
+            s.db_requests().as_slice(),
+            [e6ircd::core::DbRequest::SetChannelAccess { flags: Some(f), .. }] if f == "o"
+        ),
+        "a valid +o must enqueue a SetChannelAccess granting o"
+    );
+}
+
 /// An account may register only up to a cap of channels: each registration
 /// adds a permanent, restart-surviving founder-map entry and runs no argon2, so
 /// without a cap a REGISTER loop grows that map without bound. At the cap, a new
@@ -2896,6 +2981,40 @@ fn kick_flow() {
     // kicking a non-member
     s.line(alice, "KICK #k bob");
     assert!(has_numeric(&s.drain(alice), "441"));
+}
+
+/// KICK takes a comma-separated *user* list on one channel (Modern IRC). Before
+/// the fix only the first user was removed and the rest silently ignored.
+#[test]
+fn kick_removes_a_comma_user_list() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    let bob = s.register(2, "bob");
+    let carol = s.register(3, "carol");
+    for c in [alice, bob, carol] {
+        s.line(c, "JOIN #k");
+        s.drain(c);
+    }
+    s.drain(alice);
+    // One KICK, two victims.
+    s.line(alice, "KICK #k bob,carol :cleanup");
+    let seen = s.drain(alice);
+    assert!(
+        seen.iter().any(|l| l.contains("KICK #k bob")),
+        "bob is kicked: {seen:#?}"
+    );
+    assert!(
+        seen.iter().any(|l| l.contains("KICK #k carol")),
+        "carol is kicked too, not silently ignored: {seen:#?}"
+    );
+    // Both are actually out of the channel now.
+    for victim in [bob, carol] {
+        s.line(victim, "PRIVMSG #k :still here?");
+        assert!(
+            has_numeric(&s.drain(victim), "404"),
+            "a kicked user can no longer speak to the channel"
+        );
+    }
 }
 
 #[test]

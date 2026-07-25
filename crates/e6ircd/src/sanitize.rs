@@ -145,8 +145,13 @@ pub(crate) fn valid_client_tag_key(key: &str) -> bool {
 
 /// Whether `nick` is a legal nickname: it starts with a letter or one of the
 /// RFC1459 "special" characters and continues with those plus digits and `-`,
-/// within `nicklen`. This is the charset every other field derived from a nick
-/// (an account name from NickServ REGISTER, a source prefix) inherits.
+/// within `nicklen`. A NickServ-registered account name inherits exactly this
+/// charset (a registered nick *is* the account), and a nick-derived source
+/// prefix stays within it. An **OIDC-provisioned** account name ([`account_name`])
+/// is deliberately broader — it also admits `.` and a leading digit, for
+/// email-local-part names like `john.doe` — because it is never used in the nick
+/// position; it appears only in tag/param positions (`account=`, WHOISACCOUNT,
+/// extended-join) where those extra characters are not delimiters.
 pub(crate) fn valid_nick(nick: &str, nicklen: usize) -> bool {
     let mut bytes = nick.bytes();
     let Some(first) = bytes.next() else {

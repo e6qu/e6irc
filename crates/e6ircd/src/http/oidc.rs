@@ -2,6 +2,35 @@
 
 use super::*;
 
+/// A web-session role the server actually models. The OIDC `role` claim is
+/// free-form text from the provider; only these two values mean anything (they
+/// gate the shauth developer portal) and only these two satisfy the
+/// `web_sessions.oidc_role` CHECK constraint. Parsing the claim into this type
+/// at the boundary makes an unrecognized role structurally `None` — the raw
+/// string can never reach a DB write that the CHECK would reject.
+#[derive(Clone, Copy)]
+pub(super) enum Role {
+    Developer,
+    Admin,
+}
+
+impl Role {
+    fn from_claim(s: &str) -> Option<Self> {
+        match s {
+            "developer" => Some(Self::Developer),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 // ---- OIDC login ---------------------------------------------------------
 
 pub(super) type OidcClient = openidconnect::core::CoreClient<
@@ -424,12 +453,19 @@ pub(super) async fn oidc_callback(
     // character so a spaced/control-laden username can't split a line.
     let preferred = crate::sanitize::account_name(&preferred);
     let email = claims.email().map(|value| value.as_str().to_string());
+    // The `role` claim is free-form text from the provider, but the server only
+    // models `developer`/`admin` (they gate the shauth developer portal) and the
+    // `web_sessions.oidc_role` CHECK admits only those two. Parse it into `Role`
+    // at the edge so any other value (`user`, `member`, …) becomes `None` here —
+    // never a raw string forwarded to the session INSERT, which the CHECK would
+    // reject with a 503 that locks an otherwise-valid login out entirely.
     let role = jwt_string_claim(&id_token.to_string(), "role")
         .ok()
-        .flatten();
-    let verified_shauth_identity = email.is_some()
-        && claims.email_verified() == Some(true)
-        && matches!(role.as_deref(), Some("developer" | "admin"));
+        .flatten()
+        .as_deref()
+        .and_then(Role::from_claim);
+    let verified_shauth_identity =
+        email.is_some() && claims.email_verified() == Some(true) && role.is_some();
     if pending.provider == "shauth" && !verified_shauth_identity {
         return problem(
             StatusCode::UNAUTHORIZED,
@@ -462,7 +498,7 @@ pub(super) async fn oidc_callback(
             subject: Some(subject),
             sid: sid.as_deref(),
             email: email.as_deref(),
-            role: role.as_deref(),
+            role: role.map(Role::as_str),
         },
     )
     .await

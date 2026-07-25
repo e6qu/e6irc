@@ -1593,6 +1593,102 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-third sweep — five-front hunt: an unauthenticated argon2 DoS, an
+OIDC login lockout, TOCTOU cap bypasses, and two silent drops (2026-07-25): five
+parallel adversarial audits (core/CHATHISTORY, proto/sanitize, persistence/auth,
+bouncer/bridges, services) turned up a handful of genuine defects in a
+heavily-swept tree; all fixed here in one change, several as bug classes.
+
+1. **Unauthenticated memory-exhaustion DoS via REST argon2** (MEDIUM, `db.rs`).
+   The IRC/SASL path bounded concurrent argon2 (each ~19 MiB) to 4 via a worker
+   semaphore, but `POST /auth/app-passwords` → `issue_app_password` called argon2
+   *directly from the axum handler*, bypassing that bound — tokio's ~512-thread
+   blocking pool ⇒ ~10 GiB under flood, and `auth_rate` defaults to disabled. Made
+   the class unrepresentable: the bound now lives at the argon2 **choke point** — a
+   single process-wide `ARGON2_PERMITS` semaphore that `hash_password` and
+   `verify_credentials` acquire — so no path (worker, SASL, or REST) can spawn
+   unbounded argon2. The redundant worker-loop semaphore was removed.
+
+2. **A non-shauth OIDC login with any other `role` claim 503'd the user out**
+   (MEDIUM, `http/oidc.rs`). The `role` claim was read for *every* provider and
+   forwarded to `web_sessions.oidc_role`, whose CHECK admits only
+   `developer`/`admin`; a provider sending `role: "user"` violated the CHECK →
+   503 → the user could never log in. Fixed by parsing the claim into a typed
+   `Role{Developer,Admin}` at the boundary, so any other value is structurally
+   `None` and can never reach the DB write (parse-don't-validate at the edge).
+
+3. **TOCTOU cap bypass on PAT and BNC-network creation** (LOW→MED, `db.rs`,
+   `http/device.rs`, `http/networks.rs`). Both did a `list`-then-`insert` across
+   two pool statements, so concurrent creates each read cap-1 and both inserted,
+   overshooting the per-account cap — and each network spawns an always-on
+   outbound driver, the amplifier the cap exists to bound. Both now count and
+   insert in one `FOR UPDATE` transaction, the pattern `issue_app_password`
+   already used; the racy handler checks are deleted and the caps live in one
+   place in the DB layer (a new `DbError::TooManyNetworks`).
+
+4. **A multi-target line dropped all-but-one non-delivery notice on the Matrix
+   bridge** (MEDIUM silent drop §2, `bouncer/matrix.rs`). `handle_command` folded
+   a `Vec<RouteResult>` into a single `outcome`, overwriting it each iteration, so
+   only the last target's problem surfaced — Discord/Slack emitted per-target. The
+   outcome-surfacing is now a shared `relay_routed` used by all three bridges: it
+   consumes the whole routed list and emits one notice per non-OK target, so
+   "fold N target outcomes into one" is unwritable. (Duplication dropped as a
+   result: three copies became one.)
+
+5. **TAGMSG and KICK ignored comma-separated target lists** (LOW fidelity,
+   `handler/message.rs`, `handler/chanops.rs`). Both took only the first target,
+   so `TAGMSG #a,#b` and `KICK #c a,b` — syntax that works for PRIVMSG/NOTICE —
+   silently affected only the first. Both now split/dedup/`TARGMAX` over their
+   list through per-target helpers, matching the PRIVMSG choke-point shape.
+
+6. **ChanServ FLAGS silently dropped an unknown flag and misreported the result**
+   (MEDIUM silent no-op §2, `handler/services.rs`). `apply_flag_changes` hit a
+   `_ => {}` arm for any flag other than `o`/`v`, so `FLAGS #c bob +q` produced an
+   empty set — a *revoke* the founder never asked for — reported back as success.
+   It now returns the bad char as `Err`, and FLAGS rejects the whole change
+   loudly, like every other ChanServ token parser.
+
+7. **A disabled owned network silently fell through to a shared one** (LOW §2,
+   `bouncer/serve.rs`). Disabling a network removed it from the registry, and
+   `Registry::get` then fell through to a shared (ownerless) network of the same
+   name — silently attaching the user to the operator's network. Split into
+   `get_owned` (no fall-through) + `get_shared`; `bnc_serve` now checks the DB for
+   an owned-but-disabled network and reports it explicitly, only falling through
+   to a shared network for a name the account does not own at all.
+
+Boy-scout also: a construction-side `serialize_message` fuzz target (the
+serialize→parse direction the parse-first fuzzer never covered, now that
+`Message`'s fields are `pub`); and a corrected `valid_nick` doc that had
+over-claimed OIDC account names inherit its exact charset (they admit `.` and a
+leading digit, safe in the tag/param positions they occupy).
+
+Verified: full workspace suite + 3 new core tests (TAGMSG/KICK multi-target,
+ChanServ FLAGS reject) + a `relay_routed` bridge test (every target outcome
+surfaces); PG db suite **43** (+2 atomic-cap tests) on real PostgreSQL; embed-web
+`http` (12) and dex `oidc` (4); bridges under `--features matrix,discord,slack`
+(98 lib tests); `serialize_message` fuzz (500k, clean); all `tools/check-*` gates
+(duplication *down* to 2.91%). Also folded in this one PR: the **One-PR Rule**
+(AGENTS.md) — at most one open PR, ever — recorded after two parallel PRs off
+`main` caused exactly the merge churn it now forbids.
+
+Escalated as decisions (not silently filed — see below), each low-severity and
+either operator-scoped or a genuine trade-off:
+- **Back-channel OIDC logout has no per-IP `RateLimited`** (unlike front-channel).
+  Adding it would throttle legitimate IdP-initiated logout bursts (one source IP)
+  for a marginal DoS benefit (signature verify is fast; rows only for valid signed
+  tokens). Left for a decision rather than guessed.
+- **IDENTIFY does not thread a labeled-response label through its deferred
+  verdict** the way REGISTER now does — a label-tracking client can't correlate
+  the IDENTIFY result. A real consistency gap; fixing it means routing the verdict
+  through the deferred-label path.
+- **Bridge upstream dials (matrix/discord/slack) aren't IP-vetted at dial time**
+  the way `irc_driver` is. Operator-scoped (bridge config is operator-only, not
+  tenant-reachable), so not the tenant SSRF vector; closing it needs a custom
+  reqwest/tungstenite resolver.
+- **A bridge with permanently-bad credentials reconnects forever** (backoff-capped,
+  operator-scoped) — the still-open half of the "fatal auth stops reconnect" item
+  that `irc_driver` already has.
+
 Eighty-second sweep — a multiline message replayed as one message
 (2026-07-25): CHATHISTORY reconstruction of a `draft/multiline` message was the
 last place the codebase minted message ids it never delivered.
