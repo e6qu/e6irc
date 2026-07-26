@@ -51,10 +51,10 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (registered, prefix, old_key, old_nick_display) = {
         let session = &state.sessions[&conn];
         (
-            session.registered,
-            session.registered.then(|| session.prefix()),
-            session.nick.as_ref().map(|o| state.nick_key(o)),
-            session.nick.clone(),
+            session.is_registered(),
+            session.is_registered().then(|| session.prefix()),
+            session.nick().as_ref().map(|o| state.nick_key(o)),
+            session.nick().map(String::from),
         )
     };
     // NICK to the *exact* current nick (identical bytes, not merely the same
@@ -68,7 +68,11 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if registered && !case_change_only {
         state.record_whowas(conn);
     }
-    state.sessions.get_mut(&conn).expect("checked").nick = Some(nick.to_string());
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .set_nick(nick.to_string());
     if let Some(old_key) = old_key {
         state.nicks.remove(&old_key);
     }
@@ -96,7 +100,7 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 }
 
 pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    if state.sessions[&conn].registered {
+    if state.sessions[&conn].is_registered() {
         state.numeric(
             conn,
             ERR_ALREADYREGISTERED,
@@ -124,8 +128,8 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // lines, so an unbounded one makes every such line's fixed head unbounded
     // and no per-line fitting can save it. Truncation here is the protocol
     // norm (Solanum does the same) and USERLEN is advertised in ISUPPORT.
-    session.user = Some(crate::sanitize::username(p[0], USERLEN));
-    session.realname = Some(truncate_chars(p[3], REALLEN).to_string());
+    session.set_user(crate::sanitize::username(p[0], USERLEN));
+    session.set_realname(truncate_chars(p[3], REALLEN).to_string());
     maybe_complete_registration(state, conn);
 }
 
@@ -133,9 +137,9 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 pub(super) fn cap_target(state: &ServerState, conn: ConnId) -> String {
     state.sessions[&conn]
-        .nick
-        .clone()
-        .unwrap_or_else(|| "*".into())
+        .nick()
+        .map(String::from)
+        .unwrap_or_else(|| "*".to_string())
 }
 
 /// `FAIL REGISTER <code> <account> :<description>` — the spec's shape, with the
@@ -172,7 +176,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let nick = state.sessions[&conn].nick.clone();
+    let nick = state.sessions[&conn].nick().map(String::from);
     let [account, email, password] = p else {
         register_fail(
             state,
@@ -185,7 +189,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     // A connection that has not finished registering has not proven it can
     // hold the nick it is asking to register, so this is opt-in.
-    if !state.sessions[&conn].registered && !state.config.registration_before_connect {
+    if !state.sessions[&conn].is_registered() && !state.config.registration_before_connect {
         register_fail(
             state,
             conn,
@@ -370,7 +374,7 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .unwrap_or_default();
     match sub.as_str() {
         "LS" => {
-            if !state.sessions[&conn].registered {
+            if !state.sessions[&conn].is_registered() {
                 state
                     .sessions
                     .get_mut(&conn)
@@ -414,7 +418,7 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         "REQ" => {
             let request = p.get(1).copied().unwrap_or("");
-            if !state.sessions[&conn].registered {
+            if !state.sessions[&conn].is_registered() {
                 state
                     .sessions
                     .get_mut(&conn)
@@ -472,7 +476,7 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         "END" => {
             let session = state.sessions.get_mut(&conn).expect("checked");
-            if !session.registered && session.cap_negotiating {
+            if !session.is_registered() && session.cap_negotiating {
                 session.cap_negotiating = false;
                 maybe_complete_registration(state, conn);
             }

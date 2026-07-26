@@ -95,7 +95,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         }
         crate::core::state::HistoryKey::from(&key)
     } else {
-        if state.sessions[&conn].nick.is_none() {
+        if state.sessions[&conn].nick().is_none() {
             chathistory_fail(
                 state,
                 conn,
@@ -770,7 +770,12 @@ pub(crate) fn history_page(
     // client spelled the target, so a replayed message is byte-identical to the
     // one delivered live.
     let dm = (!display.starts_with('#'))
-        .then(|| state.sessions.get(&conn).and_then(|s| s.nick.clone()))
+        .then(|| {
+            state
+                .sessions
+                .get(&conn)
+                .and_then(|s| s.nick().map(String::from))
+        })
         .flatten()
         .map(|me| {
             // The requester's *identity* (account, or `~nick`) — stable across a

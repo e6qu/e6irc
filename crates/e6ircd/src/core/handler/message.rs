@@ -441,7 +441,10 @@ pub(super) fn deliver_one_message(
         // The conversation is recorded once, under a key both participants
         // derive identically, so each side's CHATHISTORY sees the whole thread
         // rather than only the half it sent.
-        let peer_nick = state.sessions[&peer].nick.clone().expect("registered");
+        let peer_nick = state.sessions[&peer]
+            .nick()
+            .map(String::from)
+            .expect("registered");
         let (conv, peers) =
             state.dm_conversation(&state.conn_identity(conn), &state.conn_identity(peer));
         record_history(
@@ -459,8 +462,12 @@ pub(super) fn deliver_one_message(
                 multiline: None,
             },
         );
-        // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free).
-        if loud && let Some(away) = state.sessions[&peer].away.clone() {
+        // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free), and never
+        // for a message to yourself — you don't need to be told you're away.
+        if loud
+            && peer != conn
+            && let Some(away) = state.sessions[&peer].away.clone()
+        {
             state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
         }
     }
@@ -986,9 +993,13 @@ pub(super) fn deliver_multiline(
     // ordinary PRIVMSG does; NOTICE stays reply-free).
     if loud
         && let ResolvedKind::User { peer } = &resolved.kind
+        && *peer != conn
         && let Some(away) = state.sessions[peer].away.clone()
     {
-        let peer_nick = state.sessions[peer].nick.clone().expect("registered");
+        let peer_nick = state.sessions[peer]
+            .nick()
+            .map(String::from)
+            .expect("registered");
         state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
     }
 

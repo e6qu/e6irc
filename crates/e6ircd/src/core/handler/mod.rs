@@ -281,7 +281,7 @@ fn flood_ok(state: &mut ServerState, conn: ConnId) -> bool {
     };
     {
         let s = &state.sessions[&conn];
-        if !s.registered || s.oper {
+        if !s.is_registered() || s.oper {
             return true;
         }
     }
@@ -360,7 +360,7 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "REGISTER" => return cmd_register(state, conn, p),
         _ => {}
     }
-    if !state.sessions[&conn].registered {
+    if !state.sessions[&conn].is_registered() {
         state.numeric(
             conn,
             ERR_NOTREGISTERED,
@@ -448,7 +448,7 @@ pub(crate) fn reap_idle(state: &mut ServerState, now: e6irc_proto::time::MonoMil
     let mut expired: Vec<(ConnId, &'static str)> = Vec::new();
     let mut to_ping: Vec<ConnId> = Vec::new();
     for (&conn, s) in &state.sessions {
-        if !s.registered {
+        if !s.is_registered() {
             if now.saturating_sub(s.opened_at).as_millis() >= REGISTRATION_TIMEOUT_MS {
                 expired.push((conn, "Registration timeout"));
             }

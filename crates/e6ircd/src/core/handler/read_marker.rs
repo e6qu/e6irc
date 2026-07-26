@@ -204,7 +204,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             if state
                 .sessions
                 .get(&peer)
-                .is_some_and(|s| s.registered && s.caps.read_marker)
+                .is_some_and(|s| s.is_registered() && s.caps.read_marker)
             {
                 state.send(peer, &line);
             }

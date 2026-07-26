@@ -218,13 +218,33 @@ pub(crate) const CAP_NAMES: &[(&str, CapAccessor)] = &[
     ("chghost", |c| &mut c.chghost),
 ];
 
+/// A connection's registration state. Held as a sum type rather than a
+/// `registered: bool` beside three `Option` identity fields so the invalid combo
+/// "registered but no nick" is unrepresentable: `Registered` *has* a nick, user,
+/// and realname by construction, so [`Session::prefix`] and every other
+/// "a registered session has a nick" site is total, not `.expect()`-guarded.
+pub(crate) enum Registration {
+    /// Pre-registration: the nick and/or USER have not both arrived (or CAP END
+    /// is still pending). Each identity field fills in independently.
+    Registering {
+        nick: Option<String>,
+        user: Option<String>,
+        realname: Option<String>,
+    },
+    /// Registration complete: the connection has a nick, user, and realname.
+    Registered {
+        nick: String,
+        user: String,
+        realname: String,
+    },
+}
+
 pub(crate) struct Session {
     pub tx: Sender<Output>,
     pub host: String,
-    pub nick: Option<String>,
-    pub user: Option<String>,
-    pub realname: Option<String>,
-    pub registered: bool,
+    /// Registration state and the identity fields, as one sum type (see
+    /// [`Registration`]): a registered connection *has* a nick/user/realname.
+    pub reg: Registration,
     /// Mid-CAP-negotiation: registration is held until CAP END.
     pub cap_negotiating: bool,
     pub caps: Caps,
@@ -284,7 +304,11 @@ pub(crate) struct Session {
     pub multiline: Option<MultilineBatch>,
     /// Read markers for a client that isn't logged in: per-connection and not
     /// persisted (there is no account to key them to). A logged-in client uses
-    /// the account-keyed `ServerState::read_markers` instead.
+    /// the account-keyed `ServerState::read_markers` instead. A marker set here
+    /// *before* a mid-session login is intentionally not migrated into the account
+    /// map on IDENTIFY/SASL: it was unattributable when set, and carrying it over
+    /// would write a persisted marker the client never asked to associate with the
+    /// account (same reason the DM-history identity key is not back-filled).
     pub anon_read_markers: HashMap<ChanKey, e6irc_proto::time::Millis>,
     /// Command-flood token bucket (only used when `command_burst` is set):
     /// tokens remaining, and the clock-millisecond through which refill has
@@ -321,14 +345,95 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// `nick!user@host` — only valid once registered.
+    /// Whether registration has completed.
+    pub fn is_registered(&self) -> bool {
+        matches!(self.reg, Registration::Registered { .. })
+    }
+
+    /// The current nick, in either registration state (`None` before NICK).
+    pub fn nick(&self) -> Option<&str> {
+        match &self.reg {
+            Registration::Registering { nick, .. } => nick.as_deref(),
+            Registration::Registered { nick, .. } => Some(nick),
+        }
+    }
+
+    /// The username, in either state (`None` before USER).
+    pub fn user(&self) -> Option<&str> {
+        match &self.reg {
+            Registration::Registering { user, .. } => user.as_deref(),
+            Registration::Registered { user, .. } => Some(user),
+        }
+    }
+
+    /// The realname, in either state (`None` before USER).
+    pub fn realname(&self) -> Option<&str> {
+        match &self.reg {
+            Registration::Registering { realname, .. } => realname.as_deref(),
+            Registration::Registered { realname, .. } => Some(realname),
+        }
+    }
+
+    /// Set (or, once registered, rename) the nick — valid in both states, since a
+    /// NICK rename happens after registration too.
+    pub fn set_nick(&mut self, value: String) {
+        match &mut self.reg {
+            Registration::Registering { nick, .. } => *nick = Some(value),
+            Registration::Registered { nick, .. } => *nick = value,
+        }
+    }
+
+    /// Set the username (only meaningful pre-registration; USER is sent once).
+    pub fn set_user(&mut self, value: String) {
+        if let Registration::Registering { user, .. } = &mut self.reg {
+            *user = Some(value);
+        }
+    }
+
+    /// Set the realname — valid in both states (SETNAME changes it post-registration).
+    pub fn set_realname(&mut self, value: String) {
+        match &mut self.reg {
+            Registration::Registering { realname, .. } => *realname = Some(value),
+            Registration::Registered { realname, .. } => *realname = value,
+        }
+    }
+
+    /// Transition `Registering → Registered` once a nick and user are present.
+    /// The caller (`maybe_complete_registration`) verifies both first; realname is
+    /// set alongside user, so it defaults to empty only defensively. A no-op if
+    /// already registered or the identity is incomplete.
+    pub fn complete_registration(&mut self) {
+        let placeholder = Registration::Registering {
+            nick: None,
+            user: None,
+            realname: None,
+        };
+        self.reg = match std::mem::replace(&mut self.reg, placeholder) {
+            Registration::Registering {
+                nick: Some(nick),
+                user: Some(user),
+                realname,
+            } => Registration::Registered {
+                nick,
+                user,
+                realname: realname.unwrap_or_default(),
+            },
+            // Already registered, or not yet complete: restore unchanged.
+            other => other,
+        };
+    }
+
+    /// `nick!user@host` — total on a registered session (its nick/user exist by
+    /// construction). Calling it on an unregistered session is a caller bug.
     pub fn prefix(&self) -> String {
-        format!(
-            "{}!{}@{}",
-            self.nick.as_deref().expect("registered session has nick"),
-            self.user.as_deref().expect("registered session has user"),
-            self.host,
-        )
+        match &self.reg {
+            Registration::Registered { nick, user, .. } => {
+                format!("{nick}!{user}@{}", self.host)
+            }
+            Registration::Registering { .. } => {
+                unreachable!("prefix() on an unregistered session")
+            }
+        }
     }
 }
 
@@ -912,15 +1017,15 @@ impl ServerState {
             return;
         };
         let (Some(nick), Some(user), Some(realname)) =
-            (&session.nick, &session.user, &session.realname)
+            (session.nick(), session.user(), session.realname())
         else {
             return; // never fully registered; nothing worth recording
         };
         let entry = WhowasEntry {
-            nick: nick.clone(),
-            user: user.clone(),
+            nick: nick.to_string(),
+            user: user.to_string(),
             host: session.host.clone(),
-            realname: realname.clone(),
+            realname: realname.to_string(),
             signoff: (self.config.clock)(),
         };
         if self.whowas.len() == WHOWAS_CAP {
@@ -1165,7 +1270,7 @@ impl ServerState {
         self.nicks
             .get(&NickKey(folded.to_string()))
             .and_then(|&conn| self.sessions.get(&conn))
-            .and_then(|s| s.nick.clone())
+            .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| folded.to_string())
     }
 
@@ -1183,7 +1288,7 @@ impl ServerState {
                         .as_deref()
                         .is_some_and(|a| self.casemap.casefold(a) == identity)
                 })
-                .and_then(|s| s.nick.clone())
+                .and_then(|s| s.nick().map(String::from))
                 .unwrap_or_else(|| identity.to_string()),
         }
     }
@@ -1208,10 +1313,7 @@ impl ServerState {
         match self.sessions.get(&conn) {
             Some(s) => match &s.account {
                 Some(account) => self.casemap.casefold(account),
-                None => format!(
-                    "~{}",
-                    self.casemap.casefold(s.nick.as_deref().unwrap_or(""))
-                ),
+                None => format!("~{}", self.casemap.casefold(s.nick().unwrap_or(""))),
             },
             None => String::new(),
         }
@@ -1256,7 +1358,7 @@ impl ServerState {
         self.nicks
             .get(key)
             .copied()
-            .filter(|c| self.sessions.get(c).is_some_and(|s| s.registered))
+            .filter(|c| self.sessions.get(c).is_some_and(|s| s.is_registered()))
     }
 
     pub fn open(&mut self, conn: ConnId, tx: Sender<Output>, host: String) {
@@ -1266,10 +1368,11 @@ impl ServerState {
             Session {
                 tx,
                 host,
-                nick: None,
-                user: None,
-                realname: None,
-                registered: false,
+                reg: Registration::Registering {
+                    nick: None,
+                    user: None,
+                    realname: None,
+                },
                 cap_negotiating: false,
                 caps: Caps::default(),
                 account: None,
@@ -1508,7 +1611,7 @@ impl ServerState {
         let target = self
             .sessions
             .get(&conn)
-            .and_then(|s| s.nick.clone())
+            .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| "*".into());
         let mut line = format!(
             ":{} {} {}",
@@ -1583,7 +1686,7 @@ impl ServerState {
         let target = self
             .sessions
             .get(&conn)
-            .and_then(|s| s.nick.clone())
+            .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| "*".into());
         let mut overhead = 1
             + self.config.server_name.len()
@@ -1722,7 +1825,7 @@ impl ServerState {
         let nick = self
             .sessions
             .get(&conn)
-            .and_then(|s| s.nick.clone())
+            .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| "*".into());
         let host = format!("services.{}", self.config.server_name);
         let line = format!(":{service}!{service}@{host} NOTICE {nick} :{text}");
@@ -1737,7 +1840,7 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return;
         };
-        let was_registered = session.registered;
+        let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the
         // terminal ERROR a QUIT or kill path sent just before this close. The
@@ -1802,7 +1905,7 @@ impl ServerState {
                 }
             }
         }
-        if let Some(nick) = &session.nick {
+        if let Some(nick) = session.nick() {
             let nick_key = NickKey(self.casemap.casefold(nick));
             self.nicks.remove(&nick_key);
             if was_registered {

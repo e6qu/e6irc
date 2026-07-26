@@ -270,7 +270,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         let session = &state.sessions[&conn];
         (
             session.account.clone().unwrap_or_else(|| "*".into()),
-            session.realname.clone().expect("registered"),
+            session.realname().map(String::from).expect("registered"),
         )
     };
     let plain_join = format!(":{prefix} JOIN {display}");
@@ -307,8 +307,8 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     // needs no broadcast — nobody else is present to desync.
     if !first && (is_founder || access_op || access_voice) {
         let nick = state.sessions[&conn]
-            .nick
-            .clone()
+            .nick()
+            .map(String::from)
             .expect("registered joiner has a nick");
         let mut letters = String::from("+");
         let mut args = String::new();
@@ -458,7 +458,10 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
             let shown = if requester_caps.userhost_in_names {
                 member.prefix()
             } else {
-                member.nick.clone().expect("member is registered")
+                member
+                    .nick()
+                    .map(String::from)
+                    .expect("member is registered")
             };
             let sigil = match (modes.op, modes.voice, requester_caps.multi_prefix) {
                 (true, true, true) => "@+",
@@ -844,7 +847,10 @@ pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
 }
 
 pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
-    let self_nick = state.sessions[&conn].nick.clone().expect("registered");
+    let self_nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     if state.nick_key(target) != state.nick_key(&self_nick) {
         state.numeric(
             conn,
@@ -905,7 +911,10 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
         state.numeric(conn, ERR_UMODEUNKNOWNFLAG, &[], Some("Unknown MODE flag"));
     }
     if !applied.is_empty() {
-        let nick = state.sessions[&conn].nick.clone().expect("registered");
+        let nick = state.sessions[&conn]
+            .nick()
+            .map(String::from)
+            .expect("registered");
         let server = state.config.server_name.clone();
         state.send(conn, &format!(":{server} MODE {nick} :{applied}"));
     }
@@ -1315,7 +1324,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 let member_nick = state
                     .sessions
                     .get(&member_conn)
-                    .and_then(|s| s.nick.clone())
+                    .and_then(|s| s.nick().map(String::from))
                     .unwrap_or_else(|| who.to_string());
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let Some(member) = chan.members.get_mut(&member_conn) else {

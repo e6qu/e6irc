@@ -152,11 +152,11 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             _ => "",
                         };
                         (
-                            s.user.clone().expect("registered"),
+                            s.user().map(String::from).expect("registered"),
                             s.host.clone(),
-                            s.nick.clone().expect("registered"),
+                            s.nick().map(String::from).expect("registered"),
                             who_flags(s, sigil),
-                            s.realname.clone().expect("registered"),
+                            s.realname().map(String::from).expect("registered"),
                             s.account.clone(),
                             // The clock is milliseconds; WHOX `l` is seconds.
                             now.saturating_sub(s.last_active).as_secs(),
@@ -199,11 +199,11 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let targets: Vec<ConnId> = state
             .sessions
             .iter()
-            .filter(|(_, s)| s.registered)
+            .filter(|(_, s)| s.is_registered())
             .filter(|(_, s)| !opers_only || s.oper)
             .filter(|(_, s)| {
                 match_all || {
-                    let nick = s.nick.as_deref().unwrap_or("");
+                    let nick = s.nick().unwrap_or("");
                     e6irc_proto::mask::matches(casemap, mask, nick)
                         || e6irc_proto::mask::matches(casemap, mask, &s.host)
                 }
@@ -222,17 +222,17 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             .filter(|&peer| {
                 let s = &state.sessions[&peer];
                 let named_by_nick = !is_wildcard
-                    && e6irc_proto::mask::matches(casemap, mask, s.nick.as_deref().unwrap_or(""));
+                    && e6irc_proto::mask::matches(casemap, mask, s.nick().unwrap_or(""));
                 peer == conn || !s.invisible || state.share_channel(conn, peer) || named_by_nick
             })
             .collect();
         for peer in targets {
             let s = &state.sessions[&peer];
             let (user, host, nick, realname, account, flags, idle_secs) = (
-                s.user.clone().expect("registered"),
+                s.user().map(String::from).expect("registered"),
                 s.host.clone(),
-                s.nick.clone().expect("registered"),
-                s.realname.clone().expect("registered"),
+                s.nick().map(String::from).expect("registered"),
+                s.realname().map(String::from).expect("registered"),
                 s.account.clone(),
                 who_flags(s, ""),
                 // The clock is milliseconds; WHOX `l` is seconds.
@@ -287,10 +287,10 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         Some(peer) => {
             let s = &state.sessions[&peer];
             let (nick, user, host, realname) = (
-                s.nick.clone().expect("registered"),
-                s.user.clone().expect("registered"),
+                s.nick().map(String::from).expect("registered"),
+                s.user().map(String::from).expect("registered"),
                 s.host.clone(),
-                s.realname.clone().expect("registered"),
+                s.realname().map(String::from).expect("registered"),
             );
             let mut chans: Vec<String> = s
                 .channels
@@ -407,7 +407,11 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     let prefix = state.sessions[&conn].prefix();
     let new_name = truncate_chars(new_name, REALLEN);
-    state.sessions.get_mut(&conn).expect("checked").realname = Some(new_name.to_string());
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .set_realname(new_name.to_string());
     let line = format!(":{prefix} SETNAME :{new_name}");
     state.send_timed(conn, &line);
     for peer in state.channel_peers(conn) {
@@ -597,7 +601,7 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .flat_map(|arg| arg.split_whitespace())
         .filter_map(|nick| {
             let peer = state.registered_peer(&state.nick_key(nick))?;
-            state.sessions[&peer].nick.clone()
+            state.sessions[&peer].nick().map(String::from)
         })
         .collect();
     // RPL_ISON is a single reply by RFC 2812 (splitting it would be
@@ -606,7 +610,7 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Match Solanum: pack nicks while they fit and drop the rest, which a
     // client re-queries next poll anyway (ISON is a polling command). Uses the
     // shared whole-item packer (same as USERHOST/USERIP) against the real head.
-    let target = state.sessions[&conn].nick.as_deref().unwrap_or("*");
+    let target = state.sessions[&conn].nick().unwrap_or("*");
     let head_len = format!(
         ":{} {} {} :",
         state.config.server_name,
