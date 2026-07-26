@@ -1593,10 +1593,12 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
-Eighty-ninth sweep — the three sweep-88 decisions, done, plus an XLINE split bug
-and a concurrent-REGISTER guard (2026-07-26): the human approved all three
-decisions sweep 88 left open ("yes to them all"); all three are implemented, and
-two more real bugs were found and fixed on the way.
+Eighty-ninth sweep — six approved decisions done (three from sweep 88, three
+oper-hunt), plus two bugs found on the way, and a parse-don't-validate refactor
+(2026-07-26): the human approved every escalated decision ("yes to them all") and
+asked to lean harder on parse-don't-validate / type-driven unrepresentability on
+user-controlled-input paths. All six decisions are implemented in one PR; two more
+real bugs (an XLINE split, a concurrent REGISTER) were found and fixed on the way.
 
 **(1) Per-IP account-creation rate limit** (`core::state`, `config`, `net`,
 `registration`, `services`). The per-connection argon2 budget stops one *link*
@@ -1660,18 +1662,41 @@ the `deferred_replies` doc claimed strict issue-order it doesn't provide. Both n
 state precisely what holds: *ambiguous output never overtakes a deferred reply*;
 two deferred replies may resolve in completion order.
 
-Escalated, not yet done (oper-hunt observations, policy/fidelity judgment calls):
-(a) a too-broad-mask guard rejecting/​warning on `*@*`-style server bans; (b)
-SETHOST emitting `RPL_VISIBLEHOST` (396) so a non-`chghost` target learns its new
-visible host (it currently gets only the CHGHOST, which such a client can't see;
-`RPL_VISIBLEHOST` is defined but unused); (c) oper server-notices (snotices) on
-KILL/ban actions. None is a proven defect — each is a feature/convention choice —
-so they are put to the human rather than built speculatively.
+The three oper-hunt observations were escalated as decisions and the human
+approved all three ("yes to them all"); all are now implemented in this same PR:
 
-Verified: workspace suite (252 core tests incl. 3 new) + all bins; each bridge
-feature alone under `-Dwarnings`; `cargo clippy --all-features`; all
-`tools/check-*` gates + `cargo deny`; irctest main (382 passed); PG db suite (44
-passed).
+**(a) Too-broad server-ban masks refused — as a parse-don't-validate type**
+(`oper.rs`; per the human's "do more parse-don't-validate on user-controlled
+paths"). Rather than bolt on another after-the-fact check, the ban-mask handling
+became a `BanMask` newtype whose *only* constructor is `BanMask::parse(kind,
+params, has_trailing)`. Parsing folds three previously-separate ad-hoc steps into
+one place — the XLINE reason/mask split (keyed on the trailing marker), the
+`*@host` normalization, and the match-everyone refusal — so downstream code can no
+longer represent a mis-split fragment *or* a `*@*`/`*` netban mask: those bug
+classes are unrepresentable, not merely guarded. A netban attempt gets a loud
+NOTICE ("matches every user; use a more specific mask"), never a silent narrowing.
+`user@*` (specific user field) is still accepted.
+
+**(b) SETHOST emits `RPL_VISIBLEHOST` (396)** (`oper.rs`) — a `chghost`-capable
+target learns of its new host from the CHGHOST, but a client *without* the cap
+would otherwise never be told its own host moved. It now receives 396 ("is now
+your visible host") — sent only when the target lacks `chghost`, so a capable
+client gets no redundant numeric. (The previously-defined-but-unused
+`RPL_VISIBLEHOST` numeric is now live.)
+
+**(c) Operator server-notices (snotices) on KILL/ban** (`oper.rs`) — a new
+`notify_opers(except, text)` raises `NOTICE … :*** Notice -- …` to every
+registered operator (skipping a KILL victim about to be closed), so privileged
+activity is visible without tailing the DB audit log. The snotice text is
+length-fitted per recipient (`fit_trailing`) — a first cut overflowed 512 bytes on
+a maximal KILL comment, caught by the debug wire-check and fixed. This is the
+minimal surface: there is no `+s` snomask yet, so every oper sees every notice.
+
+Verified: workspace suite (256 core tests incl. 7 new — rate-limit, concurrent-
+REGISTER, XLINE no-reason mask, netban refusal, SETHOST 396 present/absent, oper
+snotices) + all bins; each bridge feature alone under `-Dwarnings`; `cargo clippy
+--all-features`; all `tools/check-*` gates + `cargo deny`; fuzz targets build
+under `--cfg fuzzing`; irctest main (382 passed); PG db suite (44 passed).
 
 Eighty-eighth sweep — sealed secrets bound to their context + a lingering-BNC
 detach bug (2026-07-26): the second escalation from sweep 86 — AAD context-binding

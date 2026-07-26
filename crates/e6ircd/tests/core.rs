@@ -7021,18 +7021,20 @@ fn server_ban_preserves_display_case_and_removes_case_insensitively() {
 
 /// A ban that matches the setting oper's own session must still confirm and
 /// audit before the self-disconnect: the confirmation NOTICE and `record_audit`
-/// run ahead of the victims loop, so a self-matching `KLINE *@*` doesn't close
-/// the oper's session and then send its confirmation into a gone connection
-/// (a silent no-op) or record an actor-less audit row — the same self-close
-/// ordering `cmd_kill` guards.
+/// run ahead of the victims loop, so a self-matching ban doesn't close the
+/// oper's session and then send its confirmation into a gone connection (a
+/// silent no-op) or record an actor-less audit row — the same self-close
+/// ordering `cmd_kill` guards. (The mask targets the oper's own host rather
+/// than `*@*`, which is refused as a netban, while still self-matching.)
 #[test]
 fn self_matching_kline_confirms_before_disconnecting_the_setter() {
     let mut s = TestServer::new();
     let op = s.register(1, "god");
     s.line(op, "OPER god letmein");
     s.drain(op);
-    // A mask that matches everyone, including the oper's own user@host.
-    s.line(op, "KLINE *@* :cleanup");
+    // A mask specific enough to pass the netban guard but that still matches the
+    // oper's own user@host (the test harness gives conn 1 the host host1.example).
+    s.line(op, "KLINE *@host1.example :cleanup");
     let out = s.drain(op);
     assert!(
         out.iter().any(|l| l.contains("Added K-Line")),
@@ -7192,6 +7194,49 @@ fn oper_xline_multiword_mask_without_reason_bans_whole_mask() {
     );
 }
 
+/// A ban mask that constrains nothing (`*@*`, `*`) is an accidental server-wide
+/// ban; `BanMask::parse` refuses it so such a mask can never reach the ban list.
+/// The refusal is loud (a NOTICE), never a silent narrowing.
+#[test]
+fn oper_ban_matching_everyone_is_refused() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    // Each of these constrains nothing and must be refused, with no DB write.
+    for cmd in ["KLINE *@* :bye", "DLINE * :bye", "XLINE * :bye"] {
+        s.line(op, cmd);
+        let out = s.drain(op);
+        assert!(
+            out.iter()
+                .any(|l| l.contains("Refusing") && l.contains("matches every user")),
+            "{cmd} should be refused as a netban: {out:#?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("Added")),
+            "{cmd} must not be added"
+        );
+        assert!(
+            s.db_requests()
+                .iter()
+                .all(|r| !matches!(r, e6ircd::core::DbRequest::AddServerBan { .. })),
+            "{cmd} must not reach the database"
+        );
+    }
+    // A specific mask on the same commands is still accepted.
+    s.line(op, "KLINE bad@host.example :spam");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added K-Line")),
+        "a specific KLINE is still accepted"
+    );
+    // `nick@*` constrains the user field, so it is not a netban.
+    s.line(op, "KLINE baddie@* :spam");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added K-Line")),
+        "user@* is specific enough to accept"
+    );
+}
+
 /// Server-ban removal folds like enforcement: a ban set with one casing is
 /// removable with another. Before, `UNKLINE` compared case-sensitively and
 /// reported "no such ban" while the ban kept enforcing.
@@ -7338,6 +7383,15 @@ fn oper_sethost_changes_host_and_chghosts() {
             .any(|l| l.contains("@host3.example CHGHOST user cloak.example")),
         "no CHGHOST"
     );
+    // The target has no chghost cap, so it learns its new host via
+    // RPL_VISIBLEHOST (396) instead of a CHGHOST it couldn't parse.
+    let target_out = s.drain(target);
+    assert!(
+        target_out
+            .iter()
+            .any(|l| l.split(' ').nth(1) == Some("396") && l.contains("cloak.example")),
+        "target not sent RPL_VISIBLEHOST: {target_out:#?}"
+    );
     // The host actually changed: the target's next message shows it.
     s.line(target, "PRIVMSG #room :hi");
     assert!(
@@ -7353,6 +7407,65 @@ fn oper_sethost_changes_host_and_chghosts() {
     assert!(
         s.drain(plain).iter().any(|l| l.contains(" 481 ")),
         "non-oper allowed to SETHOST"
+    );
+}
+
+/// A chghost-capable target already learns of the host change from CHGHOST, so
+/// it must not also get a redundant RPL_VISIBLEHOST.
+#[test]
+fn oper_sethost_capable_target_gets_no_redundant_396() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let target = register_with_caps(&mut s, 2, "user", "chghost");
+    s.drain(target);
+    s.line(op, "SETHOST user cloak.example");
+    s.drain(op);
+    let out = s.drain(target);
+    assert!(
+        out.iter().any(|l| l.contains("CHGHOST user cloak.example")),
+        "capable target should get CHGHOST: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.split(' ').nth(1) == Some("396")),
+        "capable target must not get a redundant RPL_VISIBLEHOST: {out:#?}"
+    );
+}
+
+/// Privileged actions (KILL, server bans) raise an operator server-notice to
+/// every other operator, so oper activity is visible without tailing the DB
+/// audit log.
+#[test]
+fn oper_kill_and_ban_raise_snotices() {
+    let mut s = TestServer::new();
+    let op1 = s.register(1, "god");
+    s.line(op1, "OPER god letmein");
+    s.drain(op1);
+    // A second operator (same credentials, second session) watches for snotices.
+    let op2 = s.register(2, "god2");
+    s.line(op2, "OPER god letmein");
+    s.drain(op2);
+    let victim = s.register(3, "victim");
+    s.drain(victim);
+
+    // KILL: op2 sees the notice; the killed victim does not (it is excluded).
+    s.line(op1, "KILL victim :spamming");
+    let seen = s.drain(op2);
+    assert!(
+        seen.iter()
+            .any(|l| l.contains("Notice -- Received KILL message for victim")
+                && l.contains("from god")),
+        "op2 did not see the KILL snotice: {seen:#?}"
+    );
+
+    // Ban: op2 sees the K-Line notice.
+    s.line(op1, "KLINE bad@host.example :spam");
+    let seen = s.drain(op2);
+    assert!(
+        seen.iter()
+            .any(|l| l.contains("Notice --") && l.contains("added K-Line for bad@host.example")),
+        "op2 did not see the ban snotice: {seen:#?}"
     );
 }
 
