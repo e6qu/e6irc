@@ -48,6 +48,24 @@ pub(super) fn client_tag_string(msg: &Message) -> String {
         .join(";")
 }
 
+/// Yield the unique, non-empty targets of a comma-separated target list,
+/// deduplicated by casefold so `#a,#A` (or `nick,NICK`) collapse to one.
+///
+/// The fold-dedup is applied here *by construction*, so no command that fans out
+/// over a target list can forget it — the class that let `#a,#A` double-deliver,
+/// or that made one path (TAGMSG) drop all but the first target. Callers apply
+/// their own cap (`TARGMAX`, `MONITOR` limit, …) since the loud over-cap reply
+/// differs per command; this guarantees only the fold.
+pub(super) fn unique_targets(
+    targets: &str,
+    casemap: e6irc_proto::casemap::CaseMapping,
+) -> impl Iterator<Item = &str> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .split(',')
+        .filter(move |t| !t.is_empty() && seen.insert(casemap.casefold(t)))
+}
+
 pub(super) fn cmd_message(
     state: &mut ServerState,
     conn: ConnId,
@@ -82,30 +100,25 @@ pub(super) fn cmd_message(
         }
         return;
     }
-    // A comma-separated target list delivers to each recipient, deduped and
-    // bounded by TARGMAX (advertised in ISUPPORT). Past the cap the message
-    // is refused loudly rather than silently truncated.
-    let mut seen = std::collections::HashSet::new();
-    let mut delivered = 0usize;
-    for target in targets.split(',').filter(|t| !t.is_empty()) {
-        // Dedup on the casefolded target so `#a,#A` (or `nick,NICK`) collapse
-        // to one delivery rather than two.
-        if !seen.insert(state.casemap.casefold(target)) {
-            continue;
-        }
+    // A comma-separated target list delivers to each recipient, deduped (by
+    // `unique_targets`) and bounded by TARGMAX (advertised in ISUPPORT). Past the
+    // cap the message is refused loudly rather than silently truncated.
+    let ordered: Vec<String> = unique_targets(targets, state.casemap)
+        .map(str::to_string)
+        .collect();
+    for (delivered, target) in ordered.into_iter().enumerate() {
         if delivered >= TARGMAX {
             if loud {
                 state.numeric(
                     conn,
                     ERR_TOOMANYTARGETS,
-                    &[target],
+                    &[&target],
                     Some("Too many targets; message not delivered"),
                 );
             }
             break;
         }
-        delivered += 1;
-        deliver_one_message(state, conn, target, text, kind, &client_tags, loud);
+        deliver_one_message(state, conn, &target, text, kind, &client_tags, loud);
     }
 }
 
@@ -511,27 +524,25 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
     };
     // Only client-only tags (`+` prefix) are relayed.
     let client_tags = client_tag_string(msg);
-    // A comma-separated target list delivers to each recipient, deduped and
-    // bounded by TARGMAX — exactly as PRIVMSG/NOTICE do. TAGMSG previously took
-    // only the first target, so `TAGMSG #a,#b` failed with ERR_NOSUCHCHANNEL for
-    // the whole (unsplit) string while the identical PRIVMSG syntax worked.
-    let mut seen = std::collections::HashSet::new();
-    let mut delivered = 0usize;
-    for target in targets.split(',').filter(|t| !t.is_empty()) {
-        if !seen.insert(state.casemap.casefold(target)) {
-            continue;
-        }
+    // A comma-separated target list delivers to each recipient, deduped (by the
+    // shared `unique_targets`) and bounded by TARGMAX — exactly as PRIVMSG/NOTICE
+    // do. TAGMSG previously took only the first target, so `TAGMSG #a,#b` failed
+    // with ERR_NOSUCHCHANNEL for the whole (unsplit) string while the identical
+    // PRIVMSG syntax worked; sharing the splitter keeps them from drifting again.
+    let ordered: Vec<String> = unique_targets(targets, state.casemap)
+        .map(str::to_string)
+        .collect();
+    for (delivered, target) in ordered.into_iter().enumerate() {
         if delivered >= TARGMAX {
             state.numeric(
                 conn,
                 ERR_TOOMANYTARGETS,
-                &[target],
+                &[&target],
                 Some("Too many targets; message not delivered"),
             );
             break;
         }
-        delivered += 1;
-        deliver_one_tagmsg(state, conn, target, &client_tags);
+        deliver_one_tagmsg(state, conn, &target, &client_tags);
     }
 }
 

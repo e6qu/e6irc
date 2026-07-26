@@ -142,9 +142,10 @@ pub(crate) enum SessionOutcome {
 pub(crate) const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
 
 /// Depth of the bounded client→upstream command queue per network (shared by all
-/// attached clients). Past this the sender backpressures rather than buffering
-/// without limit — see [`NetworkHandle::channels`]. Each line is already bounded
-/// by `MAX_CLIENT_FRAME_LEN`, so this bounds the queue's memory.
+/// attached clients). Past this a send is refused (`SendOutcome::Full`) and the
+/// client is told loudly, rather than blocking — a blocking send on this *shared*
+/// queue would stall every other attached client (see [`NetworkHandle::send`]).
+/// Each line is already bounded by `MAX_CLIENT_FRAME_LEN`, so this bounds memory.
 const BNC_COMMAND_QUEUE: usize = 256;
 
 /// Whether an HTTP status from a bridge's auth/login call means the *credentials*
@@ -749,11 +750,34 @@ pub(crate) fn render_bridged_privmsg(
     out
 }
 
+/// Outcome of a non-blocking send to a network's shared upstream command queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The line was queued for the upstream.
+    Sent,
+    /// The bounded queue is full (upstream reconnecting / congested). The line
+    /// was not queued; the caller must tell the client loudly.
+    Full,
+    /// The driver is gone; the caller should detach.
+    Closed,
+}
+
 impl NetworkHandle {
-    /// Send a raw line to the upstream network. Awaits if the bounded command
-    /// queue is full (backpressure); returns `false` only if the driver is gone.
-    pub async fn send(&self, line: &str) -> bool {
-        self.commands.send(line.to_string()).await.is_ok()
+    /// Try to hand a raw line to the upstream network **without blocking**.
+    ///
+    /// The command queue is bounded and *shared by every client attached to the
+    /// network*. A blocking send would make one client's backlog (e.g. a burst
+    /// during an upstream reconnect) stall every *other* attached client's
+    /// delivery loop — a cross-tenant head-of-line stall on operator-shared
+    /// networks. So this never waits: a full queue returns [`SendOutcome::Full`]
+    /// and the caller surfaces it to the client loudly (the same discipline the
+    /// core's SendQ uses — bound, then act, never silently block or drop).
+    pub fn send(&self, line: &str) -> SendOutcome {
+        match self.commands.try_send(line.to_string()) {
+            Ok(()) => SendOutcome::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => SendOutcome::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => SendOutcome::Closed,
+        }
     }
 
     /// A copy of the current detached buffer (for attach playback).
@@ -1109,11 +1133,24 @@ where
                     for event in parsed.drain(..) {
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => {
-                                    if commands.send(text).await.is_err() {
+                                Ok(text) => match commands.try_send(text) {
+                                    Ok(()) => {}
+                                    // Full: the upstream is congested/reconnecting.
+                                    // Drop this line loudly rather than block —
+                                    // blocking here would stall every other client
+                                    // sharing this network's queue. Never silent.
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        write
+                                            .write_all(
+                                                b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
+                                            )
+                                            .await?;
+                                        write.flush().await?;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
                                         return Ok(()); // driver gone
                                     }
-                                }
+                                },
                                 // This relay is UTF-8, like the core ingest
                                 // path; reject a non-UTF-8 line loudly rather
                                 // than swallowing it.

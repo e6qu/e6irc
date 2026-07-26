@@ -1706,7 +1706,26 @@ impl ServerState {
             e6irc_proto::numerics::code_str(code),
             target
         );
+        // The whole line must fit the wire limit including CRLF. Per-middle and
+        // per-trailing clips alone don't guarantee that: a numeric like WHOX
+        // (RPL_WHOSPCRPL) packs up to a dozen middles whose *sum* — driven by the
+        // configured `server_name` and nick maxima (each appears in both the head
+        // and a middle) plus a client-supplied WHOX token — can exceed 512 on its
+        // own, before any trailing. Bounding the running line as middles are
+        // appended (reserving room for the trailing's " :" when there is one) is
+        // the total-length guard that keeps every numeric ≤ 512 at this one choke
+        // point, so no row is ever discarded whole by the recipient's framing.
+        const WIRE_BUDGET: usize = e6irc_proto::message::MAX_LINE_LEN - 2; // minus CRLF
+        let reserve = if trailing.is_some() { 2 } else { 0 };
         for p in middle {
+            // Room left for this middle, including its leading space. Stop before
+            // an over-long line rather than emit one that vanishes on the wire.
+            let avail = WIRE_BUDGET
+                .saturating_sub(reserve)
+                .saturating_sub(line.len());
+            if avail <= 1 {
+                break;
+            }
             line.push(' ');
             // A middle that can't stand as a wire parameter would corrupt the
             // reply's framing — an empty one collapses into the separator, a
@@ -1724,22 +1743,18 @@ impl ServerState {
                 line.push('*');
                 continue;
             }
-            line.push_str(e6irc_proto::message::truncate_on_char_boundary(
-                p,
-                Self::NUMERIC_MIDDLE_MAX,
-            ));
+            let cap = Self::NUMERIC_MIDDLE_MAX.min(avail - 1);
+            line.push_str(e6irc_proto::message::truncate_on_char_boundary(p, cap));
         }
         if let Some(t) = trailing {
             line.push_str(" :");
-            // Fit the trailing to the wire limit. Each middle is individually
-            // clipped above, but a numeric like WHOX (RPL_WHOSPCRPL) packs many
-            // middles *and* a client-influenced trailing (the realname); their
-            // sum can exceed 512, and the recipient's framing then discards the
-            // whole line — the row silently vanishes. Truncating the trailing
-            // against the accumulated head bounds every numeric at one place.
-            // (A `numeric_list` page is already built to fit, so this is a no-op
-            // for it.)
-            let budget = 512usize.saturating_sub(line.len() + 2 /* CRLF */);
+            // Fit the trailing into whatever the (already-bounded) middles left.
+            // The middle loop above reserved 2 bytes for this " :", so there is
+            // always room for the separator; the trailing itself is clipped to
+            // the remaining budget. (A `numeric_list` page is already built to
+            // fit, so this is a no-op for it.)
+            let budget =
+                e6irc_proto::message::MAX_LINE_LEN.saturating_sub(line.len() + 2 /* CRLF */);
             line.push_str(e6irc_proto::message::truncate_on_char_boundary(t, budget));
         }
         self.send(conn, &line);

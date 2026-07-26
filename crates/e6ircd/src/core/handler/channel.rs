@@ -94,6 +94,29 @@ pub(super) fn truncate_chars(s: &str, max: usize) -> &str {
     e6irc_proto::message::truncate_on_char_boundary(s, max)
 }
 
+/// Parse a channel list-mode (`+b/+q/+e/+I`) mask argument into its stored
+/// [`MaskKey`] — the one constructor for the "a stored channel mask is canonical
+/// `nick!user@host`, ≤ `BANMASKLEN`, and (for an add) space-free" invariant, so
+/// it holds by construction rather than by keeping three steps in order at a call
+/// site (DESIGN §2, mirroring `oper::BanMask::parse`). `Err` is a
+/// space-containing *add*: an embedded space (reachable only via the trailing
+/// form, `MODE #c +b :a b`) would split the mask across two tokens in both the
+/// MODE broadcast and the RPL_BANLIST middle, and copying the displayed form into
+/// `-b` could never remove it. Removals (`adding == false`) never reject, so a
+/// legacy space-containing mask stays removable via the same form that set it.
+pub(super) fn channel_list_mask(
+    raw: &str,
+    adding: bool,
+    casemap: e6irc_proto::casemap::CaseMapping,
+) -> Result<crate::core::state::MaskKey, ()> {
+    let norm = normalize_ban_mask(raw);
+    let mask = truncate_chars(&norm, BANMASKLEN);
+    if adding && mask.contains(' ') {
+        return Err(());
+    }
+    Ok(crate::core::state::MaskKey::new(mask, casemap))
+}
+
 pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // A target list with no non-empty entry (`JOIN`, `JOIN :`, `JOIN ,`) must be
     // ERR_NEEDMOREPARAMS, not a silent no-op: a bare presence check passes an
@@ -1211,32 +1234,27 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     emit_channel_list(state, conn, &key, &display, c, true);
                     continue;
                 };
-                // Canonicalize to nick!user@host so a bare `+b nick` actually
-                // matches `nick!user@host` (Solanum clean_ban_mask); otherwise
-                // banning by nick — a very common op — silently never applies.
-                // Then clip to BANMASKLEN so the stored mask always fits both
-                // the RPL_BANLIST middle and the MODE broadcast (see the
-                // constant's doc for why an unclipped one is a state desync).
-                let norm = normalize_ban_mask(raw_mask);
-                let mask = truncate_chars(&norm, BANMASKLEN);
-                // A mask with an embedded space (reachable only via the
-                // trailing-parameter form, `MODE #c +b :a b`) would split into
-                // two tokens in both the MODE broadcast and the RPL_BANLIST
-                // middle — a malformed line for every state-tracking client,
-                // and an entry that copying the displayed form into `-b` can
-                // never remove (breaking the BANMASKLEN invariant above).
-                // Reject the add like the `+k` arm rejects space-containing
-                // keys; removals pass through so a legacy stored mask stays
-                // removable via the same trailing form that created it.
-                if adding && mask.contains(' ') {
-                    state.numeric(
-                        conn,
-                        ERR_INVALIDMODEPARAM,
-                        &[&display, &c.to_string(), "*"],
-                        Some("Mask contains a space"),
-                    );
-                    continue;
-                }
+                // One constructor canonicalizes to nick!user@host (so a bare
+                // `+b nick` matches, Solanum clean_ban_mask), clips to BANMASKLEN
+                // (so the stored mask fits the RPL_BANLIST middle and the MODE
+                // broadcast), and rejects a space-containing add — the invariant
+                // now holds by construction. `Err` is the space rejection.
+                let mask_key = match channel_list_mask(raw_mask, adding, casemap) {
+                    Ok(m) => m,
+                    Err(()) => {
+                        state.numeric(
+                            conn,
+                            ERR_INVALIDMODEPARAM,
+                            &[&display, &c.to_string(), "*"],
+                            Some("Mask contains a space"),
+                        );
+                        continue;
+                    }
+                };
+                // Owned so the display survives `mask_key` being moved into the
+                // list below (both are needed: the key for storage, the display
+                // for the RPL_BANLIST/broadcast echo).
+                let mask = mask_key.as_str().to_string();
                 // Bound the lists: without a cap a single opped client could
                 // stream distinct masks until the core worker OOMs (and every
                 // JOIN/PRIVMSG re-scans them). `MAXLIST=bqeI:100` advertises a
@@ -1245,7 +1263,6 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 // The folding key: equality/dedup/removal against the list now
                 // fold *by construction* (the matcher folds too), so a case
                 // variant can't double-store or fail to remove — see `MaskKey`.
-                let mask_key = crate::core::state::MaskKey::new(mask, casemap);
                 let chan_ref = state.channels.get(&key).expect("checked");
                 let list_ref = match c {
                     'b' => &chan_ref.bans,
@@ -1264,7 +1281,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     state.numeric(
                         conn,
                         ERR_BANLISTFULL,
-                        &[&display, mask],
+                        &[&display, &mask],
                         Some("Channel list is full"),
                     );
                     continue;
@@ -1293,7 +1310,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     list.len() != before
                 };
                 if changed {
-                    changes.push((adding, c, Some(mask.to_string())));
+                    changes.push((adding, c, Some(mask)));
                 }
             }
             'o' | 'v' => {

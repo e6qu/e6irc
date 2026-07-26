@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
-use e6ircd::bouncer::{DriverEvent, LoopbackDriver, NetworkDriver, NetworkHandle, attach};
+use e6ircd::bouncer::{
+    DriverEvent, LoopbackDriver, NetworkDriver, NetworkHandle, SendOutcome, attach,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::Receiver;
 
@@ -49,7 +51,11 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     .unwrap_or(false);
     assert!(connected, "{kind}: never reported Connected");
 
-    assert!(handle.send("hello world").await, "{kind}: send failed");
+    assert_eq!(
+        handle.send("hello world"),
+        SendOutcome::Sent,
+        "{kind}: send failed"
+    );
     assert!(
         wait_for(
             &mut events,
@@ -85,7 +91,7 @@ async fn attach_relays_over_the_loopback_driver() {
     // Pre-attach line lands in the buffer and must replay on attach.
     // Poll for it rather than sleeping a fixed interval (a fixed sleep is
     // a latent flake on a slow runner).
-    handle.send("earlier").await;
+    assert_eq!(handle.send("earlier"), SendOutcome::Sent);
     let buffered = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if handle.buffer_snapshot().iter().any(|l| l == "earlier") {
