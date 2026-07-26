@@ -206,6 +206,49 @@ pub enum NetworkKind {
     Slack,
 }
 
+impl NetworkKind {
+    /// Stable lowercase token for the DB `kind` column and the wire (matches the
+    /// serde `rename_all = "lowercase"` used when parsing config).
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            NetworkKind::Irc => "irc",
+            NetworkKind::Local => "local",
+            NetworkKind::Matrix => "matrix",
+            NetworkKind::Discord => "discord",
+            NetworkKind::Slack => "slack",
+        }
+    }
+
+    /// Parse a DB/wire kind token; `None` for anything unrecognized (callers
+    /// surface the bad value rather than silently defaulting).
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "irc" => Some(NetworkKind::Irc),
+            "local" => Some(NetworkKind::Local),
+            "matrix" => Some(NetworkKind::Matrix),
+            "discord" => Some(NetworkKind::Discord),
+            "slack" => Some(NetworkKind::Slack),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a chat-platform bridge (Matrix/Discord/Slack) rather than
+    /// an IRC upstream or the in-process local network.
+    pub fn is_bridge(self) -> bool {
+        matches!(
+            self,
+            NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack
+        )
+    }
+
+    /// Whether this kind carries its secret in `sasl_account` (Slack's bot
+    /// token), which the DB path must therefore seal — unlike an IRC account
+    /// name, which is public.
+    pub fn account_is_secret(self) -> bool {
+        matches!(self, NetworkKind::Slack)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BncConfig {

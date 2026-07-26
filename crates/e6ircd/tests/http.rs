@@ -472,6 +472,7 @@ async fn account_page_lists_networks_for_a_session() {
         &pool,
         "alice",
         &e6ircd::db::BncNetworkRow {
+            kind: Default::default(),
             name: "libera".into(),
             addr: "irc.libera.chat:6697".into(),
             tls: true,
@@ -535,6 +536,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         &pool,
         "alice",
         &e6ircd::db::BncNetworkRow {
+            kind: Default::default(),
             name: "libera".into(),
             addr: "irc.libera.chat:6697".into(),
             tls: true,
@@ -974,6 +976,87 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
     }
 }
 
+/// Adding a bridge from the console is admin + CSRF gated and refuses a kind
+/// whose build feature is absent (this default build has none) — proving the
+/// POST plumbing and the feature gate without needing a live bridge service.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_add_bridge_is_gated_and_feature_checked() {
+    let url = support::test_db("console_add_bridge_is_gated_and_feature_checked").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.console.example".into(),
+        network_name: "ConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // The CSRF token is session-bound; read it from the account page.
+    let page = format!(
+        "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (_, _, body) = request(http, &page).await;
+    let csrf = body
+        .split("X-CSRF-Token\": \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token")
+        .to_string();
+
+    let form = format!(
+        "csrf={csrf}&kind=matrix&name=hq&addr=https://matrix.example&nick=e6bot&sasl_password=secret"
+    );
+    let post = format!(
+        "POST /console/integrations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{form}",
+        form.len()
+    );
+    // Feature not built in this binary -> 400 with an explanatory message.
+    let (status, _, body) = request(http, &post).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("feature"), "{body}");
+
+    // A wrong CSRF token -> 403.
+    let form_nocsrf = "csrf=wrong&kind=matrix&name=hq&sasl_password=x";
+    let post_nocsrf = format!(
+        "POST /console/integrations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{form_nocsrf}",
+        form_nocsrf.len()
+    );
+    let (status, _, _) = request(http, &post_nocsrf).await;
+    assert_eq!(status, 403);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_page_add_network_form_with_csrf() {
@@ -1296,6 +1379,7 @@ async fn network_buffer_read() {
         &pool,
         "alice",
         &e6ircd::db::BncNetworkRow {
+            kind: Default::default(),
             name: "work".into(),
             addr: "127.0.0.1:1".into(),
             tls: false,

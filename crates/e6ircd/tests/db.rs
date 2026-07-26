@@ -804,6 +804,7 @@ async fn bnc_networks_are_capped_per_account() {
         .await
         .expect("create");
     let row = |i: usize| db::BncNetworkRow {
+        kind: Default::default(),
         name: format!("net{i}"),
         addr: "irc.example:6697".into(),
         tls: true,
@@ -1743,6 +1744,7 @@ async fn bnc_networks_crud() {
     db::create_account(&pool, "bob", "pw").await.expect("acct");
 
     let libera = db::BncNetworkRow {
+        kind: Default::default(),
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,
@@ -1777,11 +1779,39 @@ async fn bnc_networks_crud() {
     let alice_nets = db::list_bnc_networks(&pool, "alice").await.expect("list");
     assert_eq!(alice_nets.len(), 1);
     assert_eq!(alice_nets[0].name, "libera");
+    assert_eq!(alice_nets[0].kind, e6ircd::config::NetworkKind::Irc);
     assert_eq!(alice_nets[0].autojoin, vec!["#rust", "#e6irc"]);
     assert_eq!(
         alice_nets[0].sasl_password_sealed.as_deref(),
         Some("enc:v1:abc")
     );
+
+    // A bridge kind round-trips through the new `kind` column (the generic
+    // columns carry the bridge's fields: here a Matrix homeserver/user).
+    let matrix = db::BncNetworkRow {
+        kind: e6ircd::config::NetworkKind::Matrix,
+        name: "hq".into(),
+        addr: "https://matrix.example".into(),
+        tls: true,
+        nick: "e6bot".into(),
+        realname: None,
+        autojoin: vec!["#room:matrix.example".into()],
+        sasl_account: None,
+        sasl_password_sealed: Some("enc:v2:sealed".into()),
+        enabled: true,
+    };
+    db::create_bnc_network(&pool, "alice", &matrix)
+        .await
+        .expect("matrix");
+    let hq = db::get_bnc_network(&pool, "alice", "hq")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(hq.kind, e6ircd::config::NetworkKind::Matrix);
+    assert_eq!(hq.addr, "https://matrix.example");
+    db::delete_bnc_network(&pool, "alice", "hq")
+        .await
+        .expect("cleanup");
 
     // list_all pairs each network with its owner (two rows: alice+bob)
     let all = db::list_all_bnc_networks(&pool).await.expect("all");
@@ -1824,6 +1854,7 @@ async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
         .await
         .expect("acct");
     let net = db::BncNetworkRow {
+        kind: Default::default(),
         name: "libera".into(),
         addr: "irc.libera.chat:6697".into(),
         tls: true,

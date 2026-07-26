@@ -2,9 +2,9 @@
 {% block main %}
         <h1>Integrations</h1>
         <p class="meta">
-          Bridges connect e6irc to other chat platforms as bouncer networks. Each
-          is available only if this binary was built with its feature, and is
-          configured as a <code>[[network]]</code> with the given <code>kind</code>.
+          Bridges connect e6irc to other chat platforms as bouncer networks, run
+          through the same driver machinery as an IRC upstream. A platform is
+          available only if this binary was built with its feature.
           {% if !bouncer_enabled %}<strong>The bouncer is not enabled on this server.</strong>{% endif %}
         </p>
 
@@ -16,30 +16,54 @@
           <p class="meta">{{ p.configure }}</p>
           {% if !p.built %}
             <p class="empty">
-              This binary was built without the <code>{{ p.kind }}</code> feature, so
-              {{ p.name }} bridges cannot run here. Rebuild with
-              <code>--features {{ p.kind }}</code> to enable it.
+              Built without the <code>{{ p.kind }}</code> feature; rebuild with
+              <code>--features {{ p.kind }}</code> to enable {{ p.name }} bridges.
             </p>
-          {% else if p.networks.is_empty() %}
-            <p class="empty">No {{ p.name }} bridges configured.</p>
           {% else %}
-            <div class="scroll">
-              <table>
-                <thead><tr><th>Status</th><th>Network</th><th>Owner</th></tr></thead>
-                <tbody>
-                  {% for n in p.networks %}
-                    <tr>
-                      <td>
-                        {% if n.connected %}<span class="dot on"></span>connected
-                        {% else %}<span class="dot off"></span>disconnected{% endif %}
-                      </td>
-                      <td><code>{{ n.name }}</code></td>
-                      <td><code>{{ n.owner }}</code></td>
-                    </tr>
-                  {% endfor %}
-                </tbody>
-              </table>
-            </div>
+            {% if bouncer_enabled %}
+              <form class="add" method="post" action="/console/integrations">
+                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="kind" value="{{ p.kind }}" />
+                <input type="text" name="name" placeholder="name" required />
+                {% if p.needs_addr %}<input type="text" name="addr" placeholder="homeserver / API base" />{% endif %}
+                {% if p.needs_nick %}<input type="text" name="nick" placeholder="user" />{% endif %}
+                {% if p.needs_account %}<input type="text" name="sasl_account" placeholder="{{ p.account_label }}" required />{% endif %}
+                <input type="text" name="sasl_password" placeholder="{{ p.password_label }}" required />
+                <input type="text" name="autojoin" placeholder="rooms / channels (comma-sep)" />
+                <button type="submit">Add {{ p.name }} bridge</button>
+              </form>
+            {% endif %}
+            {% if p.networks.is_empty() %}
+              <p class="empty">No {{ p.name }} bridges configured.</p>
+            {% else %}
+              <div class="scroll">
+                <table>
+                  <thead><tr><th>Status</th><th>Network</th><th>Owner</th><th></th></tr></thead>
+                  <tbody>
+                    {% for n in p.networks %}
+                      <tr>
+                        <td>
+                          {% if n.connected %}<span class="dot on"></span>connected
+                          {% else %}<span class="dot off"></span>disconnected{% endif %}
+                        </td>
+                        <td><code>{{ n.name }}</code></td>
+                        <td><code>{{ n.owner }}</code></td>
+                        <td>
+                          {% if n.deletable %}
+                            <form method="post" action="/console/integrations/delete"
+                                  onsubmit="return confirm('Remove bridge {{ n.name }}?')">
+                              <input type="hidden" name="csrf" value="{{ csrf }}" />
+                              <input type="hidden" name="name" value="{{ n.name }}" />
+                              <button class="danger" type="submit">Remove</button>
+                            </form>
+                          {% else %}<span class="meta">config</span>{% endif %}
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            {% endif %}
           {% endif %}
         {% endfor %}
 {% endblock %}

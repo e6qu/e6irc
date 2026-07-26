@@ -102,80 +102,33 @@ impl Registry {
             pool,
         };
         for e in entries {
-            let config = NetworkConfig {
-                addr: e.addr.clone(),
-                tls: e.tls,
-                nick: e.nick.clone(),
-                realname: e.realname.clone().unwrap_or_else(|| e.nick.clone()),
-                autojoin: e.autojoin.clone(),
-                buffer_cap: e.buffer_cap,
-                sasl: match (&e.sasl_account, &e.sasl_password) {
-                    (Some(a), Some(p)) => Some((a.clone(), p.clone())),
-                    _ => None,
-                },
-            };
-            let driver: Box<dyn super::NetworkDriver> = match e.kind {
-                NetworkKind::Irc => Box::new(super::IrcDriver::new(config)),
-                NetworkKind::Local => Box::new(super::LocalDriver::new(core.clone(), config)),
-                NetworkKind::Matrix => {
-                    #[cfg(feature = "matrix")]
-                    {
-                        Box::new(super::MatrixDriver::new(super::MatrixConfig {
-                            homeserver: e.addr.clone(),
-                            user: e.nick.clone(),
-                            password: e.sasl_password.clone().unwrap_or_default(),
-                            rooms: e.autojoin.clone(),
-                            buffer_cap: e.buffer_cap,
-                        }))
-                    }
-                    #[cfg(not(feature = "matrix"))]
-                    {
-                        return Err(format!(
-                            "network '{}' is kind=matrix but this binary was built \
-                             without the `matrix` feature",
-                            e.name
-                        ));
-                    }
-                }
-                NetworkKind::Discord => {
-                    #[cfg(feature = "discord")]
-                    {
-                        Box::new(super::DiscordDriver::new(super::DiscordConfig {
-                            token: e.sasl_password.clone().unwrap_or_default(),
-                            api_base: e.addr.clone(),
-                            channels: e.autojoin.clone(),
-                            buffer_cap: e.buffer_cap,
-                        }))
-                    }
-                    #[cfg(not(feature = "discord"))]
-                    {
-                        return Err(format!(
-                            "network '{}' is kind=discord but this binary was built \
-                             without the `discord` feature",
-                            e.name
-                        ));
-                    }
-                }
-                NetworkKind::Slack => {
-                    #[cfg(feature = "slack")]
-                    {
-                        Box::new(super::SlackDriver::new(super::SlackConfig {
-                            bot_token: e.sasl_account.clone().unwrap_or_default(),
-                            app_token: e.sasl_password.clone().unwrap_or_default(),
-                            api_base: e.addr.clone(),
-                            channels: e.autojoin.clone(),
-                            buffer_cap: e.buffer_cap,
-                        }))
-                    }
-                    #[cfg(not(feature = "slack"))]
-                    {
-                        return Err(format!(
-                            "network '{}' is kind=slack but this binary was built \
-                             without the `slack` feature",
-                            e.name
-                        ));
-                    }
-                }
+            // `local` needs the in-process core handles, so it stays special; all
+            // other kinds go through the shared feature-gated `build_driver`
+            // factory (the same one the DB create/boot/re-enable paths use).
+            let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
+                let config = NetworkConfig {
+                    addr: e.addr.clone(),
+                    tls: e.tls,
+                    nick: e.nick.clone(),
+                    realname: e.realname.clone().unwrap_or_else(|| e.nick.clone()),
+                    autojoin: e.autojoin.clone(),
+                    buffer_cap: e.buffer_cap,
+                    sasl: None,
+                };
+                Box::new(super::LocalDriver::new(core.clone(), config))
+            } else {
+                super::build_driver(
+                    e.kind,
+                    e.addr.clone(),
+                    e.tls,
+                    e.nick.clone(),
+                    e.realname.clone().unwrap_or_else(|| e.nick.clone()),
+                    e.autojoin.clone(),
+                    e.buffer_cap,
+                    e.sasl_account.clone(),
+                    e.sasl_password.clone(),
+                )
+                .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
             registry.add(e.owner.as_deref(), &e.name, driver);
         }
