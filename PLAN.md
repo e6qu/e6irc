@@ -1593,6 +1593,51 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Console-surface hardening sweep (2026-07-26): two adversarial audits over the
+freshly-landed console/bridge-CRUD/web-client code (it hadn't been swept). The
+web client had **no XSS** (rendering is DOM-API-only) and the bridge secret
+seal/unseal is symmetric and panic-free, but real defects surfaced and are fixed.
+
+**SSRF — an IP-literal bridge base URL bypassed vetting (HIGH).** A bridge's HTTP
+SSRF control is the dial-time DNS `VettingResolver`, which reqwest/hyper invokes
+only for *named* hosts — an IP-literal URL host builds the socket directly and is
+never vetted. And the create-time `upstream_addr_is_internal` parsed `host:port`,
+not a URL, so `addr = http://169.254.169.254` (URL-shaped) sailed through. Any
+authenticated tenant on a bridge-featured binary could reach the cloud-metadata
+endpoint. Fixed by teaching `upstream_addr_is_internal` to strip a URL scheme/
+path and classify the host for *both* forms — closing it at the create choke
+point for every kind (unit-tested with URL literals; loopback/LAN still allowed).
+
+**Boot DoS — one un-buildable tenant row aborted the whole server (MED/HIGH).**
+`net.rs` boot did `driver_from_row(...)?` per DB row, so a single tenant network
+that became un-buildable (a bridge kind whose feature was dropped in a binary
+swap, or a sealed secret after a master-key rotation) aborted the entire
+daemon's startup for everyone. Now a failed row is logged loudly and skipped —
+that one network is down until fixed — while config-file networks still fail hard
+(operator's own, checked at start).
+
+**Sealed Slack bot-token echoed in the network JSON (LOW).** `/api/v1/…/networks`
+returned `sasl_account` verbatim, which for Slack is the sealed `enc:` blob (not
+cleartext, but needless). It now mirrors the password: `has_sasl_account` boolean,
+and the plaintext name only for kinds where the account is public (IRC). The
+`kind` is now surfaced too. Also folded the network `name` into the CR/LF/**NUL**
+control-char check the other fields already get.
+
+**Web client (all found, fixed):** the active-buffer DOM grew without bound (the
+trim guard keyed on the already-clamped model length, so it never fired) — now
+trims on the live DOM node count; no cap on buffer or nick count let a hostile
+upstream exhaust memory via distinct channels/senders or a giant NAMES — now
+capped (overflow buffers fold into the server buffer, nick lists bounded);
+prefixless JOIN/PART/QUIT/NICK threw in `stripSigil(null)` and left nick state
+half-mutated — now null-guarded; nicks/buffers were keyed case-sensitively though
+IRC is casefolded — now keyed by an RFC1459 `fold` (display casing kept); `/me`
+and CTCP `ACTION` now render as "* nick …" and self-`/me` echoes locally; and the
+sign-out href is only accepted as a same-origin relative path.
+
+Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
+under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
+`cargo deny`; PG http/db/ws_ui suites.
+
 Management console — stage 6 (a real in-browser IRC client) (2026-07-26): the
 last planned console surface. The `/ws/ui` live client was an 88-line raw-line
 log (server pushed `hx-swap-oob` HTML fragments into one `#buffer`); it is now a

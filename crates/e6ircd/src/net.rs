@@ -225,9 +225,20 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?
             {
-                let driver = crate::bouncer::driver_from_row(&row, secret_key.as_deref(), &owner)
-                    .map_err(io::Error::other)?;
-                reg.add(Some(&owner), &row.name, driver);
+                // One tenant's un-buildable network must not abort the whole
+                // server's boot: a row can become un-buildable after a binary
+                // swap (a bridge kind whose feature was dropped) or a master-key
+                // rotation (its sealed secret no longer opens). Skip it loudly —
+                // that one network is down until fixed — rather than brick the
+                // shared daemon for every user. Config-file networks still fail
+                // hard (they are the operator's own, checked at start).
+                match crate::bouncer::driver_from_row(&row, secret_key.as_deref(), &owner) {
+                    Ok(driver) => reg.add(Some(&owner), &row.name, driver),
+                    Err(e) => eprintln!(
+                        "bnc: not starting network {owner}/{} at boot: {e}",
+                        row.name
+                    ),
+                }
             }
         }
         Some(reg)
