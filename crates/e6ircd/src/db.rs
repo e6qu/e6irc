@@ -33,6 +33,8 @@ pub enum DbError {
     TooManyCredentials,
     /// The account already holds the maximum number of BNC networks.
     TooManyNetworks,
+    /// The channel already holds the maximum number of access entries.
+    TooManyAccessEntries,
 }
 
 impl std::fmt::Display for DbError {
@@ -49,6 +51,7 @@ impl std::fmt::Display for DbError {
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
             Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
             Self::TooManyNetworks => write!(f, "account holds too many networks"),
+            Self::TooManyAccessEntries => write!(f, "channel holds too many access entries"),
         }
     }
 }
@@ -517,6 +520,9 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     flags,
                     applied,
                 },
+                Err(DbError::TooManyAccessEntries) => {
+                    DbReply::ChannelAccessLimitReached { channel }
+                }
                 Err(e) => {
                     eprintln!("db: channel access persistence failed: {e}");
                     DbReply::ChannelAccessUnavailable { channel }
@@ -1101,8 +1107,10 @@ pub async fn query_targets(
         .collect())
 }
 
-/// Upsert (or remove, when `flags` is `None`) one channel access entry by
-/// casefolded channel + account names.
+/// Most access entries (auto-op/voice grants) one channel may hold. Bounds both
+/// the persisted `channel_access` rows and the in-core map they preload into.
+const MAX_ACCESS_ENTRIES_PER_CHANNEL: i64 = 256;
+
 /// Upsert (`flags = Some`) or remove (`flags = None`) one channel-access entry.
 /// Returns whether the change was *applied to a real account*: the grant INSERT
 /// affects no rows when no `accounts` row matches (the account isn't
@@ -1119,21 +1127,62 @@ pub async fn set_channel_access(
     let account_folded = CaseMapping::Rfc1459.casefold(account);
     match flags {
         Some(flags) => {
-            let res = sqlx::query(
-                "INSERT INTO channel_access (channel_id, account_id, flags)
-                 SELECT c.id, a.id, $3 FROM channels c, accounts a
+            // Cap the access list per channel, like every sibling grant collection
+            // (app passwords, PATs, BNC networks): count + insert in one
+            // transaction with the channel row locked FOR UPDATE, so two founders
+            // granting concurrently can't both slip past the cap. Without it the
+            // map — and its persisted rows, re-loaded into RAM on every boot by
+            // `preload_access` — grow without bound. Only a *new* (channel,
+            // account) pair counts against the cap; re-flagging an existing entry
+            // is always allowed (it replaces, it doesn't grow).
+            let mut tx = pool.begin().await.map_err(DbError::Query)?;
+            let ids: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT c.id, a.id FROM channels c, accounts a
                  WHERE c.name_folded = $1 AND a.name_folded = $2
-                 ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
+                 FOR UPDATE OF c",
             )
             .bind(&channel_folded)
             .bind(&account_folded)
-            .bind(flags)
-            .execute(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(DbError::Query)?;
-            // No rows → the (channel, account) join matched nothing, i.e. the
-            // account is not registered; nothing was granted.
-            Ok(res.rows_affected() > 0)
+            // No match → the account isn't registered (or the channel is gone);
+            // nothing granted, same as before.
+            let Some((channel_id, account_id)) = ids else {
+                return Ok(false);
+            };
+            let already: Option<i64> = sqlx::query_scalar(
+                "SELECT account_id FROM channel_access WHERE channel_id = $1 AND account_id = $2",
+            )
+            .bind(channel_id)
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+            if already.is_none() {
+                let count: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM channel_access WHERE channel_id = $1")
+                        .bind(channel_id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(DbError::Query)?;
+                if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
+                    return Err(DbError::TooManyAccessEntries);
+                }
+            }
+            sqlx::query(
+                "INSERT INTO channel_access (channel_id, account_id, flags)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (channel_id, account_id) DO UPDATE SET flags = EXCLUDED.flags",
+            )
+            .bind(channel_id)
+            .bind(account_id)
+            .bind(flags)
+            .execute(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+            tx.commit().await.map_err(DbError::Query)?;
+            Ok(true)
         }
         None => {
             sqlx::query(

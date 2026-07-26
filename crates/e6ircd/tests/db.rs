@@ -831,6 +831,59 @@ async fn bnc_networks_are_capped_per_account() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_access_is_capped_per_channel() {
+    let url = support::test_db("channel_access_is_capped_per_channel").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    // A founder and a registered channel. Insert account rows directly (no argon2
+    // needed — the cap counts registered accounts, not credentials), so 256+
+    // accounts don't cost 256 password hashes.
+    sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('founder', 'founder')")
+        .execute(&pool)
+        .await
+        .expect("founder");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#c', '#c', id FROM accounts WHERE name_folded = 'founder'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+
+    // Fill the access list to the cap (256); each grant to a distinct registered
+    // account succeeds.
+    for i in 0..256 {
+        let name = format!("t{i}");
+        sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ($1, $1)")
+            .bind(&name)
+            .execute(&pool)
+            .await
+            .expect("target account");
+        db::set_channel_access(&pool, "#c", &name, Some("v".into()))
+            .await
+            .unwrap_or_else(|e| panic!("grant {i} should succeed: {e}"));
+    }
+
+    // The 257th distinct account is refused with the dedicated error.
+    sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('t256', 't256')")
+        .execute(&pool)
+        .await
+        .expect("target account");
+    let over = db::set_channel_access(&pool, "#c", "t256", Some("v".into())).await;
+    assert!(
+        matches!(over, Err(db::DbError::TooManyAccessEntries)),
+        "the 257th access entry must be refused: {over:?}"
+    );
+
+    // Re-flagging an EXISTING entry is still allowed — it replaces, not grows.
+    let reflag = db::set_channel_access(&pool, "#c", "t0", Some("o".into())).await;
+    assert!(
+        matches!(reflag, Ok(true)),
+        "re-flagging an existing entry stays allowed at the cap: {reflag:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn read_marker_persists() {
     let url = support::test_db("read_marker_persists").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
