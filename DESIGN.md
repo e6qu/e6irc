@@ -325,7 +325,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | HTTP | **axum** + tower | Thin over hyper, tower middleware for auth/rate limits; no needless layers. |
 | Database | **sqlx** (postgres + rustls features only) | Async, compile-time-checked queries, embedded migrations. |
 | Templates | **askama** | Compile-time templates → fast, no runtime template engine in the binary. |
-| Web client | **HTMX** (+ its WebSocket extension), bundled by **Vite** | Server-rendered fragments; near-zero client-side JS to maintain. |
+| Web client | **HTMX** for the server-rendered management pages; a small vanilla-JS IRC client for live chat, bundled by **Vite** | No SPA framework; server-rendered where state is the server's, client-parsed where it's the client's (chat buffers/nick lists). |
 | TUI | **ratatui** + crossterm | Standard, portable. |
 | Passwords | **argon2** (argon2id) | For local passwords and hashed app passwords. |
 | OIDC | **openidconnect** crate | Certified-flow implementation of code+PKCE, discovery, JWKS. |
@@ -1010,19 +1010,25 @@ always served (no feature gate, no utoipa dependency).
 
 ### 13.1 Model
 
-Server-rendered application: askama templates render both full pages
-(login, user section) and **fragments** the chat UI swaps in. Interactivity
-budget: htmx + its WebSocket extension + a small hand-written JS file
-(scroll anchoring, notifications, composer niceties). No SPA framework.
+Two surfaces, both without an SPA framework. The **management** pages —
+login, the user account section, and the `/console` admin/BNC/integrations
+console — are server-rendered askama pages/fragments driven by **htmx**. The
+**live chat client** is a small hand-written vanilla-JS IRC client (`web/src`,
+bundled by Vite): it parses IRC lines client-side into buffers and a member
+list rather than swapping server HTML, since per-channel routing and nick-list
+state are naturally client state.
 
 ### 13.2 Live chat over WebSocket
 
-The chat page opens one WS (`/ws/ui`, cookie-authenticated). Server pushes
-ready-to-swap HTML fragments (`hx-swap-oob` targets: message list append,
-member list, buffer badges); the composer and slash-commands send small
-messages up the same socket. This keeps the web client on the exact same
-multiplexer attach path as an IRC client — the web client *is* an attached
-client of the user's networks.
+The chat page opens one WS (`/ws/ui`, cookie-authenticated). The server pushes
+JSON events — `{"t":"line","v":"<raw IRC line>"}` and `{"t":"status",...}` —
+and the client parses each line, routes it to the right buffer (channel / DM /
+server), maintains the per-channel member list, and renders the active buffer
+(all via DOM APIs, never `innerHTML` on server text, so a hostile upstream line
+can't inject markup). The composer sends `{target, message}` (with
+slash-commands) up the same socket, which the server maps to an IRC line. This
+keeps the web client on the exact same multiplexer attach path as an IRC client
+— the web client *is* an attached client of the user's networks.
 
 ### 13.3 Build & deployment duality
 

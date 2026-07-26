@@ -145,11 +145,11 @@ pub(super) struct UiParams {
 }
 
 /// The web client's live socket: cookie-authenticated, attaches to one
-/// of the caller's networks, and pushes ready-to-swap HTML fragments
-/// (the browser side runs htmx's WS extension). Composer text sent up
-/// the socket is relayed to the upstream network. This is the same
-/// multiplexer attach path an IRC client uses — the web client *is* an
-/// attached client.
+/// of the caller's networks, and pushes JSON events (`{"t":"line",...}` /
+/// `{"t":"status",...}`) that the browser client parses into buffers and a
+/// member list. Composer text sent up the socket is relayed to the upstream
+/// network. This is the same multiplexer attach path an IRC client uses — the
+/// web client *is* an attached client.
 pub(super) async fn ws_ui(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -226,7 +226,7 @@ pub(super) async fn ws_ui_conn(
         ConnStatus::Disconnected
     };
     if socket
-        .send(WsMessage::text(render_status_fragment(status)))
+        .send(WsMessage::text(status_event(status)))
         .await
         .is_err()
     {
@@ -236,7 +236,7 @@ pub(super) async fn ws_ui_conn(
     // Playback: everything buffered while detached, as fragments.
     for line in handle.buffer_snapshot() {
         if socket
-            .send(WsMessage::text(render_line_fragment(&line)))
+            .send(WsMessage::text(line_event(&line)))
             .await
             .is_err()
         {
@@ -250,7 +250,7 @@ pub(super) async fn ws_ui_conn(
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
                     let _ = socket
-                        .send(WsMessage::text(render_line_fragment(
+                        .send(WsMessage::text(line_event(
                             ":*bnc* NOTICE * :network removed; detaching",
                         )))
                         .await;
@@ -260,7 +260,7 @@ pub(super) async fn ws_ui_conn(
             ev = events.recv() => match ev {
                 Ok(DriverEvent::Line(line)) => {
                     if socket
-                        .send(WsMessage::text(render_line_fragment(&line)))
+                        .send(WsMessage::text(line_event(&line)))
                         .await
                         .is_err()
                     {
@@ -268,17 +268,17 @@ pub(super) async fn ws_ui_conn(
                     }
                 }
                 Ok(DriverEvent::Connected) => {
-                    let _ = socket.send(WsMessage::text(render_status_fragment(ConnStatus::Connected))).await;
+                    let _ = socket.send(WsMessage::text(status_event(ConnStatus::Connected))).await;
                 }
                 Ok(DriverEvent::Disconnected) => {
-                    let _ = socket.send(WsMessage::text(render_status_fragment(ConnStatus::Disconnected))).await;
+                    let _ = socket.send(WsMessage::text(status_event(ConnStatus::Disconnected))).await;
                 }
                 Err(RecvError::Lagged(n)) => {
                     // Slow client: the broadcast buffer overwrote lines this
                     // socket hadn't read. They're unrecoverable, but surface
                     // the gap rather than let it vanish silently.
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
-                    let _ = socket.send(WsMessage::text(render_line_fragment(&notice))).await;
+                    let _ = socket.send(WsMessage::text(line_event(&notice))).await;
                 }
                 Err(RecvError::Closed) => break,      // driver gone
             },
@@ -297,7 +297,7 @@ pub(super) async fn ws_ui_conn(
                             let notice =
                                 ":*bnc* NOTICE * :upstream busy; line not sent, try again";
                             let _ = socket
-                                .send(WsMessage::text(render_line_fragment(notice)))
+                                .send(WsMessage::text(line_event(notice)))
                                 .await;
                         }
                         crate::bouncer::SendOutcome::Closed => break, // driver gone
@@ -370,40 +370,21 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> String {
     }
 }
 
-/// Escape text for safe interpolation into an HTML fragment.
-pub(super) fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// One upstream line as an out-of-band append into the buffer element.
-pub(super) fn render_line_fragment(line: &str) -> String {
-    // Drop any IRCv3 tag prefix: the buffer stores fully-tagged lines, but the
-    // web view renders the message text, not the tags.
+/// One upstream line as a JSON event for the web client:
+/// `{"t":"line","v":"<raw IRC line>"}`. The client parses the IRC line itself
+/// (routing it to a buffer, updating the nick list) and renders via safe DOM
+/// APIs, so no HTML is produced here. The IRCv3 tag prefix is dropped — the
+/// client renders message content, not tags. `serde_json` handles all escaping.
+pub(super) fn line_event(line: &str) -> String {
     let line = line
         .strip_prefix('@')
         .and_then(|rest| rest.split_once(' '))
         .map_or(line, |(_, body)| body);
-    format!(
-        "<div hx-swap-oob=\"beforeend:#buffer\"><div class=\"line\">{}</div></div>",
-        html_escape(line)
-    )
+    serde_json::json!({ "t": "line", "v": line }).to_string()
 }
 
-/// A connection-status change as an OOB swap of the status element.
-/// Connection state shown in the web UI's status fragment. An enum (not a
-/// free `&str`) so the value interpolated into the `class` attribute is
-/// closed and can never carry untrusted text.
+/// Connection state sent to the web client. An enum (not a free `&str`) so the
+/// emitted value is closed and can never carry untrusted text.
 #[derive(Clone, Copy)]
 pub(super) enum ConnStatus {
     Connected,
@@ -419,7 +400,7 @@ impl ConnStatus {
     }
 }
 
-pub(super) fn render_status_fragment(status: ConnStatus) -> String {
-    let s = status.label();
-    format!("<div id=\"status\" hx-swap-oob=\"true\" class=\"status status-{s}\">{s}</div>")
+/// A connection-status change as a JSON event: `{"t":"status","v":"connected"}`.
+pub(super) fn status_event(status: ConnStatus) -> String {
+    serde_json::json!({ "t": "status", "v": status.label() }).to_string()
 }

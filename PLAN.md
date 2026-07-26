@@ -1593,6 +1593,26 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Management console — stage 6 (a real in-browser IRC client) (2026-07-26): the
+last planned console surface. The `/ws/ui` live client was an 88-line raw-line
+log (server pushed `hx-swap-oob` HTML fragments into one `#buffer`); it is now a
+small vanilla-JS IRC client. The socket protocol changed from HTML fragments to
+JSON events — `{"t":"line","v":"<raw IRC line>"}` / `{"t":"status",...}` (backend
+`line_event`/`status_event`, replacing `render_line_fragment` and the now-dead
+`html_escape`) — and the client (`web/src/main.js`) parses each IRC line itself,
+routing it to the right buffer (channel / direct message / server), maintaining a
+per-channel member list from JOIN/PART/QUIT/NICK/KICK/353, tracking topics
+(TOPIC/332), and rendering the active buffer with a buffer sidebar (unread
+badges), a member list, and a composer that targets the active buffer (the server
+still maps `{target, message}` + slash-commands to IRC). All rendering is via DOM
+APIs — never `innerHTML` on server text — so a hostile upstream line can't inject
+markup. The management pages (account, `/console/*`) keep their htmx server-
+rendered model; only the chat client moved to client-side parsing, where the
+buffer/nick-list state naturally lives. Verified: `vite build` succeeds (6.5 kB
+JS); the `ws_ui` e2e now asserts the JSON line event; workspace (29 bins), clippy
+default + `embed-web`, all `tools/check-*` gates + `cargo deny` clean.
+DESIGN.md §13 updated.
+
 Management console — stage 5 (runtime bridge CRUD — the approved decision, built)
 (2026-07-26): the human said yes to making bridges runtime-manageable, so they now
 are — created/removed from the console (or REST) and persisted, just like IRC

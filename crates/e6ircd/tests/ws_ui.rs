@@ -1,6 +1,6 @@
 //! e2e for the live web-UI socket (`/ws/ui`): a cookie/bearer-auth'd
 //! WebSocket attaches to one of the caller's BNC networks, receives
-//! upstream traffic as HTML fragments, and relays composer input back to
+//! upstream traffic as JSON line events, and relays composer input back to
 //! the upstream. PG-gated (auth needs the account store).
 
 use e6ircd::config::{BncConfig, Config, DatabaseConfig, HttpConfig, ListenerConfig, NetworkEntry};
@@ -101,9 +101,10 @@ async fn ws_ui_streams_fragments_and_relays_composer() {
         .await
         .expect("ws/ui connect");
 
-    // upstream -> UI: the peer posts, the UI receives an HTML fragment
+    // upstream -> UI: the peer posts, the UI receives a JSON line event
+    // carrying the raw IRC line (the browser client parses it into a buffer).
     peer.send_line("PRIVMSG #lobby :hello web").await.unwrap();
-    let fragment = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match ws.next().await {
                 Some(Ok(Tung::Text(t))) if t.contains("hello web") => return t.to_string(),
@@ -113,10 +114,15 @@ async fn ws_ui_streams_fragments_and_relays_composer() {
         }
     })
     .await
-    .expect("timeout waiting for fragment");
+    .expect("timeout waiting for line event");
+    let v: serde_json::Value = serde_json::from_str(&event).expect("json event");
+    assert_eq!(v["t"], "line", "not a line event: {event}");
     assert!(
-        fragment.contains("hx-swap-oob=\"beforeend:#buffer\""),
-        "not an OOB fragment: {fragment}"
+        v["v"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PRIVMSG #lobby :hello web"),
+        "line event missing the raw line: {event}"
     );
 
     // UI composer -> upstream: text up the socket reaches the peer
