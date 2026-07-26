@@ -101,6 +101,7 @@ impl TestServer {
                     clock,
                     mono_clock: test_mono,
                     command_burst: None,
+                    registration_burst: None,
                 },
                 db_tx,
             ),
@@ -2406,6 +2407,41 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
         out.iter()
             .any(|l| l.contains("PONG") && l.contains("liveness")),
         "output is not stuck behind a leaked deferred reply: {out:#?}"
+    );
+}
+
+#[test]
+fn second_register_while_first_pending_is_refused() {
+    // Only one account creation may be in flight per connection. A second
+    // REGISTER while the first still awaits its DB verdict must be refused, not
+    // spawn a second argon2 hash / deferred reply whose label overwrites the
+    // first's — which would frame the earlier reply under the wrong label.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    s.line(alice, "REGISTER * * hunter2");
+    let first = s.db_requests();
+    assert_eq!(first.len(), 1, "first REGISTER enqueues one CreateAccount");
+    // Second REGISTER before the first resolves.
+    s.line(alice, "REGISTER * * hunter2");
+    assert!(
+        s.db_requests().is_empty(),
+        "a duplicate in-flight REGISTER must not enqueue a second CreateAccount"
+    );
+    // Now resolve the first; its deferred FAIL is held behind the defer, and the
+    // duplicate's refusal (a synchronous FAIL) was held too — both flush here.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL REGISTER TEMPORARILY_UNAVAILABLE")
+                && l.contains("already in progress")),
+        "the duplicate REGISTER is refused as already-in-progress: {out:#?}"
     );
 }
 
@@ -4765,6 +4801,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: early_mono,
             command_burst: Some(10),
+            registration_burst: None,
         },
         db_tx,
     );
@@ -4812,6 +4849,81 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
 }
 
 #[test]
+fn account_creation_is_rate_limited_per_ip() {
+    // With registration_burst=1, one client IP may create at most one account
+    // before the bucket empties; the second REGISTER is refused without ever
+    // reaching the DB worker. (The bucket refills over an hour, far longer than
+    // this test's fixed clock advances, so the second attempt stays throttled.)
+    let (db_tx, mut db_rx) = queue(Config {
+        name: "d",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let mut core = Core::new(
+        CoreConfig {
+            server_name: "irc.test.example".into(),
+            network_name: "T".into(),
+            description: "test server".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
+            sendq: 256,
+            motd: vec![],
+            nicklen: 16,
+            sasl_enabled: true,
+            opers: vec![],
+            max_hot_channels: 8,
+            clock: || Millis::from_millis(1_000_000_000),
+            mono_clock: test_mono,
+            command_burst: None,
+            registration_burst: Some(1),
+        },
+        db_tx,
+    );
+    let conn = ConnId(1);
+    let (tx, _rx) = queue(Config {
+        name: "s",
+        capacity: 512,
+        policy: Policy::Fifo,
+    });
+    core.handle(Input::Open {
+        conn,
+        tx,
+        host: "shared-ip".into(),
+    });
+    for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * pw"] {
+        core.handle(Input::Line {
+            conn,
+            line: line.as_bytes().to_vec(),
+        });
+    }
+    // Resolve the first REGISTER as "already exists": this clears the
+    // in-flight `pending_register` (so the per-connection concurrent-register
+    // guard won't be what refuses the next attempt) without logging the
+    // session in — leaving it eligible to try again, now against an empty
+    // bucket.
+    core.handle(Input::DbReply {
+        conn,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    // A second account-creation attempt from the same IP must be throttled by
+    // the rate limiter (not the concurrent-register guard): it never reaches
+    // the worker.
+    core.handle(Input::Line {
+        conn,
+        line: b"REGISTER * * pw".to_vec(),
+    });
+    let creates = std::iter::from_fn(|| db_rx.try_pop())
+        .filter(|env| matches!(env.payload, e6ircd::core::DbRequest::CreateAccount { .. }))
+        .count();
+    assert_eq!(
+        creates, 1,
+        "registration_burst=1 must let exactly one account creation reach the DB worker"
+    );
+}
+
+#[test]
 fn hot_history_ring_is_lru_evicted() {
     // A server with room for only 2 hot channels: activity in a third
     // must evict the least-recently-active channel's ring.
@@ -4836,6 +4948,7 @@ fn hot_history_ring_is_lru_evicted() {
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
             command_burst: None,
+            registration_burst: None,
         },
         db_tx,
     );
@@ -6188,6 +6301,16 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
             }],
             "REGISTER {arg} must register the caller's own nick"
         );
+        // Resolve the in-flight registration (as "already exists": clears the
+        // pending-register guard without logging the session in) so the next
+        // iteration is a fresh attempt, not a refused duplicate.
+        s.core.handle(Input::DbReply {
+            conn: alice,
+            reply: e6ircd::core::DbReply::AccountExists {
+                origin: e6ircd::core::AccountOrigin::RegisterCommand,
+            },
+        });
+        s.drain(alice);
     }
 }
 
@@ -6316,6 +6439,7 @@ fn history_logmessage_gated_on_database() {
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: test_mono,
                 command_burst: None,
+                registration_burst: None,
             },
             db_tx,
         );
@@ -6897,18 +7021,20 @@ fn server_ban_preserves_display_case_and_removes_case_insensitively() {
 
 /// A ban that matches the setting oper's own session must still confirm and
 /// audit before the self-disconnect: the confirmation NOTICE and `record_audit`
-/// run ahead of the victims loop, so a self-matching `KLINE *@*` doesn't close
-/// the oper's session and then send its confirmation into a gone connection
-/// (a silent no-op) or record an actor-less audit row — the same self-close
-/// ordering `cmd_kill` guards.
+/// run ahead of the victims loop, so a self-matching ban doesn't close the
+/// oper's session and then send its confirmation into a gone connection (a
+/// silent no-op) or record an actor-less audit row — the same self-close
+/// ordering `cmd_kill` guards. (The mask targets the oper's own host rather
+/// than `*@*`, which is refused as a netban, while still self-matching.)
 #[test]
 fn self_matching_kline_confirms_before_disconnecting_the_setter() {
     let mut s = TestServer::new();
     let op = s.register(1, "god");
     s.line(op, "OPER god letmein");
     s.drain(op);
-    // A mask that matches everyone, including the oper's own user@host.
-    s.line(op, "KLINE *@* :cleanup");
+    // A mask specific enough to pass the netban guard but that still matches the
+    // oper's own user@host (the test harness gives conn 1 the host host1.example).
+    s.line(op, "KLINE *@host1.example :cleanup");
     let out = s.drain(op);
     assert!(
         out.iter().any(|l| l.contains("Added K-Line")),
@@ -7032,6 +7158,82 @@ fn oper_xline_mask_with_spaces_is_not_split() {
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed X-Line")),
         "multi-word xline could not be removed by its own mask"
+    );
+}
+
+/// An XLINE with a multi-word mask and *no* reason (no trailing `:`) must ban
+/// the whole space-joined mask, not treat its last word as the reason. Keying
+/// the split on `p.len() >= 2` alone banned `*Evil` with reason `Corp*` for
+/// `XLINE *Evil Corp*` — the reason is only present when sent as a trailing.
+#[test]
+fn oper_xline_multiword_mask_without_reason_bans_whole_mask() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "XLINE *Evil Corp*");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added X-Line")),
+        "no xline confirmation"
+    );
+    // The full multi-word glob is banned...
+    let banned = s.connect(2);
+    s.line(banned, "NICK sam");
+    s.line(banned, "USER sam 0 * :Totally Evil Corp Ltd");
+    assert!(
+        s.drain(banned).iter().any(|l| l.contains(" 465 ")),
+        "multi-word no-reason gecos ban did not take"
+    );
+    // ...while a realname matching only the would-be split token ("*Evil") is not.
+    let ok = s.connect(3);
+    s.line(ok, "NICK amy");
+    s.line(ok, "USER amy 0 * :Not So Evil");
+    assert!(
+        s.drain(ok).iter().any(|l| l.contains(" 001 ")),
+        "a realname matching only the split-off token was wrongly banned"
+    );
+}
+
+/// A ban mask that constrains nothing (`*@*`, `*`) is an accidental server-wide
+/// ban; `BanMask::parse` refuses it so such a mask can never reach the ban list.
+/// The refusal is loud (a NOTICE), never a silent narrowing.
+#[test]
+fn oper_ban_matching_everyone_is_refused() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    // Each of these constrains nothing and must be refused, with no DB write.
+    for cmd in ["KLINE *@* :bye", "DLINE * :bye", "XLINE * :bye"] {
+        s.line(op, cmd);
+        let out = s.drain(op);
+        assert!(
+            out.iter()
+                .any(|l| l.contains("Refusing") && l.contains("matches every user")),
+            "{cmd} should be refused as a netban: {out:#?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("Added")),
+            "{cmd} must not be added"
+        );
+        assert!(
+            s.db_requests()
+                .iter()
+                .all(|r| !matches!(r, e6ircd::core::DbRequest::AddServerBan { .. })),
+            "{cmd} must not reach the database"
+        );
+    }
+    // A specific mask on the same commands is still accepted.
+    s.line(op, "KLINE bad@host.example :spam");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added K-Line")),
+        "a specific KLINE is still accepted"
+    );
+    // `nick@*` constrains the user field, so it is not a netban.
+    s.line(op, "KLINE baddie@* :spam");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added K-Line")),
+        "user@* is specific enough to accept"
     );
 }
 
@@ -7181,6 +7383,15 @@ fn oper_sethost_changes_host_and_chghosts() {
             .any(|l| l.contains("@host3.example CHGHOST user cloak.example")),
         "no CHGHOST"
     );
+    // The target has no chghost cap, so it learns its new host via
+    // RPL_VISIBLEHOST (396) instead of a CHGHOST it couldn't parse.
+    let target_out = s.drain(target);
+    assert!(
+        target_out
+            .iter()
+            .any(|l| l.split(' ').nth(1) == Some("396") && l.contains("cloak.example")),
+        "target not sent RPL_VISIBLEHOST: {target_out:#?}"
+    );
     // The host actually changed: the target's next message shows it.
     s.line(target, "PRIVMSG #room :hi");
     assert!(
@@ -7196,6 +7407,65 @@ fn oper_sethost_changes_host_and_chghosts() {
     assert!(
         s.drain(plain).iter().any(|l| l.contains(" 481 ")),
         "non-oper allowed to SETHOST"
+    );
+}
+
+/// A chghost-capable target already learns of the host change from CHGHOST, so
+/// it must not also get a redundant RPL_VISIBLEHOST.
+#[test]
+fn oper_sethost_capable_target_gets_no_redundant_396() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    let target = register_with_caps(&mut s, 2, "user", "chghost");
+    s.drain(target);
+    s.line(op, "SETHOST user cloak.example");
+    s.drain(op);
+    let out = s.drain(target);
+    assert!(
+        out.iter().any(|l| l.contains("CHGHOST user cloak.example")),
+        "capable target should get CHGHOST: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|l| l.split(' ').nth(1) == Some("396")),
+        "capable target must not get a redundant RPL_VISIBLEHOST: {out:#?}"
+    );
+}
+
+/// Privileged actions (KILL, server bans) raise an operator server-notice to
+/// every other operator, so oper activity is visible without tailing the DB
+/// audit log.
+#[test]
+fn oper_kill_and_ban_raise_snotices() {
+    let mut s = TestServer::new();
+    let op1 = s.register(1, "god");
+    s.line(op1, "OPER god letmein");
+    s.drain(op1);
+    // A second operator (same credentials, second session) watches for snotices.
+    let op2 = s.register(2, "god2");
+    s.line(op2, "OPER god letmein");
+    s.drain(op2);
+    let victim = s.register(3, "victim");
+    s.drain(victim);
+
+    // KILL: op2 sees the notice; the killed victim does not (it is excluded).
+    s.line(op1, "KILL victim :spamming");
+    let seen = s.drain(op2);
+    assert!(
+        seen.iter()
+            .any(|l| l.contains("Notice -- Received KILL message for victim")
+                && l.contains("from god")),
+        "op2 did not see the KILL snotice: {seen:#?}"
+    );
+
+    // Ban: op2 sees the K-Line notice.
+    s.line(op1, "KLINE bad@host.example :spam");
+    let seen = s.drain(op2);
+    assert!(
+        seen.iter()
+            .any(|l| l.contains("Notice --") && l.contains("added K-Line for bad@host.example")),
+        "op2 did not see the ban snotice: {seen:#?}"
     );
 }
 

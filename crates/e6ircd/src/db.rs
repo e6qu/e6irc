@@ -244,8 +244,19 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                 // `ARGON2_PERMITS` choke point) so a cheap one-line REGISTER can't
                 // monopolize the single worker for the full hash and stall every
                 // queued read/login behind it. It writes only the accounts table
-                // (never `messages`), so — like VerifyPassword — no log-batch flush
-                // is needed and there is no ordering hazard.
+                // (never `messages`), so — like VerifyPassword — no log-batch
+                // flush is needed for *table* consistency.
+                //
+                // Reply *ordering* is a subtler matter: because this reply is
+                // produced off the serial loop, a CHATHISTORY the same client
+                // pipelined right after (answered on the serial loop in ~ms) can
+                // resolve before this ~100ms hash does, so the two deferred
+                // replies release in completion order, not issue order. That is
+                // deliberately tolerated — see the `deferred_replies` invariant
+                // in `core::state`: only self-identifying replies (a REGISTER
+                // SUCCESS/FAIL vs. a chathistory BATCH) can swap, ambiguous sync
+                // output never overtakes either, and a labeled-response client
+                // correlates each by its own label regardless of arrival order.
                 DbRequest::CreateAccount {
                     conn,
                     name,

@@ -129,6 +129,11 @@ pub struct LimitsConfig {
     /// `None` disables auth rate limiting.
     #[serde(default)]
     pub auth_rate_burst: Option<usize>,
+    /// Token-bucket size for account creation (REGISTER / NickServ REGISTER),
+    /// per client IP; the bucket refills to full over one hour. Bounds bulk
+    /// account minting from one address. `None` disables the throttle.
+    #[serde(default)]
+    pub registration_burst: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -488,6 +493,13 @@ impl Config {
         if self.limits.auth_rate_burst == Some(0) {
             return Err(ConfigError::Invalid(
                 "limits.auth_rate_burst must be nonzero when set".into(),
+            ));
+        }
+        if self.limits.registration_burst == Some(0) {
+            return Err(ConfigError::Invalid(
+                "limits.registration_burst must be nonzero when set (0 refuses every account \
+                 creation)"
+                    .into(),
             ));
         }
         // `try_acquire` refuses a connection once `count >= max`, so a max of 0
@@ -1089,6 +1101,25 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "command_burst=0 flood-kills every command and must be rejected"
+        );
+    }
+
+    #[test]
+    fn zero_registration_burst_is_rejected() {
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+            }],
+            limits: LimitsConfig {
+                registration_burst: Some(0),
+                ..LimitsConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(
+            cfg.validate().is_err(),
+            "registration_burst=0 refuses every account creation and must be rejected"
         );
     }
 

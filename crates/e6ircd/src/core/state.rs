@@ -149,6 +149,12 @@ pub struct CoreConfig {
     /// throttle. Registered non-oper sessions spend one token per
     /// command (PING/PONG exempt) and refill one token per second.
     pub command_burst: Option<usize>,
+    /// Per-client-IP account-creation bucket size; `None` disables the throttle.
+    /// One token is spent per REGISTER/NickServ-REGISTER that reaches account
+    /// creation; the bucket refills to full over an hour (account creation is
+    /// rare per real client, so a small burst suffices to blunt bulk-account
+    /// abuse without hindering a genuine sign-up).
+    pub registration_burst: Option<usize>,
 }
 
 /// SASL negotiation progress of one connection.
@@ -333,13 +339,26 @@ pub(crate) struct Session {
     /// How many database-backed replies this connection is still waiting on,
     /// and the output withheld behind them.
     ///
-    /// A client's replies must reach it in the order it issued the commands.
-    /// CHATHISTORY can only be answered after a round trip to PostgreSQL, and
-    /// everything produced in the meantime — including the PONG to a PING the
-    /// client pipelined right after — would otherwise overtake the batch. A
-    /// client that treats that PONG as a sync point then concludes the history
-    /// was empty, which is indistinguishable from the server having no history
-    /// at all.
+    /// The invariant this enforces: **ambiguous output never overtakes a
+    /// deferred reply.** CHATHISTORY can only be answered after a round trip to
+    /// PostgreSQL, and everything produced in the meantime — including the PONG
+    /// to a PING the client pipelined right after — is held until every pending
+    /// deferred reply resolves (the counter returns to 0). Without the hold, a
+    /// client that treats that PONG as a sync point concludes the history was
+    /// empty, which is indistinguishable from the server having no history at
+    /// all.
+    ///
+    /// What this does *not* promise: strict issue-order between two *deferred*
+    /// replies on the same connection. Each releases via the `emitting_deferred`
+    /// bypass the moment its own DB round trip completes, so if a client
+    /// pipelines two DB-backed commands whose completions race — e.g. a REGISTER
+    /// (offloaded ~100ms argon2, see `db::CreateAccount`) then a CHATHISTORY
+    /// (serial, ~ms) — the second may emit before the first. That is benign:
+    /// both are *self-identifying* (a REGISTER SUCCESS/FAIL cannot be mistaken
+    /// for a chathistory BATCH), ambiguous sync output stays held behind *both*
+    /// (it flushes only at count 0), and a labeled-response client correlates
+    /// each reply by its own label regardless of arrival order. Only the
+    /// ambiguous-overtake case above is a real hazard, and that one is closed.
     pub deferred_replies: usize,
     pub held: Vec<Bytes>,
 }
@@ -878,7 +897,24 @@ pub(crate) struct ServerState {
     /// While set, output to this connection bypasses its deferred-reply hold:
     /// it is the deferred reply itself, which the held output waits behind.
     pub emitting_deferred: Option<ConnId>,
+    /// Per-client-IP account-creation token buckets (only used when
+    /// `registration_burst` is set): folded host → (tokens, monotonic
+    /// millisecond refill has been credited through). Bounds bulk-account
+    /// abuse from one address; hard-capped at `MAX_REGISTRATION_BUCKETS` so
+    /// a distinct-IP flood can't grow it without bound.
+    pub registration_buckets: HashMap<String, (f64, e6irc_proto::time::MonoMillis)>,
 }
+
+/// Hard ceiling on the account-creation bucket map, mirroring the HTTP
+/// `auth_rate_ok` limiter: the refill window is long (an hour), so a flood
+/// from many distinct IPs keeps every entry below full and nothing prunes —
+/// this cap bounds the map by evicting the least-recently-seen entry.
+pub(crate) const MAX_REGISTRATION_BUCKETS: usize = 4096;
+
+/// Account creation is rare per genuine client, so the bucket refills to full
+/// slowly (one hour). A small burst absorbs a legitimate retry while capping
+/// how fast one address can mint accounts.
+const REGISTRATION_REFILL_WINDOW_MS: u64 = 60 * 60 * 1000;
 
 /// Buffered direct responses to a labeled command.
 pub(crate) struct Capture {
@@ -935,6 +971,57 @@ impl ServerState {
             hot_history: std::collections::VecDeque::new(),
             emitting_deferred: None,
             capture: None,
+            registration_buckets: HashMap::new(),
+        }
+    }
+
+    /// Spend one token from `host`'s account-creation bucket. Returns `false`
+    /// (rate-limited) when the bucket is empty; always `true` when
+    /// `registration_burst` is unset. The bucket refills to full over
+    /// `REGISTRATION_REFILL_WINDOW_MS`; fully-refilled entries are pruned, and
+    /// the map is hard-capped at `MAX_REGISTRATION_BUCKETS` so it can't grow
+    /// without bound even under a distinct-IP flood. Mirrors the HTTP
+    /// `auth_rate_ok` limiter, but on the core's monotonic clock.
+    pub fn registration_rate_ok(&mut self, host: &str) -> bool {
+        let Some(burst) = self.config.registration_burst else {
+            return true;
+        };
+        let burst = burst as f64;
+        let now = (self.config.mono_clock)();
+        let refill_per_ms = burst / REGISTRATION_REFILL_WINDOW_MS as f64;
+        let buckets = &mut self.registration_buckets;
+        if buckets.len() > MAX_REGISTRATION_BUCKETS {
+            buckets.retain(|_, (tokens, last)| {
+                *tokens + now.saturating_sub(*last).as_millis() as f64 * refill_per_ms < burst
+            });
+            // A distinct-IP flood leaves nothing for the retain to prune (every
+            // entry is below full). Evict the least-recently-seen entry to make
+            // room — its bucket simply resets to a fresh burst next time, which
+            // is harmless — so memory stays bounded regardless of source spread.
+            if buckets.len() >= MAX_REGISTRATION_BUCKETS
+                && !buckets.contains_key(host)
+                && let Some(oldest) = buckets
+                    .iter()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(k, _)| k.clone())
+            {
+                buckets.remove(&oldest);
+            }
+        }
+        let entry = buckets.entry(host.to_string()).or_insert((burst, now));
+        // The refill watermark is monotonic; guard against a non-monotonic
+        // source as defense in depth (same as the command-flood bucket).
+        if now < entry.1 {
+            entry.1 = now;
+        }
+        entry.0 =
+            (entry.0 + now.saturating_sub(entry.1).as_millis() as f64 * refill_per_ms).min(burst);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            true
+        } else {
+            false
         }
     }
 

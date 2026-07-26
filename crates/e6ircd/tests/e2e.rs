@@ -224,6 +224,7 @@ async fn per_ip_connection_limit_refuses_excess() {
         limits: LimitsConfig {
             max_connections_per_ip: Some(2),
             command_burst: None,
+            registration_burst: None,
             ..LimitsConfig::default()
         },
         ..Config::default()
@@ -277,6 +278,7 @@ async fn command_flood_throttle_closes_excess() {
         limits: LimitsConfig {
             max_connections_per_ip: None,
             command_burst: Some(5),
+            registration_burst: None,
             ..LimitsConfig::default()
         },
         ..Config::default()

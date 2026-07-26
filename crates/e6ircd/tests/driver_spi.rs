@@ -49,7 +49,7 @@ async fn assert_echo_driver_contract(driver: Box<dyn NetworkDriver>) {
     .unwrap_or(false);
     assert!(connected, "{kind}: never reported Connected");
 
-    assert!(handle.send("hello world"), "{kind}: send failed");
+    assert!(handle.send("hello world").await, "{kind}: send failed");
     assert!(
         wait_for(
             &mut events,
@@ -85,7 +85,7 @@ async fn attach_relays_over_the_loopback_driver() {
     // Pre-attach line lands in the buffer and must replay on attach.
     // Poll for it rather than sleeping a fixed interval (a fixed sleep is
     // a latent flake on a slow runner).
-    handle.send("earlier");
+    handle.send("earlier").await;
     let buffered = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if handle.buffer_snapshot().iter().any(|l| l == "earlier") {
@@ -106,7 +106,17 @@ async fn attach_relays_over_the_loopback_driver() {
     let (r, mut w) = tokio::io::split(client);
     let mut lines = BufReader::new(r).lines();
 
-    // Playback of the buffered line.
+    // Attach greeting: the current upstream connection status comes first.
+    let status = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+        .await
+        .expect("timeout")
+        .expect("io")
+        .expect("line");
+    assert!(
+        status.contains("*bnc*") && status.contains("upstream"),
+        "attach sends an initial status line: {status}"
+    );
+    // Then playback of the buffered line.
     let replayed = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
         .await
         .expect("timeout")

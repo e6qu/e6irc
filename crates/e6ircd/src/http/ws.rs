@@ -288,7 +288,10 @@ pub(super) async fn ws_ui_conn(
                     // other client→upstream paths run bytes through LineBuffer,
                     // so match that invariant here (no CRLF injection, bounded
                     // length) instead of sending the raw frame unframed.
-                    if !handle.send(&sanitize_composer_line(&composer_to_irc(&t))) {
+                    if !handle
+                        .send(&sanitize_composer_line(&composer_to_irc(&t)))
+                        .await
+                    {
                         break; // driver gone
                     }
                 }

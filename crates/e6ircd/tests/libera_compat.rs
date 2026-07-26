@@ -82,6 +82,7 @@ fn our_isupport() -> HashMap<String, String> {
             clock: || e6irc_proto::time::Millis::from_millis(0),
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(0),
             command_burst: None,
+            registration_burst: None,
         },
         db_tx,
     );

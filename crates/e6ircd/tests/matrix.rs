@@ -132,7 +132,11 @@ async fn matrix_bridge_relays_both_ways() {
     );
 
     // IRC -> Matrix: a downstream command reaches the room; alice sees it.
-    assert!(handle.send(&format!("PRIVMSG #{room_local} :from the bridge")));
+    assert!(
+        handle
+            .send(&format!("PRIVMSG #{room_local} :from the bridge"))
+            .await
+    );
     let seen = tokio::time::timeout(Duration::from_secs(10), async {
         let mut since = String::new();
         loop {

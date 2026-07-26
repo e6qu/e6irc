@@ -98,6 +98,12 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // and recording afterwards would resolve the actor to an empty string —
     // an unattributed row in the log whose whole purpose is attribution.
     record_audit(state, conn, "KILL", target, comment);
+    // Snotice every other oper (the victim, if an oper, is about to be closed).
+    notify_opers(
+        state,
+        Some(victim),
+        &format!("Received KILL message for {target} from {oper_nick}: {comment}"),
+    );
     // The reason is echoed inside this ERROR wrapper, whose overhead can push
     // a maximal KILL comment past the wire limit — fit it like the QUIT path
     // does, or the victim's framing discards the whole close notice (and the
@@ -138,6 +144,30 @@ pub(super) fn record_audit(
     }
 }
 
+/// Broadcast an operator server-notice (snotice) to every registered operator,
+/// optionally skipping one connection (`except`) — used to spare a KILL victim
+/// who is about to be closed. This is the minimal snotice surface: there is no
+/// `+s` server-notice mask yet, so every operator sees every privileged-action
+/// notice rather than subscribing to flags. Best-effort, like any NOTICE.
+pub(super) fn notify_opers(state: &mut ServerState, except: Option<ConnId>, text: &str) {
+    let server = state.config.server_name.clone();
+    let recipients: Vec<(ConnId, String)> = state
+        .sessions
+        .iter()
+        .filter(|(c, s)| s.is_registered() && s.oper && Some(**c) != except)
+        .filter_map(|(&c, s)| s.nick().map(|n| (c, n.to_string())))
+        .collect();
+    for (c, nick) in recipients {
+        // `text` can embed client-controlled, unbounded data (a KILL comment, a
+        // ban reason), so fit it to the wire limit per recipient — the head's
+        // length varies with the recipient's nick — or a maximal comment pushes
+        // the line past 512 and the recipient's framing discards it whole.
+        let head = format!(":{server} NOTICE {nick} :*** Notice -- ");
+        let fitted = fit_trailing(&head, text);
+        state.send(c, &format!("{head}{fitted}"));
+    }
+}
+
 /// Normalise a K-line target: a bare host/nick becomes `*@target`.
 /// Normalize a ban `arg` into a mask for `kind`. A KLINE `user@host` with a
 /// bare token becomes `*@host`; DLINE (host/IP) and XLINE (realname) masks
@@ -149,10 +179,99 @@ pub(super) fn ban_mask(kind: BanKind, arg: &str) -> String {
     }
 }
 
+/// Whether a glob token matches *any* value — non-empty and made only of `*`
+/// (`*`, `**`, …). Such a token places no constraint at all.
+fn glob_matches_all(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b == b'*')
+}
+
+/// A parsed, normalized server-ban target, produced *only* by [`BanMask::parse`].
+///
+/// Parsing is where three concerns that used to be separate ad-hoc steps in the
+/// handler are unified — and, being the *only* constructor, is what makes their
+/// failure modes unrepresentable downstream (DESIGN §2, "parse, don't validate"):
+///
+/// 1. **The reason/mask split.** An XLINE targets the gecos, which routinely
+///    contains spaces, so its mask spans several IRC params; the reason is
+///    present only when sent as a `:trailing`. Keying the split on `has_trailing`
+///    here means no other code can re-derive it wrongly (the class of bug where
+///    `XLINE *Evil Corp*` banned `*Evil` with reason `Corp*`).
+/// 2. **Bare-host normalization** (`ban_mask`): a KLINE `host` becomes `*@host`.
+/// 3. **The match-everyone refusal.** A mask that constrains nothing (`*@*`,
+///    `*`) is an accidental server-wide ban; parse *rejects* it, so a `BanMask`
+///    value that matches every user simply cannot exist — the handler never has
+///    to guard against one because the type guarantees its absence.
+pub(super) struct BanMask(String);
+
+/// Why an oper's ban command yielded no [`BanMask`].
+pub(super) enum BanReject {
+    /// The normalized mask matches every user; refused to prevent a netban from
+    /// a slipped glob. Carries the offending display mask for the notice.
+    MatchesEveryone(String),
+}
+
+impl BanMask {
+    /// Parse a KLINE/DLINE/XLINE's parameter list into `(mask, reason)`.
+    /// `params` is known non-empty by the caller (the bare-command *list* form
+    /// is handled before parsing); `has_trailing` is whether the last parameter
+    /// carried the `:` trailing marker.
+    pub(super) fn parse(
+        kind: BanKind,
+        params: &[&str],
+        has_trailing: bool,
+    ) -> Result<(Self, String), BanReject> {
+        // XLINE: the gecos mask spans every param; the reason is the last param
+        // *iff* it was a trailing. KLINE/DLINE masks are spaceless, so mask is
+        // the first param and reason the second (a spaces-in-reason KLINE also
+        // uses the trailing, which lands as a single param).
+        let (raw_mask, reason) = match kind {
+            BanKind::Xline if has_trailing && params.len() >= 2 => (
+                params[..params.len() - 1].join(" "),
+                params[params.len() - 1].to_string(),
+            ),
+            BanKind::Xline => (params.join(" "), "No reason".to_string()),
+            _ => (
+                params[0].to_string(),
+                params.get(1).copied().unwrap_or("No reason").to_string(),
+            ),
+        };
+        // Bound the oper-supplied reason: it rides the victim's closing ERROR and
+        // the ban-list NOTICE, both single lines the recipient's framing discards
+        // whole past 512 bytes. 300 chars is ample with room for the wrapping.
+        let reason = e6irc_proto::message::truncate_on_char_boundary(&reason, 300).to_string();
+        let display = ban_mask(kind, &raw_mask);
+        // A mask that constrains nothing bans everyone. `user@host` is a netban
+        // only when *both* sides are pure wildcard; a single-field DLINE/XLINE
+        // glob is one when the whole field is.
+        let matches_everyone = match kind {
+            BanKind::Kline => match display.split_once('@') {
+                Some((user, host)) => glob_matches_all(user) && glob_matches_all(host),
+                None => glob_matches_all(&display),
+            },
+            BanKind::Dline | BanKind::Xline => glob_matches_all(&display),
+        };
+        if matches_everyone {
+            return Err(BanReject::MatchesEveryone(display));
+        }
+        Ok((BanMask(display), reason))
+    }
+
+    /// The normalized display mask (operator's casing preserved).
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// KLINE/DLINE/XLINE [<mask> [reason]] — oper-only. With no argument, list
 /// the current bans of this kind; otherwise add one (persisted; matching
 /// registered sessions are disconnected).
-pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, p: &[&str]) {
+pub(super) fn cmd_add_ban(
+    state: &mut ServerState,
+    conn: ConnId,
+    kind: BanKind,
+    p: &[&str],
+    has_trailing: bool,
+) {
     if !state.sessions[&conn].oper {
         state.numeric(
             conn,
@@ -169,7 +288,7 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
         .nick()
         .map(String::from)
         .expect("registered");
-    let Some(&mask_arg) = p.first() else {
+    if p.is_empty() {
         // List current bans of this kind.
         let lines: Vec<String> = state
             .server_bans
@@ -192,7 +311,7 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
             &format!(":{server} NOTICE {nick} :End of {label} list."),
         );
         return;
-    };
+    }
     // Enforcement folds mask and subject under the casemap (`mask::matches`), so
     // the stored mask must fold for comparison too: otherwise `KLINE Baddie@Host`
     // then `UNKLINE baddie@host` would compare case-sensitively, fail to remove,
@@ -202,29 +321,28 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     // keys, and matching all agree — the same discipline the channel
     // `+b/+q/+e/+I` lists use.
     let casemap = state.casemap;
-    // XLINE targets the realname/gecos, which routinely contains spaces; IRC
-    // tokenization splits it across params, so rejoin everything before the
-    // reason. A middle param can never contain a space, so the reason (when
-    // given) is the final param and the mask is the rest. Without this,
-    // `XLINE *Evil Corp* :spam` silently banned `*Evil` with reason `Corp*` — a
-    // different, broader ban than typed. KLINE/DLINE masks never contain spaces,
-    // so they keep the plain mask=first, reason=second split.
-    let (raw_mask, reason) = match kind {
-        BanKind::Xline if p.len() >= 2 => (p[..p.len() - 1].join(" "), p[p.len() - 1].to_string()),
-        _ => (
-            mask_arg.to_string(),
-            p.get(1).copied().unwrap_or("No reason").to_string(),
-        ),
+    // Parse the params into a guaranteed-well-formed target: the reason/mask
+    // split (XLINE-aware, keyed on the trailing marker), the `*@host`
+    // normalization, and the match-everyone refusal all happen inside
+    // `BanMask::parse`, so nothing below can see a mis-split fragment or a
+    // netban mask. A rejection is reported loudly, never silently narrowed.
+    let (parsed_mask, reason) = match BanMask::parse(kind, p, has_trailing) {
+        Ok(parsed) => parsed,
+        Err(BanReject::MatchesEveryone(attempted)) => {
+            state.send(
+                conn,
+                &format!(
+                    ":{server} NOTICE {nick} :Refusing {label} for {attempted}: it matches every \
+                     user (use a more specific mask)"
+                ),
+            );
+            return;
+        }
     };
-    // Bound the oper-supplied reason: it rides the victim's closing ERROR and
-    // the ban-list NOTICE, both single lines the recipient's framing discards
-    // whole if they pass 512 bytes. 300 chars is ample and leaves room for the
-    // fixed wrapping on either line.
-    let reason = e6irc_proto::message::truncate_on_char_boundary(&reason, 300).to_string();
     // A MaskKey folds for comparison (so a differently-cased UN*LINE removes it)
     // while keeping the operator's casing for STATS and the confirmation — the
     // same discipline the channel ban lists use.
-    let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
+    let mask = crate::core::state::MaskKey::new(parsed_mask.as_str(), casemap);
     // Replace any existing ban of this kind on the same mask (folded equality).
     state
         .server_bans
@@ -265,6 +383,13 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
             ":{server} NOTICE {nick} :Added {label} for {}",
             mask.as_str()
         ),
+    );
+    // Snotice every oper before the disconnect loop — for the same reason the
+    // audit/confirm run first: a self-matching ban may close `conn` here.
+    notify_opers(
+        state,
+        None,
+        &format!("{nick} added {label} for {} ({reason})", mask.as_str()),
     );
     // Disconnect any matching registered sessions (possibly including `conn`).
     let victims: Vec<ConnId> = state
@@ -421,6 +546,18 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         if state.sessions.get(&peer).is_some_and(|s| s.caps.chghost) {
             state.send_timed(peer, &chghost);
         }
+    }
+    // A chghost-capable target learned of the change from the CHGHOST above; a
+    // client without the cap would otherwise never be told its own host moved.
+    // Fill that gap with RPL_VISIBLEHOST so every target learns its new visible
+    // host — the CHGHOST is for *other* clients' view, 396 is for the target's.
+    if state.sessions.get(&target).is_some_and(|s| !s.caps.chghost) {
+        state.numeric(
+            target,
+            RPL_VISIBLEHOST,
+            &[newhost],
+            Some("is now your visible host"),
+        );
     }
     record_audit(state, conn, "SETHOST", nick, newhost);
     state.send(

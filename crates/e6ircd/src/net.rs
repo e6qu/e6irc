@@ -325,6 +325,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
             clock: wall_clock,
             mono_clock,
             command_burst: config.limits.command_burst,
+            registration_burst: config.limits.registration_burst,
         },
         db_tx,
     );
@@ -811,6 +812,7 @@ mod tests {
             clock: wall_clock,
             mono_clock,
             command_burst: None,
+            registration_burst: None,
         }
     }
 

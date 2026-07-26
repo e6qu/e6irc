@@ -1593,6 +1593,111 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-ninth sweep — six approved decisions done (three from sweep 88, three
+oper-hunt), plus two bugs found on the way, and a parse-don't-validate refactor
+(2026-07-26): the human approved every escalated decision ("yes to them all") and
+asked to lean harder on parse-don't-validate / type-driven unrepresentability on
+user-controlled-input paths. All six decisions are implemented in one PR; two more
+real bugs (an XLINE split, a concurrent REGISTER) were found and fixed on the way.
+
+**(1) Per-IP account-creation rate limit** (`core::state`, `config`, `net`,
+`registration`, `services`). The per-connection argon2 budget stops one *link*
+from driving unbounded hashing, but not one *address* from minting accounts
+across a churn of short-lived connections (each spends only its own budget). A
+new `registration_burst: Option<usize>` (off by default, `0` rejected at load
+like its `command_burst`/`auth_rate_burst` siblings) adds a per-client-IP token
+bucket — mirroring the HTTP `auth_rate_ok` limiter but on the core's monotonic
+clock, refilling to full over an hour (account creation is rare per genuine
+client). Bounded at `MAX_REGISTRATION_BUCKETS=4096` with least-recently-seen
+eviction, so a distinct-IP flood can't grow the map. Both REGISTER and NickServ
+REGISTER consult it before enqueuing `CreateAccount`; a throttled attempt gets a
+loud `TEMPORARILY_UNAVAILABLE` FAIL / NickServ notice, never a silent drop.
+
+**(2) The client→upstream BNC command channel is now bounded** (`bouncer/mod.rs`,
+`http/ws.rs`; from sweep 88's second decision). It was an unbounded mpsc that,
+during a reconnect wait, accumulated every client line with no backpressure. It
+is now `mpsc::channel(BNC_COMMAND_QUEUE=256)`, shared per network; `NetworkHandle::
+send` became async and a full queue backpressures the sender (the attach/WS read
+side stops reading the client socket) instead of growing without bound. Verified
+no deadlock: a dead driver drops the receiver so `send().await` returns Err and
+the attach loop exits; during a reconnect the sender briefly blocks until the
+queue drains. (Landed with the test-caller `.await` updates across the driver-SPI,
+matrix, and bouncer suites.)
+
+**(3) IRC `attach` now sends an initial upstream-status line** (from sweep 88's
+third decision) — `:*bnc* NOTICE * :upstream connected|disconnected` before the
+buffer replay, matching what `/ws/ui` already did, so an attaching client learns
+the connection state immediately instead of inferring it. The driver-SPI attach
+test consumes the status line before asserting playback.
+
+**XLINE with a multi-word mask and no reason was mis-split** (`oper.rs`, found by
+an oper-command hunt). The gecos/realname an XLINE targets routinely contains
+spaces, so the mask spans several IRC params; the code took the *last* param as
+the reason unconditionally (`p.len() >= 2`), so `XLINE *Evil Corp*` (no reason)
+banned `*Evil` with reason `Corp*` — a different, broader ban than typed. The
+reason is present only when the client sent it as a trailing (`:reason`), so the
+split now keys on `msg.has_trailing`: with a trailing, last param = reason and
+the rest = mask; without, every param joins into the mask and the reason
+defaults. KLINE/DLINE (spaceless masks) are unchanged. New test covers the
+no-reason multi-word form; the existing with-reason test still passes.
+
+**A second REGISTER while the first is still pending is now refused**
+(`registration.rs`, found by the deferred-reply audit). Nothing guarded against a
+duplicate in-flight account creation, so a second REGISTER spawned a second
+argon2 hash and a second deferred reply whose label *overwrote* the first's
+`pending_register` — framing the earlier reply under the wrong label. One
+creation may now be in flight per connection; the duplicate gets a
+`TEMPORARILY_UNAVAILABLE` "already in progress" FAIL.
+
+**Deferred-reply ordering invariant corrected, not code** (`db.rs`, `core::state`
+docs; from the same audit). The audit confirmed the defer/release machinery is
+balanced (no counter leak, no cross-connection contamination, terminal ERROR
+never dropped) but found the documented invariant over-broad: an offloaded
+REGISTER (~100ms argon2) and a serial CHATHISTORY (~ms) the client pipelines
+after it release in *completion* order, so the two self-identifying replies can
+swap. This is benign — ambiguous sync output (a pipelined PONG) still never
+overtakes a deferred reply (held flushes only at count 0), and a labeled client
+correlates by label — but the `db.rs` "no ordering hazard" comment was wrong and
+the `deferred_replies` doc claimed strict issue-order it doesn't provide. Both now
+state precisely what holds: *ambiguous output never overtakes a deferred reply*;
+two deferred replies may resolve in completion order.
+
+The three oper-hunt observations were escalated as decisions and the human
+approved all three ("yes to them all"); all are now implemented in this same PR:
+
+**(a) Too-broad server-ban masks refused — as a parse-don't-validate type**
+(`oper.rs`; per the human's "do more parse-don't-validate on user-controlled
+paths"). Rather than bolt on another after-the-fact check, the ban-mask handling
+became a `BanMask` newtype whose *only* constructor is `BanMask::parse(kind,
+params, has_trailing)`. Parsing folds three previously-separate ad-hoc steps into
+one place — the XLINE reason/mask split (keyed on the trailing marker), the
+`*@host` normalization, and the match-everyone refusal — so downstream code can no
+longer represent a mis-split fragment *or* a `*@*`/`*` netban mask: those bug
+classes are unrepresentable, not merely guarded. A netban attempt gets a loud
+NOTICE ("matches every user; use a more specific mask"), never a silent narrowing.
+`user@*` (specific user field) is still accepted.
+
+**(b) SETHOST emits `RPL_VISIBLEHOST` (396)** (`oper.rs`) — a `chghost`-capable
+target learns of its new host from the CHGHOST, but a client *without* the cap
+would otherwise never be told its own host moved. It now receives 396 ("is now
+your visible host") — sent only when the target lacks `chghost`, so a capable
+client gets no redundant numeric. (The previously-defined-but-unused
+`RPL_VISIBLEHOST` numeric is now live.)
+
+**(c) Operator server-notices (snotices) on KILL/ban** (`oper.rs`) — a new
+`notify_opers(except, text)` raises `NOTICE … :*** Notice -- …` to every
+registered operator (skipping a KILL victim about to be closed), so privileged
+activity is visible without tailing the DB audit log. The snotice text is
+length-fitted per recipient (`fit_trailing`) — a first cut overflowed 512 bytes on
+a maximal KILL comment, caught by the debug wire-check and fixed. This is the
+minimal surface: there is no `+s` snomask yet, so every oper sees every notice.
+
+Verified: workspace suite (256 core tests incl. 7 new — rate-limit, concurrent-
+REGISTER, XLINE no-reason mask, netban refusal, SETHOST 396 present/absent, oper
+snotices) + all bins; each bridge feature alone under `-Dwarnings`; `cargo clippy
+--all-features`; all `tools/check-*` gates + `cargo deny`; fuzz targets build
+under `--cfg fuzzing`; irctest main (382 passed); PG db suite (44 passed).
+
 Eighty-eighth sweep — sealed secrets bound to their context + a lingering-BNC
 detach bug (2026-07-26): the second escalation from sweep 86 — AAD context-binding
 for sealed secrets — is done, and two fresh audits (BNC attach/backlog, arithmetic/

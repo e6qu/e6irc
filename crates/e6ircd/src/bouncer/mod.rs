@@ -141,6 +141,12 @@ pub(crate) enum SessionOutcome {
 /// parks until the network is reconfigured (which drops the handle and ends it).
 pub(crate) const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
 
+/// Depth of the bounded client→upstream command queue per network (shared by all
+/// attached clients). Past this the sender backpressures rather than buffering
+/// without limit — see [`NetworkHandle::channels`]. Each line is already bounded
+/// by `MAX_CLIENT_FRAME_LEN`, so this bounds the queue's memory.
+const BNC_COMMAND_QUEUE: usize = 256;
+
 /// Whether an HTTP status from a bridge's auth/login call means the *credentials*
 /// were rejected (401/403) — a permanent failure retrying won't fix, so the
 /// caller returns [`SessionOutcome::AuthRejected`] rather than `Dropped`. Gives
@@ -600,7 +606,7 @@ pub enum ConnectionEvent {
 /// driver keeps running while zero are attached.
 pub struct NetworkHandle {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
-    commands: mpsc::UnboundedSender<String>,
+    commands: mpsc::Sender<String>,
     /// Authoritative stop signal. The registry (and only the registry) holds
     /// the `Sender`; `attach` clones `commands` but never this, so removing or
     /// replacing a network stops its driver even while a client is attached —
@@ -744,9 +750,10 @@ pub(crate) fn render_bridged_privmsg(
 }
 
 impl NetworkHandle {
-    /// Send a raw line to the upstream network.
-    pub fn send(&self, line: &str) -> bool {
-        self.commands.send(line.to_string()).is_ok()
+    /// Send a raw line to the upstream network. Awaits if the bounded command
+    /// queue is full (backpressure); returns `false` only if the driver is gone.
+    pub async fn send(&self, line: &str) -> bool {
+        self.commands.send(line.to_string()).await.is_ok()
     }
 
     /// A copy of the current detached buffer (for attach playback).
@@ -799,7 +806,13 @@ impl NetworkHandle {
     /// broadcasts events through the returned [`DriverEnds`].
     pub fn channels(buffer_cap: usize) -> (NetworkHandle, DriverEnds) {
         let (events, _) = tokio::sync::broadcast::channel(1024);
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        // Bounded, not unbounded: the driver drains one command per loop
+        // iteration, and during a reconnect wait (up to ~30s of backoff) it
+        // doesn't drain at all — an unbounded queue would let an attached client's
+        // sends grow without limit. A full queue backpressures the sender (the
+        // attach/WS read side stops reading the client socket) instead, bounding
+        // memory. Shared across all clients attached to this one network.
+        let (command_tx, command_rx) = mpsc::channel(BNC_COMMAND_QUEUE);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -838,7 +851,7 @@ impl NetworkHandle {
 /// upstream lines to the detached buffer, and broadcasts live events.
 pub struct DriverEnds {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
-    commands: mpsc::UnboundedReceiver<String>,
+    commands: mpsc::Receiver<String>,
     /// Fires (or its sender drops) when the network is stopped; the driver
     /// observes it in `next_command` and `run_with_backoff` so it tears down
     /// promptly on removal, not when the last client happens to detach.
@@ -1025,6 +1038,18 @@ where
         return Ok(());
     }
 
+    // Send the current upstream connection status up front, so a client that
+    // attaches to an already-connected (or still-reconnecting) network learns the
+    // state now rather than only at the next connect/disconnect transition — the
+    // same up-front status `/ws/ui` sends over WebSocket. The wording matches the
+    // live `DriverEvent::Connected`/`Disconnected` lines below.
+    let status: &[u8] = if handle.is_connected() {
+        b":*bnc* NOTICE * :upstream connected\r\n"
+    } else {
+        b":*bnc* NOTICE * :upstream disconnected\r\n"
+    };
+    write.write_all(status).await?;
+
     // Playback: everything buffered while detached, in order, with tags the
     // client didn't negotiate stripped.
     for line in handle.buffer_snapshot() {
@@ -1085,7 +1110,7 @@ where
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
                                 Ok(text) => {
-                                    if commands.send(text).is_err() {
+                                    if commands.send(text).await.is_err() {
                                         return Ok(()); // driver gone
                                     }
                                 }
