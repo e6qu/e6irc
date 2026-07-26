@@ -828,7 +828,13 @@ server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit log) — the read views that begin the web
 management UI; it shares the `pages` module, `render_private`, and the exact
 admin gate the `/api/v1/admin/*` JSON endpoints use, so it can never surface
-server-wide data to a non-admin.
+server-wide data to a non-admin. The console shell (`console_base.html`) is
+also the home of `/console/networks` — a per-user BNC network manager with
+live connection status, available to any authenticated user for their own
+networks — and `/console/integrations` (admin), which surfaces the
+chat-platform bridges: build availability per platform and any running bridge
+with its status. Bridges remain config-file networks today; runtime bridge
+CRUD (a `bnc_networks` `kind` migration) is a decision put to the maintainer.
 
 ---
 

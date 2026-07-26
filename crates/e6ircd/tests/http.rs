@@ -906,6 +906,74 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
     }
 }
 
+/// The console Integrations page is admin-gated and lists every chat-platform
+/// bridge with its build availability. This default (no-bridge-feature) build
+/// reports all three as not built.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_integrations_page_lists_platforms_for_admins_only() {
+    let url = support::test_db("console_integrations_page_lists_platforms_for_admins_only").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("tok");
+    let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "t")
+        .await
+        .expect("tok");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.console.example".into(),
+        network_name: "ConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let auth = |token: &str| {
+        format!(
+            "GET /console/integrations HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Anonymous -> redirect to /login.
+    let (status, head, _) = request(http, &get("/console/integrations")).await;
+    assert_eq!(status, 303, "{head}");
+    // Signed-in non-admin -> 403.
+    let (status, _, _) = request(http, &auth(&bob_token)).await;
+    assert_eq!(status, 403);
+    // Admin -> 200 listing all three platforms; none is built in this binary.
+    let (status, _, body) = request(http, &auth(&alice_token)).await;
+    assert_eq!(status, 200, "{body}");
+    for needle in ["Integrations", "Matrix", "Discord", "Slack", "not built"] {
+        assert!(
+            body.contains(needle),
+            "integrations missing {needle:?}: {body}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_page_add_network_form_with_csrf() {

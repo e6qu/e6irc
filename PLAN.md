@@ -1593,6 +1593,29 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Management console — stage 4 (integrations status + a decision put to the human)
+(2026-07-26): a new admin `/console/integrations` page surfaces the chat-platform
+bridges, which were previously invisible in the UI. For each of Matrix / Discord /
+Slack it shows whether *this binary* was built with the feature (`cfg!(feature =
+…)`), the bridge networks currently running (with live connection status), and the
+`[[network]]` config shape to add one. Backend: the registry now records each
+driver's `kind` on its slot and exposes `Registry::list()` (owner, name, kind,
+connected) — a small, safe read addition — consumed by the page.
+
+The scope boundary is a real fork, not a silent skip: bridges today are
+*config-file* networks (`kind = matrix|discord|slack`), feature-gated and started
+at boot, whereas the runtime DB-backed BNC networks are IRC-only (`create_network_
+core` always builds an `IrcDriver`). Making bridges *runtime-manageable* (add/edit
+a bridge from the UI) needs a real backend project — a `kind` column + bridge
+fields on `bnc_networks` (a schema migration), `create_network_core` building the
+right feature-gated driver, and bot-token sealing/secrets UX. That is a
+consequential, hard-to-reverse decision, so it is **put to the human** rather than
+committed unilaterally; this stage delivers the honest status+guidance view that
+needs no migration and sets up the section. Verified: workspace (29 bins) + a new
+PG-backed test (admin gate + all three platforms shown as not-built on the default
+build); clippy default + `embed-web`; each bridge alone under `-Dwarnings`; all
+`tools/check-*` gates + `cargo deny`.
+
 Management console — stage 3 (BNC session + network management) (2026-07-26):
 the console shell was refactored into a shared `console_base.html` (header + nav +
 `{% block main %}`, askama inheritance) so every console page shares one chrome;

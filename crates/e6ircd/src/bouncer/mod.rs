@@ -26,7 +26,7 @@ pub use irc_driver::{IrcNetwork, NetworkConfig};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDriver};
-pub use serve::{Registry, bnc_serve};
+pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 

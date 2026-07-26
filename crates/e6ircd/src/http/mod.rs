@@ -175,6 +175,7 @@ pub fn router(state: AppState) -> Router {
             "/console/networks/{name}",
             axum::routing::delete(pages::console_delete_network),
         )
+        .route("/console/integrations", get(pages::console_integrations))
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -900,6 +901,101 @@ mod pages {
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         console_networks_fragment(&state, &account, csrf).await
+    }
+
+    struct BridgeNet {
+        name: String,
+        owner: String,
+        connected: bool,
+    }
+    struct BridgePlatform {
+        name: &'static str,
+        kind: &'static str,
+        built: bool,
+        configure: &'static str,
+        networks: Vec<BridgeNet>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_integrations.html")]
+    struct ConsoleIntegrations {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        bouncer_enabled: bool,
+        platforms: Vec<BridgePlatform>,
+    }
+
+    /// Console → Integrations (admin): the chat-platform bridges. For each
+    /// platform it shows whether this binary was built with the feature and the
+    /// bridge networks currently running (with live status). Bridges are
+    /// configured as `[[network]]` entries today; runtime CRUD is future work,
+    /// so this is a status + configuration-guidance view.
+    pub async fn console_integrations(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        if !is_admin_account(&state, &account) {
+            return problem(StatusCode::FORBIDDEN, "Admin only", None);
+        }
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let all = state
+            .bnc_registry
+            .as_ref()
+            .map(|r| r.list())
+            .unwrap_or_default();
+        let platform = |name, kind, built, configure| BridgePlatform {
+            name,
+            kind,
+            built,
+            configure,
+            networks: all
+                .iter()
+                .filter(|n| n.kind == kind)
+                .map(|n| BridgeNet {
+                    name: n.name.clone(),
+                    owner: n.owner.clone().unwrap_or_else(|| "shared".into()),
+                    connected: n.connected,
+                })
+                .collect(),
+        };
+        let platforms = vec![
+            platform(
+                "Matrix",
+                "matrix",
+                cfg!(feature = "matrix"),
+                "kind = \"matrix\", addr = homeserver URL, nick = login user, \
+                 sasl_password = login password, autojoin = rooms.",
+            ),
+            platform(
+                "Discord",
+                "discord",
+                cfg!(feature = "discord"),
+                "kind = \"discord\", sasl_password = bot token, autojoin = channel IDs, \
+                 addr = optional API base.",
+            ),
+            platform(
+                "Slack",
+                "slack",
+                cfg!(feature = "slack"),
+                "kind = \"slack\", sasl_account = bot token, sasl_password = app token, \
+                 autojoin = channels, addr = optional API base.",
+            ),
+        ];
+        render_private(ConsoleIntegrations {
+            account,
+            csrf,
+            is_admin: true,
+            active: "integrations",
+            bouncer_enabled: state.bnc_registry.is_some(),
+            platforms,
+        })
     }
 
     #[derive(Template)]

@@ -54,6 +54,18 @@ pub struct Registry {
 struct Slot {
     handle: Arc<NetworkHandle>,
     persistence: Option<tokio::task::JoinHandle<()>>,
+    /// The driver's stable kind (`irc`, `matrix`, `discord`, `slack`, …),
+    /// captured before `start()` consumes the driver — for status views.
+    kind: &'static str,
+}
+
+/// A read-only snapshot of one registered network, for status/management views.
+pub struct NetworkStatus {
+    /// Owning account (casefolded), or `None` for a server-level shared network.
+    pub owner: Option<String>,
+    pub name: String,
+    pub kind: &'static str,
+    pub connected: bool,
 }
 
 impl Slot {
@@ -175,6 +187,8 @@ impl Registry {
     /// With a database, restore recent backlog and persist new lines.
     pub fn add(&self, owner: Option<&str>, name: &str, driver: Box<dyn super::NetworkDriver>) {
         let key = NetworkKey::new(owner, name);
+        // Capture the kind before `start()` consumes the driver.
+        let kind = driver.kind();
         let handle = Arc::new(driver.start());
         // The persistence task keys `bnc_buffer` rows by the same casefolded
         // owner the registry uses, so a buffer cannot be written under one
@@ -185,6 +199,7 @@ impl Registry {
         let slot = Slot {
             handle,
             persistence,
+            kind,
         };
         // Replacing a key must stop the old driver, not leak it.
         if let Some(old) = self
@@ -236,6 +251,22 @@ impl Registry {
             .expect("registry poisoned")
             .get(&NetworkKey::new(None, name))
             .map(|slot| slot.handle.clone())
+    }
+
+    /// A snapshot of every registered network — its owner, name, driver kind,
+    /// and live connection state — for the console's status/integration views.
+    pub fn list(&self) -> Vec<NetworkStatus> {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
+            .iter()
+            .map(|(key, slot)| NetworkStatus {
+                owner: key.owner.clone(),
+                name: key.name.clone(),
+                kind: slot.kind,
+                connected: slot.handle.is_connected(),
+            })
+            .collect()
     }
 }
 

@@ -1,0 +1,45 @@
+{% extends "console_base.html" %}
+{% block main %}
+        <h1>Integrations</h1>
+        <p class="meta">
+          Bridges connect e6irc to other chat platforms as bouncer networks. Each
+          is available only if this binary was built with its feature, and is
+          configured as a <code>[[network]]</code> with the given <code>kind</code>.
+          {% if !bouncer_enabled %}<strong>The bouncer is not enabled on this server.</strong>{% endif %}
+        </p>
+
+        {% for p in platforms %}
+          <h2>
+            {{ p.name }}
+            {% if p.built %}<span class="tag">built in</span>{% else %}<span class="tag">not built</span>{% endif %}
+          </h2>
+          <p class="meta">{{ p.configure }}</p>
+          {% if !p.built %}
+            <p class="empty">
+              This binary was built without the <code>{{ p.kind }}</code> feature, so
+              {{ p.name }} bridges cannot run here. Rebuild with
+              <code>--features {{ p.kind }}</code> to enable it.
+            </p>
+          {% else if p.networks.is_empty() %}
+            <p class="empty">No {{ p.name }} bridges configured.</p>
+          {% else %}
+            <div class="scroll">
+              <table>
+                <thead><tr><th>Status</th><th>Network</th><th>Owner</th></tr></thead>
+                <tbody>
+                  {% for n in p.networks %}
+                    <tr>
+                      <td>
+                        {% if n.connected %}<span class="dot on"></span>connected
+                        {% else %}<span class="dot off"></span>disconnected{% endif %}
+                      </td>
+                      <td><code>{{ n.name }}</code></td>
+                      <td><code>{{ n.owner }}</code></td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% endif %}
+        {% endfor %}
+{% endblock %}
