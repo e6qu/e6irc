@@ -45,6 +45,17 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "NickServ", "You are already logged in.");
                 return;
             }
+            // Per-IP account-creation throttle (mirrors the REGISTER path): the
+            // per-connection budget alone doesn't stop one address minting
+            // accounts across a churn of short-lived connections.
+            if !state.registration_rate_ok(&state.sessions[&conn].host.clone()) {
+                state.service_notice(
+                    conn,
+                    "NickServ",
+                    "Too many account registrations from your address. Try again later.",
+                );
+                return;
+            }
             // Account creation runs argon2 (a full hash even when the account
             // already exists, via ON CONFLICT), so it must spend from the shared
             // per-connection credential budget — otherwise a loop of REGISTER

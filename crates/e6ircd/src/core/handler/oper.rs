@@ -152,7 +152,13 @@ pub(super) fn ban_mask(kind: BanKind, arg: &str) -> String {
 /// KLINE/DLINE/XLINE [<mask> [reason]] — oper-only. With no argument, list
 /// the current bans of this kind; otherwise add one (persisted; matching
 /// registered sessions are disconnected).
-pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, p: &[&str]) {
+pub(super) fn cmd_add_ban(
+    state: &mut ServerState,
+    conn: ConnId,
+    kind: BanKind,
+    p: &[&str],
+    has_trailing: bool,
+) {
     if !state.sessions[&conn].oper {
         state.numeric(
             conn,
@@ -203,14 +209,22 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     // `+b/+q/+e/+I` lists use.
     let casemap = state.casemap;
     // XLINE targets the realname/gecos, which routinely contains spaces; IRC
-    // tokenization splits it across params, so rejoin everything before the
-    // reason. A middle param can never contain a space, so the reason (when
-    // given) is the final param and the mask is the rest. Without this,
-    // `XLINE *Evil Corp* :spam` silently banned `*Evil` with reason `Corp*` — a
-    // different, broader ban than typed. KLINE/DLINE masks never contain spaces,
-    // so they keep the plain mask=first, reason=second split.
+    // tokenization splits it across params, so rejoin them into the mask. The
+    // reason is present *only* when the client sent it as a trailing (`:reason`)
+    // — a middle param cannot contain a space, so a multi-word gecos mask has no
+    // way to also carry a space-separated reason without one. Keying on the
+    // trailing marker is what distinguishes the two:
+    //   `XLINE *Evil Corp*`       → mask `*Evil Corp*`, no reason
+    //   `XLINE *Evil Corp* :spam` → mask `*Evil Corp*`, reason `spam`
+    // Using the last param as the reason unconditionally banned `*Evil` with
+    // reason `Corp*` for the first form — a different, broader ban than typed.
+    // KLINE/DLINE masks never contain spaces, so they keep mask=first,
+    // reason=second (a spaces-in-reason KLINE also uses the trailing).
     let (raw_mask, reason) = match kind {
-        BanKind::Xline if p.len() >= 2 => (p[..p.len() - 1].join(" "), p[p.len() - 1].to_string()),
+        BanKind::Xline if has_trailing && p.len() >= 2 => {
+            (p[..p.len() - 1].join(" "), p[p.len() - 1].to_string())
+        }
+        BanKind::Xline => (p.join(" "), "No reason".to_string()),
         _ => (
             mask_arg.to_string(),
             p.get(1).copied().unwrap_or("No reason").to_string(),

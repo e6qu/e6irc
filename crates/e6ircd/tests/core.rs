@@ -101,6 +101,7 @@ impl TestServer {
                     clock,
                     mono_clock: test_mono,
                     command_burst: None,
+                    registration_burst: None,
                 },
                 db_tx,
             ),
@@ -2406,6 +2407,41 @@ fn deferred_register_reply_is_released_on_transient_db_failure() {
         out.iter()
             .any(|l| l.contains("PONG") && l.contains("liveness")),
         "output is not stuck behind a leaked deferred reply: {out:#?}"
+    );
+}
+
+#[test]
+fn second_register_while_first_pending_is_refused() {
+    // Only one account creation may be in flight per connection. A second
+    // REGISTER while the first still awaits its DB verdict must be refused, not
+    // spawn a second argon2 hash / deferred reply whose label overwrites the
+    // first's — which would frame the earlier reply under the wrong label.
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.drain(alice);
+    s.line(alice, "REGISTER * * hunter2");
+    let first = s.db_requests();
+    assert_eq!(first.len(), 1, "first REGISTER enqueues one CreateAccount");
+    // Second REGISTER before the first resolves.
+    s.line(alice, "REGISTER * * hunter2");
+    assert!(
+        s.db_requests().is_empty(),
+        "a duplicate in-flight REGISTER must not enqueue a second CreateAccount"
+    );
+    // Now resolve the first; its deferred FAIL is held behind the defer, and the
+    // duplicate's refusal (a synchronous FAIL) was held too — both flush here.
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|l| l.contains("FAIL REGISTER TEMPORARILY_UNAVAILABLE")
+                && l.contains("already in progress")),
+        "the duplicate REGISTER is refused as already-in-progress: {out:#?}"
     );
 }
 
@@ -4765,6 +4801,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: early_mono,
             command_burst: Some(10),
+            registration_burst: None,
         },
         db_tx,
     );
@@ -4812,6 +4849,86 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
 }
 
 #[test]
+fn account_creation_is_rate_limited_per_ip() {
+    // With registration_burst=1, one client IP may create at most one account
+    // before the bucket empties; the second REGISTER is refused without ever
+    // reaching the DB worker. (The bucket refills over an hour, far longer than
+    // this test's fixed clock advances, so the second attempt stays throttled.)
+    let (db_tx, mut db_rx) = queue(Config {
+        name: "d",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let mut core = Core::new(
+        CoreConfig {
+            server_name: "irc.test.example".into(),
+            network_name: "T".into(),
+            description: "test server".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
+            sendq: 256,
+            motd: vec![],
+            nicklen: 16,
+            sasl_enabled: true,
+            opers: vec![],
+            max_hot_channels: 8,
+            clock: || Millis::from_millis(1_000_000_000),
+            mono_clock: test_mono,
+            command_burst: None,
+            registration_burst: Some(1),
+        },
+        db_tx,
+    );
+    let conn = ConnId(1);
+    let (tx, _rx) = queue(Config {
+        name: "s",
+        capacity: 512,
+        policy: Policy::Fifo,
+    });
+    core.handle(Input::Open {
+        conn,
+        tx,
+        host: "shared-ip".into(),
+    });
+    for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * pw"] {
+        core.handle(Input::Line {
+            conn,
+            line: line.as_bytes().to_vec(),
+        });
+    }
+    // Resolve the first REGISTER as "already exists": this clears the
+    // in-flight `pending_register` (so the per-connection concurrent-register
+    // guard won't be what refuses the next attempt) without logging the
+    // session in — leaving it eligible to try again, now against an empty
+    // bucket.
+    core.handle(Input::DbReply {
+        conn,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    // A second account-creation attempt from the same IP must be throttled by
+    // the rate limiter (not the concurrent-register guard): it never reaches
+    // the worker.
+    core.handle(Input::Line {
+        conn,
+        line: b"REGISTER * * pw".to_vec(),
+    });
+    let creates = std::iter::from_fn(|| db_rx.try_pop())
+        .filter(|env| {
+            matches!(
+                env.payload,
+                e6ircd::core::DbRequest::CreateAccount { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        creates, 1,
+        "registration_burst=1 must let exactly one account creation reach the DB worker"
+    );
+}
+
+#[test]
 fn hot_history_ring_is_lru_evicted() {
     // A server with room for only 2 hot channels: activity in a third
     // must evict the least-recently-active channel's ring.
@@ -4836,6 +4953,7 @@ fn hot_history_ring_is_lru_evicted() {
             clock: || Millis::from_millis(1_000_000_000),
             mono_clock: test_mono,
             command_burst: None,
+            registration_burst: None,
         },
         db_tx,
     );
@@ -6188,6 +6306,16 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
             }],
             "REGISTER {arg} must register the caller's own nick"
         );
+        // Resolve the in-flight registration (as "already exists": clears the
+        // pending-register guard without logging the session in) so the next
+        // iteration is a fresh attempt, not a refused duplicate.
+        s.core.handle(Input::DbReply {
+            conn: alice,
+            reply: e6ircd::core::DbReply::AccountExists {
+                origin: e6ircd::core::AccountOrigin::RegisterCommand,
+            },
+        });
+        s.drain(alice);
     }
 }
 
@@ -6316,6 +6444,7 @@ fn history_logmessage_gated_on_database() {
                 clock: || Millis::from_millis(1_000_000_000),
                 mono_clock: test_mono,
                 command_burst: None,
+                registration_burst: None,
             },
             db_tx,
         );
@@ -7032,6 +7161,39 @@ fn oper_xline_mask_with_spaces_is_not_split() {
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed X-Line")),
         "multi-word xline could not be removed by its own mask"
+    );
+}
+
+/// An XLINE with a multi-word mask and *no* reason (no trailing `:`) must ban
+/// the whole space-joined mask, not treat its last word as the reason. Keying
+/// the split on `p.len() >= 2` alone banned `*Evil` with reason `Corp*` for
+/// `XLINE *Evil Corp*` — the reason is only present when sent as a trailing.
+#[test]
+fn oper_xline_multiword_mask_without_reason_bans_whole_mask() {
+    let mut s = TestServer::new();
+    let op = s.register(1, "god");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.line(op, "XLINE *Evil Corp*");
+    assert!(
+        s.drain(op).iter().any(|l| l.contains("Added X-Line")),
+        "no xline confirmation"
+    );
+    // The full multi-word glob is banned...
+    let banned = s.connect(2);
+    s.line(banned, "NICK sam");
+    s.line(banned, "USER sam 0 * :Totally Evil Corp Ltd");
+    assert!(
+        s.drain(banned).iter().any(|l| l.contains(" 465 ")),
+        "multi-word no-reason gecos ban did not take"
+    );
+    // ...while a realname matching only the would-be split token ("*Evil") is not.
+    let ok = s.connect(3);
+    s.line(ok, "NICK amy");
+    s.line(ok, "USER amy 0 * :Not So Evil");
+    assert!(
+        s.drain(ok).iter().any(|l| l.contains(" 001 ")),
+        "a realname matching only the split-off token was wrongly banned"
     );
 }
 

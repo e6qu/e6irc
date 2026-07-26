@@ -1593,6 +1593,86 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-ninth sweep — the three sweep-88 decisions, done, plus an XLINE split bug
+and a concurrent-REGISTER guard (2026-07-26): the human approved all three
+decisions sweep 88 left open ("yes to them all"); all three are implemented, and
+two more real bugs were found and fixed on the way.
+
+**(1) Per-IP account-creation rate limit** (`core::state`, `config`, `net`,
+`registration`, `services`). The per-connection argon2 budget stops one *link*
+from driving unbounded hashing, but not one *address* from minting accounts
+across a churn of short-lived connections (each spends only its own budget). A
+new `registration_burst: Option<usize>` (off by default, `0` rejected at load
+like its `command_burst`/`auth_rate_burst` siblings) adds a per-client-IP token
+bucket — mirroring the HTTP `auth_rate_ok` limiter but on the core's monotonic
+clock, refilling to full over an hour (account creation is rare per genuine
+client). Bounded at `MAX_REGISTRATION_BUCKETS=4096` with least-recently-seen
+eviction, so a distinct-IP flood can't grow the map. Both REGISTER and NickServ
+REGISTER consult it before enqueuing `CreateAccount`; a throttled attempt gets a
+loud `TEMPORARILY_UNAVAILABLE` FAIL / NickServ notice, never a silent drop.
+
+**(2) The client→upstream BNC command channel is now bounded** (`bouncer/mod.rs`,
+`http/ws.rs`; from sweep 88's second decision). It was an unbounded mpsc that,
+during a reconnect wait, accumulated every client line with no backpressure. It
+is now `mpsc::channel(BNC_COMMAND_QUEUE=256)`, shared per network; `NetworkHandle::
+send` became async and a full queue backpressures the sender (the attach/WS read
+side stops reading the client socket) instead of growing without bound. Verified
+no deadlock: a dead driver drops the receiver so `send().await` returns Err and
+the attach loop exits; during a reconnect the sender briefly blocks until the
+queue drains. (Landed with the test-caller `.await` updates across the driver-SPI,
+matrix, and bouncer suites.)
+
+**(3) IRC `attach` now sends an initial upstream-status line** (from sweep 88's
+third decision) — `:*bnc* NOTICE * :upstream connected|disconnected` before the
+buffer replay, matching what `/ws/ui` already did, so an attaching client learns
+the connection state immediately instead of inferring it. The driver-SPI attach
+test consumes the status line before asserting playback.
+
+**XLINE with a multi-word mask and no reason was mis-split** (`oper.rs`, found by
+an oper-command hunt). The gecos/realname an XLINE targets routinely contains
+spaces, so the mask spans several IRC params; the code took the *last* param as
+the reason unconditionally (`p.len() >= 2`), so `XLINE *Evil Corp*` (no reason)
+banned `*Evil` with reason `Corp*` — a different, broader ban than typed. The
+reason is present only when the client sent it as a trailing (`:reason`), so the
+split now keys on `msg.has_trailing`: with a trailing, last param = reason and
+the rest = mask; without, every param joins into the mask and the reason
+defaults. KLINE/DLINE (spaceless masks) are unchanged. New test covers the
+no-reason multi-word form; the existing with-reason test still passes.
+
+**A second REGISTER while the first is still pending is now refused**
+(`registration.rs`, found by the deferred-reply audit). Nothing guarded against a
+duplicate in-flight account creation, so a second REGISTER spawned a second
+argon2 hash and a second deferred reply whose label *overwrote* the first's
+`pending_register` — framing the earlier reply under the wrong label. One
+creation may now be in flight per connection; the duplicate gets a
+`TEMPORARILY_UNAVAILABLE` "already in progress" FAIL.
+
+**Deferred-reply ordering invariant corrected, not code** (`db.rs`, `core::state`
+docs; from the same audit). The audit confirmed the defer/release machinery is
+balanced (no counter leak, no cross-connection contamination, terminal ERROR
+never dropped) but found the documented invariant over-broad: an offloaded
+REGISTER (~100ms argon2) and a serial CHATHISTORY (~ms) the client pipelines
+after it release in *completion* order, so the two self-identifying replies can
+swap. This is benign — ambiguous sync output (a pipelined PONG) still never
+overtakes a deferred reply (held flushes only at count 0), and a labeled client
+correlates by label — but the `db.rs` "no ordering hazard" comment was wrong and
+the `deferred_replies` doc claimed strict issue-order it doesn't provide. Both now
+state precisely what holds: *ambiguous output never overtakes a deferred reply*;
+two deferred replies may resolve in completion order.
+
+Escalated, not yet done (oper-hunt observations, policy/fidelity judgment calls):
+(a) a too-broad-mask guard rejecting/​warning on `*@*`-style server bans; (b)
+SETHOST emitting `RPL_VISIBLEHOST` (396) so a non-`chghost` target learns its new
+visible host (it currently gets only the CHGHOST, which such a client can't see;
+`RPL_VISIBLEHOST` is defined but unused); (c) oper server-notices (snotices) on
+KILL/ban actions. None is a proven defect — each is a feature/convention choice —
+so they are put to the human rather than built speculatively.
+
+Verified: workspace suite (252 core tests incl. 3 new) + all bins; each bridge
+feature alone under `-Dwarnings`; `cargo clippy --all-features`; all
+`tools/check-*` gates + `cargo deny`; irctest main (382 passed); PG db suite (44
+passed).
+
 Eighty-eighth sweep — sealed secrets bound to their context + a lingering-BNC
 detach bug (2026-07-26): the second escalation from sweep 86 — AAD context-binding
 for sealed secrets — is done, and two fresh audits (BNC attach/backlog, arithmetic/

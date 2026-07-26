@@ -242,6 +242,36 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    // One account creation may be in flight per connection. A second REGISTER
+    // while the first still awaits its DB verdict would spawn a second argon2
+    // hash and a second deferred reply, and its label would overwrite the
+    // first's `pending_register` — the earlier reply would then be framed under
+    // the wrong label. Refuse the duplicate instead.
+    if state.sessions[&conn].pending_register.is_some() {
+        register_fail(
+            state,
+            conn,
+            "TEMPORARILY_UNAVAILABLE",
+            &nick,
+            "A registration is already in progress",
+        );
+        return;
+    }
+    // Per-connection budget stops one *link* from driving unbounded argon2;
+    // this per-IP bucket stops one *address* from minting accounts in bulk
+    // across a churn of short-lived connections (each of which spends only its
+    // own budget). It refills slowly — account creation is rare per genuine
+    // client — so a legitimate retry passes while a mint loop is throttled.
+    if !state.registration_rate_ok(&state.sessions[&conn].host.clone()) {
+        register_fail(
+            state,
+            conn,
+            "TEMPORARILY_UNAVAILABLE",
+            &nick,
+            "Too many account registrations from your address; try again later",
+        );
+        return;
+    }
     // Account creation runs argon2 (a full hash even for an existing account),
     // so it spends from the shared per-connection credential budget — the same
     // cap SASL/IDENTIFY use — so a REGISTER loop can't drive unbounded hashing.
