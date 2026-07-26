@@ -471,6 +471,13 @@ pub enum DbReply {
     ChannelAccessUnavailable {
         channel: String,
     },
+    /// A ChanServ FLAGS grant was refused because the channel's access list is at
+    /// its cap. Distinct from `ChannelAccessUnavailable` (a store fault) and from
+    /// `applied: false` (account not registered) so the founder is told the real
+    /// reason and can revoke an entry rather than retry.
+    ChannelAccessLimitReached {
+        channel: String,
+    },
     /// A credential verification could not be attempted — the database is
     /// unreachable or errored. Carries the origin so the client gets the loud
     /// failure appropriate to how it asked (SASL FAIL vs NickServ notice),

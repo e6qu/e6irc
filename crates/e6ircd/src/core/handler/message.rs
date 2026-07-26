@@ -811,8 +811,6 @@ pub(super) fn deliver_multiline(
     conn: ConnId,
     batch: crate::core::state::MultilineBatch,
 ) {
-    let kind = batch.kind.unwrap_or(crate::core::MessageKind::Privmsg);
-    let loud = kind.is_loud();
     if batch.lines.is_empty() {
         // Opened and closed without content: nothing happened — but if the
         // opening BATCH was labeled, that command still owes a response (the
@@ -821,6 +819,14 @@ pub(super) fn deliver_multiline(
         ack_multiline_label(state, conn, batch.label.as_deref());
         return;
     }
+    // A non-empty batch always carries the kind `multiline_collect` set from its
+    // first line (and enforced identical across every line). `None` here would be
+    // a collector logic bug, not client input — so surface it rather than silently
+    // defaulting to PRIVMSG (which could deliver a NOTICE batch as PRIVMSG).
+    let kind = batch
+        .kind
+        .expect("a non-empty multiline batch has a kind (set by multiline_collect)");
+    let loud = kind.is_loud();
     // Permission checks see the whole message, so a CTCP or a ban cannot be
     // slipped past them by splitting it across lines. Crucially the join
     // respects `draft/multiline-concat`: a concat line is delivered joined to

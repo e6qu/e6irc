@@ -300,6 +300,67 @@ pub(super) fn account_registration_flags(state: &ServerState) -> String {
     flags.join(",")
 }
 
+/// A capability that carries an LS *value* parameter, so it lives outside
+/// [`CAP_NAMES`]. Advertising (CAP LS), accepting (CAP REQ), and reporting (CAP
+/// LIST) all derive from this one registry, so an enabled value-cap can't be
+/// accept-able but not reported, or advertised but not accept-able — the desync
+/// class that once told a re-syncing client a negotiated cap was off. Adding a
+/// value-cap is one entry here, not three hand-maintained lists.
+struct ValueCap {
+    name: &'static str,
+    accessor: crate::core::state::CapAccessor,
+    /// The exact LS token to advertise (`v302` selects the value form), or `None`
+    /// when the cap isn't offered at all (e.g. it needs a database). REQ uses
+    /// `ls_token(..).is_some()` as the single "may this be enabled?" gate, so the
+    /// offered/acceptable decision is expressed in exactly one place.
+    ls_token: fn(&ServerState, bool) -> Option<String>,
+}
+
+const VALUE_CAPS: &[ValueCap] = &[
+    ValueCap {
+        name: "sasl",
+        accessor: |c| &mut c.sasl,
+        ls_token: |state, v302| {
+            state.config.sasl_enabled.then(|| {
+                if v302 {
+                    "sasl=PLAIN,OAUTHBEARER".into()
+                } else {
+                    "sasl".into()
+                }
+            })
+        },
+    },
+    ValueCap {
+        name: ACCOUNT_REGISTRATION_CAP,
+        accessor: |c| &mut c.account_registration,
+        ls_token: |state, v302| {
+            state.config.sasl_enabled.then(|| {
+                if v302 {
+                    match account_registration_flags(state) {
+                        flags if flags.is_empty() => ACCOUNT_REGISTRATION_CAP.into(),
+                        flags => format!("{ACCOUNT_REGISTRATION_CAP}={flags}"),
+                    }
+                } else {
+                    ACCOUNT_REGISTRATION_CAP.into()
+                }
+            })
+        },
+    },
+    ValueCap {
+        name: MULTILINE_CAP,
+        accessor: |c| &mut c.multiline,
+        ls_token: |_state, v302| {
+            Some(if v302 {
+                format!(
+                    "{MULTILINE_CAP}=max-bytes={MULTILINE_MAX_BYTES},max-lines={MULTILINE_MAX_LINES}"
+                )
+            } else {
+                MULTILINE_CAP.into()
+            })
+        },
+    },
+];
+
 pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     let target = cap_target(state, conn);
@@ -318,28 +379,13 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             }
             let v302 = p.get(1).is_some_and(|v| *v == "302");
             let mut names: Vec<String> = CAP_NAMES.iter().map(|(n, _)| n.to_string()).collect();
-            if state.config.sasl_enabled {
-                names.push(if v302 {
-                    "sasl=PLAIN,OAUTHBEARER".into()
-                } else {
-                    "sasl".into()
-                });
-                names.push(if v302 {
-                    match account_registration_flags(state) {
-                        flags if flags.is_empty() => ACCOUNT_REGISTRATION_CAP.into(),
-                        flags => format!("{ACCOUNT_REGISTRATION_CAP}={flags}"),
-                    }
-                } else {
-                    ACCOUNT_REGISTRATION_CAP.into()
-                });
-            }
-            names.push(if v302 {
-                format!(
-                    "{MULTILINE_CAP}=max-bytes={MULTILINE_MAX_BYTES},max-lines={MULTILINE_MAX_LINES}"
-                )
-            } else {
-                MULTILINE_CAP.into()
-            });
+            // The value-carrying caps advertise from the shared registry, so LS
+            // can't offer a cap REQ/LIST don't know about (or vice versa).
+            names.extend(
+                VALUE_CAPS
+                    .iter()
+                    .filter_map(|vc| (vc.ls_token)(state, v302)),
+            );
             state.send(
                 conn,
                 &format!(":{server} CAP {target} LS :{}", names.join(" ")),
@@ -352,20 +398,15 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .filter(|(_, get)| *get(&mut caps))
                 .map(|(n, _)| *n)
                 .collect();
-            // `sasl`, account-registration, and multiline are tracked outside
-            // CAP_NAMES (they carry LS value params), so each must be reported
-            // here too — CAP LIST must enumerate *every* enabled capability, and
-            // a client re-syncing its negotiated set via LIST would otherwise be
-            // told an enabled cap is off and mis-track it.
-            if caps.sasl {
-                active.push("sasl");
-            }
-            if caps.account_registration {
-                active.push(ACCOUNT_REGISTRATION_CAP);
-            }
-            if caps.multiline {
-                active.push(MULTILINE_CAP);
-            }
+            // The value-carrying caps report from the same registry LS advertises
+            // and REQ accepts, so LIST can't tell a re-syncing client a negotiated
+            // cap is off (the desync this used to hand-maintain three lists for).
+            active.extend(
+                VALUE_CAPS
+                    .iter()
+                    .filter(|vc| *(vc.accessor)(&mut caps))
+                    .map(|vc| vc.name),
+            );
             state.send(
                 conn,
                 &format!(":{server} CAP {target} LIST :{}", active.join(" ")),
@@ -389,16 +430,15 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     Some(n) => (n, false),
                     None => (token, true),
                 };
-                if name == "sasl" && state.config.sasl_enabled {
-                    caps.sasl = enable;
-                    continue;
-                }
-                if name == ACCOUNT_REGISTRATION_CAP && state.config.sasl_enabled {
-                    caps.account_registration = enable;
-                    continue;
-                }
-                if name == MULTILINE_CAP {
-                    caps.multiline = enable;
+                // A value-cap is acceptable iff it is currently offered (its
+                // `ls_token` yields Some) — the same gate LS advertises on, so a
+                // cap can never be REQ-able but unadvertised. A recognised name
+                // that isn't offered (e.g. `sasl` with no database) falls through
+                // to the unknown-token path and NAKs, as before.
+                if let Some(vc) = VALUE_CAPS.iter().find(|vc| vc.name == name)
+                    && (vc.ls_token)(state, false).is_some()
+                {
+                    *(vc.accessor)(&mut caps) = enable;
                     continue;
                 }
                 match CAP_NAMES.iter().find(|(n, _)| *n == name) {

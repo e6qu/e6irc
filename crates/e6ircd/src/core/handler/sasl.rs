@@ -658,6 +658,15 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 ),
             );
         }
+        crate::core::DbReply::ChannelAccessLimitReached { channel } => {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!(
+                    "The access list for \x02{channel}\x02 is full; revoke an entry before adding another."
+                ),
+            );
+        }
     }
     // A connect-time SASL verify that resolved may have been the last thing
     // registration was waiting on (the client sent CAP END before the verdict).

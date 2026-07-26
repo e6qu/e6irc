@@ -1593,6 +1593,74 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-sixth sweep — a missing grant cap, a silent multiline fallback, and a
+cap-negotiation class closed (2026-07-26): four class-oriented audits (casefold
+key discipline, unbounded growth, secrets/crypto, representable-invalid states).
+Casefold and crypto came back clean; the other two each surfaced one real item,
+and one latent class was worth closing now. No escalated backlog this round.
+
+**A per-channel grant map had no cap** (MED, `db.rs`, `services.rs`, `state.rs`).
+`channel_access` — a channel's auto-op/voice grants — was the one per-scope grant
+collection that skipped the count-then-insert-under-lock pattern every sibling
+uses (app passwords, PATs, BNC networks, read markers). A founder could grant to
+unbounded distinct accounts, growing the in-core map *and* its persisted rows
+(re-loaded into RAM on every boot by `preload_access`). `set_channel_access` now
+caps a channel at `MAX_ACCESS_ENTRIES_PER_CHANNEL` (256) inside one `FOR UPDATE`
+transaction, counting only *new* pairs (re-flagging an existing entry still
+works); a new `DbError::TooManyAccessEntries` surfaces as a ChanServ NOTICE via a
+dedicated `ChannelAccessLimitReached` reply. New PG-gated test fills the list to
+the cap, confirms the 257th is refused and re-flagging is still allowed.
+
+**A multiline batch's kind was a silent `unwrap_or(Privmsg)`** (LOW §2,
+`message.rs`). `deliver_multiline` computed `kind = batch.kind.unwrap_or(Privmsg)`
+*before* the empty-batch check, so a `None` kind silently became PRIVMSG — dead
+today (a non-empty batch always has the kind `multiline_collect` set from its
+first line), but a silent fallback one reorder from mis-delivering a NOTICE batch
+as PRIVMSG. The empty case now returns first, then `kind` is bound with a loud
+`expect` on the collector invariant — no silent default.
+
+**Value-carrying capabilities now negotiate from one registry** (class,
+`registration.rs`). `sasl`/`draft/account-registration`/`draft/multiline` carry LS
+value params so they sit outside `CAP_NAMES`, and CAP LS, REQ, and LIST each
+hand-listed them — the desync that once told a re-syncing client a negotiated cap
+was off. A single `VALUE_CAPS` registry (name + accessor + an `ls_token` that both
+renders the LS value and is the one "is it offered?" gate) now drives all three,
+so a value-cap can't be advertised without being accept-able, or enabled without
+being reported. Adding one is a single entry, not three lists. Behavior-preserving
+(all 22 CAP tests + irctest CAP/SASL/multiline/register green).
+
+Clean bills: the casefold discipline (`ChanKey`/`NickKey`/`AccountKey`/`MaskKey`/
+`HistoryKey`) is comprehensively enforced — every identifier lookup folds both
+sides, no two-casing repro produces a wrong result; and the secret/crypto surface
+(ChaCha20-Poly1305 sealing with fresh per-seal nonces, OIDC/JWT signature+iss+aud+
+exp+nonce verification, PKCE, constant-time CSRF/state compares, 256-bit hashed
+tokens) is sound.
+
+Escalated as decisions (latent class-hardening, each a sizeable change to
+currently-correct code — surfaced loudly, not filed away):
+- **`Session` models `registered: bool` beside `nick/user/realname: Option`**
+  rather than a `Registration` enum, so `registered=true, nick=None` is
+  representable and `prefix()` leans on `.expect()`. Not reachable today (the one
+  writer guards it), but a future edit that sets it early panics the whole shared
+  worker. It is the design's own cited example — worth closing as a
+  `Registering|Registered` enum — but a ~100-site accessor refactor of correct
+  code, too large to land green as a rider on this PR; recommend a dedicated pass.
+- **`SecretKey::seal/open` bind no AAD context** (`Aad::empty()`), so a blob
+  sealed for one account/purpose is cryptographically openable in another. Not
+  exploitable (no API returns or accepts a raw blob; moving one between rows needs
+  DB write = already game over), but binding `account_id||purpose` would make it
+  structurally impossible. Needs a versioned blob format (`enc:v2:`) to stay
+  backward-compatible with existing sealed secrets — a scoped change worth a
+  decision.
+- **`create_account` has no global registration rate-limit**, which is what makes
+  bulk-account abuse (and thus the now-capped `channel_access` growth) reachable.
+  A per-connection credential budget already bounds one socket; a global/per-IP
+  account-creation cap is a policy decision for the operator.
+
+Verified: workspace suite + new PG cap test; each bridge feature alone under
+`-Dwarnings`; all 22 CAP tests + irctest CAP/SASL/multiline/register; all
+`tools/check-*` gates + `cargo deny` clean.
+
 Eighty-fifth sweep — the last escalated item, done, plus an ISUPPORT drift
 that unmasked a KICK gap (2026-07-26): the single remaining escalation from sweep
 84 is resolved, and three fresh audits (WS/admin, time/clock, config/ISUPPORT)
