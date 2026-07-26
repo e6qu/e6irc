@@ -51,7 +51,10 @@
         <input type="text" name="name" placeholder="name" required />
         <input type="text" name="addr" placeholder="host:port" required />
         <input type="text" name="nick" placeholder="nick" required />
+        <input type="text" name="realname" placeholder="real name (optional)" />
         <input type="text" name="autojoin" placeholder="#chan,#chan2" />
+        <input type="text" name="sasl_account" placeholder="SASL account (optional)" />
+        <input type="password" name="sasl_password" placeholder="SASL password (optional)" />
         <label><input type="checkbox" name="tls" /> TLS</label>
         <button type="submit">Add</button>
       </form>
@@ -74,5 +77,6 @@
         </table>
       {% endif %}
     </main>
+    {% include "_toast.html" %}
   </body>
 </html>

@@ -673,6 +673,46 @@ async fn console_add_and_delete_network_via_the_console() {
         "{frag}"
     );
 
+    // Disable the network via the toggle button -> 200 fragment showing it
+    // stopped and offering to Enable it again.
+    let off = "enabled=false";
+    let toggle_off = format!(
+        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{off}",
+        off.len()
+    );
+    let (status, _, frag) = request(http, &toggle_off).await;
+    assert_eq!(status, 200, "{frag}");
+    assert!(
+        frag.contains("Enable") && frag.contains("stopped"),
+        "{frag}"
+    );
+
+    // Re-enable it -> 200 fragment offering to Disable.
+    let on = "enabled=true";
+    let toggle_on = format!(
+        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{on}",
+        on.len()
+    );
+    let (status, _, frag) = request(http, &toggle_on).await;
+    assert_eq!(status, 200, "{frag}");
+    assert!(frag.contains("Disable"), "{frag}");
+
+    // A name outside the token charset is refused (this is what breaks the htmx
+    // delete path and the JS-string confirm) -> 400, nothing created.
+    let bad = "name=bad%3Fname&addr=irc.example:6667&nick=z";
+    let add_bad = format!(
+        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, _, _) = request(http, &add_bad).await;
+    assert_eq!(status, 400);
+
     // Without the CSRF header -> 403.
     let no_csrf = format!(
         "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\

@@ -1638,6 +1638,46 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+CI + console polish sweep (2026-07-27): a CI-focused pass plus fixes and
+missing-feature work driven by three adversarial audits (protocol core, HTTP/web
+surface, CI). The **protocol core was found clean** — 250+ conformance/adversarial
+probes, zero defects (one inaccurate teardown comment in `core/state.rs` corrected:
+a channel key *can* contain `!`, but rfc1459 casefolding — `~`→`^` — keeps a folded
+channel key from ever colliding with a `~`-prefixed DM identity).
+
+**CI hardening.** The `fuzz-smoke` loop ran a hand-maintained list that had drifted
+— `serialize_message` was built as a target but never fuzzed; the loop now
+enumerates targets from `cargo fuzz list` so a new target can never silently go
+un-run. Per-bridge CI was `cargo check`; it is now `cargo clippy` so a clippy lint
+that fires only under one bridge (not in the `--all-features` union) is caught. The
+dex/Conduit readiness loops fell through silently on timeout; they now fail loudly
+with the container log.
+
+**Web/console security + correctness.** Network names were validated by a
+scatter of ad-hoc checks that still admitted URL-significant (`?#%&`) and
+quote/angle characters — the root of a JS-string self-XSS in the bridge Remove
+`confirm()` and a broken htmx delete path for such names. Replaced by one pure,
+unit-tested `network_name_ok` token charset (`[A-Za-z0-9._-]`, no `.`/`..`),
+making those bad states unrepresentable (parse-don't-validate); the fragile
+inline-JS confirm now reads the name from a `data-` attribute at runtime. Also:
+the sign-out href now rejects protocol-relative `//host`, and a greedy CTCP
+`ACTION` capture that trailed a `\x01` into rendered text is now non-greedy.
+
+**Console polish + features.** htmx form failures were invisible (htmx doesn't
+swap non-2xx) — a shared `_toast.html` partial now surfaces the problem+json
+`detail` on the console and account pages. Added: **enable/disable toggle** for
+BNC networks (reuses the REST `PATCH` core via a new `set_network_enabled_core`;
+posts the target state so there's no read-then-write race); **SASL account +
+password + realname** inputs on both add-network forms (the backend already
+supported them, so Libera-style SASL upstreams are now creatable from the UI);
+a delete confirmation on the account page (it had none); and a responsive console
+layout. The duplicated `NetworkFormFields → CreateNetwork` construction is now one
+`into_create` helper.
+
+Verified: `vite build`; new `network_name_ok` + toggle/name-rejection http tests;
+`cargo fmt`; workspace tests; clippy default + `embed-web` + each bridge alone;
+all `tools/check-*` gates + `cargo deny`; PG http suite (17).
+
 Management console — stage 6 (a real in-browser IRC client) (2026-07-26): the
 last planned console surface. The `/ws/ui` live client was an 88-line raw-line
 log (server pushed `hx-swap-oob` HTML fragments into one `#buffer`); it is now a

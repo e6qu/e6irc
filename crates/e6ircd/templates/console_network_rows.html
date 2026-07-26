@@ -15,6 +15,13 @@
         <td>{% if n.autojoin.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ n.autojoin }}</code>{% endif %}</td>
         <td>
           <button
+            hx-post="/console/networks/{{ n.name }}/toggle"
+            hx-vals='{"enabled": "{% if n.enabled %}false{% else %}true{% endif %}"}'
+            hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
+            hx-target="#cnetworks"
+            hx-swap="outerHTML"
+          >{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
+          <button
             class="danger"
             hx-delete="/console/networks/{{ n.name }}"
             hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'

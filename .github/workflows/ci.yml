@@ -29,9 +29,11 @@ jobs:
       # something `matrix` pulls in builds there and breaks for the deployment
       # that enables one bridge, which is the normal case.
       - name: Each bridge feature on its own
+        # clippy, not just check: a clippy lint that fires only under one bridge
+        # (not in the --all-features union above) would otherwise ship unseen.
         run: |
           for feature in discord matrix slack; do
-            cargo check -p e6ircd --all-targets --features "$feature"
+            cargo clippy -p e6ircd --all-targets --features "$feature"
           done
       # No-op guard (AGENTS.md / DESIGN §2): shipped source must carry no
       # deferred-work markers or unmessaged panics.
@@ -113,8 +115,9 @@ jobs:
           docker run -d --name dex -p 15556:5556 \
             -v "$PWD/tools/dex-config.yaml:/etc/dex/config.yaml" \
             ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
-          for _ in $(seq 1 30); do
+          for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:15556/dex/.well-known/openid-configuration >/dev/null && break
+            [ "$i" = 30 ] && { echo "dex did not become ready"; docker logs dex; exit 1; }
             sleep 1
           done
       - run: cargo test -p e6ircd --test oidc -- --ignored --test-threads=1
@@ -330,8 +333,9 @@ jobs:
             -e CONDUIT_CONFIG=/etc/conduit.toml \
             -v "$PWD/vendor/tests/external-oracles/conduit/conduit.toml:/etc/conduit.toml:ro" \
             matrixconduit/matrix-conduit:v0.9.0
-          for _ in $(seq 1 40); do
+          for i in $(seq 1 40); do
             curl -sf http://127.0.0.1:16167/_matrix/client/versions >/dev/null && break
+            [ "$i" = 40 ] && { echo "conduit did not become ready"; docker logs conduit; exit 1; }
             sleep 1
           done
       - run: cargo test -p e6ircd --features matrix --test matrix -- --ignored
@@ -380,8 +384,14 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Fuzz each target briefly
         working-directory: fuzz
+        # Enumerate targets from cargo-fuzz itself (the Cargo.toml [[bin]] set)
+        # rather than a hand-maintained list, so a newly-added target can never
+        # silently go un-fuzzed — serialize_message did exactly that under the
+        # old hardcoded list.
         run: |
-          for target in parse_message tag_escaping isupport_token core_dispatch core_multi client_messages truncate_boundary framing base64_roundtrip bouncer_lines mask_matching; do
+          targets="$(cargo +nightly-2026-07-23 fuzz list)"
+          test -n "$targets" || { echo "no fuzz targets found"; exit 1; }
+          for target in $targets; do
             cargo +nightly-2026-07-23 fuzz run "$target" -- -max_total_time=30
           done
 

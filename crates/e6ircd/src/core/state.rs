@@ -2024,9 +2024,16 @@ impl ServerState {
                 let my_identity = format!("~{}", self.casemap.casefold(nick));
                 self.history
                     .retain(|k, _| match k.as_str().split_once('!') {
-                        // A DM key is `lo!hi`; keep it only if neither side is us.
+                        // A DM key is `lo!hi` where each side is an identity
+                        // (`~<foldednick>` for an unauthenticated peer); keep it
+                        // only if neither side is us. A channel name *can* legally
+                        // contain `!` (sanitize::valid_channel_name allows it), so
+                        // a channel key can also split here — but the key is
+                        // casefolded and `~` folds to `^` under rfc1459, so a
+                        // folded channel key never contains the `~`-prefixed
+                        // `my_identity` and is thus always retained.
                         Some((lo, hi)) => lo != my_identity && hi != my_identity,
-                        // A channel key has no `!` — never a DM, always kept.
+                        // No `!`: not a DM key, always kept.
                         None => true,
                     });
                 self.hot_history.retain(|k| self.history.contains_key(k));

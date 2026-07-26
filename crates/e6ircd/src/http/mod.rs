@@ -176,6 +176,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(pages::console_delete_network),
         )
         .route(
+            "/console/networks/{name}/toggle",
+            post(pages::console_toggle_network),
+        )
+        .route(
             "/console/integrations",
             get(pages::console_integrations).post(pages::console_add_bridge),
         )
@@ -496,7 +500,9 @@ mod pages {
     }
 
     /// The account page's add-network form (urlencoded). `tls` is an
-    /// HTML checkbox (`"on"` when checked, absent otherwise).
+    /// HTML checkbox (`"on"` when checked, absent otherwise). The SASL pair and
+    /// realname are optional text inputs that submit as empty strings when left
+    /// blank, so `into_create` maps blank → `None`.
     #[derive(Deserialize)]
     pub struct NetworkFormFields {
         name: String,
@@ -506,6 +512,41 @@ mod pages {
         tls: Option<String>,
         #[serde(default)]
         autojoin: String,
+        #[serde(default)]
+        realname: String,
+        #[serde(default)]
+        sasl_account: String,
+        #[serde(default)]
+        sasl_password: String,
+    }
+
+    impl NetworkFormFields {
+        /// Build the `CreateNetwork` for an IRC upstream from the submitted form,
+        /// treating a blank optional text input as absent. Shared by the account
+        /// page and the console so the two forms map identically.
+        fn into_create(self) -> CreateNetwork {
+            let opt = |s: String| {
+                let s = s.trim().to_string();
+                (!s.is_empty()).then_some(s)
+            };
+            CreateNetwork {
+                kind: crate::config::NetworkKind::Irc,
+                name: self.name,
+                addr: self.addr,
+                tls: self.tls.as_deref() == Some("on"),
+                nick: self.nick,
+                realname: opt(self.realname),
+                autojoin: self
+                    .autojoin
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                sasl_account: opt(self.sasl_account),
+                sasl_password: opt(self.sasl_password),
+            }
+        }
     }
 
     struct CredView {
@@ -856,23 +897,7 @@ mod pages {
                 );
             }
         };
-        let req = CreateNetwork {
-            kind: crate::config::NetworkKind::Irc,
-            name: f.name,
-            addr: f.addr,
-            tls: f.tls.as_deref() == Some("on"),
-            nick: f.nick,
-            realname: None,
-            autojoin: f
-                .autojoin
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-            sasl_account: None,
-            sasl_password: None,
-        };
+        let req = f.into_create();
         if let Err(r) = create_network_core(&state, registry, &account, &req).await {
             return r;
         }
@@ -905,6 +930,45 @@ mod pages {
                 );
             }
         };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        console_networks_fragment(&state, &account, csrf).await
+    }
+
+    /// The console toggle button posts the *target* enabled state so the flip is
+    /// not derived from a possibly-stale row (no read-then-write race).
+    #[derive(Deserialize)]
+    pub struct ToggleFields {
+        enabled: String,
+    }
+
+    /// Enable/disable a network from the console (htmx); returns the refreshed
+    /// rows fragment. Reuses the same core the REST `PATCH` uses.
+    pub async fn console_toggle_network(
+        State(state): State<Arc<AppState>>,
+        CsrfVerified(account): CsrfVerified,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+        form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid form",
+                    Some(&e.to_string()),
+                );
+            }
+        };
+        let enabled = matches!(f.enabled.as_str(), "true" | "on" | "1");
+        if let Err(r) = set_network_enabled_core(&state, registry, &account, &name, enabled).await {
+            return r;
+        }
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
@@ -1295,23 +1359,7 @@ mod pages {
                 );
             }
         };
-        let req = CreateNetwork {
-            kind: crate::config::NetworkKind::Irc,
-            name: f.name,
-            addr: f.addr,
-            tls: f.tls.as_deref() == Some("on"),
-            nick: f.nick,
-            realname: None,
-            autojoin: f
-                .autojoin
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-            sasl_account: None,
-            sasl_password: None,
-        };
+        let req = f.into_create();
         if let Err(r) = create_network_core(&state, registry, &account, &req).await {
             return r;
         }

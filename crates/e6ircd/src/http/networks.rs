@@ -175,19 +175,36 @@ pub(crate) fn is_blocked_upstream_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// A network name is a client-facing `/network` selector that is interpolated
+/// into URL path segments, HTML attributes and JS-string confirm dialogs.
+/// Restricting it to an unambiguous token charset (letters, digits, `-`, `_`,
+/// `.`) makes URL-significant, quote/angle (XSS), whitespace and control
+/// characters unrepresentable in a name rather than relying on correct escaping
+/// at every render site (DESIGN §2). `.`/`..` are excluded so a name can never
+/// resolve to a path-traversal segment.
+pub(super) fn network_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 pub(super) async fn create_network_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
     account: &str,
     req: &CreateNetwork,
 ) -> Result<(), Response> {
-    // The name is the client-facing /network selector: no separator or
-    // whitespace, and non-empty.
-    if req.name.is_empty() || req.name.contains('/') || req.name.chars().any(char::is_whitespace) {
+    // The name is the client-facing /network selector; see network_name_ok.
+    if !network_name_ok(&req.name) {
         return Err(problem(
             StatusCode::BAD_REQUEST,
             "Invalid network name",
-            Some("name must be non-empty and contain no '/' or whitespace"),
+            Some(
+                "name must be non-empty, not '.'/'..', and use only letters, digits, '-', '_' or '.'",
+            ),
         ));
     }
     use crate::config::NetworkKind;
@@ -260,8 +277,9 @@ pub(super) async fn create_network_core(
     // a NUL inside either value would shift the authzid/authcid/passwd fields
     // the upstream parses — the same injection-primitive class as CR/LF in a
     // command line.
-    if has_control(&req.name)
-        || has_control(&req.addr)
+    // req.name is already charset-restricted above, so it cannot carry control
+    // bytes; the remaining free-form fields still must be checked.
+    if has_control(&req.addr)
         || has_control(&req.nick)
         || req.realname.as_deref().is_some_and(has_control)
         || req.autojoin.iter().any(|c| has_control(c))
@@ -475,9 +493,75 @@ pub(super) struct PatchNetwork {
     pub(super) enabled: bool,
 }
 
-/// Enable or disable one of the caller's networks: persist the flag and
-/// start (enable) or stop (disable) its always-on driver. Config and
-/// buffers are untouched — a disabled network can be re-enabled later.
+/// Persist a network's enabled flag and start (enable) or stop (disable) its
+/// always-on driver, rolling the flag back if a re-enabled driver can't be
+/// built. Config and buffers are untouched — a disabled network can be
+/// re-enabled later. Returns `Err(response)` (a problem+json) on any failure.
+/// Shared by the REST `PATCH` and the console toggle button.
+pub(super) async fn set_network_enabled_core(
+    state: &AppState,
+    registry: &crate::bouncer::Registry,
+    account: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<(), Response> {
+    let pool = pool_of(state);
+
+    // Persist the flag first; a miss means the caller owns no such network.
+    match crate::db::set_bnc_network_enabled(pool, account, name, enabled).await {
+        Ok(true) => {}
+        Ok(false) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+        Err(e) => {
+            eprintln!("http: network enable/disable failed: {e}");
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    }
+
+    if enabled {
+        // Rebuild the driver from the persisted row and (re)start it.
+        let row = match crate::db::get_bnc_network(pool, account, name).await {
+            Ok(Some(row)) => row,
+            // We just updated it; a miss here means a concurrent delete.
+            Ok(None) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+            Err(e) => {
+                eprintln!("http: network reload failed: {e}");
+                return Err(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ));
+            }
+        };
+        let driver =
+            match crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account) {
+                Ok(driver) => driver,
+                Err(e) => {
+                    // Can't start it — undo the enable so the flag matches reality.
+                    if let Err(re) =
+                        crate::db::set_bnc_network_enabled(pool, account, name, false).await
+                    {
+                        eprintln!("http: failed to roll back enable after start error: {re}");
+                    }
+                    return Err(problem(
+                        StatusCode::CONFLICT,
+                        "Cannot start network",
+                        Some(&e),
+                    ));
+                }
+            };
+        registry.add(Some(account), name, driver);
+    } else {
+        registry.remove(Some(account), name);
+    }
+    Ok(())
+}
+
+/// Enable or disable one of the caller's networks (REST): persist the flag and
+/// start/stop its always-on driver.
 pub(super) async fn patch_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
@@ -487,55 +571,9 @@ pub(super) async fn patch_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let pool = pool_of(&state);
-
-    // Persist the flag first; a miss means the caller owns no such network.
-    match crate::db::set_bnc_network_enabled(pool, &account, &name, req.enabled).await {
-        Ok(true) => {}
-        Ok(false) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-        Err(e) => {
-            eprintln!("http: network enable/disable failed: {e}");
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            );
-        }
+    if let Err(r) = set_network_enabled_core(&state, registry, &account, &name, req.enabled).await {
+        return r;
     }
-
-    if req.enabled {
-        // Rebuild the driver from the persisted row and (re)start it.
-        let row = match crate::db::get_bnc_network(pool, &account, &name).await {
-            Ok(Some(row)) => row,
-            // We just updated it; a miss here means a concurrent delete.
-            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-            Err(e) => {
-                eprintln!("http: network reload failed: {e}");
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                );
-            }
-        };
-        let driver =
-            match crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), &account) {
-                Ok(driver) => driver,
-                Err(e) => {
-                    // Can't start it — undo the enable so the flag matches reality.
-                    if let Err(re) =
-                        crate::db::set_bnc_network_enabled(pool, &account, &name, false).await
-                    {
-                        eprintln!("http: failed to roll back enable after start error: {re}");
-                    }
-                    return problem(StatusCode::CONFLICT, "Cannot start network", Some(&e));
-                }
-            };
-        registry.add(Some(&account), &name, driver);
-    } else {
-        registry.remove(Some(&account), &name);
-    }
-
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({ "name": name, "enabled": req.enabled }).to_string(),
@@ -572,7 +610,32 @@ pub(super) async fn delete_network(
 
 #[cfg(test)]
 mod tests {
-    use super::upstream_addr_is_internal;
+    use super::{network_name_ok, upstream_addr_is_internal};
+
+    #[test]
+    fn network_name_charset_is_restricted() {
+        // Plain token names are accepted.
+        assert!(network_name_ok("libera"));
+        assert!(network_name_ok("my-net_1"));
+        assert!(network_name_ok("irc.example"));
+        // URL-significant characters — these broke the htmx delete path.
+        assert!(!network_name_ok("foo?bar"));
+        assert!(!network_name_ok("foo#bar"));
+        assert!(!network_name_ok("foo%41"));
+        assert!(!network_name_ok("a&b"));
+        assert!(!network_name_ok("a/b"));
+        // Quote/angle — the JS-string / HTML-attribute XSS vectors.
+        assert!(!network_name_ok("'-alert(1)-'"));
+        assert!(!network_name_ok("<script>"));
+        assert!(!network_name_ok("a\"b"));
+        // Whitespace, control and empty.
+        assert!(!network_name_ok(""));
+        assert!(!network_name_ok("a b"));
+        assert!(!network_name_ok("a\nb"));
+        // Path-traversal segments.
+        assert!(!network_name_ok("."));
+        assert!(!network_name_ok(".."));
+    }
 
     #[test]
     fn internal_upstream_addresses_are_refused() {

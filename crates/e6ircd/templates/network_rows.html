@@ -15,6 +15,7 @@
             hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
             hx-target="#networks"
             hx-swap="outerHTML"
+            hx-confirm="Remove network {{ n.name }}?"
           >Remove</button>
         </td>
       </tr>

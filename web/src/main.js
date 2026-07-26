@@ -275,7 +275,7 @@ function isMe(nick) {
 // A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text"; a plain
 // message is unchanged. Returns { kind, from, text } for addLine.
 function asMessage(kind, from, text) {
-  const action = text.match(/^ACTION (.*)?$/s);
+  const action = text.match(/^ACTION (.*?)?$/s);
   if (action) return { kind: "event", from: null, text: `* ${from} ${action[1]}` };
   return { kind, from, text };
 }
@@ -415,8 +415,13 @@ async function boot() {
     el("account-name").title = typeof me.email === "string" ? me.email : "";
     if (typeof me.role === "string") el("account-role").textContent = me.role;
     // Only accept a same-origin relative path, so a hostile value can't turn the
-    // sign-out control into a `javascript:` / cross-origin link.
-    if (typeof me.logout_url === "string" && me.logout_url.startsWith("/")) {
+    // sign-out control into a `javascript:` / cross-origin link. Reject a
+    // protocol-relative `//host` (which starts with "/" but is cross-origin).
+    if (
+      typeof me.logout_url === "string" &&
+      me.logout_url.startsWith("/") &&
+      !me.logout_url.startsWith("//")
+    ) {
       el("logout-link").href = me.logout_url;
     }
   } catch {

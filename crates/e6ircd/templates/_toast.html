@@ -1,0 +1,40 @@
+{# Shared htmx failure toast. htmx does not swap non-2xx responses, so without
+   this an add/delete the server rejects (bad name, duplicate, network cap
+   reached, missing master key, DB error) would silently appear to do nothing.
+   The handlers answer application/problem+json, so show its `detail`/`title`.
+   Included by the console shell and the account page (each has its own <head>,
+   so the partial carries its own style). #}
+<div id="toast" role="alert" aria-live="assertive"></div>
+<style>
+  #toast { position: fixed; left: 50%; bottom: 1.25rem; transform: translateX(-50%);
+    background: #b23b3b; color: #fff; padding: 0.6rem 1rem; border-radius: 0.5rem;
+    max-width: 90vw; box-shadow: 0 2px 12px rgba(0,0,0,0.25); opacity: 0;
+    pointer-events: none; transition: opacity 0.2s; z-index: 50; }
+  #toast.show { opacity: 1; }
+</style>
+<script>
+  (function () {
+    var toast = document.getElementById("toast");
+    var timer;
+    function show(msg) {
+      toast.textContent = msg;
+      toast.classList.add("show");
+      clearTimeout(timer);
+      timer = setTimeout(function () { toast.classList.remove("show"); }, 6000);
+    }
+    document.body.addEventListener("htmx:responseError", function (e) {
+      var xhr = e.detail && e.detail.xhr;
+      var msg = "Request failed.";
+      if (xhr) {
+        try {
+          var p = JSON.parse(xhr.responseText);
+          msg = p.detail || p.title || msg;
+        } catch (_) { msg = xhr.statusText || msg; }
+      }
+      show(msg);
+    });
+    document.body.addEventListener("htmx:sendError", function () {
+      show("Network error — could not reach the server.");
+    });
+  })();
+</script>
