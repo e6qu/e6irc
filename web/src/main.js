@@ -80,8 +80,43 @@ function isChannel(target) {
   return target.startsWith("#") || target.startsWith("&");
 }
 
+// Channel membership sigils and their underlying modes, highest rank first.
+// `~`=owner(+q), `&`=admin(+a), `@`=op(+o), `%`=halfop(+h), `+`=voice(+v).
+const RANKS = [
+  ["q", "~"],
+  ["a", "&"],
+  ["o", "@"],
+  ["h", "%"],
+  ["v", "+"],
+];
+const SIGIL_MODE = { "~": "q", "&": "a", "@": "o", "%": "h", "+": "v" };
+// Membership modes (each consumes a nick argument in a MODE line).
+const SIGIL_MODE_CHARS = "qaohv";
+// Modes that consume a parameter whether set or unset (membership + list +
+// key), vs. only when set (limit). Used to keep MODE argument alignment so a
+// mixed line like `+o-l nick` maps the nick to `o`, not `l`.
+const MODE_ALWAYS_ARG = new Set(["q", "a", "o", "h", "v", "b", "e", "I", "k"]);
+const MODE_SET_ARG = new Set(["l"]);
+
+// Split a NAMES/prefix nick into its leading sigils and the bare nick, and seed
+// the mode set the sigils imply.
+function splitSigil(nick) {
+  const s = nick || "";
+  let i = 0;
+  while (i < s.length && SIGIL_MODE[s[i]] !== undefined) i += 1;
+  const modes = new Set();
+  for (const c of s.slice(0, i)) modes.add(SIGIL_MODE[c]);
+  return { name: s.slice(i), modes };
+}
+
 function stripSigil(nick) {
-  return (nick || "").replace(/^[~&@%+]+/, "");
+  return splitSigil(nick).name;
+}
+
+// The single highest-rank sigil for a set of membership modes ("" if none).
+function nickPrefix(modes) {
+  for (const [mode, sigil] of RANKS) if (modes.has(mode)) return sigil;
+  return "";
 }
 
 // ---- rendering ----------------------------------------------------------
@@ -106,7 +141,15 @@ function renderBufferList() {
       badge.textContent = String(b.unread);
       li.appendChild(badge);
     }
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
     li.addEventListener("click", () => setActive(b.key));
+    li.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setActive(b.key);
+      }
+    });
     buffersEl.appendChild(li);
   }
 }
@@ -144,12 +187,33 @@ function renderNickList() {
     return;
   }
   nicklistEl.hidden = false;
-  const names = [...b.nicks.values()].sort((a, c) => a.localeCompare(c));
-  nickcountEl.textContent = String(names.length);
+  // Sort by rank (owner/op/… first) then name, and show the sigil.
+  const rankOf = (m) => {
+    const p = nickPrefix(m);
+    const i = RANKS.findIndex(([, s]) => s === p);
+    return i === -1 ? RANKS.length : i;
+  };
+  const members = [...b.nicks.values()].sort(
+    (a, c) => rankOf(a.modes) - rankOf(c.modes) || a.name.localeCompare(c.name),
+  );
+  nickcountEl.textContent = String(members.length);
   nicksEl.replaceChildren();
-  for (const n of names) {
+  for (const m of members) {
     const li = document.createElement("li");
-    li.textContent = n;
+    li.className = "nick";
+    li.tabIndex = 0;
+    li.setAttribute("role", "button");
+    li.title = `Message ${m.name}`;
+    li.textContent = nickPrefix(m.modes) + m.name;
+    // Click / Enter opens a query buffer with this nick.
+    const open = () => setActive(ensureBuffer(m.name, "dm").display);
+    li.addEventListener("click", open);
+    li.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        open();
+      }
+    });
     nicksEl.appendChild(li);
   }
 }
@@ -197,11 +261,30 @@ const addServer = (text) => addLine(SERVER, "server", "server", null, text);
 const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 
 function addNick(chan, nick) {
-  const display = stripSigil(nick);
-  if (!display) return;
+  const { name, modes } = splitSigil(nick);
+  if (!name) return;
   const b = ensureBuffer(chan, "channel");
-  if (b.nicks.size >= MAX_NICKS && !b.nicks.has(fold(display))) return;
-  b.nicks.set(fold(display), display);
+  const key = fold(name);
+  if (b.nicks.size >= MAX_NICKS && !b.nicks.has(key)) return;
+  const existing = b.nicks.get(key);
+  if (existing) {
+    existing.name = name;
+    for (const mo of modes) existing.modes.add(mo);
+  } else {
+    b.nicks.set(key, { name, modes });
+  }
+  if (b.key === active) renderNickList();
+}
+
+// Apply a membership mode change from a channel MODE line: `add` (true for `+`)
+// the mode `mode` (o/h/v/a/q) to `nick` in `chan`, updating its sigil.
+function setNickMode(chan, nick, mode, add) {
+  const b = buffers.get(fold(chan));
+  if (!b) return;
+  const entry = b.nicks.get(fold(stripSigil(nick)));
+  if (!entry) return;
+  if (add) entry.modes.add(mode);
+  else entry.modes.delete(mode);
   if (b.key === active) renderNickList();
 }
 
@@ -221,12 +304,16 @@ function removeNickEverywhere(nick, text) {
 
 function renameNick(from, to) {
   const fromKey = fold(stripSigil(from));
-  const toDisplay = stripSigil(to);
-  if (!fromKey || !toDisplay) return;
+  const toName = stripSigil(to);
+  if (!fromKey || !toName) return;
   for (const b of buffers.values()) {
-    if (b.kind === "channel" && b.nicks.delete(fromKey)) {
-      b.nicks.set(fold(toDisplay), toDisplay);
-      addEvent(b.display, `${from} is now ${to}`);
+    if (b.kind !== "channel") continue;
+    const entry = b.nicks.get(fromKey);
+    if (entry) {
+      b.nicks.delete(fromKey);
+      entry.name = toName;
+      b.nicks.set(fold(toName), entry);
+      addEvent(b.display, `${stripSigil(from)} is now ${toName}`);
     }
   }
   if (active) renderNickList();
@@ -295,6 +382,10 @@ function handleLine(raw) {
       const r = asMessage(kind, m.nick, text);
       if (isChannel(target)) {
         addLine(target, r.kind, "channel", r.from, r.text);
+      } else if (target === "*" || target === "") {
+        // A server / global notice (e.g. the bouncer's *bnc* control messages):
+        // show it in the server buffer, not a phantom DM keyed on the sender.
+        addLine(SERVER, r.kind, "server", r.from, r.text);
       } else {
         // A direct message: key the buffer by the other party — the sender,
         // unless the sender is us (a message we sent to `target`).
@@ -317,19 +408,47 @@ function handleLine(raw) {
     }
     case "PART":
       if (m.params[0]) {
+        const reason = m.params[1] ? ` (${m.params[1]})` : "";
         removeNick(m.params[0], m.nick);
-        addEvent(m.params[0], `${m.nick || "?"} left`);
+        addEvent(m.params[0], `${m.nick || "?"} left${reason}`);
       }
       break;
     case "KICK":
       if (m.params[0] && m.params[1]) {
+        const reason = m.params[2] ? ` (${m.params[2]})` : "";
+        const by = m.nick ? ` by ${m.nick}` : "";
         removeNick(m.params[0], m.params[1]);
-        addEvent(m.params[0], `${m.params[1]} was kicked`);
+        addEvent(m.params[0], `${m.params[1]} was kicked${by}${reason}`);
       }
       break;
     case "QUIT":
-      if (m.nick) removeNickEverywhere(m.nick, `${m.nick} quit`);
+      if (m.nick) {
+        const reason = m.params[0] ? ` (${m.params[0]})` : "";
+        removeNickEverywhere(m.nick, `${stripSigil(m.nick)} quit${reason}`);
+      }
       break;
+    case "MODE": {
+      // Channel MODE: track membership sigil changes for the member list.
+      const chan = m.params[0];
+      if (chan && isChannel(chan)) {
+        const modestr = m.params[1] || "";
+        const args = m.params.slice(2);
+        let adding = true;
+        let ai = 0;
+        for (const ch of modestr) {
+          if (ch === "+") adding = true;
+          else if (ch === "-") adding = false;
+          else {
+            const takesArg = MODE_ALWAYS_ARG.has(ch) || (adding && MODE_SET_ARG.has(ch));
+            const arg = takesArg ? args[ai++] : undefined;
+            if (arg && SIGIL_MODE_CHARS.includes(ch)) setNickMode(chan, arg, ch, adding);
+          }
+        }
+      } else {
+        addServer(m.params.length ? m.params[m.params.length - 1] : raw);
+      }
+      break;
+    }
     case "NICK":
       if (m.nick && m.params[0]) {
         renameNick(m.nick, m.params[0]);
@@ -362,12 +481,47 @@ function handleLine(raw) {
 
 // ---- socket + composer --------------------------------------------------
 
+// Reconnect with exponential backoff + jitter: a transient drop (server
+// restart, laptop sleep, network blip) must not leave a dead socket that the
+// user has to reload past. Backoff resets on a successful open.
+let reconnectDelay = 0;
+let reconnectTimer = null;
+const RECONNECT_MIN = 1000;
+const RECONNECT_MAX = 30000;
+
+function scheduleReconnect() {
+  if (reconnectTimer) return; // one pending attempt at a time
+  reconnectDelay = reconnectDelay ? Math.min(reconnectDelay * 2, RECONNECT_MAX) : RECONNECT_MIN;
+  const jitter = Math.floor(reconnectDelay * 0.25 * Math.random());
+  const wait = reconnectDelay + jitter;
+  setStatus(`reconnecting in ${Math.round(wait / 1000)}s…`, "error");
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, wait);
+}
+
 function connect() {
+  // Drop any previous socket so overlapping connections can't both feed events.
+  if (socket) {
+    socket.onclose = null;
+    try {
+      socket.close();
+    } catch {
+      /* already closed */
+    }
+  }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const url = `${proto}://${window.location.host}/ws/ui?network=${encodeURIComponent(network)}`;
   socket = new WebSocket(url);
-  socket.addEventListener("open", () => setStatus(`attached to ${network}`, "ok"));
-  socket.addEventListener("close", () => setStatus("disconnected", "error"));
+  socket.addEventListener("open", () => {
+    reconnectDelay = 0; // healthy connection: reset backoff
+    setStatus(`attached to ${network}`, "ok");
+  });
+  socket.addEventListener("close", () => {
+    setStatus("disconnected — reconnecting…", "error");
+    scheduleReconnect();
+  });
   socket.addEventListener("message", (ev) => {
     let event;
     try {
@@ -386,6 +540,14 @@ composer.addEventListener("submit", (e) => {
   if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
   // The server maps {target, message} (with slash-commands) to an IRC line.
   const b = active !== SERVER ? buffers.get(active) : null;
+  // In the server buffer there is no target, so plain text would be sent as a
+  // raw IRC line and bounce back as "421 Unknown command". Require a /command
+  // (e.g. /join #chan) there instead of emitting a bogus line.
+  if (!b && !text.startsWith("/")) {
+    addServer("No active channel/query — use a /command here (e.g. /join #chan) or pick a buffer.");
+    messageInput.value = "";
+    return;
+  }
   const target = b ? b.display : "";
   socket.send(JSON.stringify({ target, message: text }));
   // Echo our own message locally (the upstream doesn't reflect it back). A
@@ -397,6 +559,68 @@ composer.addEventListener("submit", (e) => {
   messageInput.value = "";
   messageInput.focus();
 });
+
+// Sidebar "join #channel" input: a one-field affordance so joining doesn't
+// require knowing the /join slash-command.
+const joinForm = el("join-form");
+if (joinForm) {
+  joinForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const input = el("join-input");
+    let chan = (input.value || "").trim();
+    if (!chan) return;
+    if (!isChannel(chan)) chan = "#" + chan;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ target: "", message: `/join ${chan}` }));
+    } else {
+      addServer("Not connected — cannot join yet.");
+    }
+    input.value = "";
+  });
+}
+
+// The network picker shown when the page is opened without ?network=<name>:
+// list the caller's networks as links, so the client has a real entry point
+// instead of requiring a hand-crafted URL.
+async function renderNetworkPicker() {
+  setStatus("choose a network", "error");
+  bufnameEl.textContent = "Select a network";
+  buftopicEl.textContent = "";
+  nicklistEl.hidden = true;
+  messagesEl.replaceChildren();
+  let nets = [];
+  try {
+    const list = await (await fetch("/api/v1/me/networks", { headers: { Accept: "application/json" } })).json();
+    nets = list.networks || [];
+  } catch {
+    /* fall through to the empty-state message */
+  }
+  const intro = document.createElement("li");
+  intro.className = "line line-server";
+  intro.textContent = nets.length
+    ? "Choose a network to open:"
+    : "You have no networks yet.";
+  messagesEl.appendChild(intro);
+  for (const n of nets) {
+    const li = document.createElement("li");
+    li.className = "line";
+    const a = document.createElement("a");
+    a.className = "picker-net";
+    a.href = `?network=${encodeURIComponent(n.name)}`;
+    const tag = n.connected ? " · connected" : n.enabled === false ? " · disabled" : "";
+    a.textContent = `▸ ${n.name}${tag}`;
+    li.appendChild(a);
+    messagesEl.appendChild(li);
+  }
+  const manageLi = document.createElement("li");
+  manageLi.className = "line";
+  const manage = document.createElement("a");
+  manage.className = "picker-net";
+  manage.href = "/console/networks";
+  manage.textContent = nets.length ? "⚙ Manage networks" : "⚙ Add a network in the console";
+  manageLi.appendChild(manage);
+  messagesEl.appendChild(manageLi);
+}
 
 // ---- boot ---------------------------------------------------------------
 
@@ -429,8 +653,7 @@ async function boot() {
   }
 
   if (!network) {
-    setStatus("add ?network=<name> to the URL to connect", "error");
-    addServer("No network selected. Append ?network=<name> to the URL.");
+    await renderNetworkPicker();
     return;
   }
 

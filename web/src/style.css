@@ -138,6 +138,36 @@ body {
   cursor: pointer;
 }
 
+#join-form { display: flex; gap: 0.3rem; padding: 0.4rem 0.5rem 0.2rem; }
+#join-input {
+  flex: 1 1 auto; min-width: 0; padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border); border-radius: 0.4rem;
+  background: transparent; color: inherit; font: inherit;
+}
+#join-form button {
+  flex: 0 0 auto; width: 1.9rem; border: 1px solid var(--border);
+  border-radius: 0.4rem; background: transparent; color: var(--accent);
+  font-weight: 700; cursor: pointer;
+}
+.nick { cursor: pointer; border-radius: 0.3rem; }
+.nick:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.buf:focus-visible, .nick:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}
+.picker-net {
+  display: inline-block; color: var(--accent); text-decoration: none;
+  padding: 0.15rem 0; font-weight: 600;
+}
+.picker-net:hover { text-decoration: underline; }
+
 @media (max-width: 42rem) {
   #sidebar, #nicklist { flex-basis: 8rem; }
+}
+/* Narrow / phone: stack the panes and let the member list collapse so the
+   chat pane is usable instead of a sliver. */
+@media (max-width: 30rem) {
+  #workspace { flex-direction: column; }
+  #sidebar { flex: 0 0 auto; max-height: 30vh; border-right: none;
+    border-bottom: 1px solid var(--border); }
+  #nicklist { display: none; }
 }

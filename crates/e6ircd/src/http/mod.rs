@@ -1056,26 +1056,20 @@ mod pages {
         active: &'static str,
         bouncer_enabled: bool,
         platforms: Vec<BridgePlatform>,
+        /// Error banner shown after a failed add/remove; `None` on the plain GET.
+        error: Option<String>,
     }
 
     /// Console → Integrations (admin): the chat-platform bridges. For each
     /// platform it shows whether this binary was built with the feature and the
-    /// bridge networks currently running (with live status). Bridges are
-    /// configured as `[[network]]` entries today; runtime CRUD is future work,
-    /// so this is a status + configuration-guidance view.
-    pub async fn console_integrations(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-    ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
-        };
-        if !is_admin_account(&state, &account) {
-            return problem(StatusCode::FORBIDDEN, "Admin only", None);
-        }
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
+    /// bridge networks currently running (with live status), plus add/remove for
+    /// the admin's own bridges. `error` renders a banner after a failed action.
+    fn console_integrations_build(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        error: Option<String>,
+    ) -> ConsoleIntegrations {
         let all = state
             .bnc_registry
             .as_ref()
@@ -1133,14 +1127,51 @@ mod pages {
                 networks: bridge_nets("slack"),
             },
         ];
-        render_private(ConsoleIntegrations {
+        ConsoleIntegrations {
             account,
             csrf,
             is_admin: true,
             active: "integrations",
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
-        })
+            error,
+        }
+    }
+
+    /// Console → Integrations (admin) GET.
+    pub async fn console_integrations(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        if !is_admin_account(&state, &account) {
+            return problem(StatusCode::FORBIDDEN, "Admin only", None);
+        }
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        render_private(console_integrations_build(&state, account, csrf, None))
+    }
+
+    /// Re-render the integrations page with an error banner after a failed
+    /// add/remove (an admin has already been resolved by the caller).
+    async fn console_integrations_error(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        message: String,
+    ) -> Response {
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        render_private(console_integrations_build(
+            state,
+            account,
+            csrf,
+            Some(message),
+        ))
     }
 
     /// The console add-bridge form (urlencoded; hidden CSRF field — a plain form
@@ -1465,12 +1496,24 @@ mod pages {
             Err(r) => return r,
         };
         let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+            let msg = "The bouncer is not enabled on this server.".to_string();
+            return console_integrations_error(&state, &headers, account, msg).await;
         };
         let Some(kind) = crate::config::NetworkKind::from_db_str(&f.kind).filter(|k| k.is_bridge())
         else {
-            return problem(StatusCode::BAD_REQUEST, "Not a bridge kind", None);
+            let msg = format!("'{}' is not a bridge platform.", f.kind);
+            return console_integrations_error(&state, &headers, account, msg).await;
         };
+        // Pre-check the build feature so the banner names it specifically (rather
+        // than the generic create-failure message) — create_network_core also
+        // enforces it, but its problem+json detail is lost to the plain form.
+        if !kind_feature_available(kind) {
+            let msg = format!(
+                "This server was not built with the {} feature — rebuild with --features {}.",
+                f.kind, f.kind
+            );
+            return console_integrations_error(&state, &headers, account, msg).await;
+        }
         let opt = |s: String| if s.is_empty() { None } else { Some(s) };
         let req = CreateNetwork {
             kind,
@@ -1489,8 +1532,17 @@ mod pages {
             sasl_account: opt(f.sasl_account),
             sasl_password: opt(f.sasl_password),
         };
-        if let Err(r) = create_network_core(&state, registry, &account, &req).await {
-            return r;
+        // create_network_core answers a problem+json Response; for the console
+        // (a plain form) re-render the page with a banner instead of navigating
+        // the admin to a bare JSON body. The specific reason is on the REST path.
+        if create_network_core(&state, registry, &account, &req)
+            .await
+            .is_err()
+        {
+            let msg = "Could not add the bridge — check the name and required \
+                       fields (and the server's master key for sealed tokens)."
+                .to_string();
+            return console_integrations_error(&state, &headers, account, msg).await;
         }
         Redirect::to("/console/integrations").into_response()
     }
@@ -1515,14 +1567,14 @@ mod pages {
         let pool = pool_of(&state);
         match crate::db::delete_bnc_network(pool, &account, &f.name).await {
             Ok(true) => registry.remove(Some(&account), &f.name),
-            Ok(false) => return problem(StatusCode::NOT_FOUND, "No such bridge", None),
+            Ok(false) => {
+                let msg = format!("No such bridge '{}'.", f.name);
+                return console_integrations_error(&state, &headers, account, msg).await;
+            }
             Err(e) => {
                 eprintln!("console: bridge delete: {e}");
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                );
+                let msg = "Database unavailable — bridge not removed.".to_string();
+                return console_integrations_error(&state, &headers, account, msg).await;
             }
         };
         Redirect::to("/console/integrations").into_response()

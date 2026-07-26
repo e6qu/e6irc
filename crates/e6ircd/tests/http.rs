@@ -1349,10 +1349,15 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
          Connection: close\r\n\r\n{form}",
         form.len()
     );
-    // Feature not built in this binary -> 400 with an explanatory message.
+    // Feature not built in this binary -> the integrations page is re-rendered
+    // (200) with an error banner naming the feature, rather than a raw
+    // problem+json page.
     let (status, _, body) = request(http, &post).await;
-    assert_eq!(status, 400, "{body}");
-    assert!(body.contains("feature"), "{body}");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("feature") && body.contains("banner-error"),
+        "{body}"
+    );
 
     // A wrong CSRF token -> 403.
     let form_nocsrf = "csrf=wrong&kind=matrix&name=hq&sasl_password=x";
