@@ -97,7 +97,7 @@ pub struct Config {
     /// The bouncer listener, where clients attach as nick/network.
     #[serde(default)]
     pub bnc: Option<BncConfig>,
-    /// Source of the key that decrypts sealed (`enc:v1:`) secrets. When
+    /// Source of the key that decrypts sealed (`enc:v1:`/`enc:v2:`) secrets. When
     /// absent, the `E6IRC_SECRET_KEY` env var is consulted instead.
     #[serde(default)]
     pub secrets: Option<SecretsConfig>,
@@ -350,12 +350,14 @@ fn open_secret(value: &str, key: Option<&crate::secret::SecretKey>) -> Result<St
     }
     let key = key.ok_or_else(|| {
         ConfigError::Invalid(
-            "an encrypted secret (enc:v1:) is present but no key is configured — \
+            "an encrypted secret (enc:v1:/enc:v2:) is present but no key is configured — \
              set [secrets].key_file or E6IRC_SECRET_KEY"
                 .into(),
         )
     })?;
-    key.open(value)
+    // Config-file secrets share one context tag, distinct from any per-account
+    // BNC secret's, so the two classes can't be substituted.
+    key.open(value, crate::secret::CONFIG_CONTEXT)
         .map_err(|e| ConfigError::Invalid(format!("cannot decrypt secret: {e}")))
 }
 
@@ -913,20 +915,22 @@ mod tests {
     #[test]
     fn sealed_secret_decrypts_with_key() {
         let key = crate::secret::SecretKey::generate();
-        let sealed = key.seal("s3cr3t");
+        let sealed = key.seal("s3cr3t", crate::secret::CONFIG_CONTEXT);
         assert_eq!(open_secret(&sealed, Some(&key)).unwrap(), "s3cr3t");
     }
 
     #[test]
     fn sealed_secret_without_key_is_rejected() {
-        let sealed = crate::secret::SecretKey::generate().seal("s3cr3t");
+        let sealed =
+            crate::secret::SecretKey::generate().seal("s3cr3t", crate::secret::CONFIG_CONTEXT);
         let err = open_secret(&sealed, None).unwrap_err().to_string();
         assert!(err.contains("no key is configured"), "{err}");
     }
 
     #[test]
     fn sealed_secret_with_wrong_key_is_rejected() {
-        let sealed = crate::secret::SecretKey::generate().seal("s3cr3t");
+        let sealed =
+            crate::secret::SecretKey::generate().seal("s3cr3t", crate::secret::CONFIG_CONTEXT);
         let other = crate::secret::SecretKey::generate();
         assert!(open_secret(&sealed, Some(&other)).is_err());
     }
@@ -934,10 +938,10 @@ mod tests {
     #[test]
     fn resolve_decrypts_network_sasl_password_via_key_file() {
         let key = crate::secret::SecretKey::generate();
-        let sealed = key.seal("upstreampass");
+        let sealed = key.seal("upstreampass", crate::secret::CONFIG_CONTEXT);
         // The Slack driver's bot token lives in sasl_account; a sealed value
         // there must also be unsealed (it used to be handed to Slack verbatim).
-        let sealed_account = key.seal("xoxb-secret-token");
+        let sealed_account = key.seal("xoxb-secret-token", crate::secret::CONFIG_CONTEXT);
         let dir = std::env::temp_dir();
         let path = dir.join(format!("e6irc-key-{}.b64", std::process::id()));
         std::fs::write(&path, key.to_base64()).unwrap();
@@ -1293,13 +1297,13 @@ mod tests {
         let mut cfg = Config {
             opers: vec![OperConfig {
                 name: "root".into(),
-                password: key.seal("operpass"),
+                password: key.seal("operpass", crate::secret::CONFIG_CONTEXT),
             }],
             oidc_providers: vec![OidcProviderConfig {
                 name: "corp".into(),
                 issuer_url: "https://issuer.example".into(),
                 client_id: "cid".into(),
-                client_secret: key.seal("oidcsecret"),
+                client_secret: key.seal("oidcsecret", crate::secret::CONFIG_CONTEXT),
                 scopes: vec![],
                 end_session_endpoint: None,
                 token_endpoint_auth_method: Default::default(),

@@ -48,7 +48,8 @@ fn genkey_seal_and_load_round_trip() {
     std::fs::write(&key_file, genkey()).unwrap();
 
     let sealed = seal(&key_file, "upstreampass");
-    assert!(sealed.starts_with("enc:v1:"), "sealed: {sealed}");
+    // The CLI seals with the current (context-bound) format.
+    assert!(sealed.starts_with("enc:v2:"), "sealed: {sealed}");
 
     let config_toml = format!(
         r#"

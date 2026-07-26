@@ -28,8 +28,10 @@ fn genkey() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Read plaintext from stdin and print its sealed `enc:v1:` form, using
-/// the key from `--key-file` or the `E6IRC_SECRET_KEY` env var.
+/// Read plaintext from stdin and print its sealed `enc:v2:` form (bound to the
+/// config-secret context), using the key from `--key-file` or the
+/// `E6IRC_SECRET_KEY` env var. The output belongs in a config field (oper/OIDC/
+/// server-network secret); per-account BNC passwords are sealed by the server.
 fn seal(args: &[String]) -> ExitCode {
     let key = match load_seal_key(args) {
         Ok(k) => k,
@@ -46,7 +48,7 @@ fn seal(args: &[String]) -> ExitCode {
     // A trailing newline from a pipe or interactive entry is not part of
     // the secret.
     let plaintext = plaintext.strip_suffix('\n').unwrap_or(&plaintext);
-    println!("{}", key.seal(plaintext));
+    println!("{}", key.seal(plaintext, e6ircd::secret::CONFIG_CONTEXT));
     ExitCode::SUCCESS
 }
 

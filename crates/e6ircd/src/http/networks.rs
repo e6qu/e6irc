@@ -249,7 +249,9 @@ pub(super) async fn create_network_core(
                     Some("the server cannot store upstream credentials without [secrets]"),
                 ));
             };
-            Some(key.seal(password))
+            // Bind the sealed password to its owning account, so it can never be
+            // opened for a different account's network row.
+            Some(key.seal(password, &crate::bouncer::bnc_secret_context(account)))
         }
         None => None,
     };
@@ -415,7 +417,11 @@ pub(super) async fn patch_network(
                 );
             }
         };
-        let cfg = match crate::bouncer::network_config_from_row(&row, state.secret_key.as_deref()) {
+        let cfg = match crate::bouncer::network_config_from_row(
+            &row,
+            state.secret_key.as_deref(),
+            &account,
+        ) {
             Ok(cfg) => cfg,
             Err(e) => {
                 // Can't start it — undo the enable so the flag matches reality.

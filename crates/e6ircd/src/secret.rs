@@ -1,19 +1,35 @@
-//! Secrets at rest. Sensitive config values (upstream SASL passwords)
-//! may be stored sealed — `enc:v1:<base64>` — and decrypted at startup
-//! with a 256-bit key kept outside the config file (a key file or the
-//! `E6IRC_SECRET_KEY` env var). A leaked config alone then reveals no
-//! passwords. Sealing uses ChaCha20-Poly1305 (aws-lc-rs, already in the
-//! tree via rustls) with a fresh random nonce per value.
+//! Secrets at rest. Sensitive values (upstream SASL passwords, the OIDC client
+//! secret, oper passwords) may be stored sealed and decrypted at startup with a
+//! 256-bit key kept outside the config (a key file or the `E6IRC_SECRET_KEY` env
+//! var). A leaked config alone then reveals no passwords. Sealing uses
+//! ChaCha20-Poly1305 (aws-lc-rs, already in the tree via rustls) with a fresh
+//! random nonce per value.
 //!
-//! A plaintext value whose text begins with the `enc:v1:` marker cannot
+//! **Context binding.** A sealed blob is bound to an authenticated-additional-data
+//! *context* — a purpose/owner tag — so a blob sealed in one context (say, the
+//! per-account BNC password of account A) cannot be opened in another (account B's
+//! row, or a config field): the AEAD tag check fails. New blobs are `enc:v2:` and
+//! carry that binding. Legacy `enc:v1:` blobs were sealed with no context and are
+//! still opened (with empty AAD) so an existing deployment keeps working; a value
+//! re-sealed on change upgrades to v2.
+//!
+//! A plaintext value whose text begins with an `enc:v1:`/`enc:v2:` marker cannot
 //! be represented literally; store such a value sealed instead.
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
-const PREFIX: &str = "enc:v1:";
+/// Legacy marker: sealed with no context binding (empty AAD). Read-only now.
+const V1_PREFIX: &str = "enc:v1:";
+/// Current marker: sealed with a context bound as AEAD associated data.
+const V2_PREFIX: &str = "enc:v2:";
 const KEY_LEN: usize = 32;
 const TAG_LEN: usize = 16;
+
+/// The context bound to a config-file secret (oper/OIDC/server-network values):
+/// a fixed tag that a per-account BNC blob's context can never equal, so the two
+/// classes of secret can't be substituted for one another.
+pub const CONFIG_CONTEXT: &[u8] = b"config";
 
 /// A 256-bit key that seals and opens config secrets.
 pub struct SecretKey([u8; KEY_LEN]);
@@ -22,7 +38,7 @@ pub struct SecretKey([u8; KEY_LEN]);
 pub enum SecretError {
     /// The key material was not 32 base64-decoded bytes.
     BadKey,
-    /// The blob did not carry the `enc:v1:` marker.
+    /// The blob did not carry an `enc:v1:`/`enc:v2:` marker.
     NotSealed,
     /// The base64 body was malformed or too short to hold nonce+tag.
     Corrupt,
@@ -34,7 +50,7 @@ impl std::fmt::Display for SecretError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadKey => write!(f, "key must be 32 base64-encoded bytes"),
-            Self::NotSealed => write!(f, "value is not a sealed secret (enc:v1:)"),
+            Self::NotSealed => write!(f, "value is not a sealed secret (enc:v1:/enc:v2:)"),
             Self::Corrupt => write!(f, "sealed secret is malformed"),
             Self::Decrypt => write!(f, "wrong key or tampered secret"),
         }
@@ -43,9 +59,10 @@ impl std::fmt::Display for SecretError {
 
 impl std::error::Error for SecretError {}
 
-/// True when `value` is a sealed blob (and so needs a key to open).
+/// True when `value` is a sealed blob (and so needs a key to open), of either
+/// generation.
 pub fn is_sealed(value: &str) -> bool {
-    value.starts_with(PREFIX)
+    value.starts_with(V1_PREFIX) || value.starts_with(V2_PREFIX)
 }
 
 impl SecretKey {
@@ -80,8 +97,10 @@ impl SecretKey {
         )
     }
 
-    /// Seal `plaintext` into an `enc:v1:` blob with a fresh random nonce.
-    pub fn seal(&self, plaintext: &str) -> String {
+    /// Seal `plaintext` into an `enc:v2:` blob (fresh random nonce), binding
+    /// `context` as AEAD associated data — the blob can then only be opened with
+    /// the same context, so it cannot be reused in a different purpose/owner.
+    pub fn seal(&self, plaintext: &str, context: &[u8]) -> String {
         let mut nonce = [0u8; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -90,20 +109,29 @@ impl SecretKey {
         self.aead()
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce),
-                Aad::empty(),
+                Aad::from(context),
                 &mut in_out,
             )
             .expect("sealing cannot fail with a valid key");
         let mut blob = Vec::with_capacity(NONCE_LEN + in_out.len());
         blob.extend_from_slice(&nonce);
         blob.extend_from_slice(&in_out);
-        format!("{PREFIX}{}", e6irc_proto::base64::encode(&blob))
+        format!("{V2_PREFIX}{}", e6irc_proto::base64::encode(&blob))
     }
 
-    /// Open an `enc:v1:` blob back to plaintext. Fails loudly on a wrong
-    /// key, a tampered blob, or a value that isn't sealed at all.
-    pub fn open(&self, blob: &str) -> Result<String, SecretError> {
-        let body = blob.strip_prefix(PREFIX).ok_or(SecretError::NotSealed)?;
+    /// Open a sealed blob back to plaintext. A `v2` blob must be opened with the
+    /// same `context` it was sealed under (the AEAD tag check fails otherwise); a
+    /// legacy `v1` blob carried no context and is opened with empty AAD (`context`
+    /// ignored) so existing deployments keep working. Fails loudly on a wrong key,
+    /// a tampered blob, a context mismatch, or a value that isn't sealed at all.
+    pub fn open(&self, blob: &str, context: &[u8]) -> Result<String, SecretError> {
+        let (body, aad) = if let Some(body) = blob.strip_prefix(V2_PREFIX) {
+            (body, Aad::from(context))
+        } else if let Some(body) = blob.strip_prefix(V1_PREFIX) {
+            (body, Aad::from(&[][..]))
+        } else {
+            return Err(SecretError::NotSealed);
+        };
         let raw = e6irc_proto::base64::decode(body).ok_or(SecretError::Corrupt)?;
         if raw.len() < NONCE_LEN + TAG_LEN {
             return Err(SecretError::Corrupt);
@@ -113,7 +141,7 @@ impl SecretKey {
         let mut in_out = ct.to_vec();
         let plain = self
             .aead()
-            .open_in_place(nonce, Aad::empty(), &mut in_out)
+            .open_in_place(nonce, aad, &mut in_out)
             .map_err(|_| SecretError::Decrypt)?;
         String::from_utf8(plain.to_vec()).map_err(|_| SecretError::Decrypt)
     }
@@ -123,27 +151,62 @@ impl SecretKey {
 mod tests {
     use super::*;
 
+    const CTX: &[u8] = b"test-context";
+
     #[test]
     fn seal_open_round_trips() {
         let key = SecretKey::generate();
         for pt in ["", "hunter2", "a longer secret with spaces", "unïcodé🔑"] {
-            let sealed = key.seal(pt);
+            let sealed = key.seal(pt, CTX);
             assert!(is_sealed(&sealed), "{sealed}");
-            assert_eq!(key.open(&sealed).unwrap(), pt);
+            assert!(sealed.starts_with(V2_PREFIX), "new seals are v2: {sealed}");
+            assert_eq!(key.open(&sealed, CTX).unwrap(), pt);
         }
+    }
+
+    #[test]
+    fn open_with_a_different_context_fails() {
+        let key = SecretKey::generate();
+        let sealed = key.seal("secret", b"context-a");
+        // Right key, right blob, WRONG context: the AEAD tag check rejects it, so
+        // a blob sealed for one owner/purpose cannot be opened for another.
+        assert_eq!(key.open(&sealed, b"context-b"), Err(SecretError::Decrypt));
+        assert_eq!(key.open(&sealed, b"context-a").unwrap(), "secret");
+    }
+
+    #[test]
+    fn legacy_v1_blob_opens_with_empty_context() {
+        // A blob produced by the pre-context sealer (no AAD) must still open,
+        // regardless of the context passed — existing deployments keep working.
+        let key = SecretKey::generate();
+        let mut nonce = [0u8; NONCE_LEN];
+        SystemRandom::new().fill(&mut nonce).unwrap();
+        let mut in_out = b"legacy".to_vec();
+        key.aead()
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::empty(),
+                &mut in_out,
+            )
+            .unwrap();
+        let mut blob = nonce.to_vec();
+        blob.extend_from_slice(&in_out);
+        let v1 = format!("{V1_PREFIX}{}", e6irc_proto::base64::encode(&blob));
+        assert_eq!(key.open(&v1, b"whatever").unwrap(), "legacy");
+        assert_eq!(key.open(&v1, CONFIG_CONTEXT).unwrap(), "legacy");
     }
 
     #[test]
     fn nonce_is_fresh_per_seal() {
         let key = SecretKey::generate();
-        assert_ne!(key.seal("same"), key.seal("same"));
+        assert_ne!(key.seal("same", CTX), key.seal("same", CTX));
     }
 
     #[test]
     fn wrong_key_fails_loudly() {
-        let sealed = SecretKey::generate().seal("secret");
+        let sealed = SecretKey::generate().seal("secret", CTX);
         assert_eq!(
-            SecretKey::generate().open(&sealed),
+            SecretKey::generate().open(&sealed, CTX),
             Err(SecretError::Decrypt)
         );
     }
@@ -151,21 +214,21 @@ mod tests {
     #[test]
     fn tamper_fails_loudly() {
         let key = SecretKey::generate();
-        let sealed = key.seal("secret");
-        let body = sealed.strip_prefix(PREFIX).unwrap();
+        let sealed = key.seal("secret", CTX);
+        let body = sealed.strip_prefix(V2_PREFIX).unwrap();
         let mut raw = e6irc_proto::base64::decode(body).unwrap();
         let last = raw.len() - 1;
         raw[last] ^= 0x01;
-        let tampered = format!("{PREFIX}{}", e6irc_proto::base64::encode(&raw));
-        assert_eq!(key.open(&tampered), Err(SecretError::Decrypt));
+        let tampered = format!("{V2_PREFIX}{}", e6irc_proto::base64::encode(&raw));
+        assert_eq!(key.open(&tampered, CTX), Err(SecretError::Decrypt));
     }
 
     #[test]
     fn rejects_unsealed_and_corrupt() {
         let key = SecretKey::generate();
-        assert_eq!(key.open("plaintext"), Err(SecretError::NotSealed));
-        assert_eq!(key.open("enc:v1:!!!!"), Err(SecretError::Corrupt));
-        assert_eq!(key.open("enc:v1:AAAA"), Err(SecretError::Corrupt));
+        assert_eq!(key.open("plaintext", CTX), Err(SecretError::NotSealed));
+        assert_eq!(key.open("enc:v2:!!!!", CTX), Err(SecretError::Corrupt));
+        assert_eq!(key.open("enc:v2:AAAA", CTX), Err(SecretError::Corrupt));
     }
 
     #[test]
@@ -173,7 +236,7 @@ mod tests {
         let key = SecretKey::generate();
         let restored = SecretKey::from_base64(&key.to_base64()).unwrap();
         // A blob sealed by one must open with the other.
-        assert_eq!(restored.open(&key.seal("x")).unwrap(), "x");
+        assert_eq!(restored.open(&key.seal("x", CTX), CTX).unwrap(), "x");
     }
 
     #[test]

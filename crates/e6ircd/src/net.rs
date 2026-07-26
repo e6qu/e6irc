@@ -225,8 +225,9 @@ pub async fn start(config: Config) -> io::Result<Running> {
                 .await
                 .map_err(io::Error::other)?
             {
-                let cfg = crate::bouncer::network_config_from_row(&row, secret_key.as_deref())
-                    .map_err(io::Error::other)?;
+                let cfg =
+                    crate::bouncer::network_config_from_row(&row, secret_key.as_deref(), &owner)
+                        .map_err(io::Error::other)?;
                 reg.add(
                     Some(&owner),
                     &row.name,
