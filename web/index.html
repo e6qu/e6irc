@@ -3,10 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>e6irc</title>
-    <script src="/htmx.min.js"></script>
-    <script>htmx.config.allowEval = false;</script>
-    <script src="/ws.min.js"></script>
     <script type="module" src="/src/main.js"></script>
   </head>
   <body>
@@ -23,26 +21,37 @@
         </nav>
       </header>
 
-      <!-- The live socket. main.js fills ws-connect from the URL and lets
-           the htmx ws extension apply the server's hx-swap-oob fragments. -->
-      <section id="chat" hx-ext="ws">
-        <ol id="buffer" aria-live="polite"></ol>
+      <div id="workspace">
+        <!-- Buffer list: the server buffer plus one per channel / DM. -->
+        <aside id="sidebar" aria-label="Buffers">
+          <div class="side-head">Buffers</div>
+          <ul id="buffers"></ul>
+        </aside>
 
-        <!-- Composer: htmx serializes the form and sends it over the
-             socket; the server turns {target, message} into a PRIVMSG. -->
-        <form id="composer" ws-send autocomplete="off">
-          <input type="hidden" name="target" id="target" value="" />
-          <input
-            type="text"
-            name="message"
-            id="message"
-            placeholder="message… (/raw to send a literal IRC line)"
-            autocomplete="off"
-            autofocus
-          />
-          <button type="submit">Send</button>
-        </form>
-      </section>
+        <section id="chatpane">
+          <div id="bufhead">
+            <span id="bufname">—</span>
+            <span id="buftopic" class="topic"></span>
+          </div>
+          <ol id="messages" aria-live="polite"></ol>
+          <form id="composer" autocomplete="off">
+            <input
+              type="text"
+              id="message"
+              placeholder="message… (/join #chan, /msg nick text, /raw LINE)"
+              autocomplete="off"
+              autofocus
+            />
+            <button type="submit">Send</button>
+          </form>
+        </section>
+
+        <!-- Channel member list; hidden for the server buffer and DMs. -->
+        <aside id="nicklist" aria-label="Members" hidden>
+          <div class="side-head"><span id="nickcount">0</span> members</div>
+          <ul id="nicks"></ul>
+        </aside>
+      </div>
     </main>
   </body>
 </html>
