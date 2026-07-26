@@ -1593,6 +1593,54 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-seventh sweep — "registered but no nick" made unrepresentable (2026-07-26):
+the headline escalation from sweep 86 — the `Session` identity model — is closed
+at the type level, plus two fresh audits (less-common reply fidelity, cross-feature
+seams) that came back essentially clean.
+
+**`Session` registration is now a sum type** (`state.rs` + ~100 call sites). The
+connection identity was `registered: bool` beside `nick`/`user`/`realname:
+Option<String>`, so the invalid combination "registered but no nick" was
+representable and `prefix()` leaned on `.expect("registered session has nick")` —
+the design's *own* cited example (DESIGN §2) of a class to close with a type. It
+is now a `Registration` enum: `Registering { nick, user, realname: Option }` vs
+`Registered { nick, user, realname: String }`. A registered session *has* a nick,
+user, and realname by construction, so `prefix()` and the identity accessors are
+total on it — you cannot build `Registered` without them, and a future edit that
+set `registered=true` early (which would have panicked the shared worker at the
+next `prefix()`) no longer compiles. Access goes through `nick()`/`user()`/
+`realname()` (→ `Option<&str>`, valid in both states), `is_registered()`,
+`set_nick`/`set_user`/`set_realname`, and `complete_registration()` (the one
+`Registering → Registered` transition). Behavior-preserving: all 249 core tests +
+irctest green.
+
+**Away auto-reply to yourself** (LOW, `message.rs`; found by the cross-feature
+audit). `PRIVMSG <ownnick>` while away answered you with RPL_AWAY *about yourself*
+(and its multiline twin did too). Both paths now skip the auto-reply when
+`peer == conn`; new test. The stranded-anon-read-marker observation from the same
+audit is a deliberate non-migration (a marker set before a mid-session login was
+unattributable when set) — now documented on the field, matching the DM-identity
+split's rationale.
+
+Clean bills: the less-common reply handlers (WHOWAS, LINKS, ADMIN, INFO, LUSERS,
+TIME, VERSION, MOTD, STATS, USERHOST/USERIP, ISON, UMODEIS/CHANNELMODEIS,
+ISUPPORT split, KNOCK, MONITOR, AWAY, INVITE, WALLOPS/OPER/KILL, SASL numerics)
+were checked against their spec shapes and are correct — the single `numeric()`
+funnel and typed row structs already make the transposition class unrepresentable.
+The feature *seams* (nick change × membership/bans/MONITOR/DM-keys; echo-message ×
+STATUSMSG/self/TAGMSG/service/labeled; account transitions mid-session; away ×
+notify caps; PART/KICK/QUIT × in-flight DB replies; STATUSMSG × history;
+mid-session CAP re-negotiation) were traced and all handle correctly.
+
+Still open as decisions (carried from sweep 86, each a scoped change to
+currently-correct code): `SecretKey::seal/open` AAD context-binding (needs a
+versioned blob format), and a global/per-IP `create_account` rate-limit (an
+operator policy call). Neither is exploitable today.
+
+Verified: workspace suite + new away-self test; each bridge feature alone under
+`-Dwarnings`; irctest main; PG db suite; `core_multi`/`core_dispatch` fuzz build;
+all `tools/check-*` gates + `cargo deny` clean.
+
 Eighty-sixth sweep — a missing grant cap, a silent multiline fallback, and a
 cap-negotiation class closed (2026-07-26): four class-oriented audits (casefold
 key discipline, unbounded growth, secrets/crypto, representable-invalid states).

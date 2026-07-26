@@ -29,7 +29,10 @@ pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     state.sessions.get_mut(&conn).expect("registered").oper = true;
-    let nick = state.sessions[&conn].nick.clone().expect("registered");
+    let nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     record_audit(state, conn, "OPER", name, "");
     state.numeric(
         conn,
@@ -85,7 +88,10 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let comment = p.get(1).copied().unwrap_or("Killed");
-    let oper_nick = state.sessions[&conn].nick.clone().expect("registered");
+    let oper_nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     let reason = format!("Killed ({oper_nick} ({comment}))");
     let server = state.config.server_name.clone();
     // Audit before the close: a self-kill removes the actor's own session,
@@ -119,7 +125,7 @@ pub(super) fn record_audit(
     let actor = state
         .sessions
         .get(&conn)
-        .and_then(|s| s.nick.clone())
+        .and_then(|s| s.nick().map(String::from))
         .unwrap_or_default();
     let request = crate::core::DbRequest::AuditLog {
         actor,
@@ -159,7 +165,10 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     let label = kind.label();
     let command = kind.as_str().to_uppercase();
     let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn].nick.clone().expect("registered");
+    let nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     let Some(&mask_arg) = p.first() else {
         // List current bans of this kind.
         let lines: Vec<String> = state
@@ -261,13 +270,13 @@ pub(super) fn cmd_add_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, 
     let victims: Vec<ConnId> = state
         .sessions
         .iter()
-        .filter(|(_, s)| s.registered)
+        .filter(|(_, s)| s.is_registered())
         .filter_map(|(&c, s)| {
             let subject = ServerState::ban_subject(
                 kind,
-                s.user.as_deref().unwrap_or("*"),
+                s.user().unwrap_or("*"),
                 &s.host,
-                s.realname.as_deref().unwrap_or(""),
+                s.realname().unwrap_or(""),
             );
             e6irc_proto::mask::matches(casemap, mask.as_str(), &subject).then_some(c)
         })
@@ -334,7 +343,10 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         }
     }
     let server = state.config.server_name.clone();
-    let nick = state.sessions[&conn].nick.clone().expect("registered");
+    let nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     let msg = if removed {
         format!("Removed {label} for {}", mask.as_str())
     } else {
@@ -369,7 +381,10 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let server = state.config.server_name.clone();
-    let oper_nick = state.sessions[&conn].nick.clone().expect("registered");
+    let oper_nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     // A host must be a single non-empty token without user/prefix chars.
     // A host rides in every future prefix built for this user, so an unbounded
     // one makes every subsequent line unfittable at the source — bound it here
@@ -393,7 +408,7 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     };
     let (user, old_prefix) = {
         let s = &state.sessions[&target];
-        (s.user.clone().unwrap_or_default(), s.prefix())
+        (s.user().map(String::from).unwrap_or_default(), s.prefix())
     };
     state.sessions.get_mut(&target).expect("checked").host = newhost.to_string();
 
@@ -445,7 +460,7 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let recipients: Vec<ConnId> = state
         .sessions
         .iter()
-        .filter(|(_, s)| s.registered && s.wallops)
+        .filter(|(_, s)| s.is_registered() && s.wallops)
         .map(|(c, _)| *c)
         .collect();
     for recipient in recipients {

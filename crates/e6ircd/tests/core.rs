@@ -3314,6 +3314,28 @@ fn away_flow() {
     assert!(has_numeric(&s.drain(alice), "305"));
 }
 
+/// Messaging yourself while away must not trigger an away auto-reply about
+/// yourself — you already know you're away.
+#[test]
+fn away_self_message_gets_no_away_reply() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "AWAY :brb");
+    s.drain(alice);
+    s.line(alice, "PRIVMSG alice :note to self");
+    let out = s.drain(alice);
+    assert!(
+        !out.iter().any(|l| l.contains(" 301 ")),
+        "a self-message must not yield RPL_AWAY: {out:#?}"
+    );
+    // The message itself is still delivered to self.
+    assert!(
+        out.iter()
+            .any(|l| l.contains("PRIVMSG alice :note to self")),
+        "the self-message is still delivered: {out:#?}"
+    );
+}
+
 #[test]
 fn list_hides_secret_channels() {
     let mut s = TestServer::new();

@@ -53,7 +53,10 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let prefix = state.sessions[&conn].prefix();
-    let kicker_nick = state.sessions[&conn].nick.clone().expect("registered");
+    let kicker_nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     // Dedup identical (channel, user) pairs; bound the total number of kicks by
     // TARGMAX (the advertised per-KICK target cap), like PRIVMSG's target list.
     let mut seen = std::collections::HashSet::new();
@@ -158,7 +161,10 @@ fn kick_one_user(
         );
         return;
     };
-    let victim_nick = state.sessions[&victim].nick.clone().expect("registered");
+    let victim_nick = state.sessions[&victim]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     let line = match reason {
         Some(reason) => {
             // KICKLEN bounds the reason itself; the relayed line also carries
@@ -242,7 +248,10 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    let invitee_nick = state.sessions[&invitee].nick.clone().expect("registered");
+    let invitee_nick = state.sessions[&invitee]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     // Bound the channel's pending-invite set — INVITE would otherwise grow it
     // without limit (invites to since-disconnected sessions linger). Drop
     // entries for dead connections first; if still at the cap, evict an
@@ -393,10 +402,10 @@ pub(super) fn userhost_entries(state: &ServerState, p: &[&str]) -> Vec<String> {
             let oper_marker = if s.oper { "*" } else { "" };
             entries.push(format!(
                 "{}{}={}{}@{}",
-                s.nick.as_deref().expect("registered"),
+                s.nick().expect("registered"),
                 oper_marker,
                 away_marker,
-                s.user.as_deref().expect("registered"),
+                s.user().expect("registered"),
                 s.host,
             ));
         }
@@ -428,7 +437,7 @@ fn pack_userhost_entries(
     code: u16,
     entries: &[String],
 ) -> String {
-    let target = state.sessions[&conn].nick.as_deref().unwrap_or("*");
+    let target = state.sessions[&conn].nick().unwrap_or("*");
     let head_len = format!(
         ":{} {} {} :",
         state.config.server_name,

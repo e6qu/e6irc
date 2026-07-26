@@ -53,7 +53,10 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             if !credential_attempt_ok(state, conn) {
                 return;
             }
-            let name = state.sessions[&conn].nick.clone().expect("registered");
+            let name = state.sessions[&conn]
+                .nick()
+                .map(String::from)
+                .expect("registered");
             let request = crate::core::DbRequest::CreateAccount {
                 conn,
                 name,
@@ -72,7 +75,10 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             // IDENTIFY <password> | IDENTIFY <account> <password>
             let (account, password) = match args {
                 [password] => (
-                    state.sessions[&conn].nick.clone().expect("registered"),
+                    state.sessions[&conn]
+                        .nick()
+                        .map(String::from)
+                        .expect("registered"),
                     *password,
                 ),
                 [account, password] => (account.to_string(), *password),
@@ -171,7 +177,10 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "NickServ", "You cannot ghost yourself.");
                 return;
             }
-            let by = state.sessions[&conn].nick.clone().unwrap_or_default();
+            let by = state.sessions[&conn]
+                .nick()
+                .map(String::from)
+                .unwrap_or_default();
             let server = state.config.server_name.clone();
             let reason = format!("GHOST command used by {by}");
             state.send(victim, &format!("ERROR :Closing Link: {server} ({reason})"));
@@ -550,7 +559,10 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
     // Target: the named nick, or the requester's own nick.
     let target_nick = match args.get(1) {
         Some(&n) => n.to_string(),
-        None => state.sessions[&conn].nick.clone().expect("registered"),
+        None => state.sessions[&conn]
+            .nick()
+            .map(String::from)
+            .expect("registered"),
     };
     let nk = state.nick_key(&target_nick);
     let Some(&target_conn) = state.nicks.get(&nk) else {
@@ -800,10 +812,10 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
 pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {
     {
         let session = &state.sessions[&conn];
-        if session.registered
+        if session.is_registered()
             || session.cap_negotiating
-            || session.nick.is_none()
-            || session.user.is_none()
+            || session.nick().is_none()
+            || session.user().is_none()
             // Hold registration while a SASL credential verify is in flight, so
             // its 900/903 (or 904) can't arrive *after* the 001 welcome burst:
             // a client that sends CAP END before the verdict lands must still
@@ -818,9 +830,9 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     // completing registration.
     {
         let session = &state.sessions[&conn];
-        let user = session.user.as_deref().unwrap_or("*");
+        let user = session.user().unwrap_or("*");
         let host = session.host.clone();
-        let realname = session.realname.as_deref().unwrap_or("");
+        let realname = session.realname().unwrap_or("");
         if let Some((kind, reason)) = state.ban_match(user, &host, realname) {
             let label = kind.label();
             state.numeric(
@@ -844,11 +856,15 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     let active = (state.config.mono_clock)();
     {
         let session = state.sessions.get_mut(&conn).expect("checked");
-        session.registered = true;
+        session.complete_registration();
         session.signon = signon;
         session.last_active = active;
     }
-    let registered_now = state.sessions.values().filter(|s| s.registered).count();
+    let registered_now = state
+        .sessions
+        .values()
+        .filter(|s| s.is_registered())
+        .count();
     state.max_users = state.max_users.max(registered_now);
     let prefix = state.sessions[&conn].prefix();
     let (server, network) = (
@@ -895,7 +911,10 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
     send_isupport(state, conn);
     send_lusers(state, conn);
     send_motd(state, conn);
-    let nick = state.sessions[&conn].nick.clone().expect("registered");
+    let nick = state.sessions[&conn]
+        .nick()
+        .map(String::from)
+        .expect("registered");
     monitor_notify(state, &nick, true);
 }
 
@@ -904,19 +923,27 @@ pub(super) fn version() -> &'static str {
 }
 
 pub(super) fn send_lusers(state: &mut ServerState, conn: ConnId) {
-    let users = state.sessions.values().filter(|s| s.registered).count();
+    let users = state
+        .sessions
+        .values()
+        .filter(|s| s.is_registered())
+        .count();
     let invisible = state
         .sessions
         .values()
-        .filter(|s| s.registered && s.invisible)
+        .filter(|s| s.is_registered() && s.invisible)
         .count();
     let visible = users - invisible;
     let opers = state
         .sessions
         .values()
-        .filter(|s| s.registered && s.oper)
+        .filter(|s| s.is_registered() && s.oper)
         .count();
-    let unknown = state.sessions.values().filter(|s| !s.registered).count();
+    let unknown = state
+        .sessions
+        .values()
+        .filter(|s| !s.is_registered())
+        .count();
     let channels = state.channels.len();
     state.numeric(
         conn,

@@ -42,9 +42,9 @@ fn verify_denied(
                 "Services are temporarily unavailable. Try again later.".to_string()
             } else {
                 let nick = state.sessions[&conn]
-                    .nick
-                    .clone()
-                    .unwrap_or_else(|| "*".into());
+                    .nick()
+                    .map(String::from)
+                    .unwrap_or_else(|| "*".to_string());
                 format!("Invalid password for \x02{nick}\x02.")
             };
             // Frame the failure under the IDENTIFY's label; unheld, like the
@@ -353,8 +353,14 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 session.account = Some(account.clone());
             }
             let session = &state.sessions[&conn];
-            let nick = session.nick.clone().unwrap_or_else(|| "*".into());
-            let user = session.user.clone().unwrap_or_else(|| "*".into());
+            let nick = session
+                .nick()
+                .map(String::from)
+                .unwrap_or_else(|| "*".into());
+            let user = session
+                .user()
+                .map(String::from)
+                .unwrap_or_else(|| "*".into());
             let host = session.host.clone();
             state.numeric(
                 conn,
@@ -427,9 +433,9 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                         .take()
                         .flatten();
                     let nick = state.sessions[&conn]
-                        .nick
-                        .clone()
-                        .unwrap_or_else(|| "*".into());
+                        .nick()
+                        .map(String::from)
+                        .unwrap_or_else(|| "*".to_string());
                     state.emit_deferred_labeled(conn, label, move |state| {
                         register_fail(
                             state,
@@ -485,9 +491,9 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         }
         crate::core::DbReply::AccountExists { origin } => {
             let nick = state.sessions[&conn]
-                .nick
-                .clone()
-                .unwrap_or_else(|| "*".into());
+                .nick()
+                .map(String::from)
+                .unwrap_or_else(|| "*".to_string());
             match origin {
                 crate::core::AccountOrigin::NickServ => state.service_notice(
                     conn,
@@ -681,7 +687,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
 /// account-notify: tell channel peers with the cap about a login state
 /// change.
 pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, account: &str) {
-    if !state.sessions.get(&conn).is_some_and(|s| s.registered) {
+    if !state.sessions.get(&conn).is_some_and(|s| s.is_registered()) {
         return; // pre-registration SASL: peers cannot exist yet
     }
     let prefix = state.sessions[&conn].prefix();
