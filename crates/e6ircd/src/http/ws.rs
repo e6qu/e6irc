@@ -288,11 +288,19 @@ pub(super) async fn ws_ui_conn(
                     // other client→upstream paths run bytes through LineBuffer,
                     // so match that invariant here (no CRLF injection, bounded
                     // length) instead of sending the raw frame unframed.
-                    if !handle
-                        .send(&sanitize_composer_line(&composer_to_irc(&t)))
-                        .await
-                    {
-                        break; // driver gone
+                    match handle.send(&sanitize_composer_line(&composer_to_irc(&t))) {
+                        crate::bouncer::SendOutcome::Sent => {}
+                        // Full: upstream congested/reconnecting. Tell the client
+                        // its line was not sent rather than block (which would
+                        // stall other clients sharing the queue) or drop silently.
+                        crate::bouncer::SendOutcome::Full => {
+                            let notice =
+                                ":*bnc* NOTICE * :upstream busy; line not sent, try again";
+                            let _ = socket
+                                .send(WsMessage::text(render_line_fragment(notice)))
+                                .await;
+                        }
+                        crate::bouncer::SendOutcome::Closed => break, // driver gone
                     }
                 }
                 Some(Ok(_)) => {}

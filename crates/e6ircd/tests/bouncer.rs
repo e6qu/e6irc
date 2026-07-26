@@ -2,7 +2,7 @@
 //! as the "external network" and verify it registers, relays, and
 //! buffers upstream traffic.
 
-use e6ircd::bouncer::{DriverEvent, IrcNetwork, NetworkConfig};
+use e6ircd::bouncer::{DriverEvent, IrcNetwork, NetworkConfig, SendOutcome};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::net;
 
@@ -102,7 +102,10 @@ async fn driver_registers_relays_and_buffers() {
 
     // downstream command reaches upstream: the driver sends a message
     // that the other client receives
-    handle.send("PRIVMSG #bnc :from the bouncer").await;
+    assert_eq!(
+        handle.send("PRIVMSG #bnc :from the bouncer"),
+        SendOutcome::Sent
+    );
     let echoed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let m = other.next_message().await.unwrap().unwrap();

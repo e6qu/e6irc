@@ -1593,6 +1593,87 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Ninetieth sweep — parse-don't-validate on the user-controlled surfaces + a real
+WHOX overflow (2026-07-26): the human asked to lean harder on "parse, don't
+validate" and type-driven unrepresentability, especially on paths that process
+user-controlled input, while still hunting bugs. Three read-only audits (a
+parse-don't-validate opportunity scan, a wire-parsing/framing hunt, a
+bouncer/HTTP/auth hunt) drove the work; one real Medium bug and one Low bug were
+found and fixed, and three stringly-typed surfaces became typed.
+
+**WHOX numeric rows could exceed 512 bytes** (MEDIUM, `core::state::numeric`;
+wire-hunt finding). The numeric funnel clipped each middle (≤100) and the trailing
+(to the remaining budget) but never the *sum of the middles*. A WHOX row
+(RPL_WHOSPCRPL) packs up to a dozen middles whose total — driven by the configured
+`server_name` and nick maxima (each appears in both the head and a middle) plus a
+client-supplied token — can exceed 512 on its own, before any trailing. Result: a
+debug/fuzz build panics on the over-long line (aborting the single worker that
+serves every client), and a release build ships it, whereupon the recipient's
+framing discards the whole 354 and the row silently vanishes. `numeric()` now
+enforces the total line budget as middles are appended (reserving room for the
+trailing's " :"), clipping once the line would overrun — the class-kill at the one
+choke point. The existing WHOX-fit test was strengthened to the true worst case
+(63-char server_name, nicklen=64, a 64-char account and 50-char channel) which
+forces the *middles* over the limit; the weaker head it used before was handled by
+the trailing clip alone and never exercised this path.
+
+**CHATHISTORY selectors and subcommand are now parsed once into types**
+(`handler::history`; the parse-don't-validate audit's top pick). The selector was
+a `&str` re-classified (`*` / `msgid=` / `timestamp=`) and re-parsed at ~half a
+dozen sites; a `timestamp=` was parsed for validation, then re-parsed inside the
+ring resolver, the DB pivot, and `selector_ts` — and `selector_bound` re-parsed it
+with a silent `unwrap_or(epoch 0)` guarded only by a comment-enforced "already
+validated" ordering. New `Selector { Star, Msgid, Timestamp(Millis) }` (via
+`Selector::parse`) and `ChathistorySub` (via `ChathistorySub::parse`) are parsed
+once at the command boundary; a `Timestamp` carries its `Millis`, so no downstream
+site re-parses and the silent-default bound is *unrepresentable*. The typed
+subcommand also means the ring resolver and the DB query builder can no longer
+enumerate subcommands differently (the ring-vs-DB `msgid=` divergence a prior
+sweep had to fix). Error-code ordering (INVALID_MSGREFTYPE → `*`-misuse →
+malformed-timestamp) is preserved; the exhaustive differential window test and the
+20 integration + 44 PG tests still pass.
+
+**Comma target-lists share one fold-applying splitter** (`handler::message`;
+audit #3). `cmd_message` and `cmd_tagmsg` had verbatim split→casefold-dedup→cap
+loops (TAGMSG once took only the first target — a shipped bug). A new
+`unique_targets` iterator applies the casefold-dedup *by construction*, so no
+fan-out path can forget it (the `#a,#A` double-deliver class). KICK (folds
+(channel,user) *pairs*) and MONITOR (folds via `NickKey`) already fold by other
+means and were left.
+
+**Channel list-mode masks get one constructor** (`handler::channel`; audit #2).
+`channel_list_mask(raw, adding, casemap)` folds the three previously-inline steps
+— canonicalize to `nick!user@host`, clip to BANMASKLEN, reject a space-containing
+add — into one named constructor for the "stored channel mask is canonical,
+bounded, space-free" invariant (mirroring `oper::BanMask::parse`). Channel bans
+have a single construction site and aren't persisted, so the storage-type newtype
+would ripple disproportionately; the constructor centralizes the invariant without
+that churn.
+
+**Bouncer shared-network command queue no longer blocks across clients** (LOW,
+`bouncer`/`http::ws`; bouncer-hunt finding). Sweep 89 bounded the per-network
+client→upstream command queue with *blocking* backpressure, but the queue is
+shared by every client attached to a network: during an upstream reconnect a
+blocking `send().await` let one client's backlog stall every other attached
+client's delivery loop (a cross-tenant head-of-line stall on operator-shared
+networks). `NetworkHandle::send` is now non-blocking (`try_send` → `SendOutcome`);
+a full queue returns `Full` and the client is told loudly ("upstream busy; line
+not sent"), never blocking another tenant and never dropping silently — the same
+"bound, then act" discipline the core's SendQ uses.
+
+Escalated as a decision (audit #4, not done): promoting nick/channel from
+validated `&str` to `Nick`/`ChannelName` newtypes is the purest parse-don't-
+validate move but a multi-hundred-site migration (the identity half is already
+closed by `NickKey`/`ChanKey`); the audit itself recommended escalating rather
+than a drive-by. Put to the human for a dedicated future sweep; the narrow
+`username → PrefixSafeUser` slice (its output is already shaped, only the type is
+missing) is the low-cost first step if desired.
+
+Verified: workspace suite (29 binaries incl. the strengthened WHOX test + CHATHISTORY
+window differential) + all bins; each bridge feature alone under `-Dwarnings`;
+`cargo clippy --all-features`; all `tools/check-*` gates + `cargo deny`; fuzz
+targets build under `--cfg fuzzing`; irctest main; PG db suite.
+
 Eighty-ninth sweep — six approved decisions done (three from sweep 88, three
 oper-hunt), plus two bugs found on the way, and a parse-don't-validate refactor
 (2026-07-26): the human approved every escalated decision ("yes to them all") and

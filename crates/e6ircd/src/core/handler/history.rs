@@ -9,10 +9,92 @@ use super::*;
 /// what is advertised can never drift from what is enforced.
 pub(super) const CHATHISTORY_MAX: usize = 500;
 
-/// A CHATHISTORY selector is a supported message reference: the open bound
-/// `*`, a `msgid=`, or a `timestamp=`. Anything else is INVALID_MSGREFTYPE.
-pub(super) fn is_valid_msgref(sel: &str) -> bool {
-    sel == "*" || sel.starts_with("msgid=") || sel.starts_with("timestamp=")
+/// A CHATHISTORY message-reference selector, parsed *once* from the wire token.
+///
+/// This is the "parse, don't validate" boundary for CHATHISTORY windowing
+/// (DESIGN §2): the only way to obtain a `Selector` is [`Selector::parse`], which
+/// rejects an unknown reference type (→ INVALID_MSGREFTYPE) and a malformed
+/// `timestamp=` value (→ INVALID_PARAMS) up front. Every downstream site —
+/// ring resolution, the DB pivot, the covered-by-ring test — then consumes the
+/// typed value, so a `timestamp=` can never be re-parsed (it carries its
+/// [`Millis`](e6irc_proto::time::Millis) already) and a malformed one can never
+/// silently default to epoch 0, which the old string-threaded `selector_bound`
+/// did behind a comment-enforced "already validated" invariant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Selector {
+    /// The open bound `*` — a real selector only for LATEST.
+    Star,
+    /// `msgid=<id>`: an exact message reference.
+    Msgid(String),
+    /// `timestamp=<t>`: a server-time bound, already parsed to milliseconds.
+    Timestamp(e6irc_proto::time::Millis),
+}
+
+/// Why a wire token is not a usable [`Selector`]; maps to the FAIL the client
+/// gets — the two distinct CHATHISTORY error codes for a bad reference.
+pub(super) enum SelectorError {
+    /// Not one of `*` / `msgid=` / `timestamp=` (→ INVALID_MSGREFTYPE).
+    UnknownRefType,
+    /// A `timestamp=` whose value is not a valid server-time (→ INVALID_PARAMS).
+    MalformedTimestamp,
+}
+
+impl Selector {
+    /// Parse a wire selector token. The single classification point for
+    /// `*` / `msgid=` / `timestamp=`; a malformed timestamp is a hard error
+    /// here rather than a silently-defaulted bound later.
+    pub(super) fn parse(sel: &str) -> Result<Self, SelectorError> {
+        if sel == "*" {
+            Ok(Selector::Star)
+        } else if let Some(id) = sel.strip_prefix("msgid=") {
+            Ok(Selector::Msgid(id.to_string()))
+        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
+            e6irc_proto::time::parse_server_time_millis(ts)
+                .map(Selector::Timestamp)
+                .ok_or(SelectorError::MalformedTimestamp)
+        } else {
+            Err(SelectorError::UnknownRefType)
+        }
+    }
+
+    /// Whether this is the open bound `*`.
+    pub(super) fn is_star(&self) -> bool {
+        matches!(self, Selector::Star)
+    }
+}
+
+/// A CHATHISTORY subcommand, parsed once from the wire token. Threading this
+/// typed value (rather than re-matching the `&str` in two places) means the ring
+/// resolver and the DB query builder can no longer enumerate the subcommands
+/// differently — the exact ring-vs-DB divergence a prior sweep had to fix for a
+/// `msgid=` pivot (see `BetweenSelectors`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ChathistorySub {
+    Latest,
+    Before,
+    After,
+    Around,
+    Between,
+}
+
+impl ChathistorySub {
+    /// Parse a subcommand token (case-insensitive). `None` is an unknown
+    /// subcommand (→ INVALID_PARAMS).
+    pub(super) fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "LATEST" => Some(Self::Latest),
+            "BEFORE" => Some(Self::Before),
+            "AFTER" => Some(Self::After),
+            "AROUND" => Some(Self::Around),
+            "BETWEEN" => Some(Self::Between),
+            _ => None,
+        }
+    }
+
+    /// BETWEEN takes two selectors then the limit; the others take one.
+    pub(super) fn takes_two_selectors(self) -> bool {
+        matches!(self, Self::Between)
+    }
 }
 
 /// Emit a draft/chathistory `FAIL`. `context` carries the spec's positional
@@ -109,19 +191,39 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             .dm_conversation(&state.conn_identity(conn), &state.nick_identity(target))
             .0
     };
-    // BETWEEN takes two selectors then the limit; the others take one
-    // selector then the limit.
-    let is_between = sub.eq_ignore_ascii_case("BETWEEN");
-    let selector = p.get(2).copied().unwrap_or("*");
-    let selector2 = p.get(3).copied().unwrap_or("*");
-    // An unrecognized message-reference type is INVALID_MSGREFTYPE, not a
-    // silently-empty batch (we advertise MSGREFTYPES=msgid,timestamp).
-    let refs: &[&str] = if is_between {
-        &[selector, selector2]
-    } else {
-        &[selector]
+    // Parse the subcommand once into a typed value: the ring resolver and the DB
+    // query builder both consume it, so they can no longer enumerate the
+    // subcommands differently (the ring-vs-DB `msgid=` divergence a prior sweep
+    // had to fix). An unknown subcommand is INVALID_PARAMS.
+    let Some(parsed_sub) = ChathistorySub::parse(sub) else {
+        chathistory_fail(
+            state,
+            conn,
+            "INVALID_PARAMS",
+            &[sub, target],
+            &format!("Unknown subcommand {sub}"),
+        );
+        return;
     };
-    if refs.iter().any(|s| !is_valid_msgref(s)) {
+    // BETWEEN takes two selectors then the limit; the others take one.
+    let is_between = parsed_sub.takes_two_selectors();
+    let sel1_raw = p.get(2).copied().unwrap_or("*");
+    let sel2_raw = p.get(3).copied().unwrap_or("*");
+    // Parse each selector *once* (parse, don't validate). The parsed `Selector`
+    // carries an already-resolved `timestamp=` value, so no downstream site
+    // re-parses it or silently defaults a malformed one to epoch 0 (the trap the
+    // old string-threaded `selector_bound` guarded only with a comment). Error
+    // priority is preserved: unknown reference type (INVALID_MSGREFTYPE) first,
+    // then `*` misuse, then a malformed timestamp (both INVALID_PARAMS).
+    let r1 = Selector::parse(sel1_raw);
+    let r2 = if is_between {
+        Selector::parse(sel2_raw)
+    } else {
+        Ok(Selector::Star)
+    };
+    if matches!(r1, Err(SelectorError::UnknownRefType))
+        || matches!(r2, Err(SelectorError::UnknownRefType))
+    {
         chathistory_fail(
             state,
             conn,
@@ -133,11 +235,16 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     }
     // `*` is the open bound, meaningful *only* for LATEST. For BEFORE/AFTER/
     // AROUND — and for either bound of BETWEEN — it is not a real selector, and
-    // accepting it silently yields the wrong window: an empty batch for the
-    // one-selector forms, or a full unbounded scan for BETWEEN (both selectors
-    // resolve to "no position", degenerating to `0 .. u64::MAX`). Reject it as
-    // INVALID_PARAMS rather than answer a malformed request with wrong data.
-    if !sub.eq_ignore_ascii_case("LATEST") && refs.contains(&"*") {
+    // accepting it yields the wrong window: an empty batch for the one-selector
+    // forms, or a full unbounded scan for BETWEEN. Reject it as INVALID_PARAMS.
+    let star_misused = match parsed_sub {
+        ChathistorySub::Latest => false,
+        ChathistorySub::Between => {
+            matches!(r1, Ok(Selector::Star)) || matches!(r2, Ok(Selector::Star))
+        }
+        _ => matches!(r1, Ok(Selector::Star)),
+    };
+    if star_misused {
         chathistory_fail(
             state,
             conn,
@@ -147,14 +254,8 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         );
         return;
     }
-    // A `timestamp=` selector whose value is not a valid server-time is
-    // malformed. Reject it up front instead of letting `selector_ts` silently
-    // default the bound (to 0, or `u64::MAX as i64 == -1`), which would answer a
-    // garbage request with the latest N messages or a silently-empty window.
-    if refs.iter().any(|s| {
-        s.strip_prefix("timestamp=")
-            .is_some_and(|v| e6irc_proto::time::parse_server_time_millis(v).is_none())
-    }) {
+    // Anything still an error is a malformed `timestamp=` value.
+    let (Ok(selector), Ok(selector2)) = (r1, r2) else {
         chathistory_fail(
             state,
             conn,
@@ -163,7 +264,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             "Malformed timestamp= selector",
         );
         return;
-    }
+    };
     // The limit must be a positive integer — never silently default it.
     let limit: usize = match p
         .get(if is_between { 4 } else { 3 })
@@ -183,22 +284,13 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     };
     let (history, complete) = state.history_ring(&hist_key);
 
-    // Pure resolution of the requested window against the in-memory ring;
-    // `None` is an unknown subcommand. Extracted so the arithmetic — which has
-    // carried off-by-one and paging-direction bugs — is unit- and
-    // differentially-fuzz-testable in isolation from the I/O around it.
-    let Some((entries, covered)) =
-        resolve_ring_window(&history, complete, sub, selector, selector2, limit)
-    else {
-        chathistory_fail(
-            state,
-            conn,
-            "INVALID_PARAMS",
-            &[sub, target],
-            &format!("Unknown subcommand {sub}"),
-        );
-        return;
-    };
+    // Pure resolution of the requested window against the in-memory ring.
+    // Extracted so the arithmetic — which has carried off-by-one and
+    // paging-direction bugs — is unit- and differentially-fuzz-testable in
+    // isolation from the I/O around it. The subcommand is already typed, so
+    // there is no "unknown subcommand" path left here.
+    let (entries, covered) =
+        resolve_ring_window(&history, complete, parsed_sub, &selector, &selector2, limit);
 
     // The batch names the target the client asked for, echoed as given; the
     // replayed messages carry their own canonical addressing (history_page).
@@ -215,37 +307,54 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // Ring miss with a database available: page from PostgreSQL instead,
     // preserving one code path for rendering (history_page).
     if !covered && state.config.sasl_enabled {
-        // A msgid selector pages on the composite (ts, id) via a msgid pivot,
-        // which stays exact even if two messages share a millisecond; a
-        // timestamp selector uses the millisecond ts bound.
-        let msgid_of = |sel: &str| sel.strip_prefix("msgid=").map(str::to_string);
-        let query = match sub.to_ascii_uppercase().as_str() {
-            // `LATEST <target> * <limit>` is unbounded; any other selector
-            // bounds it to messages strictly newer than the selector.
-            "LATEST" if selector == "*" => crate::core::HistoryQuery::Latest { limit },
-            "LATEST" => match msgid_of(selector) {
-                Some(msgid) => crate::core::HistoryQuery::LatestAfterMsgid { msgid, limit },
-                None => crate::core::HistoryQuery::LatestAfter {
-                    after_ts: selector_ts(&history, selector)
-                        .unwrap_or(e6irc_proto::time::Millis::from_millis(0)),
+        // A `msgid=` pivot pages on the composite (ts, id), which stays exact
+        // even if two messages share a millisecond; a `timestamp=` pivot carries
+        // its already-parsed millisecond bound (no re-parse, no silent default).
+        // `*` reaches here only for LATEST (rejected for the others above).
+        let query = match parsed_sub {
+            ChathistorySub::Latest => match &selector {
+                Selector::Star => crate::core::HistoryQuery::Latest { limit },
+                Selector::Msgid(msgid) => crate::core::HistoryQuery::LatestAfterMsgid {
+                    msgid: msgid.clone(),
+                    limit,
+                },
+                Selector::Timestamp(t) => crate::core::HistoryQuery::LatestAfter {
+                    after_ts: *t,
                     limit,
                 },
             },
-            "BEFORE" => match msgid_of(selector) {
-                Some(msgid) => crate::core::HistoryQuery::BeforeMsgid { msgid, limit },
-                None => crate::core::HistoryQuery::Before {
-                    before_ts: selector_ts(&history, selector)
-                        .unwrap_or(e6irc_proto::time::Millis::from_millis(u64::MAX)),
+            ChathistorySub::Before => match &selector {
+                Selector::Msgid(msgid) => crate::core::HistoryQuery::BeforeMsgid {
+                    msgid: msgid.clone(),
                     limit,
                 },
+                Selector::Timestamp(t) => crate::core::HistoryQuery::Before {
+                    before_ts: *t,
+                    limit,
+                },
+                Selector::Star => unreachable!("* is rejected for non-LATEST above"),
             },
-            "AROUND" => match msgid_of(selector) {
-                Some(msgid) => crate::core::HistoryQuery::AroundMsgid { msgid, limit },
-                None => crate::core::HistoryQuery::Around {
-                    around_ts: selector_ts(&history, selector)
-                        .unwrap_or(e6irc_proto::time::Millis::from_millis(0)),
+            ChathistorySub::Around => match &selector {
+                Selector::Msgid(msgid) => crate::core::HistoryQuery::AroundMsgid {
+                    msgid: msgid.clone(),
                     limit,
                 },
+                Selector::Timestamp(t) => crate::core::HistoryQuery::Around {
+                    around_ts: *t,
+                    limit,
+                },
+                Selector::Star => unreachable!("* is rejected for non-LATEST above"),
+            },
+            ChathistorySub::After => match &selector {
+                Selector::Msgid(msgid) => crate::core::HistoryQuery::AfterMsgid {
+                    msgid: msgid.clone(),
+                    limit,
+                },
+                Selector::Timestamp(t) => crate::core::HistoryQuery::After {
+                    after_ts: *t,
+                    limit,
+                },
+                Selector::Star => unreachable!("* is rejected for non-LATEST above"),
             },
             // Both selectors travel to the DB as-is; it resolves each pivot's
             // `(ts, id)` position and derives the span and paging direction
@@ -253,18 +362,10 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             // pivot that has scrolled out of the ring used to lose its bound
             // (mixed with a timestamp) or collapse the direction to oldest-first
             // (two msgids), returning the wrong or an empty (inverted) window.
-            "BETWEEN" => crate::core::HistoryQuery::BetweenSelectors {
-                first: selector_bound(selector),
-                second: selector_bound(selector2),
+            ChathistorySub::Between => crate::core::HistoryQuery::BetweenSelectors {
+                first: selector_bound(&selector),
+                second: selector_bound(&selector2),
                 limit,
-            },
-            _ => match msgid_of(selector) {
-                Some(msgid) => crate::core::HistoryQuery::AfterMsgid { msgid, limit },
-                None => crate::core::HistoryQuery::After {
-                    after_ts: selector_ts(&history, selector)
-                        .unwrap_or(e6irc_proto::time::Millis::from_millis(0)),
-                    limit,
-                },
             },
         };
         // Carry the labeled-response label (if any) onto the deferred batch.
@@ -525,17 +626,12 @@ pub(crate) fn targets_page(
     state.send(conn, &format!(":{server} BATCH -{batch_ref}"));
 }
 
-/// A ring-missing reference needs PostgreSQL when the ring is full
-/// (older rows may exist) and the selector is a timestamp we can bound
-/// on directly. A msgid absent from the ring is treated as ring-empty
-/// (returns nothing) rather than triggering an unbounded DB scan.
 /// Resolve a CHATHISTORY request against the in-memory ring, purely.
 ///
 /// Returns the matching entries (oldest-first, as stored) and whether the ring
 /// *covers* the request — `false` means the window reaches older than the ring
-/// holds and PostgreSQL must serve it. `None` is an unknown subcommand. `sub` is
-/// matched case-insensitively; `selector`/`selector2` are `msgid=`/`timestamp=`
-/// references (or `*`), `limit` the requested count.
+/// holds and PostgreSQL must serve it. `sub` and the `selector`s are already
+/// parsed (a `timestamp=` carries its `Millis`), so this does no string work.
 ///
 /// This is the arithmetic the whole subsystem turns on and the part that has
 /// carried bugs (paging direction, off-by-one at the bounds, same-second
@@ -544,40 +640,37 @@ pub(crate) fn targets_page(
 pub(super) fn resolve_ring_window(
     history: &[crate::core::state::HistoryEntry],
     complete: bool,
-    sub: &str,
-    selector: &str,
-    selector2: &str,
+    sub: ChathistorySub,
+    selector: &Selector,
+    selector2: &Selector,
     limit: usize,
-) -> Option<(Vec<crate::core::state::HistoryEntry>, bool)> {
+) -> (Vec<crate::core::state::HistoryEntry>, bool) {
     let n = history.len();
     // Start index of a *lower-exclusive* bound (AFTER / bounded-LATEST / the older
     // end of BETWEEN): the first entry strictly newer than the pivot. A `msgid`
     // pivot is the message *after* it; a `timestamp=T` pivot is the first entry
     // with `ts > T` — strict, exactly as the DB (`ts > $2`), so the ring can't
     // drop the first message after a `T` that falls between two entries. `None`
-    // means a msgid pivot absent from the ring (route to the DB).
-    let lower_start = |sel: &str| -> Option<usize> {
-        if let Some(msgid) = sel.strip_prefix("msgid=") {
-            history.iter().position(|e| e.msgid == msgid).map(|p| p + 1)
-        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
-            e6irc_proto::time::parse_server_time_millis(ts)
-                .map(|t| history.iter().position(|e| e.ts > t).unwrap_or(n))
-        } else {
-            None
+    // means a msgid pivot absent from the ring (route to the DB), or `*`.
+    let lower_start = |sel: &Selector| -> Option<usize> {
+        match sel {
+            Selector::Msgid(msgid) => history
+                .iter()
+                .position(|e| e.msgid == *msgid)
+                .map(|p| p + 1),
+            Selector::Timestamp(t) => Some(history.iter().position(|e| e.ts > *t).unwrap_or(n)),
+            Selector::Star => None,
         }
     };
     // End index (exclusive) of an *upper-exclusive* bound (BEFORE / the newer end
     // of BETWEEN): the count of entries strictly older than the pivot. A `msgid`
     // pivot excludes itself (entries before it); a `timestamp=T` pivot is the
     // entries with `ts < T`. `None` means a msgid pivot absent from the ring.
-    let upper_end = |sel: &str| -> Option<usize> {
-        if let Some(msgid) = sel.strip_prefix("msgid=") {
-            history.iter().position(|e| e.msgid == msgid)
-        } else if let Some(ts) = sel.strip_prefix("timestamp=") {
-            e6irc_proto::time::parse_server_time_millis(ts)
-                .map(|t| history.iter().position(|e| e.ts >= t).unwrap_or(n))
-        } else {
-            None
+    let upper_end = |sel: &Selector| -> Option<usize> {
+        match sel {
+            Selector::Msgid(msgid) => history.iter().position(|e| e.msgid == *msgid),
+            Selector::Timestamp(t) => Some(history.iter().position(|e| e.ts >= *t).unwrap_or(n)),
+            Selector::Star => None,
         }
     };
     // AROUND's pivot: the index where the "newer half" begins. A `msgid` pivot is
@@ -595,121 +688,100 @@ pub(super) fn resolve_ring_window(
         let start = start.min(end);
         history[start..(start + limit).min(end)].to_vec()
     };
-    let miss = |sel: &str| (Vec::new(), !needs_db_for_missing_ref(!complete, sel));
+    let miss = |sel: &Selector| (Vec::new(), !needs_db_for_missing_ref(!complete, sel));
 
-    let resolved: (Vec<crate::core::state::HistoryEntry>, bool) =
-        match sub.to_ascii_uppercase().as_str() {
-            // `*` is unbounded; any other selector restricts LATEST to
-            // messages strictly newer than it (draft/chathistory).
-            "LATEST" if selector == "*" => (keep_newest(0, n), complete || n >= limit),
-            "LATEST" => match lower_start(selector) {
-                // Newest `limit` of the entries after the pivot. The newest are
-                // always in the ring, so this is covered unless the whole
-                // after-set is smaller than `limit` *and* the pivot is older than
-                // the ring's oldest (start == 0), where evicted entries might
-                // belong to it.
-                Some(start) => (keep_newest(start, n), complete || start > 0 || n >= limit),
-                None => miss(selector),
-            },
-            "BEFORE" => match upper_end(selector) {
-                Some(end) => {
-                    let start = end.saturating_sub(limit);
-                    (keep_newest(0, end), complete || start > 0)
-                }
-                None => miss(selector),
-            },
-            "AFTER" => match lower_start(selector) {
-                // Oldest `limit` after the pivot. The result's oldest is the
-                // globally-first entry after the pivot only when the pivot sits
-                // at/after the ring's oldest (start > 0) — otherwise evicted
-                // entries may also be after it, so the DB must serve it.
-                Some(start) => (keep_oldest(start, n), complete || start > 0),
-                None => miss(selector),
-            },
-            "AROUND" => match around_pivot(selector) {
-                Some(pivot) => {
-                    let before = limit / 2;
-                    let start = pivot.saturating_sub(before);
-                    let end = (pivot + (limit - before)).min(n);
-                    (
-                        history[start..end.max(start)].to_vec(),
-                        complete || start > 0,
-                    )
-                }
-                None => miss(selector),
-            },
-            "BETWEEN" => {
-                // Both endpoints must resolve in the ring; otherwise the DB does.
-                match (upper_end(selector), upper_end(selector2)) {
-                    (Some(u1), Some(u2)) => {
-                        // Order the pivots by how many entries precede each: the
-                        // smaller `upper_end` is the older bound. The window walks
-                        // *from* the first selector *toward* the second, so the
-                        // `limit` cuts from the first's end — newest-first when the
-                        // first selector is the newer bound.
-                        let newest_first = u1 > u2;
-                        let older_sel = if u1 <= u2 { selector } else { selector2 };
-                        // Lower bound: strictly after the older pivot. Upper bound:
-                        // strictly before the newer pivot (= the larger upper_end).
-                        match lower_start(older_sel) {
-                            Some(start) => {
-                                let end = u1.max(u2);
-                                let covered = complete || start > 0;
-                                let rows = if newest_first {
-                                    keep_newest(start, end)
-                                } else {
-                                    keep_oldest(start, end)
-                                };
-                                (rows, covered)
-                            }
-                            None => (Vec::new(), complete),
-                        }
-                    }
-                    // An endpoint missing from the ring: only the DB can resolve it.
-                    _ => (Vec::new(), complete),
-                }
+    match sub {
+        // `*` is unbounded; any other selector restricts LATEST to
+        // messages strictly newer than it (draft/chathistory).
+        ChathistorySub::Latest if selector.is_star() => (keep_newest(0, n), complete || n >= limit),
+        ChathistorySub::Latest => match lower_start(selector) {
+            // Newest `limit` of the entries after the pivot. The newest are
+            // always in the ring, so this is covered unless the whole
+            // after-set is smaller than `limit` *and* the pivot is older than
+            // the ring's oldest (start == 0), where evicted entries might
+            // belong to it.
+            Some(start) => (keep_newest(start, n), complete || start > 0 || n >= limit),
+            None => miss(selector),
+        },
+        ChathistorySub::Before => match upper_end(selector) {
+            Some(end) => {
+                let start = end.saturating_sub(limit);
+                (keep_newest(0, end), complete || start > 0)
             }
-            _ => return None,
-        };
-    Some(resolved)
+            None => miss(selector),
+        },
+        ChathistorySub::After => match lower_start(selector) {
+            // Oldest `limit` after the pivot. The result's oldest is the
+            // globally-first entry after the pivot only when the pivot sits
+            // at/after the ring's oldest (start > 0) — otherwise evicted
+            // entries may also be after it, so the DB must serve it.
+            Some(start) => (keep_oldest(start, n), complete || start > 0),
+            None => miss(selector),
+        },
+        ChathistorySub::Around => match around_pivot(selector) {
+            Some(pivot) => {
+                let before = limit / 2;
+                let start = pivot.saturating_sub(before);
+                let end = (pivot + (limit - before)).min(n);
+                (
+                    history[start..end.max(start)].to_vec(),
+                    complete || start > 0,
+                )
+            }
+            None => miss(selector),
+        },
+        ChathistorySub::Between => {
+            // Both endpoints must resolve in the ring; otherwise the DB does.
+            match (upper_end(selector), upper_end(selector2)) {
+                (Some(u1), Some(u2)) => {
+                    // Order the pivots by how many entries precede each: the
+                    // smaller `upper_end` is the older bound. The window walks
+                    // *from* the first selector *toward* the second, so the
+                    // `limit` cuts from the first's end — newest-first when the
+                    // first selector is the newer bound.
+                    let newest_first = u1 > u2;
+                    let older_sel = if u1 <= u2 { selector } else { selector2 };
+                    // Lower bound: strictly after the older pivot. Upper bound:
+                    // strictly before the newer pivot (= the larger upper_end).
+                    match lower_start(older_sel) {
+                        Some(start) => {
+                            let end = u1.max(u2);
+                            let covered = complete || start > 0;
+                            let rows = if newest_first {
+                                keep_newest(start, end)
+                            } else {
+                                keep_oldest(start, end)
+                            };
+                            (rows, covered)
+                        }
+                        None => (Vec::new(), complete),
+                    }
+                }
+                // An endpoint missing from the ring: only the DB can resolve it.
+                _ => (Vec::new(), complete),
+            }
+        }
+    }
 }
 
-pub(super) fn needs_db_for_missing_ref(ring_full: bool, selector: &str) -> bool {
+pub(super) fn needs_db_for_missing_ref(ring_full: bool, selector: &Selector) -> bool {
     // A `msgid=` pivot resolves in SQL against the composite `(ts, id)` position
     // (BeforeMsgid/AfterMsgid/AroundMsgid), so a msgid absent from an *incomplete*
     // ring must go to the database — not be treated as "no such/older history",
     // which silently dead-ended backward pagination one page past the ring edge.
     // A `timestamp=` bound likewise pages from the DB. Only `*` (open bound) can
     // never need it.
-    ring_full && (selector.starts_with("timestamp=") || selector.starts_with("msgid="))
+    ring_full && !selector.is_star()
 }
 
-/// Turn a validated BETWEEN selector into a [`SelectorBound`] for the DB to
-/// resolve. By this point the selector has passed `is_valid_msgref`, the
-/// non-`*` check, and (for `timestamp=`) the parse check, so both prefixes hold.
-fn selector_bound(selector: &str) -> crate::core::SelectorBound {
-    if let Some(msgid) = selector.strip_prefix("msgid=") {
-        crate::core::SelectorBound::Msgid(msgid.to_string())
-    } else {
-        let ts = selector
-            .strip_prefix("timestamp=")
-            .and_then(e6irc_proto::time::parse_server_time_millis)
-            .unwrap_or_else(|| e6irc_proto::time::Millis::from_millis(0));
-        crate::core::SelectorBound::Timestamp(ts)
-    }
-}
-
-/// Resolve a msgid=/timestamp= selector to a timestamp for DB paging.
-pub(super) fn selector_ts(
-    history: &[crate::core::state::HistoryEntry],
-    selector: &str,
-) -> Option<e6irc_proto::time::Millis> {
-    if let Some(msgid) = selector.strip_prefix("msgid=") {
-        history.iter().find(|e| e.msgid == msgid).map(|e| e.ts)
-    } else if let Some(ts) = selector.strip_prefix("timestamp=") {
-        e6irc_proto::time::parse_server_time_millis(ts)
-    } else {
-        None
+/// Turn a BETWEEN selector into a [`SelectorBound`] for the DB to resolve. `*`
+/// is unreachable — it is rejected for BETWEEN before any bound is built — so
+/// this is total over the reachable selectors with no silent default.
+fn selector_bound(selector: &Selector) -> crate::core::SelectorBound {
+    match selector {
+        Selector::Msgid(msgid) => crate::core::SelectorBound::Msgid(msgid.clone()),
+        Selector::Timestamp(t) => crate::core::SelectorBound::Timestamp(*t),
+        Selector::Star => unreachable!("BETWEEN rejects * before building a bound"),
     }
 }
 
@@ -942,10 +1014,29 @@ pub(crate) fn history_page(
 
 #[cfg(test)]
 mod window_tests {
-    use super::resolve_ring_window;
+    use super::{ChathistorySub, Selector, resolve_ring_window};
     use crate::core::MessageKind;
     use crate::core::state::HistoryEntry;
     use e6irc_proto::time::Millis;
+
+    /// String-selector adapter for the typed `resolve_ring_window`: parses the
+    /// wire tokens exactly as the command layer does, so the differential test
+    /// can keep expressing cases as strings. Returns `None` on an unknown
+    /// subcommand or unparseable selector (matching the `reference` oracle's
+    /// `None`), else the resolved `(rows, covered)`.
+    fn rw(
+        history: &[HistoryEntry],
+        complete: bool,
+        sub: &str,
+        sel: &str,
+        sel2: &str,
+        limit: usize,
+    ) -> Option<(Vec<HistoryEntry>, bool)> {
+        let sub = ChathistorySub::parse(sub)?;
+        let s1 = Selector::parse(sel).ok()?;
+        let s2 = Selector::parse(sel2).ok()?;
+        Some(resolve_ring_window(history, complete, sub, &s1, &s2, limit))
+    }
 
     fn entry(i: usize) -> HistoryEntry {
         HistoryEntry {
@@ -1102,10 +1193,9 @@ mod window_tests {
                 for sub in ["LATEST", "BEFORE", "AFTER", "AROUND"] {
                     for sel in &sels {
                         for limit in 1..=8usize {
-                            let got = resolve_ring_window(&history, complete, sub, sel, "*", limit)
-                                .map(|(v, c)| {
-                                    (v.iter().map(|e| e.msgid.clone()).collect::<Vec<_>>(), c)
-                                });
+                            let got = rw(&history, complete, sub, sel, "*", limit).map(|(v, c)| {
+                                (v.iter().map(|e| e.msgid.clone()).collect::<Vec<_>>(), c)
+                            });
                             let want = reference(&history, complete, sub, sel, "*", limit);
                             assert_eq!(
                                 got, want,
@@ -1119,10 +1209,9 @@ mod window_tests {
                     for b in &sels {
                         for limit in 1..=8usize {
                             let got =
-                                resolve_ring_window(&history, complete, "BETWEEN", a, b, limit)
-                                    .map(|(v, c)| {
-                                        (v.iter().map(|e| e.msgid.clone()).collect::<Vec<_>>(), c)
-                                    });
+                                rw(&history, complete, "BETWEEN", a, b, limit).map(|(v, c)| {
+                                    (v.iter().map(|e| e.msgid.clone()).collect::<Vec<_>>(), c)
+                                });
                             let want = reference(&history, complete, "BETWEEN", a, b, limit);
                             assert_eq!(
                                 got, want,
@@ -1151,15 +1240,14 @@ mod window_tests {
         let ids = |rows: Vec<HistoryEntry>| -> Vec<String> {
             rows.into_iter().map(|e| e.msgid).collect()
         };
-        let (rows, covered) =
-            resolve_ring_window(&history, true, "AFTER", &t(1005), "*", 10).unwrap();
+        let (rows, covered) = rw(&history, true, "AFTER", &t(1005), "*", 10).unwrap();
         assert_eq!(ids(rows), ["m1", "m2"]);
         assert!(covered);
         // Exactly on a message excludes it (strict): AFTER 1010 → [m2].
-        let (rows, _) = resolve_ring_window(&history, true, "AFTER", &t(1010), "*", 10).unwrap();
+        let (rows, _) = rw(&history, true, "AFTER", &t(1010), "*", 10).unwrap();
         assert_eq!(ids(rows), ["m2"]);
         // Bounded LATEST is strict too: LATEST timestamp=1005 → newest of ts>1005.
-        let (rows, _) = resolve_ring_window(&history, true, "LATEST", &t(1005), "*", 10).unwrap();
+        let (rows, _) = rw(&history, true, "LATEST", &t(1005), "*", 10).unwrap();
         assert_eq!(ids(rows), ["m1", "m2"]);
     }
 
@@ -1173,14 +1261,13 @@ mod window_tests {
             "timestamp={}",
             e6irc_proto::time::server_time(Millis::from_millis(500))
         );
-        let (_, covered) = resolve_ring_window(&history, false, "AFTER", &old, "*", 10).unwrap();
+        let (_, covered) = rw(&history, false, "AFTER", &old, "*", 10).unwrap();
         assert!(
             !covered,
             "AFTER older than an incomplete ring must defer to the DB"
         );
         // A complete ring genuinely has everything, so it stays covered.
-        let (_, covered_complete) =
-            resolve_ring_window(&history, true, "AFTER", &old, "*", 10).unwrap();
+        let (_, covered_complete) = rw(&history, true, "AFTER", &old, "*", 10).unwrap();
         assert!(covered_complete);
     }
 
@@ -1193,15 +1280,13 @@ mod window_tests {
         // covered (empty).
         let history: Vec<HistoryEntry> = (0..3).map(entry).collect();
         for sub in ["BEFORE", "AFTER", "AROUND", "LATEST"] {
-            let (rows, covered) =
-                resolve_ring_window(&history, false, sub, "msgid=gone", "*", 10).unwrap();
+            let (rows, covered) = rw(&history, false, sub, "msgid=gone", "*", 10).unwrap();
             assert!(rows.is_empty());
             assert!(
                 !covered,
                 "{sub} with a missing msgid on an incomplete ring must defer to the DB"
             );
-            let (_, covered_complete) =
-                resolve_ring_window(&history, true, sub, "msgid=gone", "*", 10).unwrap();
+            let (_, covered_complete) = rw(&history, true, sub, "msgid=gone", "*", 10).unwrap();
             assert!(
                 covered_complete,
                 "{sub} on a complete ring with no such msgid is genuinely empty"

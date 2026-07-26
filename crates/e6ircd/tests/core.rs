@@ -59,19 +59,6 @@ impl TestServer {
         Self::with_full_config(sasl_enabled, clock, sendq, "irc.test.example", 16)
     }
 
-    /// A server that advertises a long `server_name` and a large `nicklen`, to
-    /// exercise the numeric wire-length fitting (WHOX packs many middles plus a
-    /// client-influenced realname trailing, so the summed line can approach 512).
-    fn with_long_head() -> Self {
-        Self::with_full_config(
-            true,
-            || Millis::from_millis(1_000_000_000),
-            256,
-            "irc.a-rather-long-server-name.example.net",
-            30,
-        )
-    }
-
     fn with_full_config(
         sasl_enabled: bool,
         clock: fn() -> Millis,
@@ -2982,22 +2969,38 @@ fn whox_full_fields_with_account() {
 
 #[test]
 fn whox_reply_never_exceeds_the_wire_limit() {
-    // WHOX packs up to 12 middles plus the realname trailing; on a server with a
-    // long name and large nicklen those sum past 512, and the recipient's
-    // framing then discards the whole 354 — the row silently vanishes. The
-    // numeric funnel must fit the trailing so the line always stays legal.
-    let mut s = TestServer::with_long_head();
+    // WHOX packs up to a dozen middles whose *sum* — not just any single field or
+    // the realname trailing — can exceed 512 at supported maxima: a 63-char
+    // server_name and nicklen=64 put both in the head AND a middle (`s`/`n`), a
+    // 64-char account is another wide middle (`a`), a 50-char channel another
+    // (`c`), and the client token adds up to 100 (`t`). The numeric funnel must
+    // bound the whole line — clipping middles once they'd overrun — or the
+    // recipient's framing discards the 354 whole (the row silently vanishes) and
+    // a debug build panics on the over-long line. This exercises that guard; the
+    // weaker head sizes the trailing clip alone already handled did not.
+    let server = "s".repeat(63);
+    let mut s = TestServer::with_full_config(
+        true, // SASL: lets us identify to a wide account for the `a` field
+        || Millis::from_millis(1_000_000_000),
+        512,
+        &server,
+        64,
+    );
+    let nick = "n".repeat(64);
     let alice = s.connect(1);
-    s.line(alice, "NICK aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); // 30 chars (== nicklen)
-    // A maximal realname (server clamps to REALLEN); pad well past it.
-    let realname = "R".repeat(300);
-    s.line(alice, &format!("USER u 0 * :{realname}"));
+    s.line(alice, &format!("NICK {nick}"));
+    s.line(
+        alice,
+        &format!("USER {} 0 * :{}", "u".repeat(10), "R".repeat(300)),
+    );
     s.drain(alice);
-    s.line(alice, "JOIN #wx");
+    identify(&mut s, alice, &"a".repeat(64));
+    let chan = format!("#{}", "c".repeat(49)); // 50 chars incl '#' (== CHANNELLEN)
+    s.line(alice, &format!("JOIN {chan}"));
     s.drain(alice);
-    // Every WHOX field, plus a long client token — the worst case.
+    // Every WHOX field, plus a maximal client token — the true worst case.
     let token = "T".repeat(120);
-    s.line(alice, &format!("WHO #wx %tcuihsnfdlaor,{token}"));
+    s.line(alice, &format!("WHO {chan} %tcuihsnfdlaor,{token}"));
     let out = s.drain(alice);
     let row = out.iter().find(|l| l.contains(" 354 ")).expect("354 row");
     assert!(
