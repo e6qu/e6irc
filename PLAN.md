@@ -1638,6 +1638,39 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+CI coverage + bouncer-fidelity sweep (2026-07-27): a second CI-focused pass
+plus two bug fixes an adversarial audit of the least-swept surfaces (BNC
+bouncer, bridges, DB, CLI, TUI) surfaced. That audit found those subsystems
+exceptionally hardened; the two real defects, both LOW, are fixed:
+
+- **Silent fallback on a DB error during BNC attach** (`bouncer/serve.rs`).
+  Attach resolved the target network with `matches!(get_bnc_network(...),
+  Ok(Some(_)))`, so a *transient DB error* read as "not owned" and fell through
+  to a shared (operator-owned) network of the same name — a silent-fallback
+  violation (DESIGN §2). Now an explicit match: owned-but-disabled says so, a DB
+  error **fails closed** ("temporarily unavailable"), and only a genuinely
+  un-owned name falls through to a shared network.
+- **SASL PLAIN chunked continuation unsupported in the BNC handshake**
+  (`bouncer/serve.rs`). The main IRC path accumulates 400-byte `AUTHENTICATE`
+  chunks (SASL spec); the BNC handshake decoded only the first line, failing a
+  long credential. It now accumulates continuation chunks (bounded, mirroring
+  the core's `SASL_MAX`) exactly like the main path. Covered by a new raw-socket
+  end-to-end test (`bnc_listener_accepts_chunked_sasl_plain`).
+
+**CI robustness + coverage.** The pinned-irctest `git clone` is now retried
+(a transient GitHub hiccup no longer fails the job); `cargo-fuzz` and
+`pytest-timeout` are version-pinned (no silent drift). WS-IRC — a shipped
+transport with only one happy-path test — gained conformance coverage in
+`tests/ws_irc.rs` (multiple messages per frame, binary-frame input, and the
+overlong-line → 417 path); these run in the full OS matrix. Wiring upstream
+irctest's `websocket.py` is a maintainer decision raised in the response (not
+silently skipped): it hardcodes a root-path `ws://host:port`, so it needs either
+a production routing change or a dedicated WS-IRC listener.
+
+Verified: new ws_irc + chunked-SASL tests; `cargo fmt`; workspace tests; clippy
+default + `embed-web` + each bridge alone; all `tools/check-*` gates + `cargo
+deny`; PG bouncer/http suites; CI YAML validated.
+
 CI + console polish sweep (2026-07-27): a CI-focused pass plus fixes and
 missing-feature work driven by three adversarial audits (protocol core, HTTP/web
 surface, CI). The **protocol core was found clean** — 250+ conformance/adversarial

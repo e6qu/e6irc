@@ -334,26 +334,53 @@ where
     // all falls through to a shared (ownerless) network.
     let handle = if let Some(handle) = registry.get_owned(&account, &network) {
         handle
-    } else if matches!(
-        crate::db::get_bnc_network(pool, &account, &network).await,
-        Ok(Some(_))
-    ) {
-        let _ = write
-            .write_all(
-                format!(":{server_name} NOTICE * :Your network '{network}' is disabled.\r\n")
-                    .as_bytes(),
-            )
-            .await;
-        return Ok(());
-    } else if let Some(handle) = registry.get_shared(&network) {
-        handle
     } else {
-        let _ = write
-            .write_all(
-                format!(":{server_name} NOTICE * :Unknown network '{network}'.\r\n").as_bytes(),
-            )
-            .await;
-        return Ok(());
+        match crate::db::get_bnc_network(pool, &account, &network).await {
+            // Owned but not live: disabled. Say so rather than falling through
+            // to a shared network of the same name.
+            Ok(Some(_)) => {
+                let _ = write
+                    .write_all(
+                        format!(
+                            ":{server_name} NOTICE * :Your network '{network}' is disabled.\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                return Ok(());
+            }
+            // DB error: ownership is unresolved. Fail closed — never fall
+            // through to a shared network, which could silently attach the
+            // client to a *different* (operator-owned) network of the same name
+            // (DESIGN §2: no silent fallbacks).
+            Err(e) => {
+                eprintln!("bnc: attach ownership lookup for {account}/{network} failed: {e}");
+                let _ = write
+                    .write_all(
+                        format!(
+                            ":{server_name} NOTICE * :Network '{network}' is temporarily unavailable.\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                return Ok(());
+            }
+            // Not owned at all: a shared (ownerless) network of that name is a
+            // legitimate fallback.
+            Ok(None) => {
+                if let Some(handle) = registry.get_shared(&network) {
+                    handle
+                } else {
+                    let _ = write
+                        .write_all(
+                            format!(":{server_name} NOTICE * :Unknown network '{network}'.\r\n")
+                                .as_bytes(),
+                        )
+                        .await;
+                    return Ok(());
+                }
+            }
+        }
     };
 
     // Complete the client's registration burst (001 + end-of-MOTD) so it
@@ -393,6 +420,11 @@ where
     let mut have_user = false;
     let mut cap_open = false;
     let mut awaiting_payload = false;
+    // Accumulates 400-byte AUTHENTICATE continuation chunks until a short line
+    // completes the payload (SASL spec), mirroring the main IRC path. Bounded so
+    // a client cannot grow it without end (matches the core's SASL_MAX).
+    let mut sasl_buf = String::new();
+    const SASL_MAX: usize = 8192;
     let mut account: Option<String> = None;
     let mut caps = super::AttachCaps::default();
 
@@ -432,22 +464,42 @@ where
                         } else {
                             reject_sasl(write, server_name).await?;
                         }
-                    } else {
+                    } else if arg == "*" {
+                        // Client abort.
                         awaiting_payload = false;
-                        match verify_plain(pool, arg).await {
-                            Some(acct) => {
-                                write
-                                    .write_all(
-                                        format!(
-                                            ":{server_name} 900 * * {acct} :You are now logged in as {acct}\r\n\
-                                             :{server_name} 903 * :SASL authentication successful\r\n"
-                                        )
-                                        .as_bytes(),
-                                    )
-                                    .await?;
-                                account = Some(acct);
+                        sasl_buf.clear();
+                        reject_sasl(write, server_name).await?;
+                    } else {
+                        // Continuation: a full 400-char line means more follows;
+                        // a shorter line (or "+", the empty final chunk)
+                        // completes the payload.
+                        let piece = if arg == "+" { "" } else { arg };
+                        if sasl_buf.len() + piece.len() > SASL_MAX {
+                            awaiting_payload = false;
+                            sasl_buf.clear();
+                            reject_sasl(write, server_name).await?;
+                        } else {
+                            sasl_buf.push_str(piece);
+                            if arg.len() != 400 {
+                                awaiting_payload = false;
+                                let payload = std::mem::take(&mut sasl_buf);
+                                match verify_plain(pool, &payload).await {
+                                    Some(acct) => {
+                                        write
+                                            .write_all(
+                                                format!(
+                                                    ":{server_name} 900 * * {acct} :You are now logged in as {acct}\r\n\
+                                                     :{server_name} 903 * :SASL authentication successful\r\n"
+                                                )
+                                                .as_bytes(),
+                                            )
+                                            .await?;
+                                        account = Some(acct);
+                                    }
+                                    None => reject_sasl(write, server_name).await?,
+                                }
                             }
-                            None => reject_sasl(write, server_name).await?,
+                            // else: 400-char chunk, keep awaiting_payload = true
                         }
                     }
                 }

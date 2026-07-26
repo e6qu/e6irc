@@ -417,6 +417,77 @@ async fn bnc_listener_rejects_unauthenticated_and_wrong_password() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_listener_accepts_chunked_sasl_plain() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A password long enough that base64(authzid\0authcid\0passwd) exceeds the
+    // 400-char AUTHENTICATE line limit, forcing the client to chunk it — the
+    // continuation path the BNC handshake must accumulate (SASL spec).
+    let long_pw = "p".repeat(320);
+    let url = bnc_account_db("bnc_listener_accepts_chunked_sasl_plain", "alice", &long_pw).await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url)).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut sock = tokio::net::TcpStream::connect(bnc).await.unwrap();
+    sock.write_all(b"NICK alice/up\r\nUSER x 0 * :x\r\nAUTHENTICATE PLAIN\r\n")
+        .await
+        .unwrap();
+
+    // Wait for the server's "AUTHENTICATE +" go-ahead.
+    let mut b = [0u8; 2048];
+    let mut acc = String::new();
+    loop {
+        let n = sock.read(&mut b).await.unwrap();
+        assert!(n > 0, "closed before AUTHENTICATE +");
+        acc.push_str(&String::from_utf8_lossy(&b[..n]));
+        if acc.contains("AUTHENTICATE +") {
+            break;
+        }
+    }
+
+    // Chunk the base64 PLAIN payload at 400 chars: a full 400-char line means
+    // "more follows"; the shorter final line completes it.
+    let payload = e6irc_proto::base64::encode(format!("\0alice\0{long_pw}").as_bytes());
+    assert!(
+        payload.len() > 400,
+        "payload should span >1 line: {}",
+        payload.len()
+    );
+    let (first, rest) = payload.split_at(400);
+    sock.write_all(format!("AUTHENTICATE {first}\r\n").as_bytes())
+        .await
+        .unwrap();
+    sock.write_all(format!("AUTHENTICATE {rest}\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    // Only correct accumulation yields the valid credential -> RPL_SASLSUCCESS
+    // (903); a broken chunker would verify the first chunk alone and fail (904).
+    let mut acc = String::new();
+    let ok = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let n = sock.read(&mut b).await.unwrap();
+            if n == 0 {
+                return false;
+            }
+            acc.push_str(&String::from_utf8_lossy(&b[..n]));
+            if acc.contains(" 903 ") {
+                return true;
+            }
+            if acc.contains(" 904 ") {
+                return false;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for SASL verdict");
+    assert!(ok, "chunked SASL PLAIN should succeed: {acc}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn driver_authenticates_to_sasl_upstream() {
     use e6ircd::config::DatabaseConfig;
     let url = support::test_db("driver_authenticates_to_sasl_upstream").await;

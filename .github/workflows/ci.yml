@@ -194,7 +194,13 @@ jobs:
       - run: cargo build -p e6ircd
       - name: Check out pinned irctest
         run: |
-          git clone https://github.com/progval/irctest ../irctest
+          # Retry the clone: a transient GitHub hiccup should not fail the job.
+          for attempt in 1 2 3; do
+            rm -rf ../irctest
+            git clone https://github.com/progval/irctest ../irctest && break
+            [ "$attempt" = 3 ] && { echo "irctest clone failed after 3 attempts"; exit 1; }
+            sleep 5
+          done
           git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
       - uses: actions/setup-python@v6.3.0
         with:
@@ -202,7 +208,7 @@ jobs:
       - name: Run irctest green list
         working-directory: ../irctest
         run: |
-          pip install -r requirements.txt pytest-timeout
+          pip install -r requirements.txt "pytest-timeout==2.4.0"
           PATH="$GITHUB_WORKSPACE/target/debug:$PATH" \
           PYTHONPATH="$GITHUB_WORKSPACE/vendor/tests/irctest" \
           pytest --controller=e6ircd_controller --timeout=15 \
@@ -290,7 +296,13 @@ jobs:
       - run: cargo build -p e6ircd
       - name: Check out pinned irctest
         run: |
-          git clone https://github.com/progval/irctest ../irctest
+          # Retry the clone: a transient GitHub hiccup should not fail the job.
+          for attempt in 1 2 3; do
+            rm -rf ../irctest
+            git clone https://github.com/progval/irctest ../irctest && break
+            [ "$attempt" = 3 ] && { echo "irctest clone failed after 3 attempts"; exit 1; }
+            sleep 5
+          done
           git -C ../irctest checkout a468d9fcd64abc72b02ecb20f4f8612fd72c8829
       - uses: actions/setup-python@v6.3.0
         with:
@@ -298,7 +310,7 @@ jobs:
       - name: Run persistence-backed irctest green list
         working-directory: ../irctest
         run: |
-          pip install -r requirements.txt pytest-timeout
+          pip install -r requirements.txt "pytest-timeout==2.4.0"
           PATH="$GITHUB_WORKSPACE/target/debug:$PATH" \
           PYTHONPATH="$GITHUB_WORKSPACE/vendor/tests/irctest" \
           E6IRC_IRCTEST_DB="postgres://postgres:test@127.0.0.1:5432/irctest" \
@@ -381,7 +393,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz each target briefly
         working-directory: fuzz
         # Enumerate targets from cargo-fuzz itself (the Cargo.toml [[bin]] set)
