@@ -206,6 +206,15 @@ pub(super) async fn ws_ui_conn(
     // network, leaking the task and its handle. attach() over raw IRC guards
     // the same way.
     let mut shutdown = handle.watch_shutdown();
+    // The network may already have been removed between the route resolving this
+    // handle and here (the whole WS upgrade handshake sits in that window). A
+    // `watch::Receiver` subscribed after the shutdown was signalled treats the
+    // value as already seen, so `changed()` below would never fire — check it now
+    // and close, or the socket would linger forever on a dead network. attach()
+    // over raw IRC guards the same way.
+    if *shutdown.borrow() {
+        return;
+    }
 
     // Send the current connection status up front: a driver is always-on, so a
     // client attaching to an already-connected network would otherwise see no

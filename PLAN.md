@@ -1593,6 +1593,58 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Eighty-eighth sweep — sealed secrets bound to their context + a lingering-BNC
+detach bug (2026-07-26): the second escalation from sweep 86 — AAD context-binding
+for sealed secrets — is done, and two fresh audits (BNC attach/backlog, arithmetic/
+panic reachability) turned up one real bug. Arithmetic came back fully clean.
+
+**Sealed secrets are now context-bound** (`secret.rs` + callers). `SecretKey::seal/
+open` used `Aad::empty()`, so a blob sealed in one context was cryptographically
+openable in another (a per-account BNC password moved into a different account's
+row, or a config field). `seal(plaintext, context)` / `open(blob, context)` now
+bind an AEAD associated-data *context*, in a new `enc:v2:` format — a per-account
+BNC password binds `bnc:<owner_folded>` (so it can't open for another owner), a
+config secret binds a fixed `config` tag (so the two classes can't be
+substituted). Legacy `enc:v1:` blobs (no AAD) still open with empty AAD, so
+existing deployments keep working; a value re-sealed on change upgrades to v2. The
+owner is threaded into `network_config_from_row`; the CLI `seal` produces a
+config-context blob. New unit tests cover context-mismatch rejection and v1
+backward-compat. Not exploitable before (no API returns or accepts a raw blob;
+moving one between rows needs DB write) — this closes the class structurally.
+
+**Attaching to an already-removed BNC network lingered forever** (MED, `bouncer/
+mod.rs`, `http/ws.rs`; found by the attach audit, verified with a standalone tokio
+harness). Both the IRC `attach` and the `/ws/ui` paths subscribe to the network's
+shutdown `watch` and loop on `changed()` — but a `watch::Receiver` subscribed
+*after* the shutdown was signalled treats that value as already-seen, so
+`changed()` never fires. If the network was removed between the caller resolving
+the handle and the attach (a wide window — the whole handshake/WS upgrade), the
+client's task, socket, and `Arc<NetworkHandle>` leaked until the client's own TCP
+closed (no server-side ping on the attached socket). Both paths now check the
+current shutdown value once, up front, and detach immediately. New test attaches
+to a shut-down handle and asserts prompt detach. Class: "watch a stop-signal that
+may already be set" — the safe idiom is check `borrow()` once, then loop on
+`changed()`; both attach paths now follow it.
+
+Clean bills: the arithmetic/slicing/panic surface (proto parse/serialize/base64/
+isupport/mask/framing, the CHATHISTORY window math, mode/ban/multiline length
+math, net/db/oidc offset math) — every risky site is guarded (char-boundary
+choke point, clamped limits, `saturating_`/`checked_`, proven `expect` invariants);
+no client-reachable worker panic. The BNC attach/backlog/detach layer is otherwise
+sound: subscribe-before-snapshot ordering is correct on every path (no lost line),
+broadcast lag is surfaced not silent, teardown reaches the driver and drops the
+decrypted SASL password, and multi-client fan-out is independent.
+
+Still open as decisions (low-severity or policy): a global/per-IP `create_account`
+rate-limit (from sweep 86); the client→upstream BNC command channel is unbounded
+and undrained during a reconnect wait (per-account, `MAX_CLIENT_FRAME_LEN`-bounded
+per line); and the IRC `attach` path sends no initial connection-status line
+(unlike `/ws/ui`) — likely intentional, flagged to confirm.
+
+Verified: workspace suite + new secret/attach tests; each bridge feature alone
+under `-Dwarnings`; irctest main; PG db suite; ws_ui detach + attach integration
+tests; all `tools/check-*` gates + `cargo deny` clean.
+
 Eighty-seventh sweep — "registered but no nick" made unrepresentable (2026-07-26):
 the headline escalation from sweep 86 — the `Session` identity model — is closed
 at the type level, plus two fresh audits (less-common reply fidelity, cross-feature

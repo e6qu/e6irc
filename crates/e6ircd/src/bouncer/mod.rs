@@ -30,18 +30,33 @@ pub use serve::{Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 
-/// Build a driver config from a stored network row, decrypting its
-/// sealed upstream SASL password with the master key. Fails loudly if a
-/// sealed secret is present but no key is configured, or it won't open.
+/// The secret-context a BNC upstream password is sealed under: its *owning*
+/// e6irc account, casefolded, with a `bnc:` purpose tag. Binding the blob to the
+/// owner means a sealed password cannot be opened for a different account's row
+/// (the AEAD tag check fails), and the `bnc:` tag keeps it distinct from a config
+/// secret's [`crate::secret::CONFIG_CONTEXT`]. Seal and open must derive it the
+/// same way, so both go through this one function.
+pub fn bnc_secret_context(owner: &str) -> Vec<u8> {
+    let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner);
+    format!("bnc:{folded}").into_bytes()
+}
+
+/// Build a driver config from a stored network row (owned by `owner`), decrypting
+/// its sealed upstream SASL password with the master key under the owner's
+/// context. Fails loudly if a sealed secret is present but no key is configured,
+/// it won't open, or it was sealed for a different owner.
 pub fn network_config_from_row(
     row: &crate::db::BncNetworkRow,
     key: Option<&crate::secret::SecretKey>,
+    owner: &str,
 ) -> Result<NetworkConfig, String> {
     let sasl = match (&row.sasl_account, &row.sasl_password_sealed) {
         (Some(account), Some(sealed)) => {
             let key =
                 key.ok_or("stored upstream secret present but no master key is configured")?;
-            let password = key.open(sealed).map_err(|e| e.to_string())?;
+            let password = key
+                .open(sealed, &bnc_secret_context(owner))
+                .map_err(|e| e.to_string())?;
             Some((account.clone(), password))
         }
         _ => None,
@@ -996,6 +1011,19 @@ where
     // without this an attached client would linger on a stopped network — its
     // upstream gone but the session still open.
     let mut shutdown = handle.shutdown.subscribe();
+    // The network may have been removed *between* the caller resolving this
+    // handle and here (the same account's own API can delete/replace it, and the
+    // handshake/upgrade before attach is a wide window). A `watch::Receiver`
+    // subscribed after the shutdown was signalled treats that value as already
+    // seen, so `changed()` below would never fire and the client would linger
+    // forever on a dead network. Check the current value once, up front.
+    if *shutdown.borrow() {
+        let _ = write
+            .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
+            .await;
+        let _ = write.flush().await;
+        return Ok(());
+    }
 
     // Playback: everything buffered while detached, in order, with tags the
     // client didn't negotiate stripped.
@@ -1139,6 +1167,37 @@ mod tests {
             .expect("driver did not stop on shutdown")
             .expect("driver task panicked");
         drop(held);
+    }
+
+    /// Attaching to a network that was ALREADY shut down (removed between the
+    /// caller resolving the handle and the attach) must detach immediately, not
+    /// linger forever. A `watch::Receiver` subscribed after the shutdown treats
+    /// it as already-seen, so `changed()` never fires — the up-front `borrow()`
+    /// check is what closes the client.
+    #[tokio::test]
+    async fn attach_to_an_already_shutdown_network_detaches_immediately() {
+        use tokio::io::AsyncReadExt;
+        let (handle, _ends) = NetworkHandle::channels(16);
+        handle.shutdown(); // network removed BEFORE the client attaches
+        let (client_side, server_side) = tokio::io::duplex(4096);
+        // attach must RETURN (not hang) even though the broadcast never closes.
+        let attached = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            attach(server_side, &handle, AttachCaps::default()),
+        )
+        .await;
+        assert!(
+            attached.is_ok(),
+            "attach to an already-dead network must not linger"
+        );
+        // The client was told why, then the socket closed.
+        let (mut cr, _cw) = tokio::io::split(client_side);
+        let mut buf = vec![0u8; 256];
+        let n = cr.read(&mut buf).await.expect("read");
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("network removed"),
+            "the client gets a detach notice"
+        );
     }
 
     /// A multi-target line surfaces EVERY target's outcome, not just the last.
