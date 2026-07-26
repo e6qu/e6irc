@@ -4915,12 +4915,7 @@ fn account_creation_is_rate_limited_per_ip() {
         line: b"REGISTER * * pw".to_vec(),
     });
     let creates = std::iter::from_fn(|| db_rx.try_pop())
-        .filter(|env| {
-            matches!(
-                env.payload,
-                e6ircd::core::DbRequest::CreateAccount { .. }
-            )
-        })
+        .filter(|env| matches!(env.payload, e6ircd::core::DbRequest::CreateAccount { .. }))
         .count();
     assert_eq!(
         creates, 1,

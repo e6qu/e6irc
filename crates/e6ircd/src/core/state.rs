@@ -1008,9 +1008,7 @@ impl ServerState {
                 buckets.remove(&oldest);
             }
         }
-        let entry = buckets
-            .entry(host.to_string())
-            .or_insert((burst, now));
+        let entry = buckets.entry(host.to_string()).or_insert((burst, now));
         // The refill watermark is monotonic; guard against a non-monotonic
         // source as defense in depth (same as the command-flood bucket).
         if now < entry.1 {
