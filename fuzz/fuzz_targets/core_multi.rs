@@ -60,6 +60,7 @@ fuzz_target!(|data: &[u8]| {
             clock: advancing_clock,
             mono_clock: || e6irc_proto::time::MonoMillis::from_millis(1_000_000_000),
             command_burst: None,
+            registration_burst: None,
             registration_before_connect: false,
             registration_require_email: false,
         },
