@@ -828,7 +828,18 @@ server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit log) — the read views that begin the web
 management UI; it shares the `pages` module, `render_private`, and the exact
 admin gate the `/api/v1/admin/*` JSON endpoints use, so it can never surface
-server-wide data to a non-admin.
+server-wide data to a non-admin. The console shell (`console_base.html`) is
+also the home of `/console/networks` — a per-user BNC network manager with
+live connection status, available to any authenticated user for their own
+networks — and `/console/integrations` (admin), which manages the chat-platform
+bridges: per-platform build availability, running bridges with status, and
+add/remove. A network's `kind` (`irc`/`matrix`/`discord`/`slack`) is a column on
+`bnc_networks`, so bridges are runtime-managed just like IRC upstreams — created
+via the console or REST, persisted, and started by the one feature-gated
+`bouncer::build_driver` factory that every construction site (config-network
+startup, DB-network boot, runtime create, re-enable) shares. Per-kind secrecy:
+the password is always sealed; a kind whose *account* field is a secret (Slack's
+bot token) seals that too, while an IRC `sasl_account` login name stays plaintext.
 
 ---
 

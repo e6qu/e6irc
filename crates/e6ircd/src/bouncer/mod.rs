@@ -26,7 +26,7 @@ pub use irc_driver::{IrcNetwork, NetworkConfig};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDriver};
-pub use serve::{Registry, bnc_serve};
+pub use serve::{NetworkStatus, Registry, bnc_serve};
 #[cfg(feature = "slack")]
 pub use slack::{SlackConfig, SlackDriver};
 
@@ -45,31 +45,132 @@ pub fn bnc_secret_context(owner: &str) -> Vec<u8> {
 /// its sealed upstream SASL password with the master key under the owner's
 /// context. Fails loudly if a sealed secret is present but no key is configured,
 /// it won't open, or it was sealed for a different owner.
-pub fn network_config_from_row(
+/// Default backlog buffer capacity for a runtime-created (DB-backed) network.
+const DB_NETWORK_BUFFER_CAP: usize = 1000;
+
+/// Build the driver for a network of `kind` from its *plaintext* fields — the
+/// one feature-gated factory that maps the generic network fields onto each
+/// backend's config. A bridge kind whose build feature is absent is a loud
+/// error (never a silent fall-through to IRC), and `local` is not creatable as a
+/// bouncer network. Used by config-network startup, DB-network boot, runtime
+/// create, and re-enable, so no site can construct a driver by kind differently.
+#[allow(clippy::too_many_arguments)]
+pub fn build_driver(
+    kind: crate::config::NetworkKind,
+    addr: String,
+    tls: bool,
+    nick: String,
+    realname: String,
+    autojoin: Vec<String>,
+    buffer_cap: usize,
+    sasl_account: Option<String>,
+    sasl_password: Option<String>,
+) -> Result<Box<dyn NetworkDriver>, String> {
+    use crate::config::NetworkKind;
+    match kind {
+        // The Irc arm uses every parameter, so they are never "unused" even in a
+        // build with no bridge features — the bridge arms below just don't run.
+        NetworkKind::Irc => {
+            let sasl = match (sasl_account, sasl_password) {
+                (Some(a), Some(p)) => Some((a, p)),
+                _ => None,
+            };
+            Ok(Box::new(IrcDriver::new(NetworkConfig {
+                addr,
+                tls,
+                nick,
+                realname,
+                autojoin,
+                buffer_cap,
+                sasl,
+            })))
+        }
+        NetworkKind::Local => {
+            Err("kind=local is an in-process network, not creatable as a bouncer network".into())
+        }
+        NetworkKind::Matrix => {
+            #[cfg(feature = "matrix")]
+            {
+                Ok(Box::new(MatrixDriver::new(MatrixConfig {
+                    homeserver: addr,
+                    user: nick,
+                    password: sasl_password.unwrap_or_default(),
+                    rooms: autojoin,
+                    buffer_cap,
+                })))
+            }
+            #[cfg(not(feature = "matrix"))]
+            {
+                Err("kind=matrix but this binary was built without the `matrix` feature".into())
+            }
+        }
+        NetworkKind::Discord => {
+            #[cfg(feature = "discord")]
+            {
+                Ok(Box::new(DiscordDriver::new(DiscordConfig {
+                    token: sasl_password.unwrap_or_default(),
+                    api_base: addr,
+                    channels: autojoin,
+                    buffer_cap,
+                })))
+            }
+            #[cfg(not(feature = "discord"))]
+            {
+                Err("kind=discord but this binary was built without the `discord` feature".into())
+            }
+        }
+        NetworkKind::Slack => {
+            #[cfg(feature = "slack")]
+            {
+                Ok(Box::new(SlackDriver::new(SlackConfig {
+                    bot_token: sasl_account.unwrap_or_default(),
+                    app_token: sasl_password.unwrap_or_default(),
+                    api_base: addr,
+                    channels: autojoin,
+                    buffer_cap,
+                })))
+            }
+            #[cfg(not(feature = "slack"))]
+            {
+                Err("kind=slack but this binary was built without the `slack` feature".into())
+            }
+        }
+    }
+}
+
+/// Build the driver for a persisted network row, unsealing its stored secrets
+/// per kind: the password (`sasl_password_sealed`) is always sealed, and for a
+/// kind whose *account* field carries a secret (Slack's bot token) that is
+/// sealed too — an IRC `sasl_account` is a public name and stays plaintext.
+pub fn driver_from_row(
     row: &crate::db::BncNetworkRow,
     key: Option<&crate::secret::SecretKey>,
     owner: &str,
-) -> Result<NetworkConfig, String> {
-    let sasl = match (&row.sasl_account, &row.sasl_password_sealed) {
-        (Some(account), Some(sealed)) => {
-            let key =
-                key.ok_or("stored upstream secret present but no master key is configured")?;
-            let password = key
-                .open(sealed, &bnc_secret_context(owner))
-                .map_err(|e| e.to_string())?;
-            Some((account.clone(), password))
-        }
-        _ => None,
+) -> Result<Box<dyn NetworkDriver>, String> {
+    let context = bnc_secret_context(owner);
+    let unseal = |blob: &str| -> Result<String, String> {
+        let key = key.ok_or("stored upstream secret present but no master key is configured")?;
+        key.open(blob, &context).map_err(|e| e.to_string())
     };
-    Ok(NetworkConfig {
-        addr: row.addr.clone(),
-        tls: row.tls,
-        nick: row.nick.clone(),
-        realname: row.realname.clone().unwrap_or_else(|| row.nick.clone()),
-        autojoin: row.autojoin.clone(),
-        buffer_cap: 1000,
-        sasl,
-    })
+    let password = match &row.sasl_password_sealed {
+        Some(sealed) => Some(unseal(sealed)?),
+        None => None,
+    };
+    let account = match &row.sasl_account {
+        Some(account) if row.kind.account_is_secret() => Some(unseal(account)?),
+        other => other.clone(),
+    };
+    build_driver(
+        row.kind,
+        row.addr.clone(),
+        row.tls,
+        row.nick.clone(),
+        row.realname.clone().unwrap_or_else(|| row.nick.clone()),
+        row.autojoin.clone(),
+        DB_NETWORK_BUFFER_CAP,
+        account,
+        password,
+    )
 }
 
 use tokio::sync::mpsc;

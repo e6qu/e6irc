@@ -1737,6 +1737,9 @@ pub async fn verify_credentials(
 /// key before starting the driver.
 #[derive(Debug, Clone)]
 pub struct BncNetworkRow {
+    /// Which driver backs this network (`irc` for a plain upstream, or a
+    /// `matrix`/`discord`/`slack` bridge).
+    pub kind: crate::config::NetworkKind,
     pub name: String,
     pub addr: String,
     pub tls: bool,
@@ -1753,6 +1756,10 @@ pub struct BncNetworkRow {
 fn bnc_row(row: &sqlx::postgres::PgRow) -> BncNetworkRow {
     use sqlx::Row;
     BncNetworkRow {
+        // An unrecognized stored kind falls back to `irc` (the column default and
+        // the only kind that predates this column) rather than dropping the row.
+        kind: crate::config::NetworkKind::from_db_str(&row.get::<String, _>("kind"))
+            .unwrap_or_default(),
         name: row.get("name"),
         addr: row.get("addr"),
         tls: row.get("tls"),
@@ -1798,8 +1805,8 @@ pub async fn create_bnc_network(
     let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
-            sasl_account, sasl_password_sealed)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            sasl_account, sasl_password_sealed, kind)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (account_id, name) DO NOTHING
          RETURNING id",
     )
@@ -1812,6 +1819,7 @@ pub async fn create_bnc_network(
     .bind(&net.autojoin)
     .bind(&net.sasl_account)
     .bind(&net.sasl_password_sealed)
+    .bind(net.kind.as_db_str())
     .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?
@@ -1833,7 +1841,7 @@ pub async fn list_bnc_networks(
     let folded = CaseMapping::Rfc1459.casefold(account);
     let rows = sqlx::query(
         "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
-                n.sasl_account, n.sasl_password_sealed, n.enabled
+                n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE a.name_folded = $1 ORDER BY n.name",
     )
@@ -1855,7 +1863,7 @@ pub async fn get_bnc_network(
     let folded = CaseMapping::Rfc1459.casefold(account);
     let row = sqlx::query(
         "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
-                n.sasl_account, n.sasl_password_sealed, n.enabled
+                n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE a.name_folded = $1 AND n.name = $2",
     )
@@ -1897,7 +1905,7 @@ pub async fn list_all_bnc_networks(pool: &PgPool) -> Result<Vec<(String, BncNetw
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.realname,
-                n.autojoin, n.sasl_account, n.sasl_password_sealed, n.enabled
+                n.autojoin, n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
          WHERE n.enabled",
     )

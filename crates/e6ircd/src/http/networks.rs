@@ -6,6 +6,9 @@ use super::*;
 
 #[derive(Deserialize)]
 pub(super) struct CreateNetwork {
+    /// Driver kind; defaults to `irc`. A bridge kind requires its build feature.
+    #[serde(default)]
+    pub(super) kind: crate::config::NetworkKind,
     pub(super) name: String,
     pub(super) addr: String,
     #[serde(default)]
@@ -165,11 +168,46 @@ pub(super) async fn create_network_core(
             Some("name must be non-empty and contain no '/' or whitespace"),
         ));
     }
-    if req.addr.is_empty() || req.nick.is_empty() {
+    use crate::config::NetworkKind;
+    let kind = req.kind;
+    // A bridge kind can only run on a binary built with its feature, and `local`
+    // is not creatable as a bouncer network — reject up front (before any insert)
+    // rather than persist a row whose driver could never start.
+    if !kind_feature_available(kind) {
         return Err(problem(
             StatusCode::BAD_REQUEST,
-            "addr and nick are required",
-            None,
+            "Unsupported network kind",
+            Some(match kind {
+                NetworkKind::Local => "kind=local is not a creatable bouncer network",
+                _ => "this server was not built with that bridge's feature",
+            }),
+        ));
+    }
+    // Per-kind required fields (mirrors the config-file validation): an IRC/Matrix
+    // upstream needs an address and nick; every bridge needs its secret token(s).
+    let missing = match kind {
+        NetworkKind::Irc => req.addr.is_empty() || req.nick.is_empty(),
+        NetworkKind::Matrix => {
+            req.addr.is_empty() || req.nick.is_empty() || req.sasl_password.is_none()
+        }
+        NetworkKind::Discord => req.sasl_password.is_none(),
+        NetworkKind::Slack => req.sasl_account.is_none() || req.sasl_password.is_none(),
+        NetworkKind::Local => true,
+    };
+    if missing {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Missing required fields for this network kind",
+            Some(match kind {
+                NetworkKind::Matrix => {
+                    "matrix requires addr (homeserver), nick (user), sasl_password (password)"
+                }
+                NetworkKind::Discord => "discord requires sasl_password (bot token)",
+                NetworkKind::Slack => {
+                    "slack requires sasl_account (bot token) and sasl_password (app token)"
+                }
+                _ => "addr and nick are required",
+            }),
         ));
     }
     // `nick`/`realname`/`autojoin` are interpolated into NICK/USER/JOIN lines to
@@ -227,44 +265,57 @@ pub(super) async fn create_network_core(
             Some("addr must not be a loopback, link-local, unspecified or multicast IP"),
         ));
     }
-    // Upstream SASL is both-or-neither.
-    let upstream = match (&req.sasl_account, &req.sasl_password) {
-        (Some(a), Some(p)) => Some((a.clone(), p.clone())),
-        (None, None) => None,
-        _ => {
+    // For IRC the SASL pair is both-or-neither (account = login name, password =
+    // secret). Bridges don't follow that rule — their required fields are checked
+    // above — so this only applies to IRC.
+    if kind == NetworkKind::Irc && req.sasl_account.is_some() != req.sasl_password.is_some() {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Incomplete upstream SASL",
+            Some("provide both sasl_account and sasl_password, or neither"),
+        ));
+    }
+    // Seal secrets for storage, per kind. The password is always a secret and is
+    // sealed. The account field is a secret *only* for Slack (its bot token), so
+    // it is sealed there too; an IRC `sasl_account` is a public login name and is
+    // stored in the clear (and read back verbatim). Sealing binds to the owning
+    // account so a blob can never be opened for a different account's row.
+    let need_key =
+        req.sasl_password.is_some() || (kind.account_is_secret() && req.sasl_account.is_some());
+    let key = match (&state.secret_key, need_key) {
+        (Some(k), _) => Some(k),
+        (None, false) => None,
+        (None, true) => {
             return Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Incomplete upstream SASL",
-                Some("provide both sasl_account and sasl_password, or neither"),
+                StatusCode::CONFLICT,
+                "No master key configured",
+                Some("the server cannot store upstream credentials without [secrets]"),
             ));
         }
     };
-    // Seal the upstream password for storage; requires a master key.
-    let sealed = match &upstream {
-        Some((_, password)) => {
-            let Some(key) = &state.secret_key else {
-                return Err(problem(
-                    StatusCode::CONFLICT,
-                    "No master key configured",
-                    Some("the server cannot store upstream credentials without [secrets]"),
-                ));
-            };
-            // Bind the sealed password to its owning account, so it can never be
-            // opened for a different account's network row.
-            Some(key.seal(password, &crate::bouncer::bnc_secret_context(account)))
-        }
-        None => None,
+    let context = crate::bouncer::bnc_secret_context(account);
+    let sealed_password = req.sasl_password.as_ref().map(|p| {
+        key.expect("key present when a password is")
+            .seal(p, &context)
+    });
+    let stored_account = match &req.sasl_account {
+        Some(a) if kind.account_is_secret() => Some(
+            key.expect("key present when the account is secret")
+                .seal(a, &context),
+        ),
+        other => other.clone(),
     };
 
     let row = crate::db::BncNetworkRow {
+        kind,
         name: req.name.clone(),
         addr: req.addr.clone(),
         tls: req.tls,
         nick: req.nick.clone(),
         realname: req.realname.clone(),
         autojoin: req.autojoin.clone(),
-        sasl_account: upstream.as_ref().map(|(a, _)| a.clone()),
-        sasl_password_sealed: sealed,
+        sasl_account: stored_account,
+        sasl_password_sealed: sealed_password,
         enabled: true,
     };
     let pool = state.pool.as_ref().expect("caller checked the pool");
@@ -298,22 +349,49 @@ pub(super) async fn create_network_core(
         }
     }
 
-    registry.add(
-        Some(account),
-        &req.name,
-        Box::new(crate::bouncer::IrcDriver::new(
-            crate::bouncer::NetworkConfig {
-                addr: req.addr.clone(),
-                tls: req.tls,
-                nick: req.nick.clone(),
-                realname: req.realname.clone().unwrap_or_else(|| req.nick.clone()),
-                autojoin: req.autojoin.clone(),
-                buffer_cap: 1000,
-                sasl: upstream,
-            },
-        )),
-    );
+    // Build the driver from the *plaintext* creds (the row stored the sealed
+    // forms) via the one feature-gated factory. Feature availability was checked
+    // up front, so an error here is unexpected — undo the insert rather than
+    // leave a row whose driver never started.
+    let driver = match crate::bouncer::build_driver(
+        kind,
+        req.addr.clone(),
+        req.tls,
+        req.nick.clone(),
+        req.realname.clone().unwrap_or_else(|| req.nick.clone()),
+        req.autojoin.clone(),
+        1000,
+        req.sasl_account.clone(),
+        req.sasl_password.clone(),
+    ) {
+        Ok(driver) => driver,
+        Err(e) => {
+            if let Err(re) = crate::db::delete_bnc_network(pool, account, &req.name).await {
+                eprintln!("http: rollback after driver-build failure failed: {re}");
+            }
+            return Err(problem(
+                StatusCode::CONFLICT,
+                "Cannot start network",
+                Some(&e),
+            ));
+        }
+    };
+    registry.add(Some(account), &req.name, driver);
     Ok(())
+}
+
+/// Whether a network of `kind` can actually run on this binary: `irc` always,
+/// each bridge only if built with its feature, `local` never (it is an
+/// in-process network, not a creatable bouncer network).
+pub(super) fn kind_feature_available(kind: crate::config::NetworkKind) -> bool {
+    use crate::config::NetworkKind;
+    match kind {
+        NetworkKind::Irc => true,
+        NetworkKind::Local => false,
+        NetworkKind::Matrix => cfg!(feature = "matrix"),
+        NetworkKind::Discord => cfg!(feature = "discord"),
+        NetworkKind::Slack => cfg!(feature = "slack"),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -417,27 +495,20 @@ pub(super) async fn patch_network(
                 );
             }
         };
-        let cfg = match crate::bouncer::network_config_from_row(
-            &row,
-            state.secret_key.as_deref(),
-            &account,
-        ) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                // Can't start it — undo the enable so the flag matches reality.
-                if let Err(re) =
-                    crate::db::set_bnc_network_enabled(pool, &account, &name, false).await
-                {
-                    eprintln!("http: failed to roll back enable after start error: {re}");
+        let driver =
+            match crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), &account) {
+                Ok(driver) => driver,
+                Err(e) => {
+                    // Can't start it — undo the enable so the flag matches reality.
+                    if let Err(re) =
+                        crate::db::set_bnc_network_enabled(pool, &account, &name, false).await
+                    {
+                        eprintln!("http: failed to roll back enable after start error: {re}");
+                    }
+                    return problem(StatusCode::CONFLICT, "Cannot start network", Some(&e));
                 }
-                return problem(StatusCode::CONFLICT, "Cannot start network", Some(&e));
-            }
-        };
-        registry.add(
-            Some(&account),
-            &name,
-            Box::new(crate::bouncer::IrcDriver::new(cfg)),
-        );
+            };
+        registry.add(Some(&account), &name, driver);
     } else {
         registry.remove(Some(&account), &name);
     }

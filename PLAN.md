@@ -1593,6 +1593,62 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Management console — stage 5 (runtime bridge CRUD — the approved decision, built)
+(2026-07-26): the human said yes to making bridges runtime-manageable, so they now
+are — created/removed from the console (or REST) and persisted, just like IRC
+upstreams, instead of living only in the config file. The generic `bnc_networks`
+columns already carried every bridge's fields; the only schema change is a new
+`kind` column (migration `0033`, defaulting existing rows to `irc`).
+
+The heart of it is one **feature-gated `bouncer::build_driver` factory** that maps
+the generic fields onto each backend's config (Matrix/Discord/Slack, or IRC),
+returning a loud error for a bridge kind whose build feature is absent (never a
+silent fall-through to IRC) and refusing `local`. Every driver-construction site
+now goes through it — config-network startup (`Registry::start`), DB-network boot
+(`net.rs`), runtime create (`create_network_core`), and re-enable
+(`patch_network`) — so a kind can never be built differently at one site than
+another. A companion `driver_from_row` unseals a persisted row's secrets **per
+kind** before building: the password is always sealed, and a kind whose *account*
+field is a secret (Slack's `xoxb-` bot token) seals that too, while an IRC
+`sasl_account` login name stays plaintext. `create_network_core` grew per-kind
+required-field validation, an up-front feature-availability gate (so a row is
+never persisted for a driver that can't start), and matching per-kind sealing; on
+the rare post-insert driver-build failure it rolls the row back.
+
+Because `CreateNetwork` gained a `kind` field, the REST create endpoint supports
+bridges immediately. The console `/console/integrations` page became a real
+manager: per built-in platform an add form with that platform's fields, and a
+Remove button on the admin's own bridges (a config/shared bridge shows "config"
+and is managed via the file). Verified: workspace (29 bins) + a DB round-trip test
+(a Matrix row persists and reads back with its kind) + a console test (bridge-add
+is admin+CSRF gated and refuses an unbuilt kind); each bridge feature alone under
+`-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates + `cargo
+deny`; fuzz under `--cfg fuzzing`. Live bridge round-trips against real services
+remain the existing feature-gated, service-backed tests (Conduit etc.).
+
+Management console — stage 4 (integrations status + a decision put to the human)
+(2026-07-26): a new admin `/console/integrations` page surfaces the chat-platform
+bridges, which were previously invisible in the UI. For each of Matrix / Discord /
+Slack it shows whether *this binary* was built with the feature (`cfg!(feature =
+…)`), the bridge networks currently running (with live connection status), and the
+`[[network]]` config shape to add one. Backend: the registry now records each
+driver's `kind` on its slot and exposes `Registry::list()` (owner, name, kind,
+connected) — a small, safe read addition — consumed by the page.
+
+The scope boundary is a real fork, not a silent skip: bridges today are
+*config-file* networks (`kind = matrix|discord|slack`), feature-gated and started
+at boot, whereas the runtime DB-backed BNC networks are IRC-only (`create_network_
+core` always builds an `IrcDriver`). Making bridges *runtime-manageable* (add/edit
+a bridge from the UI) needs a real backend project — a `kind` column + bridge
+fields on `bnc_networks` (a schema migration), `create_network_core` building the
+right feature-gated driver, and bot-token sealing/secrets UX. That is a
+consequential, hard-to-reverse decision, so it is **put to the human** rather than
+committed unilaterally; this stage delivers the honest status+guidance view that
+needs no migration and sets up the section. Verified: workspace (29 bins) + a new
+PG-backed test (admin gate + all three platforms shown as not-built on the default
+build); clippy default + `embed-web`; each bridge alone under `-Dwarnings`; all
+`tools/check-*` gates + `cargo deny`.
+
 Management console — stage 3 (BNC session + network management) (2026-07-26):
 the console shell was refactored into a shared `console_base.html` (header + nav +
 `{% block main %}`, askama inheritance) so every console page shares one chrome;

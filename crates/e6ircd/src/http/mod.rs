@@ -176,6 +176,14 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(pages::console_delete_network),
         )
         .route(
+            "/console/integrations",
+            get(pages::console_integrations).post(pages::console_add_bridge),
+        )
+        .route(
+            "/console/integrations/delete",
+            post(pages::console_delete_bridge),
+        )
+        .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         )
@@ -849,6 +857,7 @@ mod pages {
             }
         };
         let req = CreateNetwork {
+            kind: crate::config::NetworkKind::Irc,
             name: f.name,
             addr: f.addr,
             tls: f.tls.as_deref() == Some("on"),
@@ -900,6 +909,251 @@ mod pages {
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         console_networks_fragment(&state, &account, csrf).await
+    }
+
+    struct BridgeNet {
+        name: String,
+        owner: String,
+        connected: bool,
+        /// Whether the viewing admin owns this bridge (so it can be removed from
+        /// here). A config-file / shared bridge is managed via config, not here.
+        deletable: bool,
+    }
+    struct BridgePlatform {
+        name: &'static str,
+        kind: &'static str,
+        built: bool,
+        configure: &'static str,
+        /// Fields the add-bridge form should collect for this platform.
+        needs_addr: bool,
+        needs_nick: bool,
+        needs_account: bool,
+        account_label: &'static str,
+        password_label: &'static str,
+        networks: Vec<BridgeNet>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_integrations.html")]
+    struct ConsoleIntegrations {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        bouncer_enabled: bool,
+        platforms: Vec<BridgePlatform>,
+    }
+
+    /// Console → Integrations (admin): the chat-platform bridges. For each
+    /// platform it shows whether this binary was built with the feature and the
+    /// bridge networks currently running (with live status). Bridges are
+    /// configured as `[[network]]` entries today; runtime CRUD is future work,
+    /// so this is a status + configuration-guidance view.
+    pub async fn console_integrations(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        if !is_admin_account(&state, &account) {
+            return problem(StatusCode::FORBIDDEN, "Admin only", None);
+        }
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let all = state
+            .bnc_registry
+            .as_ref()
+            .map(|r| r.list())
+            .unwrap_or_default();
+        let admin_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
+        let bridge_nets = |kind: &str| -> Vec<BridgeNet> {
+            all.iter()
+                .filter(|n| n.kind == kind)
+                .map(|n| BridgeNet {
+                    name: n.name.clone(),
+                    owner: n.owner.clone().unwrap_or_else(|| "shared".into()),
+                    connected: n.connected,
+                    // Only the admin's own bridges are removable here; a shared /
+                    // config-file bridge (owner = None) is managed via config.
+                    deletable: n.owner.as_deref() == Some(admin_folded.as_str()),
+                })
+                .collect()
+        };
+        let platforms = vec![
+            BridgePlatform {
+                name: "Matrix",
+                kind: "matrix",
+                built: cfg!(feature = "matrix"),
+                configure: "A homeserver bridged as a network: messages relay both ways.",
+                needs_addr: true,
+                needs_nick: true,
+                needs_account: false,
+                account_label: "",
+                password_label: "Login password",
+                networks: bridge_nets("matrix"),
+            },
+            BridgePlatform {
+                name: "Discord",
+                kind: "discord",
+                built: cfg!(feature = "discord"),
+                configure: "A Discord bot session; autojoin lists the channel IDs to bridge.",
+                needs_addr: false,
+                needs_nick: false,
+                needs_account: false,
+                account_label: "",
+                password_label: "Bot token",
+                networks: bridge_nets("discord"),
+            },
+            BridgePlatform {
+                name: "Slack",
+                kind: "slack",
+                built: cfg!(feature = "slack"),
+                configure: "A Slack workspace; autojoin lists the channels to bridge.",
+                needs_addr: false,
+                needs_nick: false,
+                needs_account: true,
+                account_label: "Bot token (xoxb-)",
+                password_label: "App token (xapp-)",
+                networks: bridge_nets("slack"),
+            },
+        ];
+        render_private(ConsoleIntegrations {
+            account,
+            csrf,
+            is_admin: true,
+            active: "integrations",
+            bouncer_enabled: state.bnc_registry.is_some(),
+            platforms,
+        })
+    }
+
+    /// The console add-bridge form (urlencoded; hidden CSRF field — a plain form
+    /// can't set the `x-csrf-token` header htmx uses). Field meaning is per kind.
+    #[derive(Deserialize)]
+    pub struct BridgeFormFields {
+        csrf: String,
+        kind: String,
+        name: String,
+        #[serde(default)]
+        addr: String,
+        #[serde(default)]
+        nick: String,
+        #[serde(default)]
+        sasl_account: String,
+        #[serde(default)]
+        sasl_password: String,
+        #[serde(default)]
+        autojoin: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct BridgeDeleteFields {
+        csrf: String,
+        name: String,
+    }
+
+    async fn require_admin_form_actor(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        csrf: &str,
+    ) -> Result<String, Response> {
+        let account = authenticate(state, headers)
+            .await
+            .map_err(|_| Redirect::to("/login").into_response())?;
+        if !is_admin_account(state, &account) {
+            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
+        }
+        let Some(session) = session_token(headers, state.secure_cookies) else {
+            return Err(problem(StatusCode::UNAUTHORIZED, "Session required", None));
+        };
+        if !state.csrf_valid(&session, csrf) {
+            return Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None));
+        }
+        Ok(account)
+    }
+
+    /// Console → Integrations: add a bridge (admin). Maps the platform form onto
+    /// `CreateNetwork` and reuses `create_network_core` (schema, per-kind secret
+    /// sealing, feature-gated driver construction) — so a console-created bridge
+    /// and a config-file one run through the exact same path. Owned by the
+    /// creating admin's account.
+    pub async fn console_add_bridge(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BridgeFormFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let Some(kind) = crate::config::NetworkKind::from_db_str(&f.kind).filter(|k| k.is_bridge())
+        else {
+            return problem(StatusCode::BAD_REQUEST, "Not a bridge kind", None);
+        };
+        let opt = |s: String| if s.is_empty() { None } else { Some(s) };
+        let req = CreateNetwork {
+            kind,
+            name: f.name,
+            addr: f.addr,
+            tls: true,
+            nick: f.nick,
+            realname: None,
+            autojoin: f
+                .autojoin
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            sasl_account: opt(f.sasl_account),
+            sasl_password: opt(f.sasl_password),
+        };
+        if let Err(r) = create_network_core(&state, registry, &account, &req).await {
+            return r;
+        }
+        Redirect::to("/console/integrations").into_response()
+    }
+
+    /// Console → Integrations: remove one of the admin's own bridges.
+    pub async fn console_delete_bridge(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BridgeDeleteFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let pool = pool_of(&state);
+        match crate::db::delete_bnc_network(pool, &account, &f.name).await {
+            Ok(true) => registry.remove(Some(&account), &f.name),
+            Ok(false) => return problem(StatusCode::NOT_FOUND, "No such bridge", None),
+            Err(e) => {
+                eprintln!("console: bridge delete: {e}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                );
+            }
+        };
+        Redirect::to("/console/integrations").into_response()
     }
 
     #[derive(Template)]
@@ -1042,6 +1296,7 @@ mod pages {
             }
         };
         let req = CreateNetwork {
+            kind: crate::config::NetworkKind::Irc,
             name: f.name,
             addr: f.addr,
             tls: f.tls.as_deref() == Some("on"),

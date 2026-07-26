@@ -54,6 +54,18 @@ pub struct Registry {
 struct Slot {
     handle: Arc<NetworkHandle>,
     persistence: Option<tokio::task::JoinHandle<()>>,
+    /// The driver's stable kind (`irc`, `matrix`, `discord`, `slack`, …),
+    /// captured before `start()` consumes the driver — for status views.
+    kind: &'static str,
+}
+
+/// A read-only snapshot of one registered network, for status/management views.
+pub struct NetworkStatus {
+    /// Owning account (casefolded), or `None` for a server-level shared network.
+    pub owner: Option<String>,
+    pub name: String,
+    pub kind: &'static str,
+    pub connected: bool,
 }
 
 impl Slot {
@@ -90,80 +102,33 @@ impl Registry {
             pool,
         };
         for e in entries {
-            let config = NetworkConfig {
-                addr: e.addr.clone(),
-                tls: e.tls,
-                nick: e.nick.clone(),
-                realname: e.realname.clone().unwrap_or_else(|| e.nick.clone()),
-                autojoin: e.autojoin.clone(),
-                buffer_cap: e.buffer_cap,
-                sasl: match (&e.sasl_account, &e.sasl_password) {
-                    (Some(a), Some(p)) => Some((a.clone(), p.clone())),
-                    _ => None,
-                },
-            };
-            let driver: Box<dyn super::NetworkDriver> = match e.kind {
-                NetworkKind::Irc => Box::new(super::IrcDriver::new(config)),
-                NetworkKind::Local => Box::new(super::LocalDriver::new(core.clone(), config)),
-                NetworkKind::Matrix => {
-                    #[cfg(feature = "matrix")]
-                    {
-                        Box::new(super::MatrixDriver::new(super::MatrixConfig {
-                            homeserver: e.addr.clone(),
-                            user: e.nick.clone(),
-                            password: e.sasl_password.clone().unwrap_or_default(),
-                            rooms: e.autojoin.clone(),
-                            buffer_cap: e.buffer_cap,
-                        }))
-                    }
-                    #[cfg(not(feature = "matrix"))]
-                    {
-                        return Err(format!(
-                            "network '{}' is kind=matrix but this binary was built \
-                             without the `matrix` feature",
-                            e.name
-                        ));
-                    }
-                }
-                NetworkKind::Discord => {
-                    #[cfg(feature = "discord")]
-                    {
-                        Box::new(super::DiscordDriver::new(super::DiscordConfig {
-                            token: e.sasl_password.clone().unwrap_or_default(),
-                            api_base: e.addr.clone(),
-                            channels: e.autojoin.clone(),
-                            buffer_cap: e.buffer_cap,
-                        }))
-                    }
-                    #[cfg(not(feature = "discord"))]
-                    {
-                        return Err(format!(
-                            "network '{}' is kind=discord but this binary was built \
-                             without the `discord` feature",
-                            e.name
-                        ));
-                    }
-                }
-                NetworkKind::Slack => {
-                    #[cfg(feature = "slack")]
-                    {
-                        Box::new(super::SlackDriver::new(super::SlackConfig {
-                            bot_token: e.sasl_account.clone().unwrap_or_default(),
-                            app_token: e.sasl_password.clone().unwrap_or_default(),
-                            api_base: e.addr.clone(),
-                            channels: e.autojoin.clone(),
-                            buffer_cap: e.buffer_cap,
-                        }))
-                    }
-                    #[cfg(not(feature = "slack"))]
-                    {
-                        return Err(format!(
-                            "network '{}' is kind=slack but this binary was built \
-                             without the `slack` feature",
-                            e.name
-                        ));
-                    }
-                }
+            // `local` needs the in-process core handles, so it stays special; all
+            // other kinds go through the shared feature-gated `build_driver`
+            // factory (the same one the DB create/boot/re-enable paths use).
+            let driver: Box<dyn super::NetworkDriver> = if e.kind == NetworkKind::Local {
+                let config = NetworkConfig {
+                    addr: e.addr.clone(),
+                    tls: e.tls,
+                    nick: e.nick.clone(),
+                    realname: e.realname.clone().unwrap_or_else(|| e.nick.clone()),
+                    autojoin: e.autojoin.clone(),
+                    buffer_cap: e.buffer_cap,
+                    sasl: None,
+                };
+                Box::new(super::LocalDriver::new(core.clone(), config))
+            } else {
+                super::build_driver(
+                    e.kind,
+                    e.addr.clone(),
+                    e.tls,
+                    e.nick.clone(),
+                    e.realname.clone().unwrap_or_else(|| e.nick.clone()),
+                    e.autojoin.clone(),
+                    e.buffer_cap,
+                    e.sasl_account.clone(),
+                    e.sasl_password.clone(),
+                )
+                .map_err(|msg| format!("network '{}': {msg}", e.name))?
             };
             registry.add(e.owner.as_deref(), &e.name, driver);
         }
@@ -175,6 +140,8 @@ impl Registry {
     /// With a database, restore recent backlog and persist new lines.
     pub fn add(&self, owner: Option<&str>, name: &str, driver: Box<dyn super::NetworkDriver>) {
         let key = NetworkKey::new(owner, name);
+        // Capture the kind before `start()` consumes the driver.
+        let kind = driver.kind();
         let handle = Arc::new(driver.start());
         // The persistence task keys `bnc_buffer` rows by the same casefolded
         // owner the registry uses, so a buffer cannot be written under one
@@ -185,6 +152,7 @@ impl Registry {
         let slot = Slot {
             handle,
             persistence,
+            kind,
         };
         // Replacing a key must stop the old driver, not leak it.
         if let Some(old) = self
@@ -236,6 +204,22 @@ impl Registry {
             .expect("registry poisoned")
             .get(&NetworkKey::new(None, name))
             .map(|slot| slot.handle.clone())
+    }
+
+    /// A snapshot of every registered network — its owner, name, driver kind,
+    /// and live connection state — for the console's status/integration views.
+    pub fn list(&self) -> Vec<NetworkStatus> {
+        self.networks
+            .lock()
+            .expect("registry poisoned")
+            .iter()
+            .map(|(key, slot)| NetworkStatus {
+                owner: key.owner.clone(),
+                name: key.name.clone(),
+                kind: slot.kind,
+                connected: slot.handle.is_connected(),
+            })
+            .collect()
     }
 }
 
