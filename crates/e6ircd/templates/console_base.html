@@ -60,6 +60,14 @@
         background: transparent; color: inherit; cursor: pointer; }
       form.add button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
       button.danger { color: var(--off); border-color: var(--off); background: transparent; }
+      @media (max-width: 40rem) {
+        .layout { flex-direction: column; }
+        nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
+          border-right: none; border-bottom: 1px solid var(--border);
+          display: flex; flex-wrap: wrap; gap: 0.25rem; }
+        nav .section { width: 100%; margin: 0.5rem 0.7rem 0.15rem; }
+        main { padding: 1rem; }
+      }
     </style>
   </head>
   <body>
@@ -88,5 +96,6 @@
         {% block main %}{% endblock %}
       </main>
     </div>
+    {% include "_toast.html" %}
   </body>
 </html>
