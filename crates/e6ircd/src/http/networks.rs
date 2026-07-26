@@ -46,14 +46,25 @@ pub(super) async fn list_networks(
                     let connected = registry
                         .get_owned(&account, &n.name)
                         .map(|h| h.is_connected());
+                    // `sasl_account` is a public login name for IRC, but a
+                    // *secret* (sealed) for a kind like Slack — never echo the
+                    // sealed ciphertext; expose only its presence, like the
+                    // password. IRC keeps returning the plaintext name.
+                    let account = if n.kind.account_is_secret() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(n.sasl_account)
+                    };
                     serde_json::json!({
                         "name": n.name,
+                        "kind": n.kind.as_db_str(),
                         "addr": n.addr,
                         "tls": n.tls,
                         "nick": n.nick,
                         "realname": n.realname,
                         "autojoin": n.autojoin,
-                        "sasl_account": n.sasl_account,
+                        "sasl_account": account,
+                        "has_sasl_account": n.sasl_account.is_some(),
                         "has_sasl_password": n.sasl_password_sealed.is_some(),
                         "enabled": n.enabled,
                         "connected": connected,
@@ -100,23 +111,34 @@ pub(super) async fn create_network(
     }
 }
 
-/// Whether `addr` (`host:port`, IPv6 bracketed) has an IP-literal host that
-/// points at a target that is never a legitimate IRC upstream and that the
-/// server must not be tricked into dialing: the cloud-metadata link-local range
-/// (169.254/fe80), unspecified, multicast, broadcast, and documentation ranges.
+/// Whether `addr` has an IP-literal host that points at a target that is never a
+/// legitimate upstream and that the server must not be tricked into dialing: the
+/// cloud-metadata link-local range (169.254/fe80), unspecified, multicast,
+/// broadcast, and documentation ranges.
+///
+/// Accepts both an IRC `host:port` (IPv6 bracketed) **and** a bridge base URL
+/// (`scheme://host[:port]/path`): a bridge address is a URL, and the bridge HTTP
+/// client only routes *named* hosts through its dial-time vetting resolver — an
+/// IP-literal URL host would otherwise reach an internal target unvetted, the
+/// exact metadata-SSRF this exists to stop. Extracting the host from either form
+/// closes that at the create boundary for every kind.
 ///
 /// Loopback and RFC-1918 / unique-local *private* ranges are deliberately
-/// **allowed** — a self-hosted or LAN IRC upstream (including `127.0.0.1`) is a
-/// first-class e6irc use case, so blocking those would break real deployments;
-/// the sharp, zero-false-positive SSRF vector is the link-local metadata
-/// endpoint, which this refuses. A hostname (non-literal) returns `false` here —
-/// the concrete reported vector is the IP literal; hostname resolution lives in
-/// the dialer.
+/// **allowed** — a self-hosted or LAN upstream (including `127.0.0.1`) is a
+/// first-class e6irc use case. A hostname (non-literal) returns `false` here —
+/// the concrete reported vector is the IP literal; hostname resolution is vetted
+/// at dial time.
 fn upstream_addr_is_internal(addr: &str) -> bool {
-    let host = if let Some(rest) = addr.strip_prefix('[') {
+    // Strip a URL scheme and any path/query/fragment, leaving `host[:port]`.
+    let hostport = addr.split_once("://").map_or(addr, |(_, rest)| rest);
+    let hostport = hostport.split(['/', '?', '#']).next().unwrap_or(hostport);
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest) // [ipv6]:port
     } else {
-        addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+        hostport
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(hostport)
     };
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
         return false; // hostname — not classifiable without DNS (vetted at dial)
@@ -238,7 +260,8 @@ pub(super) async fn create_network_core(
     // a NUL inside either value would shift the authzid/authcid/passwd fields
     // the upstream parses — the same injection-primitive class as CR/LF in a
     // command line.
-    if has_control(&req.addr)
+    if has_control(&req.name)
+        || has_control(&req.addr)
         || has_control(&req.nick)
         || req.realname.as_deref().is_some_and(has_control)
         || req.autojoin.iter().any(|c| has_control(c))
@@ -580,5 +603,26 @@ mod tests {
         // Real public IPs and hostnames are allowed (the dialer resolves names).
         assert!(!upstream_addr_is_internal("93.184.216.34:6697"));
         assert!(!upstream_addr_is_internal("irc.libera.chat:6697"));
+    }
+
+    #[test]
+    fn bridge_url_addr_ssrf_is_classified() {
+        // A bridge base is a URL. An IP-literal host in URL form must be
+        // classified the same as `host:port` — the metadata endpoint reached via
+        // `http://169.254.169.254` bypassed the check before (URL didn't parse as
+        // host:port) and was never vetted by the HTTP client's named-host-only
+        // resolver.
+        assert!(upstream_addr_is_internal("http://169.254.169.254"));
+        assert!(upstream_addr_is_internal("https://169.254.169.254/gateway"));
+        assert!(upstream_addr_is_internal(
+            "http://169.254.169.254:8443/x?y=1"
+        ));
+        assert!(upstream_addr_is_internal("https://[fe80::1]/api"));
+        assert!(upstream_addr_is_internal("http://[::ffff:169.254.169.254]"));
+        // A real homeserver / API base (hostname, or an allowed private literal).
+        assert!(!upstream_addr_is_internal("https://matrix.org"));
+        assert!(!upstream_addr_is_internal("https://slack.com/api"));
+        assert!(!upstream_addr_is_internal("http://127.0.0.1:8008")); // self-hosted, allowed
+        assert!(!upstream_addr_is_internal("http://192.168.1.10:8008")); // LAN, allowed
     }
 }
