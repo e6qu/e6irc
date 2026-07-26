@@ -17,7 +17,7 @@
         <div class="actions">
           {% match sole_provider %}
             {% when Some with (provider) %}
-              <a class="primary-action" href="/api/v1/auth/oidc/{{ provider }}/start">Sign in with {{ provider }}</a>
+              <a class="primary-action" href="/api/v1/auth/oidc/{{ provider }}/start">Sign in with {{ provider|capitalize }}</a>
             {% when None %}
               <a class="primary-action" href="/login">Choose a sign-in provider</a>
           {% endmatch %}

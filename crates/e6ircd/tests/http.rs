@@ -1318,8 +1318,13 @@ async fn rp_initiated_logout_redirects_to_provider() {
         assert_eq!(status, 200, "attempt {attempt}: {headers}");
         assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
         assert!(body.contains("You are signed out"), "{body}");
+        // The control text is the provider's proper name (capitalized), which is
+        // the exact accessible name Shauth's SSO validator matches
+        // ("Sign in with Shauth"); the starter path keeps the configured
+        // lowercase provider name. (Regression: issue #129 — a lowercase
+        // "Sign in with shauth" failed the validator's exact-name match.)
         assert!(
-            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with shauth</a>"),
+            body.contains("href=\"/api/v1/auth/oidc/shauth/start\">Sign in with Shauth</a>"),
             "{body}"
         );
     }
