@@ -31,8 +31,16 @@ pub(super) async fn list_networks(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
 ) -> Response {
+    // A read of "my networks" with no bouncer is an empty collection, not an
+    // error: returning 200 `{networks:[]}` lets the web client's network picker
+    // render cleanly (a 404 here shows up as a failed resource load in the
+    // browser console). The mutation endpoints still 404 when the bouncer is off.
     let Some(registry) = &state.bnc_registry else {
-        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        return (
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "networks": [] }).to_string(),
+        )
+            .into_response();
     };
     let pool = pool_of(&state);
     match crate::db::list_bnc_networks(pool, &account).await {
