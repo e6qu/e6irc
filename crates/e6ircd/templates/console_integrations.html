@@ -1,5 +1,8 @@
 {% extends "console_base.html" %}
 {% block main %}
+        {% if let Some(err) = error %}
+          <p class="banner-error" role="alert">{{ err }}</p>
+        {% endif %}
         <h1>Integrations</h1>
         <p class="meta">
           Bridges connect e6irc to other chat platforms as bouncer networks, run

@@ -1025,7 +1025,11 @@ console — are server-rendered askama pages/fragments driven by **htmx**. The
 **live chat client** is a small hand-written vanilla-JS IRC client (`web/src`,
 bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list
-state are naturally client state.
+state are naturally client state. The socket reconnects with backoff so a
+transient drop self-heals; opening the page without a `?network=` selector
+shows a picker of the caller's networks (its entry point); the member list is
+rank-ordered with sigils kept live from channel `MODE`; and it offers a
+join-channel input and click-to-query on nicks.
 
 ### 13.2 Live chat over WebSocket
 

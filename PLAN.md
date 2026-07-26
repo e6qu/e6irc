@@ -1638,6 +1638,36 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+Web-UI sweep — client usability + console error surfacing (2026-07-27):
+an audit-driven pass over the whole web UI (in-browser IRC client + the
+htmx/askama console). One flagged "bug" (incoming CTCP ACTION rendering) was a
+**false positive** — the regex already carries the literal `\x01` framing bytes
+the editor hides — and was left untouched.
+
+Web IRC client (`web/`):
+- **Reconnection with backoff+jitter** — the socket previously never retried, so
+  any drop (server restart, sleep, the bouncer's own detach) left a dead client
+  until manual reload; now it reconnects, resetting backoff on a healthy open.
+- **Network picker entry point** — opening `/` without `?network=` now lists the
+  caller's networks as links (via `/api/v1/me/networks`) instead of printing a
+  "add ?network= to the URL" dead-end.
+- **Member list is now rank-aware**: sigils (`~&@%+`) are kept, sorted by rank
+  then name, and live channel `MODE` changes update them (with correct
+  argument-alignment across mixed mode strings).
+- **Server/global notices** (the bouncer's `*bnc*` control lines, target `*`) go
+  to the server buffer instead of a phantom DM; PART/QUIT/KICK now show
+  reason + actor; a "join #channel" sidebar input and clickable nicks (open a
+  query) were added; buffers and nicks are keyboard-operable (role/tabindex/
+  Enter/Space); plain text typed in the server buffer no longer bounces as a
+  `421` (it asks for a /command); the member pane's `aria-live` flood was
+  removed; the layout collapses sensibly on a phone.
+
+Console (`crates/e6ircd`): the Integrations add/remove bridge forms previously
+navigated the admin to a bare problem+json body on failure; they now re-render
+the page with an error banner (mirroring the bans/channels/sessions pages),
+naming the missing build feature specifically. `console_integrations` was split
+into a reusable `console_integrations_build`.
+
 WS-IRC listener + admin server-management (2026-07-27, multi-phase, one PR):
 two maintainer-approved features landed as sequential phases on a single PR.
 
