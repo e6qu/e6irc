@@ -14,6 +14,21 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 /// unauthenticated socket can pin.
 const MAX_WS_FRAME: usize = 64 * 1024;
 
+/// Outbound WebSocket frame discipline, fixed for the connection by ircv3
+/// subprotocol negotiation (<https://ircv3.net/specs/extensions/websocket>).
+#[derive(Clone, Copy)]
+pub(super) enum WsFrameMode {
+    /// `binary.ircv3.net`: every line is a binary frame (raw bytes verbatim).
+    Binary,
+    /// `text.ircv3.net`: every line is a text frame; non-UTF-8 bytes are lossily
+    /// replaced with U+FFFD, since a WebSocket text frame must be valid UTF-8.
+    Text,
+    /// No subprotocol negotiated: text when the line is valid UTF-8, otherwise
+    /// binary — so arbitrary IRC bytes survive. The historical behavior the
+    /// existing `/ws/irc` clients rely on.
+    Auto,
+}
+
 pub(super) async fn ws_irc(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -32,9 +47,32 @@ pub(super) async fn ws_irc(
             None,
         );
     };
-    ws.max_message_size(MAX_WS_FRAME)
-        .max_frame_size(MAX_WS_FRAME)
-        .on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip))
+    // ircv3 WebSocket subprotocol negotiation: pick the client's first-offered
+    // of binary.ircv3.net / text.ircv3.net (client preference order — the suite
+    // requires the *client's* first choice, not the server's). Passing exactly
+    // that one to `.protocols()` makes axum echo it in the response. With none
+    // offered we fall back to per-line Auto framing.
+    let chosen = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|list| {
+            list.split(',')
+                .map(str::trim)
+                .find(|p| *p == "binary.ircv3.net" || *p == "text.ircv3.net")
+                .map(String::from)
+        });
+    let mode = match chosen.as_deref() {
+        Some("binary.ircv3.net") => WsFrameMode::Binary,
+        Some("text.ircv3.net") => WsFrameMode::Text,
+        _ => WsFrameMode::Auto,
+    };
+    let mut upgrade = ws
+        .max_message_size(MAX_WS_FRAME)
+        .max_frame_size(MAX_WS_FRAME);
+    if let Some(proto) = chosen {
+        upgrade = upgrade.protocols([proto]);
+    }
+    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -47,6 +85,7 @@ pub(super) async fn ws_irc_conn(
     mut socket: WebSocket,
     _conn_guard: crate::net::ConnGuard,
     ip: std::net::IpAddr,
+    mode: WsFrameMode,
 ) {
     use crate::core::{ConnId, Input, Output};
     use e6irc_proto::framing::{LineBuffer, LineEvent};
@@ -93,13 +132,21 @@ pub(super) async fn ws_irc_conn(
                     .strip_suffix(b"\r\n")
                     .or_else(|| bytes.strip_suffix(b"\n"))
                     .unwrap_or(&bytes);
-                // A WebSocket text frame must be valid UTF-8, but IRC message
-                // bodies may carry non-UTF-8 bytes. Send those as a binary frame
-                // rather than corrupting them with lossy U+FFFD replacement —
-                // both frame types are valid under the ircv3 WS subprotocol.
-                let sent = match std::str::from_utf8(line) {
-                    Ok(text) => socket.send(WsMessage::text(text)).await,
-                    Err(_) => socket.send(WsMessage::binary(line.to_vec())).await,
+                // Frame type follows the negotiated subprotocol. Under Auto (no
+                // subprotocol) a non-UTF-8 body goes out as a binary frame rather
+                // than being corrupted by lossy U+FFFD replacement; under the
+                // text subprotocol the client asked for text, so it is replaced.
+                let sent = match mode {
+                    WsFrameMode::Binary => socket.send(WsMessage::binary(line.to_vec())).await,
+                    WsFrameMode::Text => {
+                        socket
+                            .send(WsMessage::text(String::from_utf8_lossy(line).into_owned()))
+                            .await
+                    }
+                    WsFrameMode::Auto => match std::str::from_utf8(line) {
+                        Ok(text) => socket.send(WsMessage::text(text)).await,
+                        Err(_) => socket.send(WsMessage::binary(line.to_vec())).await,
+                    },
                 };
                 if sent.is_err() {
                     break;

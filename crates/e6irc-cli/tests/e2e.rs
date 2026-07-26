@@ -13,6 +13,7 @@ async fn start_server() -> std::net::SocketAddr {
         listeners: vec![e6ircd::config::ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         ..e6ircd::config::Config::default()
     };
@@ -142,6 +143,7 @@ async fn cli_sasl_login() {
         listeners: vec![e6ircd::config::ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(e6ircd::config::DatabaseConfig { url }),
         ..e6ircd::config::Config::default()
@@ -317,6 +319,7 @@ async fn client_tls_connect() {
                 cert_path: cert_path.clone(),
                 key_path,
             }),
+            websocket: false,
         }],
         ..e6ircd::config::Config::default()
     };
@@ -345,6 +348,7 @@ async fn start_server_with_http() -> (std::net::SocketAddr, std::net::SocketAddr
         listeners: vec![e6ircd::config::ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(e6ircd::config::HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),

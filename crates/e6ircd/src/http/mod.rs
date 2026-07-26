@@ -157,7 +157,7 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         .into_response()
 }
 
-pub fn router(state: AppState) -> Router {
+pub fn router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/healthz", get(async || "ok"))
         .route("/login", get(pages::login))
@@ -271,7 +271,20 @@ pub fn router(state: AppState) -> Router {
                 resp
             },
         ))
-        .with_state(Arc::new(state))
+        .with_state(state)
+}
+
+/// A minimal router that serves IRC-over-WebSocket at the root path (`/`). Used
+/// by a dedicated `websocket = true` listener — a bare WS-IRC port with no HTTP
+/// UI — so a client connecting to `ws://host:port/` reaches the same core as the
+/// raw TCP listeners. Shares the AppState (core_tx, per-IP limiter, sendq) with
+/// any HTTP server. Kept separate from `router` so the full HTTP surface
+/// (login, console, API) is never exposed on a port meant only for WS-IRC.
+pub fn ws_irc_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(ws_irc))
+        .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .with_state(state)
 }
 
 /// Embedded web client (the Vite build in web/dist) served under the

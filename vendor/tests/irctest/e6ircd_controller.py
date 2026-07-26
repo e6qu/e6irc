@@ -113,8 +113,6 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
         websocket_hostname: Optional[str] = None,
         websocket_port: Optional[int] = None,
     ) -> None:
-        if websocket_hostname is not None or websocket_port is not None:
-            raise NotImplementedByController("websockets")
         if password is not None:
             raise NotImplementedByController("PASS")
         if ssl:
@@ -130,6 +128,15 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
         assert self.directory
 
         config = TEMPLATE_CONFIG.format(hostname=hostname, port=port)
+        # A websocket-IRC transport is served by a dedicated listener at the
+        # requested host:port (served at the root path, which is what irctest's
+        # WebSocketClientMock connects to: ws://host:port).
+        if websocket_port is not None:
+            config += (
+                "\n[[listeners]]\n"
+                f'addr = "{websocket_hostname}:{websocket_port}"\n'
+                "websocket = true\n"
+            )
         # draft/account-registration policy, which irctest varies per test case.
         config += (
             "\n[registration]\n"

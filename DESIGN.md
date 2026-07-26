@@ -1050,6 +1050,20 @@ Separately from the HTMX UI socket, expose the IRCv3 WebSocket text
 encoding at `/ws/irc` so existing web IRC clients (e.g. gamja) can connect
 directly. Cheap to provide (same parser, same session path as TCP).
 
+The endpoint negotiates the IRCv3 WebSocket subprotocol: a client offering
+`binary.ircv3.net` and/or `text.ircv3.net` gets its **first choice** echoed,
+which fixes the outbound frame type for the connection (binary → raw bytes;
+text → text frames, non-UTF-8 lossily replaced with U+FFFD as a text frame
+requires valid UTF-8). A client offering neither gets per-line auto framing
+(text when valid UTF-8, else binary) — the original behavior.
+
+A dedicated **WS-IRC listener** is also available: a `[[listeners]]` entry
+with `websocket = true` serves this same endpoint at the root path
+(`ws://addr/`) on its own port, with no HTTP UI surface — for deployments
+that want a bare WS-IRC port (and the shape upstream irctest's websocket
+suite drives). TLS is terminated at a front proxy, so `websocket = true`
+with a `tls` section is refused at config load.
+
 ---
 
 ## 14. Native clients

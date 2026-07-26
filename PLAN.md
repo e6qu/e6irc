@@ -1638,6 +1638,23 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+WS-IRC listener + admin server-management (2026-07-27, multi-phase, one PR):
+two maintainer-approved features landed as sequential phases on a single PR.
+
+Phase 1 — dedicated WS-IRC listener + full irctest websocket conformance:
+a `[[listeners]]` entry with `websocket = true` now serves IRC-over-WebSocket
+at the root path (`ws://addr/`) on its own port with no HTTP UI surface
+(`net::start` builds one shared `AppState` and mounts a minimal `ws_irc_router`
+per WS listener; `websocket = true` + `tls` is refused at load). The `/ws/irc`
+handler now performs IRCv3 subprotocol negotiation — a client's first-offered
+`binary.ircv3.net`/`text.ircv3.net` is echoed and fixes the outbound frame type
+(binary = raw bytes; text = text frames, non-UTF-8 → U+FFFD; none = per-line
+auto, the prior behavior). This lets the irctest controller honor
+`websocket_hostname/port`, so upstream `server_tests/websocket.py` is now in the
+CI green list (verified locally: 6 passed / 2 optional-skips). New Rust tests
+cover the root-path listener; the config gains `ListenerConfig.websocket` with a
+validation test.
+
 CI coverage + bouncer-fidelity sweep (2026-07-27): a second CI-focused pass
 plus two bug fixes an adversarial audit of the least-swept surfaces (BNC
 bouncer, bridges, DB, CLI, TUI) surfaced. That audit found those subsystems

@@ -143,6 +143,7 @@ async fn sasl_over_real_socket() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -202,6 +203,7 @@ async fn sasl_oauthbearer_with_api_token() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -268,6 +270,7 @@ async fn app_password_issued_over_http_works_for_sasl() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -361,6 +364,7 @@ async fn auth_endpoint_rate_limit_returns_429_after_burst() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -417,6 +421,7 @@ async fn channel_messages_are_persisted() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -565,6 +570,7 @@ async fn credential_list_and_revoke() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -898,6 +904,7 @@ async fn read_marker_persists() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -999,6 +1006,7 @@ async fn history_rest_endpoint() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1241,6 +1249,7 @@ async fn chathistory_pages_from_postgres_past_the_ring() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -1378,6 +1387,7 @@ async fn chathistory_recreated_channel_serves_persisted_history_with_label() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -1480,6 +1490,7 @@ async fn read_marker_preloaded_after_restart() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url: url.clone() }),
         ..Config::default()
@@ -1551,6 +1562,7 @@ async fn sasl_registration_fails_loudly_on_nick_in_use() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -1595,6 +1607,7 @@ async fn labeled_chathistory_targets_carries_label_on_db_path() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -1669,6 +1682,7 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()

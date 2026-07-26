@@ -15,6 +15,7 @@ fn test_config() -> Config {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -164,6 +165,7 @@ async fn upstream_server() -> std::net::SocketAddr {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         ..Config::default()
     };
@@ -208,6 +210,7 @@ async fn bnc_network_management_lifecycle() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -355,6 +358,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -497,6 +501,7 @@ async fn account_page_lists_networks_for_a_session() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -561,6 +566,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -626,6 +632,7 @@ async fn console_add_and_delete_network_via_the_console() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -776,6 +783,7 @@ async fn admin_accounts_endpoint_is_gated() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -903,6 +911,7 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -978,6 +987,7 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1040,6 +1050,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1118,6 +1129,7 @@ async fn account_page_add_network_form_with_csrf() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1197,6 +1209,7 @@ async fn device_authorization_grant_flow() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1351,6 +1364,7 @@ async fn me_tokens_list_and_revoke() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1450,6 +1464,7 @@ async fn network_buffer_read() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1529,6 +1544,7 @@ async fn me_read_markers_list() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1608,6 +1624,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1845,6 +1862,7 @@ async fn application_entry_is_fail_closed_and_uses_silent_sso() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1926,6 +1944,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
