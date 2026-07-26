@@ -1593,6 +1593,33 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Management console — stage 1 (shell) + stage 2 (server admin) (2026-07-26): the
+first slice of the web management UI the maintainer asked for ("a full UI for the
+IRC server, clients, BNC sessions, and integrations"). The backend/API is already
+rich — the gap is the UI. Built on the existing stack (askama server-rendered
+pages + htmx + strict-CSP-friendly `render_private`, one binary via embed-web), no
+framework.
+
+A new admin-gated `/console` page (`pages::console`, `templates/console.html`)
+renders the server-wide read views the `/api/v1/admin/*` JSON endpoints expose —
+overview counts, accounts, registered channels, server bans, and the audit log —
+in one dashboard with a nav shell (Overview / Server / You / "coming next"
+placeholders for BNC sessions, Integrations, IRC client). It reuses the exact
+admin gate the JSON API uses (`authenticate` → `admin_accounts` casefold check):
+an anonymous visitor is redirected to `/login`, a signed-in non-admin gets 403, an
+admin gets the dashboard — so it can never surface server-wide data to a non-admin.
+DB errors surface through the shared `admin_db_error` (no silent blanks). The
+account page gained an `is_admin`-gated **Console** link for discoverability
+(preserving the `data-shauth-*` hooks the SSO harness drives). New PG-backed test
+`admin_console_page_renders_server_data_for_admins_only` asserts the 303/403/200
+gate and that seeded server data renders.
+
+Next stages (each its own PR): BNC session + network management, integrations
+(Slack/Discord/Matrix — needs new persisted bridge-config CRUD first, mirroring
+`networks.rs`), and the live `/ws/ui` IRC client. Verified: workspace suite + the
+new console test (PG); each bridge feature alone under `-Dwarnings`; `cargo clippy
+--all-features` + `--features embed-web`; all `tools/check-*` gates + `cargo deny`.
+
 Ninetieth sweep — parse-don't-validate on the user-controlled surfaces + a real
 WHOX overflow (2026-07-26): the human asked to lean harder on "parse, don't
 validate" and type-driven unrepresentability, especially on paths that process

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>e6irc — console</title>
+    <script src="/htmx.min.js" defer></script>
+    <style>
+      :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2f6feb;
+        --bg: #f6f7f9; --fg: #16181d; --panel: #fff; }
+      @media (prefers-color-scheme: dark) { :root { --border: #262b33; --muted: #9aa3b1;
+        --bg: #0f1115; --fg: #e6e8ec; --panel: #14171d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.6 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+        padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--border); }
+      header .brand { font-weight: 700; letter-spacing: 0.02em; }
+      header .who { color: var(--muted); }
+      header a { color: var(--accent); text-decoration: none; }
+      .layout { display: flex; align-items: flex-start; gap: 0; }
+      nav { flex: 0 0 13rem; padding: 1rem 0.75rem; border-right: 1px solid var(--border);
+        position: sticky; top: 0; align-self: stretch; min-height: calc(100vh - 3.1rem); }
+      nav a { display: block; padding: 0.4rem 0.7rem; border-radius: 0.4rem; color: var(--fg);
+        text-decoration: none; margin-bottom: 0.15rem; }
+      nav a:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+      nav .section { color: var(--muted); font-size: 0.72rem; text-transform: uppercase;
+        letter-spacing: 0.06em; margin: 1rem 0.7rem 0.35rem; }
+      nav a.soon { color: var(--muted); pointer-events: none; }
+      nav a.soon::after { content: "soon"; float: right; font-size: 0.62rem; border: 1px solid var(--border);
+        border-radius: 0.6rem; padding: 0 0.35rem; color: var(--muted); }
+      main { flex: 1 1 auto; padding: 1.25rem 1.5rem; min-width: 0; max-width: 64rem; }
+      h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+      h2 { font-size: 1.05rem; margin: 2rem 0 0.5rem; padding-top: 0.5rem; }
+      .cards { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.5rem 0 0.5rem; }
+      .card { flex: 1 1 8rem; background: var(--panel); border: 1px solid var(--border);
+        border-radius: 0.6rem; padding: 0.8rem 1rem; }
+      .card .n { font-size: 1.6rem; font-weight: 700; }
+      .card .l { color: var(--muted); font-size: 0.8rem; }
+      .scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 0.6rem; }
+      table { width: 100%; border-collapse: collapse; background: var(--panel); }
+      th, td { text-align: left; padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--border);
+        white-space: nowrap; }
+      th { color: var(--muted); font-weight: 600; font-size: 0.78rem; }
+      tr:last-child td { border-bottom: none; }
+      .empty { color: var(--muted); padding: 0.6rem 0; }
+      code { font-family: ui-monospace, Menlo, monospace; }
+      .meta { color: var(--muted); font-size: 0.85rem; }
+      .tag { display: inline-block; font-size: 0.72rem; border: 1px solid var(--border);
+        border-radius: 0.6rem; padding: 0 0.4rem; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="brand" aria-label="e6irc">e6irc console</span>
+      <span>
+        <span class="who" data-shauth-user="{{ admin }}">{{ admin }}</span>
+        &nbsp;·&nbsp;
+        <a data-shauth-sign-out href="/api/v1/auth/logout?csrf={{ csrf }}">Sign out</a>
+      </span>
+    </header>
+    <div class="layout">
+      <nav>
+        <a href="#overview">Overview</a>
+        <div class="section">Server</div>
+        <a href="#accounts">Accounts</a>
+        <a href="#channels">Channels</a>
+        <a href="#bans">Server bans</a>
+        <a href="#audit">Audit log</a>
+        <div class="section">You</div>
+        <a href="/account">Your networks &amp; keys</a>
+        <div class="section">Coming next</div>
+        <a class="soon" aria-disabled="true">BNC sessions</a>
+        <a class="soon" aria-disabled="true">Integrations</a>
+        <a class="soon" aria-disabled="true">IRC client</a>
+      </nav>
+      <main>
+        <h1 id="overview">{{ server_name }}</h1>
+        <p class="meta">Network <strong>{{ network_name }}</strong> · e6ircd {{ version }}</p>
+        <div class="cards">
+          <div class="card"><div class="n">{{ stat_accounts }}</div><div class="l">Accounts</div></div>
+          <div class="card"><div class="n">{{ stat_channels }}</div><div class="l">Registered channels</div></div>
+          <div class="card"><div class="n">{{ stat_server_bans }}</div><div class="l">Server bans</div></div>
+        </div>
+
+        <h2 id="accounts">Accounts <span class="tag">{{ accounts.len() }}</span></h2>
+        {% if accounts.is_empty() %}
+          <p class="empty">No accounts.</p>
+        {% else %}
+          <div class="scroll">
+            <table>
+              <thead><tr><th>Name</th></tr></thead>
+              <tbody>
+                {% for a in accounts %}<tr><td><code>{{ a }}</code></td></tr>{% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+
+        <h2 id="channels">Registered channels <span class="tag">{{ channels.len() }}</span></h2>
+        {% if channels.is_empty() %}
+          <p class="empty">No registered channels.</p>
+        {% else %}
+          <div class="scroll">
+            <table>
+              <thead><tr><th>Channel</th><th>Founder</th></tr></thead>
+              <tbody>
+                {% for c in channels %}
+                  <tr><td><code>{{ c.name }}</code></td><td><code>{{ c.founder }}</code></td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+
+        <h2 id="bans">Server bans <span class="tag">{{ bans.len() }}</span></h2>
+        {% if bans.is_empty() %}
+          <p class="empty">No server bans.</p>
+        {% else %}
+          <div class="scroll">
+            <table>
+              <thead><tr><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th></tr></thead>
+              <tbody>
+                {% for b in bans %}
+                  <tr><td>{{ b.kind }}</td><td><code>{{ b.mask }}</code></td>
+                    <td>{{ b.reason }}</td><td><code>{{ b.set_by }}</code></td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+
+        <h2 id="audit">Audit log <span class="tag">latest {{ audit.len() }}</span></h2>
+        {% if audit.is_empty() %}
+          <p class="empty">No audited actions.</p>
+        {% else %}
+          <div class="scroll">
+            <table>
+              <thead><tr><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+              <tbody>
+                {% for e in audit %}
+                  <tr><td class="meta">{{ e.at }}</td><td><code>{{ e.actor }}</code></td>
+                    <td>{{ e.action }}</td><td><code>{{ e.target }}</code></td><td>{{ e.detail }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+      </main>
+    </div>
+  </body>
+</html>

@@ -166,6 +166,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
         .route("/auth.css", get(pages::auth_styles))
         .route("/account", get(pages::account))
+        .route("/console", get(pages::console))
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -502,6 +503,9 @@ mod pages {
     struct Account {
         account: String,
         csrf: String,
+        /// Whether this account may reach the admin `/console` — controls the
+        /// header link, so a non-admin is never shown a door that 403s.
+        is_admin: bool,
         networks: Vec<NetworkView>,
         credentials: Vec<CredView>,
     }
@@ -573,11 +577,129 @@ mod pages {
                 );
             }
         };
+        let is_admin = state
+            .admin_accounts
+            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
         render_private(Account {
             account,
             csrf,
+            is_admin,
             networks,
             credentials,
+        })
+    }
+
+    struct ChannelRow {
+        name: String,
+        founder: String,
+    }
+    struct BanRow {
+        kind: String,
+        mask: String,
+        reason: String,
+        set_by: String,
+    }
+    struct AuditRow {
+        at: String,
+        actor: String,
+        action: String,
+        target: String,
+        detail: String,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console.html")]
+    struct Console {
+        admin: String,
+        csrf: String,
+        server_name: String,
+        network_name: String,
+        version: String,
+        stat_accounts: i64,
+        stat_channels: i64,
+        stat_server_bans: i64,
+        accounts: Vec<String>,
+        channels: Vec<ChannelRow>,
+        bans: Vec<BanRow>,
+        audit: Vec<AuditRow>,
+    }
+
+    /// Admin console: server-wide read views (accounts, registered channels,
+    /// server bans, audit log) rendered server-side. Cookie-authenticated and
+    /// admin-gated the same way the `/api/v1/admin/*` JSON endpoints are — an
+    /// unauthenticated visitor goes to `/login`, a signed-in non-admin gets 403 —
+    /// so the console can never surface server-wide data to a non-admin.
+    pub async fn console(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
+        if !state.admin_accounts.contains(&folded) {
+            return problem(StatusCode::FORBIDDEN, "Admin only", None);
+        }
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let pool = pool_of(&state);
+
+        let (stat_accounts, stat_channels, stat_server_bans) =
+            match crate::db::server_stats(pool).await {
+                Ok(t) => t,
+                Err(e) => return super::device::admin_db_error("server stats", e),
+            };
+        let accounts = match crate::db::list_accounts(pool).await {
+            Ok(v) => v,
+            Err(e) => return super::device::admin_db_error("account list", e),
+        };
+        let channels = match crate::db::list_registered_channels(pool).await {
+            Ok(v) => v
+                .into_iter()
+                .map(|(name, founder)| ChannelRow { name, founder })
+                .collect(),
+            Err(e) => return super::device::admin_db_error("channel list", e),
+        };
+        let bans = match crate::db::list_server_bans(pool).await {
+            Ok(v) => v
+                .into_iter()
+                .map(|(mask, reason, set_by, kind)| BanRow {
+                    kind,
+                    mask,
+                    reason,
+                    set_by,
+                })
+                .collect(),
+            Err(e) => return super::device::admin_db_error("server-ban list", e),
+        };
+        let audit = match crate::db::list_audit_log(pool, 100).await {
+            Ok(v) => v
+                .into_iter()
+                .map(|(actor, action, target, detail, at)| AuditRow {
+                    at,
+                    actor,
+                    action,
+                    target,
+                    detail,
+                })
+                .collect(),
+            Err(e) => return super::device::admin_db_error("audit log", e),
+        };
+
+        render_private(Console {
+            admin: account,
+            csrf,
+            server_name: state.server_name.clone(),
+            network_name: state.network_name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            stat_accounts,
+            stat_channels,
+            stat_server_bans,
+            accounts,
+            channels,
+            bans,
+            audit,
         })
     }
 

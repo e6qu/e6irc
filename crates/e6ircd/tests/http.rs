@@ -645,6 +645,94 @@ async fn admin_accounts_endpoint_is_gated() {
     assert_eq!(v["server_bans"], 1, "{body}");
 }
 
+/// The admin `/console` page is gated exactly like the admin JSON API — an
+/// anonymous visitor is redirected to `/login`, a signed-in non-admin gets 403,
+/// and an admin gets a server-rendered dashboard carrying the seeded server data.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_console_page_renders_server_data_for_admins_only() {
+    let url = support::test_db("admin_console_page_renders_server_data_for_admins_only").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("tok");
+    let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "t")
+        .await
+        .expect("tok");
+    e6ircd::db::add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
+        .await
+        .expect("kline");
+    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
+        .await
+        .expect("audit");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.console.example".into(),
+        network_name: "ConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let auth = |token: &str| {
+        format!(
+            "GET /console HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Anonymous -> redirect to /login (a page, not a 401 like the JSON API).
+    let (status, head, _) = request(http, &get("/console")).await;
+    assert_eq!(status, 303, "{head}");
+    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+    // Signed-in non-admin -> 403.
+    let (status, _, _) = request(http, &auth(&bob_token)).await;
+    assert_eq!(status, 403);
+    // Admin -> 200 with the seeded server data rendered into the dashboard.
+    let (status, _, body) = request(http, &auth(&alice_token)).await;
+    assert_eq!(status, 200, "{body}");
+    for needle in [
+        "e6irc console",
+        "irc.console.example",
+        "ConsoleNet",
+        "alice",
+        "bob",
+        "#lounge",
+        "spammer@*",
+        "KLINE",
+    ] {
+        assert!(body.contains(needle), "console missing {needle:?}: {body}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_page_add_network_form_with_csrf() {
