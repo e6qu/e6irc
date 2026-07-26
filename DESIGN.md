@@ -823,7 +823,12 @@ CERTFP is explicitly out of scope for v1 (not selected).
 Personal access tokens (hashed at rest, scoped, expiring) via
 `Authorization: Bearer`, or the web session cookie (for the HTMX client,
 with the CSRF rules above). Admin endpoints additionally require the
-account's admin flag.
+account's admin flag. The same admin-gated data is also served as a
+server-rendered management **console** at `/console` (accounts, registered
+channels, server bans, audit log) — the read views that begin the web
+management UI; it shares the `pages` module, `render_private`, and the exact
+admin gate the `/api/v1/admin/*` JSON endpoints use, so it can never surface
+server-wide data to a non-admin.
 
 ---
 

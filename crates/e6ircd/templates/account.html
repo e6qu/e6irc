@@ -33,7 +33,11 @@
   <body>
     <header>
       <span class="who" data-shauth-user="{{ account }}">{{ account }}</span>
-      <a data-shauth-sign-out href="/api/v1/auth/logout?csrf={{ csrf }}">Sign out</a>
+      <span>
+        <a href="{% if is_admin %}/console{% else %}/console/networks{% endif %}">Console</a>
+        &nbsp;·&nbsp;
+        <a data-shauth-sign-out href="/api/v1/auth/logout?csrf={{ csrf }}">Sign out</a>
+      </span>
     </header>
     <main>
       <h2>Networks</h2>

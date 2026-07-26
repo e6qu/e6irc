@@ -1,0 +1,29 @@
+{# The BNC networks table body — swapped in by htmx after add/delete. #}
+{% if networks.is_empty() %}
+  <tbody id="cnetworks"><tr><td colspan="6" class="empty">No networks yet. Add one above.</td></tr></tbody>
+{% else %}
+  <tbody id="cnetworks">
+    {% for n in networks %}
+      <tr>
+        <td>
+          {% if n.connected %}<span class="dot on"></span>connected
+          {% else %}<span class="dot off"></span>{% if n.enabled %}disconnected{% else %}stopped{% endif %}{% endif %}
+        </td>
+        <td><code>{{ n.name }}</code></td>
+        <td><code>{{ n.addr }}</code>{% if n.tls %} <span class="tag">TLS</span>{% endif %}</td>
+        <td><code>{{ n.nick }}</code></td>
+        <td>{% if n.autojoin.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ n.autojoin }}</code>{% endif %}</td>
+        <td>
+          <button
+            class="danger"
+            hx-delete="/console/networks/{{ n.name }}"
+            hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
+            hx-target="#cnetworks"
+            hx-swap="outerHTML"
+            hx-confirm="Remove network {{ n.name }}?"
+          >Remove</button>
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+{% endif %}

@@ -518,6 +518,179 @@ async fn account_page_lists_networks_for_a_session() {
     assert!(body.contains("libera"), "network listed: {body}");
 }
 
+/// The console BNC networks page lists the caller's own networks (with a live
+/// status column) for any authenticated user, and redirects an anonymous
+/// visitor to `/login`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_networks_page_lists_the_callers_networks() {
+    let url = support::test_db("console_networks_page_lists_the_callers_networks").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    e6ircd::db::create_bnc_network(
+        &pool,
+        "alice",
+        &e6ircd::db::BncNetworkRow {
+            name: "libera".into(),
+            addr: "irc.libera.chat:6697".into(),
+            tls: true,
+            nick: "alice_".into(),
+            realname: None,
+            autojoin: vec!["#e6irc".into()],
+            sasl_account: None,
+            sasl_password_sealed: None,
+            enabled: true,
+        },
+    )
+    .await
+    .expect("network");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.console.example".into(),
+        network_name: "ConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http bound");
+
+    // Anonymous -> redirect to /login.
+    let (status, head, _) = request(http, &get("/console/networks")).await;
+    assert_eq!(status, 303, "{head}");
+    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+
+    // Authenticated -> the console shell with the caller's network and its
+    // status column.
+    let req = format!(
+        "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &req).await;
+    assert_eq!(status, 200, "{head}");
+    for needle in [
+        "e6irc console",
+        "BNC networks",
+        "libera",
+        "irc.libera.chat:6697",
+        "#e6irc",
+    ] {
+        assert!(
+            body.contains(needle),
+            "console networks missing {needle:?}: {body}"
+        );
+    }
+}
+
+/// The console networks page can add and remove a network via htmx, gated by the
+/// same CSRF header the account page uses; both return the refreshed rows.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_add_and_delete_network_via_the_console() {
+    let url = support::test_db("console_add_and_delete_network_via_the_console").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.console.example".into(),
+        network_name: "ConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Load the page and extract the session-bound CSRF token.
+    let page_req = format!(
+        "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (_, _, page) = request(http, &page_req).await;
+    let csrf = page
+        .split("X-CSRF-Token\": \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token in page")
+        .to_string();
+    assert!(!csrf.is_empty());
+
+    // Add a network with the CSRF header -> 200 rows fragment carrying it.
+    let body = "name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby&tls=on";
+    let add = format!(
+        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _, frag) = request(http, &add).await;
+    assert_eq!(status, 200, "{frag}");
+    assert!(
+        frag.contains("work") && frag.contains("irc.example:6667"),
+        "{frag}"
+    );
+
+    // Without the CSRF header -> 403.
+    let no_csrf = format!(
+        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _, _) = request(http, &no_csrf).await;
+    assert_eq!(status, 403);
+
+    // Delete it with the CSRF header -> 200 rows fragment without it.
+    let del = format!(
+        "DELETE /console/networks/work HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-CSRF-Token: {csrf}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, frag) = request(http, &del).await;
+    assert_eq!(status, 200, "{frag}");
+    assert!(!frag.contains("irc.example:6667"), "still present: {frag}");
+}
+
 // ---- admin API (PG-gated) -----------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -643,6 +816,94 @@ async fn admin_accounts_endpoint_is_gated() {
     assert_eq!(v["accounts"], 2, "{body}");
     assert_eq!(v["registered_channels"], 1, "{body}");
     assert_eq!(v["server_bans"], 1, "{body}");
+}
+
+/// The admin `/console` page is gated exactly like the admin JSON API — an
+/// anonymous visitor is redirected to `/login`, a signed-in non-admin gets 403,
+/// and an admin gets a server-rendered dashboard carrying the seeded server data.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_console_page_renders_server_data_for_admins_only() {
+    let url = support::test_db("admin_console_page_renders_server_data_for_admins_only").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("tok");
+    let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "t")
+        .await
+        .expect("tok");
+    e6ircd::db::add_server_ban(&pool, "spammer@*", "spammer@*", "spam", "alice", "kline")
+        .await
+        .expect("kline");
+    e6ircd::db::insert_audit_log(&pool, "alice", "KLINE", "spammer@*", "spam")
+        .await
+        .expect("audit");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#lounge', '#lounge', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.console.example".into(),
+        network_name: "ConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let auth = |token: &str| {
+        format!(
+            "GET /console HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // Anonymous -> redirect to /login (a page, not a 401 like the JSON API).
+    let (status, head, _) = request(http, &get("/console")).await;
+    assert_eq!(status, 303, "{head}");
+    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+    // Signed-in non-admin -> 403.
+    let (status, _, _) = request(http, &auth(&bob_token)).await;
+    assert_eq!(status, 403);
+    // Admin -> 200 with the seeded server data rendered into the dashboard.
+    let (status, _, body) = request(http, &auth(&alice_token)).await;
+    assert_eq!(status, 200, "{body}");
+    for needle in [
+        "e6irc console",
+        "irc.console.example",
+        "ConsoleNet",
+        "alice",
+        "bob",
+        "#lounge",
+        "spammer@*",
+        "KLINE",
+    ] {
+        assert!(body.contains(needle), "console missing {needle:?}: {body}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
