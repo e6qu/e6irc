@@ -1593,6 +1593,27 @@ pinned by round-trip + differential fuzzers, OIDC provisioning can't duplicate
 accounts (unique constraint + rollback), no auth path logs-and-continues, and the
 CHATHISTORY windows are exhaustively differential-tested.
 
+Management console — stage 3 (BNC session + network management) (2026-07-26):
+the console shell was refactored into a shared `console_base.html` (header + nav +
+`{% block main %}`, askama inheritance) so every console page shares one chrome;
+the nav shows the admin **Server** section only when `is_admin`, and a **You**
+section every authenticated user sees. A new `/console/networks` page (any
+authenticated user, scoped to their own account — not admin-gated) lists the
+caller's always-on BNC upstreams with a **live connection-status** column
+resolved from the registry (`registry.get_owned(account, name).is_connected()`) —
+the piece missing from every existing view — plus htmx add/remove that reuse the
+same `create_network_core` / `delete_bnc_network` + `registry.remove` the REST API
+and account page use (one CSRF-header path, no duplicated core). The view lists
+from the database, so it works even where the bouncer is disabled (status reads
+not-connected); add/remove require the live registry. The account page's console
+link now points admins at `/console` and everyone else at `/console/networks`.
+Three new PG-backed tests: the networks list (303 anon / 200 with the network +
+status), and add+delete via htmx with the CSRF gate (403 without). Next: the
+integrations stage needs persisted bridge-config CRUD first (mirroring
+`networks.rs`) before its UI. Verified: workspace (29 bins) + the new console
+tests (PG); clippy default + `embed-web`; each bridge alone under `-Dwarnings`;
+all `tools/check-*` gates + `cargo deny`.
+
 Management console — stage 1 (shell) + stage 2 (server admin) (2026-07-26): the
 first slice of the web management UI the maintainer asked for ("a full UI for the
 IRC server, clients, BNC sessions, and integrations"). The backend/API is already

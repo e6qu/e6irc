@@ -168,6 +168,14 @@ pub fn router(state: AppState) -> Router {
         .route("/account", get(pages::account))
         .route("/console", get(pages::console))
         .route(
+            "/console/networks",
+            get(pages::console_networks).post(pages::console_add_network),
+        )
+        .route(
+            "/console/networks/{name}",
+            axum::routing::delete(pages::console_delete_network),
+        )
+        .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         )
@@ -577,9 +585,7 @@ mod pages {
                 );
             }
         };
-        let is_admin = state
-            .admin_accounts
-            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
+        let is_admin = is_admin_account(&state, &account);
         render_private(Account {
             account,
             csrf,
@@ -610,8 +616,11 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console.html")]
     struct Console {
-        admin: String,
+        // Shared console-shell fields (see `console_base.html`).
+        account: String,
         csrf: String,
+        is_admin: bool,
+        active: &'static str,
         server_name: String,
         network_name: String,
         version: String,
@@ -622,6 +631,35 @@ mod pages {
         channels: Vec<ChannelRow>,
         bans: Vec<BanRow>,
         audit: Vec<AuditRow>,
+    }
+
+    /// One BNC network in the console networks view, with its live upstream
+    /// connection state resolved from the registry (not just its stored config).
+    struct ConsoleNetView {
+        name: String,
+        addr: String,
+        tls: bool,
+        nick: String,
+        autojoin: String,
+        enabled: bool,
+        connected: bool,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_networks.html")]
+    struct ConsoleNetworks {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        networks: Vec<ConsoleNetView>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_network_rows.html")]
+    struct ConsoleNetworkRows {
+        csrf: String,
+        networks: Vec<ConsoleNetView>,
     }
 
     /// Admin console: server-wide read views (accounts, registered channels,
@@ -636,8 +674,7 @@ mod pages {
         let Ok(account) = authenticate(&state, &headers).await else {
             return Redirect::to("/login").into_response();
         };
-        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-        if !state.admin_accounts.contains(&folded) {
+        if !is_admin_account(&state, &account) {
             return problem(StatusCode::FORBIDDEN, "Admin only", None);
         }
         let csrf = session_token(&headers, state.secure_cookies)
@@ -688,8 +725,10 @@ mod pages {
         };
 
         render_private(Console {
-            admin: account,
+            account,
             csrf,
+            is_admin: true, // gated above; the shell shows the Server nav section
+            active: "overview",
             server_name: state.server_name.clone(),
             network_name: state.network_name.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -701,6 +740,166 @@ mod pages {
             bans,
             audit,
         })
+    }
+
+    /// Whether `account` may reach the admin console sections.
+    fn is_admin_account(state: &AppState, account: &str) -> bool {
+        state
+            .admin_accounts
+            .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
+    }
+
+    /// Build the caller's BNC networks with live upstream state from the
+    /// registry (a network with no live handle — disabled, or not yet dialed —
+    /// reads as not connected). One place so the full page and the htmx
+    /// add/delete fragment render identical rows.
+    async fn console_network_views(
+        state: &AppState,
+        account: &str,
+    ) -> Result<Vec<ConsoleNetView>, Response> {
+        let pool = pool_of(state);
+        let rows = crate::db::list_bnc_networks(pool, account)
+            .await
+            .map_err(|e| {
+                eprintln!("console: network list: {e}");
+                problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                )
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|n| {
+                let connected = state
+                    .bnc_registry
+                    .as_ref()
+                    .and_then(|r| r.get_owned(account, &n.name))
+                    .map(|h| h.is_connected())
+                    .unwrap_or(false);
+                ConsoleNetView {
+                    name: n.name,
+                    addr: n.addr,
+                    tls: n.tls,
+                    nick: n.nick,
+                    autojoin: n.autojoin.join(", "),
+                    enabled: n.enabled,
+                    connected,
+                }
+            })
+            .collect())
+    }
+
+    /// Console → BNC networks: the caller's own always-on upstreams with live
+    /// connection status, plus add/remove. Any authenticated user manages their
+    /// own networks (not admin-gated); an anonymous visitor goes to `/login`.
+    pub async fn console_networks(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        // The view lists networks straight from the database (like the account
+        // page), so it works even where the bouncer is disabled — status simply
+        // reads not-connected. Add/remove do require the live registry.
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let is_admin = is_admin_account(&state, &account);
+        let networks = match console_network_views(&state, &account).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        render_private(ConsoleNetworks {
+            account,
+            csrf,
+            is_admin,
+            active: "networks",
+            networks,
+        })
+    }
+
+    async fn console_networks_fragment(state: &AppState, account: &str, csrf: String) -> Response {
+        match console_network_views(state, account).await {
+            Ok(networks) => render_private(ConsoleNetworkRows { csrf, networks }),
+            Err(r) => r,
+        }
+    }
+
+    /// Add a network from the console (htmx); returns the refreshed rows fragment.
+    /// Reuses the same `create_network_core` the REST API and account page use.
+    pub async fn console_add_network(
+        State(state): State<Arc<AppState>>,
+        CsrfVerified(account): CsrfVerified,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid form",
+                    Some(&e.to_string()),
+                );
+            }
+        };
+        let req = CreateNetwork {
+            name: f.name,
+            addr: f.addr,
+            tls: f.tls.as_deref() == Some("on"),
+            nick: f.nick,
+            realname: None,
+            autojoin: f
+                .autojoin
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            sasl_account: None,
+            sasl_password: None,
+        };
+        if let Err(r) = create_network_core(&state, registry, &account, &req).await {
+            return r;
+        }
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        console_networks_fragment(&state, &account, csrf).await
+    }
+
+    /// Delete a network from the console (htmx); returns the refreshed fragment.
+    pub async fn console_delete_network(
+        State(state): State<Arc<AppState>>,
+        CsrfVerified(account): CsrfVerified,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+    ) -> Response {
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let pool = pool_of(&state);
+        match crate::db::delete_bnc_network(pool, &account, &name).await {
+            Ok(true) => registry.remove(Some(&account), &name),
+            Ok(false) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+            Err(e) => {
+                eprintln!("console: network delete: {e}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                );
+            }
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        console_networks_fragment(&state, &account, csrf).await
     }
 
     #[derive(Template)]

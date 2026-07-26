@@ -1,0 +1,30 @@
+{% extends "console_base.html" %}
+{% block main %}
+        <h1>BNC networks</h1>
+        <p class="meta">
+          Your always-on upstream connections. Attach any IRC client over SASL as
+          <code>{{ account }}/&lt;network&gt;</code> to resume where you left off.
+        </p>
+        <form
+          class="add"
+          hx-post="/console/networks"
+          hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
+          hx-target="#cnetworks"
+          hx-swap="outerHTML"
+        >
+          <input type="text" name="name" placeholder="name" required />
+          <input type="text" name="addr" placeholder="host:port" required />
+          <input type="text" name="nick" placeholder="nick" required />
+          <input type="text" name="autojoin" placeholder="#chan,#chan2" />
+          <label><input type="checkbox" name="tls" /> TLS</label>
+          <button type="submit">Add network</button>
+        </form>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th>Status</th><th>Name</th><th>Upstream</th><th>Nick</th><th>Autojoin</th><th></th></tr>
+            </thead>
+            {% include "console_network_rows.html" %}
+          </table>
+        </div>
+{% endblock %}
