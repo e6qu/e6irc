@@ -8,6 +8,7 @@ use super::state::{
     BanKind, CAP_NAMES, ChanKey, Channel, MemberModes, ServerBan, ServerState, Topic,
 };
 
+pub(crate) mod admin;
 mod channel;
 mod chanops;
 mod history;

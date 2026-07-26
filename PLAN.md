@@ -1655,6 +1655,20 @@ CI green list (verified locally: 6 passed / 2 optional-skips). New Rust tests
 cover the root-path listener; the config gains `ListenerConfig.websocket` with a
 validation test.
 
+Phase 2 — admin console: server-ban CRUD + channel unregister. The admin
+`/console` page can now add/remove K/D/X-lines and unregister a registered
+channel. These run **through the core** via a new `Input::Admin { req, reply }`
+(oneshot-reply) so a console action reuses the exact live-state + persistence
+path of the equivalent oper/services command: a console ban updates the hot
+list, persists, disconnects matching sessions and audit-logs identically to oper
+KLINE (no divergent second implementation — the shared logic was extracted into
+`apply_server_ban` / `remove_server_ban` / `record_audit_by` /
+`drop_registered_channel`, which the oper/ChanServ paths now also call). Actions
+are admin-gated + CSRF-protected (`require_admin_form_actor`); success redirects
+back to `/console` (PRG), failures re-render with an error banner. Covered by a
+PG-gated http test (`admin_console_ban_and_channel_actions`) exercising
+add → remove → drop plus the CSRF/anonymous gates.
+
 CI coverage + bouncer-fidelity sweep (2026-07-27): a second CI-focused pass
 plus two bug fixes an adversarial audit of the least-swept surfaces (BNC
 bouncer, bridges, DB, CLI, TUI) surfaced. That audit found those subsystems

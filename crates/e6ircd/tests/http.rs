@@ -957,6 +957,158 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
     }
 }
 
+/// Admin console server-management actions: add/remove a server ban and drop a
+/// registered channel, all driven through the core (so they enforce like the
+/// IRC oper/services commands) and admin-gated + CSRF-protected.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_console_ban_and_channel_actions() {
+    let url = support::test_db("admin_console_ban_and_channel_actions").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#dropme', '#dropme', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.admin.example".into(),
+        network_name: "AdminNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Load the console and extract the session-bound CSRF token.
+    let page_req = format!(
+        "GET /console HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page) = request(http, &page_req).await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = page
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token in console")
+        .to_string();
+    assert!(!csrf.is_empty());
+
+    // Fetch /console and test for a needle, retrying while the fire-and-forget
+    // DB write behind a core action settles.
+    let console_has = |needle: &'static str, want: bool| {
+        let req = page_req.clone();
+        async move {
+            for _ in 0..40 {
+                let (_, _, body) = request(http, &req).await;
+                if body.contains(needle) == want {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        }
+    };
+
+    // Add a K-line via the console -> 303 back to /console; the ban appears.
+    let body = "csrf=CSRF&kind=kline&mask=*@bad.example&reason=spam";
+    let body = body.replace("CSRF", &csrf);
+    let add = format!(
+        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = request(http, &add).await;
+    assert_eq!(status, 303, "{head}");
+    // Discriminate on the bans-table empty-state text, not the mask itself: the
+    // mask also appears in the audit-log rows (KLINE/UNKLINE target), so a bare
+    // substring check would false-match after removal.
+    assert!(
+        console_has("No server bans.", false).await,
+        "ban not listed after add"
+    );
+
+    // Remove it -> 303; the bans table is empty again.
+    let del = "csrf=CSRF&kind=kline&mask=*@bad.example".replace("CSRF", &csrf);
+    let del_req = format!(
+        "POST /console/bans/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{del}",
+        del.len()
+    );
+    let (status, _, _) = request(http, &del_req).await;
+    assert_eq!(status, 303);
+    assert!(
+        console_has("No server bans.", true).await,
+        "ban still listed after remove"
+    );
+
+    // Drop the registered channel -> 303; the channel list becomes empty.
+    assert!(
+        console_has("No registered channels.", false).await,
+        "channel not listed to begin with"
+    );
+    let drop_body = "csrf=CSRF&channel=%23dropme".replace("CSRF", &csrf);
+    let drop_req = format!(
+        "POST /console/channels/drop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{drop_body}",
+        drop_body.len()
+    );
+    let (status, _, _) = request(http, &drop_req).await;
+    assert_eq!(status, 303);
+    assert!(
+        console_has("No registered channels.", true).await,
+        "channel still listed after drop"
+    );
+
+    // Gate: a wrong CSRF is refused (403); an anonymous POST redirects to login.
+    let bad = "csrf=wrong&kind=kline&mask=*@x.example&reason=x";
+    let bad_req = format!(
+        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, _, _) = request(http, &bad_req).await;
+    assert_eq!(status, 403);
+    let anon = format!(
+        "POST /console/bans HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, head, _) = request(http, &anon).await;
+    assert_eq!(status, 303, "{head}");
+    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+}
+
 /// The console Integrations page is admin-gated and lists every chat-platform
 /// bridge with its build availability. This default (no-bridge-feature) build
 /// reports all three as not built.

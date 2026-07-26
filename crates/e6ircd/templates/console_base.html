@@ -60,6 +60,12 @@
         background: transparent; color: inherit; cursor: pointer; }
       form.add button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
       button.danger { color: var(--off); border-color: var(--off); background: transparent; }
+      form.add select { padding: 0.4rem 0.6rem; border: 1px solid var(--border);
+        border-radius: 0.4rem; background: transparent; color: inherit; }
+      .cell-form { display: inline; margin: 0; }
+      .banner-error { background: color-mix(in srgb, var(--off) 15%, transparent);
+        border: 1px solid var(--off); color: var(--fg); padding: 0.5rem 0.8rem;
+        border-radius: 0.5rem; margin: 0 0 1rem; }
       @media (max-width: 40rem) {
         .layout { flex-direction: column; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;

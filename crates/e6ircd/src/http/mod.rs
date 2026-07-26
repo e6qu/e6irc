@@ -187,6 +187,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/integrations/delete",
             post(pages::console_delete_bridge),
         )
+        .route("/console/bans", post(pages::console_add_ban))
+        .route("/console/bans/delete", post(pages::console_remove_ban))
+        .route("/console/channels/drop", post(pages::console_drop_channel))
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -693,6 +696,73 @@ mod pages {
         channels: Vec<ChannelRow>,
         bans: Vec<BanRow>,
         audit: Vec<AuditRow>,
+        /// An error banner shown at the top when a management action failed
+        /// (e.g. an invalid ban mask). `None` on the plain GET.
+        error: Option<String>,
+    }
+
+    /// Assemble the admin console view (all server-wide read data). `error` is a
+    /// banner to show when re-rendering after a failed management action. Callers
+    /// have already admin-gated the request.
+    async fn console_build(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        error: Option<String>,
+    ) -> Result<Console, Response> {
+        let pool = pool_of(state);
+        let (stat_accounts, stat_channels, stat_server_bans) = crate::db::server_stats(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("server stats", e))?;
+        let accounts = crate::db::list_accounts(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("account list", e))?;
+        let channels = crate::db::list_registered_channels(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("channel list", e))?
+            .into_iter()
+            .map(|(name, founder)| ChannelRow { name, founder })
+            .collect();
+        let bans = crate::db::list_server_bans(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("server-ban list", e))?
+            .into_iter()
+            .map(|(mask, reason, set_by, kind)| BanRow {
+                kind,
+                mask,
+                reason,
+                set_by,
+            })
+            .collect();
+        let audit = crate::db::list_audit_log(pool, 100)
+            .await
+            .map_err(|e| super::device::admin_db_error("audit log", e))?
+            .into_iter()
+            .map(|(actor, action, target, detail, at)| AuditRow {
+                at,
+                actor,
+                action,
+                target,
+                detail,
+            })
+            .collect();
+        Ok(Console {
+            account,
+            csrf,
+            is_admin: true,
+            active: "overview",
+            server_name: state.server_name.clone(),
+            network_name: state.network_name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            stat_accounts,
+            stat_channels,
+            stat_server_bans,
+            accounts,
+            channels,
+            bans,
+            audit,
+            error,
+        })
     }
 
     /// One BNC network in the console networks view, with its live upstream
@@ -742,66 +812,10 @@ mod pages {
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let pool = pool_of(&state);
-
-        let (stat_accounts, stat_channels, stat_server_bans) =
-            match crate::db::server_stats(pool).await {
-                Ok(t) => t,
-                Err(e) => return super::device::admin_db_error("server stats", e),
-            };
-        let accounts = match crate::db::list_accounts(pool).await {
-            Ok(v) => v,
-            Err(e) => return super::device::admin_db_error("account list", e),
-        };
-        let channels = match crate::db::list_registered_channels(pool).await {
-            Ok(v) => v
-                .into_iter()
-                .map(|(name, founder)| ChannelRow { name, founder })
-                .collect(),
-            Err(e) => return super::device::admin_db_error("channel list", e),
-        };
-        let bans = match crate::db::list_server_bans(pool).await {
-            Ok(v) => v
-                .into_iter()
-                .map(|(mask, reason, set_by, kind)| BanRow {
-                    kind,
-                    mask,
-                    reason,
-                    set_by,
-                })
-                .collect(),
-            Err(e) => return super::device::admin_db_error("server-ban list", e),
-        };
-        let audit = match crate::db::list_audit_log(pool, 100).await {
-            Ok(v) => v
-                .into_iter()
-                .map(|(actor, action, target, detail, at)| AuditRow {
-                    at,
-                    actor,
-                    action,
-                    target,
-                    detail,
-                })
-                .collect(),
-            Err(e) => return super::device::admin_db_error("audit log", e),
-        };
-
-        render_private(Console {
-            account,
-            csrf,
-            is_admin: true, // gated above; the shell shows the Server nav section
-            active: "overview",
-            server_name: state.server_name.clone(),
-            network_name: state.network_name.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            stat_accounts,
-            stat_channels,
-            stat_server_bans,
-            accounts,
-            channels,
-            bans,
-            audit,
-        })
+        match console_build(&state, account, csrf, None).await {
+            Ok(view) => render_private(view),
+            Err(resp) => resp,
+        }
     }
 
     /// Whether `account` may reach the admin console sections.
@@ -1149,6 +1163,143 @@ mod pages {
             return Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None));
         }
         Ok(account)
+    }
+
+    /// Run one admin console action on the core worker and await its outcome.
+    /// The action mutates live state (hot ban list, registered-channel maps) and
+    /// persists, exactly like the equivalent oper/services IRC command.
+    async fn admin_action(
+        state: &AppState,
+        req: crate::core::AdminRequest,
+    ) -> Result<String, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state
+            .core_tx
+            .push(crate::core::Input::Admin { req, reply: tx })
+            .await
+            .is_err()
+        {
+            return Err("core worker unavailable".into());
+        }
+        match rx.await {
+            Ok(crate::core::AdminReply::Ok(m)) => Ok(m),
+            Ok(crate::core::AdminReply::Err(m)) => Err(m),
+            Err(_) => Err("core worker dropped the request".into()),
+        }
+    }
+
+    /// Re-render the admin console with an error banner after a failed action.
+    async fn console_error_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        message: String,
+    ) -> Response {
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        match console_build(state, account, csrf, Some(message)).await {
+            Ok(view) => render_private(view),
+            Err(resp) => resp,
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct BanForm {
+        csrf: String,
+        kind: String,
+        mask: String,
+        #[serde(default)]
+        reason: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct BanDeleteForm {
+        csrf: String,
+        kind: String,
+        mask: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct DropChannelForm {
+        csrf: String,
+        channel: String,
+    }
+
+    /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
+    /// and disconnects matching sessions exactly like oper KLINE.
+    pub async fn console_add_ban(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BanForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let req = crate::core::AdminRequest::AddServerBan {
+            mask: f.mask,
+            kind: f.kind,
+            reason: f.reason,
+            actor: account.clone(),
+        };
+        match admin_action(&state, req).await {
+            Ok(_) => Redirect::to("/console").into_response(),
+            Err(msg) => console_error_page(&state, &headers, account, msg).await,
+        }
+    }
+
+    /// Console → remove a K/D/X-line (admin).
+    pub async fn console_remove_ban(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BanDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let req = crate::core::AdminRequest::RemoveServerBan {
+            mask: f.mask,
+            kind: f.kind,
+            actor: account.clone(),
+        };
+        match admin_action(&state, req).await {
+            Ok(_) => Redirect::to("/console").into_response(),
+            Err(msg) => console_error_page(&state, &headers, account, msg).await,
+        }
+    }
+
+    /// Console → unregister a channel (admin), like ChanServ DROP.
+    pub async fn console_drop_channel(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<DropChannelForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let req = crate::core::AdminRequest::DropChannel {
+            channel: f.channel,
+            actor: account.clone(),
+        };
+        match admin_action(&state, req).await {
+            Ok(_) => Redirect::to("/console").into_response(),
+            Err(msg) => console_error_page(&state, &headers, account, msg).await,
+        }
     }
 
     /// Console → Integrations: add a bridge (admin). Maps the platform form onto

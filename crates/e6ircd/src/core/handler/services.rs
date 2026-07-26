@@ -11,6 +11,29 @@ use super::*;
 pub(super) const SERVICE_NICKS: [&str; 2] = ["nickserv", "chanserv"];
 
 /// Whether `key` (a casefolded nick) is a reserved services pseudo-client.
+/// Unregister a channel: persist the deletion and clear every hot map scoped to
+/// its registration. Returns `false` (making no change) if the persist request
+/// could not be queued. `drop_channel` deletes the whole `channels` row — and
+/// the mlock/keeptopic settings are columns *on that row* — so every hot map
+/// scoped to registration must be cleared, or a later recreation of the channel
+/// reapplies a stale lock / keeptopic the DB no longer holds (a divergence a
+/// restart would silently flip). The DB row's `channel_access` cascades on the
+/// row delete. Shared by ChanServ DROP and the HTTP admin console.
+pub(crate) fn drop_registered_channel(state: &mut ServerState, key: &ChanKey) -> bool {
+    let request = crate::core::DbRequest::DropChannel {
+        channel: key.as_str().to_string(),
+    };
+    if state.db_tx.try_push(request).is_err() {
+        return false;
+    }
+    state.registered_founders.remove(key);
+    state.registered_topics.remove(key);
+    state.channel_access.remove(key);
+    state.channel_mlock.remove(key);
+    state.keeptopic_off.remove(key);
+    true
+}
+
 pub(super) fn is_service_nick(key: &str) -> bool {
     SERVICE_NICKS.contains(&key)
 }
@@ -320,10 +343,7 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 );
                 return;
             }
-            let request = crate::core::DbRequest::DropChannel {
-                channel: key.as_str().to_string(),
-            };
-            if state.db_tx.try_push(request).is_err() {
+            if !drop_registered_channel(state, &key) {
                 state.service_notice(
                     conn,
                     "ChanServ",
@@ -331,19 +351,6 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 );
                 return;
             }
-            // Drop the hot registration too: no more founder-op, topic
-            // retention, mode lock, keeptopic override, or access for this
-            // channel. `drop_channel` deletes the whole `channels` row — and the
-            // mlock/keeptopic settings are columns *on that row* — so every hot
-            // map scoped to registration must be cleared, or a later recreation
-            // of the channel reapplies a stale lock / keeptopic that the DB no
-            // longer holds (a divergence that a restart would silently flip).
-            // (The DB row's channel_access cascades on the row delete.)
-            state.registered_founders.remove(&key);
-            state.registered_topics.remove(&key);
-            state.channel_access.remove(&key);
-            state.channel_mlock.remove(&key);
-            state.keeptopic_off.remove(&key);
             state.service_notice(
                 conn,
                 "ChanServ",
