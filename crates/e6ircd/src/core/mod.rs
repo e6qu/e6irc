@@ -70,6 +70,68 @@ pub enum Input {
     /// `Sender<DbRequest>` and letting the DB worker drain and flush its
     /// buffered history before the process exits (DESIGN §18).
     Shutdown,
+    /// An administrative action from the HTTP console, run on the core thread
+    /// like any other input (so it sees and mutates live state consistently).
+    /// There is no IRC session behind it — the acting admin account is named in
+    /// the request — and the outcome is returned over the oneshot `reply`.
+    Admin {
+        req: AdminRequest,
+        reply: tokio::sync::oneshot::Sender<AdminReply>,
+    },
+}
+
+/// A privileged action requested by the HTTP admin console (DESIGN §9.4).
+/// Processed on the core thread via [`Input::Admin`], reusing the same live
+/// state, hot lists and persistence path as the equivalent IRC oper/services
+/// command — so a console ban enforces (and disconnects) identically.
+#[derive(Debug)]
+pub enum AdminRequest {
+    /// Add a K/D/X-line (`kind` is "kline"/"dline"/"xline"). Persisted,
+    /// enforced, and matching sessions disconnected — exactly like oper KLINE.
+    AddServerBan {
+        mask: String,
+        kind: String,
+        reason: String,
+        actor: String,
+    },
+    /// Remove a K/D/X-line by (mask, kind).
+    RemoveServerBan {
+        mask: String,
+        kind: String,
+        actor: String,
+    },
+    /// Unregister a registered channel (like ChanServ DROP, founder-agnostic).
+    DropChannel { channel: String, actor: String },
+    /// Snapshot every live (registered) client session for the console.
+    ListSessions,
+    /// Disconnect the session holding `nick` (like oper KILL).
+    Kill {
+        nick: String,
+        reason: String,
+        actor: String,
+    },
+}
+
+/// A snapshot of one live client session, for the admin console's sessions view.
+#[derive(Debug)]
+pub struct SessionInfo {
+    pub nick: String,
+    pub user: String,
+    pub host: String,
+    pub account: Option<String>,
+    pub oper: bool,
+    pub channels: Vec<String>,
+}
+
+/// The outcome of an [`AdminRequest`], returned over its oneshot reply.
+#[derive(Debug)]
+pub enum AdminReply {
+    /// Success, with a human-readable one-line summary.
+    Ok(String),
+    /// Rejected: bad input, nothing matched, or persistence unavailable.
+    Err(String),
+    /// A live-sessions snapshot (answer to [`AdminRequest::ListSessions`]).
+    Sessions(Vec<SessionInfo>),
 }
 
 /// Work the core asks the DB worker to do. The worker answers by
@@ -626,6 +688,13 @@ impl Core {
             // (see `net::core_worker`), which drops the `Core` and closes the
             // DB write path so the buffered history flushes.
             Input::Shutdown => self.state.broadcast_shutdown("Server shutting down"),
+            Input::Admin { req, reply } => {
+                let outcome = handler::admin::handle(&mut self.state, req);
+                // The receiver is the HTTP handler awaiting this action; if it
+                // has gone away (client hung up), the action still applied —
+                // dropping the reply is fine.
+                let _ = reply.send(outcome);
+            }
         }
         // Sweep connections whose SendQ overflowed while handling the
         // event: the slow client dies (may cascade if its QUIT broadcast

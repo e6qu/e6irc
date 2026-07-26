@@ -29,6 +29,7 @@ async fn full_oidc_login_provisions_account_and_session() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: http_addr,
@@ -161,6 +162,7 @@ async fn pat_bearer_auth_works() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -243,6 +245,7 @@ async fn oidc_identity_link_flow_and_conflict() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: http_addr,
@@ -367,6 +370,7 @@ async fn oidc_silent_sso_reuses_provider_session() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: http_addr,

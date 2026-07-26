@@ -362,6 +362,11 @@ pub struct ListenerConfig {
     pub addr: SocketAddr,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Serve IRC-over-WebSocket at the root path on this listener instead of a
+    /// raw TCP IRC stream (a bare WS-IRC port with no HTTP UI). A client
+    /// connects to `ws://addr/` and reaches the same core as a raw listener.
+    #[serde(default)]
+    pub websocket: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -476,6 +481,19 @@ impl Config {
         if self.listeners.is_empty() {
             return Err(ConfigError::Invalid(
                 "at least one [[listeners]] required".into(),
+            ));
+        }
+        // A websocket listener is served by plain axum (like the [http]
+        // listener) with TLS terminated by a front proxy; it cannot itself
+        // present a certificate. Reject the combination rather than silently
+        // ignore the tls section.
+        if self
+            .listeners
+            .iter()
+            .any(|l| l.websocket && l.tls.is_some())
+        {
+            return Err(ConfigError::Invalid(
+                "a [[listeners]] with websocket = true cannot also set tls (terminate TLS at a proxy)".into(),
             ));
         }
         if self.server_name.is_empty() || self.server_name.contains(' ') {
@@ -1071,6 +1089,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             networks: vec![net("libera", Some("alice")), net("libera", Some("bob"))],
             bnc: bnc(),
@@ -1081,11 +1100,31 @@ mod tests {
     }
 
     #[test]
+    fn websocket_listener_with_tls_is_rejected() {
+        // A websocket listener is served by plain axum with TLS terminated at a
+        // proxy; combining it with a tls section is refused at load, never
+        // silently ignored.
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: Some(TlsConfig {
+                    cert_path: "/unused/cert.pem".into(),
+                    key_path: "/unused/key.pem".into(),
+                }),
+                websocket: true,
+            }],
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "websocket + tls must be rejected");
+    }
+
+    #[test]
     fn duplicate_owner_and_name_is_rejected() {
         let cfg = Config {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             networks: vec![net("libera", Some("alice")), net("libera", Some("alice"))],
             bnc: bnc(),
@@ -1101,6 +1140,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             networks: vec![net("libera", None), net("libera", Some("alice"))],
             bnc: bnc(),
@@ -1120,6 +1160,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             networks: vec![net("libera", None)],
             ..Config::default()
@@ -1134,6 +1175,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             limits: LimitsConfig {
                 command_burst: Some(0),
@@ -1153,6 +1195,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             limits: LimitsConfig {
                 registration_burst: Some(0),
@@ -1174,6 +1217,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             limits: LimitsConfig {
                 max_connections_per_ip: Some(0),
@@ -1193,6 +1237,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             nicklen: 500,
             ..Config::default()
@@ -1209,6 +1254,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             registration: RegistrationConfig {
                 before_connect: true,
@@ -1229,6 +1275,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             max_hot_channels: 0,
             ..Config::default()
@@ -1244,6 +1291,7 @@ mod tests {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 tls: None,
+                websocket: false,
             }],
             http: Some(HttpConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),

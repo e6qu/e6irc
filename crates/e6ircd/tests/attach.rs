@@ -14,6 +14,7 @@ async fn upstream() -> std::net::SocketAddr {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         ..Config::default()
     };

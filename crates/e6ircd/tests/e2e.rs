@@ -18,6 +18,7 @@ fn test_config() -> Config {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         ..Config::default()
     }
@@ -171,6 +172,7 @@ async fn tls_client_full_flow() {
             cert_path: cert_path.clone(),
             key_path: key_path.clone(),
         }),
+        websocket: false,
     }];
     let running = net::start(config).await.expect("start tls");
     let addr = running.addrs[0];
@@ -220,6 +222,7 @@ async fn per_ip_connection_limit_refuses_excess() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         limits: LimitsConfig {
             max_connections_per_ip: Some(2),
@@ -274,6 +277,7 @@ async fn command_flood_throttle_closes_excess() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         limits: LimitsConfig {
             max_connections_per_ip: None,

@@ -13,6 +13,7 @@ fn config() -> Config {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -118,6 +119,34 @@ async fn read_until(
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}"))
+}
+
+/// A dedicated `websocket = true` listener (no [http] section) serves IRC over
+/// WebSocket at the root path, so `ws://addr/` reaches the same core as a raw
+/// TCP listener would. This is the surface upstream irctest's websocket suite
+/// drives (it connects to `ws://host:port` with no path).
+#[tokio::test]
+async fn dedicated_ws_listener_serves_irc_at_root() {
+    let config = Config {
+        server_name: "irc.wsl.example".into(),
+        network_name: "WsLNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: true,
+        }],
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let addr = running.addrs[0];
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+        .await
+        .expect("ws connect at root");
+    ws.send(Tung::text("NICK wsroot\r\nUSER w 0 * :W"))
+        .await
+        .unwrap();
+    let welcome = read_until(&mut ws, " 001 ").await;
+    assert!(welcome.contains("wsroot"), "{welcome}");
 }
 
 /// The ircv3 WebSocket transport allows several complete IRC messages in one

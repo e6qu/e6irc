@@ -15,6 +15,7 @@ fn test_config() -> Config {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -164,6 +165,7 @@ async fn upstream_server() -> std::net::SocketAddr {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         ..Config::default()
     };
@@ -208,6 +210,7 @@ async fn bnc_network_management_lifecycle() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -355,6 +358,7 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -497,6 +501,7 @@ async fn account_page_lists_networks_for_a_session() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -561,6 +566,7 @@ async fn console_networks_page_lists_the_callers_networks() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -626,6 +632,7 @@ async fn console_add_and_delete_network_via_the_console() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -776,6 +783,7 @@ async fn admin_accounts_endpoint_is_gated() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -903,6 +911,7 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -948,6 +957,264 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
     }
 }
 
+/// Admin console server-management actions: add/remove a server ban and drop a
+/// registered channel, all driven through the core (so they enforce like the
+/// IRC oper/services commands) and admin-gated + CSRF-protected.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_console_ban_and_channel_actions() {
+    let url = support::test_db("admin_console_ban_and_channel_actions").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#dropme', '#dropme', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.admin.example".into(),
+        network_name: "AdminNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Load the console and extract the session-bound CSRF token.
+    let page_req = format!(
+        "GET /console HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page) = request(http, &page_req).await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = page
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token in console")
+        .to_string();
+    assert!(!csrf.is_empty());
+
+    // Fetch /console and test for a needle, retrying while the fire-and-forget
+    // DB write behind a core action settles.
+    let console_has = |needle: &'static str, want: bool| {
+        let req = page_req.clone();
+        async move {
+            for _ in 0..40 {
+                let (_, _, body) = request(http, &req).await;
+                if body.contains(needle) == want {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        }
+    };
+
+    // Add a K-line via the console -> 303 back to /console; the ban appears.
+    let body = "csrf=CSRF&kind=kline&mask=*@bad.example&reason=spam";
+    let body = body.replace("CSRF", &csrf);
+    let add = format!(
+        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = request(http, &add).await;
+    assert_eq!(status, 303, "{head}");
+    // Discriminate on the bans-table empty-state text, not the mask itself: the
+    // mask also appears in the audit-log rows (KLINE/UNKLINE target), so a bare
+    // substring check would false-match after removal.
+    assert!(
+        console_has("No server bans.", false).await,
+        "ban not listed after add"
+    );
+
+    // Remove it -> 303; the bans table is empty again.
+    let del = "csrf=CSRF&kind=kline&mask=*@bad.example".replace("CSRF", &csrf);
+    let del_req = format!(
+        "POST /console/bans/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{del}",
+        del.len()
+    );
+    let (status, _, _) = request(http, &del_req).await;
+    assert_eq!(status, 303);
+    assert!(
+        console_has("No server bans.", true).await,
+        "ban still listed after remove"
+    );
+
+    // Drop the registered channel -> 303; the channel list becomes empty.
+    assert!(
+        console_has("No registered channels.", false).await,
+        "channel not listed to begin with"
+    );
+    let drop_body = "csrf=CSRF&channel=%23dropme".replace("CSRF", &csrf);
+    let drop_req = format!(
+        "POST /console/channels/drop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{drop_body}",
+        drop_body.len()
+    );
+    let (status, _, _) = request(http, &drop_req).await;
+    assert_eq!(status, 303);
+    assert!(
+        console_has("No registered channels.", true).await,
+        "channel still listed after drop"
+    );
+
+    // Gate: a wrong CSRF is refused (403); an anonymous POST redirects to login.
+    let bad = "csrf=wrong&kind=kline&mask=*@x.example&reason=x";
+    let bad_req = format!(
+        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, _, _) = request(http, &bad_req).await;
+    assert_eq!(status, 403);
+    let anon = format!(
+        "POST /console/bans HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, head, _) = request(http, &anon).await;
+    assert_eq!(status, 303, "{head}");
+    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+}
+
+/// Admin console live-sessions view + KILL: a connected IRC client shows up in
+/// the sessions list and can be disconnected from the console.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_console_lists_and_kills_sessions() {
+    let url = support::test_db("admin_console_lists_and_kills_sessions").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.sess.example".into(),
+        network_name: "SessNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let irc = running.addrs[0];
+    let http = running.http_addr.expect("http");
+
+    // A client connects and registers, so it is a live session.
+    let mut victim = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("tcp");
+    victim.register("victim", "v").await.expect("register");
+
+    let sessions_req = format!(
+        "GET /console/sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    // Wait for the session to appear (registration completes asynchronously).
+    let mut csrf = String::new();
+    let mut listed = false;
+    for _ in 0..40 {
+        let (status, _, body) = request(http, &sessions_req).await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("victim") {
+            listed = true;
+            csrf = body
+                .split("name=\"csrf\" value=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(listed, "victim session not listed");
+    assert!(!csrf.is_empty(), "no csrf on sessions page");
+
+    // KILL it from the console -> 303 back to the sessions view.
+    let body = "csrf=CSRF&nick=victim&reason=cleanup".replace("CSRF", &csrf);
+    let kill = format!(
+        "POST /console/sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = request(http, &kill).await;
+    assert_eq!(status, 303, "{head}");
+
+    // The victim's connection is closed by the server (an ERROR then EOF).
+    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match victim.next_message().await {
+                Ok(Some(m)) if m.command == "ERROR" => return true,
+                Ok(Some(_)) => continue,
+                _ => return true, // EOF / closed
+            }
+        }
+    })
+    .await
+    .expect("victim was not disconnected");
+    assert!(killed);
+
+    // It no longer appears in the sessions list.
+    let mut gone = false;
+    for _ in 0..40 {
+        let (_, _, body) = request(http, &sessions_req).await;
+        if !body.contains(">victim<") && !body.contains("<code>victim</code>") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(gone, "victim still listed after kill");
+}
+
 /// The console Integrations page is admin-gated and lists every chat-platform
 /// bridge with its build availability. This default (no-bridge-feature) build
 /// reports all three as not built.
@@ -978,6 +1245,7 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1040,6 +1308,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1118,6 +1387,7 @@ async fn account_page_add_network_form_with_csrf() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1197,6 +1467,7 @@ async fn device_authorization_grant_flow() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1351,6 +1622,7 @@ async fn me_tokens_list_and_revoke() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1450,6 +1722,7 @@ async fn network_buffer_read() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1529,6 +1802,7 @@ async fn me_read_markers_list() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1608,6 +1882,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1845,6 +2120,7 @@ async fn application_entry_is_fail_closed_and_uses_silent_sso() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -1926,6 +2202,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         http: Some(HttpConfig {
             addr: "127.0.0.1:0".parse().unwrap(),

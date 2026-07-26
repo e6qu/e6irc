@@ -157,7 +157,7 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         .into_response()
 }
 
-pub fn router(state: AppState) -> Router {
+pub fn router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/healthz", get(async || "ok"))
         .route("/login", get(pages::login))
@@ -187,6 +187,11 @@ pub fn router(state: AppState) -> Router {
             "/console/integrations/delete",
             post(pages::console_delete_bridge),
         )
+        .route("/console/bans", post(pages::console_add_ban))
+        .route("/console/bans/delete", post(pages::console_remove_ban))
+        .route("/console/channels/drop", post(pages::console_drop_channel))
+        .route("/console/sessions", get(pages::console_sessions))
+        .route("/console/sessions/kill", post(pages::console_kill_session))
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -271,7 +276,20 @@ pub fn router(state: AppState) -> Router {
                 resp
             },
         ))
-        .with_state(Arc::new(state))
+        .with_state(state)
+}
+
+/// A minimal router that serves IRC-over-WebSocket at the root path (`/`). Used
+/// by a dedicated `websocket = true` listener — a bare WS-IRC port with no HTTP
+/// UI — so a client connecting to `ws://host:port/` reaches the same core as the
+/// raw TCP listeners. Shares the AppState (core_tx, per-IP limiter, sendq) with
+/// any HTTP server. Kept separate from `router` so the full HTTP surface
+/// (login, console, API) is never exposed on a port meant only for WS-IRC.
+pub fn ws_irc_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(ws_irc))
+        .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
+        .with_state(state)
 }
 
 /// Embedded web client (the Vite build in web/dist) served under the
@@ -680,6 +698,73 @@ mod pages {
         channels: Vec<ChannelRow>,
         bans: Vec<BanRow>,
         audit: Vec<AuditRow>,
+        /// An error banner shown at the top when a management action failed
+        /// (e.g. an invalid ban mask). `None` on the plain GET.
+        error: Option<String>,
+    }
+
+    /// Assemble the admin console view (all server-wide read data). `error` is a
+    /// banner to show when re-rendering after a failed management action. Callers
+    /// have already admin-gated the request.
+    async fn console_build(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        error: Option<String>,
+    ) -> Result<Console, Response> {
+        let pool = pool_of(state);
+        let (stat_accounts, stat_channels, stat_server_bans) = crate::db::server_stats(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("server stats", e))?;
+        let accounts = crate::db::list_accounts(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("account list", e))?;
+        let channels = crate::db::list_registered_channels(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("channel list", e))?
+            .into_iter()
+            .map(|(name, founder)| ChannelRow { name, founder })
+            .collect();
+        let bans = crate::db::list_server_bans(pool)
+            .await
+            .map_err(|e| super::device::admin_db_error("server-ban list", e))?
+            .into_iter()
+            .map(|(mask, reason, set_by, kind)| BanRow {
+                kind,
+                mask,
+                reason,
+                set_by,
+            })
+            .collect();
+        let audit = crate::db::list_audit_log(pool, 100)
+            .await
+            .map_err(|e| super::device::admin_db_error("audit log", e))?
+            .into_iter()
+            .map(|(actor, action, target, detail, at)| AuditRow {
+                at,
+                actor,
+                action,
+                target,
+                detail,
+            })
+            .collect();
+        Ok(Console {
+            account,
+            csrf,
+            is_admin: true,
+            active: "overview",
+            server_name: state.server_name.clone(),
+            network_name: state.network_name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            stat_accounts,
+            stat_channels,
+            stat_server_bans,
+            accounts,
+            channels,
+            bans,
+            audit,
+            error,
+        })
     }
 
     /// One BNC network in the console networks view, with its live upstream
@@ -692,6 +777,27 @@ mod pages {
         autojoin: String,
         enabled: bool,
         connected: bool,
+    }
+
+    struct SessionRow {
+        nick: String,
+        user: String,
+        host: String,
+        account: Option<String>,
+        oper: bool,
+        /// Channels the session is in, pre-joined for display.
+        channels: String,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_sessions.html")]
+    struct ConsoleSessions {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        sessions: Vec<SessionRow>,
+        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -729,66 +835,10 @@ mod pages {
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let pool = pool_of(&state);
-
-        let (stat_accounts, stat_channels, stat_server_bans) =
-            match crate::db::server_stats(pool).await {
-                Ok(t) => t,
-                Err(e) => return super::device::admin_db_error("server stats", e),
-            };
-        let accounts = match crate::db::list_accounts(pool).await {
-            Ok(v) => v,
-            Err(e) => return super::device::admin_db_error("account list", e),
-        };
-        let channels = match crate::db::list_registered_channels(pool).await {
-            Ok(v) => v
-                .into_iter()
-                .map(|(name, founder)| ChannelRow { name, founder })
-                .collect(),
-            Err(e) => return super::device::admin_db_error("channel list", e),
-        };
-        let bans = match crate::db::list_server_bans(pool).await {
-            Ok(v) => v
-                .into_iter()
-                .map(|(mask, reason, set_by, kind)| BanRow {
-                    kind,
-                    mask,
-                    reason,
-                    set_by,
-                })
-                .collect(),
-            Err(e) => return super::device::admin_db_error("server-ban list", e),
-        };
-        let audit = match crate::db::list_audit_log(pool, 100).await {
-            Ok(v) => v
-                .into_iter()
-                .map(|(actor, action, target, detail, at)| AuditRow {
-                    at,
-                    actor,
-                    action,
-                    target,
-                    detail,
-                })
-                .collect(),
-            Err(e) => return super::device::admin_db_error("audit log", e),
-        };
-
-        render_private(Console {
-            account,
-            csrf,
-            is_admin: true, // gated above; the shell shows the Server nav section
-            active: "overview",
-            server_name: state.server_name.clone(),
-            network_name: state.network_name.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            stat_accounts,
-            stat_channels,
-            stat_server_bans,
-            accounts,
-            channels,
-            bans,
-            audit,
-        })
+        match console_build(&state, account, csrf, None).await {
+            Ok(view) => render_private(view),
+            Err(resp) => resp,
+        }
     }
 
     /// Whether `account` may reach the admin console sections.
@@ -1136,6 +1186,264 @@ mod pages {
             return Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None));
         }
         Ok(account)
+    }
+
+    /// Run one admin console action on the core worker and await its outcome.
+    /// The action mutates live state (hot ban list, registered-channel maps) and
+    /// persists, exactly like the equivalent oper/services IRC command.
+    async fn admin_action(
+        state: &AppState,
+        req: crate::core::AdminRequest,
+    ) -> Result<String, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state
+            .core_tx
+            .push(crate::core::Input::Admin { req, reply: tx })
+            .await
+            .is_err()
+        {
+            return Err("core worker unavailable".into());
+        }
+        match rx.await {
+            Ok(crate::core::AdminReply::Ok(m)) => Ok(m),
+            Ok(crate::core::AdminReply::Err(m)) => Err(m),
+            Ok(crate::core::AdminReply::Sessions(_)) => {
+                Err("unexpected sessions reply for a mutation".into())
+            }
+            Err(_) => Err("core worker dropped the request".into()),
+        }
+    }
+
+    /// Snapshot the live client sessions from the core worker.
+    async fn admin_list_sessions(
+        state: &AppState,
+    ) -> Result<Vec<crate::core::SessionInfo>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state
+            .core_tx
+            .push(crate::core::Input::Admin {
+                req: crate::core::AdminRequest::ListSessions,
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err("core worker unavailable".into());
+        }
+        match rx.await {
+            Ok(crate::core::AdminReply::Sessions(s)) => Ok(s),
+            Ok(_) => Err("unexpected reply".into()),
+            Err(_) => Err("core worker dropped the request".into()),
+        }
+    }
+
+    /// Re-render the admin console with an error banner after a failed action.
+    async fn console_error_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        message: String,
+    ) -> Response {
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        match console_build(state, account, csrf, Some(message)).await {
+            Ok(view) => render_private(view),
+            Err(resp) => resp,
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct BanForm {
+        csrf: String,
+        kind: String,
+        mask: String,
+        #[serde(default)]
+        reason: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct BanDeleteForm {
+        csrf: String,
+        kind: String,
+        mask: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct DropChannelForm {
+        csrf: String,
+        channel: String,
+    }
+
+    /// Gate an admin form action (admin + CSRF) and run it on the core. Returns
+    /// the redirect `Response` on success, or the gate `Response` (login/403) on
+    /// a gate failure; on an *action* failure returns `Err((account, message))`
+    /// so the caller re-renders its own page with the message. This is the shared
+    /// tail of every console mutation — only the form type, the request it builds,
+    /// and the page it re-renders on error differ.
+    async fn run_admin_form(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        csrf: &str,
+        redirect: &'static str,
+        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
+    ) -> Result<Response, (String, String)> {
+        let account = match require_admin_form_actor(state, headers, csrf).await {
+            Ok(a) => a,
+            Err(gate) => return Ok(gate),
+        };
+        let req = make_req(account.clone());
+        match admin_action(state, req).await {
+            Ok(_) => Ok(Redirect::to(redirect).into_response()),
+            Err(msg) => Err((account, msg)),
+        }
+    }
+
+    /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
+    /// and disconnects matching sessions exactly like oper KLINE.
+    pub async fn console_add_ban(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BanForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let make = |actor| crate::core::AdminRequest::AddServerBan {
+            mask: f.mask,
+            kind: f.kind,
+            reason: f.reason,
+            actor,
+        };
+        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+        }
+    }
+
+    /// Console → remove a K/D/X-line (admin).
+    pub async fn console_remove_ban(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BanDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let make = |actor| crate::core::AdminRequest::RemoveServerBan {
+            mask: f.mask,
+            kind: f.kind,
+            actor,
+        };
+        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+        }
+    }
+
+    /// Console → unregister a channel (admin), like ChanServ DROP.
+    pub async fn console_drop_channel(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<DropChannelForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let make = |actor| crate::core::AdminRequest::DropChannel {
+            channel: f.channel,
+            actor,
+        };
+        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct KillForm {
+        csrf: String,
+        nick: String,
+        #[serde(default)]
+        reason: String,
+    }
+
+    /// Render the live client-sessions view (admin). `error` shows a banner after
+    /// a failed KILL.
+    async fn console_sessions_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        error: Option<String>,
+    ) -> Response {
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let (sessions, error) = match admin_list_sessions(state).await {
+            Ok(list) => (
+                list.into_iter()
+                    .map(|s| SessionRow {
+                        nick: s.nick,
+                        user: s.user,
+                        host: s.host,
+                        account: s.account,
+                        oper: s.oper,
+                        channels: s.channels.join(", "),
+                    })
+                    .collect(),
+                error,
+            ),
+            // Surface a snapshot failure as the banner rather than a blank page.
+            Err(msg) => (Vec::new(), Some(error.unwrap_or(msg))),
+        };
+        render_private(ConsoleSessions {
+            account,
+            csrf,
+            is_admin: true,
+            active: "sessions",
+            sessions,
+            error,
+        })
+    }
+
+    /// Console → live client sessions (admin-gated, like `/console`).
+    pub async fn console_sessions(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        if !is_admin_account(&state, &account) {
+            return problem(StatusCode::FORBIDDEN, "Admin only", None);
+        }
+        console_sessions_page(&state, &headers, account, None).await
+    }
+
+    /// Console → KILL a client session by nick (admin), like oper KILL.
+    pub async fn console_kill_session(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<KillForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let make = |actor| crate::core::AdminRequest::Kill {
+            nick: f.nick,
+            reason: f.reason,
+            actor,
+        };
+        match run_admin_form(&state, &headers, &f.csrf, "/console/sessions", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => {
+                console_sessions_page(&state, &headers, account, Some(msg)).await
+            }
+        }
     }
 
     /// Console → Integrations: add a bridge (admin). Maps the platform form onto

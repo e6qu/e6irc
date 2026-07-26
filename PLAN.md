@@ -1638,6 +1638,49 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+WS-IRC listener + admin server-management (2026-07-27, multi-phase, one PR):
+two maintainer-approved features landed as sequential phases on a single PR.
+
+Phase 1 — dedicated WS-IRC listener + full irctest websocket conformance:
+a `[[listeners]]` entry with `websocket = true` now serves IRC-over-WebSocket
+at the root path (`ws://addr/`) on its own port with no HTTP UI surface
+(`net::start` builds one shared `AppState` and mounts a minimal `ws_irc_router`
+per WS listener; `websocket = true` + `tls` is refused at load). The `/ws/irc`
+handler now performs IRCv3 subprotocol negotiation — a client's first-offered
+`binary.ircv3.net`/`text.ircv3.net` is echoed and fixes the outbound frame type
+(binary = raw bytes; text = text frames, non-UTF-8 → U+FFFD; none = per-line
+auto, the prior behavior). This lets the irctest controller honor
+`websocket_hostname/port`, so upstream `server_tests/websocket.py` is now in the
+CI green list (verified locally: 6 passed / 2 optional-skips). New Rust tests
+cover the root-path listener; the config gains `ListenerConfig.websocket` with a
+validation test.
+
+Phase 2 — admin console: server-ban CRUD + channel unregister. The admin
+`/console` page can now add/remove K/D/X-lines and unregister a registered
+channel. These run **through the core** via a new `Input::Admin { req, reply }`
+(oneshot-reply) so a console action reuses the exact live-state + persistence
+path of the equivalent oper/services command: a console ban updates the hot
+list, persists, disconnects matching sessions and audit-logs identically to oper
+KLINE (no divergent second implementation — the shared logic was extracted into
+`apply_server_ban` / `remove_server_ban` / `record_audit_by` /
+`drop_registered_channel`, which the oper/ChanServ paths now also call). Actions
+are admin-gated + CSRF-protected (`require_admin_form_actor`); success redirects
+back to `/console` (PRG), failures re-render with an error banner. Covered by a
+PG-gated http test (`admin_console_ban_and_channel_actions`) exercising
+add → remove → drop plus the CSRF/anonymous gates.
+
+Phase 3 — live client-sessions view + KILL. A new admin `/console/sessions`
+page lists every live registered client (nick, user@host, account, oper flag,
+channels) as a snapshot of the core's session table, with a KILL button per
+row. Both the snapshot (`AdminRequest::ListSessions` → `AdminReply::Sessions`)
+and the KILL (`AdminRequest::Kill`, reusing the extracted `oper::kill_by_nick`)
+run through the same core `Input::Admin` path, so a console KILL is the exact
+teardown oper KILL performs (audit + snotice + close `ERROR`). Covered by a
+PG-gated http test (`admin_console_lists_and_kills_sessions`) that connects a
+real IRC client, sees it listed, kills it, and confirms the disconnect. The
+four console mutation handlers share a `run_admin_form` gate/dispatch helper
+(keeping the copy-paste ratchet green).
+
 CI coverage + bouncer-fidelity sweep (2026-07-27): a second CI-focused pass
 plus two bug fixes an adversarial audit of the least-swept surfaces (BNC
 bouncer, bridges, DB, CLI, TUI) surfaced. That audit found those subsystems

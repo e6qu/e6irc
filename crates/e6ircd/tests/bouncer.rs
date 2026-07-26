@@ -15,6 +15,7 @@ async fn upstream() -> std::net::SocketAddr {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         ..Config::default()
     };
@@ -246,6 +247,7 @@ fn bnc_config(up: std::net::SocketAddr, url: String) -> Config {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         networks: vec![
@@ -506,6 +508,7 @@ async fn driver_authenticates_to_sasl_upstream() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         ..Config::default()
@@ -622,6 +625,7 @@ async fn bnc_buffer_persists_and_restores_across_restart() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url: url.clone() }),
         networks: vec![NetworkEntry {
@@ -693,6 +697,7 @@ async fn local_driver_presents_the_in_process_network() {
         listeners: vec![ListenerConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
             tls: None,
+            websocket: false,
         }],
         database: Some(DatabaseConfig { url }),
         networks: vec![NetworkEntry {

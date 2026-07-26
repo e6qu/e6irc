@@ -251,56 +251,79 @@ pub async fn start(config: Config) -> io::Result<Running> {
     // its sessions through /ws/irc instead of the raw port.
     let limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
 
+    // One shared HTTP `AppState`, built when either the HTTP server or any
+    // dedicated websocket-IRC listener needs it, so both serve against the same
+    // core, per-IP limiter and sendq. A websocket listener with no `[http]`
+    // section still gets a state (with HTTP-UI fields defaulted — they are
+    // unused by the WS-IRC router).
+    let any_ws_listener = config.listeners.iter().any(|l| l.websocket);
+    let app_state: Option<Arc<crate::http::AppState>> = if config.http.is_some() || any_ws_listener
+    {
+        let trusted_proxies = config
+            .limits
+            .trusted_proxies
+            .iter()
+            .map(|s| {
+                s.parse::<ipnet::IpNet>().map_err(|e| {
+                    io::Error::other(format!("invalid trusted_proxies CIDR {s:?}: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (public_url, secure_cookies, admin_accounts) = match &config.http {
+            Some(h) => (
+                h.public_url.clone(),
+                h.secure_cookies,
+                h.admin_accounts
+                    .iter()
+                    .map(|a| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(a))
+                    .collect(),
+            ),
+            None => (None, false, std::collections::HashSet::new()),
+        };
+        Some(Arc::new(crate::http::AppState {
+            server_name: config.server_name.clone(),
+            network_name: config.network_name.clone(),
+            pool: pool.clone(),
+            public_url,
+            secure_cookies,
+            oidc_providers: config.oidc_providers.clone(),
+            application_release_revision: config.application_release_revision.clone(),
+            pending_auth: crate::http::AppState::no_pending_auth(),
+            core_tx: core_tx.clone(),
+            next_conn: next_conn.clone(),
+            sendq: config.sendq,
+            bnc_registry: bnc_registry.clone(),
+            secret_key: secret_key.clone(),
+            admin_accounts,
+            csrf_key: {
+                use aws_lc_rs::rand::SecureRandom;
+                let mut k = [0u8; 32];
+                aws_lc_rs::rand::SystemRandom::new()
+                    .fill(&mut k)
+                    .expect("system RNG for CSRF key");
+                k
+            },
+            trusted_proxies,
+            auth_rate_burst: config.limits.auth_rate_burst,
+            auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            conn_limiter: limiter.clone(),
+        }))
+    } else {
+        None
+    };
+
     let http_addr = match &config.http {
         Some(http_config) => {
             let listener = TcpListener::bind(http_config.addr).await?;
             let bound = listener.local_addr()?;
-            let trusted_proxies = config
-                .limits
-                .trusted_proxies
-                .iter()
-                .map(|s| {
-                    s.parse::<ipnet::IpNet>().map_err(|e| {
-                        io::Error::other(format!("invalid trusted_proxies CIDR {s:?}: {e}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let router = crate::http::router(crate::http::AppState {
-                server_name: config.server_name.clone(),
-                network_name: config.network_name.clone(),
-                pool: pool.clone(),
-                public_url: http_config.public_url.clone(),
-                secure_cookies: http_config.secure_cookies,
-                oidc_providers: config.oidc_providers.clone(),
-                application_release_revision: config.application_release_revision.clone(),
-                pending_auth: crate::http::AppState::no_pending_auth(),
-                core_tx: core_tx.clone(),
-                next_conn: next_conn.clone(),
-                sendq: config.sendq,
-                bnc_registry: bnc_registry.clone(),
-                secret_key: secret_key.clone(),
-                admin_accounts: http_config
-                    .admin_accounts
-                    .iter()
-                    .map(|a| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(a))
-                    .collect(),
-                csrf_key: {
-                    use aws_lc_rs::rand::SecureRandom;
-                    let mut k = [0u8; 32];
-                    aws_lc_rs::rand::SystemRandom::new()
-                        .fill(&mut k)
-                        .expect("system RNG for CSRF key");
-                    k
-                },
-                trusted_proxies,
-                auth_rate_burst: config.limits.auth_rate_burst,
-                auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
-                conn_limiter: limiter.clone(),
-            });
+            let state = app_state
+                .clone()
+                .expect("app_state is built whenever [http] is set");
             let http_task = tokio::spawn(async move {
                 // `ConnectInfo<SocketAddr>` so handlers can see the socket peer
                 // (for rate limiting / X-Forwarded-For client-IP resolution).
-                let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+                let service = crate::http::router(state)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
                 if let Err(e) = axum::serve(listener, service).await {
                     eprintln!("http server exited: {e}");
                 }
@@ -461,6 +484,23 @@ pub async fn start(config: Config) -> io::Result<Running> {
     for listener_config in &config.listeners {
         let listener = TcpListener::bind(listener_config.addr).await?;
         addrs.push(listener.local_addr()?);
+        if listener_config.websocket {
+            // A dedicated WS-IRC listener: serve the ws-irc router at the root
+            // path (`ws://addr/`) against the shared core, instead of the raw
+            // TCP accept loop. Same per-IP cap (it lives in the shared state).
+            let state = app_state
+                .clone()
+                .expect("app_state is built whenever a websocket listener is set");
+            let ws_task = tokio::spawn(async move {
+                let service = crate::http::ws_irc_router(state)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+                if let Err(e) = axum::serve(listener, service).await {
+                    eprintln!("ws-irc listener exited: {e}");
+                }
+            });
+            listeners.push(ws_task.abort_handle());
+            continue;
+        }
         let acceptor = match &listener_config.tls {
             Some(tls) => Some(tls_acceptor(tls)?),
             None => None,

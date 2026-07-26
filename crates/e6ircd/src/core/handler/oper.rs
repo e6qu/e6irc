@@ -78,7 +78,7 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let key = state.nick_key(target);
-    let Some(&victim) = state.nicks.get(&key) else {
+    if !state.nicks.contains_key(&key) {
         state.numeric(
             conn,
             ERR_NOSUCHNICK,
@@ -86,34 +86,52 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("No such nick/channel"),
         );
         return;
-    };
+    }
     let comment = p.get(1).copied().unwrap_or("Killed");
     let oper_nick = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    let reason = format!("Killed ({oper_nick} ({comment}))");
+    kill_by_nick(state, target, comment, &oper_nick);
+}
+
+/// Disconnect the session currently holding `target` (by nick): audit it, snotice
+/// the other opers, send the standard KILL close `ERROR`, and close it. Returns
+/// whether a session was found and closed. `killer` is the display name
+/// attributed in the reason and audit — an oper's nick, or an admin account for
+/// the HTTP console. Shared by oper KILL and the admin console.
+pub(crate) fn kill_by_nick(
+    state: &mut ServerState,
+    target: &str,
+    comment: &str,
+    killer: &str,
+) -> bool {
+    let key = state.nick_key(target);
+    let Some(&victim) = state.nicks.get(&key) else {
+        return false;
+    };
+    let reason = format!("Killed ({killer} ({comment}))");
     let server = state.config.server_name.clone();
-    // Audit before the close: a self-kill removes the actor's own session,
-    // and recording afterwards would resolve the actor to an empty string —
-    // an unattributed row in the log whose whole purpose is attribution.
-    record_audit(state, conn, "KILL", target, comment);
+    // Audit before the close: a self-kill removes the actor's own session, and
+    // recording afterwards would resolve the actor to an empty string — an
+    // unattributed row in the log whose whole purpose is attribution.
+    record_audit_by(state, killer, "KILL", target, comment);
     // Snotice every other oper (the victim, if an oper, is about to be closed).
     notify_opers(
         state,
         Some(victim),
-        &format!("Received KILL message for {target} from {oper_nick}: {comment}"),
+        &format!("Received KILL message for {target} from {killer}: {comment}"),
     );
-    // The reason is echoed inside this ERROR wrapper, whose overhead can push
-    // a maximal KILL comment past the wire limit — fit it like the QUIT path
-    // does, or the victim's framing discards the whole close notice (and the
-    // debug wire check would abort the core worker on an oper-typed line).
-    // The trailing `)` is part of the head's cost: include it before fitting,
-    // re-append after.
+    // The reason is echoed inside this ERROR wrapper, whose overhead can push a
+    // maximal KILL comment past the wire limit — fit it like the QUIT path does,
+    // or the victim's framing discards the whole close notice (and the debug wire
+    // check would abort the core worker on an oper-typed line). The trailing `)`
+    // is part of the head's cost: include it before fitting, re-append after.
     let head = format!("ERROR :Closing Link: {server} (");
     let fitted = fit_trailing(&format!("{head})"), &reason);
     state.send(victim, &format!("{head}{fitted})"));
     state.close(victim, &reason);
+    true
 }
 
 /// Record a privileged oper action in the audit log (best-effort; only
@@ -125,16 +143,29 @@ pub(super) fn record_audit(
     target: &str,
     detail: &str,
 ) {
-    if !state.config.sasl_enabled {
-        return;
-    }
     let actor = state
         .sessions
         .get(&conn)
         .and_then(|s| s.nick().map(String::from))
         .unwrap_or_default();
+    record_audit_by(state, &actor, action, target, detail);
+}
+
+/// Record an audit-log row for an actor named directly (rather than resolved
+/// from a connection) — used by the HTTP admin console, which has no IRC
+/// session. Same fire-and-forget persistence as [`record_audit`].
+pub(crate) fn record_audit_by(
+    state: &mut ServerState,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) {
+    if !state.config.sasl_enabled {
+        return;
+    }
     let request = crate::core::DbRequest::AuditLog {
-        actor,
+        actor: actor.to_string(),
         action: action.to_string(),
         target: target.to_string(),
         detail: detail.to_string(),
@@ -343,39 +374,12 @@ pub(super) fn cmd_add_ban(
     // while keeping the operator's casing for STATS and the confirmation — the
     // same discipline the channel ban lists use.
     let mask = crate::core::state::MaskKey::new(parsed_mask.as_str(), casemap);
-    // Replace any existing ban of this kind on the same mask (folded equality).
-    state
-        .server_bans
-        .retain(|b| !(b.kind == kind && b.mask == mask));
-    state.server_bans.push(ServerBan {
-        mask: mask.clone(),
-        reason: reason.clone(),
-        set_by: nick.clone(),
-        kind,
-    });
-    if state.config.sasl_enabled {
-        let request = crate::core::DbRequest::AddServerBan {
-            // The folded form is the storage/uniqueness key; the display form is
-            // persisted alongside so the original casing survives a restart.
-            mask: mask.folded().to_string(),
-            mask_display: mask.as_str().to_string(),
-            reason: reason.clone(),
-            set_by: nick.clone(),
-            kind: kind.as_str().to_string(),
-        };
-        if state.db_tx.try_push(request).is_err() {
-            eprintln!(
-                "{command}: db queue full or closed; {label} for {} not persisted",
-                mask.as_str()
-            );
-        }
-    }
-    // Audit and confirm *before* the disconnect loop: a self-matching ban
-    // (`KLINE *@*`, or a mask covering the oper's own host) closes `conn`'s own
-    // session inside the loop, after which `record_audit` would resolve the
-    // actor to an empty string (an unattributed row) and the confirmation NOTICE
-    // would be a silent no-op on the gone session. This is the same ordering
-    // `cmd_kill` documents for a self-kill.
+    // Audit and confirm *before* the apply: `apply_server_ban` disconnects
+    // matching sessions, and a self-matching ban (`KLINE *@*`, or a mask
+    // covering the oper's own host) closes `conn` in that loop — after which
+    // `record_audit` would resolve the actor to an empty string and the
+    // confirmation NOTICE would be a silent no-op on the gone session. Same
+    // ordering `cmd_kill` documents for a self-kill.
     record_audit(state, conn, &command, mask.as_str(), &reason);
     state.send(
         conn,
@@ -384,14 +388,57 @@ pub(super) fn cmd_add_ban(
             mask.as_str()
         ),
     );
-    // Snotice every oper before the disconnect loop — for the same reason the
-    // audit/confirm run first: a self-matching ban may close `conn` here.
     notify_opers(
         state,
         None,
         &format!("{nick} added {label} for {} ({reason})", mask.as_str()),
     );
-    // Disconnect any matching registered sessions (possibly including `conn`).
+    apply_server_ban(state, mask, kind, &reason, &nick, label);
+}
+
+/// Apply a server ban to live state: replace any existing ban of the same kind
+/// on the same (folded) `mask`, add it to the hot list, persist it, and
+/// disconnect every matching registered session. Returns the number
+/// disconnected. Shared by the oper KLINE/DLINE/XLINE path and the HTTP admin
+/// console, which has no IRC session of its own.
+pub(crate) fn apply_server_ban(
+    state: &mut ServerState,
+    mask: crate::core::state::MaskKey,
+    kind: BanKind,
+    reason: &str,
+    set_by: &str,
+    label: &str,
+) -> usize {
+    let casemap = state.casemap;
+    // Replace any existing ban of this kind on the same mask (folded equality).
+    state
+        .server_bans
+        .retain(|b| !(b.kind == kind && b.mask == mask));
+    state.server_bans.push(ServerBan {
+        mask: mask.clone(),
+        reason: reason.to_string(),
+        set_by: set_by.to_string(),
+        kind,
+    });
+    if state.config.sasl_enabled {
+        let request = crate::core::DbRequest::AddServerBan {
+            // The folded form is the storage/uniqueness key; the display form is
+            // persisted alongside so the original casing survives a restart.
+            mask: mask.folded().to_string(),
+            mask_display: mask.as_str().to_string(),
+            reason: reason.to_string(),
+            set_by: set_by.to_string(),
+            kind: kind.as_str().to_string(),
+        };
+        if state.db_tx.try_push(request).is_err() {
+            eprintln!(
+                "server-ban: db queue full or closed; {label} for {} not persisted",
+                mask.as_str()
+            );
+        }
+    }
+    // Disconnect any matching registered sessions (possibly including the setter
+    // when driven by an oper).
     let victims: Vec<ConnId> = state
         .sessions
         .iter()
@@ -406,6 +453,7 @@ pub(super) fn cmd_add_ban(
             e6irc_proto::mask::matches(casemap, mask.as_str(), &subject).then_some(c)
         })
         .collect();
+    let disconnected = victims.len();
     for victim in victims {
         state.send(
             victim,
@@ -413,6 +461,36 @@ pub(super) fn cmd_add_ban(
         );
         state.close(victim, &format!("{label}d: {reason}"));
     }
+    disconnected
+}
+
+/// Remove a server ban of `kind` matching `mask` (folded equality) from the hot
+/// list and persist the removal. Returns whether a ban was actually removed.
+/// Shared by the oper UN*LINE path and the HTTP admin console.
+pub(crate) fn remove_server_ban(
+    state: &mut ServerState,
+    mask: &crate::core::state::MaskKey,
+    kind: BanKind,
+) -> bool {
+    let before = state.server_bans.len();
+    state
+        .server_bans
+        .retain(|b| !(b.kind == kind && b.mask == *mask));
+    let removed = state.server_bans.len() < before;
+    if removed && state.config.sasl_enabled {
+        let request = crate::core::DbRequest::RemoveServerBan {
+            // The folded form is the DB delete key (see apply_server_ban).
+            mask: mask.folded().to_string(),
+            kind: kind.as_str().to_string(),
+        };
+        if state.db_tx.try_push(request).is_err() {
+            eprintln!(
+                "un-ban: db queue full or closed; removal of {} not persisted",
+                mask.as_str()
+            );
+        }
+    }
+    removed
 }
 
 /// UNKLINE/UNDLINE/UNXLINE <mask> — oper-only. Remove a server ban of the
@@ -449,24 +527,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         _ => p[0].to_string(),
     };
     let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
-    let before = state.server_bans.len();
-    state
-        .server_bans
-        .retain(|b| !(b.kind == kind && b.mask == mask));
-    let removed = state.server_bans.len() < before;
-    if removed && state.config.sasl_enabled {
-        let request = crate::core::DbRequest::RemoveServerBan {
-            // The folded form is the DB delete key (see cmd_add_ban).
-            mask: mask.folded().to_string(),
-            kind: kind.as_str().to_string(),
-        };
-        if state.db_tx.try_push(request).is_err() {
-            eprintln!(
-                "{un}: db queue full or closed; removal of {} not persisted",
-                mask.as_str()
-            );
-        }
-    }
+    let removed = remove_server_ban(state, &mask, kind);
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn]
         .nick()
