@@ -78,7 +78,7 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let key = state.nick_key(target);
-    let Some(&victim) = state.nicks.get(&key) else {
+    if !state.nicks.contains_key(&key) {
         state.numeric(
             conn,
             ERR_NOSUCHNICK,
@@ -86,34 +86,52 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("No such nick/channel"),
         );
         return;
-    };
+    }
     let comment = p.get(1).copied().unwrap_or("Killed");
     let oper_nick = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    let reason = format!("Killed ({oper_nick} ({comment}))");
+    kill_by_nick(state, target, comment, &oper_nick);
+}
+
+/// Disconnect the session currently holding `target` (by nick): audit it, snotice
+/// the other opers, send the standard KILL close `ERROR`, and close it. Returns
+/// whether a session was found and closed. `killer` is the display name
+/// attributed in the reason and audit — an oper's nick, or an admin account for
+/// the HTTP console. Shared by oper KILL and the admin console.
+pub(crate) fn kill_by_nick(
+    state: &mut ServerState,
+    target: &str,
+    comment: &str,
+    killer: &str,
+) -> bool {
+    let key = state.nick_key(target);
+    let Some(&victim) = state.nicks.get(&key) else {
+        return false;
+    };
+    let reason = format!("Killed ({killer} ({comment}))");
     let server = state.config.server_name.clone();
-    // Audit before the close: a self-kill removes the actor's own session,
-    // and recording afterwards would resolve the actor to an empty string —
-    // an unattributed row in the log whose whole purpose is attribution.
-    record_audit(state, conn, "KILL", target, comment);
+    // Audit before the close: a self-kill removes the actor's own session, and
+    // recording afterwards would resolve the actor to an empty string — an
+    // unattributed row in the log whose whole purpose is attribution.
+    record_audit_by(state, killer, "KILL", target, comment);
     // Snotice every other oper (the victim, if an oper, is about to be closed).
     notify_opers(
         state,
         Some(victim),
-        &format!("Received KILL message for {target} from {oper_nick}: {comment}"),
+        &format!("Received KILL message for {target} from {killer}: {comment}"),
     );
-    // The reason is echoed inside this ERROR wrapper, whose overhead can push
-    // a maximal KILL comment past the wire limit — fit it like the QUIT path
-    // does, or the victim's framing discards the whole close notice (and the
-    // debug wire check would abort the core worker on an oper-typed line).
-    // The trailing `)` is part of the head's cost: include it before fitting,
-    // re-append after.
+    // The reason is echoed inside this ERROR wrapper, whose overhead can push a
+    // maximal KILL comment past the wire limit — fit it like the QUIT path does,
+    // or the victim's framing discards the whole close notice (and the debug wire
+    // check would abort the core worker on an oper-typed line). The trailing `)`
+    // is part of the head's cost: include it before fitting, re-append after.
     let head = format!("ERROR :Closing Link: {server} (");
     let fitted = fit_trailing(&format!("{head})"), &reason);
     state.send(victim, &format!("{head}{fitted})"));
     state.close(victim, &reason);
+    true
 }
 
 /// Record a privileged oper action in the audit log (best-effort; only

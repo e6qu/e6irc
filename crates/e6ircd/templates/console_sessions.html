@@ -1,0 +1,44 @@
+{% extends "console_base.html" %}
+{% block main %}
+        {% if let Some(err) = error %}
+          <p class="banner-error" role="alert">{{ err }}</p>
+        {% endif %}
+        <h1>Client sessions <span class="tag">{{ sessions.len() }}</span></h1>
+        <p class="meta">
+          Live registered client connections (raw IRC, WebSocket, and BNC attach).
+          KILL disconnects one immediately, like the oper command.
+        </p>
+        {% if sessions.is_empty() %}
+          <p class="empty">No client sessions.</p>
+        {% else %}
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr><th>Nick</th><th>User@Host</th><th>Account</th><th>Channels</th><th></th></tr>
+              </thead>
+              <tbody>
+                {% for s in sessions %}
+                  <tr>
+                    <td><code>{{ s.nick }}</code>{% if s.oper %} <span class="tag">oper</span>{% endif %}</td>
+                    <td><code>{{ s.user }}@{{ s.host }}</code></td>
+                    <td>{% if let Some(a) = s.account %}<code>{{ a }}</code>{% else %}<span class="meta">—</span>{% endif %}</td>
+                    <td>{% if s.channels.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ s.channels }}</code>{% endif %}</td>
+                    <td>
+                      {# nick read from the data-attribute at runtime, never
+                         concatenated into JS source. #}
+                      <form class="cell-form" method="post" action="/console/sessions/kill"
+                            data-nick="{{ s.nick }}"
+                            onsubmit="return confirm('KILL ' + this.dataset.nick + '?')">
+                        <input type="hidden" name="csrf" value="{{ csrf }}" />
+                        <input type="hidden" name="nick" value="{{ s.nick }}" />
+                        <input type="text" name="reason" placeholder="reason" />
+                        <button class="danger" type="submit">Kill</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+{% endblock %}

@@ -102,6 +102,25 @@ pub enum AdminRequest {
     },
     /// Unregister a registered channel (like ChanServ DROP, founder-agnostic).
     DropChannel { channel: String, actor: String },
+    /// Snapshot every live (registered) client session for the console.
+    ListSessions,
+    /// Disconnect the session holding `nick` (like oper KILL).
+    Kill {
+        nick: String,
+        reason: String,
+        actor: String,
+    },
+}
+
+/// A snapshot of one live client session, for the admin console's sessions view.
+#[derive(Debug)]
+pub struct SessionInfo {
+    pub nick: String,
+    pub user: String,
+    pub host: String,
+    pub account: Option<String>,
+    pub oper: bool,
+    pub channels: Vec<String>,
 }
 
 /// The outcome of an [`AdminRequest`], returned over its oneshot reply.
@@ -111,6 +130,8 @@ pub enum AdminReply {
     Ok(String),
     /// Rejected: bad input, nothing matched, or persistence unavailable.
     Err(String),
+    /// A live-sessions snapshot (answer to [`AdminRequest::ListSessions`]).
+    Sessions(Vec<SessionInfo>),
 }
 
 /// Work the core asks the DB worker to do. The worker answers by

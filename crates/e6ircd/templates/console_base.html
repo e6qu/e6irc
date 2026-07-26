@@ -27,9 +27,6 @@
       nav a.active { background: color-mix(in srgb, var(--accent) 18%, transparent); font-weight: 600; }
       nav .section { color: var(--muted); font-size: 0.72rem; text-transform: uppercase;
         letter-spacing: 0.06em; margin: 1rem 0.7rem 0.35rem; }
-      nav a.soon { color: var(--muted); pointer-events: none; }
-      nav a.soon::after { content: "soon"; float: right; font-size: 0.62rem; border: 1px solid var(--border);
-        border-radius: 0.6rem; padding: 0 0.35rem; color: var(--muted); }
       main { flex: 1 1 auto; padding: 1.25rem 1.5rem; min-width: 0; max-width: 64rem; }
       h1 { font-size: 1.3rem; margin: 0 0 1rem; }
       h2 { font-size: 1.05rem; margin: 2rem 0 0.5rem; padding-top: 0.5rem; }
@@ -90,13 +87,12 @@
         {% if is_admin %}
           <div class="section">Server</div>
           <a href="/console"{% if active == "overview" %} class="active"{% endif %}>Overview</a>
+          <a href="/console/sessions"{% if active == "sessions" %} class="active"{% endif %}>Sessions</a>
           <a href="/console/integrations"{% if active == "integrations" %} class="active"{% endif %}>Integrations</a>
         {% endif %}
         <div class="section">You</div>
         <a href="/console/networks"{% if active == "networks" %} class="active"{% endif %}>BNC networks</a>
         <a href="/account">Account &amp; keys</a>
-        <div class="section">Coming next</div>
-        <a class="soon" aria-disabled="true">IRC client</a>
       </nav>
       <main>
         {% block main %}{% endblock %}

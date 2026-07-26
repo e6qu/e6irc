@@ -28,6 +28,49 @@ pub(crate) fn handle(state: &mut ServerState, req: AdminRequest) -> AdminReply {
             remove_ban(state, &mask, &kind, &actor)
         }
         AdminRequest::DropChannel { channel, actor } => drop_channel(state, &channel, &actor),
+        AdminRequest::ListSessions => list_sessions(state),
+        AdminRequest::Kill {
+            nick,
+            reason,
+            actor,
+        } => kill(state, &nick, &reason, &actor),
+    }
+}
+
+fn list_sessions(state: &ServerState) -> AdminReply {
+    let mut sessions: Vec<crate::core::SessionInfo> = state
+        .sessions
+        .values()
+        .filter(|s| s.is_registered())
+        .map(|s| {
+            let mut channels: Vec<String> =
+                s.channels.iter().map(|k| k.as_str().to_string()).collect();
+            channels.sort();
+            crate::core::SessionInfo {
+                nick: s.nick().unwrap_or("*").to_string(),
+                user: s.user().unwrap_or("*").to_string(),
+                host: s.host.clone(),
+                account: s.account.clone(),
+                oper: s.oper,
+                channels,
+            }
+        })
+        .collect();
+    sessions.sort_by_key(|s| s.nick.to_lowercase());
+    AdminReply::Sessions(sessions)
+}
+
+fn kill(state: &mut ServerState, nick_in: &str, reason_in: &str, actor: &str) -> AdminReply {
+    let comment = e6irc_proto::message::truncate_on_char_boundary(reason_in.trim(), 300);
+    let comment = if comment.is_empty() {
+        "Killed via admin console"
+    } else {
+        comment
+    };
+    if super::oper::kill_by_nick(state, nick_in, comment, actor) {
+        AdminReply::Ok(format!("Killed {nick_in}"))
+    } else {
+        AdminReply::Err(format!("no such nick '{nick_in}'"))
     }
 }
 

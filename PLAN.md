@@ -1669,6 +1669,18 @@ back to `/console` (PRG), failures re-render with an error banner. Covered by a
 PG-gated http test (`admin_console_ban_and_channel_actions`) exercising
 add → remove → drop plus the CSRF/anonymous gates.
 
+Phase 3 — live client-sessions view + KILL. A new admin `/console/sessions`
+page lists every live registered client (nick, user@host, account, oper flag,
+channels) as a snapshot of the core's session table, with a KILL button per
+row. Both the snapshot (`AdminRequest::ListSessions` → `AdminReply::Sessions`)
+and the KILL (`AdminRequest::Kill`, reusing the extracted `oper::kill_by_nick`)
+run through the same core `Input::Admin` path, so a console KILL is the exact
+teardown oper KILL performs (audit + snotice + close `ERROR`). Covered by a
+PG-gated http test (`admin_console_lists_and_kills_sessions`) that connects a
+real IRC client, sees it listed, kills it, and confirms the disconnect. The
+four console mutation handlers share a `run_admin_form` gate/dispatch helper
+(keeping the copy-paste ratchet green).
+
 CI coverage + bouncer-fidelity sweep (2026-07-27): a second CI-focused pass
 plus two bug fixes an adversarial audit of the least-swept surfaces (BNC
 bouncer, bridges, DB, CLI, TUI) surfaced. That audit found those subsystems

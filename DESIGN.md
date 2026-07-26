@@ -828,14 +828,16 @@ server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit log); it shares the `pages` module,
 `render_private`, and the exact admin gate the `/api/v1/admin/*` JSON endpoints
 use, so it can never surface server-wide data to a non-admin. Beyond the read
-views, the console can **act**: add/remove a K/D/X-line and unregister a
-registered channel. These run on the core worker via `Input::Admin { req,
-reply }` (a oneshot-reply), reusing the exact live-state + persistence path of
-the equivalent oper/services command — a console ban updates the hot ban list,
+views, the console can **act**: add/remove a K/D/X-line, unregister a registered
+channel, and — from a live client-sessions view at `/console/sessions` — KILL a
+session by nick. These run on the core worker via `Input::Admin { req, reply }`
+(a oneshot-reply), reusing the exact live-state + persistence path of the
+equivalent oper/services command — a console ban updates the hot ban list,
 persists, disconnects matching sessions, and audit-logs identically to oper
-KLINE (the shared logic is extracted so there is one implementation, not two).
-Actions are admin-gated + CSRF-protected; success redirects (PRG), failure
-re-renders with an error banner. The console shell (`console_base.html`) is
+KLINE; a console KILL is the same teardown as oper KILL; the sessions view is a
+live snapshot of the core's session table (the shared logic is extracted so
+there is one implementation, not two). Actions are admin-gated + CSRF-protected;
+success redirects (PRG), failure re-renders with an error banner. The console shell (`console_base.html`) is
 also the home of `/console/networks` — a per-user BNC network manager with
 live connection status, available to any authenticated user for their own
 networks — and `/console/integrations` (admin), which manages the chat-platform

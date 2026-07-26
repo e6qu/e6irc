@@ -1109,6 +1109,112 @@ async fn admin_console_ban_and_channel_actions() {
     assert!(head.to_lowercase().contains("location: /login"), "{head}");
 }
 
+/// Admin console live-sessions view + KILL: a connected IRC client shows up in
+/// the sessions list and can be disconnected from the console.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_console_lists_and_kills_sessions() {
+    let url = support::test_db("admin_console_lists_and_kills_sessions").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.sess.example".into(),
+        network_name: "SessNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let irc = running.addrs[0];
+    let http = running.http_addr.expect("http");
+
+    // A client connects and registers, so it is a live session.
+    let mut victim = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("tcp");
+    victim.register("victim", "v").await.expect("register");
+
+    let sessions_req = format!(
+        "GET /console/sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    // Wait for the session to appear (registration completes asynchronously).
+    let mut csrf = String::new();
+    let mut listed = false;
+    for _ in 0..40 {
+        let (status, _, body) = request(http, &sessions_req).await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("victim") {
+            listed = true;
+            csrf = body
+                .split("name=\"csrf\" value=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(listed, "victim session not listed");
+    assert!(!csrf.is_empty(), "no csrf on sessions page");
+
+    // KILL it from the console -> 303 back to the sessions view.
+    let body = "csrf=CSRF&nick=victim&reason=cleanup".replace("CSRF", &csrf);
+    let kill = format!(
+        "POST /console/sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, head, _) = request(http, &kill).await;
+    assert_eq!(status, 303, "{head}");
+
+    // The victim's connection is closed by the server (an ERROR then EOF).
+    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match victim.next_message().await {
+                Ok(Some(m)) if m.command == "ERROR" => return true,
+                Ok(Some(_)) => continue,
+                _ => return true, // EOF / closed
+            }
+        }
+    })
+    .await
+    .expect("victim was not disconnected");
+    assert!(killed);
+
+    // It no longer appears in the sessions list.
+    let mut gone = false;
+    for _ in 0..40 {
+        let (_, _, body) = request(http, &sessions_req).await;
+        if !body.contains(">victim<") && !body.contains("<code>victim</code>") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(gone, "victim still listed after kill");
+}
+
 /// The console Integrations page is admin-gated and lists every chat-platform
 /// bridge with its build availability. This default (no-bridge-feature) build
 /// reports all three as not built.

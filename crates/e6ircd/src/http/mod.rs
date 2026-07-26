@@ -190,6 +190,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/bans", post(pages::console_add_ban))
         .route("/console/bans/delete", post(pages::console_remove_ban))
         .route("/console/channels/drop", post(pages::console_drop_channel))
+        .route("/console/sessions", get(pages::console_sessions))
+        .route("/console/sessions/kill", post(pages::console_kill_session))
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -777,6 +779,27 @@ mod pages {
         connected: bool,
     }
 
+    struct SessionRow {
+        nick: String,
+        user: String,
+        host: String,
+        account: Option<String>,
+        oper: bool,
+        /// Channels the session is in, pre-joined for display.
+        channels: String,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_sessions.html")]
+    struct ConsoleSessions {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        sessions: Vec<SessionRow>,
+        error: Option<String>,
+    }
+
     #[derive(Template)]
     #[template(path = "console_networks.html")]
     struct ConsoleNetworks {
@@ -1184,6 +1207,32 @@ mod pages {
         match rx.await {
             Ok(crate::core::AdminReply::Ok(m)) => Ok(m),
             Ok(crate::core::AdminReply::Err(m)) => Err(m),
+            Ok(crate::core::AdminReply::Sessions(_)) => {
+                Err("unexpected sessions reply for a mutation".into())
+            }
+            Err(_) => Err("core worker dropped the request".into()),
+        }
+    }
+
+    /// Snapshot the live client sessions from the core worker.
+    async fn admin_list_sessions(
+        state: &AppState,
+    ) -> Result<Vec<crate::core::SessionInfo>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if state
+            .core_tx
+            .push(crate::core::Input::Admin {
+                req: crate::core::AdminRequest::ListSessions,
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err("core worker unavailable".into());
+        }
+        match rx.await {
+            Ok(crate::core::AdminReply::Sessions(s)) => Ok(s),
+            Ok(_) => Err("unexpected reply".into()),
             Err(_) => Err("core worker dropped the request".into()),
         }
     }
@@ -1226,6 +1275,30 @@ mod pages {
         channel: String,
     }
 
+    /// Gate an admin form action (admin + CSRF) and run it on the core. Returns
+    /// the redirect `Response` on success, or the gate `Response` (login/403) on
+    /// a gate failure; on an *action* failure returns `Err((account, message))`
+    /// so the caller re-renders its own page with the message. This is the shared
+    /// tail of every console mutation — only the form type, the request it builds,
+    /// and the page it re-renders on error differ.
+    async fn run_admin_form(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        csrf: &str,
+        redirect: &'static str,
+        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
+    ) -> Result<Response, (String, String)> {
+        let account = match require_admin_form_actor(state, headers, csrf).await {
+            Ok(a) => a,
+            Err(gate) => return Ok(gate),
+        };
+        let req = make_req(account.clone());
+        match admin_action(state, req).await {
+            Ok(_) => Ok(Redirect::to(redirect).into_response()),
+            Err(msg) => Err((account, msg)),
+        }
+    }
+
     /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
     /// and disconnects matching sessions exactly like oper KLINE.
     pub async fn console_add_ban(
@@ -1237,19 +1310,15 @@ mod pages {
             Ok(f) => f,
             Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
         };
-        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
-        let req = crate::core::AdminRequest::AddServerBan {
+        let make = |actor| crate::core::AdminRequest::AddServerBan {
             mask: f.mask,
             kind: f.kind,
             reason: f.reason,
-            actor: account.clone(),
+            actor,
         };
-        match admin_action(&state, req).await {
-            Ok(_) => Redirect::to("/console").into_response(),
-            Err(msg) => console_error_page(&state, &headers, account, msg).await,
+        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
         }
     }
 
@@ -1263,18 +1332,14 @@ mod pages {
             Ok(f) => f,
             Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
         };
-        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
-        let req = crate::core::AdminRequest::RemoveServerBan {
+        let make = |actor| crate::core::AdminRequest::RemoveServerBan {
             mask: f.mask,
             kind: f.kind,
-            actor: account.clone(),
+            actor,
         };
-        match admin_action(&state, req).await {
-            Ok(_) => Redirect::to("/console").into_response(),
-            Err(msg) => console_error_page(&state, &headers, account, msg).await,
+        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
         }
     }
 
@@ -1288,17 +1353,96 @@ mod pages {
             Ok(f) => f,
             Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
         };
-        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
-        let req = crate::core::AdminRequest::DropChannel {
+        let make = |actor| crate::core::AdminRequest::DropChannel {
             channel: f.channel,
-            actor: account.clone(),
+            actor,
         };
-        match admin_action(&state, req).await {
-            Ok(_) => Redirect::to("/console").into_response(),
-            Err(msg) => console_error_page(&state, &headers, account, msg).await,
+        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct KillForm {
+        csrf: String,
+        nick: String,
+        #[serde(default)]
+        reason: String,
+    }
+
+    /// Render the live client-sessions view (admin). `error` shows a banner after
+    /// a failed KILL.
+    async fn console_sessions_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        error: Option<String>,
+    ) -> Response {
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let (sessions, error) = match admin_list_sessions(state).await {
+            Ok(list) => (
+                list.into_iter()
+                    .map(|s| SessionRow {
+                        nick: s.nick,
+                        user: s.user,
+                        host: s.host,
+                        account: s.account,
+                        oper: s.oper,
+                        channels: s.channels.join(", "),
+                    })
+                    .collect(),
+                error,
+            ),
+            // Surface a snapshot failure as the banner rather than a blank page.
+            Err(msg) => (Vec::new(), Some(error.unwrap_or(msg))),
+        };
+        render_private(ConsoleSessions {
+            account,
+            csrf,
+            is_admin: true,
+            active: "sessions",
+            sessions,
+            error,
+        })
+    }
+
+    /// Console → live client sessions (admin-gated, like `/console`).
+    pub async fn console_sessions(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        if !is_admin_account(&state, &account) {
+            return problem(StatusCode::FORBIDDEN, "Admin only", None);
+        }
+        console_sessions_page(&state, &headers, account, None).await
+    }
+
+    /// Console → KILL a client session by nick (admin), like oper KILL.
+    pub async fn console_kill_session(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<KillForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+        };
+        let make = |actor| crate::core::AdminRequest::Kill {
+            nick: f.nick,
+            reason: f.reason,
+            actor,
+        };
+        match run_admin_form(&state, &headers, &f.csrf, "/console/sessions", make).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => {
+                console_sessions_page(&state, &headers, account, Some(msg)).await
+            }
         }
     }
 
