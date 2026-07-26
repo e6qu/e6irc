@@ -349,6 +349,9 @@ async function boot() {
       el("account-name").textContent = me.account;
       el("account-link").dataset.shauthUser = me.account;
     }
+    // The email rides the account name's title attribute (the SSO validator
+    // reads it there); role and the coordinated-logout coordinate likewise.
+    el("account-name").title = typeof me.email === "string" ? me.email : "";
     if (typeof me.role === "string") el("account-role").textContent = me.role;
     if (typeof me.logout_url === "string") el("logout-link").href = me.logout_url;
   } catch {
