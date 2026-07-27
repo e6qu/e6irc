@@ -141,6 +141,22 @@ pub(super) fn validate_label(label: &str) -> Option<Response> {
     None
 }
 
+/// Unwrap a JSON request body, turning a rejection into a 400 problem response.
+/// Shared by the JSON POST handlers so the parse boilerplate isn't copied.
+#[allow(clippy::result_large_err)] // Err is a full problem Response, as throughout this module
+pub(super) fn parse_json<T>(
+    body: Result<axum::Json<T>, axum::extract::rejection::JsonRejection>,
+) -> Result<T, Response> {
+    match body {
+        Ok(axum::Json(b)) => Ok(b),
+        Err(e) => Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid request body",
+            Some(&e.to_string()),
+        )),
+    }
+}
+
 fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
     let mut body = serde_json::json!({
         "status": status.as_u16(),
@@ -196,6 +212,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/channels/drop", post(pages::console_drop_channel))
         .route("/console/sessions", get(pages::console_sessions))
         .route("/console/sessions/kill", post(pages::console_kill_session))
+        .route("/console/my-sessions", get(pages::console_my_sessions))
+        .route(
+            "/console/my-sessions/kill",
+            post(pages::console_kill_own_session),
+        )
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -821,6 +842,9 @@ mod pages {
         csrf: String,
         is_admin: bool,
         active: &'static str,
+        title: &'static str,
+        hint: &'static str,
+        kill_action: &'static str,
         sessions: Vec<SessionRow>,
         error: Option<String>,
     }
@@ -1409,6 +1433,23 @@ mod pages {
         name: String,
     }
 
+    /// Unwrap an axum form, turning a rejection into a 400 problem response.
+    /// Shared by the console's plain-form handlers so the parse boilerplate
+    /// isn't copied into each.
+    #[allow(clippy::result_large_err)] // Err is a full problem Response, as throughout
+    fn parse_form<T>(
+        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
+    ) -> Result<T, Response> {
+        match form {
+            Ok(axum::Form(f)) => Ok(f),
+            Err(e) => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid form",
+                Some(&e.to_string()),
+            )),
+        }
+    }
+
     /// Authenticate a plain-form (body-CSRF) actor: the caller is signed in and
     /// the form carried a valid CSRF token. Not admin-gated — for self-service
     /// actions on the caller's own resources. Returns the account or a response.
@@ -1467,17 +1508,20 @@ mod pages {
         }
     }
 
-    /// Snapshot the live client sessions from the core worker.
+    /// Snapshot live client sessions from the core worker. With `own`, restrict
+    /// to sessions authenticated as that account (the caller's own clients).
     async fn admin_list_sessions(
         state: &AppState,
+        own: Option<String>,
     ) -> Result<Vec<crate::core::SessionInfo>, String> {
+        let req = match own {
+            Some(account) => crate::core::AdminRequest::ListOwnSessions { account },
+            None => crate::core::AdminRequest::ListSessions,
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         if state
             .core_tx
-            .push(crate::core::Input::Admin {
-                req: crate::core::AdminRequest::ListSessions,
-                reply: tx,
-            })
+            .push(crate::core::Input::Admin { req, reply: tx })
             .await
             .is_err()
         {
@@ -1559,9 +1603,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BanForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let axum::Form(f) = match form {
+        let f = match parse_form(form) {
             Ok(f) => f,
-            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+            Err(r) => return r,
         };
         let make = |actor| crate::core::AdminRequest::AddServerBan {
             mask: f.mask,
@@ -1581,9 +1625,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BanDeleteForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let axum::Form(f) = match form {
+        let f = match parse_form(form) {
             Ok(f) => f,
-            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+            Err(r) => return r,
         };
         let make = |actor| crate::core::AdminRequest::RemoveServerBan {
             mask: f.mask,
@@ -1602,9 +1646,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<DropChannelForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let axum::Form(f) = match form {
+        let f = match parse_form(form) {
             Ok(f) => f,
-            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+            Err(r) => return r,
         };
         let make = |actor| crate::core::AdminRequest::DropChannel {
             channel: f.channel,
@@ -1624,39 +1668,63 @@ mod pages {
         reason: String,
     }
 
-    /// Render the live client-sessions view (admin). `error` shows a banner after
-    /// a failed KILL.
-    async fn console_sessions_page(
+    /// Render the client-sessions view. `own = false` is the admin view of every
+    /// session (`/console/sessions`); `own = true` is the caller's self-service
+    /// view of their own connected clients (`/console/my-sessions`). `error`
+    /// shows a banner after a failed disconnect.
+    async fn render_sessions_page(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         account: String,
+        own: bool,
         error: Option<String>,
     ) -> Response {
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let (sessions, error) = match admin_list_sessions(state).await {
-            Ok(list) => (
-                list.into_iter()
-                    .map(|s| SessionRow {
-                        nick: s.nick,
-                        user: s.user,
-                        host: s.host,
-                        account: s.account,
-                        oper: s.oper,
-                        channels: s.channels.join(", "),
-                    })
-                    .collect(),
-                error,
-            ),
-            // Surface a snapshot failure as the banner rather than a blank page.
-            Err(msg) => (Vec::new(), Some(error.unwrap_or(msg))),
+        let is_admin = is_admin_account(state, &account);
+        let filter = own.then(|| account.clone());
+        let (sessions, error): (Vec<SessionRow>, Option<String>) =
+            match admin_list_sessions(state, filter).await {
+                Ok(list) => (
+                    list.into_iter()
+                        .map(|s| SessionRow {
+                            nick: s.nick,
+                            user: s.user,
+                            host: s.host,
+                            account: s.account,
+                            oper: s.oper,
+                            channels: s.channels.join(", "),
+                        })
+                        .collect(),
+                    error,
+                ),
+                // Surface a snapshot failure as the banner rather than a blank page.
+                Err(msg) => (Vec::new(), Some(error.unwrap_or(msg))),
+            };
+        let (active, title, hint, kill_action) = if own {
+            (
+                "my-sessions",
+                "Your sessions",
+                "Clients currently signed in to your account (raw IRC, WebSocket, BNC). Disconnecting one signs it out immediately.",
+                "/console/my-sessions/kill",
+            )
+        } else {
+            (
+                "sessions",
+                "Client sessions",
+                "Live registered client connections (raw IRC, WebSocket, and BNC attach). Disconnecting one removes it immediately, like the oper KILL.",
+                "/console/sessions/kill",
+            )
         };
         render_private(ConsoleSessions {
             account,
             csrf,
-            is_admin: true,
-            active: "sessions",
+            is_admin,
+            active,
+            title,
+            hint,
+            kill_action,
             sessions,
             error,
         })
@@ -1673,7 +1741,7 @@ mod pages {
         if !is_admin_account(&state, &account) {
             return problem(StatusCode::FORBIDDEN, "Admin only", None);
         }
-        console_sessions_page(&state, &headers, account, None).await
+        render_sessions_page(&state, &headers, account, false, None).await
     }
 
     /// Console → KILL a client session by nick (admin), like oper KILL.
@@ -1682,9 +1750,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<KillForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let axum::Form(f) = match form {
+        let f = match parse_form(form) {
             Ok(f) => f,
-            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+            Err(r) => return r,
         };
         let make = |actor| crate::core::AdminRequest::Kill {
             nick: f.nick,
@@ -1694,8 +1762,46 @@ mod pages {
         match run_admin_form(&state, &headers, &f.csrf, "/console/sessions", make).await {
             Ok(resp) => resp,
             Err((account, msg)) => {
-                console_sessions_page(&state, &headers, account, Some(msg)).await
+                render_sessions_page(&state, &headers, account, false, Some(msg)).await
             }
+        }
+    }
+
+    /// Console → your own sessions (any authenticated user; not admin-gated).
+    pub async fn console_my_sessions(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        render_sessions_page(&state, &headers, account, true, None).await
+    }
+
+    /// Console → disconnect one of *your own* sessions by nick. The core refuses
+    /// to touch a session not authenticated as the caller, so this cannot kill
+    /// anyone else even though it is not admin-gated.
+    pub async fn console_kill_own_session(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<KillForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let f = match parse_form(form) {
+            Ok(f) => f,
+            Err(r) => return r,
+        };
+        let account = match require_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let req = crate::core::AdminRequest::KillOwn {
+            nick: f.nick,
+            reason: f.reason,
+            account: account.clone(),
+        };
+        match admin_action(&state, req).await {
+            Ok(_) => Redirect::to("/console/my-sessions").into_response(),
+            Err(msg) => render_sessions_page(&state, &headers, account, true, Some(msg)).await,
         }
     }
 
@@ -1709,9 +1815,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BridgeFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let axum::Form(f) = match form {
+        let f = match parse_form(form) {
             Ok(f) => f,
-            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+            Err(r) => return r,
         };
         let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
             Ok(a) => a,
@@ -1775,9 +1881,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BridgeDeleteFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let axum::Form(f) = match form {
+        let f = match parse_form(form) {
             Ok(f) => f,
-            Err(e) => return problem(StatusCode::BAD_REQUEST, "Bad form", Some(&e.to_string())),
+            Err(r) => return r,
         };
         let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
             Ok(a) => a,

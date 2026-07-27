@@ -837,7 +837,11 @@ persists, disconnects matching sessions, and audit-logs identically to oper
 KLINE; a console KILL is the same teardown as oper KILL; the sessions view is a
 live snapshot of the core's session table (the shared logic is extracted so
 there is one implementation, not two). Actions are admin-gated + CSRF-protected;
-success redirects (PRG), failure re-renders with an error banner. The console shell (`console_base.html`) is
+success redirects (PRG), failure re-renders with an error banner. A non-admin
+counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
+*their own* connected clients: the core scopes the snapshot to the caller's
+account and refuses a self-service kill of a session not authenticated as the
+caller, so it can never touch anyone else's. The console shell (`console_base.html`) is
 also the home of `/console/networks` — a per-user BNC network manager with
 live connection status, add/remove/enable-disable, and **edit** of a network's
 connection/identity fields (addr, tls, nick, realname, autojoin; SASL

@@ -28,20 +28,46 @@ pub(crate) fn handle(state: &mut ServerState, req: AdminRequest) -> AdminReply {
             remove_ban(state, &mask, &kind, &actor)
         }
         AdminRequest::DropChannel { channel, actor } => drop_channel(state, &channel, &actor),
-        AdminRequest::ListSessions => list_sessions(state),
+        AdminRequest::ListSessions => list_sessions(state, None),
         AdminRequest::Kill {
             nick,
             reason,
             actor,
         } => kill(state, &nick, &reason, &actor),
+        AdminRequest::ListOwnSessions { account } => list_sessions(state, Some(&account)),
+        AdminRequest::KillOwn {
+            nick,
+            reason,
+            account,
+        } => kill_own(state, &nick, &reason, &account),
     }
 }
 
-fn list_sessions(state: &ServerState) -> AdminReply {
+/// Whether session `conn`'s authenticated account casefolds to `account`.
+fn session_owned_by(state: &ServerState, conn: crate::core::ConnId, account: &str) -> bool {
+    let want = state.casemap.casefold(account);
+    state
+        .sessions
+        .get(&conn)
+        .and_then(|s| s.account.as_deref())
+        .is_some_and(|a| state.casemap.casefold(a) == want)
+}
+
+/// Snapshot registered sessions. With `only_account`, restrict to sessions
+/// authenticated as that account (the caller's own connected clients).
+fn list_sessions(state: &ServerState, only_account: Option<&str>) -> AdminReply {
+    let want = only_account.map(|a| state.casemap.casefold(a));
     let mut sessions: Vec<crate::core::SessionInfo> = state
         .sessions
         .values()
         .filter(|s| s.is_registered())
+        .filter(|s| match &want {
+            None => true,
+            Some(w) => s
+                .account
+                .as_deref()
+                .is_some_and(|a| &state.casemap.casefold(a) == w),
+        })
         .map(|s| {
             let mut channels: Vec<String> =
                 s.channels.iter().map(|k| k.as_str().to_string()).collect();
@@ -71,6 +97,32 @@ fn kill(state: &mut ServerState, nick_in: &str, reason_in: &str, actor: &str) ->
         AdminReply::Ok(format!("Killed {nick_in}"))
     } else {
         AdminReply::Err(format!("no such nick '{nick_in}'"))
+    }
+}
+
+/// Self-service kill: disconnect `nick` only if that session is authenticated as
+/// `account` (the caller). Refuses to touch a session that isn't the caller's,
+/// so a non-admin cannot kill anyone else by guessing a nick.
+fn kill_own(state: &mut ServerState, nick_in: &str, reason_in: &str, account: &str) -> AdminReply {
+    let key = state.nick_key(nick_in);
+    let Some(&conn) = state.nicks.get(&key) else {
+        return AdminReply::Err(format!("no such session '{nick_in}'"));
+    };
+    if !session_owned_by(state, conn, account) {
+        // Report as not-found rather than forbidden, so this can't be used to
+        // probe which nicks exist / are signed in as other accounts.
+        return AdminReply::Err(format!("no such session '{nick_in}'"));
+    }
+    let comment = e6irc_proto::message::truncate_on_char_boundary(reason_in.trim(), 300);
+    let comment = if comment.is_empty() {
+        "Disconnected from your account console"
+    } else {
+        comment
+    };
+    if super::oper::kill_by_nick(state, nick_in, comment, account) {
+        AdminReply::Ok(format!("Disconnected {nick_in}"))
+    } else {
+        AdminReply::Err(format!("no such session '{nick_in}'"))
     }
 }
 
