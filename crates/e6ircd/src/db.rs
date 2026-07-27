@@ -1898,6 +1898,42 @@ pub async fn set_bnc_network_enabled(
     Ok(done.rows_affected() > 0)
 }
 
+/// Update `account`'s network `name` connection/identity fields (addr, tls,
+/// nick, realname, autojoin). The SASL credentials and `kind` are deliberately
+/// left unchanged — a credential/kind change goes through delete+recreate, so
+/// this never has to preserve-or-replace a sealed secret. Returns whether a row
+/// matched (false ⇒ no such network for that owner).
+#[allow(clippy::too_many_arguments)] // one column per parameter; a struct would just re-list them
+pub async fn update_bnc_network(
+    pool: &PgPool,
+    account: &str,
+    name: &str,
+    addr: &str,
+    tls: bool,
+    nick: &str,
+    realname: Option<&str>,
+    autojoin: &[String],
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let done = sqlx::query(
+        "UPDATE bnc_networks n
+         SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7
+         FROM accounts a
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND n.name = $2",
+    )
+    .bind(&folded)
+    .bind(name)
+    .bind(addr)
+    .bind(tls)
+    .bind(nick)
+    .bind(realname)
+    .bind(autojoin)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Every *enabled* network across all accounts, paired with its owner's
 /// display name — used to start always-on drivers at boot. Disabled
 /// networks are intentionally skipped: they run no driver.

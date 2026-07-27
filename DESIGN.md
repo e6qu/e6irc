@@ -839,8 +839,11 @@ live snapshot of the core's session table (the shared logic is extracted so
 there is one implementation, not two). Actions are admin-gated + CSRF-protected;
 success redirects (PRG), failure re-renders with an error banner. The console shell (`console_base.html`) is
 also the home of `/console/networks` — a per-user BNC network manager with
-live connection status, available to any authenticated user for their own
-networks — and `/console/integrations` (admin), which manages the chat-platform
+live connection status, add/remove/enable-disable, and **edit** of a network's
+connection/identity fields (addr, tls, nick, realname, autojoin; SASL
+credentials change via delete+recreate), available to any authenticated user
+for their own networks — and `/console/integrations` (admin), which manages the
+chat-platform
 bridges: per-platform build availability, running bridges with status, and
 add/remove. A network's `kind` (`irc`/`matrix`/`discord`/`slack`) is a column on
 `bnc_networks`, so bridges are runtime-managed just like IRC upstreams — created

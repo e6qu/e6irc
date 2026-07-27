@@ -740,6 +740,132 @@ async fn console_add_and_delete_network_via_the_console() {
     assert!(!frag.contains("irc.example:6667"), "still present: {frag}");
 }
 
+/// Editing a network from the console: the pre-filled form, a successful field
+/// update (persisted + reflected in the list), and the SSRF guard on a changed
+/// address re-rendering with an error banner.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_edit_network_updates_fields() {
+    let url = support::test_db("console_edit_network_updates_fields").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.edit.example".into(),
+        network_name: "EditNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    // Extract the session CSRF from the networks page (add form's header value).
+    let page_req = format!(
+        "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (_, _, page) = request(http, &page_req).await;
+    let csrf = page
+        .split("X-CSRF-Token\": \"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf")
+        .to_string();
+
+    // Create the network to edit.
+    let body = "name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby";
+    let add = format!(
+        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _, _) = request(http, &add).await;
+    assert_eq!(status, 200);
+
+    // The edit form is pre-filled with the current values.
+    let edit_get = format!(
+        "GET /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, form) = request(http, &edit_get).await;
+    assert_eq!(status, 200, "{form}");
+    assert!(
+        form.contains("value=\"alice_\"") && form.contains("irc.example:6667"),
+        "{form}"
+    );
+
+    // Apply an edit (body CSRF; plain form) -> 303 back to the list.
+    let edit =
+        "csrf=CSRF&addr=irc.new.example:6697&nick=newbie&realname=Bob&autojoin=%23lobby&tls=on"
+            .replace("CSRF", &csrf);
+    let edit_post = format!(
+        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{edit}",
+        edit.len()
+    );
+    let (status, head, _) = request(http, &edit_post).await;
+    assert_eq!(status, 303, "{head}");
+
+    // The list now shows the new nick and address.
+    let (_, _, page2) = request(http, &page_req).await;
+    assert!(
+        page2.contains("newbie") && page2.contains("irc.new.example:6697"),
+        "{page2}"
+    );
+
+    // The SSRF guard applies to a changed address too: an internal IP is refused
+    // and the form re-renders (200) with an error banner.
+    let bad = "csrf=CSRF&addr=169.254.169.254:6667&nick=newbie".replace("CSRF", &csrf);
+    let bad_post = format!(
+        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, _, body) = request(http, &bad_post).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("banner-error") && body.contains("Could not save"),
+        "{body}"
+    );
+
+    // Wrong CSRF is refused.
+    let wrong = "csrf=nope&addr=irc.x.example:6667&nick=z";
+    let wrong_post = format!(
+        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{wrong}",
+        wrong.len()
+    );
+    let (status, _, _) = request(http, &wrong_post).await;
+    assert_eq!(status, 403);
+}
+
 // ---- admin API (PG-gated) -----------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
