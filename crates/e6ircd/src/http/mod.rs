@@ -372,9 +372,9 @@ mod web {
 
     /// The application entry point is an authentication boundary, not a
     /// public static file. An existing local session renders the client. A
-    /// browser with only an upstream SSO session is sent through a silent
-    /// OpenID Connect authorization request, while a completed silent probe
-    /// without an upstream session lands on the interactive login page.
+    /// browser is sent through the provider's ordinary OpenID Connect
+    /// authorization request. An existing provider session completes without
+    /// prompting; otherwise the provider owns the credential prompt.
     pub async fn index(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -387,7 +387,7 @@ mod web {
                 Redirect::to("/login").into_response()
             }
             Err(_) if state.oidc_providers.len() == 1 => Redirect::temporary(&format!(
-                "/api/v1/auth/oidc/{}/sso",
+                "/api/v1/auth/oidc/{}/start",
                 state.oidc_providers[0].name
             ))
             .into_response(),

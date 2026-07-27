@@ -837,10 +837,11 @@ supplied.
   origin check; plain-form POSTs carry a per-session token.
 - The embedded application entry point was an authentication boundary. A
   valid local session rendered the client; otherwise a single configured
-  provider was probed with `prompt=none`, allowing an existing Shauth session
-  to enter without another prompt. A negative silent probe landed on the
-  interactive login page without a redirect loop. The application shell
-  exposed the authenticated account and a top-level logout navigation.
+  provider's ordinary authorization flow began immediately. An existing
+  Shauth session completed that flow without another prompt, while a browser
+  without one stopped at Shauth's credential page rather than falling back to
+  a local login page. The application shell exposed the authenticated account
+  and a top-level logout navigation.
 - Coordinated logout: the session retained its OIDC issuer, subject, session
   ID, provider, and ID token. `GET /api/v1/auth/logout` performed
   RP-initiated logout through the provider `end_session_endpoint` with the ID
