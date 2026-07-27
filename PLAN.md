@@ -1779,6 +1779,7 @@ corrected. One design **decision escalated** to the maintainer: BNC network-name
 selection is case-sensitive (only the owner is folded in `NetworkKey`), which can
 silently fall a case-mismatched own-network attach through to a shared network of
 the folded-same name — an asymmetry with DESIGN §2, but tested-as-intentional.
+**Resolved** in the BNC network-name casefold sweep below (folded end-to-end).
 
 WS-IRC listener + admin server-management (2026-07-27, multi-phase, one PR):
 two maintainer-approved features landed as sequential phases on a single PR.
@@ -4436,6 +4437,29 @@ fixed here on one PR.
 3. **Stale doc comment on `next_message`** claimed a "NUL-free" guarantee the
    framing does not make (it guarantees non-empty, not NUL-free); corrected and
    cross-referenced to `next_message_lossy` for interactive loops.
+
+BNC network-name casefold sweep (2026-07-27): closed the DESIGN §2 asymmetry
+the whole-daemon sweep escalated. The `NetworkKey` folded the *owner* but stored
+the *network name* verbatim, and the DB matched it case-sensitively
+(`n.name = $2`, `UNIQUE(account_id, name)`) — so a user who owns network `foo`
+and types `/network Foo` would miss their own network on both the registry and
+the DB lookup and, if an operator-defined shared network `Foo` existed, silently
+attach to **that operator's network** instead of their own (a cross-owner
+substitution). Network names are already restricted to `[A-Za-z0-9._-]`
+(`network_name_ok`), which excludes RFC1459's `[]\^` specials, so `lower(name)`
+is exactly the fold the registry uses — the fix is consistent by construction.
+Folded end-to-end: `NetworkKey::new` now folds the name too (one choke point, so
+persistence keys `bnc_buffer` by the same folded selector); migration 0034
+replaces the case-sensitive uniqueness with a `UNIQUE (account_id, lower(name))`
+functional index and folds existing `bnc_buffer.network` rows (mirroring the
+owner fold in 0025); and `get`/`set_enabled`/`update`/`delete_bnc_network` match
+`lower(n.name) = lower($2)`. A half-fix (folding only the registry key) would
+have *introduced* a bug — two case-variant DB rows collide on the folded key and
+silently overwrite on startup load — so the DB uniqueness moved with it. Display
+casing is preserved (`name` stored as typed; only matching folds). Covered by an
+extended `NetworkKey` unit test and a new PG-gated
+`bnc_network_name_selection_is_case_insensitive` (case-variant create collides,
+lookups/enable/delete resolve by any casing, display case preserved).
 
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI

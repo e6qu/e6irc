@@ -17,12 +17,15 @@ use e6irc_proto::message::Message;
 /// Registry key: the owning account (`None` = shared) and the network
 /// name the client selects with the `/network` suffix.
 ///
-/// The account is stored casefolded. Every caller happens to pass the stored
-/// `accounts.name` today, so raw strings would match — but a key that is only
-/// correct while every producer remembers to spell it the same way is the wrong
-/// kind of correct. A miss on the owned key would let a client fall through to a
-/// shared network of the same name, so a casing mismatch would silently attach
-/// it to the operator's network instead of its own. [`NetworkKey::new`] is the
+/// Both fields are stored casefolded so selection is case-insensitive, like
+/// every other IRC identifier. A key correct only while every producer spells
+/// the name the same way is the wrong kind of correct: a miss on the owned key
+/// falls through to a shared network of the same name, so a casing mismatch
+/// (`/network Foo` for an owned `foo`) would silently attach the client to an
+/// operator's network instead of its own (DESIGN §2). Network names are
+/// restricted to `[A-Za-z0-9._-]` (`network_name_ok`), which excludes RFC1459's
+/// `[]\^` specials, so the fold here matches the DB's `lower(name)` (unique
+/// index + lookups, migration 0034) by construction. [`NetworkKey::new`] is the
 /// only way to build one, so that cannot drift.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct NetworkKey {
@@ -32,9 +35,10 @@ struct NetworkKey {
 
 impl NetworkKey {
     fn new(owner: Option<&str>, name: &str) -> Self {
+        let fold = |s: &str| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(s);
         Self {
-            owner: owner.map(|o| e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(o)),
-            name: name.to_string(),
+            owner: owner.map(fold),
+            name: fold(name),
         }
     }
 }
@@ -632,9 +636,9 @@ mod key_tests {
     use super::*;
 
     #[test]
-    fn registry_key_folds_the_owner_so_casing_cannot_miss() {
+    fn registry_key_folds_owner_and_name_so_casing_cannot_miss() {
         // A miss does not error: `get` falls through to the shared network, so
-        // an owner spelled differently than it was registered would silently
+        // either field spelled differently than it was registered would silently
         // attach a client to the operator's network instead of its own.
         let registered = NetworkKey::new(Some("Alice"), "libera");
         assert_eq!(registered, NetworkKey::new(Some("alice"), "libera"));
@@ -644,12 +648,15 @@ mod key_tests {
             NetworkKey::new(Some("Ali[ce]"), "n"),
             NetworkKey::new(Some("ali{ce}"), "n")
         );
+        // The network name is folded too: `/network Foo` must resolve to an owned
+        // `foo`, not fall through to an operator's shared network of that name.
+        assert_eq!(registered, NetworkKey::new(Some("alice"), "Libera"));
+        assert_eq!(registered, NetworkKey::new(Some("alice"), "LIBERA"));
         // A different account is still a different key, and the shared owner
         // stays distinct from any account.
         assert_ne!(registered, NetworkKey::new(Some("bob"), "libera"));
         assert_ne!(registered, NetworkKey::new(None, "libera"));
-        // The network name is a selector the owner chose, not an identity, and
-        // is matched exactly.
-        assert_ne!(registered, NetworkKey::new(Some("alice"), "Libera"));
+        // A genuinely different name is still a different key.
+        assert_ne!(registered, NetworkKey::new(Some("alice"), "oftc"));
     }
 }

@@ -1854,6 +1854,74 @@ async fn bnc_networks_crud() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_network_name_selection_is_case_insensitive() {
+    // A network name is an IRC-identifier-like selector, folded end-to-end
+    // (registry key + DB, migration 0034). Without this a user who owns `libera`
+    // and typed `/network Libera` would miss their own network and could fall
+    // through to an operator's shared network of that name (DESIGN §2).
+    let pool =
+        db::connect_and_migrate(&support::test_db("bnc_network_name_case_insensitive").await)
+            .await
+            .expect("connect");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("acct");
+
+    let libera = db::BncNetworkRow {
+        kind: Default::default(),
+        name: "libera".into(),
+        addr: "irc.libera.chat:6697".into(),
+        tls: true,
+        nick: "alice_".into(),
+        realname: None,
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        enabled: true,
+    };
+    db::create_bnc_network(&pool, "alice", &libera)
+        .await
+        .expect("create");
+
+    // A case-variant of an existing name is the *same* network, not a new one.
+    let mut variant = libera.clone();
+    variant.name = "Libera".into();
+    let dup = db::create_bnc_network(&pool, "alice", &variant).await;
+    assert!(
+        matches!(dup, Err(db::DbError::DuplicateNetwork(_))),
+        "case-variant create must collide with the existing network: {dup:?}"
+    );
+
+    // Lookups by any casing resolve to the one stored network (display case
+    // preserved), and enable/disable + delete hit it regardless of typed case.
+    for typed in ["libera", "Libera", "LIBERA", "lIbErA"] {
+        let got = db::get_bnc_network(&pool, "alice", typed)
+            .await
+            .expect("get")
+            .unwrap_or_else(|| panic!("`{typed}` should resolve to the owned network"));
+        assert_eq!(got.name, "libera", "display casing is preserved");
+    }
+    assert!(
+        db::set_bnc_network_enabled(&pool, "alice", "LIBERA", false)
+            .await
+            .expect("disable"),
+        "disable by a different casing must match the stored network"
+    );
+    assert!(
+        db::delete_bnc_network(&pool, "alice", "LiBeRa")
+            .await
+            .expect("delete"),
+        "delete by a different casing must match the stored network"
+    );
+    assert_eq!(
+        db::list_bnc_networks(&pool, "alice").await.unwrap().len(),
+        0,
+        "the network is gone after a case-insensitive delete"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn deleting_a_bnc_network_purges_its_casefolded_buffer() {
     // bnc_buffer is keyed by the *casefolded* owner (the persistence task folds
     // it). Deleting a network by the raw account name must still remove the
