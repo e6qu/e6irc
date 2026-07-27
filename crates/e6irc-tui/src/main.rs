@@ -62,7 +62,9 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                msg = conn.next_message() => match msg {
+                // Lossy steady-state read: one non-UTF-8 line (a Latin-1 channel
+                // message any member can post) must not disconnect the session.
+                msg = conn.next_message_lossy() => match msg {
                     Ok(Some(m)) => {
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
