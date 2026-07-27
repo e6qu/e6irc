@@ -199,6 +199,114 @@ pub(super) fn network_name_ok(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Validate the connection/identity fields shared by network create and edit:
+/// `addr` and `nick` required and length-bounded, `realname`/`autojoin`
+/// bounded, none carrying CR/LF/NUL (a line-injection primitive into the
+/// upstream NICK/USER/JOIN), and `addr` not an obviously-internal SSRF target.
+/// Returns a problem+json response on the first violation.
+/// Bounds/injection/SSRF checks on the connection/identity fields, shared by
+/// create (all kinds) and edit. Length-bounds `addr`/`nick`/`realname`/
+/// `autojoin`, rejects CR/LF/NUL in them (a line-injection primitive into the
+/// upstream NICK/USER/JOIN), and refuses an obviously-internal `addr` (SSRF).
+/// Does *not* check presence — a bridge kind legitimately has no addr/nick.
+// Err carries a full problem Response, as everywhere in this module's validators.
+#[allow(clippy::result_large_err)]
+pub(super) fn check_upstream_bounds(
+    addr: &str,
+    nick: &str,
+    realname: Option<&str>,
+    autojoin: &[String],
+) -> Result<(), Response> {
+    if addr.len() > 255
+        || nick.len() > 64
+        || realname.is_some_and(|r| r.len() > 128)
+        || autojoin.len() > 64
+        || autojoin.iter().any(|c| c.len() > 64)
+    {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Field too long",
+            Some("network fields exceed their length bounds"),
+        ));
+    }
+    let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+    if has_control(addr)
+        || has_control(nick)
+        || realname.is_some_and(has_control)
+        || autojoin.iter().any(|c| has_control(c))
+    {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid character",
+            Some("nick, realname and autojoin must not contain CR, LF or NUL"),
+        ));
+    }
+    if upstream_addr_is_internal(addr) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Disallowed upstream address",
+            Some("addr must not be a loopback, link-local, unspecified or multicast IP"),
+        ));
+    }
+    Ok(())
+}
+
+/// Full validation for an IRC upstream's connection/identity fields (create and
+/// edit): `addr`/`nick` required, plus the shared [`check_upstream_bounds`].
+#[allow(clippy::result_large_err)]
+pub(super) fn validate_irc_upstream(
+    addr: &str,
+    nick: &str,
+    realname: Option<&str>,
+    autojoin: &[String],
+) -> Result<(), Response> {
+    if addr.is_empty() || nick.is_empty() {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Missing required fields",
+            Some("addr and nick are required"),
+        ));
+    }
+    check_upstream_bounds(addr, nick, realname, autojoin)
+}
+
+/// Update the connection/identity fields of one of the caller's IRC networks
+/// (addr, tls, nick, realname, autojoin — not the SASL credentials), persist
+/// them, and rebuild the live driver so the change takes effect. Shared by the
+/// account page and the console.
+#[allow(clippy::too_many_arguments)] // one field per parameter; a struct would just re-list them
+pub(super) async fn update_network_core(
+    state: &AppState,
+    registry: &crate::bouncer::Registry,
+    account: &str,
+    name: &str,
+    addr: &str,
+    tls: bool,
+    nick: &str,
+    realname: Option<&str>,
+    autojoin: &[String],
+) -> Result<(), Response> {
+    validate_irc_upstream(addr, nick, realname, autojoin)?;
+    let pool = pool_of(state);
+    match crate::db::update_bnc_network(pool, account, name, addr, tls, nick, realname, autojoin)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+        Err(e) => {
+            eprintln!("http: network update: {e}");
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    }
+    // Rebuild the live driver from the now-updated row so the new settings take
+    // effect (replacing the running driver when enabled).
+    reconcile_network_driver(state, registry, account, name).await
+}
+
 pub(super) async fn create_network_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -257,61 +365,32 @@ pub(super) async fn create_network_core(
             }),
         ));
     }
-    // `nick`/`realname`/`autojoin` are interpolated into NICK/USER/JOIN lines to
-    // the upstream; a CR/LF would inject a second command. Reject it at the
-    // boundary (this only affects the caller's own upstream, but a line-injection
-    // primitive should never be constructible). Bound every field so a caller
-    // can't store an oversized value or an unbounded autojoin list.
-    let too_long = req.name.len() > 64
-        || req.addr.len() > 255
-        || req.nick.len() > 64
-        || req.realname.as_ref().is_some_and(|r| r.len() > 128)
-        || req.autojoin.len() > 64
-        || req.autojoin.iter().any(|c| c.len() > 64)
-        // The SASL pair is sealed and stored per network; unbounded, a caller
-        // could persist megabytes of dead secret per row. 512 accommodates
-        // long OAuth-style tokens used as SASL passwords.
+    // Bound + injection-check + SSRF-check the connection/identity fields (the
+    // subset shared with the edit path). `addr`/`nick`/`realname`/`autojoin` are
+    // interpolated into NICK/USER/JOIN lines, so a CR/LF/NUL there is a
+    // line-injection primitive; `addr` is SSRF-vetted; all are length-bounded.
+    check_upstream_bounds(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
+    // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
+    // check that matters because PLAIN uses NUL as its field separator, and the
+    // sealed-secret size cap) are checked here rather than in the shared helper.
+    let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+    if req.name.len() > 64
         || req.sasl_account.as_ref().is_some_and(|a| a.len() > 255)
-        || req.sasl_password.as_ref().is_some_and(|p| p.len() > 512);
-    if too_long {
+        || req.sasl_password.as_ref().is_some_and(|p| p.len() > 512)
+    {
         return Err(problem(
             StatusCode::BAD_REQUEST,
             "Field too long",
             Some("network fields exceed their length bounds"),
         ));
     }
-    let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
-    // The SASL pair is included because PLAIN uses NUL as its field separator:
-    // a NUL inside either value would shift the authzid/authcid/passwd fields
-    // the upstream parses — the same injection-primitive class as CR/LF in a
-    // command line.
-    // req.name is already charset-restricted above, so it cannot carry control
-    // bytes; the remaining free-form fields still must be checked.
-    if has_control(&req.addr)
-        || has_control(&req.nick)
-        || req.realname.as_deref().is_some_and(has_control)
-        || req.autojoin.iter().any(|c| has_control(c))
-        || req.sasl_account.as_deref().is_some_and(has_control)
+    if req.sasl_account.as_deref().is_some_and(has_control)
         || req.sasl_password.as_deref().is_some_and(has_control)
     {
         return Err(problem(
             StatusCode::BAD_REQUEST,
             "Invalid character",
-            Some("nick, realname, autojoin and SASL fields must not contain CR, LF or NUL"),
-        ));
-    }
-    // Refuse an upstream address that points at an obviously-internal target
-    // (loopback, the cloud link-local metadata range, unspecified, multicast).
-    // Any authenticated user can create a network that the server then dials on
-    // a reconnect loop, so without this a tenant could probe 169.254.169.254 and
-    // similar. RFC-1918 private ranges are allowed, since a self-hosted upstream
-    // on a LAN is legitimate. (Hostnames are resolved by the dialer; this bounds
-    // the IP-literal vector reported.)
-    if upstream_addr_is_internal(&req.addr) {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Disallowed upstream address",
-            Some("addr must not be a loopback, link-local, unspecified or multicast IP"),
+            Some("SASL fields must not contain CR, LF or NUL"),
         ));
     }
     // For IRC the SASL pair is both-or-neither (account = login name, password =
@@ -506,6 +585,48 @@ pub(super) struct PatchNetwork {
 /// built. Config and buffers are untouched — a disabled network can be
 /// re-enabled later. Returns `Err(response)` (a problem+json) on any failure.
 /// Shared by the REST `PATCH` and the console toggle button.
+/// Load `account`'s network `name` from the DB and reconcile its live driver
+/// with the persisted state: (re)build and install the driver when the row is
+/// enabled — `registry.add` stops and replaces any running driver — or stop it
+/// when disabled. `Err(problem)` if the row is gone or the driver can't build.
+/// Shared by enable/disable and edit, both of which need the running driver to
+/// match the stored row.
+async fn reconcile_network_driver(
+    state: &AppState,
+    registry: &crate::bouncer::Registry,
+    account: &str,
+    name: &str,
+) -> Result<(), Response> {
+    let pool = pool_of(state);
+    let row = match crate::db::get_bnc_network(pool, account, name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+        Err(e) => {
+            eprintln!("http: network reload failed: {e}");
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    };
+    if row.enabled {
+        match crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account) {
+            Ok(driver) => registry.add(Some(account), name, driver),
+            Err(e) => {
+                return Err(problem(
+                    StatusCode::CONFLICT,
+                    "Cannot start network",
+                    Some(&e),
+                ));
+            }
+        }
+    } else {
+        registry.remove(Some(account), name);
+    }
+    Ok(())
+}
+
 pub(super) async fn set_network_enabled_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
@@ -529,41 +650,16 @@ pub(super) async fn set_network_enabled_core(
         }
     }
 
-    if enabled {
-        // Rebuild the driver from the persisted row and (re)start it.
-        let row = match crate::db::get_bnc_network(pool, account, name).await {
-            Ok(Some(row)) => row,
-            // We just updated it; a miss here means a concurrent delete.
-            Ok(None) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
-            Err(e) => {
-                eprintln!("http: network reload failed: {e}");
-                return Err(problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                ));
-            }
-        };
-        let driver =
-            match crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account) {
-                Ok(driver) => driver,
-                Err(e) => {
-                    // Can't start it — undo the enable so the flag matches reality.
-                    if let Err(re) =
-                        crate::db::set_bnc_network_enabled(pool, account, name, false).await
-                    {
-                        eprintln!("http: failed to roll back enable after start error: {re}");
-                    }
-                    return Err(problem(
-                        StatusCode::CONFLICT,
-                        "Cannot start network",
-                        Some(&e),
-                    ));
-                }
-            };
-        registry.add(Some(account), name, driver);
-    } else {
-        registry.remove(Some(account), name);
+    if let Err(resp) = reconcile_network_driver(state, registry, account, name).await {
+        // A freshly-*enabled* network whose driver can't start leaves the flag
+        // disagreeing with reality — roll it back. (The disable path removes a
+        // driver and cannot fail to "start".)
+        if enabled
+            && let Err(re) = crate::db::set_bnc_network_enabled(pool, account, name, false).await
+        {
+            eprintln!("http: failed to roll back enable after start error: {re}");
+        }
+        return Err(resp);
     }
     Ok(())
 }

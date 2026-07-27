@@ -1638,6 +1638,27 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+Web-UI sweep 2 — network editing + client polish (2026-07-27): the headline
+follow-up gap. BNC networks were add/remove/toggle only — changing a nick or
+autojoin meant delete+recreate (losing buffers). The console now **edits** a
+network's connection/identity fields (addr, tls, nick, realname, autojoin) via
+`/console/networks/{name}/edit`: a pre-filled form, validated (shared
+`validate_irc_upstream`/`check_upstream_bounds` — length, CR/LF/NUL injection,
+SSRF on a changed address), persisted (`db::update_bnc_network`), and the live
+driver rebuilt (`reconcile_network_driver`, extracted and now shared with the
+enable/disable path — `registry.add` stops+replaces the running driver). SASL
+credentials are intentionally out of edit (delete+recreate), avoiding
+secret-preservation complexity. Self-service (own network) with body-CSRF
+(`require_form_actor`, factored out of `require_admin_form_actor`); PRG on
+success, error banner on failure. Covered by a PG-gated http test
+(`console_edit_network_updates_fields`: pre-fill, update, SSRF guard, CSRF gate).
+Boy-scout: the near-duplicate add/delete network handlers and the page-handler
+`authenticate+csrf` preamble were extracted to shared helpers
+(`add_network_from_form`/`delete_network_by_name`/`page_actor`), landing the
+duplication ratchet *below* its prior level. Client: unread total now shows in
+the tab title. (The earlier browser-console 404 fix — `list_networks` returning
+an empty collection when the bouncer is off — shipped in the prior PR.)
+
 Web-UI sweep — client usability + console error surfacing (2026-07-27):
 an audit-driven pass over the whole web UI (in-browser IRC client + the
 htmx/askama console). One flagged "bug" (incoming CTCP ACTION rendering) was a

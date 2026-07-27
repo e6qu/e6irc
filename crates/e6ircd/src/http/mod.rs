@@ -180,6 +180,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(pages::console_toggle_network),
         )
         .route(
+            "/console/networks/{name}/edit",
+            get(pages::console_edit_network).post(pages::console_update_network),
+        )
+        .route(
             "/console/integrations",
             get(pages::console_integrations).post(pages::console_add_bridge),
         )
@@ -615,6 +619,27 @@ mod pages {
             })
     }
 
+    /// Authenticate a cookie session for a server-rendered page and derive its
+    /// CSRF token, returning `(account, csrf)`. On no/invalid session returns the
+    /// `/login` redirect; with `admin_only`, a non-admin gets 403. This is the
+    /// shared preamble of every console/account page handler.
+    async fn page_actor(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        admin_only: bool,
+    ) -> Result<(String, String), Response> {
+        let account = authenticate(state, headers)
+            .await
+            .map_err(|_| Redirect::to("/login").into_response())?;
+        if admin_only && !is_admin_account(state, &account) {
+            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
+        }
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        Ok((account, csrf))
+    }
+
     /// User section: the signed-in account's networks and credentials,
     /// with htmx forms to add/remove networks. Cookie-authenticated;
     /// unauthenticated visitors go to `/login`.
@@ -817,6 +842,36 @@ mod pages {
         networks: Vec<ConsoleNetView>,
     }
 
+    #[derive(Template)]
+    #[template(path = "console_network_edit.html")]
+    struct ConsoleNetworkEdit {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        name: String,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: String,
+        error: Option<String>,
+    }
+
+    /// The console edit-network form (urlencoded). `tls` is an HTML checkbox.
+    #[derive(Deserialize)]
+    pub struct NetworkEditForm {
+        csrf: String,
+        addr: String,
+        nick: String,
+        #[serde(default)]
+        tls: Option<String>,
+        #[serde(default)]
+        realname: String,
+        #[serde(default)]
+        autojoin: String,
+    }
+
     /// Admin console: server-wide read views (accounts, registered channels,
     /// server bans, audit log) rendered server-side. Cookie-authenticated and
     /// admin-gated the same way the `/api/v1/admin/*` JSON endpoints are — an
@@ -926,6 +981,29 @@ mod pages {
         }
     }
 
+    /// Shared body of the two add-network form handlers (console + account):
+    /// require the bouncer, parse the (identical) form, build the CreateNetwork,
+    /// and run `create_network_core`. The callers differ only in which table
+    /// fragment they render on success.
+    async fn add_network_from_form(
+        state: &AppState,
+        account: &str,
+        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(), Response> {
+        let Some(registry) = &state.bnc_registry else {
+            return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
+        };
+        let axum::Form(f) = form.map_err(|e| {
+            problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid form",
+                Some(&e.to_string()),
+            )
+        })?;
+        let req = f.into_create();
+        create_network_core(state, registry, account, &req).await
+    }
+
     /// Add a network from the console (htmx); returns the refreshed rows fragment.
     /// Reuses the same `create_network_core` the REST API and account page use.
     pub async fn console_add_network(
@@ -934,27 +1012,41 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
-        let axum::Form(f) = match form {
-            Ok(f) => f,
-            Err(e) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid form",
-                    Some(&e.to_string()),
-                );
-            }
-        };
-        let req = f.into_create();
-        if let Err(r) = create_network_core(&state, registry, &account, &req).await {
+        if let Err(r) = add_network_from_form(&state, &account, form).await {
             return r;
         }
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         console_networks_fragment(&state, &account, csrf).await
+    }
+
+    /// Shared body of the two delete-network handlers (console + account):
+    /// require the bouncer, delete the row (owner-scoped), and stop its live
+    /// driver. The callers differ only in which fragment they render.
+    async fn delete_network_by_name(
+        state: &AppState,
+        account: &str,
+        name: &str,
+    ) -> Result<(), Response> {
+        let Some(registry) = &state.bnc_registry else {
+            return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
+        };
+        match crate::db::delete_bnc_network(pool_of(state), account, name).await {
+            Ok(true) => {
+                registry.remove(Some(account), name);
+                Ok(())
+            }
+            Ok(false) => Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+            Err(e) => {
+                eprintln!("network delete: {e}");
+                Err(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ))
+            }
+        }
     }
 
     /// Delete a network from the console (htmx); returns the refreshed fragment.
@@ -964,22 +1056,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
-        let pool = pool_of(&state);
-        match crate::db::delete_bnc_network(pool, &account, &name).await {
-            Ok(true) => registry.remove(Some(&account), &name),
-            Ok(false) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-            Err(e) => {
-                eprintln!("console: network delete: {e}");
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                );
-            }
-        };
+        if let Err(r) = delete_network_by_name(&state, &account, &name).await {
+            return r;
+        }
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
@@ -1023,6 +1102,142 @@ mod pages {
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         console_networks_fragment(&state, &account, csrf).await
+    }
+
+    /// Render the edit-network form (shared by the GET and the failed-POST
+    /// re-render, which differ only in field values and the error banner).
+    #[allow(clippy::too_many_arguments)]
+    fn console_network_edit_page(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        name: String,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: String,
+        error: Option<String>,
+    ) -> Response {
+        let is_admin = is_admin_account(state, &account); // shell nav only
+        render_private(ConsoleNetworkEdit {
+            account,
+            csrf,
+            is_admin,
+            active: "networks",
+            name,
+            addr,
+            tls,
+            nick,
+            realname,
+            autojoin,
+            error,
+        })
+    }
+
+    /// Console → edit-network form (GET): pre-filled with the network's current
+    /// connection/identity fields. Any authenticated user may edit their own
+    /// network (not admin-gated), matching `/console/networks`.
+    pub async fn console_edit_network(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+    ) -> Response {
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(x) => x,
+            Err(r) => return r,
+        };
+        let pool = pool_of(&state);
+        let row = match crate::db::get_bnc_network(pool, &account, &name).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+            Err(e) => return super::device::admin_db_error("network fetch", e),
+        };
+        console_network_edit_page(
+            &state,
+            account,
+            csrf,
+            row.name,
+            row.addr,
+            row.tls,
+            row.nick,
+            row.realname.unwrap_or_default(),
+            row.autojoin.join(", "),
+            None,
+        )
+    }
+
+    /// Console → apply an edited network (POST): validate, persist the new
+    /// connection/identity fields, and rebuild the live driver. On success
+    /// redirect to the network list; on failure re-render the form with a banner
+    /// (keeping the submitted values).
+    pub async fn console_update_network(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+        form: Result<axum::Form<NetworkEditForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        // Plain form: parse first, then authenticate + verify the body CSRF.
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid form",
+                    Some(&e.to_string()),
+                );
+            }
+        };
+        let account = match require_form_actor(&state, &headers, &f.csrf).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let tls = f.tls.as_deref() == Some("on");
+        let realname = (!f.realname.trim().is_empty()).then(|| f.realname.trim().to_string());
+        let autojoin: Vec<String> = f
+            .autojoin
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let result = update_network_core(
+            &state,
+            registry,
+            &account,
+            &name,
+            &f.addr,
+            tls,
+            &f.nick,
+            realname.as_deref(),
+            &autojoin,
+        )
+        .await;
+        if result.is_ok() {
+            return Redirect::to("/console/networks").into_response();
+        }
+        // Re-render the form with a banner, keeping what the user typed.
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|s| state.csrf_token(&s))
+            .unwrap_or_default();
+        let err = "Could not save — check the address (host:port, not an internal \
+                   IP), nick, and field lengths."
+            .to_string();
+        console_network_edit_page(
+            &state,
+            account,
+            csrf,
+            name,
+            f.addr,
+            tls,
+            f.nick,
+            f.realname,
+            f.autojoin,
+            Some(err),
+        )
     }
 
     struct BridgeNet {
@@ -1143,15 +1358,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let (account, csrf) = match page_actor(&state, &headers, true).await {
+            Ok(x) => x,
+            Err(r) => return r,
         };
-        if !is_admin_account(&state, &account) {
-            return problem(StatusCode::FORBIDDEN, "Admin only", None);
-        }
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
         render_private(console_integrations_build(&state, account, csrf, None))
     }
 
@@ -1199,7 +1409,10 @@ mod pages {
         name: String,
     }
 
-    async fn require_admin_form_actor(
+    /// Authenticate a plain-form (body-CSRF) actor: the caller is signed in and
+    /// the form carried a valid CSRF token. Not admin-gated — for self-service
+    /// actions on the caller's own resources. Returns the account or a response.
+    async fn require_form_actor(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         csrf: &str,
@@ -1207,14 +1420,23 @@ mod pages {
         let account = authenticate(state, headers)
             .await
             .map_err(|_| Redirect::to("/login").into_response())?;
-        if !is_admin_account(state, &account) {
-            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
-        }
         let Some(session) = session_token(headers, state.secure_cookies) else {
             return Err(problem(StatusCode::UNAUTHORIZED, "Session required", None));
         };
         if !state.csrf_valid(&session, csrf) {
             return Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None));
+        }
+        Ok(account)
+    }
+
+    async fn require_admin_form_actor(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        csrf: &str,
+    ) -> Result<String, Response> {
+        let account = require_form_actor(state, headers, csrf).await?;
+        if !is_admin_account(state, &account) {
+            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
         }
         Ok(account)
     }
@@ -1706,21 +1928,7 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
-        let axum::Form(f) = match form {
-            Ok(f) => f,
-            Err(e) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid form",
-                    Some(&e.to_string()),
-                );
-            }
-        };
-        let req = f.into_create();
-        if let Err(r) = create_network_core(&state, registry, &account, &req).await {
+        if let Err(r) = add_network_from_form(&state, &account, form).await {
             return r;
         }
         networks_fragment(&state, &headers, &account).await
@@ -1734,22 +1942,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
-        let pool = pool_of(&state);
-        match crate::db::delete_bnc_network(pool, &account, &name).await {
-            Ok(true) => registry.remove(Some(&account), &name),
-            Ok(false) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-            Err(e) => {
-                eprintln!("account: network delete: {e}");
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                );
-            }
-        };
+        if let Err(r) = delete_network_by_name(&state, &account, &name).await {
+            return r;
+        }
         networks_fragment(&state, &headers, &account).await
     }
 

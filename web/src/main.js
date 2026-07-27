@@ -121,7 +121,15 @@ function nickPrefix(modes) {
 
 // ---- rendering ----------------------------------------------------------
 
+// Reflect total unread in the tab title so a background tab shows activity.
+function updateTitle() {
+  let unread = 0;
+  for (const b of buffers.values()) if (b.key !== active) unread += b.unread;
+  document.title = unread > 0 ? `(${unread}) e6irc` : "e6irc";
+}
+
 function renderBufferList() {
+  updateTitle();
   buffersEl.replaceChildren();
   const order = [...buffers.values()].sort((a, b) => {
     if (a.key === SERVER) return -1;
