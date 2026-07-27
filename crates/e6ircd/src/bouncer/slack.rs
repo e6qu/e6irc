@@ -186,7 +186,13 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         return Dropped;
                     }
                 };
-                let envelope = parse_envelope(&text);
+                let envelope = match parse_envelope(&text) {
+                    Ok(envelope) => envelope,
+                    Err(e) => {
+                        eprintln!("slack: malformed Socket Mode frame: {e}");
+                        return Dropped;
+                    }
+                };
                 // Socket Mode requires acknowledging each envelope by id.
                 if let Some(ack_id) = &envelope.ack {
                     let ack = serde_json::json!({ "envelope_id": ack_id });
@@ -260,45 +266,79 @@ struct Envelope {
     message: Option<SlackMessage>,
 }
 
-fn parse_envelope(text: &str) -> Envelope {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Envelope {
-            ack: None,
-            disconnect: false,
-            message: None,
-        };
-    };
-    let ack = v["envelope_id"].as_str().map(str::to_string);
-    let kind = v["type"].as_str().unwrap_or("");
-    if kind == "disconnect" {
-        return Envelope {
-            ack,
+#[derive(serde::Deserialize)]
+struct SocketFrame {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    envelope_id: Option<String>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct SocketPayload {
+    event: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct SlackEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    bot_id: Option<String>,
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+fn parse_envelope(text: &str) -> Result<Envelope, String> {
+    let frame: SocketFrame =
+        serde_json::from_str(text).map_err(|e| format!("Socket Mode JSON: {e}"))?;
+    if frame.kind == "disconnect" {
+        return Ok(Envelope {
+            ack: frame.envelope_id,
             disconnect: true,
             message: None,
-        };
+        });
     }
-    // A real user message: type events_api, inner event type "message",
-    // no bot_id (drop our own and other bots' posts) and no subtype
-    // (edits/joins/etc. carry a subtype we do not bridge).
-    let event = &v["payload"]["event"];
-    let message = if kind == "events_api"
-        && event["type"] == "message"
-        && event["bot_id"].is_null()
-        && event["subtype"].is_null()
-    {
+    if frame.kind != "events_api" {
+        return Ok(Envelope {
+            ack: frame.envelope_id,
+            disconnect: false,
+            message: None,
+        });
+    }
+
+    let ack = frame
+        .envelope_id
+        .ok_or("events_api frame had no envelope_id")?;
+    let payload: SocketPayload =
+        serde_json::from_value(frame.payload.ok_or("events_api frame had no payload")?)
+            .map_err(|e| format!("events_api payload: {e}"))?;
+    let event: SlackEvent =
+        serde_json::from_value(payload.event).map_err(|e| format!("events_api event: {e}"))?;
+    // A real user message: inner event type "message", no bot_id (drop our
+    // own and other bots' posts), and no subtype (edits/joins/etc. carry one).
+    let message = if event.kind == "message" && event.bot_id.is_none() && event.subtype.is_none() {
         Some(SlackMessage {
-            channel: event["channel"].as_str().unwrap_or("").to_string(),
-            user: event["user"].as_str().unwrap_or("?").to_string(),
-            text: event["text"].as_str().unwrap_or("").to_string(),
+            channel: event.channel.ok_or("user message event had no channel")?,
+            user: event.user.ok_or("user message event had no user")?,
+            text: event.text.ok_or("user message event had no text")?,
         })
     } else {
         None
     };
-    Envelope {
-        ack,
+    Ok(Envelope {
+        ack: Some(ack),
         disconnect: false,
         message,
-    }
+    })
 }
 
 /// A Slack Web API response's `ok` field is the error contract: `false`
@@ -437,7 +477,8 @@ mod tests {
         let e = parse_envelope(
             r#"{"envelope_id":"abc","type":"events_api","payload":{"event":
                {"type":"message","channel":"C1","user":"U1","text":"hi"}}}"#,
-        );
+        )
+        .expect("message envelope");
         assert_eq!(e.ack.as_deref(), Some("abc"));
         assert!(!e.disconnect);
         let m = e.message.expect("message");
@@ -452,23 +493,51 @@ mod tests {
         let e = parse_envelope(
             r#"{"envelope_id":"x","type":"events_api","payload":{"event":
                {"type":"message","channel":"C1","bot_id":"B9","text":"echo"}}}"#,
-        );
+        )
+        .expect("bot message");
         assert_eq!(e.ack.as_deref(), Some("x")); // still ack it
         assert!(e.message.is_none());
         // Edits/joins carry a subtype.
         let e = parse_envelope(
             r#"{"envelope_id":"y","type":"events_api","payload":{"event":
                {"type":"message","subtype":"channel_join","channel":"C1","user":"U1"}}}"#,
-        );
+        )
+        .expect("subtyped message");
         assert!(e.message.is_none());
     }
 
     #[test]
     fn handles_disconnect_and_garbage() {
-        let e = parse_envelope(r#"{"type":"disconnect","reason":"refresh"}"#);
+        let e = parse_envelope(r#"{"type":"disconnect","reason":"refresh"}"#).expect("disconnect");
         assert!(e.disconnect);
-        let e = parse_envelope("not json");
+        let e = parse_envelope(r#"{"type":"hello","num_connections":1}"#).expect("hello");
         assert!(e.ack.is_none() && !e.disconnect && e.message.is_none());
+        let e = parse_envelope(
+            r#"{"envelope_id":"cmd","type":"slash_commands",
+               "payload":{"command":"/ignored"}}"#,
+        )
+        .expect("unknown envelope");
+        assert_eq!(e.ack.as_deref(), Some("cmd"));
+        assert!(e.message.is_none());
+        assert!(parse_envelope("not json").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_user_messages_instead_of_defaulting_fields() {
+        assert!(
+            parse_envelope(
+                r#"{"type":"events_api","payload":{"event":
+               {"type":"message","channel":"C1","user":"U1","text":"hi"}}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_envelope(
+                r#"{"envelope_id":"x","type":"events_api","payload":{"event":
+               {"type":"message","channel":"C1","text":"hi"}}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

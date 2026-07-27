@@ -236,6 +236,77 @@ struct Incoming {
     body: String,
 }
 
+#[derive(serde::Deserialize)]
+struct SyncResponse {
+    next_batch: String,
+    #[serde(default)]
+    rooms: SyncRooms,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct SyncRooms {
+    #[serde(default)]
+    join: HashMap<String, JoinedRoom>,
+}
+
+#[derive(serde::Deserialize)]
+struct JoinedRoom {
+    timeline: Timeline,
+}
+
+#[derive(serde::Deserialize)]
+struct Timeline {
+    events: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct EventHeader {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    sender: Option<String>,
+    #[serde(default)]
+    content: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct MessageContent {
+    msgtype: String,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+fn collect_sync_messages(body: SyncResponse) -> Result<(String, Vec<Incoming>), String> {
+    if body.next_batch.is_empty() {
+        return Err("sync returned an empty next_batch".to_string());
+    }
+    let mut messages = Vec::new();
+    for (room_id, room) in body.rooms.join {
+        for event in room.timeline.events {
+            let header: EventHeader = serde_json::from_value(event)
+                .map_err(|e| format!("timeline event in {room_id}: {e}"))?;
+            if header.kind != "m.room.message" {
+                continue;
+            }
+            let content: MessageContent = serde_json::from_value(header.content)
+                .map_err(|e| format!("m.room.message in {room_id}: {e}"))?;
+            if content.msgtype != "m.text" {
+                continue;
+            }
+            messages.push(Incoming {
+                room_id: room_id.clone(),
+                sender: header
+                    .sender
+                    .ok_or_else(|| format!("m.text event in {room_id} had no sender"))?,
+                body: content
+                    .body
+                    .ok_or_else(|| format!("m.text event in {room_id} had no body"))?,
+            });
+        }
+    }
+    Ok((body.next_batch, messages))
+}
+
 /// Long-poll `/sync`; returns the next batch token and any text messages.
 async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>), String> {
     let timeout = if since.is_some() { 20000 } else { 0 };
@@ -247,7 +318,7 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
     if let Some(since) = since {
         req = req.query(&[("since", since)]);
     }
-    let body: serde_json::Value = req
+    let body: SyncResponse = req
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -255,32 +326,7 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
         .map_err(|e| e.to_string())?
         .bounded_json()
         .await?;
-
-    let next = body["next_batch"]
-        .as_str()
-        .ok_or("sync had no next_batch")?
-        .to_string();
-    let mut messages = Vec::new();
-    if let Some(join) = body["rooms"]["join"].as_object() {
-        for (room_id, room) in join {
-            let Some(events) = room["timeline"]["events"].as_array() else {
-                continue;
-            };
-            for ev in events {
-                if ev["type"] == "m.room.message"
-                    && ev["content"]["msgtype"] == "m.text"
-                    && let Some(text) = ev["content"]["body"].as_str()
-                {
-                    messages.push(Incoming {
-                        room_id: room_id.clone(),
-                        sender: ev["sender"].as_str().unwrap_or("?").to_string(),
-                        body: text.to_string(),
-                    });
-                }
-            }
-        }
-    }
-    Ok((next, messages))
+    collect_sync_messages(body)
 }
 
 /// Deliver a downstream PRIVMSG to Matrix. Returns `Some(target)` when a
@@ -400,5 +446,36 @@ mod tests {
         );
         // The command/target the driver intends is preserved.
         assert!(line.contains("PRIVMSG #room :body"), "{line}");
+    }
+
+    #[test]
+    fn sync_parser_keeps_unknown_events_but_rejects_malformed_text_messages() {
+        let response: SyncResponse = serde_json::from_str(
+            r#"{"next_batch":"s1","rooms":{"join":{"!room:example":{"timeline":{"events":[
+                {"type":"m.reaction","sender":"@bob:example","content":{}},
+                {"type":"m.room.message","sender":"@alice:example",
+                 "content":{"msgtype":"m.text","body":"hello"}}
+            ]}}}}}"#,
+        )
+        .expect("sync response");
+        let (next, messages) = collect_sync_messages(response).expect("valid sync");
+        assert_eq!(next, "s1");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, "@alice:example");
+        assert_eq!(messages[0].body, "hello");
+
+        for malformed in [
+            r#"{"next_batch":"s2","rooms":{"join":{"!room:example":{"timeline":{"events":[
+                {"type":"m.room.message","content":{"msgtype":"m.text","body":"hello"}}
+            ]}}}}}"#,
+            r#"{"next_batch":"s2","rooms":{"join":{"!room:example":{"timeline":{"events":[
+                {"type":"m.room.message","sender":"@alice:example",
+                 "content":{"msgtype":"m.text"}}
+            ]}}}}}"#,
+        ] {
+            let response: SyncResponse =
+                serde_json::from_str(malformed).expect("outer sync response");
+            assert!(collect_sync_messages(response).is_err());
+        }
     }
 }

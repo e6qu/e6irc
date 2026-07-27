@@ -252,6 +252,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     delivered" — a silent drop — is unwritable (the Matrix bridge had exactly
     that against a 403/429/5xx). The same choke-point shape as the inbound
     `BoundedJson` body cap.
+  - *Bridge protocol payloads are parsed into typed envelopes at ingress.*
+    Unknown Discord dispatches, Matrix event kinds, and Slack envelope/event
+    kinds remain intentionally ignorable protocol extension points. A malformed
+    known HELLO/READY/message, `m.text`, or `events_api` payload is instead an
+    error that drops into the driver's reconnect policy. Required provider data
+    therefore cannot become a made-up heartbeat interval, empty identifier,
+    `"?"` sender, or silently absent message through JSON-index defaults.
   - Transport-owning modules deny Clippy's `let_underscore_must_use`: a
     fallible socket write, flush, queue push, or task join cannot be discarded
     with the project's former `let _ = ...` idiom. Active-session writes are

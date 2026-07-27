@@ -4577,6 +4577,20 @@ bouncer, raw/TLS socket, web-socket, and shared-client funnels. Deterministic
 regressions cover all three local-driver closure stages and an injected flush
 failure.
 
+Bridge protocol-boundary sweep (2026-07-27): the three non-IRC drivers no
+longer reinterpret malformed provider payloads through permissive
+`serde_json::Value` indexing. Discord's known gateway frames now require their
+typed sequence/event/data fields and reject a missing or zero HELLO heartbeat
+instead of inventing 45 seconds; a malformed frame reconnects the session.
+Slack's Socket Mode parser distinguishes ignorable envelope/event kinds from a
+known `events_api` user message, which must carry an acknowledgement id,
+channel, user, and text. Matrix `/sync` is decoded into typed response/room/
+timeline structures, and a known `m.text` event must carry its sender and body.
+Unknown provider event kinds remain deliberately ignored as protocol extension
+points; malformed known messages fail loudly into the existing reconnect
+policy. Offline regressions pin valid, unknown, and malformed cases for all
+three feature-gated drivers.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
