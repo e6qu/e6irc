@@ -729,7 +729,12 @@ Principal tables (columns abridged):
 - `bnc_buffer` (id, owner, network, line, created_at) — persisted
   detached-buffer lines replayed on attach after a restart; `owner` is `*`
   for a shared/server-level network; `owner` is the RFC1459-casefolded account,
-  matching the registry key. Both ways into a network's buffer — a live line
+  matching the registry key. The `/network` selector is likewise folded for
+  matching (registry key + a `UNIQUE (account_id, lower(name))` index on
+  `bnc_networks`, migration 0034), so selection is case-insensitive like every
+  other IRC identifier and a case-mismatched attach cannot fall through to an
+  operator's shared network of the same name (§2); display casing is preserved.
+  Both ways into a network's buffer — a live line
   from a driver and restored backlog from this table — neutralize embedded
   CR/LF/NUL, so a line replayed to an attaching client cannot become two
   regardless of which path it arrived through or which build wrote it, and a

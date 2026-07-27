@@ -1807,7 +1807,7 @@ pub async fn create_bnc_network(
            (account_id, name, addr, tls, nick, realname, autojoin,
             sasl_account, sasl_password_sealed, kind)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (account_id, name) DO NOTHING
+         ON CONFLICT (account_id, lower(name)) DO NOTHING
          RETURNING id",
     )
     .bind(account_id)
@@ -1865,7 +1865,7 @@ pub async fn get_bnc_network(
         "SELECT n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
                 n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
          FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
-         WHERE a.name_folded = $1 AND n.name = $2",
+         WHERE a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
     .bind(&folded)
     .bind(name)
@@ -1887,7 +1887,7 @@ pub async fn set_bnc_network_enabled(
     let done = sqlx::query(
         "UPDATE bnc_networks n SET enabled = $3
          FROM accounts a
-         WHERE n.account_id = a.id AND a.name_folded = $1 AND n.name = $2",
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
     .bind(&folded)
     .bind(name)
@@ -1919,7 +1919,7 @@ pub async fn update_bnc_network(
         "UPDATE bnc_networks n
          SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7
          FROM accounts a
-         WHERE n.account_id = a.id AND a.name_folded = $1 AND n.name = $2",
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
     .bind(&folded)
     .bind(name)
@@ -2051,7 +2051,7 @@ pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Res
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
     let res = sqlx::query(
         "DELETE FROM bnc_networks n USING accounts a
-         WHERE n.account_id = a.id AND a.name_folded = $1 AND n.name = $2",
+         WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
     .bind(&folded)
     .bind(name)
