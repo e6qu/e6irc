@@ -26,6 +26,10 @@ pub enum DbError {
     DuplicateNetwork(String),
     /// A persisted BNC network kind is outside the closed driver-kind set.
     InvalidNetworkKind(String),
+    /// Persisted server settings do not decode into the closed typed schema.
+    InvalidServerSettings(String),
+    /// A console write was based on an older settings revision.
+    StaleServerSettings,
     /// Unknown account or wrong password (indistinguishable on purpose).
     BadCredentials,
     /// A write resolved to no account row for the given name.
@@ -51,6 +55,10 @@ impl std::fmt::Display for DbError {
             Self::InvalidNetworkKind(kind) => {
                 write!(f, "invalid persisted BNC network kind: {kind}")
             }
+            Self::InvalidServerSettings(error) => {
+                write!(f, "invalid persisted server settings: {error}")
+            }
+            Self::StaleServerSettings => write!(f, "server settings changed concurrently"),
             Self::BadCredentials => write!(f, "invalid account or password"),
             Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
@@ -67,6 +75,101 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
     let pool = PgPool::connect(url).await.map_err(DbError::Connect)?;
     MIGRATOR.run(&pool).await.map_err(DbError::Migrate)?;
     Ok(pool)
+}
+
+/// One immutable view of the settings row. Callers must present `revision` on a
+/// write, making lost updates impossible instead of relying on timing.
+#[derive(Debug, Clone)]
+pub struct ManagedConfigSnapshot {
+    pub revision: i64,
+    pub settings: crate::config::ManagedConfig,
+    pub updated_by: String,
+    pub updated_at: String,
+}
+
+fn decode_managed_settings(
+    value: serde_json::Value,
+) -> Result<crate::config::ManagedConfig, DbError> {
+    serde_json::from_value(value).map_err(|error| DbError::InvalidServerSettings(error.to_string()))
+}
+
+/// Load the control-plane row, importing the validated bootstrap values exactly
+/// once when a deployment first gains this migration.
+pub async fn load_or_initialize_managed_config(
+    pool: &PgPool,
+    bootstrap: &crate::config::ManagedConfig,
+) -> Result<ManagedConfigSnapshot, DbError> {
+    let value = serde_json::to_value(bootstrap)
+        .map_err(|error| DbError::InvalidServerSettings(error.to_string()))?;
+    sqlx::query(
+        "INSERT INTO server_settings (singleton, revision, settings, updated_by)
+         VALUES (TRUE, 1, $1, 'bootstrap')
+         ON CONFLICT (singleton) DO NOTHING",
+    )
+    .bind(value)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    load_managed_config(pool).await
+}
+
+pub async fn load_managed_config(pool: &PgPool) -> Result<ManagedConfigSnapshot, DbError> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT revision, settings, updated_by,
+                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS \"UTC\"') AS updated_at
+         FROM server_settings WHERE singleton",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?
+    .ok_or_else(|| DbError::InvalidServerSettings("settings row is missing".into()))?;
+    Ok(ManagedConfigSnapshot {
+        revision: row.get("revision"),
+        settings: decode_managed_settings(row.get("settings"))?,
+        updated_by: row.get("updated_by"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+/// Store a complete typed settings revision and its redacted audit description
+/// in the same transaction. A stale revision changes no rows and emits no audit
+/// entry.
+pub async fn save_managed_config(
+    pool: &PgPool,
+    expected_revision: i64,
+    settings: &crate::config::ManagedConfig,
+    actor: &str,
+    audit_detail: &str,
+) -> Result<ManagedConfigSnapshot, DbError> {
+    let value = serde_json::to_value(settings)
+        .map_err(|error| DbError::InvalidServerSettings(error.to_string()))?;
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let next: Option<(i64, String)> = sqlx::query_as(
+        "UPDATE server_settings
+         SET revision = revision + 1, settings = $2, updated_by = $3, updated_at = now()
+         WHERE singleton AND revision = $1
+         RETURNING revision,
+                   to_char(updated_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD HH24:MI:SS \"UTC\"')",
+    )
+    .bind(expected_revision)
+    .bind(value)
+    .bind(actor)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((revision, updated_at)) = next else {
+        return Err(DbError::StaleServerSettings);
+    };
+    insert_audit_log_with(&mut *tx, actor, "CONFIG", "server", audit_detail).await?;
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(ManagedConfigSnapshot {
+        revision,
+        settings: settings.clone(),
+        updated_by: actor.to_string(),
+        updated_at,
+    })
 }
 
 /// Create an account with a local password. Used by NickServ REGISTER
@@ -1506,20 +1609,12 @@ async fn mutate_server_ban_audited(
             )
         }
     };
-    sqlx::query("INSERT INTO audit_log (actor, action, target, detail) VALUES ($1, $2, $3, $4)")
-        .bind(actor)
-        .bind(action)
-        .bind(target)
-        .bind(detail)
-        .execute(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
+    insert_audit_log_with(&mut *transaction, actor, &action, target, detail).await?;
     transaction.commit().await.map_err(DbError::Query)
 }
 
-/// Record one privileged action in the audit trail.
-pub async fn insert_audit_log(
-    pool: &PgPool,
+async fn insert_audit_log_with<'executor>(
+    executor: impl sqlx::Executor<'executor, Database = sqlx::Postgres>,
     actor: &str,
     action: &str,
     target: &str,
@@ -1530,10 +1625,21 @@ pub async fn insert_audit_log(
         .bind(action)
         .bind(target)
         .bind(detail)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(DbError::Query)?;
     Ok(())
+}
+
+/// Record one privileged action in the audit trail.
+pub async fn insert_audit_log(
+    pool: &PgPool,
+    actor: &str,
+    action: &str,
+    target: &str,
+    detail: &str,
+) -> Result<(), DbError> {
+    insert_audit_log_with(pool, actor, action, target, detail).await
 }
 
 /// The most recent `limit` audit entries as `(actor, action, target,
@@ -1592,15 +1698,7 @@ async fn drop_channel_audited(
         .rows_affected()
         == 1;
     if deleted {
-        sqlx::query(
-            "INSERT INTO audit_log (actor, action, target, detail)
-             VALUES ($1, 'DROPCHAN', $2, '')",
-        )
-        .bind(actor)
-        .bind(channel_folded)
-        .execute(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
+        insert_audit_log_with(&mut *transaction, actor, "DROPCHAN", channel_folded, "").await?;
     }
     transaction.commit().await.map_err(DbError::Query)?;
     Ok(deleted)

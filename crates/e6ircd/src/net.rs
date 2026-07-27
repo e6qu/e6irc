@@ -73,6 +73,10 @@ pub struct ShutdownHandle {
     /// PostgreSQL before exit. `None` when no `[database]` is configured (there
     /// is then no worker and nothing buffered to lose).
     db_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Runtime-managed BNC listener. Unlike the bootstrap listeners, this can
+    /// be replaced from the console, so shutdown must address the controller
+    /// rather than only the task that happened to exist at startup.
+    bnc_listener: Option<Arc<BncListenerController>>,
 }
 
 /// How graceful shutdown ended, so `main` can pick an honest exit code.
@@ -98,6 +102,9 @@ impl ShutdownHandle {
         for listener in &self.listeners {
             listener.abort();
         }
+        if let Some(listener) = &self.bnc_listener {
+            listener.stop().await;
+        }
         // 2. Tell the core to notify clients (terminal ERROR) and stop. A push
         //    failure can only mean the core queue is already closed, i.e. the
         //    core is already gone — nothing more to ask of it.
@@ -119,6 +126,127 @@ impl ShutdownHandle {
             Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
         }
     }
+}
+
+#[derive(Debug)]
+struct BncListenerState {
+    requested: SocketAddr,
+    bound: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Owns the attach listener as a replaceable runtime resource.
+///
+/// Reconfiguration binds the replacement before stopping the current listener,
+/// so an invalid or occupied address cannot take a working endpoint down. The
+/// controller is the one choke point for start, replace, disable, status, and
+/// shutdown; a console write therefore cannot drift from the socket actually
+/// accepting clients.
+pub struct BncListenerController {
+    state: tokio::sync::Mutex<Option<BncListenerState>>,
+    registry: Arc<crate::bouncer::Registry>,
+    pool: sqlx::PgPool,
+    server_name: String,
+    limiter: ConnLimiter,
+}
+
+impl BncListenerController {
+    fn new(
+        registry: Arc<crate::bouncer::Registry>,
+        pool: sqlx::PgPool,
+        server_name: String,
+        limiter: ConnLimiter,
+    ) -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(None),
+            registry,
+            pool,
+            server_name,
+            limiter,
+        }
+    }
+
+    /// The configured and effective listener addresses, when enabled.
+    pub async fn status(&self) -> Option<(SocketAddr, SocketAddr)> {
+        self.state
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| (state.requested, state.bound))
+    }
+
+    /// Enable or atomically replace the listener. The old listener remains
+    /// active when the new address cannot be bound.
+    pub async fn enable(&self, requested: SocketAddr) -> io::Result<SocketAddr> {
+        let listener = TcpListener::bind(requested).await?;
+        let bound = listener.local_addr()?;
+        let task = spawn_bnc_listener(
+            listener,
+            self.registry.clone(),
+            self.pool.clone(),
+            self.server_name.clone(),
+            self.limiter.clone(),
+        );
+        let replacement = BncListenerState {
+            requested,
+            bound,
+            task,
+        };
+        let previous = self.state.lock().await.replace(replacement);
+        if let Some(previous) = previous {
+            previous.task.abort();
+            drop(previous.task.await);
+        }
+        Ok(bound)
+    }
+
+    /// Disable the listener and wait until its accept task has been cancelled.
+    pub async fn stop(&self) {
+        if let Some(previous) = self.state.lock().await.take() {
+            previous.task.abort();
+            drop(previous.task.await);
+        }
+    }
+}
+
+fn spawn_bnc_listener(
+    listener: TcpListener,
+    registry: Arc<crate::bouncer::Registry>,
+    pool: sqlx::PgPool,
+    server_name: String,
+    limiter: ConnLimiter,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    let Some(guard) = limiter.try_acquire(peer.ip()) else {
+                        eprintln!("bnc refused {peer}: per-IP connection limit reached");
+                        continue;
+                    };
+                    let registry = registry.clone();
+                    let server_name = server_name.clone();
+                    let pool = pool.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        if let Err(e) = stream.set_nodelay(true) {
+                            eprintln!("bnc socket setup failed for {peer}: {e}");
+                            return;
+                        }
+                        if let Err(e) =
+                            crate::bouncer::bnc_serve(stream, registry, &pool, &server_name).await
+                        {
+                            eprintln!("bnc connection from {peer} failed: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("bnc accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    })
 }
 
 /// Unix-epoch milliseconds. Message timestamps are stamped from this, and
@@ -161,41 +289,80 @@ pub fn install_crypto_provider() {
 }
 
 /// Bind all listeners, spawn the core worker and acceptor tasks.
-pub async fn start(config: Config) -> io::Result<Running> {
+pub async fn start(mut config: Config) -> io::Result<Running> {
     install_crypto_provider();
+    // Resolve once and reuse for the control-plane import plus BNC secrets.
+    // UI-managed OIDC/operator credentials are always sealed in PostgreSQL.
+    let secret_key = config.secret_key().map_err(io::Error::other)?.map(Arc::new);
+    // Load persisted settings before constructing anything that consumes
+    // them. In particular, a queue's capacity cannot be changed after the
+    // queue exists; loading `core_queue` later would make that console setting
+    // a permanent no-op.
+    let (pool, managed_config) = match config.database.as_ref().map(|db| db.url.clone()) {
+        Some(database_url) => {
+            let pool = crate::db::connect_and_migrate(&database_url)
+                .await
+                .map_err(io::Error::other)?;
+            let imported =
+                crate::config::ManagedConfig::from_config(&config, secret_key.as_deref())
+                    .map_err(io::Error::other)?;
+            let mut snapshot = crate::db::load_or_initialize_managed_config(&pool, &imported)
+                .await
+                .map_err(io::Error::other)?;
+            // A legacy plaintext deployment cannot be copied into PostgreSQL
+            // safely without a key. Once a key is supplied, import the still-
+            // authoritative bootstrap credentials as sealed values in one
+            // revision before applying the database snapshot.
+            if snapshot.settings.credentials_from_bootstrap && !imported.credentials_from_bootstrap
+            {
+                let mut upgraded = snapshot.settings.clone();
+                upgraded.oidc_providers = imported.oidc_providers;
+                upgraded.opers = imported.opers;
+                upgraded.networks = imported.networks;
+                upgraded.credentials_from_bootstrap = false;
+                snapshot = crate::db::save_managed_config(
+                    &pool,
+                    snapshot.revision,
+                    &upgraded,
+                    "bootstrap",
+                    "sealed credential import after master key became available",
+                )
+                .await
+                .map_err(io::Error::other)?;
+            }
+            snapshot.settings.apply_to(&mut config);
+            config
+                .resolve_secrets_with_key(secret_key.as_deref())
+                .map_err(io::Error::other)?;
+            config.validate().map_err(io::Error::other)?;
+            (Some(pool), Some(snapshot))
+        }
+        None => (None, None),
+    };
+
     let (core_tx, core_rx) = queue::<Input>(e6irc_queue::Config {
         name: "core",
         capacity: config.core_queue,
         policy: Policy::Fifo,
     });
-
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,
         policy: Policy::Fifo,
     });
-    // SASL is only advertised when a database exists to answer
-    // verification requests.
-    let mut pool = None;
-    // Kept so graceful shutdown can await the worker and guarantee its buffered
-    // `log_batch` is flushed before the process exits (DESIGN §18).
-    let mut db_worker = None;
-    let sasl_enabled = match &config.database {
-        Some(db_config) => {
-            let p = crate::db::connect_and_migrate(&db_config.url)
-                .await
-                .map_err(io::Error::other)?;
-            db_worker = Some(tokio::spawn(crate::db::run_worker(
-                p.clone(),
-                db_rx,
-                core_tx.clone(),
-            )));
-            pool = Some(p);
-            true
-        }
+    // SASL is only advertised when a database exists to answer verification
+    // requests. Keep the worker handle so graceful shutdown can guarantee its
+    // buffered `log_batch` is flushed before the process exits (DESIGN §18).
+    let sasl_enabled = pool.is_some();
+    let db_worker = match &pool {
+        Some(pool) => Some(tokio::spawn(crate::db::run_worker(
+            pool.clone(),
+            db_rx,
+            core_tx.clone(),
+        ))),
         None => {
             drop(db_rx);
-            false
+            None
         }
     };
 
@@ -204,14 +371,11 @@ pub async fn start(config: Config) -> io::Result<Running> {
 
     let next_conn = Arc::new(AtomicU64::new(1));
 
-    // Master key for sealing/opening BNC upstream secrets, resolved once.
-    let secret_key = config.secret_key().map_err(io::Error::other)?.map(Arc::new);
-
     // The BNC registry is shared between the HTTP management API (which
     // adds/removes networks) and the BNC listener (which attaches to
     // them). Server-level [[network]]s start first, then each account's
     // persisted networks are loaded and started.
-    let bnc_registry = if config.bnc.is_some() {
+    let bnc_registry = if pool.is_some() || !config.networks.is_empty() {
         let reg = Arc::new(
             crate::bouncer::Registry::start(
                 &config.networks,
@@ -255,6 +419,27 @@ pub async fn start(config: Config) -> io::Result<Running> {
     // its sessions through /ws/irc instead of the raw port.
     let limiter = ConnLimiter::new(config.limits.max_connections_per_ip);
 
+    // Database-backed network management and the attach listener are separate
+    // capabilities. The registry exists as soon as persistence does; the
+    // listener can then be enabled or rebound from the console without
+    // reconstructing every always-on upstream.
+    let bnc_listener = match (&pool, &bnc_registry) {
+        (Some(pool), Some(registry)) => Some(Arc::new(BncListenerController::new(
+            registry.clone(),
+            pool.clone(),
+            config.server_name.clone(),
+            limiter.clone(),
+        ))),
+        _ => None,
+    };
+    let mut bnc_addr = None;
+    if let Some(bnc) = &config.bnc {
+        let controller = bnc_listener
+            .as_ref()
+            .expect("config validation guarantees [database] when [bnc] is set");
+        bnc_addr = Some(controller.enable(bnc.addr).await?);
+    }
+
     // One shared HTTP `AppState`, built when either the HTTP server or any
     // dedicated websocket-IRC listener needs it, so both serve against the same
     // core, per-IP limiter and sendq. A websocket listener with no `[http]`
@@ -289,6 +474,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
             network_name: config.network_name.clone(),
             pool: pool.clone(),
             public_url,
+            http_bind: config.http.as_ref().map(|http| http.addr),
             secure_cookies,
             oidc_providers: config.oidc_providers.clone(),
             application_release_revision: config.application_release_revision.clone(),
@@ -297,6 +483,8 @@ pub async fn start(config: Config) -> io::Result<Running> {
             next_conn: next_conn.clone(),
             sendq: config.sendq,
             bnc_registry: bnc_registry.clone(),
+            bnc_listener: bnc_listener.clone(),
+            managed_config: managed_config.clone().map(tokio::sync::RwLock::new),
             secret_key: secret_key.clone(),
             admin_accounts,
             csrf_key: {
@@ -434,62 +622,6 @@ pub async fn start(config: Config) -> io::Result<Running> {
         });
     }
 
-    // BNC listener: clients attach to always-on upstream networks.
-    let mut bnc_addr = None;
-    if let Some(bnc) = &config.bnc {
-        // The BNC authenticates attaching clients against the account
-        // store, so a database is required (enforced by config::validate).
-        let pool = pool
-            .clone()
-            .expect("config validation guarantees [database] when [bnc] is set");
-        let registry = bnc_registry
-            .clone()
-            .expect("registry is built whenever [bnc] is set");
-        let listener = TcpListener::bind(bnc.addr).await?;
-        bnc_addr = Some(listener.local_addr()?);
-        let server_name = config.server_name.clone();
-        // The *same* per-IP cap the IRC listeners and the WS path share (a
-        // clone of the one counter), not a fresh one — otherwise a single IP
-        // could hold `max_connections_per_ip` IRC/WS connections *and* that many
-        // BNC connections at once, doubling the documented limit.
-        let bnc_limiter = limiter.clone();
-        let bnc_task = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        let Some(guard) = bnc_limiter.try_acquire(peer.ip()) else {
-                            // At the per-IP cap: drop it, logging like the IRC
-                            // accept loop rather than dropping silently.
-                            eprintln!("bnc refused {peer}: per-IP connection limit reached");
-                            continue;
-                        };
-                        let registry = registry.clone();
-                        let server_name = server_name.clone();
-                        let pool = pool.clone();
-                        tokio::spawn(async move {
-                            let _guard = guard; // released when the connection ends
-                            if let Err(e) = stream.set_nodelay(true) {
-                                eprintln!("bnc socket setup failed for {peer}: {e}");
-                                return;
-                            }
-                            if let Err(e) =
-                                crate::bouncer::bnc_serve(stream, registry, &pool, &server_name)
-                                    .await
-                            {
-                                eprintln!("bnc connection from {peer} failed: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("bnc accept error: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
-        listeners.push(bnc_task.abort_handle());
-    }
-
     let mut addrs = Vec::new();
     for listener_config in &config.listeners {
         let listener = TcpListener::bind(listener_config.addr).await?;
@@ -533,6 +665,7 @@ pub async fn start(config: Config) -> io::Result<Running> {
             listeners,
             core_tx,
             db_worker,
+            bnc_listener,
         },
     })
 }

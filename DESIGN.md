@@ -899,7 +899,22 @@ counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
 *their own* connected clients: the core scopes the snapshot to the caller's
 account and refuses a self-service kill of a session not authenticated as the
 caller, so it can never touch anyone else's. The console shell (`console_base.html`) is
-also the home of `/console/networks` — a per-user BNC network manager with
+also contains `/console/configuration`, the database-backed operational control
+plane. Its singleton `server_settings` row is a typed JSON document with an
+optimistic-concurrency revision, actor, and timestamp; every committed revision
+also writes a redacted `CONFIG` audit entry in the same transaction. The
+database URL, master-key source, HTTP bind, and initial administrator remain
+bootstrap values because they are prerequisites for reaching the console.
+Identity, MOTD, IRC listeners, public URL/cookie policy, administrator grants,
+OIDC providers, operators, registration policy, resource limits, trusted
+proxies, server-level networks, and the BNC attach address are UI-managed.
+Credential-bearing values are sealed before entering PostgreSQL and are never
+rendered back. Existing
+plaintext bootstrap credentials remain authoritative until a master key is
+supplied; that next start atomically seals and imports them rather than either
+persisting plaintext or replacing them with redacted placeholders.
+
+The console is also the home of `/console/networks` — a per-user BNC network manager with
 live connection status, add/remove/enable-disable, and **edit** of an IRC
 network's connection/identity fields (addr, tls, nick, realname, autojoin; SASL
 credentials change via delete+recreate; a bridge is edited on the Integrations
@@ -1285,16 +1300,26 @@ Layers, bottom to top:
 
 ## 18. Configuration & operations
 
-- Single `e6irc.toml` (server identity, listeners, TLS cert paths, Postgres
-  URL, OIDC providers, limits, features' runtime knobs) + `E6IRC_*` env
-  overrides; unknown keys are a **startup error** (no silently ignored
-  config).
+- A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
+  secrets-key source, HTTP bind, immutable release revision, and initial
+  administrator. Unknown keys are a **startup error**.
+- Operational configuration is a typed, revisioned PostgreSQL snapshot managed
+  at `/console/configuration`. On first start after migration, validated
+  bootstrap values are imported once with provenance. Later starts load the
+  persisted revision before constructing the core or listeners, so the UI is
+  authoritative. Writes use compare-and-swap revisions and a same-transaction
+  redacted audit entry; stale writers fail visibly.
+- The BNC registry exists whenever PostgreSQL does, independently of the raw
+  attach listener. Its listener is runtime-managed: enabling or rebinding first
+  binds the replacement socket, swaps only after success, and retains the
+  working listener on failure. Disabling the attach socket does not stop
+  always-on networks or the web client.
 - Graceful shutdown: stop accepting, notify clients, flush PG write queue,
   checkpoint driver state.
-- Config reload for: MOTD, opers, ban lists, OIDC provider list, limits —
-  triggered by SIGHUP on Unix and by an authenticated admin API endpoint
-  everywhere (the endpoint is the portable path; Windows has no SIGHUP).
-  Listener/DB changes require restart (stated loudly in docs).
+- BNC listener changes apply live. Core identity/limits, IRC listeners, OIDC,
+  operator, and access-policy changes are stored immediately and explicitly
+  reported as restart-required; no response claims those values were applied
+  to the running core.
 - Ships as: prebuilt release binaries for **Linux, macOS, and Windows
   (amd64 + arm64 each)**, a systemd unit example, and a **multi-arch
   docker image** (linux/amd64 and linux/arm64 manifest; scratch/distroless

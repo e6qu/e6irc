@@ -3270,6 +3270,59 @@ async fn audit_log_records_and_lists() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn managed_configuration_rejects_stale_writes_without_auditing_them() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("managed_configuration_rejects_stale_writes_without_auditing_them").await,
+    )
+    .await
+    .expect("connect");
+    let bootstrap =
+        e6ircd::config::ManagedConfig::from_config(&Config::default(), None).expect("bootstrap");
+    let initial = db::load_or_initialize_managed_config(&pool, &bootstrap)
+        .await
+        .expect("initialize");
+    let mut changed = initial.settings.clone();
+    changed.description = "saved revision".into();
+
+    let saved = db::save_managed_config(&pool, initial.revision, &changed, "alice", "first update")
+        .await
+        .expect("save current revision");
+    let stale = db::save_managed_config(
+        &pool,
+        initial.revision,
+        &initial.settings,
+        "bob",
+        "stale update",
+    )
+    .await;
+
+    assert!(
+        matches!(stale, Err(db::DbError::StaleServerSettings)),
+        "{stale:?}"
+    );
+    let loaded = db::load_managed_config(&pool).await.expect("reload");
+    assert_eq!(loaded.revision, saved.revision);
+    assert_eq!(loaded.settings, changed);
+    assert_eq!(loaded.updated_by, "alice");
+    let audit = db::list_audit_log(&pool, 10).await.expect("audit");
+    assert_eq!(
+        audit.len(),
+        1,
+        "the failed compare-and-swap must not leave an audit record"
+    );
+    assert_eq!(
+        (&audit[0].0, &audit[0].1, &audit[0].2, &audit[0].3),
+        (
+            &"alice".to_string(),
+            &"CONFIG".to_string(),
+            &"server".to_string(),
+            &"first update".to_string(),
+        )
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_identity_link_list_and_conflict() {
     use e6ircd::db::LinkOutcome;
     let pool =

@@ -609,8 +609,9 @@ async fn console_networks_page_lists_the_callers_networks() {
     }
 }
 
-/// The console networks page can add and remove a network via htmx, gated by the
-/// same CSRF header the account page uses; both return the refreshed rows.
+/// The console networks page can add and remove a network via htmx even before
+/// the raw attach listener is enabled. Network management depends on the
+/// database-backed registry, not on an unrelated startup listener flag.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn console_add_and_delete_network_via_the_console() {
@@ -641,9 +642,6 @@ async fn console_add_and_delete_network_via_the_console() {
             admin_accounts: vec![],
         }),
         database: Some(DatabaseConfig { url }),
-        bnc: Some(BncConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-        }),
         ..Config::default()
     };
     let http = net::start(config)
@@ -657,6 +655,10 @@ async fn console_add_and_delete_network_via_the_console() {
         "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (_, _, page) = request(http, &page_req).await;
+    assert!(
+        page.contains("Raw IRC attachment is currently off"),
+        "{page}"
+    );
     let csrf = page
         .split("X-CSRF-Token\": \"")
         .nth(1)
@@ -738,6 +740,96 @@ async fn console_add_and_delete_network_via_the_console() {
     let (status, _, frag) = request(http, &del).await;
     assert_eq!(status, 200, "{frag}");
     assert!(!frag.contains("irc.example:6667"), "still present: {frag}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_configuration_enables_and_persists_bnc_listener() {
+    let url = support::test_db("console_configuration_enables_and_persists_bnc_listener").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("account");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.control.example".into(),
+        network_name: "ControlNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url: url.clone() }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    assert!(running.bnc_addr.is_none(), "bootstrap listener is off");
+    let http = running.http_addr.expect("http");
+    let get_page = format!(
+        "GET /console/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page) = request(http, &get_page).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("Configuration"), "{page}");
+    assert!(page.contains("Revision 1"), "{page}");
+    let csrf = page
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("CSRF token");
+
+    let form = format!(
+        "csrf={csrf}&revision=1&server_name=irc.control.example&network_name=ControlNet&\
+         description=e6irc+server&motd=&nicklen=16&sendq=1024&core_queue=65536&\
+         max_hot_channels=8192&bnc_enabled=on&bnc_addr=127.0.0.1%3A0&\
+         listeners=127.0.0.1%3A0+%7C+plain&admin_accounts=alice"
+    );
+    let post = format!(
+        "POST /console/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{form}",
+        form.len()
+    );
+    let (status, _, page) = request(http, &post).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("Configuration saved and applied"), "{page}");
+    let bound = page
+        .split("Accepting clients on <code>")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .expect("bound BNC address");
+    let _: tokio::net::TcpStream = tokio::net::TcpStream::connect(bound)
+        .await
+        .expect("runtime listener accepts");
+
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("reconnect");
+    let snapshot = e6ircd::db::load_managed_config(&pool)
+        .await
+        .expect("settings");
+    assert_eq!(snapshot.revision, 2);
+    assert_eq!(
+        snapshot.settings.bnc_addr,
+        Some("127.0.0.1:0".parse().unwrap())
+    );
+    drop(pool);
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
 }
 
 /// Editing a network from the console: the pre-filled form, a successful field
@@ -2503,7 +2595,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         "alice",
         e6ircd::db::OidcSessionIdentity {
             id_token: Some("the.id.token"),
-            provider: Some("shauth"),
+            provider: Some("corp"),
             issuer: Some("https://auth.example"),
             subject: Some("alice-subject"),
             sid: Some("alice-session"),
@@ -2531,7 +2623,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         }),
         database: Some(DatabaseConfig { url }),
         oidc_providers: vec![OidcProviderConfig {
-            name: "shauth".into(),
+            name: "corp".into(),
             issuer_url: "https://auth.example".into(),
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
