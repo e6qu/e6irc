@@ -535,6 +535,7 @@ pub(super) fn send_isupport(state: &mut ServerState, conn: ConnId) {
             "KNOCK",
             "UTF8ONLY",
             "WHOX",
+            &format!("KEYLEN={KEYLEN}"),
             // Derived from the enforced consts (like MAXLIST/CHANLIMIT below)
             // so the advertisement can never silently drift from enforcement.
             &format!("MONITOR={MONITOR_LIMIT}"),

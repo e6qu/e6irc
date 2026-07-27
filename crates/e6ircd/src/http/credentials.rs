@@ -14,8 +14,8 @@ pub(super) struct AppPasswordRequest {
 /// web session flow is the primary way accounts authenticate.
 pub(super) async fn create_app_password(
     State(state): State<Arc<AppState>>,
-    // Verifies a password, so it's an online brute-force target throttled only by
-    // argon2 cost without a per-IP rate cap.
+    // Verifies a password, so it's an online brute-force target: bounded by both
+    // the per-IP `RateLimited` bucket (this argument) and argon2's cost.
     _rl: RateLimited,
     body: Result<axum::Json<AppPasswordRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {

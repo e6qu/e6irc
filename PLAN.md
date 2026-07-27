@@ -1753,6 +1753,33 @@ the page with an error banner (mirroring the bans/channels/sessions pages),
 naming the missing build feature specifically. `console_integrations` was split
 into a reusable `console_integrations_build`.
 
+Whole-daemon adversarial sweep (2026-07-27): three parallel audits (HTTP/auth,
+bouncer/bridge/DB, core protocol). HTTP/auth and bouncer/bridge/DB came back
+with **no exploitable defect** (auth/CSRF/SSRF/session/IDOR/secret-AAD all
+verified sound). The core audit found and empirically proved one **HIGH**:
+
+- **Unbounded channel key `+k` → core-worker panic / silent desync.** `MODE #c
+  +k <key>` stored the key verbatim (`channel.rs`), unlike every list-mode arg
+  (clipped to `BANMASKLEN`). A ~497-byte key made the `MODE +k` broadcast ~556
+  bytes — unsplittable (one change, no flush point) — which trips the debug wire
+  assertion and **panics the single core worker** (an unprivileged one-connection
+  DoS for every client), or in release silently desyncs (recipients drop the
+  over-long line while the key is applied; a later RPL_CHANNELMODEIS is equally
+  over-long). Fixed by clipping to a new `KEYLEN = 24` (Solanum's) at the store,
+  so the mode echo and the 324 reply fit by construction, and advertising
+  `KEYLEN` in ISUPPORT. Regression test `overlong_channel_key_is_clipped_not_a_
+  wire_overflow` (panics without the fix).
+
+Two LOW boy-scout fixes from the HTTP audit: `client_ip` now joins **all**
+`X-Forwarded-For` headers before scanning right-to-left (a proxy that emits a
+separate header rather than merging could otherwise let a client-supplied header
+win — a spoofable rate-limit/ban key; new `multiple_forwarded_headers_*` test);
+and a stale `create_app_password` comment claiming no per-IP cap (there is one)
+corrected. One design **decision escalated** to the maintainer: BNC network-name
+selection is case-sensitive (only the owner is folded in `NetworkKey`), which can
+silently fall a case-mismatched own-network attach through to a shared network of
+the folded-same name — an asymmetry with DESIGN §2, but tested-as-intentional.
+
 WS-IRC listener + admin server-management (2026-07-27, multi-phase, one PR):
 two maintainer-approved features landed as sequential phases on a single PR.
 

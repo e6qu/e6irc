@@ -760,6 +760,43 @@ fn mode_key_already_set_is_rejected_with_467() {
 }
 
 #[test]
+fn overlong_channel_key_is_clipped_not_a_wire_overflow() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(alice, "JOIN #x");
+    s.drain(alice);
+    // A ~497-byte key: unclipped, the resulting `MODE #x +k <key>` broadcast is
+    // ~556 bytes and cannot be split (one change, no flush point) — the debug
+    // wire-check would panic the shared core worker (a one-connection DoS). The
+    // fix clips at KEYLEN=24, so this must NOT panic and the echo carries the
+    // clipped key.
+    let key = "K".repeat(497);
+    s.line(alice, &format!("MODE #x +k {key}"));
+    let out = s.drain(alice);
+    let mode = out
+        .iter()
+        .find(|l| l.contains("MODE #x") && l.contains("+k"))
+        .expect("expected the +k mode echo");
+    let echoed = mode.trim_end().rsplit(' ').next().unwrap_or("");
+    assert!(echoed.len() <= 24, "key not clipped to KEYLEN: {echoed:?}");
+    for l in &out {
+        assert!(
+            l.trim_end_matches(['\r', '\n']).len() <= 512,
+            "over-length line ({} bytes): {l}",
+            l.trim_end_matches(['\r', '\n']).len()
+        );
+    }
+    // The mode query (RPL_CHANNELMODEIS) also fits, since the stored key is bounded.
+    s.line(alice, "MODE #x");
+    for l in &s.drain(alice) {
+        assert!(
+            l.trim_end_matches(['\r', '\n']).len() <= 512,
+            "324 over-length: {l}"
+        );
+    }
+}
+
+#[test]
 fn banned_external_cannot_speak_to_unmoderated_channel() {
     let mut s = TestServer::new();
     let alice = s.register(1, "alice"); // founder → opped on #x

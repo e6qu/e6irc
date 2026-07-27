@@ -1020,13 +1020,24 @@ pub(super) fn client_ip(
     if !trusted.iter().any(|net| net.contains(&peer)) {
         return peer;
     }
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        for part in xff.rsplit(',') {
-            if let Some(ip) = parse_forwarded_ip(part)
-                && !trusted.iter().any(|net| net.contains(&ip))
-            {
-                return ip;
-            }
+    // Concatenate *every* X-Forwarded-For header in header order before scanning
+    // right-to-left for the first non-trusted entry (the real client the trusted
+    // proxy chain saw). Reading only the first header (`get`) would miss the
+    // trusted proxy's appended entry when a proxy emits a *separate* header
+    // rather than merging, letting a client-supplied earlier header win — a
+    // spoofed key that collapses per-IP rate limits/bans. Whole-string rsplit
+    // over the joined value handles both the merged and multi-header forms.
+    let joined = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    for part in joined.rsplit(',') {
+        if let Some(ip) = parse_forwarded_ip(part)
+            && !trusted.iter().any(|net| net.contains(&ip))
+        {
+            return ip;
         }
     }
     peer
