@@ -7,6 +7,8 @@
 //!   core → per-connection SendQ → writer half → socket
 //!     (SendQ overflow = core dooms the connection)
 
+#![deny(clippy::let_underscore_must_use)]
+
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -99,7 +101,9 @@ impl ShutdownHandle {
         // 2. Tell the core to notify clients (terminal ERROR) and stop. A push
         //    failure can only mean the core queue is already closed, i.e. the
         //    core is already gone — nothing more to ask of it.
-        let _ = self.core_tx.push(Input::Shutdown).await;
+        // Queue closure means the core already stopped, which is the requested
+        // shutdown state.
+        drop(self.core_tx.push(Input::Shutdown).await);
         // Drop our own sender clone so it isn't left keeping the core queue's
         // producer count up. (The core breaks on the Shutdown event regardless;
         // this just keeps the shutdown intent honest.)
@@ -464,10 +468,16 @@ pub async fn start(config: Config) -> io::Result<Running> {
                         let pool = pool.clone();
                         tokio::spawn(async move {
                             let _guard = guard; // released when the connection ends
-                            let _ = stream.set_nodelay(true);
-                            let _ =
+                            if let Err(e) = stream.set_nodelay(true) {
+                                eprintln!("bnc socket setup failed for {peer}: {e}");
+                                return;
+                            }
+                            if let Err(e) =
                                 crate::bouncer::bnc_serve(stream, registry, &pool, &server_name)
-                                    .await;
+                                    .await
+                            {
+                                eprintln!("bnc connection from {peer} failed: {e}");
+                            }
                         });
                     }
                     Err(e) => {
@@ -650,7 +660,10 @@ async fn accept_loop(
         let tls = tls.clone();
         tokio::spawn(async move {
             let _guard = guard; // released when this task ends
-            let _ = stream.set_nodelay(true);
+            if let Err(e) = stream.set_nodelay(true) {
+                eprintln!("socket setup failed for {peer}: {e}");
+                return;
+            }
             match tls {
                 Some(acceptor) => {
                     // Bound the handshake so a stalled TLS peer can't hold this
@@ -724,9 +737,16 @@ async fn serve_conn<S>(
         // reaper collects it ~180s later.
         reason = &mut writer => {
             let reason = reason.unwrap_or("Write task panicked");
-            let _ = core_tx
-                .push(Input::Closed { conn, reason: reason.to_string() })
-                .await;
+            // Queue closure means the core has already removed all connection
+            // state, so there is no remaining observer for this close event.
+            drop(
+                core_tx
+                    .push(Input::Closed {
+                        conn,
+                        reason: reason.to_string(),
+                    })
+                    .await,
+            );
         }
     }
 }
@@ -756,7 +776,8 @@ where
             Err(e) => break format!("Read error: {e}"),
         }
     };
-    let _ = core_tx.push(Input::Closed { conn, reason }).await;
+    // Queue closure means the core has already removed all connection state.
+    drop(core_tx.push(Input::Closed { conn, reason }).await);
 }
 
 /// Drain the sendq to the socket. Returns the reason it stopped, which the
@@ -770,7 +791,7 @@ where
     loop {
         let Some(envelope) = rx.pop().await else {
             // Core dropped the session (sender gone): flush and close.
-            let _ = write_half.shutdown().await;
+            drop(write_half.shutdown().await);
             return "Connection closed";
         };
         // Coalesce everything currently queued into one syscall.
@@ -782,7 +803,9 @@ where
         if write_half.write_all(&batch).await.is_err() {
             return "Write error"; // broken pipe / RST: the session is still live
         }
-        let _ = write_half.flush().await;
+        if write_half.flush().await.is_err() {
+            return "Write error";
+        }
     }
 }
 
@@ -823,6 +846,29 @@ mod tests {
         }
     }
 
+    struct FlushFails;
+
+    impl AsyncWrite for FlushFails {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "flush failed",
+            )))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     /// A small bounded `Input` channel for the `serve_conn` wiring tests.
     fn test_core_channel() -> (Sender<Input>, Receiver<Input>) {
         queue::<Input>(e6irc_queue::Config {
@@ -830,6 +876,20 @@ mod tests {
             capacity: 8,
             policy: Policy::Fifo,
         })
+    }
+
+    #[tokio::test]
+    async fn flush_failure_is_a_connection_write_error() {
+        let (tx, rx) = queue(e6irc_queue::Config {
+            name: "t-sendq",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        tx.push(Output(bytes::Bytes::from_static(b"NOTICE * :hello\r\n")))
+            .await
+            .expect("test output");
+
+        assert_eq!(write_loop(FlushFails, rx).await, "Write error");
     }
 
     #[tokio::test]
@@ -872,7 +932,10 @@ mod tests {
             "a mapped IPv4 peer must be canonicalized to its IPv4 host"
         );
         drop(tx);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), served).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), served)
+            .await
+            .expect("serve_conn must return after its sendq closes")
+            .expect("serve_conn task");
     }
 
     /// Minimal core config for the shutdown wiring test — no PostgreSQL needed.

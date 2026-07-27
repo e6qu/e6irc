@@ -1,5 +1,7 @@
 //! WebSocket endpoints: IRCv3-over-WebSocket and the live web UI socket.
 
+#![deny(clippy::let_underscore_must_use)]
+
 use super::*;
 
 // ---- ws-irc (IRCv3-over-WebSocket, DESIGN §13.4) -------------------------
@@ -175,12 +177,16 @@ pub(super) async fn ws_irc_conn(
             }
         }
     }
-    let _ = core_tx
-        .push(Input::Closed {
-            conn,
-            reason: "WebSocket closed".into(),
-        })
-        .await;
+    // Queue closure means the core is already gone, which has already closed
+    // this connection's authoritative state.
+    drop(
+        core_tx
+            .push(Input::Closed {
+                conn,
+                reason: "WebSocket closed".into(),
+            })
+            .await,
+    );
 }
 
 // ---- live web UI socket (DESIGN §13.2) ----------------------------------
@@ -296,11 +302,15 @@ pub(super) async fn ws_ui_conn(
             // instead of dangling on a stopped network forever.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
-                    let _ = socket
-                        .send(WsMessage::text(line_event(
-                            ":*bnc* NOTICE * :network removed; detaching",
-                        )))
-                        .await;
+                    // This is a terminal courtesy notice; a failed send means
+                    // the peer has already detached.
+                    drop(
+                        socket
+                            .send(WsMessage::text(line_event(
+                                ":*bnc* NOTICE * :network removed; detaching",
+                            )))
+                            .await,
+                    );
                     break;
                 }
             }
@@ -315,17 +325,35 @@ pub(super) async fn ws_ui_conn(
                     }
                 }
                 Ok(DriverEvent::Connected) => {
-                    let _ = socket.send(WsMessage::text(status_event(ConnStatus::Connected))).await;
+                    if socket
+                        .send(WsMessage::text(status_event(ConnStatus::Connected)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Ok(DriverEvent::Disconnected) => {
-                    let _ = socket.send(WsMessage::text(status_event(ConnStatus::Disconnected))).await;
+                    if socket
+                        .send(WsMessage::text(status_event(ConnStatus::Disconnected)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(RecvError::Lagged(n)) => {
                     // Slow client: the broadcast buffer overwrote lines this
                     // socket hadn't read. They're unrecoverable, but surface
                     // the gap rather than let it vanish silently.
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
-                    let _ = socket.send(WsMessage::text(line_event(&notice))).await;
+                    if socket
+                        .send(WsMessage::text(line_event(&notice)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(RecvError::Closed) => break,      // driver gone
             },
@@ -343,9 +371,13 @@ pub(super) async fn ws_ui_conn(
                         crate::bouncer::SendOutcome::Full => {
                             let notice =
                                 ":*bnc* NOTICE * :upstream busy; line not sent, try again";
-                            let _ = socket
+                            if socket
                                 .send(WsMessage::text(line_event(notice)))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         crate::bouncer::SendOutcome::Closed => break, // driver gone
                     }

@@ -91,12 +91,12 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         }
         Ok(Err(_)) | Err(_) => return super::SessionOutcome::Dropped,
     }
-    ends.emit(ConnectionEvent::Connected);
     for chan in &config.autojoin {
         if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
             return super::SessionOutcome::Dropped;
         }
     }
+    ends.emit(ConnectionEvent::Connected);
 
     // Keepalive: `connect_once` bounds connect + registration, but the
     // steady-state read below would otherwise block forever on a half-open
@@ -122,7 +122,9 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                         // driver's job, not the attached client's).
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
-                            let _ = conn.send_line(&format!("PONG :{token}")).await;
+                            if conn.send_line(&format!("PONG :{token}")).await.is_err() {
+                                return super::SessionOutcome::Dropped;
+                            }
                             continue;
                         }
                         // The reply to our *own* keepalive PING is internal

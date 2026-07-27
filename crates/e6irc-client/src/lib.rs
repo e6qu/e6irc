@@ -4,6 +4,8 @@
 //! `e6irc-proto` and drives registration. TLS and SASL layer on top in
 //! later work; this is the plaintext core the clients build against.
 
+#![deny(clippy::let_underscore_must_use)]
+
 use std::io;
 
 use e6irc_proto::framing::{LineBuffer, LineEvent};
@@ -111,7 +113,7 @@ impl Connection {
     /// Connect (plaintext) to `host:port`.
     pub async fn connect(addr: &str) -> io::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true).ok();
+        stream.set_nodelay(true)?;
         let (reader, writer) = stream.into_split();
         Ok(Self::from_halves(Box::new(reader), Box::new(writer)))
     }
@@ -126,7 +128,7 @@ impl Connection {
     ) -> io::Result<Self> {
         install_crypto_provider();
         let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true).ok();
+        stream.set_nodelay(true)?;
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -526,7 +528,9 @@ fn registration_refused(command: &str) -> Option<io::Error> {
 fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Another library in the process may already have installed rustls's
+        // process-wide provider; the builder below uses that provider.
+        drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
     });
 }
 
@@ -622,7 +626,7 @@ mod tests {
             "a SASL-reject numeric must surface as an error"
         );
         drop(conn); // closes the client side so the server task can end
-        let _ = server.await;
+        server.await.expect("mock server task");
     }
 
     #[tokio::test]

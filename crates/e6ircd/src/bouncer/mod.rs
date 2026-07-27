@@ -10,6 +10,8 @@
 //! hands its socket to [`attach`], which replays the detached buffer and
 //! relays live traffic both ways.
 
+#![deny(clippy::let_underscore_must_use)]
+
 #[cfg(feature = "discord")]
 mod discord;
 mod irc_driver;
@@ -967,7 +969,7 @@ impl NetworkHandle {
     /// network is removed or replaced; the driver observes it via `next_command`
     /// / `run_with_backoff` and tears down even while clients are attached.
     pub fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 }
 
@@ -1000,7 +1002,9 @@ impl DriverEnds {
             .lock()
             .expect("buffer poisoned")
             .push(line.clone());
-        let _ = self.events.send(DriverEvent::Line(line));
+        // A detached network legitimately has no live subscribers; the line is
+        // still retained in the buffer above.
+        drop(self.events.send(DriverEvent::Line(line)));
     }
 
     /// Report a connection-state change, updating the sticky connection state
@@ -1020,7 +1024,9 @@ impl DriverEnds {
                 DriverEvent::Disconnected
             }
         };
-        let _ = self.events.send(broadcast);
+        // Connection state is sticky in `connected`; zero live subscribers is
+        // therefore not a delivery failure.
+        drop(self.events.send(broadcast));
     }
 
     /// Await the next downstream command; `None` when every handle is dropped
@@ -1156,10 +1162,10 @@ where
     // seen, so `changed()` below would never fire and the client would linger
     // forever on a dead network. Check the current value once, up front.
     if *shutdown.borrow() {
-        let _ = write
+        write
             .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
-            .await;
-        let _ = write.flush().await;
+            .await?;
+        write.flush().await?;
         return Ok(());
     }
 
@@ -1191,10 +1197,10 @@ where
             // Network removed/replaced: tell the client and detach.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
-                    let _ = write
+                    write
                         .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
-                        .await;
-                    let _ = write.flush().await;
+                        .await?;
+                    write.flush().await?;
                     return Ok(());
                 }
             }

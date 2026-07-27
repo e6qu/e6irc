@@ -252,6 +252,13 @@ These are project-wide rules, enforced in review and (where possible) CI:
     delivered" — a silent drop — is unwritable (the Matrix bridge had exactly
     that against a 403/429/5xx). The same choke-point shape as the inbound
     `BoundedJson` body cap.
+  - Transport-owning modules deny Clippy's `let_underscore_must_use`: a
+    fallible socket write, flush, queue push, or task join cannot be discarded
+    with the project's former `let _ = ...` idiom. Active-session writes are
+    checked and terminate or reconnect on failure; the few terminal/broadcast
+    notifications with no possible observer use an explicit discard. This
+    closes the class where a failed PONG or status notice left a driver/socket
+    running as if delivery had succeeded.
   - `stamp()` returns the `(ts, msgid)` pair from one clock read, so a
     message's server-time tag and its history copy cannot disagree.
   - `Millis` — epoch time is a newtype, not a bare `u64`, so a seconds value
@@ -946,6 +953,12 @@ one implementation shared with the external-network path.
   client's *runtime* channel/nick changes (a JOIN or NICK it issued this
   session) is a planned enhancement, not yet implemented. Upstream SASL PLAIN
   with credentials stored encrypted (§15).
+- Every registration, auto-join, command, heartbeat, and protocol PONG emission
+  is part of the session outcome: a failed upstream transport write drops and
+  reconnects, while a closed in-process core queue stops the `local` driver
+  instead of retrying a permanently gone core. `Connected` is emitted only
+  after registration and configured auto-joins have all reached their
+  transport.
 - Primary interop target: Libera (tested against the §7.7 docker stack).
 
 ### 10.4 Attach addressing

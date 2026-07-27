@@ -4562,6 +4562,21 @@ The adjacent stored driver-kind fallback was removed: migration 0035 constrains
 invalid value rather than silently treating it as `irc`. Unit and PostgreSQL
 regressions pin both enforcement edges.
 
+Transport-failure sweep (2026-07-27): active connection paths no longer discard
+fallible writes. IRC, Discord, and Slack heartbeat/PONG failure now drops the
+upstream session into the shared reconnect policy; the web-UI socket exits when
+status, lag, or congestion notices cannot be sent. The `local` driver stops
+loudly if its core queue closes during auto-join or PONG, never emits
+`Connected` after a failed auto-join, and treats downstream queue closure as
+terminal instead of retrying a core that is gone. Raw IRC/BNC listeners reject
+a socket whose TCP no-delay setup fails, the shared client propagates that
+failure, BNC connection errors are logged, and the socket writer now treats
+flush failure as a write error. Module-level `let_underscore_must_use` denial
+makes discarded must-use transport results a compile failure across the
+bouncer, raw/TLS socket, web-socket, and shared-client funnels. Deterministic
+regressions cover all three local-driver closure stages and an injected flush
+failure.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

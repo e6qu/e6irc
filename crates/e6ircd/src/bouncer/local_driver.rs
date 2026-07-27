@@ -123,14 +123,18 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
         }
     }
     for chan in &session.autojoin {
-        let _ = session
+        if session
             .core
             .core_tx
             .push(Input::Line {
                 conn,
                 line: format!("JOIN {chan}").into_bytes(),
             })
-            .await;
+            .await
+            .is_err()
+        {
+            return Stopped;
+        }
     }
     ends.emit(ConnectionEvent::Connected);
 
@@ -153,14 +157,18 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                     // not conversation, so it is not shown in the buffer.
                     if let Some(token) = line.strip_prefix("PING ") {
                         let token = token.strip_prefix(':').unwrap_or(token);
-                        let _ = session
+                        if session
                             .core
                             .core_tx
                             .push(Input::Line {
                                 conn,
                                 line: format!("PONG :{token}").into_bytes(),
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return Stopped;
+                        }
                         continue;
                     }
                     ends.emit_line(line);
@@ -179,23 +187,163 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                         .await
                         .is_err()
                     {
-                        return Dropped;
+                        return Stopped;
                     }
                 }
                 None => {
                     // Every handle dropped: close our core session and stop for
                     // good (no reconnect — the network was removed).
-                    let _ = session
-                        .core
-                        .core_tx
-                        .push(Input::Closed {
-                            conn,
-                            reason: "local driver stopped".into(),
-                        })
-                        .await;
+                    // Queue closure here already means the core is gone; either
+                    // way the driver's requested terminal state is reached.
+                    drop(
+                        session
+                            .core
+                            .core_tx
+                            .push(Input::Closed {
+                                conn,
+                                reason: "local driver stopped".into(),
+                            })
+                            .await,
+                    );
                     return Stopped;
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use e6irc_queue::Receiver;
+    use tokio::sync::broadcast;
+
+    fn core_queue(capacity: usize) -> (Sender<Input>, Receiver<Input>) {
+        queue(QueueConfig {
+            name: "local-driver-test-core",
+            capacity,
+            policy: Policy::Fifo,
+        })
+    }
+
+    fn spawn_session(
+        core_tx: Sender<Input>,
+        autojoin: Vec<String>,
+    ) -> (
+        NetworkHandle,
+        broadcast::Receiver<super::super::DriverEvent>,
+        tokio::task::JoinHandle<super::super::SessionOutcome>,
+    ) {
+        let session = LocalSession {
+            core: CoreHandles {
+                core_tx,
+                next_conn: Arc::new(AtomicU64::new(1)),
+                sendq: 8,
+            },
+            nick: "alice".into(),
+            realname: "Alice".into(),
+            autojoin,
+        };
+        let (handle, mut ends) = NetworkHandle::channels(8);
+        let events = handle.subscribe();
+        let task = tokio::spawn(async move { session_once(&session, &mut ends).await });
+        (handle, events, task)
+    }
+
+    async fn finish_registration(core_rx: &mut Receiver<Input>) -> Sender<Output> {
+        let open = core_rx.pop().await.expect("Open event").payload;
+        let Input::Open { tx, .. } = open else {
+            panic!("expected Open");
+        };
+        for expected in ["NICK alice", "USER alice 0 * :Alice"] {
+            let input = core_rx.pop().await.expect("registration line").payload;
+            let Input::Line { line, .. } = input else {
+                panic!("expected registration line");
+            };
+            assert_eq!(String::from_utf8(line).unwrap(), expected);
+        }
+        tx
+    }
+
+    async fn stopped(
+        task: tokio::task::JoinHandle<super::super::SessionOutcome>,
+    ) -> super::super::SessionOutcome {
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("local session must stop promptly")
+            .expect("local session task")
+    }
+
+    #[tokio::test]
+    async fn autojoin_failure_stops_before_connected() {
+        // Capacity one lets registration fill the queue with USER and park on
+        // JOIN. Closing the receiver then deterministically fails auto-join.
+        let (core_tx, mut core_rx) = core_queue(1);
+        let (_handle, mut events, task) = spawn_session(core_tx.clone(), vec!["#room".into()]);
+
+        assert!(matches!(
+            core_rx.pop().await.expect("Open").payload,
+            Input::Open { .. }
+        ));
+        assert!(matches!(
+            core_rx.pop().await.expect("NICK").payload,
+            Input::Line { .. }
+        ));
+        while core_tx.depth() == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(core_rx);
+
+        assert!(matches!(
+            stopped(task).await,
+            super::super::SessionOutcome::Stopped
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pong_failure_stops_when_the_core_is_gone() {
+        let (core_tx, mut core_rx) = core_queue(8);
+        let (_handle, mut events, task) = spawn_session(core_tx, Vec::new());
+        let out_tx = finish_registration(&mut core_rx).await;
+        assert!(matches!(
+            events.recv().await,
+            Ok(super::super::DriverEvent::Connected)
+        ));
+        drop(core_rx);
+
+        out_tx
+            .push(Output(Bytes::from_static(b"PING :keepalive\r\n")))
+            .await
+            .expect("local output queue");
+        assert!(matches!(
+            stopped(task).await,
+            super::super::SessionOutcome::Stopped
+        ));
+    }
+
+    #[tokio::test]
+    async fn downstream_failure_does_not_retry_a_closed_core() {
+        let (core_tx, mut core_rx) = core_queue(8);
+        let (handle, mut events, task) = spawn_session(core_tx, Vec::new());
+        let _out_tx = finish_registration(&mut core_rx).await;
+        assert!(matches!(
+            events.recv().await,
+            Ok(super::super::DriverEvent::Connected)
+        ));
+        drop(core_rx);
+
+        assert_eq!(
+            handle.send("PRIVMSG #room :hello"),
+            super::super::SendOutcome::Sent
+        );
+        assert!(matches!(
+            stopped(task).await,
+            super::super::SessionOutcome::Stopped
+        ));
     }
 }
