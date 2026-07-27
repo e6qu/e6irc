@@ -148,19 +148,36 @@ impl Connection {
         }
     }
 
-    /// Send one raw line (CRLF appended).
+    /// Send one line (CRLF appended). This is the sole outbound funnel, so it
+    /// neutralizes any embedded CR/LF/NUL before writing — the client-side
+    /// analogue of the server's `WireLine` sanitization. Callers build commands
+    /// with `format!` from values that may carry untrusted input (a scripted
+    /// `PRIVMSG` body, a `--nick`, a channel name); without this, a value like
+    /// `"hi\r\nJOIN #evil"` would forge a second command in the authenticated
+    /// session. A legitimate single line never contains these bytes, so removing
+    /// them is lossless in practice and makes the injection unrepresentable here.
     pub async fn send_line(&mut self, line: &str) -> io::Result<()> {
-        self.writer.write_all(line.as_bytes()).await?;
+        if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == b'\0') {
+            let cleaned: String = line
+                .chars()
+                .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+                .collect();
+            self.writer.write_all(cleaned.as_bytes()).await?;
+        } else {
+            self.writer.write_all(line.as_bytes()).await?;
+        }
         self.writer.write_all(b"\r\n").await?;
         self.writer.flush().await
     }
 
     /// Read the next server message, blocking until one arrives or the
-    /// connection closes (`None`). An over-long, non-UTF-8, or unparseable
-    /// line is an error: the framing layer already guarantees non-empty,
-    /// NUL-free lines, so anything that still fails to parse means the peer
-    /// is not speaking IRC — skipping it would silently drop protocol
-    /// traffic with no observable trace.
+    /// connection closes (`None`). An over-long, non-UTF-8, or unparseable line
+    /// is an error: the framing layer guarantees non-empty lines, so anything
+    /// that still fails to parse means the peer is not speaking IRC — skipping it
+    /// would silently drop protocol traffic with no observable trace. This strict
+    /// contract is for the handshake and command/response flows; an interactive
+    /// steady-state loop should use [`Connection::next_message_lossy`] so one bad
+    /// line can't end the session.
     pub async fn next_message(&mut self) -> io::Result<Option<OwnedMessage>> {
         Ok(self.next_message_with_line().await?.map(|(msg, _)| msg))
     }
@@ -253,6 +270,26 @@ impl Connection {
                     // drop the whole connection over one over-long line.
                     LineEvent::TooLong => {}
                 }
+            }
+        }
+    }
+
+    /// Steady-state read for an *interactive* client (the TUI, `tail`): tolerant
+    /// of a single bad line, so a hostile or merely-noisy server cannot end the
+    /// session with one. A non-UTF-8 line is lossily decoded (invalid bytes →
+    /// U+FFFD) and parsed — IRC bodies carry arbitrary bytes (Latin-1/Shift-JIS
+    /// are routine), so a high-byte channel message any member can post must not
+    /// disconnect the victim. A line that still won't parse after lossy decoding
+    /// is skipped (kept off the acted-on path) rather than tearing down the link.
+    /// Distinct from [`Connection::next_message`], whose strict error-on-bad-line
+    /// contract the handshake deliberately relies on.
+    pub async fn next_message_lossy(&mut self) -> io::Result<Option<OwnedMessage>> {
+        loop {
+            match self.next_line_relayable().await? {
+                None => return Ok(None),
+                Some((Some(msg), _)) => return Ok(Some(msg)),
+                // Lossy-decoded but unparseable: skip and keep the link alive.
+                Some((None, _)) => continue,
             }
         }
     }
@@ -586,5 +623,60 @@ mod tests {
         );
         drop(conn); // closes the client side so the server task can end
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn send_line_neutralizes_injected_crlf_and_nul() {
+        use tokio::io::AsyncReadExt;
+        // A value carrying embedded CR/LF/NUL — the classic command-injection
+        // payload — must be flattened to a single wire frame, never split into a
+        // second forged command in the authenticated session.
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+
+        conn.send_line("PRIVMSG #c :hi\r\nJOIN #evil\0tail")
+            .await
+            .unwrap();
+        drop(conn); // flush + close so the server read sees EOF
+
+        let (mut sr, _sw) = tokio::io::split(server_io);
+        let mut got = Vec::new();
+        sr.read_to_end(&mut got).await.unwrap();
+        let got = String::from_utf8(got).unwrap();
+
+        // Exactly one CRLF (the appended terminator), and no interior control
+        // bytes survived — the injected JOIN is now inert text on the one line.
+        assert_eq!(got, "PRIVMSG #c :hiJOIN #eviltail\r\n");
+        assert_eq!(got.matches("\r\n").count(), 1);
+        assert!(!got[..got.len() - 2].contains(['\r', '\n', '\0']));
+    }
+
+    #[tokio::test]
+    async fn next_message_lossy_survives_non_utf8_line() {
+        use tokio::io::AsyncWriteExt;
+        // A Latin-1 body (0xE9 = 'é') any channel member can post is not valid
+        // UTF-8. Strict `next_message` errors on it (the handshake wants that);
+        // the interactive steady-state read must lossily decode and keep going.
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+
+        let (_sr, mut sw) = tokio::io::split(server_io);
+        sw.write_all(b":nick PRIVMSG #c :caf\xe9\r\n")
+            .await
+            .unwrap();
+        sw.write_all(b":nick PRIVMSG #c :ok\r\n").await.unwrap();
+
+        // The high-byte line comes back lossily decoded (é -> U+FFFD), not as an
+        // error that would tear down the session.
+        let first = conn.next_message_lossy().await.unwrap().unwrap();
+        assert_eq!(first.command, "PRIVMSG");
+        assert_eq!(first.params.get(1).map(String::as_str), Some("caf\u{fffd}"));
+        let second = conn.next_message_lossy().await.unwrap().unwrap();
+        assert_eq!(second.params.get(1).map(String::as_str), Some("ok"));
+
+        drop(conn);
+        drop(sw);
     }
 }

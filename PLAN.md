@@ -4408,6 +4408,35 @@ exact and deadlock-free; nick/account/membership/monitor indices are all cleaned
 up on close; SASL chunk reassembly, MONITOR lifecycle, and the CHATHISTORY ring
 arithmetic (exhaustive differential test) are sound.
 
+Native-client (CLI/TUI) hardening sweep (2026-07-27): two adversarial passes
+over the least-swept surfaces — the `e6irc-proto` parser (came back **clean**:
+its 250+ conformance/adversarial cases already cover every parse path) and the
+`e6irc-client`/CLI/TUI stack — surfaced three real client-side defects, all
+fixed here on one PR.
+
+1. **Command injection via `send_line`.** The client's sole outbound funnel
+   wrote the caller's line verbatim before appending CRLF. Every command is
+   built with `format!` from values that can carry untrusted input (a scripted
+   `PRIVMSG` body, a `--nick`, a channel name from an argument), so a value like
+   `"hi\r\nJOIN #evil"` forged a second command in the authenticated session —
+   the client-side analogue of the server's `WireLine` hole. `send_line` now
+   filters embedded CR/LF/NUL before writing (lossless for any legitimate single
+   line), making the injection unrepresentable at the choke point. New test
+   `send_line_neutralizes_injected_crlf_and_nul`.
+2. **A non-UTF-8 channel message disconnected interactive clients.** The strict
+   `next_message` errors on a non-UTF-8 line (correct for the handshake), but the
+   TUI net loop and the CLI's steady-state read loops (`send` drain, `tail`,
+   `history`, `raw`, and the QUIT drains) used it too — so a single Latin-1 /
+   Shift-JIS body *any channel member can post* (IRC bodies are arbitrary bytes)
+   ended the victim's session: a trivial remote DoS. Added
+   `Connection::next_message_lossy` (lossily decodes bad bytes to U+FFFD, skips a
+   still-unparseable line, keeps the link) and switched every post-registration
+   read to it, leaving the handshake on strict `next_message`. New test
+   `next_message_lossy_survives_non_utf8_line`.
+3. **Stale doc comment on `next_message`** claimed a "NUL-free" guarantee the
+   framing does not make (it guarantees non-empty, not NUL-free); corrected and
+   cross-referenced to `next_message_lossy` for interactive loops.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

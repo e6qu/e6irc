@@ -171,7 +171,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     // A close before 366 means the message was never sent —
                     // falling through to PRIVMSG would write into a dead
                     // socket and exit 0 on a delivery that never happened.
-                    let Some(msg) = conn.next_message().await? else {
+                    let Some(msg) = conn.next_message_lossy().await? else {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             format!("connection closed before the join to {target} was confirmed"),
@@ -199,7 +199,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // delivery-failure numeric in this window (401 no such nick, 404
             // cannot send to channel, …) means nobody received the message,
             // and the exit code is this tool's product.
-            while let Some(msg) = conn.next_message().await? {
+            while let Some(msg) = conn.next_message_lossy().await? {
                 if is_send_error(&msg.command) {
                     let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                     return Err(std::io::Error::other(format!(
@@ -213,7 +213,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 conn.send_line(&format!("JOIN {target}")).await?;
             }
             let mut seen = 0;
-            while let Some(msg) = conn.next_message().await? {
+            while let Some(msg) = conn.next_message_lossy().await? {
                 if msg.command == "PING" {
                     let token = msg.params.first().cloned().unwrap_or_default();
                     conn.send_line(&format!("PONG :{token}")).await?;
@@ -266,7 +266,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // otherwise this would block forever. Answer PINGs so the server
             // doesn't ping-timeout us while we wait.
             loop {
-                let Some(m) = conn.next_message().await? else {
+                let Some(m) = conn.next_message_lossy().await? else {
                     return Err(std::io::Error::other(
                         "connection closed during CAP negotiation",
                     ));
@@ -294,7 +294,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 // A close before 366 means no history was fetched — falling
                 // through would run CHATHISTORY on a dead socket and exit 0
                 // with empty output.
-                let Some(m) = conn.next_message().await? else {
+                let Some(m) = conn.next_message_lossy().await? else {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         format!("connection closed before the join to {target} was confirmed"),
@@ -317,7 +317,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             conn.send_line(&format!("CHATHISTORY LATEST {target} * {count}"))
                 .await?;
             let mut in_batch = false;
-            while let Some(m) = conn.next_message().await? {
+            while let Some(m) = conn.next_message_lossy().await? {
                 match m.command.as_str() {
                     "PING" => {
                         let token = m.params.first().cloned().unwrap_or_default();
@@ -353,7 +353,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
             }
             conn.send_line("QUIT :done").await?;
-            while conn.next_message().await?.is_some() {}
+            while conn.next_message_lossy().await?.is_some() {}
         }
         Command::Raw => {
             use tokio::io::AsyncBufReadExt;
@@ -371,7 +371,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         };
                         conn.send_line(&line).await?;
                     }
-                    msg = conn.next_message() => {
+                    msg = conn.next_message_lossy() => {
                         let Some(msg) = msg? else {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
@@ -386,7 +386,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
             }
             conn.send_line("QUIT :done").await?;
-            while conn.next_message().await?.is_some() {}
+            while conn.next_message_lossy().await?.is_some() {}
         }
         Command::Api { .. } => unreachable!("handled before the IRC connect"),
     }
