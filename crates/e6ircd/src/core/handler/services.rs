@@ -11,27 +11,16 @@ use super::*;
 pub(super) const SERVICE_NICKS: [&str; 2] = ["nickserv", "chanserv"];
 
 /// Whether `key` (a casefolded nick) is a reserved services pseudo-client.
-/// Unregister a channel: persist the deletion and clear every hot map scoped to
-/// its registration. Returns `false` (making no change) if the persist request
-/// could not be queued. `drop_channel` deletes the whole `channels` row — and
-/// the mlock/keeptopic settings are columns *on that row* — so every hot map
-/// scoped to registration must be cleared, or a later recreation of the channel
-/// reapplies a stale lock / keeptopic the DB no longer holds (a divergence a
-/// restart would silently flip). The DB row's `channel_access` cascades on the
-/// row delete. Shared by ChanServ DROP and the HTTP admin console.
-pub(crate) fn drop_registered_channel(state: &mut ServerState, key: &ChanKey) -> bool {
-    let request = crate::core::DbRequest::DropChannel {
-        channel: key.as_str().to_string(),
-    };
-    if state.db_tx.try_push(request).is_err() {
-        return false;
-    }
+/// Clear every hot map scoped to a registration after PostgreSQL confirms the
+/// row is gone. `channel_access` cascades with the row; the other fields are
+/// columns on it. One cleanup funnel serves ChanServ and the HTTP console.
+pub(crate) fn clear_registered_channel(state: &mut ServerState, key: &ChanKey) {
     state.registered_founders.remove(key);
     state.registered_topics.remove(key);
+    state.pending_channel_topics.remove(key);
     state.channel_access.remove(key);
     state.channel_mlock.remove(key);
     state.keeptopic_off.remove(key);
-    true
 }
 
 pub(super) fn is_service_nick(key: &str) -> bool {
@@ -289,6 +278,14 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 );
                 return;
             }
+            if state.channel_registration_pending(&key) {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Registration of that channel is already in progress.",
+                );
+                return;
+            }
             // Cap the channels one account may register: each adds a permanent,
             // restart-surviving founder-map entry and runs no argon2, so the
             // credential budget can't throttle a REGISTER loop. Re-registering a
@@ -307,10 +304,17 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 return;
             }
             let display = state.channels[&key].name.clone();
+            let topic = state.channels[&key]
+                .topic
+                .as_ref()
+                .map(|t| (t.text.clone(), t.set_by.clone(), t.set_at_secs));
+            let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
             let request = crate::core::DbRequest::RegisterChannel {
                 conn,
                 channel: display,
-                founder_account: account,
+                founder_account: account.clone(),
+                topic,
+                label,
             };
             if state.db_tx.try_push(request).is_err() {
                 state.service_notice(
@@ -318,7 +322,11 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     "ChanServ",
                     "Services are temporarily unavailable. Try again later.",
                 );
+                return;
             }
+            let founder_key = state.account_key(&account);
+            state.pending_channel_registrations.insert(key, founder_key);
+            state.defer_captured_reply(conn);
         }
         "DROP" => {
             // DROP <#channel>: the founder unregisters their channel.
@@ -343,19 +351,16 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 );
                 return;
             }
-            if !drop_registered_channel(state, &key) {
-                state.service_notice(
+            let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
+            let request = crate::core::DbRequest::DropChannel {
+                channel: key.as_str().to_string(),
+                requester: crate::core::ChannelDropRequester::ChanServ {
                     conn,
-                    "ChanServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-                return;
-            }
-            state.service_notice(
-                conn,
-                "ChanServ",
-                &format!("\x02{channel}\x02 has been dropped."),
-            );
+                    display: channel.to_string(),
+                    label,
+                },
+            };
+            queue_service_verdict(state, conn, request);
         }
         "FLAGS" => chanserv_flags(state, conn, args),
         "OP" => chanserv_op(state, conn, args),
@@ -681,86 +686,39 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                     return;
                 }
             };
-            // Persist first, mutate hot state only on success (no divergence).
+            let effective_topic = state
+                .pending_channel_topics
+                .get(&key)
+                .map(|(_, topic)| topic.clone())
+                .unwrap_or_else(|| state.channels.get(&key).and_then(|c| c.topic.clone()));
+            let topic = on
+                .then_some(effective_topic)
+                .flatten()
+                .map(|t| (t.text.clone(), t.set_by.clone(), t.set_at_secs));
+            let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
             let request = crate::core::DbRequest::SetChannelKeeptopic {
-                channel: key.as_str().to_string(),
-                keeptopic: on,
-            };
-            if state.db_tx.try_push(request).is_err() {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-                return;
-            }
-            if on {
-                state.keeptopic_off.remove(&key);
-                // KEEPTOPIC just became effective again; capture the current
-                // live topic so it survives the next empty→recreate cycle. The
-                // TOPIC path persists only on *change* and the earlier OFF
-                // dropped the retained copy, so without this the live topic
-                // would be silently lost. Mirrors the registration-time capture.
-                if let Some(topic) = state.channels.get(&key).and_then(|c| c.topic.clone()) {
-                    state.registered_topics.insert(key.clone(), topic.clone());
-                    let request = crate::core::DbRequest::SetChannelTopic {
-                        channel: key.as_str().to_string(),
-                        topic: Some((topic.text, topic.set_by, topic.set_at_secs)),
-                    };
-                    if state.db_tx.try_push(request).is_err() {
-                        eprintln!(
-                            "chanserv: db queue full; retained topic for {} not persisted",
-                            key.as_str()
-                        );
-                    }
-                }
-            } else {
-                state.keeptopic_off.insert(key.clone());
-                // Drop any retained topic so it can't be restored later.
-                if state.registered_topics.remove(&key).is_some() {
-                    let clear = crate::core::DbRequest::SetChannelTopic {
-                        channel: key.as_str().to_string(),
-                        topic: None,
-                    };
-                    if state.db_tx.try_push(clear).is_err() {
-                        eprintln!(
-                            "chanserv: db queue full; cleared topic for {} not persisted",
-                            key.as_str()
-                        );
-                    }
-                }
-            }
-            state.service_notice(
                 conn,
-                "ChanServ",
-                &format!(
-                    "KEEPTOPIC for \x02{channel}\x02 is now \x02{}\x02.",
-                    if on { "ON" } else { "OFF" }
-                ),
-            );
+                channel: key.as_str().to_string(),
+                display: channel.to_string(),
+                keeptopic: on,
+                topic,
+                label,
+            };
+            queue_service_verdict(state, conn, request);
         }
         "MLOCK" => {
             let spec = args.get(2).copied().unwrap_or("");
             // Clear the lock on empty / OFF / "-".
             if spec.is_empty() || spec.eq_ignore_ascii_case("OFF") || spec == "-" {
+                let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
                 let request = crate::core::DbRequest::SetChannelMlock {
-                    channel: key.as_str().to_string(),
-                    mlock: None,
-                };
-                if state.db_tx.try_push(request).is_err() {
-                    state.service_notice(
-                        conn,
-                        "ChanServ",
-                        "Services are temporarily unavailable. Try again later.",
-                    );
-                    return;
-                }
-                state.channel_mlock.remove(&key);
-                state.service_notice(
                     conn,
-                    "ChanServ",
-                    &format!("MLOCK for \x02{channel}\x02 cleared."),
-                );
+                    channel: key.as_str().to_string(),
+                    display: channel.to_string(),
+                    mlock: None,
+                    label,
+                };
+                queue_service_verdict(state, conn, request);
                 return;
             }
             let parsed = match crate::core::state::MlockModes::parse(spec) {
@@ -779,26 +737,15 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 }
             };
             let canonical = parsed.render();
+            let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
             let request = crate::core::DbRequest::SetChannelMlock {
-                channel: key.as_str().to_string(),
-                mlock: Some(canonical.clone()),
-            };
-            if state.db_tx.try_push(request).is_err() {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-                return;
-            }
-            // Persisted: record it and enforce immediately on the live channel.
-            state.channel_mlock.insert(key.clone(), parsed);
-            apply_mlock(state, &key);
-            state.service_notice(
                 conn,
-                "ChanServ",
-                &format!("MLOCK for \x02{channel}\x02 set to \x02{canonical}\x02."),
-            );
+                channel: key.as_str().to_string(),
+                display: channel.to_string(),
+                mlock: Some(canonical.clone()),
+                label,
+            };
+            queue_service_verdict(state, conn, request);
         }
         "GUARD" => {
             // GUARD keeps ChanServ in the channel so it is never destroyed
@@ -824,6 +771,258 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
                 ),
             );
         }
+    }
+}
+
+fn queue_service_verdict(state: &mut ServerState, conn: ConnId, request: crate::core::DbRequest) {
+    if state.db_tx.try_push(request).is_err() {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            "Services are temporarily unavailable. Try again later.",
+        );
+    } else {
+        state.defer_captured_reply(conn);
+    }
+}
+
+pub(crate) fn channel_drop_result(
+    state: &mut ServerState,
+    channel: String,
+    requester: crate::core::ChannelDropRequester,
+    result: crate::core::ChannelDropResult,
+) {
+    let key = state.chan_key(&channel);
+    if matches!(
+        result,
+        crate::core::ChannelDropResult::Dropped | crate::core::ChannelDropResult::Missing
+    ) {
+        clear_registered_channel(state, &key);
+    }
+    match requester {
+        crate::core::ChannelDropRequester::ChanServ {
+            conn,
+            display,
+            label,
+        } => {
+            if state.sessions.contains_key(&conn) {
+                state.emit_deferred_labeled(conn, label, |state| match result {
+                    crate::core::ChannelDropResult::Dropped => state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!("\x02{display}\x02 has been dropped."),
+                    ),
+                    crate::core::ChannelDropResult::Missing => state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!("\x02{display}\x02 is no longer registered."),
+                    ),
+                    crate::core::ChannelDropResult::Unavailable => state.service_notice(
+                        conn,
+                        "ChanServ",
+                        "Services are temporarily unavailable. Try again later.",
+                    ),
+                });
+            }
+        }
+        crate::core::ChannelDropRequester::Admin {
+            request_id,
+            actor: _,
+        } => {
+            let outcome = match result {
+                crate::core::ChannelDropResult::Dropped => {
+                    crate::core::AdminReply::Ok(format!("Unregistered {}", key.as_str()))
+                }
+                crate::core::ChannelDropResult::Missing => crate::core::AdminReply::Err(format!(
+                    "{} is no longer a registered channel",
+                    key.as_str()
+                )),
+                crate::core::ChannelDropResult::Unavailable => crate::core::AdminReply::Err(
+                    "persistence unavailable; channel not dropped".into(),
+                ),
+            };
+            match state.pending_admin_channel_drops.remove(&request_id) {
+                Some(reply) => {
+                    let _ = reply.send(outcome);
+                }
+                None => {
+                    eprintln!("core: channel-drop verdict for unknown admin request {request_id}");
+                }
+            }
+        }
+    }
+}
+
+pub(super) struct AppliedChannelKeeptopic {
+    pub(super) channel: String,
+    pub(super) display: String,
+    pub(super) keeptopic: bool,
+    pub(super) topic: Option<(String, String, u64)>,
+    pub(super) applied: bool,
+    pub(super) label: Option<String>,
+}
+
+pub(super) fn channel_keeptopic_set(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: AppliedChannelKeeptopic,
+) {
+    let AppliedChannelKeeptopic {
+        channel,
+        display,
+        keeptopic,
+        topic,
+        applied,
+        label,
+    } = result;
+    let key = state.chan_key(&channel);
+    if applied && state.is_registered(&key) {
+        if keeptopic {
+            state.keeptopic_off.remove(&key);
+            match topic {
+                Some((text, set_by, set_at_secs)) => {
+                    state.registered_topics.insert(
+                        key.clone(),
+                        Topic {
+                            text,
+                            set_by,
+                            set_at_secs,
+                        },
+                    );
+                }
+                None => {
+                    state.registered_topics.remove(&key);
+                }
+            }
+        } else {
+            state.keeptopic_off.insert(key.clone());
+            state.registered_topics.remove(&key);
+        }
+    }
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, |state| {
+            if applied && state.is_registered(&key) {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!(
+                        "KEEPTOPIC for \x02{display}\x02 is now \x02{}\x02.",
+                        if keeptopic { "ON" } else { "OFF" }
+                    ),
+                );
+            } else {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!("\x02{display}\x02 is no longer registered."),
+                );
+            }
+        });
+    }
+}
+
+pub(super) fn channel_keeptopic_unavailable(
+    state: &mut ServerState,
+    conn: ConnId,
+    display: String,
+    label: Option<String>,
+) {
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, |state| {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!(
+                    "Could not update KEEPTOPIC for \x02{display}\x02 — services are \
+                     temporarily unavailable."
+                ),
+            );
+        });
+    }
+}
+
+pub(super) fn channel_mlock_set(
+    state: &mut ServerState,
+    conn: ConnId,
+    channel: String,
+    display: String,
+    mlock: Option<String>,
+    applied: bool,
+    label: Option<String>,
+) {
+    let key = state.chan_key(&channel);
+    let parsed = mlock
+        .as_deref()
+        .map(crate::core::state::MlockModes::parse)
+        .transpose();
+    let valid = match parsed {
+        Ok(parsed) => {
+            if applied && state.is_registered(&key) {
+                match parsed {
+                    Some(modes) => {
+                        state.channel_mlock.insert(key.clone(), modes);
+                        apply_mlock(state, &key);
+                    }
+                    None => {
+                        state.channel_mlock.remove(&key);
+                    }
+                }
+            }
+            true
+        }
+        Err(bad) => {
+            eprintln!("core: database echoed invalid canonical MLOCK character {bad:?}");
+            false
+        }
+    };
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, |state| {
+            if !valid {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    "Could not apply MLOCK — services returned an invalid result.",
+                );
+            } else if !applied || !state.is_registered(&key) {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!("\x02{display}\x02 is no longer registered."),
+                );
+            } else if let Some(spec) = mlock {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!("MLOCK for \x02{display}\x02 set to \x02{spec}\x02."),
+                );
+            } else {
+                state.service_notice(
+                    conn,
+                    "ChanServ",
+                    &format!("MLOCK for \x02{display}\x02 cleared."),
+                );
+            }
+        });
+    }
+}
+
+pub(super) fn channel_mlock_unavailable(
+    state: &mut ServerState,
+    conn: ConnId,
+    display: String,
+    label: Option<String>,
+) {
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, |state| {
+            state.service_notice(
+                conn,
+                "ChanServ",
+                &format!(
+                    "Could not update MLOCK for \x02{display}\x02 — services are temporarily \
+                     unavailable."
+                ),
+            );
+        });
     }
 }
 

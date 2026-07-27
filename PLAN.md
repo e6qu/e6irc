@@ -1805,8 +1805,10 @@ channel. These run **through the core** via a new `Input::Admin { req, reply }`
 path of the equivalent oper/services command: a console ban updates the hot
 list, persists, disconnects matching sessions and audit-logs identically to oper
 KLINE (no divergent second implementation — the shared logic was extracted into
-`apply_server_ban` / `remove_server_ban` / `record_audit_by` /
-`drop_registered_channel`, which the oper/ChanServ paths now also call). Actions
+the database-confirmed `queue_server_ban_mutation` /
+`apply_server_ban_hot` / `remove_server_ban_hot` path and the
+`clear_registered_channel` cleanup funnel, which the oper/ChanServ paths also
+call). Actions
 are admin-gated + CSRF-protected (`require_admin_form_actor`); success redirects
 back to `/console` (PRG), failures re-render with an error banner. Covered by a
 PG-gated http test (`admin_console_ban_and_channel_actions`) exercising
@@ -3786,16 +3788,16 @@ concurrency/queue/worker plumbing. Eight confirmed bugs fixed:
 8. **Stale `LineEvent::Line` doc** (proto): claimed "NUL-free" while the framer
    deliberately passes NUL through for `Message::parse` to reject. Comment fixed.
 
-Surfaced, not changed: a *disabled* account network silently falls through to a
-shared network of the same name on attach (resolving it needs a DB lookup in the
-hot attach path; low-value, agent rated acceptable); the ChanServ SET
-MLOCK/KEEPTOPIC and DROP hot-map updates use the same fire-and-forget-on-enqueue
-pattern as the accepted TOPIC path (a rare DB-write failure diverges hot/DB
-until restart — the high-value authoritative-answer cases were converted to the
-reply-confirmed round-trip in sweeps 63/65; converting these three is a coherent
-follow-up, not a rush alongside eight other fixes); and the deferred-reply hold
-can reorder unrelated earlier output behind a later batch (both messages still
-delivered — a minor ordering nit). Clean bills: proto mask/glob, casemapping,
+Follow-up status: all three observations from this sweep have explicit outcomes.
+Raw BNC attach now queries ownership when no owned driver is live, refusing a
+disabled network or database error instead of falling through to a same-named
+shared network. Registered TOPIC/MLOCK/KEEPTOPIC/DROP now use typed
+database-confirmed verdicts (registered-state durability sweep, 2026-07-27).
+The deferred-reply audit established the precise supported invariant: ambiguous
+sync output never overtakes any deferred reply, while self-identifying deferred
+replies may complete out of issue order and labeled clients correlate them by
+label (see “Deferred-reply ordering invariant corrected” above). Clean bills:
+proto mask/glob, casemapping,
 tag escape symmetry, isupport, framing length/chunk logic, truncation
 boundaries; the queue's waker protocol and no-lost-wakeup under the flagged
 schedules; ConnId monotonicity; deferred-reply accounting (no double-release);
@@ -4526,6 +4528,26 @@ Pipelined same-target commands also remain monotonic on the wire: a query whose
 reply would sit behind an in-flight update fails explicitly instead of
 precomputing a stale value, and a no-op set in that position takes the database
 path so its acknowledgement uses the committed `GREATEST` result.
+
+Registered-state durability sweep (2026-07-27): every mutation of registered
+channel metadata now waits for a typed PostgreSQL verdict. REGISTER inserts the
+channel and its live initial topic atomically; pending registrations reserve the
+channel name and count toward the founder cap. Registered TOPIC changes,
+KEEPTOPIC (flag plus retained-topic capture/clear), MLOCK, and ChanServ/admin
+DROP update hot state and acknowledge only after commit. A revisioned pending
+TOPIC overlay makes pipelined TOPIC/KEEPTOPIC ordering use the latest requested
+topic rather than stale committed live state. Queue/store failures are loud,
+preserve the prior hot state, and retain labeled-response correlation; committed
+global changes still apply after the requester disconnects. The adjacent
+K/D/X-line class received the same treatment: add/remove and their audit row are
+one transaction, duplicate in-flight changes to the same `(kind, folded mask)`
+are refused explicitly, and hot enforcement, disconnects, snotices, IRC
+confirmation, and HTTP admin completion all wait for the stored verdict.
+Core regressions cover atomic initial-topic registration, founder-cap
+reservations, cross-command ordering, transient failures, labels, hot-state
+non-mutation, ChanServ/admin DROP, self-matching bans, and case-preserving ban
+removal; PostgreSQL tests cover the atomic option/topic row behavior and initial
+topic INSERT.
 
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI

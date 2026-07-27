@@ -759,33 +759,159 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             set_at_secs: now.as_secs(),
         })
     };
-    state.channels.get_mut(&key).expect("checked").topic = new_topic.clone();
-    let line = format!(":{prefix} TOPIC {display} :{new_text}");
-    state.broadcast_channel(&key, &line, None);
 
-    // A registered channel retains its topic across an empty→recreate
-    // cycle: keep the hot copy in sync and persist it — unless its
-    // ChanServ KEEPTOPIC option is OFF, in which case the topic lives only
-    // as long as the channel does.
-    if state.is_registered(&key) && state.keeptopic(&key) {
+    // An unregistered channel has no durable metadata boundary: apply its live
+    // topic immediately. A registered channel (including a registration whose
+    // INSERT is ahead of us in the serial DB queue) waits for a typed verdict,
+    // so a queue/store failure cannot look like a retained topic change that
+    // only disappears after restart. The DB reports KEEPTOPIC's committed value;
+    // this also orders a pipelined SET KEEPTOPIC and TOPIC correctly.
+    if !state.is_registered(&key) && !state.channel_registration_pending(&key) {
+        state.channels.get_mut(&key).expect("checked").topic = new_topic;
+        let line = format!(":{prefix} TOPIC {display} :{new_text}");
+        state.broadcast_channel(&key, &line, None);
+        return;
+    }
+
+    let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
+    let Some(revision) = state.channel_topic_revision.checked_add(1) else {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &format!(
+                ":{server} FAIL TOPIC TEMPORARILY_UNAVAILABLE {display} \
+                 :Topic revision space exhausted"
+            ),
+        );
+        return;
+    };
+    state.channel_topic_revision = revision;
+    let topic = new_topic
+        .as_ref()
+        .map(|t| (t.text.clone(), t.set_by.clone(), t.set_at_secs));
+    let request = crate::core::DbRequest::SetChannelTopic {
+        conn,
+        channel: key.as_str().to_string(),
+        display: display.clone(),
+        prefix,
+        topic,
+        revision,
+        label,
+    };
+    if state.db_tx.try_push(request).is_err() {
+        let server = state.config.server_name.clone();
+        state.send(
+            conn,
+            &format!(
+                ":{server} FAIL TOPIC TEMPORARILY_UNAVAILABLE {display} \
+                 :Topic could not be persisted"
+            ),
+        );
+        return;
+    }
+    state
+        .pending_channel_topics
+        .insert(key, (revision, new_topic));
+    state.defer_captured_reply(conn);
+}
+
+pub(super) struct AppliedChannelTopic {
+    pub(super) channel: String,
+    pub(super) display: String,
+    pub(super) prefix: String,
+    pub(super) topic: Option<(String, String, u64)>,
+    pub(super) revision: u64,
+    pub(super) retained: bool,
+    pub(super) label: Option<String>,
+}
+
+pub(super) fn channel_topic_set(
+    state: &mut ServerState,
+    conn: ConnId,
+    applied: AppliedChannelTopic,
+) {
+    let AppliedChannelTopic {
+        channel,
+        display,
+        prefix,
+        topic,
+        revision,
+        retained,
+        label,
+    } = applied;
+    let key = state.chan_key(&channel);
+    if state
+        .pending_channel_topics
+        .get(&key)
+        .is_some_and(|(pending_revision, _)| *pending_revision == revision)
+    {
+        state.pending_channel_topics.remove(&key);
+    }
+    let new_topic = topic.map(|(text, set_by, set_at_secs)| Topic {
+        text,
+        set_by,
+        set_at_secs,
+    });
+    if retained && state.is_registered(&key) {
         match &new_topic {
-            Some(t) => {
-                state.registered_topics.insert(key.clone(), t.clone());
+            Some(topic) => {
+                state.registered_topics.insert(key.clone(), topic.clone());
             }
             None => {
                 state.registered_topics.remove(&key);
             }
         }
-        let request = crate::core::DbRequest::SetChannelTopic {
-            channel: key.as_str().to_string(),
-            topic: new_topic.map(|t| (t.text, t.set_by, t.set_at_secs)),
+    } else {
+        state.registered_topics.remove(&key);
+    }
+
+    let text = new_topic.as_ref().map_or("", |topic| topic.text.as_str());
+    let line = format!(":{prefix} TOPIC {display} :{text}");
+    if let Some(channel_state) = state.channels.get_mut(&key) {
+        channel_state.topic = new_topic;
+        state.broadcast_channel(&key, &line, Some(conn));
+    }
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, |state| {
+            state.send_timed(conn, &line);
+        });
+    }
+}
+
+pub(super) fn channel_topic_failed(
+    state: &mut ServerState,
+    conn: ConnId,
+    channel: String,
+    display: String,
+    revision: u64,
+    label: Option<String>,
+    failure: crate::core::ChannelTopicFailure,
+) {
+    let key = state.chan_key(&channel);
+    if state
+        .pending_channel_topics
+        .get(&key)
+        .is_some_and(|(pending_revision, _)| *pending_revision == revision)
+    {
+        state.pending_channel_topics.remove(&key);
+    }
+    if state.sessions.contains_key(&conn) {
+        let server = state.config.server_name.clone();
+        let (code, message) = match failure {
+            crate::core::ChannelTopicFailure::MissingRegistration => (
+                "REGISTRATION_CHANGED",
+                "Channel is no longer registered; topic was not changed",
+            ),
+            crate::core::ChannelTopicFailure::PersistenceUnavailable => {
+                ("TEMPORARILY_UNAVAILABLE", "Topic could not be persisted")
+            }
         };
-        if state.db_tx.try_push(request).is_err() {
-            eprintln!(
-                "topic: db queue full or closed; retained topic for {} not persisted",
-                key.as_str()
+        state.emit_deferred_labeled(conn, label, |state| {
+            state.send(
+                conn,
+                &format!(":{server} FAIL TOPIC {code} {display} :{message}"),
             );
-        }
+        });
     }
 }
 

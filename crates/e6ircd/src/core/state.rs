@@ -869,10 +869,21 @@ pub(crate) struct ServerState {
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
     pub registered_founders: HashMap<ChanKey, AccountKey>,
+    /// Channel registrations waiting for a database verdict, keyed by channel
+    /// and carrying the founder reservation. A pending name cannot be queued
+    /// twice, and pending reservations count toward the per-account cap.
+    pub pending_channel_registrations: HashMap<ChanKey, AccountKey>,
     /// Registered channels → retained topic. Boot-loaded and kept in sync
     /// on TOPIC; restored when a registered channel is recreated so its
     /// topic survives the channel going empty.
     pub registered_topics: HashMap<ChanKey, Topic>,
+    /// Latest requested TOPIC per registered channel while its database
+    /// verdict is pending. The revision prevents an older reply from clearing
+    /// a newer request. SET KEEPTOPIC reads this overlay instead of a stale
+    /// committed live topic when the two commands are pipelined.
+    pub pending_channel_topics: HashMap<ChanKey, (u64, Option<Topic>)>,
+    /// Monotonic revision source for `pending_channel_topics`.
+    pub channel_topic_revision: u64,
     /// Registered channels whose ChanServ KEEPTOPIC option is OFF. Topic
     /// retention is on by default (absence ⇒ on), so only the exceptions
     /// live here; boot-loaded and updated on `SET KEEPTOPIC`.
@@ -887,6 +898,10 @@ pub(crate) struct ServerState {
     /// Server bans (oper K/D/X-lines) refused at registration. Boot-loaded
     /// and kept in sync on KLINE/DLINE/XLINE and their removals.
     pub server_bans: Vec<ServerBan>,
+    /// `(kind, folded mask)` server-ban mutations awaiting a database verdict.
+    /// A second mutation of the same durable row is refused explicitly instead
+    /// of making authorization/existence decisions against stale hot state.
+    pub pending_server_bans: HashSet<(String, String)>,
     /// Recent nick departures/changes for WHOWAS, newest-first.
     pub whowas: std::collections::VecDeque<WhowasEntry>,
     /// Hot history rings, keyed by channel or direct-message conversation.
@@ -907,6 +922,16 @@ pub(crate) struct ServerState {
     /// abuse from one address; hard-capped at `MAX_REGISTRATION_BUCKETS` so
     /// a distinct-IP flood can't grow it without bound.
     pub registration_buckets: HashMap<String, (f64, e6irc_proto::time::MonoMillis)>,
+    /// HTTP admin requests waiting for a registered-channel delete verdict.
+    /// The DB queue carries only the numeric ID, keeping `DbRequest` clonable
+    /// and comparable while the one-shot responder remains core-owned.
+    pub pending_admin_channel_drops: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
+    /// Monotonic request ID source for `pending_admin_channel_drops`.
+    pub admin_channel_drop_id: u64,
+    /// HTTP admin server-ban mutations awaiting their database verdict.
+    pub pending_admin_server_bans: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
+    /// Monotonic request ID source for `pending_admin_server_bans`.
+    pub admin_server_ban_id: u64,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -966,17 +991,25 @@ impl ServerState {
             read_markers: HashMap::new(),
             pending_read_markers: HashMap::new(),
             registered_founders: HashMap::new(),
+            pending_channel_registrations: HashMap::new(),
             registered_topics: HashMap::new(),
+            pending_channel_topics: HashMap::new(),
+            channel_topic_revision: 0,
             keeptopic_off: HashSet::new(),
             channel_mlock: HashMap::new(),
             channel_access: HashMap::new(),
             server_bans: Vec::new(),
+            pending_server_bans: HashSet::new(),
             whowas: std::collections::VecDeque::new(),
             history: HashMap::new(),
             hot_history: std::collections::VecDeque::new(),
             emitting_deferred: None,
             capture: None,
             registration_buckets: HashMap::new(),
+            pending_admin_channel_drops: HashMap::new(),
+            admin_channel_drop_id: 0,
+            pending_admin_server_bans: HashMap::new(),
+            admin_server_ban_id: 0,
         }
     }
 
@@ -1200,14 +1233,29 @@ impl ServerState {
         self.registered_founders.contains_key(key)
     }
 
-    /// How many channels `account` currently founds — the cap check for
-    /// ChanServ REGISTER, which otherwise grows the founder map without bound.
+    /// How many channels `account` currently founds or has reserved by an
+    /// in-flight registration. Counting both prevents a pipelined REGISTER
+    /// burst from stepping around the permanent-map cap before verdicts land.
     pub fn channels_founded_by(&self, account: &str) -> usize {
         let account_key = self.account_key(account);
-        self.registered_founders
+        let committed = self
+            .registered_founders
             .values()
             .filter(|f| **f == account_key)
-            .count()
+            .count();
+        let pending = self
+            .pending_channel_registrations
+            .iter()
+            .filter(|(channel, founder)| {
+                **founder == account_key && !self.registered_founders.contains_key(*channel)
+            })
+            .count();
+        committed + pending
+    }
+
+    /// Whether registration of this channel is waiting for PostgreSQL.
+    pub fn channel_registration_pending(&self, key: &ChanKey) -> bool {
+        self.pending_channel_registrations.contains_key(key)
     }
 
     /// Load persisted channel topics as `(name_folded, text, setter,
@@ -1231,11 +1279,6 @@ impl ServerState {
     /// Load the registered channels whose KEEPTOPIC is OFF (by folded name).
     pub fn preload_keeptopic_off(&mut self, names: Vec<String>) {
         self.keeptopic_off = names.into_iter().map(ChanKey).collect();
-    }
-
-    /// Whether `key` retains its topic across empty→recreate (default on).
-    pub fn keeptopic(&self, key: &ChanKey) -> bool {
-        !self.keeptopic_off.contains(key)
     }
 
     /// Load persisted mode locks as `(name_folded, spec)`. A row whose spec
@@ -1587,6 +1630,17 @@ impl ServerState {
     pub fn defer_reply(&mut self, conn: ConnId) {
         if let Some(session) = self.sessions.get_mut(&conn) {
             session.deferred_replies += 1;
+        }
+    }
+
+    /// Hold later output behind an asynchronous verdict and tell the active
+    /// labeled-response capture that its reply will be emitted by that verdict.
+    pub fn defer_captured_reply(&mut self, conn: ConnId) {
+        self.defer_reply(conn);
+        if let Some(capture) = self.capture.as_mut()
+            && capture.label.is_some()
+        {
+            capture.deferred = true;
         }
     }
 
