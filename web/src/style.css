@@ -9,8 +9,11 @@
   --ok: #1a8f4c;
   --off: #b23b3b;
 }
+/* Dark palette: applied by the OS preference under "auto", or forced by the
+   theme toggle via :root[data-theme="dark"]. The forced selectors are more
+   specific than the bare :root, so a manual choice always wins over the OS. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --border: #262b33;
     --muted: #9aa3b1;
     --bg: #0f1115;
@@ -19,6 +22,15 @@
     --ok: #3fbf72;
     --off: #e06666;
   }
+}
+:root[data-theme="dark"] {
+  --border: #262b33;
+  --muted: #9aa3b1;
+  --bg: #0f1115;
+  --fg: #e6e8ec;
+  --panel: #14171d;
+  --ok: #3fbf72;
+  --off: #e06666;
 }
 
 * { box-sizing: border-box; }
@@ -43,6 +55,11 @@ body {
 #user-nav a { color: var(--accent); text-decoration: none; }
 .user-role { color: var(--muted); font-size: 0.8rem; margin-left: 0.3rem; }
 .status { font-size: 0.8rem; padding: 0.1rem 0.5rem; border-radius: 0.6rem; border: 1px solid var(--border); color: var(--muted); }
+#settings { display: flex; gap: 0.4rem; align-items: center; }
+#settings select, #settings button {
+  font: inherit; font-size: 0.8rem; padding: 0.15rem 0.4rem; border-radius: 0.4rem;
+  border: 1px solid var(--border); background: transparent; color: inherit; cursor: pointer;
+}
 .status-ok { color: var(--ok); border-color: var(--ok); }
 .status-error { color: var(--off); border-color: var(--off); }
 
@@ -111,6 +128,13 @@ body {
 .line-notice .text, .line-notice .from { color: var(--muted); }
 .line-event { color: var(--muted); font-size: 0.85rem; font-style: italic; }
 .line-server { color: var(--muted); }
+/* A message that mentions our nick: tinted with an accent rule down the side. */
+.line-mention {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-left: 2px solid var(--accent);
+  padding-left: 0.4rem;
+  margin-left: -0.4rem;
+}
 
 #composer {
   flex: 0 0 auto;
