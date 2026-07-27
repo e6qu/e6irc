@@ -113,6 +113,17 @@ These are project-wide rules, enforced in review and (where possible) CI:
     operator's original casing. The one place map keys couldn't reach — a folded
     comparison over a `Vec` — is now closed the same way, and the by-hand
     `mask::eq` it replaced is gone.
+  - `BncBufferKey` — every database operation on a persisted bouncer buffer
+    constructs the same casefolded `(owner, network)` composite key used by the
+    live registry. A URL/delete spelling such as `Libera` therefore cannot
+    resolve the case-insensitive network row but miss (or orphan) backlog stored
+    under `libera`. The storage API accepts display spellings only at this one
+    constructor boundary; callers cannot issue an un-folded buffer query.
+  - Stored BNC driver kinds are a closed set at both edges: PostgreSQL constrains
+    `bnc_networks.kind` to the compiled model's `irc`/bridge variants, and row
+    decoding returns `InvalidNetworkKind` instead of defaulting an unknown value
+    to `irc`. Corrupt or future-schema data fails startup/read loudly rather than
+    reinterpreting bridge configuration and credentials as an IRC upstream.
   - `WireLine` — the injection class (an embedded CR/LF/NUL in a line's content,
     which would split it into a second forged line on the wire) is
     unrepresentable *at the delivery funnel*, in every build: `deliver` takes

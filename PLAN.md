@@ -4549,6 +4549,19 @@ non-mutation, ChanServ/admin DROP, self-matching bans, and case-preserving ban
 removal; PostgreSQL tests cover the atomic option/topic row behavior and initial
 topic INSERT.
 
+BNC storage-key sweep (2026-07-27): the case-insensitive network-name invariant
+now covers persisted backlog as well as network rows and the live registry.
+Every `bnc_buffer` append, trim, read, and delete cleanup constructs one
+casefolded `(owner, network)` key at the database API boundary. Previously a
+case-variant buffer URL resolved the owned network but returned an empty
+backlog, and deleting through such a spelling removed the network row while
+orphaning its folded backlog for a later same-named network to replay.
+PostgreSQL and HTTP regressions exercise cross-cased writes, reads, and deletion.
+The adjacent stored driver-kind fallback was removed: migration 0035 constrains
+`bnc_networks.kind` to the closed supported set, while row decoding reports an
+invalid value rather than silently treating it as `irc`. Unit and PostgreSQL
+regressions pin both enforcement edges.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

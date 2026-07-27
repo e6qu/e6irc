@@ -2091,6 +2091,17 @@ async fn bnc_network_name_selection_is_case_insensitive() {
             .unwrap_or_else(|| panic!("`{typed}` should resolve to the owned network"));
         assert_eq!(got.name, "libera", "display casing is preserved");
     }
+    // Buffer APIs share that same composite-key fold. A producer using display
+    // casing and a reader using a different selector spelling must still meet.
+    db::persist_bnc_line(&pool, "ALICE", "LiBeRa", ":s NOTICE * :backlog")
+        .await
+        .expect("persist case variant");
+    assert_eq!(
+        db::recent_bnc_lines(&pool, "alice", "LIBERA", 10)
+            .await
+            .expect("read case variant"),
+        vec![":s NOTICE * :backlog"]
+    );
     assert!(
         db::set_bnc_network_enabled(&pool, "alice", "LIBERA", false)
             .await
@@ -2107,6 +2118,27 @@ async fn bnc_network_name_selection_is_case_insensitive() {
         db::list_bnc_networks(&pool, "alice").await.unwrap().len(),
         0,
         "the network is gone after a case-insensitive delete"
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM bnc_buffer")
+        .fetch_one(&pool)
+        .await
+        .expect("buffer count");
+    assert_eq!(
+        remaining, 0,
+        "a case-variant delete must purge the canonical buffer rows"
+    );
+
+    let invalid_kind = sqlx::query(
+        "INSERT INTO bnc_networks
+           (account_id, name, addr, tls, nick, autojoin, kind)
+         SELECT id, 'bad-kind', 'example.test:6697', true, 'alice_', ARRAY[]::text[], 'smtp'
+         FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        invalid_kind.is_err(),
+        "the database must reject values outside the closed driver-kind set"
     );
 }
 
