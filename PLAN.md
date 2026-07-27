@@ -1638,6 +1638,23 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+Web-UI sweep 5 — client UX polish + audit-fix (2026-07-27): an adversarial
+audit over the large new console/session/network-edit surface came back with
+**no security defect** (KillOwn ownership scoping, create↔edit validation
+equivalence incl. SSRF-on-edit, CSRF on every mutation, no IDOR/injection/
+panic — all verified). It surfaced one **LOW correctness bug this sweep-series
+introduced**: the IRC-only network edit form was reachable for *bridge*
+networks (they showed an Edit link in the BNC list), so editing a Matrix/
+Discord/Slack bridge through it would overwrite its fields or reconfigure the
+homeserver. Fixed: `update_network_core` and the edit GET refuse a non-IRC kind
+(GET redirects, POST re-renders without applying), and the Edit link is hidden
+for non-IRC rows (`ConsoleNetView.editable`); covered by extending the edit
+test to prove a bridge's `addr` can't be clobbered. Client (`web/`): message
+**URLs are linkified** (DOM-only, http/https hrefs only — no markup/`javascript:`
+injection) and the composer gains **Up/Down input history** like a shell.
+Verified locally (Docker up): full http PG suite 21/21; oidc-browser 3/3;
+clippy ×5; all gates.
+
 Web-UI sweep 4 — per-user session management (2026-07-27): closes the "manage
 your own client connections" gap from the original vision. A new non-admin
 `/console/my-sessions` lists the caller's own SASL-authenticated clients (raw

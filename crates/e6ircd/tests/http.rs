@@ -756,6 +756,19 @@ async fn console_edit_network_updates_fields() {
     let session = e6ircd::db::create_web_session(&pool, "alice")
         .await
         .expect("session");
+    // A bridge network (kind=matrix), inserted directly (creating one needs the
+    // feature build). enabled=false so boot doesn't try to build its driver.
+    sqlx::query(
+        "INSERT INTO bnc_networks
+           (account_id, name, addr, tls, nick, realname, autojoin,
+            sasl_account, sasl_password_sealed, kind, enabled)
+         SELECT id, 'mtx', 'matrix.example', false, 'bot', NULL,
+                ARRAY[]::text[], NULL, 'enc:v1:x', 'matrix', false
+         FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("bridge row");
     drop(pool);
 
     let config = Config {
@@ -864,6 +877,32 @@ async fn console_edit_network_updates_fields() {
     );
     let (status, _, _) = request(http, &wrong_post).await;
     assert_eq!(status, 403);
+
+    // A bridge network is not editable via the IRC edit form: the GET redirects
+    // away, and a direct POST does not clobber the bridge's stored fields.
+    let bridge_get = format!(
+        "GET /console/networks/mtx/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, _) = request(http, &bridge_get).await;
+    assert_eq!(status, 303, "{head}"); // redirected away, no IRC form for a bridge
+    let bridge_edit = "csrf=CSRF&addr=irc.x.example:6667&nick=z".replace("CSRF", &csrf);
+    let bridge_post = format!(
+        "POST /console/networks/mtx/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bridge_edit}",
+        bridge_edit.len()
+    );
+    let _ = request(http, &bridge_post).await; // refused (re-render); must not apply
+    // The bridge's address is unchanged — the attempted overwrite was rejected.
+    let (_, _, page3) = request(http, &page_req).await;
+    assert!(
+        page3.contains("matrix.example"),
+        "bridge addr lost: {page3}"
+    );
+    assert!(
+        !page3.contains("irc.x.example"),
+        "bridge addr was clobbered: {page3}"
+    );
 }
 
 // ---- admin API (PG-gated) -----------------------------------------------

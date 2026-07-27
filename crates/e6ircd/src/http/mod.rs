@@ -823,6 +823,9 @@ mod pages {
         autojoin: String,
         enabled: bool,
         connected: bool,
+        /// Only IRC upstreams are editable via the IRC edit form; a bridge is
+        /// configured on the Integrations page, so it shows no Edit link.
+        editable: bool,
     }
 
     struct SessionRow {
@@ -955,6 +958,7 @@ mod pages {
                     .and_then(|r| r.get_owned(account, &n.name))
                     .map(|h| h.is_connected())
                     .unwrap_or(false);
+                let editable = n.kind == crate::config::NetworkKind::Irc;
                 ConsoleNetView {
                     name: n.name,
                     addr: n.addr,
@@ -963,6 +967,7 @@ mod pages {
                     autojoin: n.autojoin.join(", "),
                     enabled: n.enabled,
                     connected,
+                    editable,
                 }
             })
             .collect())
@@ -1177,6 +1182,12 @@ mod pages {
             Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
             Err(e) => return super::device::admin_db_error("network fetch", e),
         };
+        // This form edits IRC upstream fields; a bridge is configured on the
+        // Integrations page. Send a bridge there rather than render an
+        // IRC-shaped form over it.
+        if row.kind != crate::config::NetworkKind::Irc {
+            return Redirect::to("/console/networks").into_response();
+        }
         console_network_edit_page(
             &state,
             account,

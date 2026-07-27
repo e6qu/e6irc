@@ -125,6 +125,7 @@ body {
 .ts { flex: 0 0 auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.78rem; }
 .from { flex: 0 0 auto; font-weight: 600; }
 .text { flex: 1 1 auto; white-space: pre-wrap; }
+.msg-link { color: var(--accent); text-decoration: underline; word-break: break-all; }
 .line-notice .text, .line-notice .from { color: var(--muted); }
 .line-event { color: var(--muted); font-size: 0.85rem; font-style: italic; }
 .line-server { color: var(--muted); }
