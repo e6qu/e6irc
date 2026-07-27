@@ -861,6 +861,10 @@ pub(crate) struct ServerState {
     /// Read markers: (account, target) → epoch millis. Mirrors the
     /// PostgreSQL table; this is the hot copy the core serves.
     pub read_markers: HashMap<(AccountKey, ChanKey), e6irc_proto::time::Millis>,
+    /// Number of database writes in flight for each account/target. A target
+    /// is reserved here before its first durable write completes, so pipelined
+    /// MARKREAD commands cannot evade the per-account distinct-target cap.
+    pub pending_read_markers: HashMap<(AccountKey, ChanKey), usize>,
     /// Registered channels → founder account (both casefolded). The hot
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
@@ -960,6 +964,7 @@ impl ServerState {
             msgid_counter: 0,
             monitors: HashMap::new(),
             read_markers: HashMap::new(),
+            pending_read_markers: HashMap::new(),
             registered_founders: HashMap::new(),
             registered_topics: HashMap::new(),
             keeptopic_off: HashSet::new(),

@@ -219,12 +219,19 @@ pub enum DbRequest {
         /// the originating command was labeled.
         label: Option<String>,
     },
-    /// Persist a read marker (fire-and-forget).
+    /// Persist a read marker. Answered with [`DbReply::ReadMarkerStored`] or
+    /// [`DbReply::ReadMarkerUnavailable`]; the core updates its hot mirror and
+    /// acknowledges the command only after that verdict.
     SetReadMarker {
+        conn: ConnId,
         account: String,
         /// Casefolded target.
         target: String,
+        /// Validated target spelling from the command, for the reply.
+        display: String,
         marker_ms: e6irc_proto::time::Millis,
+        /// Escaped labeled-response label carried onto the deferred reply.
+        label: Option<String>,
     },
     /// Persist a registered channel's retained topic (fire-and-forget).
     /// `topic` is `(text, setter, set_at_secs)`; `None` clears it.
@@ -558,6 +565,27 @@ pub enum DbReply {
     /// reason and can revoke an entry rather than retry.
     ChannelAccessLimitReached {
         channel: String,
+    },
+    /// A read marker was durably stored. `marker_ms` is the value PostgreSQL
+    /// returned after applying the monotonic `GREATEST`, not merely the value
+    /// the client requested.
+    ReadMarkerStored {
+        account: String,
+        /// Casefolded target used by the hot map.
+        target: String,
+        /// Validated target spelling from the command, for the reply.
+        display: String,
+        marker_ms: e6irc_proto::time::Millis,
+        label: Option<String>,
+    },
+    /// A read-marker write failed. The account/target pair is carried so the
+    /// core can release its pending-target reservation even if the requesting
+    /// connection vanished during the database round trip.
+    ReadMarkerUnavailable {
+        account: String,
+        target: String,
+        display: String,
+        label: Option<String>,
     },
     /// A credential verification could not be attempted — the database is
     /// unreachable or errored. Carries the origin so the client gets the loud

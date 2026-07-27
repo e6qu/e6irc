@@ -4508,6 +4508,25 @@ database-worker boundary (primary and fallback branches) and end-to-end after
 an unauthenticated peer disconnects; `CHATHISTORY LATEST <nick>` now returns the
 same backlog that `CHATHISTORY TARGETS` advertises.
 
+Read-marker durability sweep (2026-07-27): authenticated `MARKREAD` no longer
+updates the hot mirror, acknowledges the setter, or synchronizes sibling
+clients before PostgreSQL confirms the monotonic upsert. The database worker
+returns a typed stored/unavailable verdict with the actual committed marker;
+only the stored verdict mutates global state, including when the requester
+disconnects mid-flight, while queue/store failures return
+`TEMPORARILY_UNAVAILABLE`. Deferred replies preserve command order and
+labeled-response framing. In-flight distinct targets reserve account-cap slots,
+closing the race introduced by waiting for durability. The query form now
+validates the same channel/nick target language as the set form, and every
+error/current-marker echo is bounded before entering a server line. Core
+regressions cover optimistic visibility, success fan-out, transient and
+queue-full failures, labels and ordering, requester disconnect, pending-cap
+accounting, epoch zero, and bounded invalid query echoes.
+Pipelined same-target commands also remain monotonic on the wire: a query whose
+reply would sit behind an in-flight update fails explicitly instead of
+precomputing a stale value, and a no-op set in that position takes the database
+path so its acknowledgement uses the committed `GREATEST` result.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

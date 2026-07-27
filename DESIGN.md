@@ -133,6 +133,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
     inference conflated "which command asked" with "is the attempt still live";
     a verdict routed under the wrong flag logged the client in as the wrong
     account. The flag now gates only liveness (drop a superseded verdict).
+  - `ReadMarkerStored` / `ReadMarkerUnavailable` — an authenticated MARKREAD
+    update is a database-confirmed state transition: only the stored verdict
+    may enter the hot mirror or fan out to sibling clients, while a queue/store
+    failure produces an explicit `FAIL`. Pending targets reserve their
+    per-account cap slots until the verdict, so waiting for durability cannot
+    reopen an unbounded-growth race.
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the CR/LF sanitizer and
     the detached-buffer append; the bypass is a compile error, not a lint.
@@ -751,7 +757,10 @@ Principal tables (columns abridged):
   sequence — one sequence is shared by every network, so triggering off it
   makes retention depend on the interleaving between them
 - `read_markers` (account_id, target, marker_ts) — per-account read
-  position, the source for `draft/read-marker`
+  position, the source for `draft/read-marker`. Updates are monotonic
+  (`GREATEST`) and the returned committed value drives the core mirror and
+  client acknowledgement; an enqueue or PostgreSQL failure is never reported
+  as success. Anonymous connections use explicitly session-local markers.
 - `audit_log` (oper/admin actions, API mutations)
 
 Write path for messages: producers push to an in-process MPSC; a writer pool

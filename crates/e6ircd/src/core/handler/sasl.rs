@@ -303,6 +303,8 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             crate::core::DbReply::ChannelRegistered { .. }
                 | crate::core::DbReply::FounderChanged { .. }
                 | crate::core::DbReply::ChannelAccessSet { .. }
+                | crate::core::DbReply::ReadMarkerStored { .. }
+                | crate::core::DbReply::ReadMarkerUnavailable { .. }
         )
     {
         return; // client vanished while the DB worked; nothing to do
@@ -672,6 +674,23 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     "The access list for \x02{channel}\x02 is full; revoke an entry before adding another."
                 ),
             );
+        }
+        crate::core::DbReply::ReadMarkerStored {
+            account,
+            target,
+            display,
+            marker_ms,
+            label,
+        } => {
+            read_marker_stored(state, conn, account, target, display, marker_ms, label);
+        }
+        crate::core::DbReply::ReadMarkerUnavailable {
+            account,
+            target,
+            display,
+            label,
+        } => {
+            read_marker_unavailable(state, conn, account, target, display, label);
         }
     }
     // A connect-time SASL verify that resolved may have been the last thing

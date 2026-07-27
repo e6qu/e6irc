@@ -170,6 +170,74 @@ fn identify(s: &mut TestServer, conn: ConnId, account: &str) {
     s.drain(conn);
 }
 
+#[derive(Debug)]
+struct PendingReadMarker {
+    conn: ConnId,
+    account: String,
+    target: String,
+    display: String,
+    marker_ms: Millis,
+    label: Option<String>,
+}
+
+fn take_read_marker_request(s: &mut TestServer) -> PendingReadMarker {
+    let requests = s.db_requests();
+    let [
+        e6ircd::core::DbRequest::SetReadMarker {
+            conn,
+            account,
+            target,
+            display,
+            marker_ms,
+            label,
+        },
+    ] = requests.as_slice()
+    else {
+        panic!("expected exactly one read-marker request, got {requests:#?}");
+    };
+    PendingReadMarker {
+        conn: *conn,
+        account: account.clone(),
+        target: target.clone(),
+        display: display.clone(),
+        marker_ms: *marker_ms,
+        label: label.clone(),
+    }
+}
+
+fn confirm_read_marker(s: &mut TestServer) -> PendingReadMarker {
+    let request = take_read_marker_request(s);
+    confirm_read_marker_as(s, &request, request.marker_ms);
+    request
+}
+
+fn confirm_read_marker_as(s: &mut TestServer, request: &PendingReadMarker, marker_ms: Millis) {
+    s.core.handle(Input::DbReply {
+        conn: request.conn,
+        reply: e6ircd::core::DbReply::ReadMarkerStored {
+            account: request.account.clone(),
+            target: request.target.clone(),
+            display: request.display.clone(),
+            marker_ms,
+            label: request.label.clone(),
+        },
+    });
+}
+
+fn reject_read_marker(s: &mut TestServer) -> PendingReadMarker {
+    let request = take_read_marker_request(s);
+    s.core.handle(Input::DbReply {
+        conn: request.conn,
+        reply: e6ircd::core::DbReply::ReadMarkerUnavailable {
+            account: request.account.clone(),
+            target: request.target.clone(),
+            display: request.display.clone(),
+            label: request.label.clone(),
+        },
+    });
+    request
+}
+
 fn has_numeric(lines: &[String], code: &str) -> bool {
     lines.iter().any(|l| l.split(' ').nth(1) == Some(code))
 }
@@ -4180,8 +4248,17 @@ fn markread_set_query_and_broadcast() {
     s.line(a1, "MARKREAD #room");
     assert_eq!(s.drain(a1), vec![":irc.test.example MARKREAD #room *"]);
 
-    // set a marker → echoed to the setter and the account's other client
+    // A marker is not visible or acknowledged until PostgreSQL confirms it.
     s.line(a1, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    assert!(s.drain(a1).is_empty(), "no optimistic acknowledgement");
+    assert!(s.drain(a2).is_empty(), "no optimistic sibling sync");
+    s.line(a2, "MARKREAD #room");
+    assert_eq!(
+        s.drain(a2),
+        vec![":irc.test.example MARKREAD #room *"],
+        "an in-flight write is not part of the durable hot mirror"
+    );
+    confirm_read_marker(&mut s);
     assert_eq!(
         s.drain(a1),
         vec![":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"]
@@ -4221,6 +4298,8 @@ fn markread_sync_skips_siblings_without_the_cap() {
     s.drain(a2);
     // a1 advances a marker; only a1 (capable) is notified.
     s.line(a1, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    assert!(s.drain(a1).is_empty(), "the write is not yet confirmed");
+    confirm_read_marker(&mut s);
     assert_eq!(
         s.drain(a1),
         vec![":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"],
@@ -4243,18 +4322,16 @@ fn markread_first_set_to_epoch_zero_is_persisted() {
     identify(&mut s, a1, "alice");
     let _ = s.db_requests(); // drop the IDENTIFY's VerifyPassword
     s.line(a1, "MARKREAD #room timestamp=1970-01-01T00:00:00.000Z");
+    assert!(
+        s.drain(a1).is_empty(),
+        "epoch zero must wait for persistence too"
+    );
+    let request = confirm_read_marker(&mut s);
+    assert_eq!(request.target, "#room");
+    assert_eq!(request.marker_ms.as_millis(), 0);
     assert_eq!(
         s.drain(a1),
         vec![":irc.test.example MARKREAD #room timestamp=1970-01-01T00:00:00.000Z"]
-    );
-    let reqs = s.db_requests();
-    assert!(
-        reqs.iter().any(|r| matches!(
-            r,
-            e6ircd::core::DbRequest::SetReadMarker { target, marker_ms, .. }
-                if target == "#room" && marker_ms.as_millis() == 0
-        )),
-        "a first epoch-0 set must be persisted, not silently dropped: {reqs:#?}"
     );
 }
 
@@ -4284,6 +4361,237 @@ fn markread_requires_cap_and_works_anonymously() {
     // Malformed timestamp → FAIL.
     s.line(capped, "MARKREAD #x timestamp=not-a-time");
     assert!(s.drain(capped)[0].contains("FAIL MARKREAD"));
+}
+
+#[test]
+fn markread_query_rejects_and_bounds_invalid_targets() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    // Query and set forms accept the same target language. This token fits in
+    // the client command body, but reflecting it whole alongside the server
+    // prefix and FAIL detail would exceed the server-line limit.
+    let target = "x".repeat(450);
+    s.line(alice, &format!("MARKREAD {target}"));
+    let out = s.drain(alice);
+    assert_eq!(out.len(), 1, "{out:#?}");
+    assert!(out[0].contains("FAIL MARKREAD INVALID_PARAMS"), "{out:#?}");
+    assert!(
+        out[0].len() <= e6irc_proto::message::MAX_LINE_LEN - 2,
+        "the error echo exceeded the IRC content limit: {} bytes",
+        out[0].len()
+    );
+    assert!(
+        !out[0].contains(&target),
+        "the unbounded target was reflected whole"
+    );
+}
+
+#[test]
+fn markread_store_failure_is_loud_labeled_and_non_mutating() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker labeled-response");
+    identify(&mut s, alice, "alice");
+
+    s.line(
+        alice,
+        "@label=marker1 MARKREAD #room timestamp=2026-07-18T12:00:00.000Z",
+    );
+    s.line(alice, "PING :after-marker");
+    assert!(
+        s.drain(alice).is_empty(),
+        "later output must wait behind the durable verdict"
+    );
+    let request = reject_read_marker(&mut s);
+    assert_eq!(request.label.as_deref(), Some("marker1"));
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=marker1 ")
+                && line.contains("FAIL MARKREAD TEMPORARILY_UNAVAILABLE #room")
+        }),
+        "the database failure must be labeled and explicit: {out:#?}"
+    );
+    let fail = out
+        .iter()
+        .position(|line| line.contains("FAIL MARKREAD"))
+        .expect("FAIL");
+    let pong = out
+        .iter()
+        .position(|line| line.contains("PONG") && line.contains("after-marker"))
+        .expect("held PONG released");
+    assert!(fail < pong, "the deferred verdict was overtaken: {out:#?}");
+
+    s.line(alice, "MARKREAD #room");
+    assert_eq!(
+        s.drain(alice),
+        vec![":irc.test.example MARKREAD #room *"],
+        "a failed write must not enter the durable hot mirror"
+    );
+}
+
+#[test]
+fn markread_query_behind_pending_update_never_replies_with_a_stale_value() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "MARKREAD #room timestamp=2020-01-01T00:00:00.000Z");
+    confirm_read_marker(&mut s);
+    s.drain(alice);
+
+    s.line(alice, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    s.line(alice, "MARKREAD #room");
+    assert!(
+        s.drain(alice).is_empty(),
+        "both replies remain ordered behind the pending write"
+    );
+    confirm_read_marker(&mut s);
+    let out = s.drain(alice);
+    assert_eq!(
+        out[0],
+        ":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"
+    );
+    assert!(
+        out[1].contains(
+            "FAIL MARKREAD TEMPORARILY_UNAVAILABLE #room :Read marker update in progress"
+        ),
+        "the later query must not emit the old 2020 marker after the 2026 commit: {out:#?}"
+    );
+}
+
+#[test]
+fn markread_noop_behind_pending_update_uses_the_committed_value() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "MARKREAD #room timestamp=2020-01-01T00:00:00.000Z");
+    confirm_read_marker(&mut s);
+    s.drain(alice);
+
+    s.line(alice, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    let forward = take_read_marker_request(&mut s);
+    s.line(alice, "MARKREAD #room timestamp=2010-01-01T00:00:00.000Z");
+    let older = take_read_marker_request(&mut s);
+    assert_eq!(
+        older.marker_ms,
+        e6irc_proto::time::parse_server_time_millis("2010-01-01T00:00:00.000Z")
+            .expect("test timestamp")
+    );
+
+    confirm_read_marker_as(&mut s, &forward, forward.marker_ms);
+    confirm_read_marker_as(&mut s, &older, forward.marker_ms);
+    assert_eq!(
+        s.drain(alice),
+        vec![
+            ":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z",
+            ":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z",
+        ],
+        "the second reply must use PostgreSQL's monotonic committed value"
+    );
+}
+
+#[test]
+fn markread_full_db_queue_fails_without_leaking_a_deferred_hold() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #flood");
+    s.drain(alice);
+    s.db_requests();
+    for i in 0..80 {
+        s.line(alice, &format!("PRIVMSG #flood :m{i}"));
+        s.drain(alice);
+    }
+
+    s.line(alice, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|line| line.contains("FAIL MARKREAD TEMPORARILY_UNAVAILABLE #room")),
+        "a saturated persistence queue must fail synchronously: {out:#?}"
+    );
+    s.line(alice, "PING :still-live");
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains("PONG") && line.contains("still-live")),
+        "a failed enqueue must not leave a deferred-output hold"
+    );
+}
+
+#[test]
+fn markread_pending_target_counts_toward_the_account_cap() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, alice, "alice");
+    s.core.preload_read_markers(
+        (0..255)
+            .map(|i| {
+                (
+                    "alice".to_string(),
+                    format!("#room{i}"),
+                    Millis::from_millis(i),
+                )
+            })
+            .collect(),
+    );
+
+    s.line(
+        alice,
+        "MARKREAD #reserved timestamp=2026-07-18T12:00:00.000Z",
+    );
+    assert!(s.drain(alice).is_empty(), "the first write is pending");
+    s.line(
+        alice,
+        "MARKREAD #overflow timestamp=2026-07-18T12:00:00.000Z",
+    );
+    assert!(
+        s.drain(alice).is_empty(),
+        "the cap failure remains ordered behind the first write's verdict"
+    );
+    confirm_read_marker(&mut s);
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains("FAIL MARKREAD INVALID_PARAMS #overflow")),
+        "an in-flight distinct target must reserve the final cap slot"
+    );
+}
+
+#[test]
+fn markread_commit_updates_siblings_after_requester_disconnects() {
+    let mut s = TestServer::new();
+    let a1 = register_with_caps(&mut s, 1, "alice", "draft/read-marker");
+    identify(&mut s, a1, "alice");
+    let a2 = register_with_caps(&mut s, 2, "alice2", "draft/read-marker");
+    identify(&mut s, a2, "alice");
+
+    s.line(a1, "MARKREAD #room timestamp=2026-07-18T12:00:00.000Z");
+    let request = take_read_marker_request(&mut s);
+    s.core.handle(Input::Closed {
+        conn: a1,
+        reason: "test disconnect".into(),
+    });
+    s.drain(a2);
+    s.core.handle(Input::DbReply {
+        conn: a1,
+        reply: e6ircd::core::DbReply::ReadMarkerStored {
+            account: request.account,
+            target: request.target,
+            display: request.display,
+            marker_ms: request.marker_ms,
+            label: request.label,
+        },
+    });
+    assert_eq!(
+        s.drain(a2),
+        vec![":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"],
+        "the committed global state must survive its requester's disconnect"
+    );
+    s.line(a2, "MARKREAD #room");
+    assert_eq!(
+        s.drain(a2),
+        vec![":irc.test.example MARKREAD #room timestamp=2026-07-18T12:00:00.000Z"]
+    );
 }
 
 #[test]
@@ -7766,6 +8074,11 @@ fn markread_accepts_user_target_rejects_invalid() {
     // A user (DM) target is a valid marker target (draft/read-marker allows
     // both channels and users).
     s.line(a, "MARKREAD bob timestamp=2026-07-18T12:00:00.000Z");
+    assert!(
+        s.drain(a).is_empty(),
+        "the valid target waits for its durable verdict"
+    );
+    confirm_read_marker(&mut s);
     let out = s.drain(a);
     assert!(
         !out.iter().any(|l| l.contains("FAIL")),
