@@ -1341,6 +1341,145 @@ async fn admin_console_lists_and_kills_sessions() {
     assert!(gone, "victim still listed after kill");
 }
 
+/// The per-user sessions view lists only the caller's own SASL-authenticated
+/// clients and can disconnect them — but never another account's session, even
+/// though it is not admin-gated.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn my_sessions_are_scoped_to_the_caller() {
+    let url = support::test_db("my_sessions_are_scoped_to_the_caller").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "s3cr3t")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "s3cr3t")
+        .await
+        .expect("bob");
+    let session = e6ircd::db::create_web_session(&pool, "alice")
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.mysess.example".into(),
+        network_name: "MySessNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![], // alice is NOT an admin: this is self-service
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let irc = running.addrs[0];
+    let http = running.http_addr.expect("http");
+
+    // Two IRC clients, SASL-authenticated as alice and as bob.
+    let mut alice_cli = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("tcp a");
+    alice_cli
+        .register_sasl("alicecli", "A", "alice", "s3cr3t")
+        .await
+        .expect("alice sasl");
+    let mut bob_cli = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("tcp b");
+    bob_cli
+        .register_sasl("bobcli", "B", "bob", "s3cr3t")
+        .await
+        .expect("bob sasl");
+
+    let page_req = format!(
+        "GET /console/my-sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    // Wait for alice's own client to be listed; bob's must never appear.
+    let mut csrf = String::new();
+    let mut ok = false;
+    for _ in 0..40 {
+        let (status, _, body) = request(http, &page_req).await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("alicecli") {
+            assert!(
+                !body.contains("bobcli"),
+                "another account's session leaked: {body}"
+            );
+            csrf = body
+                .split("name=\"csrf\" value=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("")
+                .to_string();
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(ok && !csrf.is_empty(), "alice's own session not listed");
+
+    // Attempt to kill bob's session by nick -> refused (not the caller's); bob
+    // stays connected.
+    let kill_bob = format!("csrf={csrf}&nick=bobcli&reason=x");
+    let kb = format!(
+        "POST /console/my-sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{kill_bob}",
+        kill_bob.len()
+    );
+    let (status, _, body) = request(http, &kb).await;
+    assert_eq!(status, 200, "{body}"); // re-renders with a banner, not a redirect
+    assert!(
+        body.contains("banner-error"),
+        "expected refusal banner: {body}"
+    );
+    // bob is still alive: a PING gets a PONG.
+    bob_cli.send_line("PING :stillhere").await.unwrap();
+    let bob_alive = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match bob_cli.next_message().await {
+                Ok(Some(m)) if m.command == "PONG" => return true,
+                Ok(Some(_)) => continue,
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(bob_alive, "bob was wrongly disconnected by alice");
+
+    // Killing alice's own session works -> 303 and the client is disconnected.
+    let kill_me = format!("csrf={csrf}&nick=alicecli&reason=bye");
+    let km = format!(
+        "POST /console/my-sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{kill_me}",
+        kill_me.len()
+    );
+    let (status, head, _) = request(http, &km).await;
+    assert_eq!(status, 303, "{head}");
+    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match alice_cli.next_message().await {
+                Ok(Some(m)) if m.command == "ERROR" => return true,
+                Ok(Some(_)) => continue,
+                _ => return true, // EOF
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(killed, "alice's own session was not disconnected");
+}
+
 /// The console Integrations page is admin-gated and lists every chat-platform
 /// bridge with its build availability. This default (no-bridge-feature) build
 /// reports all three as not built.

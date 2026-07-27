@@ -26,15 +26,9 @@ pub(super) async fn create_app_password(
             Some("This server runs without persistence; accounts are unavailable."),
         );
     };
-    let axum::Json(req) = match body {
+    let req = match super::parse_json(body) {
         Ok(b) => b,
-        Err(e) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid request body",
-                Some(&e.to_string()),
-            );
-        }
+        Err(r) => return r,
     };
     if let Some(resp) = validate_label(&req.label) {
         return resp;

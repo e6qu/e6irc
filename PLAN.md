@@ -1638,6 +1638,23 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+Web-UI sweep 4 — per-user session management (2026-07-27): closes the "manage
+your own client connections" gap from the original vision. A new non-admin
+`/console/my-sessions` lists the caller's own SASL-authenticated clients (raw
+IRC / WebSocket / BNC) and can disconnect one. It runs through the core via two
+new `Input::Admin` variants: `ListOwnSessions { account }` (the session snapshot
+filtered to that account) and `KillOwn { nick, account }` — which **refuses to
+kill a session not authenticated as the caller**, so a non-admin cannot touch
+anyone else's session even by guessing a nick. The admin `/console/sessions`
+view and this one share one parameterized template + `render_sessions_page(own)`
+builder. Boy-scout dedup to keep the ratchet green: extracted `parse_form` /
+`parse_json` body-parse helpers (used across the console/JSON POST handlers,
+including a pre-existing credentials↔device clone). Covered by a PG-gated http
+test (`my_sessions_are_scoped_to_the_caller`) that connects two SASL clients
+(alice, bob) and asserts alice sees only her own, cannot kill bob's, and can
+kill her own. Verified locally (Docker back up): full http PG suite 21/21;
+clippy ×5; all gates.
+
 Web-UI sweep 3 — client settings + notifications (2026-07-27, client-only):
 in-browser client polish, plus two latent browser-harness races the added
 module-load work surfaced. Client (`web/`): a **theme toggle** (auto/light/dark,

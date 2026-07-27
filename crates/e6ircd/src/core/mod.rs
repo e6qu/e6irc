@@ -110,6 +110,17 @@ pub enum AdminRequest {
         reason: String,
         actor: String,
     },
+    /// Snapshot only the sessions authenticated as `account` — the caller's own
+    /// connected clients (self-service, not admin).
+    ListOwnSessions { account: String },
+    /// Disconnect the session holding `nick`, but only if it is authenticated as
+    /// `account` (the caller) — a self-service kill that cannot touch anyone
+    /// else's session.
+    KillOwn {
+        nick: String,
+        reason: String,
+        account: String,
+    },
 }
 
 /// A snapshot of one live client session, for the admin console's sessions view.

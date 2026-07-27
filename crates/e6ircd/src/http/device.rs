@@ -350,15 +350,9 @@ pub(super) async fn create_api_token(
     Authenticated(account): Authenticated,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let axum::Json(req) = match body {
+    let req = match super::parse_json(body) {
         Ok(b) => b,
-        Err(e) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid request body",
-                Some(&e.to_string()),
-            );
-        }
+        Err(r) => return r,
     };
     if let Some(resp) = validate_label(&req.label) {
         return resp;
