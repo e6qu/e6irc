@@ -110,7 +110,9 @@ try {
   );
 
   // Clearing only e6irc's application session leaves the provider SSO cookie
-  // intact. Opening the application directly must silently restore access.
+  // intact. Opening the application directly must use the ordinary
+  // authorization starter and restore access without prompting at the
+  // provider.
   assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
   assert.equal((await context.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   const directTraceStart = navigationTrace.length;
@@ -118,8 +120,8 @@ try {
   await page.waitForURL(`${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
   assert.ok(
-    navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/sso`),
-    `direct flow did not use silent single sign-on:\n${navigationTrace.slice(directTraceStart).join("\n")}`,
+    navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
+    `direct flow did not use the ordinary OpenID Connect starter:\n${navigationTrace.slice(directTraceStart).join("\n")}`,
   );
 
   // The provider's registered post-logout return is public, persistent, and

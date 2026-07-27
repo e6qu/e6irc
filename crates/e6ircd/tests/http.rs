@@ -2417,9 +2417,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
 #[cfg(feature = "embed-web")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn application_entry_is_fail_closed_and_uses_silent_sso() {
+async fn application_entry_is_fail_closed_and_starts_provider_authorization() {
     use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
-    let url = support::test_db("application_entry_is_fail_closed_and_uses_silent_sso").await;
+    let url =
+        support::test_db("application_entry_is_fail_closed_and_starts_provider_authorization")
+            .await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -2467,7 +2469,7 @@ async fn application_entry_is_fail_closed_and_uses_silent_sso() {
     let (status, headers, _) = request(http, &get("/")).await;
     assert_eq!(status, 307, "{headers}");
     assert!(
-        headers.contains("/api/v1/auth/oidc/shauth/sso"),
+        headers.contains("/api/v1/auth/oidc/shauth/start"),
         "{headers}"
     );
 

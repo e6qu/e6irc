@@ -217,7 +217,9 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                 let text = match frame {
                     Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
                     Some(Ok(Ws::Ping(p))) => {
-                        let _ = write.send(Ws::Pong(p)).await;
+                        if write.send(Ws::Pong(p)).await.is_err() {
+                            return Dropped;
+                        }
                         continue;
                     }
                     Some(Ok(Ws::Close(frame))) => {

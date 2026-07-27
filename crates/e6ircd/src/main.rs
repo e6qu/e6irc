@@ -139,12 +139,16 @@ async fn wait_for_shutdown_signal() {
         let mut sigterm =
             signal(SignalKind::terminate()).expect("install SIGTERM handler for graceful shutdown");
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            res = tokio::signal::ctrl_c() => {
+                res.expect("install Ctrl-C handler for graceful shutdown");
+            }
             _ = sigterm.recv() => {}
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler for graceful shutdown");
     }
 }

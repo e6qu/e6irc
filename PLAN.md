@@ -4562,6 +4562,21 @@ The adjacent stored driver-kind fallback was removed: migration 0035 constrains
 invalid value rather than silently treating it as `irc`. Unit and PostgreSQL
 regressions pin both enforcement edges.
 
+Transport-failure sweep (2026-07-27): active connection paths no longer discard
+fallible writes. IRC, Discord, and Slack heartbeat/PONG failure now drops the
+upstream session into the shared reconnect policy; the web-UI socket exits when
+status, lag, or congestion notices cannot be sent. The `local` driver stops
+loudly if its core queue closes during auto-join or PONG, never emits
+`Connected` after a failed auto-join, and treats downstream queue closure as
+terminal instead of retrying a core that is gone. Raw IRC/BNC listeners reject
+a socket whose TCP no-delay setup fails, the shared client propagates that
+failure, BNC connection errors are logged, and the socket writer now treats
+flush failure as a write error. Module-level `let_underscore_must_use` denial
+makes discarded must-use transport results a compile failure across the
+bouncer, raw/TLS socket, web-socket, and shared-client funnels. Deterministic
+regressions cover all three local-driver closure stages and an injected flush
+failure.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,
@@ -4696,9 +4711,11 @@ Done:
   durable sessions, including sessions on other devices, while rejecting
   signature, claim, audience, issuer, time-window, and replay failures.
   The application root itself became fail-closed: unauthenticated direct and
-  catalog entry used a silent Shauth probe, a valid upstream session entered
-  without another prompt, and a negative probe reached interactive login
-  without looping. A silent probe answered `consent_required` — the browser
+  catalog entry start the ordinary Shauth authorization flow, a valid upstream
+  session enters without another prompt, and a browser without one stops at
+  Shauth's credential page rather than falling back to the application's local
+  login page. The separately exposed silent probe still answers
+  `consent_required` — the browser
   holds a provider session but has never authorized this client, which is what
   a relying party sees on its first visit — took one ordinary authorization
   request instead, so a first-party application joins an established single
@@ -4847,7 +4864,7 @@ Done (this phase's remaining, now landed):
 - Coordinated and local browser logout returned to the public, reload-safe
   `/auth/signed-out` page instead of the application root. The branded,
   accessible light/dark page exposed the explicit Shauth OIDC starter, and
-  real-browser coverage exercised catalog launch, direct silent SSO, logout
+  real-browser coverage exercised catalog launch, direct SSO, logout
   landing reload, and application-local sign-in recovery.
 - askama server-rendered pages (DESIGN §13.1): `/login` (OIDC provider
   buttons) and `/account` (cookie-authed user section listing the

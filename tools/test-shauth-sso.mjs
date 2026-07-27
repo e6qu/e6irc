@@ -74,10 +74,6 @@ try {
   assert.equal(localCredentialAttempt.status(), 401);
 
   await page.goto(`${primaryOrigin}/`);
-  await page.waitForURL(`${primaryOrigin}/login`);
-  const directStarter = page.getByRole("link", { name: "Continue with shauth", exact: true });
-  assert.equal(await directStarter.getAttribute("href"), "/api/v1/auth/oidc/shauth/start");
-  await directStarter.click();
   await page.waitForURL((url) => url.origin === shauthOrigin && url.pathname === "/login");
   await page.locator("#username").fill(username);
   await page.locator("#password").fill(password);
@@ -141,15 +137,10 @@ try {
   await page.getByRole("link", { name: "Sign in to Shauth", exact: true }).waitFor();
   await waitForRevocation(context, primaryOrigin);
   await waitForRevocation(context, secondaryOrigin);
-  // After the provider-wide sign-out, entry is fail-closed: the silent probe
-  // comes back unauthenticated and the application returns the visitor to its
-  // own sign-in page with no authenticated shell, exactly as it does for a
-  // first-time visitor above.
+  // After provider-wide sign-out, direct entry starts ordinary authorization
+  // and stops at Shauth's login page without exposing an authenticated shell.
   await page.goto(`${primaryOrigin}/`);
-  await page.waitForURL(`${primaryOrigin}/login`);
-  await page
-    .getByRole("link", { name: "Continue with shauth", exact: true })
-    .waitFor({ state: "visible" });
+  await page.waitForURL((url) => url.origin === shauthOrigin && url.pathname === "/login");
   assert.equal(await page.locator("[data-shauth-user]").count(), 0);
 
   assert.deepEqual(credentialBoundary.handlerErrors, []);

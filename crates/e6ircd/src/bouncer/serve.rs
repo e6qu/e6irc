@@ -343,14 +343,14 @@ where
             // Owned but not live: disabled. Say so rather than falling through
             // to a shared network of the same name.
             Ok(Some(_)) => {
-                let _ = write
+                write
                     .write_all(
                         format!(
                             ":{server_name} NOTICE * :Your network '{network}' is disabled.\r\n"
                         )
                         .as_bytes(),
                     )
-                    .await;
+                    .await?;
                 return Ok(());
             }
             // DB error: ownership is unresolved. Fail closed — never fall
@@ -359,14 +359,14 @@ where
             // (DESIGN §2: no silent fallbacks).
             Err(e) => {
                 eprintln!("bnc: attach ownership lookup for {account}/{network} failed: {e}");
-                let _ = write
+                write
                     .write_all(
                         format!(
                             ":{server_name} NOTICE * :Network '{network}' is temporarily unavailable.\r\n"
                         )
                         .as_bytes(),
                     )
-                    .await;
+                    .await?;
                 return Ok(());
             }
             // Not owned at all: a shared (ownerless) network of that name is a
@@ -375,12 +375,12 @@ where
                 if let Some(handle) = registry.get_shared(&network) {
                     handle
                 } else {
-                    let _ = write
+                    write
                         .write_all(
                             format!(":{server_name} NOTICE * :Unknown network '{network}'.\r\n")
                                 .as_bytes(),
                         )
-                        .await;
+                        .await?;
                     return Ok(());
                 }
             }
@@ -516,14 +516,14 @@ where
         // SASL exchange still in flight (awaiting_payload) is not yet a
         // failure.
         if nick.is_some() && have_user && !cap_open && !awaiting_payload && account.is_none() {
-            let _ = write
+            write
                 .write_all(
                     format!(
                         ":{server_name} NOTICE * :Authentication required — attach with SASL PLAIN.\r\n"
                     )
                     .as_bytes(),
                 )
-                .await;
+                .await?;
             return Ok(Registered::Closed);
         }
     }
