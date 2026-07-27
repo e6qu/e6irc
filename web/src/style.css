@@ -126,6 +126,12 @@ body {
 .from { flex: 0 0 auto; font-weight: 600; }
 .text { flex: 1 1 auto; white-space: pre-wrap; }
 .msg-link { color: var(--accent); text-decoration: underline; word-break: break-all; }
+#load-earlier {
+  flex: 0 0 auto; margin: 0.35rem auto 0; padding: 0.2rem 0.9rem; font: inherit;
+  font-size: 0.8rem; border: 1px solid var(--border); border-radius: 0.8rem;
+  background: transparent; color: var(--accent); cursor: pointer;
+}
+#load-earlier:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .line-notice .text, .line-notice .from { color: var(--muted); }
 .line-event { color: var(--muted); font-size: 0.85rem; font-style: italic; }
 .line-server { color: var(--muted); }
