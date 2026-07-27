@@ -578,10 +578,9 @@ pub(super) async fn network_buffer(
         }
     }
     let limit = params.limit.unwrap_or(200).clamp(1, 1000) as i64;
-    // Buffers are stored under the casefolded owner (the registry key), so the
-    // read has to fold too or it would look up a spelling nothing writes.
-    let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-    match crate::db::recent_bnc_lines(pool, &owner, &name, limit).await {
+    // The DB buffer API canonicalizes the owner/network composite key, matching
+    // the live registry even when this URL uses a different case.
+    match crate::db::recent_bnc_lines(pool, &account, &name, limit).await {
         Ok(lines) => (
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::json!({ "lines": lines }).to_string(),

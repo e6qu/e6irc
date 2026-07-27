@@ -24,6 +24,8 @@ pub enum DbError {
     DuplicateAccount(String),
     /// A network of that name already exists for the owner.
     DuplicateNetwork(String),
+    /// A persisted BNC network kind is outside the closed driver-kind set.
+    InvalidNetworkKind(String),
     /// Unknown account or wrong password (indistinguishable on purpose).
     BadCredentials,
     /// A write resolved to no account row for the given name.
@@ -46,6 +48,9 @@ impl std::fmt::Display for DbError {
             Self::Hash(e) => write!(f, "password hashing failed: {e}"),
             Self::DuplicateAccount(n) => write!(f, "account already exists: {n}"),
             Self::DuplicateNetwork(n) => write!(f, "network already exists: {n}"),
+            Self::InvalidNetworkKind(kind) => {
+                write!(f, "invalid persisted BNC network kind: {kind}")
+            }
             Self::BadCredentials => write!(f, "invalid account or password"),
             Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
@@ -2019,13 +2024,18 @@ pub struct BncNetworkRow {
     pub enabled: bool,
 }
 
-fn bnc_row(row: &sqlx::postgres::PgRow) -> BncNetworkRow {
+fn stored_network_kind(kind: &str) -> Result<crate::config::NetworkKind, DbError> {
+    match crate::config::NetworkKind::from_db_str(kind) {
+        Some(parsed) if parsed != crate::config::NetworkKind::Local => Ok(parsed),
+        _ => Err(DbError::InvalidNetworkKind(kind.to_string())),
+    }
+}
+
+fn bnc_row(row: &sqlx::postgres::PgRow) -> Result<BncNetworkRow, DbError> {
     use sqlx::Row;
-    BncNetworkRow {
-        // An unrecognized stored kind falls back to `irc` (the column default and
-        // the only kind that predates this column) rather than dropping the row.
-        kind: crate::config::NetworkKind::from_db_str(&row.get::<String, _>("kind"))
-            .unwrap_or_default(),
+    let kind = row.get::<String, _>("kind");
+    Ok(BncNetworkRow {
+        kind: stored_network_kind(&kind)?,
         name: row.get("name"),
         addr: row.get("addr"),
         tls: row.get("tls"),
@@ -2035,7 +2045,7 @@ fn bnc_row(row: &sqlx::postgres::PgRow) -> BncNetworkRow {
         autojoin: row.get("autojoin"),
         sasl_account: row.get("sasl_account"),
         sasl_password_sealed: row.get("sasl_password_sealed"),
-    }
+    })
 }
 
 /// Create a network owned by `account`. Errors with `DuplicateNetwork`
@@ -2115,7 +2125,7 @@ pub async fn list_bnc_networks(
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
-    Ok(rows.iter().map(bnc_row).collect())
+    rows.iter().map(bnc_row).collect()
 }
 
 /// One network owned by `account`, by name — used to rebuild a driver
@@ -2138,7 +2148,7 @@ pub async fn get_bnc_network(
     .fetch_optional(pool)
     .await
     .map_err(DbError::Query)?;
-    Ok(row.as_ref().map(bnc_row))
+    row.as_ref().map(bnc_row).transpose()
 }
 
 /// Enable or disable `account`'s network `name`. Returns whether a row
@@ -2214,10 +2224,9 @@ pub async fn list_all_bnc_networks(pool: &PgPool) -> Result<Vec<(String, BncNetw
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<String, _>("owner"), bnc_row(r)))
-        .collect())
+    rows.iter()
+        .map(|r| Ok((r.get::<String, _>("owner"), bnc_row(r)?)))
+        .collect()
 }
 
 /// Every registered channel with its founder, as `(name_folded,
@@ -2334,26 +2343,23 @@ pub async fn list_channel_mlock(pool: &PgPool) -> Result<Vec<(String, String)>, 
 /// retry returns `Ok(false)` ("no such network") while the cleanup limped along
 /// as a side effect. One transaction removes both hazards.
 pub async fn delete_bnc_network(pool: &PgPool, account: &str, name: &str) -> Result<bool, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
+    let key = BncBufferKey::new(account, name);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
     let res = sqlx::query(
         "DELETE FROM bnc_networks n USING accounts a
          WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
-    .bind(&folded)
+    .bind(&key.owner)
     .bind(name)
     .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
-    // bnc_buffer has no FK to bnc_networks (owner/network are plain text), so
-    // its rows would otherwise be orphaned forever on delete. The persistence
-    // task keys the buffer by the *casefolded* owner (NetworkKey folds it, and
-    // spawn_persistence writes/reads under that), so the delete must match the
-    // folded form too — binding the raw account here removed zero buffer rows,
-    // leaking backlog that a same-named network would later replay.
+    // `bnc_buffer` has no FK to `bnc_networks`; use the same canonical composite
+    // key as every buffer read/write so a case-variant delete cannot orphan rows
+    // that a later same-named network would replay.
     sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1 AND network = $2")
-        .bind(&folded)
-        .bind(name)
+        .bind(&key.owner)
+        .bind(&key.network)
         .execute(&mut *tx)
         .await
         .map_err(DbError::Query)?;
@@ -2376,6 +2382,26 @@ const BNC_BUFFER_CAP: i64 = 5000;
 /// land on a multiple of the interval and never be trimmed at all.
 pub const BNC_TRIM_INTERVAL: u64 = 1000;
 
+/// Canonical storage key for one persisted BNC buffer.
+///
+/// The live registry folds both account and network selectors. Constructing the
+/// database key here as well means no buffer API can accidentally bind a
+/// display/request spelling and miss rows written by the registry.
+struct BncBufferKey {
+    owner: String,
+    network: String,
+}
+
+impl BncBufferKey {
+    fn new(owner: &str, network: &str) -> Self {
+        let casemap = CaseMapping::Rfc1459;
+        Self {
+            owner: casemap.casefold(owner),
+            network: casemap.casefold(network),
+        }
+    }
+}
+
 /// Append one upstream line to a network's persisted buffer.
 pub async fn persist_bnc_line(
     pool: &PgPool,
@@ -2383,9 +2409,10 @@ pub async fn persist_bnc_line(
     network: &str,
     line: &str,
 ) -> Result<(), DbError> {
+    let key = BncBufferKey::new(owner, network);
     sqlx::query("INSERT INTO bnc_buffer (owner, network, line) VALUES ($1, $2, $3)")
-        .bind(owner)
-        .bind(network)
+        .bind(&key.owner)
+        .bind(&key.network)
         .bind(line)
         .execute(pool)
         .await
@@ -2396,6 +2423,7 @@ pub async fn persist_bnc_line(
 /// Drop all but the newest [`BNC_BUFFER_CAP`] lines of one network's buffer,
 /// so an always-on network cannot grow the table forever.
 pub async fn trim_bnc_buffer(pool: &PgPool, owner: &str, network: &str) -> Result<(), DbError> {
+    let key = BncBufferKey::new(owner, network);
     sqlx::query(
         "DELETE FROM bnc_buffer
          WHERE owner = $1 AND network = $2 AND id < (
@@ -2406,8 +2434,8 @@ pub async fn trim_bnc_buffer(pool: &PgPool, owner: &str, network: &str) -> Resul
              ) keep
          )",
     )
-    .bind(owner)
-    .bind(network)
+    .bind(&key.owner)
+    .bind(&key.network)
     .bind(BNC_BUFFER_CAP)
     .execute(pool)
     .await
@@ -2423,13 +2451,14 @@ pub async fn recent_bnc_lines(
     network: &str,
     limit: i64,
 ) -> Result<Vec<String>, DbError> {
+    let key = BncBufferKey::new(owner, network);
     let mut rows: Vec<String> = sqlx::query_scalar(
         "SELECT line FROM bnc_buffer
          WHERE owner = $1 AND network = $2
          ORDER BY id DESC LIMIT $3",
     )
-    .bind(owner)
-    .bind(network)
+    .bind(&key.owner)
+    .bind(&key.network)
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -2946,6 +2975,18 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
 
 #[cfg(test)]
 mod history_sql_tests {
+    use super::{DbError, stored_network_kind};
+
+    #[test]
+    fn unknown_persisted_network_kind_is_an_error() {
+        for invalid in ["smtp", "local"] {
+            assert!(matches!(
+                stored_network_kind(invalid),
+                Err(DbError::InvalidNetworkKind(kind)) if kind == invalid
+            ));
+        }
+    }
+
     /// The macro must produce exactly the statement the queries used to spell
     /// out. `HistoryDbRow` now binds by column *name* (`sqlx::FromRow`), so the
     /// `ts_millis` alias is load-bearing — the computed column needs a name to

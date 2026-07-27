@@ -2065,6 +2065,14 @@ async fn network_buffer_read() {
     assert_eq!(lines[0], ":srv 001 alice :hi", "{body}");
     assert_eq!(lines[2], ":a!u@h PRIVMSG #x :two", "{body}");
 
+    // The network lookup and buffer lookup use the same case-insensitive
+    // selector: a URL case variant must not resolve the row and then miss its
+    // canonically keyed backlog.
+    let (status, _, body) = request(http, &auth("/api/v1/me/networks/WoRk/buffer")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["lines"].as_array().unwrap().len(), 3, "{body}");
+
     // limit returns the most recent N (still oldest-first within that slice).
     let (_, _, body) = request(http, &auth("/api/v1/me/networks/work/buffer?limit=1")).await;
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
