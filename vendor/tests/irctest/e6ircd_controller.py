@@ -7,9 +7,10 @@ Usage (from an irctest checkout, with this repo's target/ built):
 
 Set E6IRC_IRCTEST_DB to a PostgreSQL URL to run the persistence-backed suites
 (SASL, integrated NickServ services, CHATHISTORY): the controller then embeds a
-`[database]` section, advertises SASL PLAIN, and truncates the account/message
-tables before each server so every test starts clean. Without it, the server
-runs DB-less exactly as before (the no-account green list).
+`[database]` section, advertises SASL PLAIN, and truncates the account, message,
+and managed-settings tables before each server so every test starts clean and
+imports that case's ephemeral listener and policy. Without it, the server runs
+DB-less exactly as before (the no-account green list).
 
 Pinned against irctest commit a468d9fcd64abc72b02ecb20f4f8612fd72c8829
 (see vendor/tests/libera-snapshot/PROVENANCE.md for the vendoring policy; the
@@ -144,10 +145,18 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
             f"require_email = {str(self.test_config.account_registration_requires_email).lower()}\n"
         )
         if _DB_URL is not None:
-            # Fresh account + message store per test (a no-op on the very first
-            # run, before migrations create the schema).
+            # Fresh persistent state per test (a no-op on the very first run,
+            # before migrations create the schema). Managed settings must be
+            # reset too: each irctest case supplies a new ephemeral listener
+            # and may vary registration policy. Keeping the preceding case's
+            # singleton would make the next daemon bind the old port.
             subprocess.run(
-                ["psql", _DB_URL, "-c", "TRUNCATE accounts, messages CASCADE"],
+                [
+                    "psql",
+                    _DB_URL,
+                    "-c",
+                    "TRUNCATE accounts, messages, server_settings CASCADE",
+                ],
                 check=False,
                 capture_output=True,
             )

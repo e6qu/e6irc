@@ -97,7 +97,7 @@ jobs:
           POSTGRES_DB: e6irc_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready --username postgres --dbname e6irc_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -286,7 +286,7 @@ jobs:
           POSTGRES_DB: irctest
         ports: ["5432:5432"]
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready --username postgres --dbname irctest"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
