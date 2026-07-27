@@ -1023,28 +1023,35 @@ async fn read_marker_persists() {
         .await
         .unwrap();
     expect(&mut reader, " 001 ").await;
-    w.write_all(b"MARKREAD #chan timestamp=2026-07-18T12:00:00.000Z\r\n")
-        .await
-        .unwrap();
-    expect(&mut reader, "MARKREAD #chan timestamp=").await;
-
-    // durably stored?
-    let mut got = None;
-    for _ in 0..50 {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT to_char(marker_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS')
-             FROM read_markers WHERE target = '#chan'",
-        )
-        .fetch_optional(&pool)
-        .await
-        .expect("query");
-        if let Some((ts,)) = row {
-            got = Some(ts);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Pipeline a newer marker and then an older one before either DB verdict
+    // reaches the core. Both requests are written, and PostgreSQL's GREATEST
+    // result—not the requested older value—must drive the second reply.
+    w.write_all(
+        b"MARKREAD #chan timestamp=2026-07-18T12:00:00.000Z\r\n\
+          MARKREAD #chan timestamp=2020-01-01T00:00:00.000Z\r\n",
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let reply = expect(&mut reader, "MARKREAD #chan timestamp=").await;
+        assert!(
+            reply.contains("timestamp=2026-07-18T12:00:00.000Z"),
+            "the acknowledgement must carry the committed monotonic value: {reply}"
+        );
     }
-    assert_eq!(got.as_deref(), Some("2026-07-18T12:00:00"));
+
+    // Receiving the acknowledgement means the row is already durable.
+    let got: Option<(String,)> = sqlx::query_as(
+        "SELECT to_char(marker_ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS')
+         FROM read_markers WHERE target = '#chan'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        got.as_ref().map(|row| row.0.as_str()),
+        Some("2026-07-18T12:00:00")
+    );
 }
 
 #[tokio::test]

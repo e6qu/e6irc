@@ -12,6 +12,7 @@ pub(super) fn markread_fail(
     detail: &str,
 ) {
     let server = state.config.server_name.clone();
+    let target = clip_echo(target);
     state.send(
         conn,
         &format!(":{server} FAIL MARKREAD {code} {target} :{detail}"),
@@ -40,6 +41,7 @@ pub(super) fn send_current_markread(
         .map(|ms| format!("timestamp={}", e6irc_proto::time::server_time(ms)))
         .unwrap_or_else(|| "*".to_string());
     let server = state.config.server_name.clone();
+    let display = clip_echo(display);
     state.send(conn, &format!(":{server} MARKREAD {display} {marker}"));
 }
 
@@ -64,6 +66,15 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
+    // Both forms echo the target. Validate before the query/set split so the
+    // query form cannot reflect a client-sized invalid token into an overlong
+    // server line, and cannot query names the set form would reject.
+    if !crate::sanitize::valid_channel_name(target)
+        && !crate::sanitize::valid_nick(target, state.config.nicklen)
+    {
+        markread_fail(state, conn, target, "INVALID_PARAMS", "Invalid target");
+        return;
+    }
     // A logged-in client's markers are account-keyed (shared across the
     // account's connections and persisted); a client that isn't logged in gets
     // per-connection markers (the connection *is* the client), kept in the
@@ -72,9 +83,28 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let account = state.sessions[&conn].account.clone();
     let key = state.chan_key(target);
     let server = state.config.server_name.clone();
+    let marker_pending = account.as_ref().is_some_and(|account| {
+        state
+            .pending_read_markers
+            .contains_key(&(state.account_key(account), key.clone()))
+    });
+    let output_held = state.sessions[&conn].deferred_replies > 0;
 
     // Query form: MARKREAD <target>
     let Some(&arg) = p.get(1) else {
+        // A query whose output is held while this target has an update pending
+        // cannot precompute the old value: it could be released after the new
+        // value and appear to move the marker backwards.
+        if marker_pending && output_held {
+            markread_fail(
+                state,
+                conn,
+                target,
+                "TEMPORARILY_UNAVAILABLE",
+                "Read marker update in progress",
+            );
+            return;
+        }
         send_current_markread(state, conn, &key, target);
         return;
     };
@@ -90,16 +120,6 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         markread_fail(state, conn, target, "INVALID_PARAMS", "Malformed timestamp");
         return;
     };
-    // The set form is the only path that grows a marker map, so bound the
-    // target: a real channel or a valid nick (draft/read-marker allows both
-    // channel and direct-message targets).
-    if !crate::sanitize::valid_channel_name(target)
-        && !crate::sanitize::valid_nick(target, state.config.nicklen)
-    {
-        markread_fail(state, conn, target, "INVALID_PARAMS", "Invalid target");
-        return;
-    }
-
     let Some(account) = account else {
         // Not logged in: session-local marker, capped, monotonic, replied only
         // to this connection (there are no sibling connections to sync).
@@ -139,17 +159,20 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // in-core map is keyed by the folded `AccountKey`, so a marker set as "Alice"
     // and later queried as "alice" resolves to one entry, not two.
     let account_key = state.account_key(&account);
-    let is_new = !state
+    let marker_key = (account_key.clone(), key.clone());
+    let is_new = !state.read_markers.contains_key(&marker_key)
+        && !state.pending_read_markers.contains_key(&marker_key);
+    let confirmed_count = state
         .read_markers
-        .contains_key(&(account_key.clone(), key.clone()));
-    if is_new
-        && state
-            .read_markers
-            .keys()
-            .filter(|(a, _)| a == &account_key)
-            .count()
-            >= MAX_READ_MARKERS_PER_ACCOUNT
-    {
+        .keys()
+        .filter(|(a, _)| a == &account_key)
+        .count();
+    let pending_only_count = state
+        .pending_read_markers
+        .keys()
+        .filter(|pending @ (a, _)| a == &account_key && !state.read_markers.contains_key(*pending))
+        .count();
+    if is_new && confirmed_count + pending_only_count >= MAX_READ_MARKERS_PER_ACCOUNT {
         markread_fail(
             state,
             conn,
@@ -159,57 +182,134 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    // Decide "moved forward" from whether a marker *exists*, not by comparing
-    // against a zero sentinel: `Millis(0)` is a legitimate marker value (the Unix
-    // epoch, which the timestamp parser accepts), so a `.or_insert(0)` sentinel
-    // would make a first-ever set to epoch-0 look like a no-op (`0 > 0` is false)
-    // — it would update the in-core mirror but skip the DB write, silently
-    // diverging the two. A first set always persists, whatever its value.
-    let existing = state
-        .read_markers
-        .get(&(account_key.clone(), key.clone()))
-        .copied();
-    let moved_forward = existing.is_none_or(|cur| new_ms > cur);
-    if moved_forward {
-        state
-            .read_markers
-            .insert((account_key.clone(), key.clone()), new_ms);
-        let persist = crate::core::DbRequest::SetReadMarker {
-            account: account.clone(),
-            target: key.as_str().to_string(),
-            marker_ms: new_ms,
-        };
-        if state.db_tx.try_push(persist).is_err() {
+    // A request at or behind a value that was already confirmed durable needs
+    // no write. Everything else waits for PostgreSQL: mutating the hot mirror
+    // and broadcasting first would make a queue/store failure look successful
+    // until the next restart exposed the lost marker.
+    let existing = state.read_markers.get(&marker_key).copied();
+    if !marker_pending
+        && let Some(current) = existing
+        && new_ms <= current
+    {
+        state.send(
+            conn,
+            &format!(
+                ":{server} MARKREAD {target} timestamp={}",
+                e6irc_proto::time::server_time(current)
+            ),
+        );
+        return;
+    }
+
+    let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
+    let persist = crate::core::DbRequest::SetReadMarker {
+        conn,
+        account: account.clone(),
+        target: key.as_str().to_string(),
+        display: target.to_string(),
+        marker_ms: new_ms,
+        label,
+    };
+    if state.db_tx.try_push(persist).is_err() {
+        markread_fail(
+            state,
+            conn,
+            target,
+            "TEMPORARILY_UNAVAILABLE",
+            "Read marker could not be persisted",
+        );
+        return;
+    }
+
+    *state.pending_read_markers.entry(marker_key).or_default() += 1;
+    state.defer_reply(conn);
+    if let Some(cap) = state.capture.as_mut()
+        && cap.label.is_some()
+    {
+        cap.deferred = true;
+    }
+}
+
+fn release_pending_marker(state: &mut ServerState, account: &str, target: &str) {
+    let key = (state.account_key(account), state.chan_key(target));
+    match state.pending_read_markers.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) if *entry.get() > 1 => {
+            *entry.get_mut() -= 1;
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            entry.remove();
+        }
+        std::collections::hash_map::Entry::Vacant(_) => {
             eprintln!(
-                "history: db queue full or closed; read marker for {} not persisted",
-                key.as_str()
+                "core: invariant violation: read-marker DB reply without a pending reservation"
             );
         }
     }
-    let current = existing.map_or(new_ms, |cur| cur.max(new_ms));
+}
+
+pub(super) fn read_marker_stored(
+    state: &mut ServerState,
+    conn: ConnId,
+    account: String,
+    target: String,
+    display: String,
+    marker_ms: e6irc_proto::time::Millis,
+    label: Option<String>,
+) {
+    release_pending_marker(state, &account, &target);
+    let marker_key = (state.account_key(&account), state.chan_key(&target));
+    let moved_forward = state
+        .read_markers
+        .insert(marker_key, marker_ms)
+        .is_none_or(|previous| marker_ms > previous);
+    let server = state.config.server_name.clone();
     let line = format!(
-        ":{server} MARKREAD {target} timestamp={}",
-        e6irc_proto::time::server_time(current)
+        ":{server} MARKREAD {} timestamp={}",
+        clip_echo(&display),
+        e6irc_proto::time::server_time(marker_ms)
     );
-    // A forward move syncs to all the account's clients; a no-op just
-    // confirms the current marker to the requester. The sync only reaches
-    // siblings that negotiated `draft/read-marker` and have finished
-    // registration — every other MARKREAD emission gates on the cap, and
-    // `account_connections` also includes sessions that set `account` during
-    // SASL but aren't registered yet, so an unfiltered fan-out would push a
-    // MARKREAD line to a connection that never opted into it. The setter itself
-    // holds the cap (checked on entry), so it still gets its confirmation.
+
+    // A durable forward move syncs to the account's other registered clients
+    // that negotiated the capability. The requester is emitted separately so
+    // its deferred ordering and label are preserved, including if it changed
+    // accounts while the write was in flight.
     if moved_forward {
         for peer in state.account_connections(&account) {
-            if state
-                .sessions
-                .get(&peer)
-                .is_some_and(|s| s.is_registered() && s.caps.read_marker)
+            if peer != conn
+                && state
+                    .sessions
+                    .get(&peer)
+                    .is_some_and(|session| session.is_registered() && session.caps.read_marker)
             {
                 state.send(peer, &line);
             }
         }
-    } else {
-        state.send(conn, &line);
+    }
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, move |state| {
+            state.send(conn, &line);
+        });
+    }
+}
+
+pub(super) fn read_marker_unavailable(
+    state: &mut ServerState,
+    conn: ConnId,
+    account: String,
+    target: String,
+    display: String,
+    label: Option<String>,
+) {
+    release_pending_marker(state, &account, &target);
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, move |state| {
+            markread_fail(
+                state,
+                conn,
+                &display,
+                "TEMPORARILY_UNAVAILABLE",
+                "Read marker could not be persisted",
+            );
+        });
     }
 }

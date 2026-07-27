@@ -493,14 +493,32 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                 .is_ok()
         }
         DbRequest::SetReadMarker {
+            conn,
             account,
             target,
+            display,
             marker_ms,
+            label,
         } => {
-            if let Err(e) = set_read_marker(pool, &account, &target, marker_ms).await {
-                eprintln!("db: read marker persistence failed: {e}");
-            }
-            true
+            let reply = match set_read_marker(pool, &account, &target, marker_ms).await {
+                Ok(marker_ms) => crate::core::DbReply::ReadMarkerStored {
+                    account,
+                    target,
+                    display,
+                    marker_ms,
+                    label,
+                },
+                Err(e) => {
+                    eprintln!("db: read marker persistence failed: {e}");
+                    crate::core::DbReply::ReadMarkerUnavailable {
+                        account,
+                        target,
+                        display,
+                        label,
+                    }
+                }
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::SetChannelTopic { channel, topic } => {
             if let Err(e) = set_channel_topic(pool, &channel, topic).await {
@@ -619,28 +637,28 @@ async fn set_read_marker(
     account: &str,
     target: &str,
     marker_ms: e6irc_proto::time::Millis,
-) -> Result<(), DbError> {
+) -> Result<e6irc_proto::time::Millis, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let result = sqlx::query(
+    let stored: Option<i64> = sqlx::query_scalar(
         "INSERT INTO read_markers (account_id, target, marker_ts)
          SELECT a.id, $1, to_timestamp($2::double precision / 1000)
          FROM accounts a WHERE a.name_folded = $3
          ON CONFLICT (account_id, target)
-         DO UPDATE SET marker_ts = GREATEST(read_markers.marker_ts, EXCLUDED.marker_ts)",
+         DO UPDATE SET marker_ts = GREATEST(read_markers.marker_ts, EXCLUDED.marker_ts)
+         RETURNING (EXTRACT(EPOCH FROM marker_ts) * 1000)::bigint",
     )
     .bind(target)
     .bind(marker_ms.as_millis() as i64)
     .bind(&folded)
-    .execute(pool)
+    .fetch_optional(pool)
     .await
     .map_err(DbError::Query)?;
-    // The SELECT matches no row if the account name doesn't resolve; that
-    // persists nothing while the in-core mirror already moved, silently
-    // diverging the two. Surface it instead.
-    if result.rows_affected() == 0 {
+    // The SELECT matches no row if the account name no longer resolves.
+    // Surface that as an unavailable verdict rather than a false success.
+    let Some(stored) = stored else {
         return Err(DbError::UnknownAccount(account.to_string()));
-    }
-    Ok(())
+    };
+    Ok(e6irc_proto::time::Millis::from_millis(stored as u64))
 }
 
 /// Outcome of linking an OIDC identity to an account.
