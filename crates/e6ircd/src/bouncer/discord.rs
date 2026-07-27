@@ -167,10 +167,17 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
 
     // First frame must be HELLO, carrying the heartbeat interval.
     let hb_interval = match tokio::time::timeout(Duration::from_secs(30), read.next()).await {
-        Ok(Some(Ok(Ws::Text(t)))) => match parse_frame(t.as_str()).event {
-            Event::Hello(ms) => ms,
-            _ => {
+        Ok(Some(Ok(Ws::Text(t)))) => match parse_frame(t.as_str()) {
+            Ok(Frame {
+                event: Event::Hello(ms),
+                ..
+            }) => ms,
+            Ok(_) => {
                 eprintln!("discord: first gateway frame was not HELLO");
+                return Dropped;
+            }
+            Err(e) => {
+                eprintln!("discord: malformed HELLO frame: {e}");
                 return Dropped;
             }
         },
@@ -193,7 +200,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     }
     ends.emit(ConnectionEvent::Connected);
 
-    let mut heartbeat = tokio::time::interval(Duration::from_millis(hb_interval.max(1000)));
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(hb_interval));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seq: Option<u64> = None;
     let mut our_id = String::new();
@@ -245,7 +252,13 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         return Dropped;
                     }
                 };
-                let frame = parse_frame(&text);
+                let frame = match parse_frame(&text) {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        eprintln!("discord: malformed gateway frame: {e}");
+                        return Dropped;
+                    }
+                };
                 if let Some(s) = frame.seq {
                     last_seq = Some(s);
                 }
@@ -338,42 +351,108 @@ enum Event {
     Ignore,
 }
 
-fn parse_frame(text: &str) -> Frame {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return Frame {
-            seq: None,
-            event: Event::Ignore,
-        };
-    };
-    let seq = v["s"].as_u64();
-    let event = match v["op"].as_u64() {
-        Some(10) => Event::Hello(v["d"]["heartbeat_interval"].as_u64().unwrap_or(45000)),
-        Some(1) => Event::HeartbeatRequest,
-        Some(11) => Event::Ack,
-        Some(0) => match v["t"].as_str().unwrap_or("") {
-            "READY" => Event::Ready(v["d"]["user"]["id"].as_str().unwrap_or("").to_string()),
-            "MESSAGE_CREATE" => {
-                let d = &v["d"];
-                Event::Message {
-                    channel_id: d["channel_id"].as_str().unwrap_or("").to_string(),
-                    author_id: d["author"]["id"].as_str().unwrap_or("").to_string(),
-                    author: d["author"]["username"].as_str().unwrap_or("?").to_string(),
-                    content: d["content"].as_str().unwrap_or("").to_string(),
-                    attachments: d["attachments"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x["url"].as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                }
+#[derive(serde::Deserialize)]
+struct GatewayFrame {
+    op: u64,
+    #[serde(default)]
+    s: Option<u64>,
+    #[serde(default)]
+    t: Option<String>,
+    #[serde(default)]
+    d: serde_json::Value,
+}
+
+#[derive(serde::Deserialize)]
+struct HelloData {
+    heartbeat_interval: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct ReadyData {
+    user: ReadyUser,
+}
+
+#[derive(serde::Deserialize)]
+struct ReadyUser {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MessageData {
+    channel_id: String,
+    author: MessageAuthor,
+    content: String,
+    #[serde(default)]
+    attachments: Vec<MessageAttachment>,
+}
+
+#[derive(serde::Deserialize)]
+struct MessageAuthor {
+    id: String,
+    username: String,
+}
+
+#[derive(serde::Deserialize)]
+struct MessageAttachment {
+    url: String,
+}
+
+fn decode_data<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+    event: &str,
+) -> Result<T, String> {
+    serde_json::from_value(value).map_err(|e| format!("{event} data: {e}"))
+}
+
+fn parse_frame(text: &str) -> Result<Frame, String> {
+    let frame: GatewayFrame =
+        serde_json::from_str(text).map_err(|e| format!("gateway JSON: {e}"))?;
+    let event = match frame.op {
+        10 => {
+            let hello: HelloData = decode_data(frame.d, "HELLO")?;
+            if hello.heartbeat_interval == 0 {
+                return Err("HELLO heartbeat_interval was zero".to_string());
             }
-            _ => Event::Ignore,
-        },
+            Event::Hello(hello.heartbeat_interval)
+        }
+        1 => Event::HeartbeatRequest,
+        11 => Event::Ack,
+        0 => {
+            let name = frame
+                .t
+                .as_deref()
+                .ok_or("dispatch frame had no event name")?;
+            if frame.s.is_none() {
+                return Err(format!("{name} dispatch had no sequence number"));
+            }
+            match name {
+                "READY" => {
+                    let ready: ReadyData = decode_data(frame.d, "READY")?;
+                    Event::Ready(ready.user.id)
+                }
+                "MESSAGE_CREATE" => {
+                    let message: MessageData = decode_data(frame.d, "MESSAGE_CREATE")?;
+                    Event::Message {
+                        channel_id: message.channel_id,
+                        author_id: message.author.id,
+                        author: message.author.username,
+                        content: message.content,
+                        attachments: message
+                            .attachments
+                            .into_iter()
+                            .map(|attachment| attachment.url)
+                            .collect(),
+                    }
+                }
+                _ => Event::Ignore,
+            }
+        }
         _ => Event::Ignore,
     };
-    Frame { seq, event }
+    Ok(Frame {
+        seq: frame.s,
+        event,
+    })
 }
 
 async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {
@@ -435,11 +514,12 @@ mod tests {
 
     #[test]
     fn parses_hello_and_tracks_seq() {
-        let f = parse_frame(r#"{"op":10,"d":{"heartbeat_interval":41250}}"#);
+        let f = parse_frame(r#"{"op":10,"d":{"heartbeat_interval":41250}}"#).expect("HELLO");
         assert!(matches!(f.event, Event::Hello(41250)));
         assert_eq!(f.seq, None);
 
-        let f = parse_frame(r#"{"op":0,"s":7,"t":"READY","d":{"user":{"id":"999"}}}"#);
+        let f =
+            parse_frame(r#"{"op":0,"s":7,"t":"READY","d":{"user":{"id":"999"}}}"#).expect("READY");
         assert_eq!(f.seq, Some(7));
         assert!(matches!(f.event, Event::Ready(id) if id == "999"));
     }
@@ -449,7 +529,8 @@ mod tests {
         let f = parse_frame(
             r#"{"op":0,"s":8,"t":"MESSAGE_CREATE","d":{"channel_id":"42","content":"hi",
                "author":{"id":"7","username":"alice"}}}"#,
-        );
+        )
+        .expect("MESSAGE_CREATE");
         assert_eq!(f.seq, Some(8));
         match f.event {
             Event::Message {
@@ -471,15 +552,34 @@ mod tests {
     #[test]
     fn opcodes_and_garbage() {
         assert!(matches!(
-            parse_frame(r#"{"op":1}"#).event,
+            parse_frame(r#"{"op":1}"#).expect("heartbeat request").event,
             Event::HeartbeatRequest
         ));
-        assert!(matches!(parse_frame(r#"{"op":11}"#).event, Event::Ack));
         assert!(matches!(
-            parse_frame(r#"{"op":0,"t":"TYPING_START"}"#).event,
+            parse_frame(r#"{"op":11}"#).expect("heartbeat ack").event,
+            Event::Ack
+        ));
+        assert!(matches!(
+            parse_frame(r#"{"op":0,"s":9,"t":"TYPING_START"}"#)
+                .expect("unknown dispatch")
+                .event,
             Event::Ignore
         ));
-        assert!(matches!(parse_frame("not json").event, Event::Ignore));
+        assert!(parse_frame("not json").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_known_frames_instead_of_defaulting_fields() {
+        assert!(parse_frame(r#"{"op":10,"d":{}}"#).is_err());
+        assert!(parse_frame(r#"{"op":10,"d":{"heartbeat_interval":0}}"#).is_err());
+        assert!(parse_frame(r#"{"op":0,"t":"READY","d":{"user":{"id":"999"}}}"#).is_err());
+        assert!(
+            parse_frame(
+                r#"{"op":0,"s":8,"t":"MESSAGE_CREATE","d":{"channel_id":"42","content":"hi",
+               "author":{"id":"7"}}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
