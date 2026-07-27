@@ -190,6 +190,40 @@ function renderBufferList() {
   }
 }
 
+// Render `text` into `span`, turning http(s) URLs into links. Everything goes
+// through text nodes and element *properties* (never innerHTML), and only
+// http/https tokens become links — a `javascript:`/`data:` scheme never matches
+// URL_RE — so a hostile line still cannot inject markup or an unsafe href.
+const URL_RE = /https?:\/\/[^\s<>"']+/g;
+function renderText(span, text) {
+  URL_RE.lastIndex = 0;
+  let last = 0;
+  let m;
+  while ((m = URL_RE.exec(text)) !== null) {
+    if (m.index > last) {
+      span.appendChild(document.createTextNode(text.slice(last, m.index)));
+    }
+    // Trailing sentence punctuation is usually not part of the URL.
+    let url = m[0];
+    let tail = "";
+    const trailing = url.match(/[.,;:!?)\]]+$/);
+    if (trailing) {
+      tail = trailing[0];
+      url = url.slice(0, url.length - tail.length);
+    }
+    const a = document.createElement("a");
+    a.href = url;
+    a.textContent = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.className = "msg-link";
+    span.appendChild(a);
+    if (tail) span.appendChild(document.createTextNode(tail));
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) span.appendChild(document.createTextNode(text.slice(last)));
+}
+
 function messageRow(line) {
   const row = document.createElement("li");
   row.className = "line line-" + line.kind + (line.mention ? " line-mention" : "");
@@ -202,7 +236,7 @@ function messageRow(line) {
   from.textContent = line.from ? line.from : "";
   const text = document.createElement("span");
   text.className = "text";
-  text.textContent = line.text;
+  renderText(text, line.text);
   row.append(time, from, text);
   return row;
 }
@@ -607,6 +641,37 @@ function connect() {
   });
 }
 
+// Composer input history: Up/Down recall previously sent lines, like a shell.
+const sentHistory = [];
+let historyIdx = -1; // -1 = editing a fresh line, not browsing history
+let historyDraft = ""; // the in-progress line, restored when browsing past the end
+messageInput.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowUp") {
+    if (historyIdx === -1) {
+      if (sentHistory.length === 0) return;
+      historyDraft = messageInput.value;
+      historyIdx = sentHistory.length - 1;
+    } else if (historyIdx > 0) {
+      historyIdx -= 1;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    messageInput.value = sentHistory[historyIdx];
+    messageInput.setSelectionRange(messageInput.value.length, messageInput.value.length);
+  } else if (e.key === "ArrowDown") {
+    if (historyIdx === -1) return;
+    e.preventDefault();
+    if (historyIdx < sentHistory.length - 1) {
+      historyIdx += 1;
+      messageInput.value = sentHistory[historyIdx];
+    } else {
+      historyIdx = -1;
+      messageInput.value = historyDraft;
+    }
+  }
+});
+
 composer.addEventListener("submit", (e) => {
   e.preventDefault();
   const text = messageInput.value;
@@ -629,6 +694,10 @@ composer.addEventListener("submit", (e) => {
     if (text.startsWith("/me ")) addLine(b.display, "event", b.kind, null, `* ${myNick} ${text.slice(4)}`);
     else if (!text.startsWith("/")) addLine(b.display, "msg", b.kind, myNick, text);
   }
+  // Record for Up/Down recall (skip a consecutive duplicate; bound the list).
+  if (sentHistory[sentHistory.length - 1] !== text) sentHistory.push(text);
+  if (sentHistory.length > 100) sentHistory.shift();
+  historyIdx = -1;
   messageInput.value = "";
   messageInput.focus();
 });

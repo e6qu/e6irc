@@ -843,10 +843,11 @@ counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
 account and refuses a self-service kill of a session not authenticated as the
 caller, so it can never touch anyone else's. The console shell (`console_base.html`) is
 also the home of `/console/networks` — a per-user BNC network manager with
-live connection status, add/remove/enable-disable, and **edit** of a network's
-connection/identity fields (addr, tls, nick, realname, autojoin; SASL
-credentials change via delete+recreate), available to any authenticated user
-for their own networks — and `/console/integrations` (admin), which manages the
+live connection status, add/remove/enable-disable, and **edit** of an IRC
+network's connection/identity fields (addr, tls, nick, realname, autojoin; SASL
+credentials change via delete+recreate; a bridge is edited on the Integrations
+page, so the IRC edit form refuses non-IRC kinds), available to any
+authenticated user for their own networks — and `/console/integrations` (admin), which manages the
 chat-platform
 bridges: per-platform build availability, running bridges with status, and
 add/remove. A network's `kind` (`irc`/`matrix`/`discord`/`slack`) is a column on

@@ -288,6 +288,29 @@ pub(super) async fn update_network_core(
 ) -> Result<(), Response> {
     validate_irc_upstream(addr, nick, realname, autojoin)?;
     let pool = pool_of(state);
+    // This form edits IRC connection/identity fields; a bridge (matrix/discord/
+    // slack) has no such fields and its credentials change via delete+recreate.
+    // Refuse to overwrite a non-IRC row's addr/nick/etc. through it (a direct
+    // POST to the edit URL, since the UI hides the link for bridges).
+    match crate::db::get_bnc_network(pool, account, name).await {
+        Ok(Some(row)) if row.kind != crate::config::NetworkKind::Irc => {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Not an IRC network",
+                Some("bridges are managed on the Integrations page, not edited here"),
+            ));
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+        Err(e) => {
+            eprintln!("http: network update kind check: {e}");
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    }
     match crate::db::update_bnc_network(pool, account, name, addr, tls, nick, realname, autojoin)
         .await
     {

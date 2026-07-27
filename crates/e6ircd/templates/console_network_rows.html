@@ -14,7 +14,7 @@
         <td><code>{{ n.nick }}</code></td>
         <td>{% if n.autojoin.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ n.autojoin }}</code>{% endif %}</td>
         <td>
-          <a class="rowlink" href="/console/networks/{{ n.name }}/edit">Edit</a>
+          {% if n.editable %}<a class="rowlink" href="/console/networks/{{ n.name }}/edit">Edit</a>{% endif %}
           <button
             hx-post="/console/networks/{{ n.name }}/toggle"
             hx-vals='{"enabled": "{% if n.enabled %}false{% else %}true{% endif %}"}'
