@@ -61,6 +61,17 @@ pub(super) const REALLEN: usize = 150;
 /// 63-byte host is well inside. The stored (clipped) mask is what the mode
 /// echo announces, so what clients see is exactly what is enforced.
 pub(super) const BANMASKLEN: usize = 100;
+/// Channel key (`+k`) cap, applied at store time (Solanum's `KEYLEN`, 24). Like
+/// [`BANMASKLEN`], an *unclipped* key — bounded only by the 510-byte input frame
+/// — produces a `MODE +k <key>` broadcast that the mode-line splitter cannot
+/// break (a single change, so there is no earlier flush point) and that
+/// overflows the 512-byte wire limit: a `debug_assertions` panic in the shared
+/// core worker (a one-connection DoS for every client), or in release a silent
+/// desync (recipients discard the over-long line whole while the key is applied,
+/// and a later RPL_CHANNELMODEIS is equally over-long). Clipping at the store
+/// makes the mode echo and the 324 reply fit by construction; the stored
+/// (clipped) key is exactly what is echoed and enforced. Advertised as `KEYLEN`.
+pub(super) const KEYLEN: usize = 24;
 
 /// Canonicalize a channel list-mode (+b/+q/+e/+I) mask to `nick!user@host`,
 /// filling missing components with `*` (Solanum's `clean_ban_mask`). Without
@@ -1173,6 +1184,11 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                         );
                         continue;
                     }
+                    // Clip to KEYLEN at the store, so the +k broadcast and
+                    // RPL_CHANNELMODEIS fit the wire by construction (see KEYLEN).
+                    // The echo below uses the same clipped value, so what clients
+                    // see is exactly what is enforced.
+                    let k = truncate_chars(k, KEYLEN);
                     chan.modes.key = Some(k.to_string());
                     changes.push((true, 'k', Some(k.to_string())));
                 } else {

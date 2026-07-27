@@ -2274,6 +2274,19 @@ mod client_ip_tests {
     }
 
     #[test]
+    fn multiple_forwarded_headers_are_joined_in_order() {
+        // A proxy that appends a *separate* X-Forwarded-For header rather than
+        // merging: the client-supplied first header must not win over the
+        // proxy's appended one. The real client (the appended header's rightmost
+        // untrusted entry) is returned, not the spoofed 6.6.6.6 in the first.
+        let trusted = [net("10.0.0.0/8")];
+        let mut h = axum::http::HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        h.append("x-forwarded-for", "203.0.113.7, 10.0.0.2".parse().unwrap());
+        assert_eq!(client_ip(ip("10.0.0.1"), &h, &trusted), ip("203.0.113.7"));
+    }
+
+    #[test]
     fn port_annotated_and_bracketed_forwarded_entries_are_parsed() {
         // Some proxies emit `ip:port` / `[ip6]:port`. A bare IpAddr parse would
         // reject these and skip past the real client to a spoofable entry or the
