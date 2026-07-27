@@ -4498,21 +4498,15 @@ ChanServ auth gating, and the OAuth device flow. Four defects fixed on one PR:
    URL with a host whenever set. Test
    `unparseable_public_url_is_rejected_even_without_oidc`.
 
-One MED finding is **escalated to the maintainer as an open decision** (not
-filed away): DM history with a *never-authenticated* peer becomes an empty batch
-after they disconnect. The write path keys the DM under `conn_identity(peer)` =
-`~<nick>` for an unauthenticated peer; the offline read path uses
-`nick_identity(nick)` = the bare account form (no `~`), so the keys disagree by
-the tilde and `CHATHISTORY LATEST <nick>` returns empty for backlog that
-`CHATHISTORY TARGETS` still advertises. The clean fix is blocked on a design
-question: the core holds **no synchronous registry of account names**
-(`registered_peer` only knows online sessions), so it cannot tell an offline
-account-nick (key `nick`, deliberately readable "while they are away" per the
-`nick_identity` doc) from an offline unauthenticated peer (key `~nick`). Serving
-both correctly needs either an account-name cache in the core or a dual-key /
-fallback query across the paged CHATHISTORY path — a non-trivial change to the
-most heavily-tested subsystem, with a real behavior tradeoff. Awaiting the
-maintainer's call on which direction to take.
+Follow-up (2026-07-27): the direct-message history finding is fixed with the
+dual-key database resolution path. An offline nick produces a typed
+`HistoryTargets::PreferExisting` request: PostgreSQL reads the account-form
+conversation when it exists and otherwise falls back to the unauthenticated
+`~nick` form. Channels and online peers produce `HistoryTargets::Exact`, so the
+ambiguity cannot leak into those paths. The regression is covered both at the
+database-worker boundary (primary and fallback branches) and end-to-end after
+an unauthenticated peer disconnects; `CHATHISTORY LATEST <nick>` now returns the
+same backlog that `CHATHISTORY TARGETS` advertises.
 
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI

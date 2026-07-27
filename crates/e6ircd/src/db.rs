@@ -439,13 +439,18 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
         }
         DbRequest::QueryHistory {
             conn,
-            target,
+            targets,
             display,
             batch_ref,
             query,
             label,
         } => {
-            let rows = query_history(pool, &target, query).await.map_err(|e| {
+            let rows = async {
+                let effective = resolve_history_target(pool, targets).await?;
+                query_history(pool, &effective, query).await
+            }
+            .await
+            .map_err(|e| {
                 // The error string is logged here; the core only needs to know
                 // it failed so it can FAIL the CHATHISTORY rather than reply
                 // with a misleading empty page.
@@ -802,6 +807,23 @@ macro_rules! history_window {
             ") ) w ORDER BY ts ASC, id ASC"
         )
     };
+}
+
+/// Resolve the stored target for an exact or offline-ambiguous history request.
+async fn resolve_history_target(
+    pool: &PgPool,
+    targets: crate::core::HistoryTargets,
+) -> Result<String, sqlx::Error> {
+    let (primary, fallback) = match targets {
+        crate::core::HistoryTargets::Exact(target) => return Ok(target),
+        crate::core::HistoryTargets::PreferExisting { primary, fallback } => (primary, fallback),
+    };
+    let primary_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE target = $1)")
+            .bind(&primary)
+            .fetch_one(pool)
+            .await?;
+    Ok(if primary_exists { primary } else { fallback })
 }
 
 pub async fn query_history(

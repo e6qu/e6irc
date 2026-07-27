@@ -192,8 +192,7 @@ pub enum DbRequest {
     /// in-memory ring. Answered with [`Input::HistoryPage`].
     QueryHistory {
         conn: ConnId,
-        /// Casefolded target.
-        target: String,
+        targets: HistoryTargets,
         display: String,
         batch_ref: String,
         query: HistoryQuery,
@@ -301,6 +300,15 @@ pub enum DbRequest {
         /// Unix milliseconds.
         ts: e6irc_proto::time::Millis,
     },
+}
+
+/// Stored targets that may back one CHATHISTORY request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryTargets {
+    /// A channel or an online direct-message peer resolves exactly.
+    Exact(String),
+    /// An offline nick may name an account or an unauthenticated `~nick`.
+    PreferExisting { primary: String, fallback: String },
 }
 
 /// Which command asked for an account to be created. Carried on the request

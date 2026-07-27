@@ -162,6 +162,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     silently mis-mapped (a replayed message showing its body as the source
     prefix); the computed `ts_millis` column is aliased so it has a name to bind
     to. Same class as `WhoxRow`, closed at the SQL edge.
+  - `HistoryTargets` — a database history read is either one exact target or an
+    offline direct-message choice with a primary and fallback. The fallback
+    cannot accidentally be applied to channels or online peers, and the two
+    candidate keys cannot be passed as unrelated request fields.
   - `Hidden` — a `+s` (secret) channel is invisible to non-members on *every*
     query surface. The predicate lives once in `Channel::hidden_from`, and the
     deny surfaces (MODE/KNOCK/TOPIC) take the returned `Hidden` token to the one
@@ -968,7 +972,11 @@ Design constraints recorded now:
   *unauthenticated* holders of a nick do share an identity — there is nothing
   stronger to key on, and scoping to the connection would cut the other
   participant off from their own conversation the moment the peer left. The
-  account boundary is the one that carries privilege.)
+  account boundary is the one that carries privilege.) When the correspondent
+  is offline, the core cannot distinguish an account name from a formerly
+  unauthenticated nick. The PostgreSQL read therefore prefers the account-form
+  conversation when it exists and otherwise tries the `~nick` form; online
+  peers and channels always resolve to one exact target.
 - **11.2 Query surface**: IRCv3 `CHATHISTORY` (BEFORE/AFTER/AROUND/BETWEEN/
   LATEST/TARGETS) for IRC clients; `GET /api/v1/history/...` for the web
   client and API consumers — both hit the same query layer, including direct

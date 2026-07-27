@@ -159,7 +159,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // participant in a direct-message conversation, which the requester is a
     // participant of by construction — the key is derived from their own nick,
     // so a client can only ever ask for a conversation it is part of.
-    let hist_key = if target.starts_with('#') {
+    let (hist_key, history_targets) = if target.starts_with('#') {
         let key = state.chan_key(target);
         let is_member = state
             .channels
@@ -175,7 +175,9 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             );
             return;
         }
-        crate::core::state::HistoryKey::from(&key)
+        let history_key = crate::core::state::HistoryKey::from(&key);
+        let targets = crate::core::HistoryTargets::Exact(history_key.as_str().to_string());
+        (history_key, targets)
     } else {
         if state.sessions[&conn].nick().is_none() {
             chathistory_fail(
@@ -187,9 +189,20 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
             );
             return;
         }
-        state
-            .dm_conversation(&state.conn_identity(conn), &state.nick_identity(target))
-            .0
+        let me = state.conn_identity(conn);
+        let peer = state.nick_identity(target);
+        let key = state.dm_conversation(&me, &peer).0;
+        let targets =
+            if state.registered_peer(&state.nick_key(target)).is_none() && !peer.starts_with('~') {
+                let fallback = state.dm_conversation(&me, &format!("~{peer}")).0;
+                crate::core::HistoryTargets::PreferExisting {
+                    primary: key.as_str().to_string(),
+                    fallback: fallback.as_str().to_string(),
+                }
+            } else {
+                crate::core::HistoryTargets::Exact(key.as_str().to_string())
+            };
+        (key, targets)
     };
     // Parse the subcommand once into a typed value: the ring resolver and the DB
     // query builder both consume it, so they can no longer enumerate the
@@ -372,7 +385,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         let label = state.capture.as_ref().and_then(|c| c.label.clone());
         let request = crate::core::DbRequest::QueryHistory {
             conn,
-            target: hist_key.as_str().to_string(),
+            targets: history_targets,
             display: display.clone(),
             batch_ref,
             query,
