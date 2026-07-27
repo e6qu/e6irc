@@ -170,6 +170,27 @@ fn identify(s: &mut TestServer, conn: ConnId, account: &str) {
     s.drain(conn);
 }
 
+fn commit_server_ban(s: &mut TestServer) -> e6ircd::core::ServerBanMutation {
+    let mut pending = None;
+    for request in s.db_requests() {
+        if let e6ircd::core::DbRequest::MutateServerBan {
+            mutation,
+            requester,
+        } = request
+        {
+            assert!(pending.is_none(), "expected one server-ban mutation");
+            pending = Some((mutation, requester));
+        }
+    }
+    let (mutation, requester) = pending.expect("server-ban mutation not queued");
+    s.core.handle(Input::ServerBanResult {
+        mutation: mutation.clone(),
+        requester,
+        result: e6ircd::core::ServerBanResult::Stored,
+    });
+    mutation
+}
+
 #[derive(Debug)]
 struct PendingReadMarker {
     conn: ConnId,
@@ -2778,6 +2799,8 @@ fn chanserv_register_flow() {
             conn: alice,
             channel: "#mine".into(),
             founder_account: "alice".into(),
+            topic: None,
+            label: None,
         }]
     );
     s.core.handle(Input::DbReply {
@@ -2785,6 +2808,8 @@ fn chanserv_register_flow() {
         reply: e6ircd::core::DbReply::ChannelRegistered {
             channel: "#mine".into(),
             founder_account: "alice".into(),
+            topic: None,
+            label: None,
         },
     });
     let out = s.drain(alice);
@@ -2792,6 +2817,130 @@ fn chanserv_register_flow() {
         out.iter()
             .any(|l| l.starts_with(":ChanServ!") && l.contains("registered")),
         "{out:#?}"
+    );
+}
+
+#[test]
+fn channel_registration_persists_its_initial_topic_atomically() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #mine");
+    s.drain(alice);
+    s.db_requests();
+    // Before registration this is an ordinary live-only topic.
+    s.line(alice, "TOPIC #mine :registration topic");
+    s.drain(alice);
+
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
+    assert!(
+        s.drain(alice).is_empty(),
+        "registration must wait for its durable verdict"
+    );
+    let requests = s.db_requests();
+    let topic = match requests.as_slice() {
+        [
+            e6ircd::core::DbRequest::RegisterChannel {
+                channel,
+                founder_account,
+                topic: Some(topic),
+                ..
+            },
+        ] if channel == "#mine" && founder_account == "alice" => topic.clone(),
+        other => panic!("registration did not carry its initial topic: {other:#?}"),
+    };
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::ChannelRegistered {
+            channel: "#mine".into(),
+            founder_account: "alice".into(),
+            topic: Some(topic),
+            label: None,
+        },
+    });
+    s.drain(alice);
+
+    s.line(alice, "PART #mine");
+    s.drain(alice);
+    s.line(alice, "JOIN #mine");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 332 ") && line.ends_with(":registration topic")),
+        "the atomically registered topic was not retained: {out:#?}"
+    );
+}
+
+#[test]
+fn pending_channel_registrations_count_toward_the_account_cap() {
+    let mut s = TestServer::new();
+    s.core.preload_founders(
+        (0..199)
+            .map(|i| (format!("#owned{i}"), "alice".to_string()))
+            .collect(),
+    );
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #reserved,#over-cap");
+    s.drain(alice);
+    s.db_requests();
+
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #reserved");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::RegisterChannel { channel, .. }]
+            if channel == "#reserved"
+    ));
+    // The first INSERT has not resolved, but its reservation is the 200th
+    // permanent founder entry. A pipelined 201st registration is refused.
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #over-cap");
+    assert!(
+        s.db_requests().is_empty(),
+        "an in-flight registration must consume a cap slot"
+    );
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::ChannelRegisterUnavailable {
+            channel: "#reserved".into(),
+            label: None,
+        },
+    });
+    let out = s.drain(alice);
+    assert!(
+        out.iter().any(|line| line.contains("too many channels")),
+        "the pipelined over-cap command was not refused: {out:#?}"
+    );
+}
+
+#[test]
+fn reregistering_owned_channel_does_not_reserve_an_extra_cap_slot() {
+    let mut s = TestServer::new();
+    s.core.preload_founders(
+        (0..199)
+            .map(|i| (format!("#owned{i}"), "alice".to_string()))
+            .collect(),
+    );
+    let alice = s.register(1, "alice");
+    identify(&mut s, alice, "alice");
+    s.line(alice, "JOIN #owned0,#last-slot");
+    s.drain(alice);
+    s.db_requests();
+
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #owned0");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::RegisterChannel { channel, .. }]
+            if channel == "#owned0"
+    ));
+
+    s.line(alice, "PRIVMSG ChanServ :REGISTER #last-slot");
+    assert!(
+        matches!(
+            s.db_requests().as_slice(),
+            [e6ircd::core::DbRequest::RegisterChannel { channel, .. }]
+                if channel == "#last-slot"
+        ),
+        "a pending re-registration of a committed channel must not consume a new founder slot"
     );
 }
 
@@ -2820,6 +2969,8 @@ fn chanserv_flags_rejects_an_unknown_flag() {
         reply: e6ircd::core::DbReply::ChannelRegistered {
             channel: "#mine".into(),
             founder_account: "alice".into(),
+            topic: None,
+            label: None,
         },
     });
     s.drain(alice);
@@ -5456,6 +5607,8 @@ fn registration_records_founder_for_later_rejoin() {
         reply: e6ircd::core::DbReply::ChannelRegistered {
             channel: "#room".to_string(),
             founder_account: "boss".to_string(),
+            topic: None,
+            label: None,
         },
     });
     s.drain(boss);
@@ -5505,6 +5658,8 @@ fn channel_registration_uses_the_echoed_founder_not_the_live_session() {
         reply: e6ircd::core::DbReply::ChannelRegistered {
             channel: "#room".to_string(),
             founder_account: "boss".to_string(),
+            topic: None,
+            label: None,
         },
     });
     s.drain(boss);
@@ -5565,7 +5720,10 @@ fn chanserv_register_db_unavailable_notifies() {
     s.db_requests();
     s.core.handle(Input::DbReply {
         conn: boss,
-        reply: e6ircd::core::DbReply::ChannelRegisterUnavailable,
+        reply: e6ircd::core::DbReply::ChannelRegisterUnavailable {
+            channel: "#room".into(),
+            label: None,
+        },
     });
     let out = s.drain(boss);
     assert!(
@@ -6062,13 +6220,40 @@ fn registered_channel_topic_persisted_on_set() {
     s.db_requests();
 
     s.line(boss, "TOPIC #reg :new topic");
-    s.drain(boss);
-    let persisted = s.db_requests().into_iter().any(|r| {
-        matches!(r,
-            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
-            if channel == "#reg" && text == "new topic")
+    assert!(
+        s.drain(boss).is_empty(),
+        "registered TOPIC must not echo before persistence"
+    );
+    let requests = s.db_requests();
+    let revision = match requests.as_slice() {
+        [
+            e6ircd::core::DbRequest::SetChannelTopic {
+                channel,
+                topic: Some((text, ..)),
+                revision,
+                ..
+            },
+        ] if channel == "#reg" && text == "new topic" => *revision,
+        other => panic!("SetChannelTopic not queued once: {other:#?}"),
+    };
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelTopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            prefix: "boss!u@127.0.0.1".into(),
+            topic: Some(("new topic".into(), "boss!u@127.0.0.1".into(), 1)),
+            revision,
+            retained: true,
+            label: None,
+        },
     });
-    assert!(persisted, "SetChannelTopic not queued");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|line| line.contains(" TOPIC #reg :new topic")),
+        "registered TOPIC was not emitted after persistence"
+    );
 
     // An unregistered channel does not persist its topic.
     s.line(boss, "JOIN #plain");
@@ -6081,6 +6266,183 @@ fn registered_channel_topic_persisted_on_set() {
         .into_iter()
         .any(|r| matches!(r, e6ircd::core::DbRequest::SetChannelTopic { .. }));
     assert!(!leaked, "unregistered channel wrongly persisted its topic");
+}
+
+#[test]
+fn registered_topic_failed_verdicts_are_loud_labeled_and_non_mutating() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    s.core.preload_topics(vec![(
+        "#reg".to_string(),
+        "old topic".to_string(),
+        "old!setter@host".to_string(),
+        1,
+    )]);
+    let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
+    s.line(boss, "JOIN #reg");
+    s.drain(boss);
+    s.db_requests();
+
+    s.line(boss, "@label=topic7 TOPIC #reg :new topic");
+    assert!(
+        s.drain(boss).is_empty(),
+        "a durable TOPIC verdict must not be pre-ACKed"
+    );
+    let requests = s.db_requests();
+    let revision = match requests.as_slice() {
+        [
+            e6ircd::core::DbRequest::SetChannelTopic {
+                revision,
+                label: Some(label),
+                ..
+            },
+        ] if label == "topic7" => *revision,
+        other => panic!("labeled TOPIC request lost its correlation: {other:#?}"),
+    };
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelTopicFailed {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            revision,
+            label: Some("topic7".into()),
+            failure: e6ircd::core::ChannelTopicFailure::PersistenceUnavailable,
+        },
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=topic7 ")
+                && line.contains("FAIL TOPIC TEMPORARILY_UNAVAILABLE")
+        }),
+        "store failure was not a correlated loud failure: {out:#?}"
+    );
+
+    s.line(boss, "TOPIC #reg");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 332 ") && line.ends_with(":old topic")),
+        "failed persistence changed the live topic: {out:#?}"
+    );
+
+    s.line(boss, "@label=topic8 TOPIC #reg :missing-row topic");
+    let requests = s.db_requests();
+    let revision = match requests.as_slice() {
+        [e6ircd::core::DbRequest::SetChannelTopic { revision, .. }] => *revision,
+        other => panic!("second TOPIC did not enter the persistence path: {other:#?}"),
+    };
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelTopicFailed {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            revision,
+            label: Some("topic8".into()),
+            failure: e6ircd::core::ChannelTopicFailure::MissingRegistration,
+        },
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=topic8 ") && line.contains("FAIL TOPIC REGISTRATION_CHANGED")
+        }),
+        "a missing registration row was not distinguished from a store outage: {out:#?}"
+    );
+    s.line(boss, "TOPIC #reg");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 332 ") && line.ends_with(":old topic")),
+        "a missing registration row changed the live topic: {out:#?}"
+    );
+}
+
+#[test]
+fn committed_registered_topic_survives_the_live_channel_becoming_empty() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg");
+    s.drain(boss);
+    s.db_requests();
+
+    s.line(boss, "TOPIC #reg :durable after empty");
+    let requests = s.db_requests();
+    let revision = match requests.as_slice() {
+        [e6ircd::core::DbRequest::SetChannelTopic { revision, .. }] => *revision,
+        other => panic!("registered TOPIC was not queued: {other:#?}"),
+    };
+    s.line(boss, "PART #reg");
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelTopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            prefix: "boss!u@127.0.0.1".into(),
+            topic: Some(("durable after empty".into(), "boss!u@127.0.0.1".into(), 1)),
+            revision,
+            retained: true,
+            label: None,
+        },
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" TOPIC #reg :durable after empty")),
+        "a committed topic was not acknowledged after the live channel emptied: {out:#?}"
+    );
+    assert!(
+        !out.iter().any(|line| line.contains(" 403 ")),
+        "a committed topic was falsely reported as a missing channel: {out:#?}"
+    );
+
+    s.line(boss, "JOIN #reg");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 332 ") && line.ends_with(":durable after empty")),
+        "the committed topic was not restored when the registered channel was recreated: {out:#?}"
+    );
+}
+
+#[test]
+fn keeptopic_on_captures_a_topic_request_still_in_flight() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    s.core.preload_keeptopic_off(vec!["#reg".to_string()]);
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg");
+    s.drain(boss);
+    s.db_requests();
+
+    s.line(boss, "TOPIC #reg :pending topic");
+    let topic_requests = s.db_requests();
+    assert!(matches!(
+        topic_requests.as_slice(),
+        [e6ircd::core::DbRequest::SetChannelTopic { .. }]
+    ));
+    // The TOPIC verdict has not landed, so the committed live channel still
+    // has no topic. KEEPTOPIC must nevertheless capture the pending request.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC ON");
+    let option_requests = s.db_requests();
+    assert!(
+        matches!(
+            option_requests.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelKeeptopic {
+                keeptopic: true,
+                topic: Some((text, ..)),
+                ..
+            }] if text == "pending topic"
+        ),
+        "KEEPTOPIC captured stale committed state instead of the pending TOPIC: \
+         {option_requests:#?}"
+    );
 }
 
 #[test]
@@ -6100,45 +6462,103 @@ fn chanserv_set_keeptopic_off_stops_topic_retention() {
     s.drain(boss);
     s.db_requests();
 
-    // Turn KEEPTOPIC off: it persists the flag and clears the retained topic.
+    // Turn KEEPTOPIC off: no success is emitted before PostgreSQL confirms the
+    // flag and retained-topic clear as one transition.
     s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC OFF");
     assert!(
-        s.drain(boss)
-            .iter()
-            .any(|l| l.contains("KEEPTOPIC") && l.to_ascii_uppercase().contains("OFF")),
-        "no KEEPTOPIC OFF confirmation"
+        s.drain(boss).is_empty(),
+        "KEEPTOPIC must wait for its durable verdict"
     );
     let reqs = s.db_requests();
     assert!(
-        reqs.iter().any(|r| matches!(r,
-            e6ircd::core::DbRequest::SetChannelKeeptopic { channel, keeptopic: false } if channel == "#reg")),
-        "KEEPTOPIC flag not persisted"
+        matches!(
+            reqs.as_slice(),
+            [e6ircd::core::DbRequest::SetChannelKeeptopic {
+                channel,
+                keeptopic: false,
+                topic: None,
+                ..
+            }] if channel == "#reg"
+        ),
+        "KEEPTOPIC OFF must be one atomic request: {reqs:#?}"
     );
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelKeeptopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            keeptopic: false,
+            topic: None,
+            applied: true,
+            label: None,
+        },
+    });
+    let out = s.drain(boss);
     assert!(
-        reqs.iter().any(|r| matches!(r,
-            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: None } if channel == "#reg")),
-        "retained topic not cleared on KEEPTOPIC OFF"
+        out.iter()
+            .any(|l| l.contains("KEEPTOPIC") && l.to_ascii_uppercase().contains("OFF")),
+        "no KEEPTOPIC OFF confirmation: {out:#?}"
     );
 
-    // With KEEPTOPIC off, a new topic is NOT persisted for retention.
+    // TOPIC still crosses the DB boundary while KEEPTOPIC is off. PostgreSQL
+    // returns `retained: false`, which orders this correctly against any
+    // pipelined ON/OFF request while allowing the live topic to change.
     s.line(boss, "TOPIC #reg :while off");
-    s.drain(boss);
+    assert!(s.drain(boss).is_empty());
+    let reqs = s.db_requests();
     assert!(
-        !s.db_requests()
-            .into_iter()
-            .any(|r| matches!(r, e6ircd::core::DbRequest::SetChannelTopic { .. })),
-        "topic wrongly persisted while KEEPTOPIC is off"
+        reqs.iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)), .. }
+            if channel == "#reg" && text == "while off")),
+        "registered TOPIC did not enter the ordered persistence path"
+    );
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelTopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            prefix: "boss!u@127.0.0.1".into(),
+            topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
+            revision: 1,
+            retained: false,
+            label: None,
+        },
+    });
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|line| line.contains(" TOPIC #reg :while off"))
     );
 
-    // Turning it back on resumes persistence.
+    // Turning it back on atomically captures the current live topic.
     s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC ON");
+    assert!(s.drain(boss).is_empty());
+    let reqs = s.db_requests();
+    assert!(reqs.iter().any(|r| matches!(r,
+        e6ircd::core::DbRequest::SetChannelKeeptopic {
+            channel,
+            keeptopic: true,
+            topic: Some((text, ..)),
+            ..
+        } if channel == "#reg" && text == "while off"
+    )));
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelKeeptopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            keeptopic: true,
+            topic: Some(("while off".into(), "boss!u@127.0.0.1".into(), 1)),
+            applied: true,
+            label: None,
+        },
+    });
     s.drain(boss);
-    s.db_requests();
     s.line(boss, "TOPIC #reg :back on");
-    s.drain(boss);
+    assert!(s.drain(boss).is_empty());
     assert!(
         s.db_requests().into_iter().any(|r| matches!(r,
-            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
+            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)), .. }
             if channel == "#reg" && text == "back on")),
         "topic not persisted after KEEPTOPIC ON"
     );
@@ -6158,19 +6578,47 @@ fn chanserv_set_keeptopic_on_recaptures_the_live_topic() {
     s.line(boss, "JOIN #reg");
     s.drain(boss);
     s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC OFF");
-    s.drain(boss);
     s.db_requests();
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelKeeptopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            keeptopic: false,
+            topic: None,
+            applied: true,
+            label: None,
+        },
+    });
+    s.drain(boss);
     // A topic set while KEEPTOPIC is off: live, but not retained.
     s.line(boss, "TOPIC #reg :the live topic");
-    s.drain(boss);
     s.db_requests();
-    // Turning KEEPTOPIC back on must persist the current live topic right away,
-    // with no further TOPIC command.
-    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC ON");
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelTopicSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            prefix: "boss!u@127.0.0.1".into(),
+            topic: Some(("the live topic".into(), "boss!u@127.0.0.1".into(), 1)),
+            revision: 1,
+            retained: false,
+            label: None,
+        },
+    });
     s.drain(boss);
+    // Turning KEEPTOPIC back on must persist the current live topic right away,
+    // in the same option write, with no second fallible request.
+    s.line(boss, "PRIVMSG ChanServ :SET #reg KEEPTOPIC ON");
+    assert!(s.drain(boss).is_empty());
     assert!(
         s.db_requests().into_iter().any(|r| matches!(r,
-            e6ircd::core::DbRequest::SetChannelTopic { channel, topic: Some((text, ..)) }
+            e6ircd::core::DbRequest::SetChannelKeeptopic {
+                channel,
+                keeptopic: true,
+                topic: Some((text, ..)),
+                ..
+            }
             if channel == "#reg" && text == "the live topic")),
         "KEEPTOPIC ON did not re-capture the current live topic"
     );
@@ -6204,6 +6652,27 @@ fn chanserv_set_mlock_enforces_modes() {
 
     // Lock +m-t: m forced on, t forced off — applied to the live channel now.
     s.line(boss, "PRIVMSG ChanServ :SET #reg MLOCK +m-t");
+    assert!(
+        s.drain(boss).is_empty(),
+        "MLOCK must not confirm before the durable verdict"
+    );
+    let reqs = s.db_requests();
+    assert!(
+        reqs.iter().any(|r| matches!(r,
+            e6ircd::core::DbRequest::SetChannelMlock { channel, mlock: Some(spec), .. }
+            if channel == "#reg" && spec == "+m-t")),
+        "mlock not persisted"
+    );
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelMlockSet {
+            channel: "#reg".into(),
+            display: "#reg".into(),
+            mlock: Some("+m-t".into()),
+            applied: true,
+            label: None,
+        },
+    });
     let out = s.drain(boss);
     assert!(
         out.iter()
@@ -6214,12 +6683,6 @@ fn chanserv_set_mlock_enforces_modes() {
         out.iter()
             .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
         "lock not applied on set: {out:#?}"
-    );
-    assert!(
-        s.db_requests().into_iter().any(|r| matches!(r,
-            e6ircd::core::DbRequest::SetChannelMlock { channel, mlock: Some(spec) }
-            if channel == "#reg" && spec == "+m-t")),
-        "mlock not persisted"
     );
 
     // Changing a locked mode the wrong way is refused (no MODE echo) AND the
@@ -6264,6 +6727,100 @@ fn chanserv_set_mlock_enforces_modes() {
         out.iter()
             .any(|l| l.starts_with(":ChanServ MODE #reg") && l.contains("+m") && l.contains("-t")),
         "lock not re-applied on recreate: {out:#?}"
+    );
+}
+
+#[test]
+fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#reg".to_string(), "boss".to_string())]);
+    s.core.preload_topics(vec![(
+        "#reg".to_string(),
+        "retained".to_string(),
+        "boss!u@host".to_string(),
+        1,
+    )]);
+    s.core
+        .preload_mlock(vec![("#reg".to_string(), "+m".to_string())]);
+    let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #reg");
+    s.drain(boss);
+    s.db_requests();
+
+    s.line(
+        boss,
+        "@label=keep9 PRIVMSG ChanServ :SET #reg KEEPTOPIC OFF",
+    );
+    assert!(s.drain(boss).is_empty());
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::SetChannelKeeptopic {
+            label: Some(label),
+            ..
+        }] if label == "keep9"
+    ));
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelKeeptopicUnavailable {
+            display: "#reg".into(),
+            label: Some("keep9".into()),
+        },
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=keep9 ")
+                && line.contains("KEEPTOPIC")
+                && line.contains("temporarily unavailable")
+        }),
+        "KEEPTOPIC failure was not loud and correlated: {out:#?}"
+    );
+
+    s.line(boss, "@label=lock9 PRIVMSG ChanServ :SET #reg MLOCK OFF");
+    assert!(s.drain(boss).is_empty());
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::SetChannelMlock {
+            label: Some(label),
+            mlock: None,
+            ..
+        }] if label == "lock9"
+    ));
+    s.core.handle(Input::DbReply {
+        conn: boss,
+        reply: e6ircd::core::DbReply::ChannelMlockUnavailable {
+            display: "#reg".into(),
+            label: Some("lock9".into()),
+        },
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=lock9 ")
+                && line.contains("MLOCK")
+                && line.contains("temporarily unavailable")
+        }),
+        "MLOCK failure was not loud and correlated: {out:#?}"
+    );
+
+    // Neither failed write changed the committed hot state.
+    s.line(boss, "MODE #reg -m");
+    assert!(
+        s.drain(boss)
+            .iter()
+            .any(|line| line.contains(" 742 ") && line.contains("-m")),
+        "failed MLOCK clear removed the live lock"
+    );
+    s.line(boss, "PART #reg");
+    s.drain(boss);
+    s.line(boss, "JOIN #reg");
+    let out = s.drain(boss);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 332 ") && line.ends_with(":retained")),
+        "failed KEEPTOPIC update removed the retained topic: {out:#?}"
     );
 }
 
@@ -6871,15 +7428,32 @@ fn chanserv_drop_unregisters_channel() {
     s.db_requests();
 
     s.line(boss, "PRIVMSG ChanServ :DROP #room");
+    assert!(
+        s.drain(boss).is_empty(),
+        "DROP must not confirm before PostgreSQL deletes the row"
+    );
+    let dropped = s.db_requests().into_iter().any(|r| {
+        matches!(r,
+            e6ircd::core::DbRequest::DropChannel {
+                channel,
+                requester: e6ircd::core::ChannelDropRequester::ChanServ { conn, .. },
+            } if channel == "#room" && conn == boss)
+    });
+    assert!(dropped, "DropChannel not queued");
+    s.core.handle(Input::ChannelDropResult {
+        channel: "#room".into(),
+        requester: e6ircd::core::ChannelDropRequester::ChanServ {
+            conn: boss,
+            display: "#room".into(),
+            label: None,
+        },
+        result: e6ircd::core::ChannelDropResult::Dropped,
+    });
     let out = s.drain(boss);
     assert!(
         out.iter().any(|l| l.contains("has been dropped")),
-        "no drop confirmation: {out:#?}"
+        "no committed drop confirmation: {out:#?}"
     );
-    let dropped = s.db_requests().into_iter().any(
-        |r| matches!(r, e6ircd::core::DbRequest::DropChannel { channel } if channel == "#room"),
-    );
-    assert!(dropped, "DropChannel not queued");
 
     // Registration is gone from the hot map: a second DROP is refused.
     s.line(boss, "PRIVMSG ChanServ :DROP #room");
@@ -6914,6 +7488,17 @@ fn chanserv_drop_clears_the_mode_lock() {
 
     // Drop it, empty it, then recreate it.
     s.line(boss, "PRIVMSG ChanServ :DROP #reg2");
+    assert!(s.drain(boss).is_empty());
+    s.db_requests();
+    s.core.handle(Input::ChannelDropResult {
+        channel: "#reg2".into(),
+        requester: e6ircd::core::ChannelDropRequester::ChanServ {
+            conn: boss,
+            display: "#reg2".into(),
+            label: None,
+        },
+        result: e6ircd::core::ChannelDropResult::Dropped,
+    });
     s.drain(boss);
     s.line(boss, "PART #reg2");
     s.drain(boss);
@@ -6923,6 +7508,101 @@ fn chanserv_drop_clears_the_mode_lock() {
             .iter()
             .any(|l| l.contains("MODE #reg2") && l.contains("+s")),
         "a stale mode lock must not be reapplied to a dropped-and-recreated channel"
+    );
+}
+
+#[test]
+fn chanserv_drop_store_failure_is_loud_labeled_and_non_mutating() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
+    identify(&mut s, boss, "boss");
+    s.db_requests();
+
+    s.line(boss, "@label=drop7 PRIVMSG ChanServ :DROP #room");
+    assert!(s.drain(boss).is_empty());
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::DropChannel {
+            requester: e6ircd::core::ChannelDropRequester::ChanServ {
+                label: Some(label),
+                ..
+            },
+            ..
+        }] if label == "drop7"
+    ));
+    s.core.handle(Input::ChannelDropResult {
+        channel: "#room".into(),
+        requester: e6ircd::core::ChannelDropRequester::ChanServ {
+            conn: boss,
+            display: "#room".into(),
+            label: Some("drop7".into()),
+        },
+        result: e6ircd::core::ChannelDropResult::Unavailable,
+    });
+    let out = s.drain(boss);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=drop7 ") && line.contains("temporarily unavailable")
+        }),
+        "DROP failure was not loud and correlated: {out:#?}"
+    );
+
+    // The founder entry survived the failed delete, so retrying reaches the DB
+    // instead of being refused as an already-dropped channel.
+    s.line(boss, "PRIVMSG ChanServ :DROP #room");
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::DropChannel { .. }]
+    ));
+}
+
+#[test]
+fn admin_channel_drop_waits_for_the_database_verdict() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::DropChannel {
+            channel: "#room".into(),
+            actor: "root".into(),
+        },
+        reply: reply_tx,
+    });
+    assert!(
+        matches!(
+            reply_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "admin DROP replied before persistence"
+    );
+    let requests = s.db_requests();
+    let (request_id, actor) = match requests.as_slice() {
+        [
+            e6ircd::core::DbRequest::DropChannel {
+                channel,
+                requester: e6ircd::core::ChannelDropRequester::Admin { request_id, actor },
+            },
+        ] if channel == "#room" => (*request_id, actor.clone()),
+        other => panic!("admin DROP did not use the shared DB request: {other:#?}"),
+    };
+    assert_eq!(actor, "root", "DROP request lost its atomic audit actor");
+    s.core.handle(Input::ChannelDropResult {
+        channel: "#room".into(),
+        requester: e6ircd::core::ChannelDropRequester::Admin { request_id, actor },
+        result: e6ircd::core::ChannelDropResult::Dropped,
+    });
+    match reply_rx.try_recv() {
+        Ok(e6ircd::core::AdminReply::Ok(message)) => {
+            assert!(message.contains("Unregistered #room"), "{message}");
+        }
+        other => panic!("admin DROP did not receive its committed verdict: {other:?}"),
+    }
+    assert!(
+        s.db_requests().is_empty(),
+        "admin DROP audit must be part of the delete transaction, not a second write"
     );
 }
 
@@ -7280,6 +7960,7 @@ fn oper_kline_bans_disconnects_and_refuses() {
 
     // K-line every host for user "baddie".
     s.line(op, "KLINE baddie@* :spamming");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added K-Line")),
         "no kline confirmation"
@@ -7305,6 +7986,7 @@ fn oper_kline_bans_disconnects_and_refuses() {
 
     // UNKLINE lifts it; a matching registration then succeeds.
     s.line(op, "UNKLINE baddie@*");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed K-Line")),
         "no unkline confirmation"
@@ -7338,6 +8020,7 @@ fn server_ban_preserves_display_case_and_removes_case_insensitively() {
 
     // A mixed-case KLINE mask.
     s.line(op, "KLINE Baddie@Host :spam");
+    commit_server_ban(&mut s);
     let out = s.drain(op);
     assert!(
         out.iter()
@@ -7360,6 +8043,7 @@ fn server_ban_preserves_display_case_and_removes_case_insensitively() {
 
     // A differently-cased UNKLINE still lifts it (folded comparison).
     s.line(op, "UNKLINE baddie@HOST");
+    commit_server_ban(&mut s);
     let out = s.drain(op);
     assert!(
         out.iter().any(|l| l.contains("Removed K-Line")),
@@ -7383,6 +8067,7 @@ fn self_matching_kline_confirms_before_disconnecting_the_setter() {
     // A mask specific enough to pass the netban guard but that still matches the
     // oper's own user@host (the test harness gives conn 1 the host host1.example).
     s.line(op, "KLINE *@host1.example :cleanup");
+    commit_server_ban(&mut s);
     let out = s.drain(op);
     assert!(
         out.iter().any(|l| l.contains("Added K-Line")),
@@ -7405,6 +8090,7 @@ fn oper_dline_bans_by_host() {
     s.drain(op);
 
     s.line(op, "DLINE host7.example :bad netblock");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added D-Line")),
         "no dline confirmation"
@@ -7431,6 +8117,7 @@ fn oper_dline_bans_by_host() {
     );
 
     s.line(op, "UNDLINE host7.example");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed D-Line")),
         "no undline confirmation"
@@ -7445,6 +8132,7 @@ fn oper_xline_bans_by_realname() {
     s.drain(op);
 
     s.line(op, "XLINE *spambot* :no bots");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added X-Line")),
         "no xline confirmation"
@@ -7481,6 +8169,7 @@ fn oper_xline_mask_with_spaces_is_not_split() {
     s.line(op, "OPER god letmein");
     s.drain(op);
     s.line(op, "XLINE *Evil Corp* :spam bots");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added X-Line")),
         "no xline confirmation"
@@ -7503,6 +8192,7 @@ fn oper_xline_mask_with_spaces_is_not_split() {
     );
     // And it removes by the same multi-word mask.
     s.line(op, "UNXLINE *Evil Corp*");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed X-Line")),
         "multi-word xline could not be removed by its own mask"
@@ -7520,6 +8210,7 @@ fn oper_xline_multiword_mask_without_reason_bans_whole_mask() {
     s.line(op, "OPER god letmein");
     s.drain(op);
     s.line(op, "XLINE *Evil Corp*");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added X-Line")),
         "no xline confirmation"
@@ -7567,21 +8258,76 @@ fn oper_ban_matching_everyone_is_refused() {
         assert!(
             s.db_requests()
                 .iter()
-                .all(|r| !matches!(r, e6ircd::core::DbRequest::AddServerBan { .. })),
+                .all(|r| !matches!(r, e6ircd::core::DbRequest::MutateServerBan { .. })),
             "{cmd} must not reach the database"
         );
     }
     // A specific mask on the same commands is still accepted.
     s.line(op, "KLINE bad@host.example :spam");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added K-Line")),
         "a specific KLINE is still accepted"
     );
     // `nick@*` constrains the user field, so it is not a netban.
     s.line(op, "KLINE baddie@* :spam");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added K-Line")),
         "user@* is specific enough to accept"
+    );
+}
+
+#[test]
+fn server_ban_store_failure_is_loud_labeled_and_non_mutating() {
+    let mut s = TestServer::new();
+    let op = register_with_caps(&mut s, 1, "god", "labeled-response");
+    s.line(op, "OPER god letmein");
+    s.drain(op);
+    s.db_requests();
+    let victim = s.register(2, "baddie");
+    s.drain(victim);
+
+    s.line(op, "@label=ban7 KLINE baddie@* :spam");
+    assert!(
+        s.drain(op).is_empty(),
+        "KLINE must not confirm before its audited durable write"
+    );
+    let requests = s.db_requests();
+    let (mutation, requester) = match requests.as_slice() {
+        [
+            e6ircd::core::DbRequest::MutateServerBan {
+                mutation,
+                requester:
+                    requester @ e6ircd::core::ServerBanRequester::Oper {
+                        conn,
+                        label: Some(label),
+                    },
+            },
+        ] if *conn == op && label == "ban7" => (mutation.clone(), requester.clone()),
+        other => panic!("KLINE did not preserve its requester/label: {other:#?}"),
+    };
+    assert!(
+        s.drain(victim).is_empty(),
+        "the matching user was disconnected before persistence"
+    );
+    s.core.handle(Input::ServerBanResult {
+        mutation,
+        requester,
+        result: e6ircd::core::ServerBanResult::Unavailable,
+    });
+    let out = s.drain(op);
+    assert!(
+        out.iter().any(|line| {
+            line.starts_with("@label=ban7 ")
+                && line.contains("Server-ban change failed")
+                && line.contains("temporarily unavailable")
+        }),
+        "KLINE store failure was not loud and correlated: {out:#?}"
+    );
+    assert!(
+        s.drain(victim).is_empty(),
+        "failed KLINE changed the hot enforcement list"
     );
 }
 
@@ -7595,6 +8341,7 @@ fn server_ban_removal_is_case_insensitive() {
     s.line(op, "OPER god letmein");
     s.drain(op);
     s.line(op, "KLINE Baddie@Evil.Example :out");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Added K-Line")),
         "no kline confirmation"
@@ -7606,6 +8353,7 @@ fn server_ban_removal_is_case_insensitive() {
     // host defaults to the test host; the user part matches the folded mask.
     // Remove using a different casing than it was added with.
     s.line(op, "UNKLINE baddie@evil.example");
+    commit_server_ban(&mut s);
     assert!(
         s.drain(op).iter().any(|l| l.contains("Removed K-Line")),
         "case-variant UNKLINE failed to remove the ban"
@@ -7641,21 +8389,35 @@ fn oper_actions_are_audited() {
     );
 
     s.line(op, "KLINE baddie@* :spam");
+    let mutation = commit_server_ban(&mut s);
     s.drain(op);
     assert!(
-        audits(&mut s)
-            .iter()
-            .any(|(a, t)| a == "KLINE" && t == "baddie@*"),
-        "KLINE not audited"
+        matches!(
+            mutation,
+            e6ircd::core::ServerBanMutation::Add {
+                mask_display,
+                set_by,
+                kind,
+                ..
+            } if mask_display == "baddie@*" && set_by == "god" && kind == "kline"
+        ),
+        "KLINE mutation did not carry its atomic audit fields"
     );
 
     s.line(op, "UNKLINE baddie@*");
+    let mutation = commit_server_ban(&mut s);
     s.drain(op);
     assert!(
-        audits(&mut s)
-            .iter()
-            .any(|(a, t)| a == "UNKLINE" && t == "baddie@*"),
-        "UNKLINE not audited"
+        matches!(
+            mutation,
+            e6ircd::core::ServerBanMutation::Remove {
+                mask_display,
+                actor,
+                kind,
+                ..
+            } if mask_display == "baddie@*" && actor == "god" && kind == "kline"
+        ),
+        "UNKLINE mutation did not carry its atomic audit fields"
     );
 }
 
@@ -7809,6 +8571,7 @@ fn oper_kill_and_ban_raise_snotices() {
 
     // Ban: op2 sees the K-Line notice.
     s.line(op1, "KLINE bad@host.example :spam");
+    commit_server_ban(&mut s);
     let seen = s.drain(op2);
     assert!(
         seen.iter()

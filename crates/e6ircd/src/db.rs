@@ -409,15 +409,38 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             conn,
             channel,
             founder_account,
+            topic,
+            label,
         } => {
-            let reply = handle_register_channel(pool, &channel, &founder_account).await;
+            let reply =
+                handle_register_channel(pool, &channel, &founder_account, topic, label).await;
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        DbRequest::DropChannel { channel } => {
-            if let Err(e) = drop_channel(pool, &channel).await {
-                eprintln!("db: channel drop failed: {e}");
-            }
-            true
+        DbRequest::DropChannel { channel, requester } => {
+            let dropped = match &requester {
+                crate::core::ChannelDropRequester::Admin { actor, .. } => {
+                    drop_channel_audited(pool, &channel, actor).await
+                }
+                crate::core::ChannelDropRequester::ChanServ { .. } => {
+                    drop_channel(pool, &channel).await
+                }
+            };
+            let result = match dropped {
+                Ok(true) => crate::core::ChannelDropResult::Dropped,
+                Ok(false) => crate::core::ChannelDropResult::Missing,
+                Err(e) => {
+                    eprintln!("db: channel drop failed: {e}");
+                    crate::core::ChannelDropResult::Unavailable
+                }
+            };
+            core_tx
+                .push(Input::ChannelDropResult {
+                    channel,
+                    requester,
+                    result,
+                })
+                .await
+                .is_ok()
         }
         DbRequest::SetChannelFounder {
             conn,
@@ -520,23 +543,91 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             };
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        DbRequest::SetChannelTopic { channel, topic } => {
-            if let Err(e) = set_channel_topic(pool, &channel, topic).await {
-                eprintln!("db: channel topic persistence failed: {e}");
-            }
-            true
+        DbRequest::SetChannelTopic {
+            conn,
+            channel,
+            display,
+            prefix,
+            topic,
+            revision,
+            label,
+        } => {
+            let reply = match set_channel_topic(pool, &channel, topic.clone()).await {
+                Ok(Some(retained)) => DbReply::ChannelTopicSet {
+                    channel,
+                    display,
+                    prefix,
+                    topic,
+                    revision,
+                    retained,
+                    label,
+                },
+                Ok(None) => DbReply::ChannelTopicFailed {
+                    channel,
+                    display,
+                    revision,
+                    label,
+                    failure: crate::core::ChannelTopicFailure::MissingRegistration,
+                },
+                Err(e) => {
+                    eprintln!("db: channel topic persistence failed: {e}");
+                    DbReply::ChannelTopicFailed {
+                        channel,
+                        display,
+                        revision,
+                        label,
+                        failure: crate::core::ChannelTopicFailure::PersistenceUnavailable,
+                    }
+                }
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        DbRequest::SetChannelKeeptopic { channel, keeptopic } => {
-            if let Err(e) = set_channel_keeptopic(pool, &channel, keeptopic).await {
-                eprintln!("db: channel keeptopic persistence failed: {e}");
-            }
-            true
+        DbRequest::SetChannelKeeptopic {
+            conn,
+            channel,
+            display,
+            keeptopic,
+            topic,
+            label,
+        } => {
+            let reply = match set_channel_keeptopic(pool, &channel, keeptopic, topic.clone()).await
+            {
+                Ok(applied) => DbReply::ChannelKeeptopicSet {
+                    channel,
+                    display,
+                    keeptopic,
+                    topic,
+                    applied,
+                    label,
+                },
+                Err(e) => {
+                    eprintln!("db: channel keeptopic persistence failed: {e}");
+                    DbReply::ChannelKeeptopicUnavailable { display, label }
+                }
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        DbRequest::SetChannelMlock { channel, mlock } => {
-            if let Err(e) = set_channel_mlock(pool, &channel, mlock).await {
-                eprintln!("db: channel mlock persistence failed: {e}");
-            }
-            true
+        DbRequest::SetChannelMlock {
+            conn,
+            channel,
+            display,
+            mlock,
+            label,
+        } => {
+            let reply = match set_channel_mlock(pool, &channel, mlock.clone()).await {
+                Ok(applied) => DbReply::ChannelMlockSet {
+                    channel,
+                    display,
+                    mlock,
+                    applied,
+                    label,
+                },
+                Err(e) => {
+                    eprintln!("db: channel mlock persistence failed: {e}");
+                    DbReply::ChannelMlockUnavailable { display, label }
+                }
+            };
+            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::SetChannelAccess {
             conn,
@@ -564,25 +655,25 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             };
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
-        DbRequest::AddServerBan {
-            mask,
-            mask_display,
-            reason,
-            set_by,
-            kind,
+        DbRequest::MutateServerBan {
+            mutation,
+            requester,
         } => {
-            if let Err(e) =
-                add_server_ban(pool, &mask, &mask_display, &reason, &set_by, &kind).await
-            {
-                eprintln!("db: server-ban persistence failed: {e}");
-            }
-            true
-        }
-        DbRequest::RemoveServerBan { mask, kind } => {
-            if let Err(e) = remove_server_ban(pool, &mask, &kind).await {
-                eprintln!("db: server-ban removal failed: {e}");
-            }
-            true
+            let result = match mutate_server_ban_audited(pool, &mutation).await {
+                Ok(()) => crate::core::ServerBanResult::Stored,
+                Err(e) => {
+                    eprintln!("db: audited server-ban mutation failed: {e}");
+                    crate::core::ServerBanResult::Unavailable
+                }
+            };
+            core_tx
+                .push(Input::ServerBanResult {
+                    mutation,
+                    requester,
+                    result,
+                })
+                .await
+                .is_ok()
         }
         DbRequest::AuditLog {
             actor,
@@ -741,29 +832,30 @@ pub async fn set_channel_topic(
     pool: &PgPool,
     channel_folded: &str,
     topic: Option<(String, String, u64)>,
-) -> Result<(), DbError> {
-    match topic {
-        Some((text, setter, set_at)) => sqlx::query(
-            "UPDATE channels
-             SET topic = $2, topic_setter = $3,
-                 topic_set_at = to_timestamp($4::double precision)
-             WHERE name_folded = $1",
-        )
-        .bind(channel_folded)
-        .bind(text)
-        .bind(setter)
-        .bind(set_at as f64),
-        None => sqlx::query(
-            "UPDATE channels
-             SET topic = NULL, topic_setter = NULL, topic_set_at = NULL
-             WHERE name_folded = $1",
-        )
-        .bind(channel_folded),
-    }
-    .execute(pool)
+) -> Result<Option<bool>, DbError> {
+    let (text, setter, set_at) = match topic {
+        Some((text, setter, set_at)) => (Some(text), Some(setter), Some(set_at as f64)),
+        None => (None, None, None),
+    };
+    sqlx::query_scalar(
+        "UPDATE channels
+         SET topic = CASE WHEN keeptopic THEN $2 ELSE NULL END,
+             topic_setter = CASE WHEN keeptopic THEN $3 ELSE NULL END,
+             topic_set_at = CASE
+                 WHEN keeptopic AND $4::double precision IS NOT NULL
+                 THEN to_timestamp($4::double precision)
+                 ELSE NULL
+             END
+         WHERE name_folded = $1
+         RETURNING keeptopic",
+    )
+    .bind(channel_folded)
+    .bind(text)
+    .bind(setter)
+    .bind(set_at)
+    .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
-    Ok(())
+    .map_err(DbError::Query)
 }
 
 /// One history row decoded from PostgreSQL. `#[derive(sqlx::FromRow)]` binds
@@ -1353,6 +1445,73 @@ pub async fn remove_server_ban(pool: &PgPool, mask: &str, kind: &str) -> Result<
     Ok(())
 }
 
+async fn mutate_server_ban_audited(
+    pool: &PgPool,
+    mutation: &crate::core::ServerBanMutation,
+) -> Result<(), DbError> {
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let (actor, action, target, detail) = match mutation {
+        crate::core::ServerBanMutation::Add {
+            mask,
+            mask_display,
+            reason,
+            set_by,
+            kind,
+        } => {
+            sqlx::query(
+                "INSERT INTO server_bans (mask, mask_display, reason, set_by, kind)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (mask, kind) DO UPDATE
+                    SET mask_display = EXCLUDED.mask_display,
+                        reason = EXCLUDED.reason,
+                        set_by = EXCLUDED.set_by",
+            )
+            .bind(mask)
+            .bind(mask_display)
+            .bind(reason)
+            .bind(set_by)
+            .bind(kind)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+            (
+                set_by.as_str(),
+                kind.to_ascii_uppercase(),
+                mask_display.as_str(),
+                reason.as_str(),
+            )
+        }
+        crate::core::ServerBanMutation::Remove {
+            mask,
+            mask_display,
+            kind,
+            actor,
+        } => {
+            sqlx::query("DELETE FROM server_bans WHERE mask = $1 AND kind = $2")
+                .bind(mask)
+                .bind(kind)
+                .execute(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+            (
+                actor.as_str(),
+                format!("UN{}", kind.to_ascii_uppercase()),
+                mask_display.as_str(),
+                "",
+            )
+        }
+    };
+    sqlx::query("INSERT INTO audit_log (actor, action, target, detail) VALUES ($1, $2, $3, $4)")
+        .bind(actor)
+        .bind(action)
+        .bind(target)
+        .bind(detail)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    transaction.commit().await.map_err(DbError::Query)
+}
+
 /// Record one privileged action in the audit trail.
 pub async fn insert_audit_log(
     pool: &PgPool,
@@ -1405,26 +1564,79 @@ pub async fn list_server_bans(
 }
 
 /// Unregister a channel by its casefolded name (ChanServ DROP).
-pub async fn drop_channel(pool: &PgPool, channel_folded: &str) -> Result<(), DbError> {
+pub async fn drop_channel(pool: &PgPool, channel_folded: &str) -> Result<bool, DbError> {
     sqlx::query("DELETE FROM channels WHERE name_folded = $1")
         .bind(channel_folded)
         .execute(pool)
         .await
-        .map_err(DbError::Query)?;
-    Ok(())
+        .map(|result| result.rows_affected() == 1)
+        .map_err(DbError::Query)
 }
 
-async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) -> DbReply {
+async fn drop_channel_audited(
+    pool: &PgPool,
+    channel_folded: &str,
+    actor: &str,
+) -> Result<bool, DbError> {
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let deleted = sqlx::query("DELETE FROM channels WHERE name_folded = $1")
+        .bind(channel_folded)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?
+        .rows_affected()
+        == 1;
+    if deleted {
+        sqlx::query(
+            "INSERT INTO audit_log (actor, action, target, detail)
+             VALUES ($1, 'DROPCHAN', $2, '')",
+        )
+        .bind(actor)
+        .bind(channel_folded)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    }
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(deleted)
+}
+
+async fn handle_register_channel(
+    pool: &PgPool,
+    channel: &str,
+    founder: &str,
+    topic: Option<(String, String, u64)>,
+    label: Option<String>,
+) -> DbReply {
     let chan_folded = CaseMapping::Rfc1459.casefold(channel);
     let founder_folded = CaseMapping::Rfc1459.casefold(founder);
+    let (topic_text, topic_setter, topic_set_at) = match &topic {
+        Some((text, setter, set_at)) => (
+            Some(text.as_str()),
+            Some(setter.as_str()),
+            Some(*set_at as f64),
+        ),
+        None => (None, None, None),
+    };
     let inserted: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
-        "INSERT INTO channels (name, name_folded, founder_account_id)
-         SELECT $1, $2, a.id FROM accounts a WHERE a.name_folded = $3
+        "INSERT INTO channels (
+             name, name_folded, founder_account_id,
+             topic, topic_setter, topic_set_at
+         )
+         SELECT $1, $2, a.id, $4, $5,
+                CASE WHEN $6::double precision IS NULL
+                     THEN NULL
+                     ELSE to_timestamp($6::double precision)
+                END
+         FROM accounts a WHERE a.name_folded = $3
          ON CONFLICT (name_folded) DO NOTHING RETURNING id",
     )
     .bind(channel)
     .bind(&chan_folded)
     .bind(&founder_folded)
+    .bind(topic_text)
+    .bind(topic_setter)
+    .bind(topic_set_at)
     .fetch_optional(pool)
     .await;
     match inserted {
@@ -1434,6 +1646,8 @@ async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) ->
             // map is seeded from the persisted value rather than the session's
             // possibly-since-changed account.
             founder_account: founder.to_string(),
+            topic,
+            label,
         },
         // No row: either the channel exists or the founder account
         // vanished; both leave nothing registered. Distinguish them.
@@ -1444,20 +1658,32 @@ async fn handle_register_channel(pool: &PgPool, channel: &str, founder: &str) ->
                     .fetch_optional(pool)
                     .await;
             match exists {
-                Ok(Some(_)) => DbReply::ChannelExists,
+                Ok(Some(_)) => DbReply::ChannelExists {
+                    channel: channel.to_string(),
+                    label,
+                },
                 Ok(None) => {
                     eprintln!("db: founder account {founder} missing during channel registration");
-                    DbReply::ChannelRegisterUnavailable
+                    DbReply::ChannelRegisterUnavailable {
+                        channel: channel.to_string(),
+                        label,
+                    }
                 }
                 Err(e) => {
                     eprintln!("db: channel existence check failed: {e}");
-                    DbReply::ChannelRegisterUnavailable
+                    DbReply::ChannelRegisterUnavailable {
+                        channel: channel.to_string(),
+                        label,
+                    }
                 }
             }
         }
         Err(e) => {
             eprintln!("db: channel registration failed: {e}");
-            DbReply::ChannelRegisterUnavailable
+            DbReply::ChannelRegisterUnavailable {
+                channel: channel.to_string(),
+                label,
+            }
         }
     }
 }
@@ -2032,14 +2258,35 @@ pub async fn set_channel_keeptopic(
     pool: &PgPool,
     channel_folded: &str,
     keeptopic: bool,
-) -> Result<(), DbError> {
-    sqlx::query("UPDATE channels SET keeptopic = $2 WHERE name_folded = $1")
-        .bind(channel_folded)
-        .bind(keeptopic)
-        .execute(pool)
-        .await
-        .map_err(DbError::Query)?;
-    Ok(())
+    topic: Option<(String, String, u64)>,
+) -> Result<bool, DbError> {
+    let (text, setter, set_at) = match topic {
+        Some((text, setter, set_at)) if keeptopic => {
+            (Some(text), Some(setter), Some(set_at as f64))
+        }
+        _ => (None, None, None),
+    };
+    sqlx::query(
+        "UPDATE channels
+         SET keeptopic = $2,
+             topic = $3,
+             topic_setter = $4,
+             topic_set_at = CASE
+                 WHEN $5::double precision IS NULL
+                 THEN NULL
+                 ELSE to_timestamp($5::double precision)
+             END
+         WHERE name_folded = $1",
+    )
+    .bind(channel_folded)
+    .bind(keeptopic)
+    .bind(text)
+    .bind(setter)
+    .bind(set_at)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected() == 1)
+    .map_err(DbError::Query)
 }
 
 /// The folded names of registered channels whose KEEPTOPIC is OFF — the
@@ -2057,14 +2304,14 @@ pub async fn set_channel_mlock(
     pool: &PgPool,
     channel_folded: &str,
     mlock: Option<String>,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     sqlx::query("UPDATE channels SET mlock = $2 WHERE name_folded = $1")
         .bind(channel_folded)
         .bind(mlock)
         .execute(pool)
         .await
-        .map_err(DbError::Query)?;
-    Ok(())
+        .map(|result| result.rows_affected() == 1)
+        .map_err(DbError::Query)
 }
 
 /// Registered channels with a mode lock, as `(name_folded, spec)` —

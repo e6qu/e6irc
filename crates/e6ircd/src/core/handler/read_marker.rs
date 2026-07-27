@@ -222,12 +222,7 @@ pub(super) fn cmd_markread(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 
     *state.pending_read_markers.entry(marker_key).or_default() += 1;
-    state.defer_reply(conn);
-    if let Some(cap) = state.capture.as_mut()
-        && cap.label.is_some()
-    {
-        cap.deferred = true;
-    }
+    state.defer_captured_reply(conn);
 }
 
 fn release_pending_marker(state: &mut ServerState, account: &str, target: &str) {

@@ -301,8 +301,14 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         && !matches!(
             reply,
             crate::core::DbReply::ChannelRegistered { .. }
+                | crate::core::DbReply::ChannelExists { .. }
+                | crate::core::DbReply::ChannelRegisterUnavailable { .. }
                 | crate::core::DbReply::FounderChanged { .. }
                 | crate::core::DbReply::ChannelAccessSet { .. }
+                | crate::core::DbReply::ChannelTopicSet { .. }
+                | crate::core::DbReply::ChannelTopicFailed { .. }
+                | crate::core::DbReply::ChannelKeeptopicSet { .. }
+                | crate::core::DbReply::ChannelMlockSet { .. }
                 | crate::core::DbReply::ReadMarkerStored { .. }
                 | crate::core::DbReply::ReadMarkerUnavailable { .. }
         )
@@ -450,15 +456,18 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                 }
             }
         }
-        crate::core::DbReply::ChannelRegisterUnavailable => {
-            // ChanServ REGISTER whose persist failed — previously a bare
-            // Unavailable that fell through every arm and left the founder
-            // waiting forever with no response.
-            state.service_notice(
-                conn,
-                "ChanServ",
-                "Services are temporarily unavailable. Try again later.",
-            );
+        crate::core::DbReply::ChannelRegisterUnavailable { channel, label } => {
+            let key = state.chan_key(&channel);
+            state.pending_channel_registrations.remove(&key);
+            if state.sessions.contains_key(&conn) {
+                state.emit_deferred_labeled(conn, label, |state| {
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        "Services are temporarily unavailable. Try again later.",
+                    );
+                });
+            }
         }
         crate::core::DbReply::AccountCreated { account, origin } => {
             state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
@@ -525,6 +534,8 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         crate::core::DbReply::ChannelRegistered {
             channel,
             founder_account,
+            topic,
+            label,
         } => {
             // Record ownership in the hot copy so the founder is re-opped on
             // future joins without waiting for a restart. Seed it from the
@@ -532,36 +543,109 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             // reply), not the live session — a LOGOUT/IDENTIFY between the
             // request and this reply would otherwise record the wrong founder
             // (or none), diverging the hot map from storage until restart.
-            state.set_founder(&channel, &founder_account);
-            // If the channel already carried a topic at registration time,
-            // persist it now (KEEPTOPIC defaults on). The TOPIC command path
-            // persists only on *change*, so without this the topic the founder
-            // registered with is silently lost on the first empty→recreate
-            // cycle — breaking the retention KEEPTOPIC promises.
             let key = state.chan_key(&channel);
-            if state.keeptopic(&key)
-                && let Some(topic) = state.channels.get(&key).and_then(|c| c.topic.clone())
-            {
-                state.registered_topics.insert(key.clone(), topic.clone());
-                let request = crate::core::DbRequest::SetChannelTopic {
-                    channel: key.as_str().to_string(),
-                    topic: Some((topic.text, topic.set_by, topic.set_at_secs)),
-                };
-                if state.db_tx.try_push(request).is_err() {
-                    eprintln!(
-                        "chanserv: db queue full; registered topic for {} not persisted",
-                        key.as_str()
-                    );
-                }
+            state.pending_channel_registrations.remove(&key);
+            state.set_founder(&channel, &founder_account);
+            if let Some((text, set_by, set_at_secs)) = topic {
+                state.registered_topics.insert(
+                    key,
+                    Topic {
+                        text,
+                        set_by,
+                        set_at_secs,
+                    },
+                );
             }
-            state.service_notice(
+            if state.sessions.contains_key(&conn) {
+                state.emit_deferred_labeled(conn, label, |state| {
+                    state.service_notice(
+                        conn,
+                        "ChanServ",
+                        &format!("\x02{channel}\x02 is now registered to your account."),
+                    );
+                });
+            }
+        }
+        crate::core::DbReply::ChannelExists { channel, label } => {
+            let key = state.chan_key(&channel);
+            state.pending_channel_registrations.remove(&key);
+            if state.sessions.contains_key(&conn) {
+                state.emit_deferred_labeled(conn, label, |state| {
+                    state.service_notice(conn, "ChanServ", "That channel is already registered.");
+                });
+            }
+        }
+        crate::core::DbReply::ChannelTopicSet {
+            channel,
+            display,
+            prefix,
+            topic,
+            revision,
+            retained,
+            label,
+        } => {
+            super::channel::channel_topic_set(
+                state,
                 conn,
-                "ChanServ",
-                &format!("\x02{channel}\x02 is now registered to your account."),
+                super::channel::AppliedChannelTopic {
+                    channel,
+                    display,
+                    prefix,
+                    topic,
+                    revision,
+                    retained,
+                    label,
+                },
             );
         }
-        crate::core::DbReply::ChannelExists => {
-            state.service_notice(conn, "ChanServ", "That channel is already registered.");
+        crate::core::DbReply::ChannelTopicFailed {
+            channel,
+            display,
+            revision,
+            label,
+            failure,
+        } => {
+            super::channel::channel_topic_failed(
+                state, conn, channel, display, revision, label, failure,
+            );
+        }
+        crate::core::DbReply::ChannelKeeptopicSet {
+            channel,
+            display,
+            keeptopic,
+            topic,
+            applied,
+            label,
+        } => {
+            super::services::channel_keeptopic_set(
+                state,
+                conn,
+                super::services::AppliedChannelKeeptopic {
+                    channel,
+                    display,
+                    keeptopic,
+                    topic,
+                    applied,
+                    label,
+                },
+            );
+        }
+        crate::core::DbReply::ChannelKeeptopicUnavailable { display, label } => {
+            super::services::channel_keeptopic_unavailable(state, conn, display, label);
+        }
+        crate::core::DbReply::ChannelMlockSet {
+            channel,
+            display,
+            mlock,
+            applied,
+            label,
+        } => {
+            super::services::channel_mlock_set(
+                state, conn, channel, display, mlock, applied, label,
+            );
+        }
+        crate::core::DbReply::ChannelMlockUnavailable { display, label } => {
+            super::services::channel_mlock_unavailable(state, conn, display, label);
         }
         crate::core::DbReply::FounderChanged { channel, account } => {
             // Update the hot ownership map so the new founder is re-opped.

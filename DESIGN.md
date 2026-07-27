@@ -139,6 +139,19 @@ These are project-wide rules, enforced in review and (where possible) CI:
     failure produces an explicit `FAIL`. Pending targets reserve their
     per-account cap slots until the verdict, so waiting for durability cannot
     reopen an unbounded-growth race.
+  - Registered-channel and server-ban mutations are database-confirmed state
+    transitions. Channel registration stores its initial topic in the INSERT;
+    retained TOPIC, KEEPTOPIC, MLOCK, and DROP carry typed
+    stored/missing/unavailable verdicts, and only a stored verdict changes
+    their hot mirrors or confirms the command. A revisioned pending-topic
+    overlay orders pipelined TOPIC and KEEPTOPIC without reading stale
+    committed state, while pending channel
+    registrations reserve both the channel name and the founder's cap slot.
+    K/D/X-line add/remove writes the ban row and audit row in one transaction;
+    enforcement, disconnects, operator notices, and HTTP admin responses happen
+    only after it commits. The IRC and HTTP origins are typed requesters, so a
+    global committed result does not depend on a still-live `ConnId`, and no
+    sentinel connection can accidentally stand in for an admin request.
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the CR/LF sanitizer and
     the detached-buffer append; the bypass is a compile error, not a lint.

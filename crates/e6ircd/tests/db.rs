@@ -2677,6 +2677,71 @@ async fn query_history_msgid_paginates_within_a_single_second() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_registration_stores_initial_topic_in_its_insert() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("channel_registration_stores_initial_topic_in_its_insert").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "boss", "pw")
+        .await
+        .expect("account");
+    let (request_tx, request_rx) = queue::<DbRequest>(QueueConfig {
+        name: "register-topic-db",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
+        name: "register-topic-core",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    tokio::spawn(db::run_worker(pool.clone(), request_rx, core_tx));
+    let conn = e6ircd::core::ConnId(17);
+    let topic = ("initial".to_string(), "boss!b@h".to_string(), 1000);
+    request_tx
+        .push(DbRequest::RegisterChannel {
+            conn,
+            channel: "#c".into(),
+            founder_account: "boss".into(),
+            topic: Some(topic.clone()),
+            label: None,
+        })
+        .await
+        .expect("push");
+    let Some(envelope) = core_rx.pop().await else {
+        panic!("worker died")
+    };
+    let Input::DbReply {
+        conn: got_conn,
+        reply,
+    } = envelope.payload
+    else {
+        panic!("unexpected worker reply")
+    };
+    assert_eq!(got_conn, conn);
+    assert_eq!(
+        reply,
+        DbReply::ChannelRegistered {
+            channel: "#c".into(),
+            founder_account: "boss".into(),
+            topic: Some(topic),
+            label: None,
+        }
+    );
+    assert_eq!(
+        db::list_channel_topics(&pool).await.expect("topics"),
+        vec![(
+            "#c".to_string(),
+            "initial".to_string(),
+            "boss!b@h".to_string(),
+            1000
+        )]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn channel_topic_persist_and_load() {
     let pool = db::connect_and_migrate(&support::test_db("channel_topic_persist_and_load").await)
         .await
@@ -2693,13 +2758,16 @@ async fn channel_topic_persist_and_load() {
     .expect("channel");
 
     // Set → it loads back with the same fields.
-    db::set_channel_topic(
-        &pool,
-        "#c",
-        Some(("hi there".into(), "boss!b@h".into(), 1000)),
-    )
-    .await
-    .expect("set");
+    assert_eq!(
+        db::set_channel_topic(
+            &pool,
+            "#c",
+            Some(("hi there".into(), "boss!b@h".into(), 1000)),
+        )
+        .await
+        .expect("set"),
+        Some(true)
+    );
     assert_eq!(
         db::list_channel_topics(&pool).await.expect("list"),
         vec![(
@@ -2711,9 +2779,12 @@ async fn channel_topic_persist_and_load() {
     );
 
     // Clear → it no longer loads.
-    db::set_channel_topic(&pool, "#c", None)
-        .await
-        .expect("clear");
+    assert_eq!(
+        db::set_channel_topic(&pool, "#c", None)
+            .await
+            .expect("clear"),
+        Some(true)
+    );
     assert!(
         db::list_channel_topics(&pool)
             .await
@@ -2748,24 +2819,65 @@ async fn channel_keeptopic_persist_and_load() {
             .is_empty()
     );
 
-    // Turn it off → it appears in the off-list.
-    db::set_channel_keeptopic(&pool, "#c", false)
+    db::set_channel_topic(&pool, "#c", Some(("old".into(), "boss!b@h".into(), 1000)))
         .await
-        .expect("off");
+        .expect("topic");
+
+    // Turn it off → it appears in the off-list and clears all retained-topic
+    // columns in the same UPDATE.
+    assert!(
+        db::set_channel_keeptopic(&pool, "#c", false, None)
+            .await
+            .expect("off")
+    );
     assert_eq!(
         db::list_keeptopic_off(&pool).await.expect("list"),
         vec!["#c".to_string()]
     );
+    assert!(
+        db::list_channel_topics(&pool)
+            .await
+            .expect("topics")
+            .is_empty()
+    );
 
-    // Back on → the exception clears.
-    db::set_channel_keeptopic(&pool, "#c", true)
+    // Back on → the exception clears and the supplied live topic is captured
+    // atomically, without a second write that can fail independently.
+    assert!(
+        db::set_channel_keeptopic(
+            &pool,
+            "#c",
+            true,
+            Some(("current".into(), "boss!b@h".into(), 2000)),
+        )
         .await
-        .expect("on");
+        .expect("on")
+    );
     assert!(
         db::list_keeptopic_off(&pool)
             .await
             .expect("list")
             .is_empty()
+    );
+    assert_eq!(
+        db::list_channel_topics(&pool).await.expect("topics"),
+        vec![(
+            "#c".to_string(),
+            "current".to_string(),
+            "boss!b@h".to_string(),
+            2000
+        )]
+    );
+    assert!(
+        !db::set_channel_keeptopic(&pool, "#missing", true, None)
+            .await
+            .expect("missing option row")
+    );
+    assert_eq!(
+        db::set_channel_topic(&pool, "#missing", None)
+            .await
+            .expect("missing topic row"),
+        None
     );
 }
 
@@ -2795,23 +2907,32 @@ async fn channel_mlock_persist_and_load() {
     );
 
     // Set → loads back with the same spec.
-    db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()))
-        .await
-        .expect("set");
+    assert!(
+        db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()))
+            .await
+            .expect("set")
+    );
     assert_eq!(
         db::list_channel_mlock(&pool).await.expect("list"),
         vec![("#c".to_string(), "+nt-i".to_string())]
     );
 
     // Clear → it no longer loads.
-    db::set_channel_mlock(&pool, "#c", None)
-        .await
-        .expect("clear");
+    assert!(
+        db::set_channel_mlock(&pool, "#c", None)
+            .await
+            .expect("clear")
+    );
     assert!(
         db::list_channel_mlock(&pool)
             .await
             .expect("list")
             .is_empty()
+    );
+    assert!(
+        !db::set_channel_mlock(&pool, "#missing", Some("+m".into()))
+            .await
+            .expect("missing row")
     );
 }
 
@@ -2909,6 +3030,101 @@ async fn channel_founder_transfer() {
         db::list_registered_channels(&pool).await.expect("list"),
         vec![("#c".to_string(), "alice".to_string())]
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn server_ban_worker_mutates_and_audits_atomically() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("server_ban_worker_mutates_and_audits_atomically").await,
+    )
+    .await
+    .expect("connect");
+    let (request_tx, request_rx) = queue::<DbRequest>(QueueConfig {
+        name: "server-ban-db",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
+        name: "server-ban-core",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    tokio::spawn(db::run_worker(pool.clone(), request_rx, core_tx));
+    let conn = e6ircd::core::ConnId(9);
+    let add = e6ircd::core::ServerBanMutation::Add {
+        mask: "baddie@*".into(),
+        mask_display: "Baddie@*".into(),
+        reason: "spam".into(),
+        set_by: "god".into(),
+        kind: "kline".into(),
+    };
+    let requester = e6ircd::core::ServerBanRequester::Oper { conn, label: None };
+    request_tx
+        .push(DbRequest::MutateServerBan {
+            mutation: add.clone(),
+            requester: requester.clone(),
+        })
+        .await
+        .expect("push add");
+    let Some(envelope) = core_rx.pop().await else {
+        panic!("worker died")
+    };
+    assert!(matches!(
+        envelope.payload,
+        Input::ServerBanResult {
+            mutation,
+            requester: got_requester,
+            result: e6ircd::core::ServerBanResult::Stored,
+        } if mutation == add && got_requester == requester
+    ));
+    assert_eq!(
+        db::list_server_bans(&pool).await.expect("bans"),
+        vec![(
+            "Baddie@*".to_string(),
+            "spam".to_string(),
+            "god".to_string(),
+            "kline".to_string(),
+        )]
+    );
+    let audit = db::list_audit_log(&pool, 10).await.expect("audit");
+    assert_eq!(
+        (&audit[0].0, &audit[0].1, &audit[0].2, &audit[0].3),
+        (
+            &"god".to_string(),
+            &"KLINE".to_string(),
+            &"Baddie@*".to_string(),
+            &"spam".to_string()
+        )
+    );
+
+    let remove = e6ircd::core::ServerBanMutation::Remove {
+        mask: "baddie@*".into(),
+        mask_display: "Baddie@*".into(),
+        kind: "kline".into(),
+        actor: "god".into(),
+    };
+    request_tx
+        .push(DbRequest::MutateServerBan {
+            mutation: remove,
+            requester,
+        })
+        .await
+        .expect("push remove");
+    let Some(envelope) = core_rx.pop().await else {
+        panic!("worker died")
+    };
+    assert!(matches!(
+        envelope.payload,
+        Input::ServerBanResult {
+            result: e6ircd::core::ServerBanResult::Stored,
+            ..
+        }
+    ));
+    assert!(db::list_server_bans(&pool).await.expect("bans").is_empty());
+    let audit = db::list_audit_log(&pool, 10).await.expect("audit");
+    assert_eq!(audit[0].1, "UNKLINE");
+    assert_eq!(audit[0].2, "Baddie@*");
 }
 
 #[tokio::test]

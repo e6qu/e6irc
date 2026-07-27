@@ -14,12 +14,12 @@ mod chanops;
 mod history;
 pub(crate) mod message;
 mod monitor;
-mod oper;
+pub(super) mod oper;
 mod query;
 mod read_marker;
 mod registration;
 mod sasl;
-mod services;
+pub(super) mod services;
 
 use channel::*;
 use chanops::*;

@@ -78,6 +78,21 @@ pub enum Input {
         req: AdminRequest,
         reply: tokio::sync::oneshot::Sender<AdminReply>,
     },
+    /// A registered-channel deletion verdict. Unlike ordinary DB replies this
+    /// may belong to an IRC connection or an HTTP admin request, so its typed
+    /// requester travels with it instead of inventing a sentinel `ConnId`.
+    ChannelDropResult {
+        channel: String,
+        requester: ChannelDropRequester,
+        result: ChannelDropResult,
+    },
+    /// A server-ban add/remove verdict. Like channel deletion, the requester
+    /// may be an IRC operator or an HTTP admin request.
+    ServerBanResult {
+        mutation: ServerBanMutation,
+        requester: ServerBanRequester,
+        result: ServerBanResult,
+    },
 }
 
 /// A privileged action requested by the HTTP admin console (DESIGN §9.4).
@@ -145,6 +160,69 @@ pub enum AdminReply {
     Sessions(Vec<SessionInfo>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelDropRequester {
+    ChanServ {
+        conn: ConnId,
+        display: String,
+        label: Option<String>,
+    },
+    Admin {
+        request_id: u64,
+        actor: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelDropResult {
+    Dropped,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerBanRequester {
+    Oper { conn: ConnId, label: Option<String> },
+    Admin { request_id: u64, actor: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerBanMutation {
+    Add {
+        mask: String,
+        mask_display: String,
+        reason: String,
+        set_by: String,
+        kind: String,
+    },
+    Remove {
+        mask: String,
+        mask_display: String,
+        kind: String,
+        actor: String,
+    },
+}
+
+impl ServerBanMutation {
+    pub fn key(&self) -> (&str, &str) {
+        match self {
+            Self::Add { mask, kind, .. } | Self::Remove { mask, kind, .. } => (kind, mask),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerBanResult {
+    Stored,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTopicFailure {
+    MissingRegistration,
+    PersistenceUnavailable,
+}
+
 /// Work the core asks the DB worker to do. The worker answers by
 /// pushing an [`Input::DbReply`] back into the core queue — the core
 /// itself never blocks on the database.
@@ -172,12 +250,18 @@ pub enum DbRequest {
         conn: ConnId,
         channel: String,
         founder_account: String,
+        /// The live topic at request time. Registration and its initial retained
+        /// topic are one database transition, never two independently failing
+        /// writes.
+        topic: Option<(String, String, u64)>,
+        /// Escaped labeled-response label carried onto the deferred verdict.
+        label: Option<String>,
     },
-    /// Unregister a channel (ChanServ DROP). Fire-and-forget: the core
-    /// already removed it from its hot maps.
+    /// Unregister a channel (ChanServ DROP).
     DropChannel {
         /// Casefolded channel name.
         channel: String,
+        requester: ChannelDropRequester,
     },
     /// Transfer a registered channel's founder (ChanServ SET FOUNDER).
     /// Answered with `FounderChanged` or `FounderChangeFailed`.
@@ -233,25 +317,44 @@ pub enum DbRequest {
         /// Escaped labeled-response label carried onto the deferred reply.
         label: Option<String>,
     },
-    /// Persist a registered channel's retained topic (fire-and-forget).
-    /// `topic` is `(text, setter, set_at_secs)`; `None` clears it.
+    /// Persist a registered channel's retained topic. The worker reports
+    /// whether the row still exists and has KEEPTOPIC enabled; the live topic
+    /// and retained hot mirror change only after that verdict.
     SetChannelTopic {
+        conn: ConnId,
         /// Casefolded channel name.
         channel: String,
+        /// Display spelling used in the eventual TOPIC line.
+        display: String,
+        /// Prefix captured when the command was authorized.
+        prefix: String,
         topic: Option<(String, String, u64)>,
+        revision: u64,
+        label: Option<String>,
     },
-    /// Persist a registered channel's KEEPTOPIC option (fire-and-forget).
+    /// Persist a registered channel's KEEPTOPIC option and the retained topic
+    /// it implies as one database transition.
     SetChannelKeeptopic {
+        conn: ConnId,
         /// Casefolded channel name.
         channel: String,
+        /// Display spelling used in the service verdict.
+        display: String,
         keeptopic: bool,
+        /// Current live topic when enabling; ignored when disabling.
+        topic: Option<(String, String, u64)>,
+        label: Option<String>,
     },
-    /// Persist a registered channel's mode lock (fire-and-forget). `mlock`
-    /// is the canonical spec string; `None` clears the lock.
+    /// Persist a registered channel's mode lock. `mlock` is the canonical spec
+    /// string; `None` clears the lock.
     SetChannelMlock {
+        conn: ConnId,
         /// Casefolded channel name.
         channel: String,
+        /// Display spelling used in the service verdict.
+        display: String,
         mlock: Option<String>,
+        label: Option<String>,
     },
     /// Persist one channel access entry, then answer with `ChannelAccessSet` so
     /// the hot map is updated only on a confirmed write (a grant to an
@@ -264,18 +367,12 @@ pub enum DbRequest {
         account: String,
         flags: Option<String>,
     },
-    /// Persist a server ban (oper KLINE/DLINE/XLINE). Fire-and-forget.
-    /// `mask` is the casefolded storage/uniqueness key; `mask_display` preserves
-    /// the operator's original casing for STATS across a restart.
-    AddServerBan {
-        mask: String,
-        mask_display: String,
-        reason: String,
-        set_by: String,
-        kind: String,
+    /// Persist a server-ban mutation and its audit row atomically, then return
+    /// a typed verdict before the core mutates or enforces its hot list.
+    MutateServerBan {
+        mutation: ServerBanMutation,
+        requester: ServerBanRequester,
     },
-    /// Remove a server ban by (mask, kind) (oper UN*LINE). Fire-and-forget.
-    RemoveServerBan { mask: String, kind: String },
     /// Record a privileged (oper) action in the audit log. Fire-and-forget.
     AuditLog {
         actor: String,
@@ -513,8 +610,13 @@ pub enum DbReply {
     ChannelRegistered {
         channel: String,
         founder_account: String,
+        topic: Option<(String, String, u64)>,
+        label: Option<String>,
     },
-    ChannelExists,
+    ChannelExists {
+        channel: String,
+        label: Option<String>,
+    },
     /// A NickServ/REGISTER-command account registration could not be persisted
     /// (DB down/errored). Carries the origin so the client gets the loud
     /// failure appropriate to how it asked, never a silent hang.
@@ -522,7 +624,10 @@ pub enum DbReply {
         origin: AccountOrigin,
     },
     /// A ChanServ channel registration could not be persisted (DB down/errored).
-    ChannelRegisterUnavailable,
+    ChannelRegisterUnavailable {
+        channel: String,
+        label: Option<String>,
+    },
     /// A founder transfer succeeded: `channel` as typed, `account`
     /// casefolded (updates the hot ownership map).
     FounderChanged {
@@ -565,6 +670,48 @@ pub enum DbReply {
     /// reason and can revoke an entry rather than retry.
     ChannelAccessLimitReached {
         channel: String,
+    },
+    /// A TOPIC request reached the registered-channel row. `retained` is the
+    /// row's KEEPTOPIC value: the live topic is valid either way, while only a
+    /// retained topic enters the restart-surviving hot mirror.
+    ChannelTopicSet {
+        channel: String,
+        display: String,
+        prefix: String,
+        topic: Option<(String, String, u64)>,
+        revision: u64,
+        retained: bool,
+        label: Option<String>,
+    },
+    ChannelTopicFailed {
+        channel: String,
+        display: String,
+        revision: u64,
+        label: Option<String>,
+        failure: ChannelTopicFailure,
+    },
+    ChannelKeeptopicSet {
+        channel: String,
+        display: String,
+        keeptopic: bool,
+        topic: Option<(String, String, u64)>,
+        applied: bool,
+        label: Option<String>,
+    },
+    ChannelKeeptopicUnavailable {
+        display: String,
+        label: Option<String>,
+    },
+    ChannelMlockSet {
+        channel: String,
+        display: String,
+        mlock: Option<String>,
+        applied: bool,
+        label: Option<String>,
+    },
+    ChannelMlockUnavailable {
+        display: String,
+        label: Option<String>,
     },
     /// A read marker was durably stored. `marker_ms` is the value PostgreSQL
     /// returned after applying the monotonic `GREATEST`, not merely the value
@@ -736,11 +883,21 @@ impl Core {
             // DB write path so the buffered history flushes.
             Input::Shutdown => self.state.broadcast_shutdown("Server shutting down"),
             Input::Admin { req, reply } => {
-                let outcome = handler::admin::handle(&mut self.state, req);
-                // The receiver is the HTTP handler awaiting this action; if it
-                // has gone away (client hung up), the action still applied —
-                // dropping the reply is fine.
-                let _ = reply.send(outcome);
+                handler::admin::handle(&mut self.state, req, reply);
+            }
+            Input::ChannelDropResult {
+                channel,
+                requester,
+                result,
+            } => {
+                handler::services::channel_drop_result(&mut self.state, channel, requester, result);
+            }
+            Input::ServerBanResult {
+                mutation,
+                requester,
+                result,
+            } => {
+                handler::oper::server_ban_result(&mut self.state, mutation, requester, result);
             }
         }
         // Sweep connections whose SendQ overflowed while handling the

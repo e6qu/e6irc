@@ -313,7 +313,6 @@ pub(super) fn cmd_add_ban(
         return;
     }
     let label = kind.label();
-    let command = kind.as_str().to_uppercase();
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn]
         .nick()
@@ -374,34 +373,101 @@ pub(super) fn cmd_add_ban(
     // while keeping the operator's casing for STATS and the confirmation — the
     // same discipline the channel ban lists use.
     let mask = crate::core::state::MaskKey::new(parsed_mask.as_str(), casemap);
-    // Audit and confirm *before* the apply: `apply_server_ban` disconnects
-    // matching sessions, and a self-matching ban (`KLINE *@*`, or a mask
-    // covering the oper's own host) closes `conn` in that loop — after which
-    // `record_audit` would resolve the actor to an empty string and the
-    // confirmation NOTICE would be a silent no-op on the gone session. Same
-    // ordering `cmd_kill` documents for a self-kill.
-    record_audit(state, conn, &command, mask.as_str(), &reason);
-    state.send(
-        conn,
-        &format!(
-            ":{server} NOTICE {nick} :Added {label} for {}",
-            mask.as_str()
-        ),
-    );
-    notify_opers(
-        state,
-        None,
-        &format!("{nick} added {label} for {} ({reason})", mask.as_str()),
-    );
-    apply_server_ban(state, mask, kind, &reason, &nick, label);
+    if !state.config.sasl_enabled {
+        state.send(
+            conn,
+            &format!(
+                ":{server} NOTICE {nick} :Added {label} for {}",
+                mask.as_str()
+            ),
+        );
+        notify_opers(
+            state,
+            None,
+            &format!("{nick} added {label} for {} ({reason})", mask.as_str()),
+        );
+        apply_server_ban_hot(state, mask, kind, &reason, &nick, label);
+        return;
+    }
+    let mutation = crate::core::ServerBanMutation::Add {
+        mask: mask.folded().to_string(),
+        mask_display: mask.as_str().to_string(),
+        reason,
+        set_by: nick,
+        kind: kind.as_str().to_string(),
+    };
+    begin_oper_server_ban(state, conn, label, &mask, mutation);
 }
 
-/// Apply a server ban to live state: replace any existing ban of the same kind
-/// on the same (folded) `mask`, add it to the hot list, persist it, and
-/// disconnect every matching registered session. Returns the number
-/// disconnected. Shared by the oper KLINE/DLINE/XLINE path and the HTTP admin
-/// console, which has no IRC session of its own.
-pub(crate) fn apply_server_ban(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueServerBanError {
+    AlreadyPending,
+    PersistenceUnavailable,
+}
+
+/// Reserve and enqueue exactly one mutation of a durable server-ban row.
+///
+/// IRC and HTTP callers share this boundary so pending-row serialization and
+/// the "reserve only after enqueue" ordering cannot drift between origins.
+pub(crate) fn queue_server_ban_mutation(
+    state: &mut ServerState,
+    mutation: crate::core::ServerBanMutation,
+    requester: crate::core::ServerBanRequester,
+) -> Result<(), QueueServerBanError> {
+    let (kind, mask) = mutation.key();
+    let pending_key = (kind.to_string(), mask.to_string());
+    if state.pending_server_bans.contains(&pending_key) {
+        return Err(QueueServerBanError::AlreadyPending);
+    }
+    let request = crate::core::DbRequest::MutateServerBan {
+        mutation,
+        requester,
+    };
+    state
+        .db_tx
+        .try_push(request)
+        .map_err(|_| QueueServerBanError::PersistenceUnavailable)?;
+    state.pending_server_bans.insert(pending_key);
+    Ok(())
+}
+
+fn begin_oper_server_ban(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: &str,
+    mask: &crate::core::state::MaskKey,
+    mutation: crate::core::ServerBanMutation,
+) {
+    let unavailable_action = match &mutation {
+        crate::core::ServerBanMutation::Add { .. } => "added",
+        crate::core::ServerBanMutation::Remove { .. } => "removed",
+    };
+    let response_label = state.capture.as_ref().and_then(|cap| cap.label.clone());
+    let requester = crate::core::ServerBanRequester::Oper {
+        conn,
+        label: response_label,
+    };
+    match queue_server_ban_mutation(state, mutation, requester) {
+        Ok(()) => state.defer_captured_reply(conn),
+        Err(error) => {
+            let server = state.config.server_name.clone();
+            let nick = state.sessions[&conn].nick().unwrap_or("*");
+            let message = match error {
+                QueueServerBanError::AlreadyPending => format!(
+                    "A {label} change for {} is already in progress",
+                    mask.as_str()
+                ),
+                QueueServerBanError::PersistenceUnavailable => format!(
+                    "Services are temporarily unavailable; {label} not {unavailable_action}"
+                ),
+            };
+            state.send(conn, &format!(":{server} NOTICE {nick} :{message}"));
+        }
+    }
+}
+
+/// Apply a database-confirmed server ban to live state and disconnect matches.
+pub(crate) fn apply_server_ban_hot(
     state: &mut ServerState,
     mask: crate::core::state::MaskKey,
     kind: BanKind,
@@ -420,23 +486,6 @@ pub(crate) fn apply_server_ban(
         set_by: set_by.to_string(),
         kind,
     });
-    if state.config.sasl_enabled {
-        let request = crate::core::DbRequest::AddServerBan {
-            // The folded form is the storage/uniqueness key; the display form is
-            // persisted alongside so the original casing survives a restart.
-            mask: mask.folded().to_string(),
-            mask_display: mask.as_str().to_string(),
-            reason: reason.to_string(),
-            set_by: set_by.to_string(),
-            kind: kind.as_str().to_string(),
-        };
-        if state.db_tx.try_push(request).is_err() {
-            eprintln!(
-                "server-ban: db queue full or closed; {label} for {} not persisted",
-                mask.as_str()
-            );
-        }
-    }
     // Disconnect any matching registered sessions (possibly including the setter
     // when driven by an oper).
     let victims: Vec<ConnId> = state
@@ -464,10 +513,8 @@ pub(crate) fn apply_server_ban(
     disconnected
 }
 
-/// Remove a server ban of `kind` matching `mask` (folded equality) from the hot
-/// list and persist the removal. Returns whether a ban was actually removed.
-/// Shared by the oper UN*LINE path and the HTTP admin console.
-pub(crate) fn remove_server_ban(
+/// Remove a database-confirmed server ban from the hot list.
+pub(crate) fn remove_server_ban_hot(
     state: &mut ServerState,
     mask: &crate::core::state::MaskKey,
     kind: BanKind,
@@ -476,21 +523,173 @@ pub(crate) fn remove_server_ban(
     state
         .server_bans
         .retain(|b| !(b.kind == kind && b.mask == *mask));
-    let removed = state.server_bans.len() < before;
-    if removed && state.config.sasl_enabled {
-        let request = crate::core::DbRequest::RemoveServerBan {
-            // The folded form is the DB delete key (see apply_server_ban).
-            mask: mask.folded().to_string(),
-            kind: kind.as_str().to_string(),
-        };
-        if state.db_tx.try_push(request).is_err() {
-            eprintln!(
-                "un-ban: db queue full or closed; removal of {} not persisted",
-                mask.as_str()
+    state.server_bans.len() < before
+}
+
+pub(crate) fn server_ban_result(
+    state: &mut ServerState,
+    mutation: crate::core::ServerBanMutation,
+    requester: crate::core::ServerBanRequester,
+    result: crate::core::ServerBanResult,
+) {
+    let (kind_token, folded_mask) = mutation.key();
+    state
+        .pending_server_bans
+        .remove(&(kind_token.to_string(), folded_mask.to_string()));
+    let Some(kind) = BanKind::from_token(kind_token) else {
+        eprintln!("core: database echoed invalid server-ban kind {kind_token:?}");
+        finish_server_ban_unavailable(state, requester, "server-ban result was invalid");
+        return;
+    };
+    if result == crate::core::ServerBanResult::Unavailable {
+        finish_server_ban_unavailable(state, requester, "services are temporarily unavailable");
+        return;
+    }
+
+    match mutation {
+        crate::core::ServerBanMutation::Add {
+            mask_display,
+            reason,
+            set_by,
+            ..
+        } => {
+            let mask = crate::core::state::MaskKey::new(&mask_display, state.casemap);
+            let label = kind.label();
+            match requester {
+                crate::core::ServerBanRequester::Oper {
+                    conn,
+                    label: response_label,
+                } => {
+                    if state.sessions.contains_key(&conn) {
+                        let server = state.config.server_name.clone();
+                        let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
+                        state.emit_deferred_labeled(conn, response_label, |state| {
+                            state.send(
+                                conn,
+                                &format!(
+                                    ":{server} NOTICE {nick} :Added {label} for {}",
+                                    mask.as_str()
+                                ),
+                            );
+                        });
+                    }
+                    notify_opers(
+                        state,
+                        None,
+                        &format!("{set_by} added {label} for {} ({reason})", mask.as_str()),
+                    );
+                    apply_server_ban_hot(state, mask, kind, &reason, &set_by, label);
+                }
+                crate::core::ServerBanRequester::Admin { request_id, actor } => {
+                    let disconnected =
+                        apply_server_ban_hot(state, mask.clone(), kind, &reason, &actor, label);
+                    notify_opers(
+                        state,
+                        None,
+                        &format!(
+                            "{actor} (console) added {label} for {} ({reason})",
+                            mask.as_str()
+                        ),
+                    );
+                    finish_admin_server_ban(
+                        state,
+                        request_id,
+                        crate::core::AdminReply::Ok(format!(
+                            "Added {label} for {} — {disconnected} session(s) disconnected",
+                            mask.as_str()
+                        )),
+                    );
+                }
+            }
+        }
+        crate::core::ServerBanMutation::Remove {
+            mask_display,
+            actor,
+            ..
+        } => {
+            let mask = crate::core::state::MaskKey::new(&mask_display, state.casemap);
+            remove_server_ban_hot(state, &mask, kind);
+            let label = kind.label();
+            match requester {
+                crate::core::ServerBanRequester::Oper {
+                    conn,
+                    label: response_label,
+                } => {
+                    if state.sessions.contains_key(&conn) {
+                        let server = state.config.server_name.clone();
+                        let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
+                        state.emit_deferred_labeled(conn, response_label, |state| {
+                            state.send(
+                                conn,
+                                &format!(
+                                    ":{server} NOTICE {nick} :Removed {label} for {}",
+                                    mask.as_str()
+                                ),
+                            );
+                        });
+                    }
+                }
+                crate::core::ServerBanRequester::Admin { request_id, .. } => {
+                    finish_admin_server_ban(
+                        state,
+                        request_id,
+                        crate::core::AdminReply::Ok(format!(
+                            "Removed {label} for {}",
+                            mask.as_str()
+                        )),
+                    );
+                }
+            }
+            notify_opers(
+                state,
+                None,
+                &format!("{actor} removed {label} for {}", mask.as_str()),
             );
         }
     }
-    removed
+}
+
+fn finish_server_ban_unavailable(
+    state: &mut ServerState,
+    requester: crate::core::ServerBanRequester,
+    reason: &str,
+) {
+    match requester {
+        crate::core::ServerBanRequester::Oper { conn, label } => {
+            if state.sessions.contains_key(&conn) {
+                let server = state.config.server_name.clone();
+                let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
+                state.emit_deferred_labeled(conn, label, |state| {
+                    state.send(
+                        conn,
+                        &format!(":{server} NOTICE {nick} :Server-ban change failed: {reason}"),
+                    );
+                });
+            }
+        }
+        crate::core::ServerBanRequester::Admin { request_id, .. } => {
+            finish_admin_server_ban(
+                state,
+                request_id,
+                crate::core::AdminReply::Err(format!("server-ban change failed: {reason}")),
+            );
+        }
+    }
+}
+
+fn finish_admin_server_ban(
+    state: &mut ServerState,
+    request_id: u64,
+    outcome: crate::core::AdminReply,
+) {
+    match state.pending_admin_server_bans.remove(&request_id) {
+        Some(reply) => {
+            let _ = reply.send(outcome);
+        }
+        None => {
+            eprintln!("core: server-ban verdict for unknown admin request {request_id}");
+        }
+    }
 }
 
 /// UNKLINE/UNDLINE/UNXLINE <mask> — oper-only. Remove a server ban of the
@@ -506,12 +705,11 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         return;
     }
     let label = kind.label();
-    let un = format!("UN{}", kind.as_str().to_uppercase());
     if p.is_empty() {
         state.numeric(
             conn,
             ERR_NEEDMOREPARAMS,
-            &[&un],
+            &[&format!("UN{}", kind.as_str().to_uppercase())],
             Some("Not enough parameters"),
         );
         return;
@@ -527,21 +725,43 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         _ => p[0].to_string(),
     };
     let mask = crate::core::state::MaskKey::new(&ban_mask(kind, &raw_mask), casemap);
-    let removed = remove_server_ban(state, &mask, kind);
     let server = state.config.server_name.clone();
     let nick = state.sessions[&conn]
         .nick()
         .map(String::from)
         .expect("registered");
-    let msg = if removed {
-        format!("Removed {label} for {}", mask.as_str())
-    } else {
-        format!("No {label} found for {}", mask.as_str())
-    };
-    if removed {
-        record_audit(state, conn, &un, mask.as_str(), "");
+    let exists = state
+        .server_bans
+        .iter()
+        .any(|ban| ban.kind == kind && ban.mask == mask);
+    if !exists {
+        state.send(
+            conn,
+            &format!(
+                ":{server} NOTICE {nick} :No {label} found for {}",
+                mask.as_str()
+            ),
+        );
+        return;
     }
-    state.send(conn, &format!(":{server} NOTICE {nick} :{msg}"));
+    if !state.config.sasl_enabled {
+        remove_server_ban_hot(state, &mask, kind);
+        state.send(
+            conn,
+            &format!(
+                ":{server} NOTICE {nick} :Removed {label} for {}",
+                mask.as_str()
+            ),
+        );
+        return;
+    }
+    let mutation = crate::core::ServerBanMutation::Remove {
+        mask: mask.folded().to_string(),
+        mask_display: mask.as_str().to_string(),
+        kind: kind.as_str().to_string(),
+        actor: nick,
+    };
+    begin_oper_server_ban(state, conn, label, &mask, mutation);
 }
 
 /// SETHOST <nick> <host> — oper-only. Change a user's displayed host

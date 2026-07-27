@@ -1184,8 +1184,8 @@ async fn admin_console_ban_and_channel_actions() {
         .to_string();
     assert!(!csrf.is_empty());
 
-    // Fetch /console and test for a needle, retrying while the fire-and-forget
-    // DB write behind a core action settles.
+    // Fetch /console and test for a needle, retrying while the redirect's
+    // committed core action becomes visible to the independent list query.
     let console_has = |needle: &'static str, want: bool| {
         let req = page_req.clone();
         async move {
