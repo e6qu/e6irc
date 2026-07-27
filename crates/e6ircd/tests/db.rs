@@ -6,7 +6,7 @@
 
 use e6irc_queue::{Config as QueueConfig, Policy, queue};
 use e6ircd::config::{Config, DatabaseConfig, ListenerConfig};
-use e6ircd::core::{DbReply, DbRequest, Input};
+use e6ircd::core::{DbReply, DbRequest, HistoryTargets, Input};
 use e6ircd::{db, net};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -539,6 +539,83 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
         count, 5,
         "all buffered history rows must be flushed on shutdown"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn history_worker_resolves_offline_direct_message_candidates() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("history_worker_resolves_offline_direct_message_candidates").await,
+    )
+    .await
+    .expect("connect");
+    for (msgid, target, body) in [
+        ("account-message", "alice!bob", "registered"),
+        ("anonymous-message", "bob!~carol", "unauthenticated"),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages
+                 (msgid, target, sender_prefix, kind, body, ts, dm_peers)
+             VALUES ($1, $2, 'peer!u@host', 'privmsg', $3, now(),
+                     string_to_array($2, '!'))",
+        )
+        .bind(msgid)
+        .bind(target)
+        .bind(body)
+        .execute(&pool)
+        .await
+        .expect("insert history");
+    }
+
+    let (request_tx, request_rx) = queue::<DbRequest>(QueueConfig {
+        name: "history-target-request",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    let (core_tx, mut core_rx) = queue::<Input>(QueueConfig {
+        name: "history-target-reply",
+        capacity: 8,
+        policy: Policy::Fifo,
+    });
+    tokio::spawn(db::run_worker(pool, request_rx, core_tx));
+
+    for (targets, expected) in [
+        (
+            HistoryTargets::PreferExisting {
+                primary: "alice!bob".into(),
+                fallback: "bob!~alice".into(),
+            },
+            "registered",
+        ),
+        (
+            HistoryTargets::PreferExisting {
+                primary: "bob!carol".into(),
+                fallback: "bob!~carol".into(),
+            },
+            "unauthenticated",
+        ),
+    ] {
+        request_tx
+            .push(DbRequest::QueryHistory {
+                conn: e6ircd::core::ConnId(9),
+                targets,
+                display: "peer".into(),
+                batch_ref: "batch".into(),
+                query: e6ircd::core::HistoryQuery::Latest { limit: 10 },
+                label: None,
+            })
+            .await
+            .expect("enqueue query");
+        let Some(reply) = core_rx.pop().await else {
+            panic!("worker stopped before replying")
+        };
+        let Input::HistoryPage { rows, .. } = reply.payload else {
+            panic!("unexpected worker reply")
+        };
+        let rows = rows.expect("history page");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, expected);
+    }
 }
 
 #[tokio::test]
@@ -1743,6 +1820,112 @@ async fn chathistory_targets_db_path_shows_dm_correspondent_as_a_nick() {
     assert!(
         !target_line.contains("~alice"),
         "the raw `~`-prefixed identity must not leak: {target_line}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn chathistory_dm_with_a_disconnected_unauthenticated_peer_is_readable() {
+    // Regression: an *unauthenticated* peer's DM is stored under `~nick`, but the
+    // offline read resolves the nick to the bare (account) form. Once the peer
+    // disconnects, the account-form key names no stored conversation, so
+    // without the `~nick` fallback `CHATHISTORY LATEST <nick>` returned an empty
+    // batch for backlog `CHATHISTORY TARGETS` still advertises.
+    let url = support::test_db("chathistory_dm_disconnected_unauth_peer").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    let config = Config {
+        server_name: "irc.dm2.example".into(),
+        network_name: "DmNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+
+    // bob is the querier; alice (unauthenticated) sends him a DM then quits.
+    let bob_stream = TcpStream::connect(running.addrs[0]).await.expect("bob");
+    let (br, mut bw) = bob_stream.into_split();
+    let mut breader = BufReader::new(br);
+    bw.write_all(
+        b"CAP LS 302\r\nCAP REQ :batch draft/chathistory message-tags server-time\r\n\
+          NICK bob\r\nUSER b 0 * :B\r\nCAP END\r\n",
+    )
+    .await
+    .unwrap();
+    expect_line(&mut breader, "001").await;
+
+    let alice_stream = TcpStream::connect(running.addrs[0]).await.expect("alice");
+    let (ar, mut aw) = alice_stream.into_split();
+    let mut areader = BufReader::new(ar);
+    aw.write_all(b"NICK alice\r\nUSER a 0 * :A\r\n")
+        .await
+        .unwrap();
+    expect_line(&mut areader, "001").await;
+    aw.write_all(b"PRIVMSG bob :hi there\r\n").await.unwrap();
+    expect_line(&mut breader, "PRIVMSG bob :hi there").await;
+
+    // Wait for the DM to persist before switching the lookup to the offline
+    // identity path.
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM messages WHERE dm_peers IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        if n >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // alice disconnects; poll until she is fully offline, so bob's read resolves
+    // her nick to the bare form (exercising the fallback, not the live-session
+    // path — which would resolve the correct `~alice` key directly and pass
+    // trivially).
+    aw.write_all(b"QUIT :bye\r\n").await.unwrap();
+    drop(aw);
+    drop(areader);
+    loop {
+        bw.write_all(b"ISON alice\r\n").await.unwrap();
+        let line = expect_line(&mut breader, " 303 ").await;
+        let present = line
+            .rsplit_once(" :")
+            .map(|(_, t)| t.contains("alice"))
+            .unwrap_or(false);
+        if !present {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // bob reads the DM history by alice's nick. The account-form key names no
+    // stored conversation; the `~alice` fallback must resolve the backlog.
+    bw.write_all(b"CHATHISTORY LATEST alice * 10\r\n")
+        .await
+        .unwrap();
+    let batch_open = expect_line(&mut breader, "BATCH +").await;
+    let batch_ref = batch_open
+        .split(" BATCH +")
+        .nth(1)
+        .and_then(|s| s.split(' ').next())
+        .expect("batch ref")
+        .to_string();
+    let mut found = false;
+    loop {
+        let line = expect_line(&mut breader, "").await;
+        if line.contains("BATCH -") {
+            break;
+        }
+        if line.contains(&format!("batch={batch_ref}")) && line.contains("hi there") {
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "the disconnected unauthenticated peer's DM must be replayed, not an empty batch"
     );
 }
 
