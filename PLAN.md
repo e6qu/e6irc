@@ -4461,6 +4461,59 @@ extended `NetworkKey` unit test and a new PG-gated
 `bnc_network_name_selection_is_case_insensitive` (case-variant create collides,
 lookups/enable/delete resolve by any casing, display case preserved).
 
+Least-swept-surface adversarial sweep (2026-07-27): three parallel audits
+(core session-state/lifecycle + `net.rs`; CHATHISTORY + persistence/query;
+config parsing + the lock-free queue) plus a manual pass over message/SASL/
+services/device/oper. The **queue and the core state/lifecycle came back
+clean** (every client-driven collection capped, every index-cleanup path
+complete, no client-reachable panic), as did message routing, SASL reassembly,
+ChanServ auth gating, and the OAuth device flow. Four defects fixed on one PR:
+
+1. **IPv4-mapped IPv6 inbound host was not canonicalized → server-ban evasion.**
+   `net.rs` derived a session's host from `peer.ip().to_string()`, so a
+   dual-stack (`[::]`) listener presented every IPv4 client as `::ffff:a.b.c.d`.
+   `ban_match` tests a DLINE against that host string and a KLINE against
+   `user@host`, so an operator's `DLINE 203.0.113.7` (natural IPv4 notation)
+   silently failed to match the mapped spelling — a ban bypass — and WHOIS
+   showed the mapped host. Fixed by canonicalizing at the single ingress
+   (`peer.ip().to_canonical()`), mirroring the outbound SSRF canonicalization in
+   `http/networks`. Regression test `mapped_ipv4_peer_is_canonicalized_in_the_
+   open_host`.
+2. **`server_name` accepted control/prefix-significant chars.** It rejected only
+   empty/space/over-64, while the sibling `network_name` also rejected control
+   chars — and `server_name` is the more sensitive field: the source prefix
+   (`:<server_name> …`) of every server-originated line, where `WireLine`
+   neutralizes only CR/LF/NUL. A tab/BEL/`@`/`!` would forge a malformed or
+   spoofable prefix. Restricted to a hostname charset (`[A-Za-z0-9.-]`) at load,
+   making an injected prefix unrepresentable. Test
+   `server_name_with_control_or_prefix_char_is_rejected`.
+3. **`buffer_cap = 0` on a `[[network]]` was silently coerced to 1** by
+   `Buffer::push` (`self.cap.max(1)`) — a silent fallback (DESIGN §2) an operator
+   would not expect. Rejected loudly at load like the sibling zero-value guards.
+   Test `network_buffer_cap_zero_is_rejected`.
+4. **`http.public_url` was validated only when https-shaped or OIDC present.** An
+   unparseable value slipped through when `[[oidc]]` was absent (the https guard
+   only fires on a value that *parses*), yet it also seeds the device flow's
+   user-facing verification URL (`http/device.rs`). Now validated as an http(s)
+   URL with a host whenever set. Test
+   `unparseable_public_url_is_rejected_even_without_oidc`.
+
+One MED finding is **escalated to the maintainer as an open decision** (not
+filed away): DM history with a *never-authenticated* peer becomes an empty batch
+after they disconnect. The write path keys the DM under `conn_identity(peer)` =
+`~<nick>` for an unauthenticated peer; the offline read path uses
+`nick_identity(nick)` = the bare account form (no `~`), so the keys disagree by
+the tilde and `CHATHISTORY LATEST <nick>` returns empty for backlog that
+`CHATHISTORY TARGETS` still advertises. The clean fix is blocked on a design
+question: the core holds **no synchronous registry of account names**
+(`registered_peer` only knows online sessions), so it cannot tell an offline
+account-nick (key `nick`, deliberately readable "while they are away" per the
+`nick_identity` doc) from an offline unauthenticated peer (key `~nick`). Serving
+both correctly needs either an account-name cache in the core or a dual-key /
+fallback query across the paged CHATHISTORY path — a non-trivial change to the
+most heavily-tested subsystem, with a real behavior tradeoff. Awaiting the
+maintainer's call on which direction to take.
+
 ## Phase 0 — Scaffolding ✅ (2026-07-18)
 - Cargo workspace, crate skeletons, LICENSE (AGPL-3.0-or-later), CI
   (fmt, clippy, test, cargo-deny licenses/advisories, binary-size report,

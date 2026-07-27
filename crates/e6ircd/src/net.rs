@@ -693,7 +693,14 @@ async fn serve_conn<S>(
         .push(Input::Open {
             conn,
             tx: out_tx,
-            host: peer.ip().to_string(),
+            // Canonicalize an IPv4-mapped IPv6 peer (`::ffff:1.2.3.4`) to its IPv4
+            // form at this single ingress point. A dual-stack (`[::]`) listener
+            // presents every IPv4 client mapped, so without this a `DLINE
+            // 1.2.3.4` (or `KLINE *@1.2.3.4`) an operator writes in natural IPv4
+            // notation would not match the `::ffff:1.2.3.4` subject `ban_match`
+            // tests — a silent ban evasion — and WHOIS would show the mapped
+            // spelling. Mirrors the outbound SSRF canonicalization in `networks`.
+            host: peer.ip().to_canonical().to_string(),
         })
         .await
         .is_err()
@@ -816,13 +823,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn core_close_cancels_a_parked_read() {
-        let (core_tx, mut core_rx) = queue::<Input>(e6irc_queue::Config {
+    /// A small bounded `Input` channel for the `serve_conn` wiring tests.
+    fn test_core_channel() -> (Sender<Input>, Receiver<Input>) {
+        queue::<Input>(e6irc_queue::Config {
             name: "t-core",
             capacity: 8,
             policy: Policy::Fifo,
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn core_close_cancels_a_parked_read() {
+        let (core_tx, mut core_rx) = test_core_channel();
         let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let served = tokio::spawn(serve_conn(DeadPeer, ConnId(1), peer, core_tx, 8));
 
@@ -839,6 +851,28 @@ mod tests {
             .await
             .expect("serve_conn must return promptly after the core closes the session")
             .expect("serve_conn task panicked");
+    }
+
+    #[tokio::test]
+    async fn mapped_ipv4_peer_is_canonicalized_in_the_open_host() {
+        // A dual-stack (`[::]`) listener presents an IPv4 client as its
+        // IPv4-mapped IPv6 form (`::ffff:a.b.c.d`). The session host that
+        // `Input::Open` carries — the string `ban_match` tests DLINE/KLINE
+        // against and WHOIS shows — must be the canonical IPv4, or an operator's
+        // `DLINE 203.0.113.7` in natural notation would silently not match.
+        let (core_tx, mut core_rx) = test_core_channel();
+        let peer: SocketAddr = "[::ffff:203.0.113.7]:5000".parse().unwrap();
+        let served = tokio::spawn(serve_conn(DeadPeer, ConnId(1), peer, core_tx, 8));
+        let env = core_rx.pop().await.expect("Open event");
+        let Input::Open { host, tx, .. } = env.payload else {
+            panic!("expected Open");
+        };
+        assert_eq!(
+            host, "203.0.113.7",
+            "a mapped IPv4 peer must be canonicalized to its IPv4 host"
+        );
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), served).await;
     }
 
     /// Minimal core config for the shutdown wiring test — no PostgreSQL needed.

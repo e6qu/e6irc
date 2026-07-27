@@ -496,9 +496,23 @@ impl Config {
                 "a [[listeners]] with websocket = true cannot also set tls (terminate TLS at a proxy)".into(),
             ));
         }
-        if self.server_name.is_empty() || self.server_name.contains(' ') {
+        // server_name is the source prefix (`:<server_name> …`) of every
+        // server-originated line, so a space, control byte, or prefix-significant
+        // char (`!`/`@`) would forge a malformed or spoofable source. Restrict it
+        // to a hostname charset — the contract the field already advertises — so
+        // an injected prefix is unrepresentable rather than caught per render
+        // site. (`WireLine` only neutralizes CR/LF/NUL, so other control bytes
+        // would otherwise ride onto the wire.) The `network_name` guard below
+        // rejects control chars for the same reason; server_name is the more
+        // sensitive field and must be at least as strict.
+        if self.server_name.is_empty()
+            || !self
+                .server_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
             return Err(ConfigError::Invalid(
-                "server_name must be a hostname".into(),
+                "server_name must be a hostname (ASCII letters, digits, '.', '-')".into(),
             ));
         }
         // server_name is in the fixed head of every numeric; an unbounded value
@@ -760,6 +774,21 @@ impl Config {
                     .into(),
             ));
         }
+        // A configured `public_url` seeds the OIDC redirect_uri *and* the device
+        // flow's user-facing verification URL (`http/device.rs`), so an
+        // unparseable or non-http(s) value would silently propagate a broken base
+        // URL — and the https guard above only fires on a value that *parses*, so
+        // outright garbage would slip through when `[[oidc]]` is absent. Validate
+        // it as an http/https URL with a host whenever it is set (DESIGN §2).
+        if let Some(h) = &self.http
+            && let Some(value) = h.public_url.as_deref()
+            && !openidconnect::url::Url::parse(value)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        {
+            return Err(ConfigError::Invalid(
+                "http.public_url must be an http(s) URL with a host".into(),
+            ));
+        }
         // Configured `[[network]]`s are only ever reached through the BNC
         // registry (net.rs starts them, the BNC listener attaches to them),
         // and that registry is created only when `[bnc]` is present. Without
@@ -797,6 +826,16 @@ impl Config {
             )));
         }
         for n in &self.networks {
+            // A zero backlog cap is silently coerced to 1 by `Buffer::push`
+            // (`self.cap.max(1)`) — a silent fallback (DESIGN §2) an operator
+            // would not expect. Reject it loudly like the sibling zero-value
+            // guards (`max_hot_channels`, `command_burst`).
+            if n.buffer_cap == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "network '{}' buffer_cap must be nonzero",
+                    n.name
+                )));
+            }
             match n.kind {
                 NetworkKind::Irc if n.addr.is_empty() => {
                     return Err(ConfigError::Invalid(format!(
@@ -976,6 +1015,86 @@ mod tests {
         .expect("parse");
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("network_name"), "{err}");
+    }
+
+    #[test]
+    fn server_name_with_control_or_prefix_char_is_rejected() {
+        // server_name is the source prefix of every server-originated line;
+        // a control byte (TOML `\t` tab, `\u0007` BEL), space, or prefix-significant char
+        // (`@`/`!`) must not load. (Values are TOML-escaped in the literal.)
+        for bad in [
+            r"irc\t.example",
+            r"irc\u0007.example",
+            "irc x",
+            "irc@evil",
+            "ir!c",
+        ] {
+            let c: Config = toml::from_str(&format!(
+                "server_name = \"{bad}\"\nnetwork_name = \"XNet\"\n[[listeners]]\naddr = \"127.0.0.1:0\"\n"
+            ))
+            .expect("parse");
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("server_name"),
+                "server_name {bad:?} must be rejected: got {err}"
+            );
+        }
+        // A normal hostname (with dots and a hyphen) still loads.
+        let c: Config = toml::from_str(
+            "server_name = \"irc.fail-closed.example\"\nnetwork_name = \"XNet\"\n[[listeners]]\naddr = \"127.0.0.1:0\"\n",
+        )
+        .expect("parse");
+        c.validate().expect("a hostname server_name is accepted");
+    }
+
+    #[test]
+    fn network_buffer_cap_zero_is_rejected() {
+        // A zero backlog cap is otherwise silently coerced to 1 by Buffer::push.
+        let c: Config = toml::from_str(
+            r#"
+            server_name = "irc.x.example"
+            network_name = "XNet"
+            [[listeners]]
+            addr = "127.0.0.1:0"
+            [database]
+            url = "postgres://localhost/x"
+            [bnc]
+            addr = "127.0.0.1:0"
+            [[network]]
+            name = "libera"
+            addr = "irc.libera.chat:6697"
+            tls = true
+            nick = "n"
+            buffer_cap = 0
+            "#,
+        )
+        .expect("parse");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("buffer_cap"), "{err}");
+    }
+
+    #[test]
+    fn unparseable_public_url_is_rejected_even_without_oidc() {
+        // The https-under-secure-cookies guard only fires on a value that parses;
+        // outright garbage must still be rejected (it seeds the device flow URL).
+        let with_public_url = |value: &str| -> Config {
+            toml::from_str(&format!(
+                "server_name = \"irc.x.example\"\nnetwork_name = \"XNet\"\n\
+                 [[listeners]]\naddr = \"127.0.0.1:0\"\n\
+                 [database]\nurl = \"postgres://localhost/x\"\n\
+                 [http]\naddr = \"127.0.0.1:0\"\npublic_url = \"{value}\"\n"
+            ))
+            .expect("parse")
+        };
+        let err = with_public_url("not a url")
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("public_url"), "{err}");
+        // A well-formed http(s) URL is accepted.
+        with_public_url("https://irc.example")
+            .validate()
+            .expect("a valid public_url is accepted");
     }
 
     #[test]
