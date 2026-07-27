@@ -82,7 +82,14 @@ try {
     if (message.type() === "error") browserErrors.push(message.text());
   });
   page.on("pageerror", (error) => browserErrors.push(error.message));
-  page.on("requestfailed", (request) => browserErrors.push(`${request.url()}: ${request.failure()?.errorText ?? "request failed"}`));
+  page.on("requestfailed", (request) => {
+    const errorText = request.failure()?.errorText ?? "request failed";
+    // A request cancelled in flight when the page is torn down or navigates
+    // (e.g. the client's on-load /api/v1/me/networks fetch) reports ERR_ABORTED;
+    // that is a teardown artifact, not a page error.
+    if (errorText === "net::ERR_ABORTED") return;
+    browserErrors.push(`${request.url()}: ${errorText}`);
+  });
 
   // The Shauth catalog launches this exact same-origin starter. A real dex
   // authorization-code + PKCE flow provisions the account and returns to the
@@ -90,6 +97,12 @@ try {
   await page.goto(`${applicationOrigin}/api/v1/auth/oidc/dex/start`);
   await page.waitForURL(`${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
+  // The client fills #account-name from an async /api/v1/me fetch on boot, so
+  // wait for it to be populated rather than racing the placeholder — the
+  // element exists in the served HTML immediately, but its identity does not.
+  await page.waitForFunction(
+    () => document.getElementById("account-name")?.textContent !== "signed in",
+  );
   assert.notEqual(await page.locator("#account-name").textContent(), "signed in");
   assert.ok(
     navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),

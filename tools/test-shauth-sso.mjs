@@ -44,8 +44,13 @@ try {
   page.on("pageerror", (error) => failures.push(error.message));
   page.on("requestfailed", (request) => {
     const coordinate = new URL(request.url());
+    const errorText = request.failure()?.errorText ?? "request failed";
+    // A request cancelled in flight at page teardown/navigation (e.g. the web
+    // client's on-load /api/v1/me/networks fetch) reports ERR_ABORTED — a
+    // teardown artifact, not a page failure.
+    if (errorText === "net::ERR_ABORTED") return;
     if (trackedOrigins.has(coordinate.origin)) {
-      failures.push(`${coordinate.origin}${coordinate.pathname}: ${request.failure()?.errorText ?? "request failed"}`);
+      failures.push(`${coordinate.origin}${coordinate.pathname}: ${errorText}`);
     }
   });
   page.on("request", (request) => {

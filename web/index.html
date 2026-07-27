@@ -12,6 +12,14 @@
       <header id="topbar">
         <span id="brand">e6irc</span>
         <span id="status" class="status status-connecting">connecting…</span>
+        <span id="settings">
+          <select id="theme-select" title="Theme" aria-label="Theme">
+            <option value="auto">Auto</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+          <button id="notify-toggle" type="button" title="Toggle desktop notifications">🔕 Off</button>
+        </span>
         <nav id="user-nav" aria-label="User">
           <a id="account-link" href="/account" aria-label="Open my account">
             <span id="account-name" aria-live="polite">signed in</span>

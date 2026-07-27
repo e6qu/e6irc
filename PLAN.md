@@ -1638,6 +1638,22 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+Web-UI sweep 3 — client settings + notifications (2026-07-27, client-only):
+in-browser client polish, plus two latent browser-harness races the added
+module-load work surfaced. Client (`web/`): a **theme toggle** (auto/light/dark,
+persisted in localStorage; CSS `:root[data-theme]` overrides beat the OS
+`prefers-color-scheme` default); **mention highlighting** (a channel/DM message
+naming your nick — whole-token, casefolded — gets an accent rule); **desktop
+notifications** for a highlight/DM while the tab is backgrounded, behind an
+opt-in toggle that requests permission; and full **datetime on timestamp
+hover**. Harness (e6irc's own): `test-oidc-browser.mjs` asserted `#account-name`
+!= placeholder immediately after the element existed, racing the client's async
+`/api/v1/me` populate — now waits for population; and both browser harnesses
+counted a request cancelled at page teardown (the on-load `/api/v1/me/networks`
+fetch → `net::ERR_ABORTED`) as a page error — now ignored (a teardown artifact,
+not a failure). Verified: oidc-browser 8/8 green locally (was flaky ~1/3);
+`vite build`; `cargo fmt --check`.
+
 Web-UI sweep 2 — network editing + client polish (2026-07-27): the headline
 follow-up gap. BNC networks were add/remove/toggle only — changing a nick or
 autojoin meant delete+recreate (losing buffers). The console now **edits** a

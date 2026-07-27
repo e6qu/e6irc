@@ -34,6 +34,34 @@ const MAX_BUFFERS = 200;
 const MAX_NICKS = 5000;
 const SERVER = "*server*";
 
+// ---- client settings (persisted in localStorage) -----------------------
+const SETTINGS_KEY = "e6irc.settings";
+const settings = loadSettings();
+
+function loadSettings() {
+  const defaults = { theme: "auto", notifications: false };
+  try {
+    return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };
+  } catch {
+    return { ...defaults };
+  }
+}
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    /* private mode / disabled storage — settings just don't persist */
+  }
+}
+// "light"/"dark" force the theme via data-theme (CSS overrides prefers-color-
+// scheme); "auto" removes it so the OS preference applies.
+function applyTheme() {
+  const root = document.documentElement;
+  if (settings.theme === "light" || settings.theme === "dark") root.dataset.theme = settings.theme;
+  else delete root.dataset.theme;
+}
+applyTheme();
+
 // RFC1459 casefold, matching the server's CaseMapping::Rfc1459, so a nick or
 // channel is deduplicated case-insensitively (`Alice`/`alice`, `#Chan`/`#chan`).
 function fold(s) {
@@ -164,10 +192,11 @@ function renderBufferList() {
 
 function messageRow(line) {
   const row = document.createElement("li");
-  row.className = "line line-" + line.kind;
+  row.className = "line line-" + line.kind + (line.mention ? " line-mention" : "");
   const time = document.createElement("span");
   time.className = "ts";
   time.textContent = line.time;
+  if (line.title) time.title = line.title; // full date+time on hover
   const from = document.createElement("span");
   from.className = "from";
   from.textContent = line.from ? line.from : "";
@@ -245,7 +274,10 @@ function nowHm() {
 
 function addLine(bufName, kind, bufKind, from, text) {
   const b = ensureBuffer(bufName, bufKind);
-  const line = { time: nowHm(), from, text, kind };
+  // A highlight: someone else's channel/DM message that names us.
+  const mention = kind === "msg" && from != null && !isMe(from) && mentionsMe(text);
+  const line = { time: nowHm(), title: new Date().toLocaleString(), from, text, kind, mention };
+  maybeNotify(b, line);
   b.lines.push(line);
   if (b.lines.length > MAX_LINES) b.lines.shift();
   if (b.key === active) {
@@ -365,6 +397,39 @@ function parseIrc(line) {
 // echo a different casing than our configured nick.
 function isMe(nick) {
   return nick != null && myNick != null && fold(nick) === fold(myNick);
+}
+
+// Does `text` mention our nick as a whole token (casefolded)? Splits on runs of
+// non-nick characters (an IRC nick is letters/digits and `[]{}\|^`_-`), so
+// "hey alice!" highlights but "alicexyz" does not.
+function mentionsMe(text) {
+  if (myNick == null || typeof text !== "string") return false;
+  const me = fold(myNick);
+  return fold(text)
+    .split(/[^a-z0-9{}[\]\\^`_|-]+/)
+    .some((token) => token === me);
+}
+
+// Show a desktop notification for a highlight/DM when the tab is backgrounded
+// and the user has enabled and granted notifications. Best-effort.
+function maybeNotify(b, line) {
+  if (
+    !settings.notifications ||
+    typeof Notification === "undefined" ||
+    Notification.permission !== "granted" ||
+    !document.hidden
+  ) {
+    return;
+  }
+  const isDM = b.kind === "dm";
+  if (!(line.mention || isDM)) return;
+  const title = isDM ? `DM from ${line.from ?? "?"}` : `${b.display}: ${line.from ?? ""}`;
+  try {
+    // eslint-disable-next-line no-new
+    new Notification(title, { body: line.text, tag: b.key });
+  } catch {
+    /* notifications are best-effort chrome */
+  }
 }
 
 // A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text"; a plain
@@ -629,6 +694,44 @@ async function renderNetworkPicker() {
   manageLi.appendChild(manage);
   messagesEl.appendChild(manageLi);
 }
+
+// ---- settings controls --------------------------------------------------
+
+const themeSelect = el("theme-select");
+const notifyBtn = el("notify-toggle");
+
+function updateSettingsUI() {
+  if (themeSelect) themeSelect.value = settings.theme;
+  if (notifyBtn) notifyBtn.textContent = settings.notifications ? "🔔 On" : "🔕 Off";
+}
+if (themeSelect) {
+  themeSelect.addEventListener("change", () => {
+    settings.theme = themeSelect.value;
+    saveSettings();
+    applyTheme();
+  });
+}
+if (notifyBtn) {
+  notifyBtn.addEventListener("click", async () => {
+    if (!settings.notifications) {
+      if (typeof Notification === "undefined") {
+        addServer("This browser does not support desktop notifications.");
+        return;
+      }
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") {
+        addServer("Notification permission was not granted.");
+        return;
+      }
+      settings.notifications = true;
+    } else {
+      settings.notifications = false;
+    }
+    saveSettings();
+    updateSettingsUI();
+  });
+}
+updateSettingsUI();
 
 // ---- boot ---------------------------------------------------------------
 
