@@ -245,6 +245,13 @@ function renderActive() {
   const b = buffers.get(active);
   bufnameEl.textContent = !b || b.key === SERVER ? "server" : b.display;
   buftopicEl.textContent = b ? b.topic : "";
+  // "Load earlier" is offered for a real conversation buffer (channel/DM) whose
+  // persisted backlog hasn't been pulled yet, and only when attached (network set).
+  const loadEarlierEl = el("load-earlier");
+  if (loadEarlierEl) {
+    const eligible = !!network && !!b && b.kind !== "server" && !b.historyLoaded;
+    loadEarlierEl.hidden = !eligible;
+  }
   messagesEl.replaceChildren();
   if (b) for (const line of b.lines) messagesEl.appendChild(messageRow(line));
   messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -401,8 +408,26 @@ function setTopic(chan, topic) {
 
 // ---- IRC line parsing + routing ----------------------------------------
 
+// Extract the `time` IRCv3 tag (server-time, ISO-8601) from a tag section, or
+// null. Live /ws/ui lines have their tags stripped server-side, but the buffer
+// REST endpoint returns raw lines with tags, so history can show real times.
+function tagTime(tags) {
+  if (!tags) return null;
+  for (const t of tags.split(";")) {
+    const eq = t.indexOf("=");
+    if (eq > 0 && t.slice(0, eq) === "time") return t.slice(eq + 1) || null;
+  }
+  return null;
+}
+
 function parseIrc(line) {
   let rest = line;
+  let tags = null;
+  if (rest.startsWith("@")) {
+    const sp = rest.indexOf(" ");
+    tags = rest.slice(1, sp === -1 ? undefined : sp);
+    rest = sp === -1 ? "" : rest.slice(sp + 1);
+  }
   let prefix = null;
   if (rest.startsWith(":")) {
     const sp = rest.indexOf(" ");
@@ -424,7 +449,7 @@ function parseIrc(line) {
   const command = (parts.shift() || "").toUpperCase();
   if (trailing !== null) parts.push(trailing);
   const nick = prefix ? prefix.split("!")[0] : null;
-  return { nick, command, params: parts };
+  return { tags, nick, command, params: parts };
 }
 
 // Is this our own nick? Compared under the casefold, since the upstream may
@@ -763,6 +788,71 @@ async function renderNetworkPicker() {
   manageLi.appendChild(manage);
   messagesEl.appendChild(manageLi);
 }
+
+// ---- load earlier history ----------------------------------------------
+
+// Pull the network's persisted backlog (raw lines, which carry the server-time
+// tags the live socket strips) and rebuild the active buffer's message history
+// from it — so the user sees older messages than the in-memory ring the socket
+// replayed. One-shot per buffer.
+async function loadEarlier() {
+  const b = buffers.get(active);
+  if (!network || !b || b.kind === "server" || b.historyLoaded) return;
+  const btn = el("load-earlier");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Loading…";
+  }
+  let lines = [];
+  try {
+    const r = await fetch(
+      `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=5000`,
+      { headers: { Accept: "application/json" } },
+    );
+    if (!r.ok) throw new Error("http");
+    lines = (await r.json()).lines || [];
+  } catch {
+    addServer("Could not load earlier messages.");
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Load earlier messages";
+    }
+    return;
+  }
+  const pad = (n) => String(n).padStart(2, "0");
+  const rebuilt = [];
+  for (const raw of lines) {
+    const m = parseIrc(raw);
+    if (m.command !== "PRIVMSG" && m.command !== "NOTICE") continue;
+    const target = m.params[0] || "";
+    const belongs =
+      b.kind === "channel"
+        ? fold(target) === b.key
+        : (isMe(m.nick) ? fold(target) : fold(m.nick || "")) === b.key;
+    if (!belongs) continue;
+    const kind = m.command === "NOTICE" ? "notice" : "msg";
+    const rendered = asMessage(kind, m.nick, m.params[1] ?? "");
+    const iso = tagTime(m.tags);
+    const d = iso ? new Date(iso) : null;
+    const ok = d && !Number.isNaN(d.getTime());
+    rebuilt.push({
+      time: ok ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : "",
+      title: ok ? d.toLocaleString() : "",
+      from: rendered.from,
+      text: rendered.text,
+      kind: rendered.kind,
+      mention: false,
+    });
+  }
+  // The persisted backlog is a superset of what the socket replayed, so replace
+  // (rather than risk duplicating) and keep only the most recent MAX_LINES.
+  b.lines = rebuilt.slice(-MAX_LINES);
+  b.historyLoaded = true;
+  if (b.key === active) renderActive();
+}
+
+const loadEarlierBtn = el("load-earlier");
+if (loadEarlierBtn) loadEarlierBtn.addEventListener("click", loadEarlier);
 
 // ---- settings controls --------------------------------------------------
 

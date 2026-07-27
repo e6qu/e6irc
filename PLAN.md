@@ -1638,6 +1638,20 @@ Verified: `vite build`; SSRF unit test; workspace (29 bins); each bridge alone
 under `-Dwarnings`; clippy default + `embed-web`; all `tools/check-*` gates +
 `cargo deny`; PG http/db/ws_ui suites.
 
+Web-UI sweep 6 — load earlier history (2026-07-27, client-only): the last
+backlog item. The web client only saw the in-memory ring the socket replays
+(~1000 lines), while the DB retains 5000. A "Load earlier messages" button now
+pulls the persisted backlog from the existing `/api/v1/me/networks/{name}/buffer`
+endpoint and rebuilds the active buffer's history from it — showing the older
+~4000 messages. Crucially it reads the **raw** buffered lines, which still carry
+the `@time` server-time tags the live `/ws/ui` path strips, so history renders
+with real timestamps (`parseIrc` extended to parse a leading tag section — a
+no-op on the tagless live lines). One-shot per buffer; no backend change (the
+endpoint already existed and is PG-tested); degrades gracefully (blank time if a
+line lacks the tag). Verified: `vite build`; oidc-browser 3/3 (the extended
+parser doesn't regress the live path). This completes the web-UI backlog from
+the original vision.
+
 Web-UI sweep 5 — client UX polish + audit-fix (2026-07-27): an adversarial
 audit over the large new console/session/network-edit surface came back with
 **no security defect** (KillOwn ownership scoping, create↔edit validation
