@@ -335,6 +335,19 @@ pub(crate) type DriverSession<C> =
         &'a mut DriverEnds,
     ) -> std::pin::Pin<Box<dyn Future<Output = SessionOutcome> + Send + 'a>>;
 
+async fn wait_for_reconnect(
+    ends: &mut DriverEnds,
+    backoff: &mut Backoff,
+    attempt_elapsed: std::time::Duration,
+) -> bool {
+    ends.emit(ConnectionEvent::Reconnecting);
+    tokio::select! {
+        biased;
+        _ = ends.shutdown_signalled() => false,
+        _ = backoff.wait(attempt_elapsed) => true,
+    }
+}
+
 pub(crate) async fn run_with_backoff<C>(
     config: C,
     ends: &mut DriverEnds,
@@ -349,13 +362,14 @@ pub(crate) async fn run_with_backoff<C>(
         if ends.is_shutdown() {
             return;
         }
+        ends.begin_attempt();
         let started = tokio::time::Instant::now();
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
             SessionOutcome::AuthRejected => {
                 consecutive_auth_failures += 1;
-                ends.emit(ConnectionEvent::Disconnected);
                 if consecutive_auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES {
+                    ends.emit(ConnectionEvent::AuthenticationFailed);
                     // Stop hammering an upstream that keeps rejecting the
                     // credentials; a bad/revoked password won't fix itself on
                     // retry. Park until the network is reconfigured (which drops
@@ -368,21 +382,16 @@ pub(crate) async fn run_with_backoff<C>(
                     ends.shutdown_signalled().await;
                     return;
                 }
-                tokio::select! {
-                    biased;
-                    _ = ends.shutdown_signalled() => return,
-                    _ = backoff.wait(started.elapsed()) => {}
+                if !wait_for_reconnect(ends, &mut backoff, started.elapsed()).await {
+                    return;
                 }
             }
             SessionOutcome::Dropped => {
                 // A transient (non-auth) drop: a connection-level failure that
                 // may well recover, so keep retrying and reset the auth counter.
                 consecutive_auth_failures = 0;
-                ends.emit(ConnectionEvent::Disconnected);
-                tokio::select! {
-                    biased;
-                    _ = ends.shutdown_signalled() => return,
-                    _ = backoff.wait(started.elapsed()) => {}
+                if !wait_for_reconnect(ends, &mut backoff, started.elapsed()).await {
+                    return;
                 }
             }
         }
@@ -702,7 +711,10 @@ pub enum DriverEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connected,
-    Disconnected,
+    /// A transient failure ended the current attempt; another attempt follows.
+    Reconnecting,
+    /// Repeated credential rejection parked the driver until it is reconfigured.
+    AuthenticationFailed,
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -720,13 +732,213 @@ pub struct NetworkHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
     /// Detached buffer of recent upstream lines (newest last).
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
-    /// Sticky connection state: set on Connected, cleared on Disconnected.
+    /// Runtime state and per-network counters, shared with the driver endpoint.
+    runtime: std::sync::Arc<NetworkRuntime>,
+    /// Sticky connection state: set on Connected, cleared on any failure.
     /// A live `Connected` event is broadcast-only and missed by a client
     /// that subscribes just after it fires; this flag lets any observer
     /// read the current state regardless of subscribe timing.
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
+}
+
+/// The lifecycle state of one running network driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkLifecycle {
+    Connecting,
+    Connected,
+    Reconnecting,
+    AuthenticationFailed,
+}
+
+impl NetworkLifecycle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
+            Self::AuthenticationFailed => "authentication_failed",
+        }
+    }
+}
+
+/// Owner-safe operational data for one network. It contains counters and
+/// timestamps only—never upstream credentials or raw errors that could echo a
+/// provider response containing secrets.
+#[derive(Debug, Clone)]
+pub struct NetworkRuntimeSnapshot {
+    pub lifecycle: NetworkLifecycle,
+    pub state_changed_at: e6irc_proto::time::Millis,
+    pub connected_at: Option<e6irc_proto::time::Millis>,
+    pub last_input_at: Option<e6irc_proto::time::Millis>,
+    pub last_output_at: Option<e6irc_proto::time::Millis>,
+    pub last_error_at: Option<e6irc_proto::time::Millis>,
+    pub connect_latency_ms: Option<u64>,
+    pub connection_attempts: u64,
+    pub errors: u64,
+    pub attached_clients: u64,
+    pub lines_in: u64,
+    pub bytes_in: u64,
+    pub lines_out: u64,
+    pub bytes_out: u64,
+    pub buffer_lines: usize,
+    pub buffer_capacity: usize,
+}
+
+struct NetworkRuntimeState {
+    lifecycle: NetworkLifecycle,
+    state_changed_at: e6irc_proto::time::Millis,
+    connected_at: Option<e6irc_proto::time::Millis>,
+    attempt_started: std::time::Instant,
+    connect_latency_ms: Option<u64>,
+}
+
+struct NetworkRuntime {
+    state: std::sync::Mutex<NetworkRuntimeState>,
+    connection_attempts: std::sync::atomic::AtomicU64,
+    errors: std::sync::atomic::AtomicU64,
+    attached_clients: std::sync::atomic::AtomicU64,
+    lines_in: std::sync::atomic::AtomicU64,
+    bytes_in: std::sync::atomic::AtomicU64,
+    lines_out: std::sync::atomic::AtomicU64,
+    bytes_out: std::sync::atomic::AtomicU64,
+    last_input_at: std::sync::atomic::AtomicU64,
+    last_output_at: std::sync::atomic::AtomicU64,
+    last_error_at: std::sync::atomic::AtomicU64,
+}
+
+impl NetworkRuntime {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(NetworkRuntimeState {
+                lifecycle: NetworkLifecycle::Connecting,
+                state_changed_at: epoch_millis(),
+                connected_at: None,
+                attempt_started: std::time::Instant::now(),
+                connect_latency_ms: None,
+            }),
+            connection_attempts: std::sync::atomic::AtomicU64::new(0),
+            errors: std::sync::atomic::AtomicU64::new(0),
+            attached_clients: std::sync::atomic::AtomicU64::new(0),
+            lines_in: std::sync::atomic::AtomicU64::new(0),
+            bytes_in: std::sync::atomic::AtomicU64::new(0),
+            lines_out: std::sync::atomic::AtomicU64::new(0),
+            bytes_out: std::sync::atomic::AtomicU64::new(0),
+            last_input_at: std::sync::atomic::AtomicU64::new(0),
+            last_output_at: std::sync::atomic::AtomicU64::new(0),
+            last_error_at: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn begin_attempt(&self) {
+        let attempt = self
+            .connection_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        state.lifecycle = if attempt == 0 {
+            NetworkLifecycle::Connecting
+        } else {
+            NetworkLifecycle::Reconnecting
+        };
+        state.state_changed_at = epoch_millis();
+        state.attempt_started = std::time::Instant::now();
+    }
+
+    fn connected(&self) {
+        if self
+            .connection_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            self.connection_attempts
+                .store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        let now = epoch_millis();
+        state.lifecycle = NetworkLifecycle::Connected;
+        state.state_changed_at = now;
+        state.connected_at = Some(now);
+        state.connect_latency_ms = Some(
+            state
+                .attempt_started
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        );
+    }
+
+    fn failed(&self, terminal_authentication_failure: bool) {
+        self.operational_error();
+        let now = epoch_millis();
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        state.lifecycle = if terminal_authentication_failure {
+            NetworkLifecycle::AuthenticationFailed
+        } else {
+            NetworkLifecycle::Reconnecting
+        };
+        state.state_changed_at = now;
+        state.connected_at = None;
+    }
+
+    fn operational_error(&self) {
+        self.errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = epoch_millis();
+        self.last_error_at
+            .store(now.as_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn record_input(&self, bytes: usize) {
+        self.lines_in
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_in
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        self.last_input_at.store(
+            epoch_millis().as_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn record_output(&self, bytes: usize) {
+        self.lines_out
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_out
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        self.last_output_at.store(
+            epoch_millis().as_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+fn epoch_millis() -> e6irc_proto::time::Millis {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    e6irc_proto::time::Millis::from_millis(millis)
+}
+
+fn atomic_millis(value: &std::sync::atomic::AtomicU64) -> Option<e6irc_proto::time::Millis> {
+    match value.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        millis => Some(e6irc_proto::time::Millis::from_millis(millis)),
+    }
+}
+
+/// Counts an attached raw-IRC or web client for exactly the guard's lifetime.
+pub struct NetworkAttachment {
+    runtime: std::sync::Arc<NetworkRuntime>,
+}
+
+impl Drop for NetworkAttachment {
+    fn drop(&mut self) {
+        self.runtime
+            .attached_clients
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Bounded ring of recent upstream lines, for playback on attach.
@@ -880,6 +1092,7 @@ impl NetworkHandle {
     pub fn send(&self, line: &str) -> SendOutcome {
         match self.commands.try_send(line.to_string()) {
             Ok(()) => {
+                self.runtime.record_output(line.len());
                 if let Some(telemetry) = self
                     .telemetry
                     .lock()
@@ -890,8 +1103,14 @@ impl NetworkHandle {
                 }
                 SendOutcome::Sent
             }
-            Err(mpsc::error::TrySendError::Full(_)) => SendOutcome::Full,
-            Err(mpsc::error::TrySendError::Closed(_)) => SendOutcome::Closed,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.runtime.operational_error();
+                SendOutcome::Full
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.runtime.operational_error();
+                SendOutcome::Closed
+            }
         }
     }
 
@@ -940,6 +1159,72 @@ impl NetworkHandle {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Count one attached client until the returned guard is dropped.
+    pub fn track_attachment(&self) -> NetworkAttachment {
+        self.runtime
+            .attached_clients
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        NetworkAttachment {
+            runtime: self.runtime.clone(),
+        }
+    }
+
+    /// A point-in-time operational snapshot for owner-scoped APIs and views.
+    pub fn runtime_snapshot(&self) -> NetworkRuntimeSnapshot {
+        let state = self.state_snapshot();
+        let buffer = self.buffer.lock().expect("buffer poisoned");
+        NetworkRuntimeSnapshot {
+            lifecycle: state.lifecycle,
+            state_changed_at: state.state_changed_at,
+            connected_at: state.connected_at,
+            last_input_at: atomic_millis(&self.runtime.last_input_at),
+            last_output_at: atomic_millis(&self.runtime.last_output_at),
+            last_error_at: atomic_millis(&self.runtime.last_error_at),
+            connect_latency_ms: state.connect_latency_ms,
+            connection_attempts: self
+                .runtime
+                .connection_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            errors: self
+                .runtime
+                .errors
+                .load(std::sync::atomic::Ordering::Relaxed),
+            attached_clients: self
+                .runtime
+                .attached_clients
+                .load(std::sync::atomic::Ordering::Relaxed),
+            lines_in: self
+                .runtime
+                .lines_in
+                .load(std::sync::atomic::Ordering::Relaxed),
+            bytes_in: self
+                .runtime
+                .bytes_in
+                .load(std::sync::atomic::Ordering::Relaxed),
+            lines_out: self
+                .runtime
+                .lines_out
+                .load(std::sync::atomic::Ordering::Relaxed),
+            bytes_out: self
+                .runtime
+                .bytes_out
+                .load(std::sync::atomic::Ordering::Relaxed),
+            buffer_lines: buffer.lines.len(),
+            buffer_capacity: buffer.cap,
+        }
+    }
+
+    fn state_snapshot(&self) -> NetworkRuntimeState {
+        let state = self.runtime.state.lock().expect("network runtime poisoned");
+        NetworkRuntimeState {
+            lifecycle: state.lifecycle,
+            state_changed_at: state.state_changed_at,
+            connected_at: state.connected_at,
+            attempt_started: state.attempt_started,
+            connect_latency_ms: state.connect_latency_ms,
+        }
+    }
+
     /// Build a handle and the driver-side endpoints. A driver spawns a
     /// task that reads commands, records lines to the buffer, and
     /// broadcasts events through the returned [`DriverEnds`].
@@ -955,12 +1240,14 @@ impl NetworkHandle {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = std::sync::Arc::new(NetworkRuntime::new());
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
             shutdown: shutdown_tx,
             buffer: buffer.clone(),
+            runtime: runtime.clone(),
             connected: connected.clone(),
             telemetry: telemetry.clone(),
         };
@@ -973,6 +1260,7 @@ impl NetworkHandle {
             commands: command_rx,
             shutdown: shutdown_rx,
             buffer,
+            runtime,
             connected,
             telemetry,
             reconnect_seed,
@@ -990,6 +1278,10 @@ impl NetworkHandle {
     pub(crate) fn set_telemetry(&self, telemetry: std::sync::Arc<crate::observability::Telemetry>) {
         *self.telemetry.lock().expect("telemetry hook poisoned") = Some(telemetry);
     }
+
+    pub(crate) fn record_operational_error(&self) {
+        self.runtime.operational_error();
+    }
 }
 
 /// The driver-side endpoints of a [`NetworkHandle`]. A [`NetworkDriver`]
@@ -1003,6 +1295,7 @@ pub struct DriverEnds {
     /// promptly on removal, not when the last client happens to detach.
     shutdown: tokio::sync::watch::Receiver<bool>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
+    runtime: std::sync::Arc<NetworkRuntime>,
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
@@ -1019,6 +1312,7 @@ impl DriverEnds {
     /// into an attached client's stream.
     pub fn emit_line(&self, line: String) {
         let line = crate::sanitize::upstream_line(line);
+        self.runtime.record_input(line.len());
         if let Some(telemetry) = self
             .telemetry
             .lock()
@@ -1043,20 +1337,21 @@ impl DriverEnds {
     pub fn emit(&self, event: ConnectionEvent) {
         let broadcast = match event {
             ConnectionEvent::Connected => {
+                self.runtime.connected();
                 self.connected
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 DriverEvent::Connected
             }
-            ConnectionEvent::Disconnected => {
-                let was_connected = self
-                    .connected
-                    .swap(false, std::sync::atomic::Ordering::Relaxed);
-                if was_connected
-                    && let Some(telemetry) = self
-                        .telemetry
-                        .lock()
-                        .expect("telemetry hook poisoned")
-                        .as_ref()
+            ConnectionEvent::Reconnecting | ConnectionEvent::AuthenticationFailed => {
+                self.connected
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.runtime
+                    .failed(event == ConnectionEvent::AuthenticationFailed);
+                if let Some(telemetry) = self
+                    .telemetry
+                    .lock()
+                    .expect("telemetry hook poisoned")
+                    .as_ref()
                 {
                     telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                 }
@@ -1066,6 +1361,10 @@ impl DriverEnds {
         // Connection state is sticky in `connected`; zero live subscribers is
         // therefore not a delivery failure.
         drop(self.events.send(broadcast));
+    }
+
+    fn begin_attempt(&self) {
+        self.runtime.begin_attempt();
     }
 
     /// Await the next downstream command; `None` when every handle is dropped
@@ -1187,7 +1486,6 @@ where
     // during playback is caught by the subscription instead of falling into
     // the gap between the two (a duplicated backlog line is harmless; a lost
     // one is not). This mirrors the persistence task's ordering.
-    let commands = handle.commands.clone();
     let mut events = handle.events.subscribe();
     // Detach the client if the network is removed. The broadcast does not close
     // on its own (the registry's `NetworkHandle` keeps an events sender), so
@@ -1207,6 +1505,7 @@ where
         write.flush().await?;
         return Ok(());
     }
+    let _attachment = handle.track_attachment();
 
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
@@ -1279,13 +1578,13 @@ where
                     for event in parsed.drain(..) {
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => match commands.try_send(text) {
-                                    Ok(()) => {}
+                                Ok(text) => match handle.send(&text) {
+                                    SendOutcome::Sent => {}
                                     // Full: the upstream is congested/reconnecting.
                                     // Drop this line loudly rather than block —
                                     // blocking here would stall every other client
                                     // sharing this network's queue. Never silent.
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                    SendOutcome::Full => {
                                         write
                                             .write_all(
                                                 b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
@@ -1293,7 +1592,7 @@ where
                                             .await?;
                                         write.flush().await?;
                                     }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    SendOutcome::Closed => {
                                         return Ok(()); // driver gone
                                     }
                                 },
@@ -1356,6 +1655,42 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_snapshot_tracks_lifecycle_traffic_buffers_and_attachments() {
+        let (handle, ends) = NetworkHandle::channels(16);
+        ends.begin_attempt();
+        ends.emit(ConnectionEvent::Connected);
+        ends.emit_line(":upstream PRIVMSG #room :hello".into());
+        assert_eq!(handle.send("PRIVMSG #room :reply"), SendOutcome::Sent);
+        let attachment = handle.track_attachment();
+
+        let connected = handle.runtime_snapshot();
+        assert_eq!(connected.lifecycle, NetworkLifecycle::Connected);
+        assert_eq!(connected.connection_attempts, 1);
+        assert_eq!(connected.lines_in, 1);
+        assert_eq!(connected.lines_out, 1);
+        assert!(connected.bytes_in > connected.bytes_out);
+        assert_eq!(connected.buffer_lines, 1);
+        assert_eq!(connected.buffer_capacity, 16);
+        assert_eq!(connected.attached_clients, 1);
+        assert!(connected.last_input_at.is_some());
+        assert!(connected.last_output_at.is_some());
+        assert!(connected.connect_latency_ms.is_some());
+
+        drop(attachment);
+        ends.emit(ConnectionEvent::Reconnecting);
+        let reconnecting = handle.runtime_snapshot();
+        assert_eq!(reconnecting.lifecycle, NetworkLifecycle::Reconnecting);
+        assert_eq!(reconnecting.errors, 1);
+        assert_eq!(reconnecting.attached_clients, 0);
+        assert!(reconnecting.last_error_at.is_some());
+
+        ends.emit(ConnectionEvent::AuthenticationFailed);
+        let failed = handle.runtime_snapshot();
+        assert_eq!(failed.lifecycle, NetworkLifecycle::AuthenticationFailed);
+        assert_eq!(failed.errors, 2);
+    }
 
     /// A driver must stop when the registry signals shutdown, even while a
     /// command sender is outstanding (as an attached client holds). Before this,

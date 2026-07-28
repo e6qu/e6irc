@@ -927,14 +927,25 @@ supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.
 
 The console is also the home of `/console/networks` — a per-user BNC network manager with
-live connection status, add/remove/enable-disable, and **edit** of an IRC
+add/remove/enable-disable, and **edit** of an IRC
 network's connection/identity fields (addr, tls, nick, realname, autojoin; SASL
 credentials change via delete+recreate; a bridge is edited on the Integrations
 page, so the IRC edit form refuses non-IRC kinds), available to any
-authenticated user for their own networks — and `/console/integrations` (admin), which manages the
-chat-platform
-bridges: per-platform build availability, running bridges with status, and
-add/remove. A network's `kind` (`irc`/`matrix`/`discord`/`slack`) is a column on
+authenticated user for their own networks. Each network has an owner-scoped
+operations page refreshed every ten seconds: lifecycle and state-transition
+time, connection age and latency, attempts and errors, attached raw/web
+clients, per-network line/byte traffic, in-memory buffer use, stored backlog
+bounds, and the newest 100 stored lines. `/api/v1/me/networks/{name}` exposes
+the same counters and timestamps without raw errors or credentials. The
+runtime snapshot is held once on `NetworkHandle`, so IRC and every bridge
+driver enter the same measurement path; both raw-IRC and web attachments use
+the counted `send` funnel.
+
+`/console/integrations` (admin) manages the chat-platform bridges:
+per-platform build availability, the complete stored inventory (including
+disabled bridges and bridges whose feature is absent), status, inspect,
+pause/resume, and add/remove. A network's `kind`
+(`irc`/`matrix`/`discord`/`slack`) is a column on
 `bnc_networks`, so bridges are runtime-managed just like IRC upstreams — created
 via the console or REST, persisted, and started by the one feature-gated
 `bouncer::build_driver` factory that every construction site (config-network
@@ -968,6 +979,11 @@ above the trait, provides for every network kind:
 - **Playback**: modern clients pull via `CHATHISTORY`; legacy clients get
   timestamp-prefixed backlog replay on attach (soju-style, configurable
   per client).
+- **Operations**: `NetworkHandle` owns a typed lifecycle snapshot plus
+  connection attempts/errors, connect latency, attached-client count,
+  line/byte traffic, last-activity times, and buffer occupancy. Driver endpoints
+  can change lifecycle and record inbound lines only through that shared state;
+  downstream traffic crosses the handle's counted bounded-send funnel.
 
 ### 10.2 `local` driver — always-on on our own server
 
@@ -1260,6 +1276,10 @@ putting untrusted values or secrets in labels. One process-wide snapshot
 contains connection state and lifecycle totals, IRC and BNC line/byte traffic,
 HTTP and database operation totals, SendQ kills, fixed error categories, BNC
 driver up/down state, and cumulative core/database/HTTP latency histograms.
+Each running BNC handle additionally keeps owner-scoped per-network counters
+and lifecycle timing. Those values are deliberately not process-wide metric
+labels: account and network names are unbounded label cardinality. They are
+served only through the authenticated network API and console operations page.
 
 The snapshot is the sole source for:
 

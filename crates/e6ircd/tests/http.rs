@@ -315,6 +315,31 @@ async fn bnc_network_management_lifecycle() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["networks"][0]["connected"], true, "{body}");
     assert_eq!(v["networks"][0]["enabled"], true, "{body}");
+    assert_eq!(v["networks"][0]["runtime"]["state"], "connected", "{body}");
+    assert!(
+        v["networks"][0]["runtime"]["connection_attempts"]
+            .as_u64()
+            .is_some_and(|attempts| attempts >= 1),
+        "{body}"
+    );
+    assert!(
+        v["networks"][0]["runtime"]["connect_latency_ms"].is_u64(),
+        "{body}"
+    );
+    assert!(
+        v["networks"][0]["runtime"]["traffic"]["lines_in"].is_u64(),
+        "{body}"
+    );
+
+    let detail_req = format!(
+        "GET /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, detail) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{detail}");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("network detail json");
+    assert_eq!(detail["name"], "work");
+    assert_eq!(detail["runtime"]["state"], "connected");
+    assert_eq!(detail["has_sasl_password"], false);
 
     // disable it: the flag flips and the driver stops (no live handle, so
     // `connected` is null), while the config row survives.
@@ -472,6 +497,10 @@ async fn openapi_spec_is_served() {
         v["paths"]["/api/v1/me/networks"]["post"].is_object(),
         "{body}"
     );
+    assert!(
+        v["paths"]["/api/v1/me/networks/{name}"]["get"].is_object(),
+        "{body}"
+    );
     assert!(v["paths"]["/healthz"]["get"].is_object());
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
@@ -601,6 +630,14 @@ async fn console_networks_page_lists_the_callers_networks() {
     )
     .await
     .expect("network");
+    e6ircd::db::persist_bnc_line(
+        &pool,
+        "alice",
+        "libera",
+        ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>",
+    )
+    .await
+    .expect("seed hostile backlog line");
     let session = e6ircd::db::create_web_session(&pool, "alice")
         .await
         .expect("session");
@@ -646,13 +683,34 @@ async fn console_networks_page_lists_the_callers_networks() {
         "BNC networks",
         "libera",
         "irc.libera.chat:6697",
-        "#e6irc",
     ] {
         assert!(
             body.contains(needle),
             "console networks missing {needle:?}: {body}"
         );
     }
+    let detail_req = format!(
+        "GET /console/networks/libera HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, detail) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{detail}");
+    for needle in [
+        "Live connection diagnostics",
+        "#e6irc",
+        "Connection timeline",
+        "Recent detached backlog",
+        "Not set",
+        "&#60;script&#62;alert(&#39;escaped&#39;)&#60;/script&#62;",
+    ] {
+        assert!(
+            detail.contains(needle),
+            "network detail missing {needle:?}: {detail}"
+        );
+    }
+    assert!(
+        !detail.contains("<script>alert('escaped')</script>"),
+        "network detail rendered a stored IRC line as markup: {detail}"
+    );
 }
 
 /// The console networks page can add and remove a network with standard forms even before
@@ -737,7 +795,7 @@ async fn console_add_and_delete_network_via_the_console() {
     assert_eq!(status, 303);
     let (_, _, page) = request(http, &page_req).await;
     assert!(
-        page.contains("Enable") && page.contains("stopped"),
+        page.contains("Enable") && page.contains("disabled"),
         "{page}"
     );
 
@@ -751,6 +809,20 @@ async fn console_add_and_delete_network_via_the_console() {
     );
     let (status, _, _) = request(http, &toggle_on).await;
     assert_eq!(status, 303);
+    let (_, _, page) = request(http, &page_req).await;
+    assert!(page.contains("Disable"), "{page}");
+
+    // A malformed target state is rejected rather than silently interpreted
+    // as a request to disable the network.
+    let invalid = format!("csrf={csrf}&enabled=perhaps");
+    let toggle_invalid = format!(
+        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{invalid}",
+        invalid.len()
+    );
+    let (status, _, _) = request(http, &toggle_invalid).await;
+    assert_eq!(status, 400);
     let (_, _, page) = request(http, &page_req).await;
     assert!(page.contains("Disable"), "{page}");
 
@@ -1083,8 +1155,11 @@ async fn console_edit_network_updates_fields() {
     let (status, head, _) = request(http, &edit_post).await;
     assert_eq!(status, 303, "{head}");
 
-    // The list now shows the new nick and address.
-    let (_, _, page2) = request(http, &page_req).await;
+    // The operations page now shows the updated stored configuration.
+    let detail_req = format!(
+        "GET /console/networks/work HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (_, _, page2) = request(http, &detail_req).await;
     assert!(
         page2.contains("newbie") && page2.contains("irc.new.example:6697"),
         "{page2}"
@@ -1780,6 +1855,24 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
     let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "t")
         .await
         .expect("tok");
+    e6ircd::db::create_bnc_network(
+        &pool,
+        "alice",
+        &e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Matrix,
+            name: "matrix-archive".into(),
+            addr: "https://matrix.example".into(),
+            tls: true,
+            nick: "alice".into(),
+            realname: None,
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: Some("enc:v1:test".into()),
+            enabled: false,
+        },
+    )
+    .await
+    .expect("disabled bridge");
     drop(pool);
 
     let config = Config {
@@ -1819,7 +1912,16 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
     // Admin -> 200 listing all three platforms; none is built in this binary.
     let (status, _, body) = request(http, &auth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
-    for needle in ["Integrations", "Matrix", "Discord", "Slack", "not built"] {
+    for needle in [
+        "Integrations",
+        "Matrix",
+        "Discord",
+        "Slack",
+        "not built",
+        "matrix-archive",
+        "disabled",
+        "Inspect",
+    ] {
         assert!(
             body.contains(needle),
             "integrations missing {needle:?}: {body}"
@@ -1843,6 +1945,24 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
     let session = e6ircd::db::create_web_session(&pool, "alice")
         .await
         .expect("session");
+    e6ircd::db::create_bnc_network(
+        &pool,
+        "alice",
+        &e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Matrix,
+            name: "paused".into(),
+            addr: "https://matrix.example".into(),
+            tls: true,
+            nick: "alice".into(),
+            realname: None,
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: Some("enc:v1:test".into()),
+            enabled: false,
+        },
+    )
+    .await
+    .expect("paused bridge");
     drop(pool);
 
     let config = Config {
@@ -1877,6 +1997,22 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
     );
     let (_, _, body) = request(http, &page).await;
     let csrf = csrf_from_html(&body).to_string();
+
+    let toggle = format!("csrf={csrf}&name=paused&enabled=false");
+    let toggle_post = format!(
+        "POST /console/integrations/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{toggle}",
+        toggle.len()
+    );
+    let (status, headers, _) = request(http, &toggle_post).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("location: /console/integrations"),
+        "{headers}"
+    );
 
     let form = format!(
         "csrf={csrf}&kind=matrix&name=hq&addr=https://matrix.example&nick=e6bot&sasl_password=secret"

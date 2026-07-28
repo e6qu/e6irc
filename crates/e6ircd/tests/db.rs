@@ -2013,6 +2013,18 @@ async fn bnc_networks_crud() {
         .expect("present");
     assert_eq!(hq.kind, e6ircd::config::NetworkKind::Matrix);
     assert_eq!(hq.addr, "https://matrix.example");
+    db::set_bnc_network_enabled(&pool, "alice", "hq", false)
+        .await
+        .expect("disable matrix");
+    let inventory = db::list_bnc_network_inventory(&pool)
+        .await
+        .expect("admin inventory");
+    assert_eq!(inventory.len(), 3);
+    assert!(
+        inventory.iter().any(|row| {
+            row.owner == "alice" && row.network.name == "hq" && !row.network.enabled
+        })
+    );
     db::delete_bnc_network(&pool, "alice", "hq")
         .await
         .expect("cleanup");
@@ -2102,6 +2114,12 @@ async fn bnc_network_name_selection_is_case_insensitive() {
             .expect("read case variant"),
         vec![":s NOTICE * :backlog"]
     );
+    let summary = db::bnc_buffer_summary(&pool, "Alice", "libera")
+        .await
+        .expect("buffer summary");
+    assert_eq!(summary.lines, 1);
+    assert!(summary.oldest_at.is_some());
+    assert!(summary.newest_at.is_some());
     assert!(
         db::set_bnc_network_enabled(&pool, "alice", "LIBERA", false)
             .await

@@ -71,6 +71,7 @@ pub struct NetworkStatus {
     pub name: String,
     pub kind: &'static str,
     pub connected: bool,
+    pub runtime: super::NetworkRuntimeSnapshot,
 }
 
 impl Slot {
@@ -246,11 +247,15 @@ impl Registry {
             .lock()
             .expect("registry poisoned")
             .iter()
-            .map(|(key, slot)| NetworkStatus {
-                owner: key.owner.clone(),
-                name: key.name.clone(),
-                kind: slot.kind,
-                connected: slot.handle.is_connected(),
+            .map(|(key, slot)| {
+                let runtime = slot.handle.runtime_snapshot();
+                NetworkStatus {
+                    owner: key.owner.clone(),
+                    name: key.name.clone(),
+                    kind: slot.kind,
+                    connected: runtime.lifecycle == super::NetworkLifecycle::Connected,
+                    runtime,
+                }
             })
             .collect()
     }
@@ -285,6 +290,7 @@ fn spawn_persistence(
                     if let Err(e) =
                         crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
                     {
+                        handle.record_operational_error();
                         if let Some(telemetry) = &telemetry {
                             telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                         }
@@ -297,6 +303,7 @@ fn spawn_persistence(
                         if let Err(e) =
                             crate::db::trim_bnc_buffer(&pool, &owner_key, &network).await
                         {
+                            handle.record_operational_error();
                             if let Some(telemetry) = &telemetry {
                                 telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                             }
@@ -309,6 +316,7 @@ fn spawn_persistence(
                 // the stored backlog now has a gap. Surface it rather than
                 // dropping it silently.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    handle.record_operational_error();
                     if let Some(telemetry) = &telemetry {
                         telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                     }

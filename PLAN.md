@@ -66,6 +66,23 @@ builds under a same-origin script CSP. The unused HTMX/HTMX-WebSocket packages,
 embedded assets, and feature-gated routes were removed; the Vite chat bundle
 has no production package dependencies.
 
+Per-network operations (2026-07-28): every running network now carries the
+same typed lifecycle and owner-safe runtime snapshot: state transitions,
+connection age and latency, attempts and errors, attached raw/web clients,
+per-network traffic, last activity, and buffer occupancy. Raw IRC attachment
+now crosses the counted send funnel used by the web client, fixing traffic that
+was absent from observability. `/console/networks/<name>` combines those live
+counters with stored configuration and the persisted detached backlog,
+refreshes every ten seconds, and has matching owner-scoped JSON at
+`GET /api/v1/me/networks/<name>`. The Integrations page now inventories
+disabled bridges and feature-absent stored bridges instead of losing them when
+no live handle exists, and supports inspect, pause/resume, and removal through
+the same network mutation core. The storage create edge now persists the typed
+enabled state instead of silently replacing it with the database default, so a
+paused network remains paused across every creation path and process restart.
+Both network and bridge controls reject an invalid target state instead of
+silently treating malformed form input as a disable request.
+
 Hardening sweep (2026-07-20): closed several bug classes across the tree —
 client-triggerable memory-growth DoS on the single core worker (unbounded
 `+b/+q/+e/+I` lists → MAXLIST/478, unbounded channel joins → CHANLIMIT/405,

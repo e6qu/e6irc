@@ -39,7 +39,9 @@ written against Libera should work unchanged against e6ircd.
   IRCv3-over-WebSocket — all in-process on an optional listener.
 - **BNC**: per-account always-on networks with backlog persistence and
   replay, SASL to upstreams, encrypted credential storage, and a pluggable
-  driver SPI. A **Matrix** bridge ships behind a feature flag; the local
+  driver SPI. Each network exposes owner-scoped lifecycle, connection latency,
+  traffic, attached-client, error, and buffer diagnostics. A **Matrix** bridge
+  ships behind a feature flag; the local
   in-process network gives always-on presence with no external socket.
 - **Web client**: server-rendered login, self-service, and operational
   console pages plus a vanilla-JavaScript chat client over `/ws/ui`.

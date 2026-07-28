@@ -2430,8 +2430,8 @@ pub async fn create_bnc_network(
     let id = sqlx::query_scalar(
         "INSERT INTO bnc_networks
            (account_id, name, addr, tls, nick, realname, autojoin,
-            sasl_account, sasl_password_sealed, kind)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            sasl_account, sasl_password_sealed, kind, enabled)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (account_id, lower(name)) DO NOTHING
          RETURNING id",
     )
@@ -2445,6 +2445,7 @@ pub async fn create_bnc_network(
     .bind(&net.sasl_account)
     .bind(&net.sasl_password_sealed)
     .bind(net.kind.as_db_str())
+    .bind(net.enabled)
     .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?
@@ -2475,6 +2476,35 @@ pub async fn list_bnc_networks(
     .await
     .map_err(DbError::Query)?;
     rows.iter().map(bnc_row).collect()
+}
+
+/// One stored BNC network paired with its display owner for admin inventory.
+pub struct OwnedBncNetworkRow {
+    pub owner: String,
+    pub network: BncNetworkRow,
+}
+
+/// Every account-owned network, ordered by owner and name. This is consumed
+/// only behind the HTTP administrator gate.
+pub async fn list_bnc_network_inventory(pool: &PgPool) -> Result<Vec<OwnedBncNetworkRow>, DbError> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT a.name AS owner, n.name, n.addr, n.tls, n.nick, n.realname, n.autojoin,
+                n.sasl_account, n.sasl_password_sealed, n.enabled, n.kind
+         FROM bnc_networks n JOIN accounts a ON a.id = n.account_id
+         ORDER BY a.name_folded, lower(n.name)",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    rows.iter()
+        .map(|row| {
+            Ok(OwnedBncNetworkRow {
+                owner: row.get("owner"),
+                network: bnc_row(row)?,
+            })
+        })
+        .collect()
 }
 
 /// One network owned by `account`, by name — used to rebuild a driver
@@ -2814,6 +2844,41 @@ pub async fn recent_bnc_lines(
     .map_err(DbError::Query)?;
     rows.reverse(); // DESC fetch -> oldest-first for playback
     Ok(rows)
+}
+
+/// Stored backlog size and activity bounds for one network.
+pub struct BncBufferSummary {
+    pub lines: i64,
+    pub oldest_at: Option<e6irc_proto::time::Millis>,
+    pub newest_at: Option<e6irc_proto::time::Millis>,
+}
+
+/// Summarize one canonical owner/network buffer without loading its contents.
+pub async fn bnc_buffer_summary(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+) -> Result<BncBufferSummary, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let (lines, oldest_at, newest_at): (i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT count(*)::bigint,
+                floor(extract(epoch FROM min(created_at)) * 1000)::bigint,
+                floor(extract(epoch FROM max(created_at)) * 1000)::bigint
+         FROM bnc_buffer WHERE owner = $1 AND network = $2",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)?;
+    let timestamp = |value: Option<i64>| {
+        value.map(|millis| e6irc_proto::time::Millis::from_millis(millis.max(0) as u64))
+    };
+    Ok(BncBufferSummary {
+        lines,
+        oldest_at: timestamp(oldest_at),
+        newest_at: timestamp(newest_at),
+    })
 }
 
 // ---- web auth (OIDC identities + sessions) ------------------------------

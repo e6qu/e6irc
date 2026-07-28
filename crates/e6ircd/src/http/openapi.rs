@@ -196,7 +196,7 @@ pub(super) async fn openapi() -> Response {
             },
             "/api/v1/me/networks": {
                 "get": { "summary": "List the account's BNC networks with live upstream status",
-                    "description": "Each network includes `connected`: true/false when the always-on driver holds a live handle, or null when no handle is live (e.g. not yet started).",
+                    "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": bearer, "responses": ok_json },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "security": bearer,
@@ -216,6 +216,12 @@ pub(super) async fn openapi() -> Response {
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
             "/api/v1/me/networks/{name}": {
+                "get": { "summary": "Read one BNC network and its live runtime diagnostics",
+                    "security": bearer,
+                    "parameters": [{ "name": "name", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "responses": { "200": { "description": "stored configuration and runtime counters; secrets are presence booleans only" },
+                        "404": { "description": "no such network" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
                     "security": bearer,
                     "parameters": [{ "name": "name", "in": "path", "required": true,

@@ -405,12 +405,24 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(pages::console_edit_network).post(pages::console_update_network),
         )
         .route(
+            "/console/networks/{name}/operations",
+            get(pages::console_network_operations),
+        )
+        .route(
+            "/console/networks/{name}",
+            get(pages::console_network_detail),
+        )
+        .route(
             "/console/integrations",
             get(pages::console_integrations).post(pages::console_add_bridge),
         )
         .route(
             "/console/integrations/delete",
             post(pages::console_delete_bridge),
+        )
+        .route(
+            "/console/integrations/toggle",
+            post(pages::console_toggle_bridge),
         )
         .route("/console/bans", post(pages::console_add_ban))
         .route("/console/bans/delete", post(pages::console_remove_ban))
@@ -471,7 +483,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/me/networks/{name}",
-            axum::routing::delete(delete_network).patch(patch_network),
+            get(get_network).delete(delete_network).patch(patch_network),
         )
         .route("/api/v1/me/networks/{name}/buffer", get(network_buffer))
         .route("/api/v1/history", get(history))
@@ -1673,15 +1685,14 @@ mod pages {
     /// connection state resolved from the registry (not just its stored config).
     struct ConsoleNetView {
         name: String,
+        kind: &'static str,
         addr: String,
         tls: bool,
-        nick: String,
-        autojoin: String,
         enabled: bool,
         connected: bool,
-        /// Only IRC upstreams are editable via the IRC edit form; a bridge is
-        /// configured on the Integrations page, so it shows no Edit link.
-        editable: bool,
+        state: String,
+        attached_clients: u64,
+        errors: u64,
     }
 
     #[derive(Template)]
@@ -2696,6 +2707,56 @@ mod pages {
         error: Option<String>,
     }
 
+    struct NetworkOperationsView {
+        state: String,
+        connected: bool,
+        state_changed: String,
+        connected_since: String,
+        last_input: String,
+        last_output: String,
+        last_error: String,
+        connect_latency: String,
+        connection_attempts: u64,
+        errors: u64,
+        attached_clients: u64,
+        traffic_in: String,
+        traffic_out: String,
+        lines_in: u64,
+        lines_out: u64,
+        memory_buffer: String,
+        stored_lines: i64,
+        stored_oldest: String,
+        stored_newest: String,
+        recent_lines: Vec<String>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_network_detail.html")]
+    struct ConsoleNetworkDetail {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        name: String,
+        kind: &'static str,
+        addr: String,
+        tls: bool,
+        nick: String,
+        realname: String,
+        autojoin: String,
+        enabled: bool,
+        editable: bool,
+        has_sasl_account: bool,
+        has_sasl_password: bool,
+        view: NetworkOperationsView,
+    }
+
+    #[derive(Template)]
+    #[template(path = "_network_operations.html")]
+    struct ConsoleNetworkOperations {
+        view: NetworkOperationsView,
+    }
+
     /// The console edit-network form (urlencoded). `tls` is an HTML checkbox.
     #[derive(Deserialize)]
     pub struct NetworkEditForm {
@@ -2763,25 +2824,200 @@ mod pages {
         Ok(rows
             .into_iter()
             .map(|n| {
-                let connected = state
+                let runtime = state
                     .bnc_registry
                     .as_ref()
                     .and_then(|r| r.get_owned(account, &n.name))
-                    .map(|h| h.is_connected())
-                    .unwrap_or(false);
-                let editable = n.kind == crate::config::NetworkKind::Irc;
+                    .map(|h| h.runtime_snapshot());
+                let connected = runtime.as_ref().is_some_and(|runtime| {
+                    runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
+                });
+                let state_label = if n.enabled {
+                    runtime
+                        .as_ref()
+                        .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
+                        .unwrap_or_else(|| "not running".into())
+                } else {
+                    "disabled".into()
+                };
                 ConsoleNetView {
                     name: n.name,
+                    kind: n.kind.as_db_str(),
                     addr: n.addr,
                     tls: n.tls,
-                    nick: n.nick,
-                    autojoin: n.autojoin.join(", "),
                     enabled: n.enabled,
                     connected,
-                    editable,
+                    state: state_label,
+                    attached_clients: runtime
+                        .as_ref()
+                        .map_or(0, |runtime| runtime.attached_clients),
+                    errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
                 }
             })
             .collect())
+    }
+
+    fn runtime_time(value: Option<e6irc_proto::time::Millis>) -> String {
+        value
+            .map(e6irc_proto::time::server_time)
+            .unwrap_or_else(|| "never".into())
+    }
+
+    fn runtime_age(value: Option<e6irc_proto::time::Millis>) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        value
+            .map(|at| format_age(now, at.as_millis()))
+            .unwrap_or_else(|| "never".into())
+    }
+
+    async fn network_operations_view(
+        state: &AppState,
+        account: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<NetworkOperationsView, Response> {
+        let runtime = state
+            .bnc_registry
+            .as_ref()
+            .and_then(|registry| registry.get_owned(account, name))
+            .map(|handle| handle.runtime_snapshot());
+        let summary = crate::db::bnc_buffer_summary(pool_of(state), account, name)
+            .await
+            .map_err(|error| {
+                eprintln!("console: network buffer summary: {error}");
+                problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                )
+            })?;
+        let recent_lines = crate::db::recent_bnc_lines(pool_of(state), account, name, 100)
+            .await
+            .map_err(|error| {
+                eprintln!("console: network buffer read: {error}");
+                problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                )
+            })?;
+        let state_label = if !enabled {
+            "disabled".into()
+        } else {
+            runtime
+                .as_ref()
+                .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
+                .unwrap_or_else(|| "not running".into())
+        };
+        let connected = runtime.as_ref().is_some_and(|runtime| {
+            runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
+        });
+        Ok(NetworkOperationsView {
+            state: state_label,
+            connected,
+            state_changed: runtime
+                .as_ref()
+                .map(|runtime| e6irc_proto::time::server_time(runtime.state_changed_at))
+                .unwrap_or_else(|| "not available".into()),
+            connected_since: runtime_age(runtime.as_ref().and_then(|runtime| runtime.connected_at)),
+            last_input: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_input_at)),
+            last_output: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_output_at)),
+            last_error: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_error_at)),
+            connect_latency: runtime
+                .as_ref()
+                .and_then(|runtime| runtime.connect_latency_ms)
+                .map(|millis| format_latency(millis.saturating_mul(1_000)))
+                .unwrap_or_else(|| "not measured".into()),
+            connection_attempts: runtime
+                .as_ref()
+                .map_or(0, |runtime| runtime.connection_attempts),
+            errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
+            attached_clients: runtime
+                .as_ref()
+                .map_or(0, |runtime| runtime.attached_clients),
+            traffic_in: format_bytes(runtime.as_ref().map_or(0, |runtime| runtime.bytes_in)),
+            traffic_out: format_bytes(runtime.as_ref().map_or(0, |runtime| runtime.bytes_out)),
+            lines_in: runtime.as_ref().map_or(0, |runtime| runtime.lines_in),
+            lines_out: runtime.as_ref().map_or(0, |runtime| runtime.lines_out),
+            memory_buffer: runtime
+                .as_ref()
+                .map(|runtime| format!("{} / {}", runtime.buffer_lines, runtime.buffer_capacity))
+                .unwrap_or_else(|| "0 / 0".into()),
+            stored_lines: summary.lines,
+            stored_oldest: runtime_time(summary.oldest_at),
+            stored_newest: runtime_time(summary.newest_at),
+            recent_lines,
+        })
+    }
+
+    /// Resolve one authenticated caller's stored network and its page token.
+    /// Keeping authentication, ownership lookup, and not-found/error mapping in
+    /// one edge prevents the detail page and its refresh fragment from drifting
+    /// into different access-control behavior.
+    async fn console_owned_network(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        name: &str,
+    ) -> Result<(String, String, crate::db::BncNetworkRow), Response> {
+        let (account, csrf) = page_actor(state, headers, false).await?;
+        let network = crate::db::get_bnc_network(pool_of(state), &account, name)
+            .await
+            .map_err(|error| super::device::admin_db_error("network fetch", error))?
+            .ok_or_else(|| problem(StatusCode::NOT_FOUND, "No such network", None))?;
+        Ok((account, csrf, network))
+    }
+
+    pub async fn console_network_detail(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+    ) -> Response {
+        let (account, csrf, network) = match console_owned_network(&state, &headers, &name).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+        let view =
+            match network_operations_view(&state, &account, &network.name, network.enabled).await {
+                Ok(view) => view,
+                Err(response) => return response,
+            };
+        render_private(ConsoleNetworkDetail {
+            account: account.clone(),
+            csrf,
+            is_admin: is_admin_account(&state, &account),
+            active: "networks",
+            name: network.name,
+            kind: network.kind.as_db_str(),
+            addr: network.addr,
+            tls: network.tls,
+            nick: network.nick,
+            realname: network.realname.unwrap_or_default(),
+            autojoin: network.autojoin.join(", "),
+            enabled: network.enabled,
+            editable: network.kind == crate::config::NetworkKind::Irc,
+            has_sasl_account: network.sasl_account.is_some(),
+            has_sasl_password: network.sasl_password_sealed.is_some(),
+            view,
+        })
+    }
+
+    pub async fn console_network_operations(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+    ) -> Response {
+        let (account, _, network) = match console_owned_network(&state, &headers, &name).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
+        match network_operations_view(&state, &account, &network.name, network.enabled).await {
+            Ok(view) => render_private(ConsoleNetworkOperations { view }),
+            Err(response) => response,
+        }
     }
 
     /// Console → BNC networks: the caller's own always-on upstreams with live
@@ -2908,6 +3144,22 @@ mod pages {
         enabled: String,
     }
 
+    fn toggle_target(value: &str) -> Option<bool> {
+        match value {
+            "true" | "on" | "1" => Some(true),
+            "false" | "off" | "0" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn invalid_toggle_response() -> Response {
+        problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid enabled state",
+            Some("enabled must be true or false"),
+        )
+    }
+
     /// Enable/disable a network from the console. Reuses the same core the REST
     /// `PATCH` uses.
     pub async fn console_toggle_network(
@@ -2933,7 +3185,9 @@ mod pages {
             Ok(account) => account,
             Err(response) => return response,
         };
-        let enabled = matches!(f.enabled.as_str(), "true" | "on" | "1");
+        let Some(enabled) = toggle_target(&f.enabled) else {
+            return invalid_toggle_response();
+        };
         if let Err(r) = set_network_enabled_core(&state, registry, &account, &name, enabled).await {
             return r;
         }
@@ -3086,9 +3340,11 @@ mod pages {
         name: String,
         owner: String,
         connected: bool,
+        enabled: bool,
+        state: String,
         /// Whether the viewing admin owns this bridge (so it can be removed from
         /// here). A config-file / shared bridge is managed via config, not here.
-        deletable: bool,
+        manageable: bool,
     }
     struct BridgePlatform {
         name: &'static str,
@@ -3121,30 +3377,62 @@ mod pages {
     /// platform it shows whether this binary was built with the feature and the
     /// bridge networks currently running (with live status), plus add/remove for
     /// the admin's own bridges. `error` renders a banner after a failed action.
-    fn console_integrations_build(
+    async fn console_integrations_build(
         state: &AppState,
         account: String,
         csrf: String,
         error: Option<String>,
-    ) -> ConsoleIntegrations {
+    ) -> Result<ConsoleIntegrations, Response> {
         let all = state
             .bnc_registry
             .as_ref()
             .map(|r| r.list())
             .unwrap_or_default();
+        let stored = crate::db::list_bnc_network_inventory(pool_of(state))
+            .await
+            .map_err(|error| super::device::admin_db_error("network inventory", error))?;
         let admin_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
         let bridge_nets = |kind: &str| -> Vec<BridgeNet> {
-            all.iter()
-                .filter(|n| n.kind == kind)
-                .map(|n| BridgeNet {
-                    name: n.name.clone(),
-                    owner: n.owner.clone().unwrap_or_else(|| "shared".into()),
-                    connected: n.connected,
-                    // Only the admin's own bridges are removable here; a shared /
-                    // config-file bridge (owner = None) is managed via config.
-                    deletable: n.owner.as_deref() == Some(admin_folded.as_str()),
+            let mut networks: Vec<BridgeNet> = stored
+                .iter()
+                .filter(|row| row.network.kind.as_db_str() == kind)
+                .map(|row| {
+                    let owner_folded =
+                        e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&row.owner);
+                    let runtime = all.iter().find(|status| {
+                        status.owner.as_deref() == Some(owner_folded.as_str())
+                            && status.name.eq_ignore_ascii_case(&row.network.name)
+                    });
+                    let connected = runtime.is_some_and(|status| status.connected);
+                    BridgeNet {
+                        name: row.network.name.clone(),
+                        owner: row.owner.clone(),
+                        connected,
+                        enabled: row.network.enabled,
+                        state: if row.network.enabled {
+                            runtime
+                                .map(|status| status.runtime.lifecycle.as_str().replace('_', " "))
+                                .unwrap_or_else(|| "not running".into())
+                        } else {
+                            "disabled".into()
+                        },
+                        manageable: owner_folded == admin_folded,
+                    }
                 })
-                .collect()
+                .collect();
+            networks.extend(
+                all.iter()
+                    .filter(|status| status.kind == kind && status.owner.is_none())
+                    .map(|status| BridgeNet {
+                        name: status.name.clone(),
+                        owner: "shared".into(),
+                        connected: status.connected,
+                        enabled: true,
+                        state: status.runtime.lifecycle.as_str().replace('_', " "),
+                        manageable: false,
+                    }),
+            );
+            networks
         };
         let platforms = vec![
             BridgePlatform {
@@ -3184,7 +3472,7 @@ mod pages {
                 networks: bridge_nets("slack"),
             },
         ];
-        ConsoleIntegrations {
+        Ok(ConsoleIntegrations {
             account,
             csrf,
             is_admin: true,
@@ -3192,7 +3480,7 @@ mod pages {
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
             error,
-        }
+        })
     }
 
     /// Console → Integrations (admin) GET.
@@ -3204,7 +3492,10 @@ mod pages {
             Ok(x) => x,
             Err(r) => return r,
         };
-        render_private(console_integrations_build(&state, account, csrf, None))
+        match console_integrations_build(&state, account, csrf, None).await {
+            Ok(view) => render_private(view),
+            Err(response) => response,
+        }
     }
 
     /// Re-render the integrations page with an error banner after a failed
@@ -3218,12 +3509,10 @@ mod pages {
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        render_private(console_integrations_build(
-            state,
-            account,
-            csrf,
-            Some(message),
-        ))
+        match console_integrations_build(state, account, csrf, Some(message)).await {
+            Ok(view) => render_private(view),
+            Err(response) => response,
+        }
     }
 
     /// The console add-bridge form (urlencoded with a hidden CSRF field). Field
@@ -3249,6 +3538,13 @@ mod pages {
     pub struct BridgeDeleteFields {
         csrf: String,
         name: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct BridgeToggleFields {
+        csrf: String,
+        name: String,
+        enabled: String,
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.
@@ -3723,6 +4019,41 @@ mod pages {
                 return console_integrations_error(&state, &headers, account, msg).await;
             }
         };
+        Redirect::to("/console/integrations").into_response()
+    }
+
+    /// Pause or resume one of the administrator's account-owned bridges while
+    /// retaining its encrypted configuration and detached backlog.
+    pub async fn console_toggle_bridge(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BridgeToggleFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let account = match require_admin_form_actor(&state, &headers, &form.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let Some(enabled) = toggle_target(&form.enabled) else {
+            return invalid_toggle_response();
+        };
+        if set_network_enabled_core(&state, registry, &account, &form.name, enabled)
+            .await
+            .is_err()
+        {
+            let message = format!(
+                "Could not {} bridge '{}'.",
+                if enabled { "enable" } else { "disable" },
+                form.name
+            );
+            return console_integrations_error(&state, &headers, account, message).await;
+        }
         Redirect::to("/console/integrations").into_response()
     }
 

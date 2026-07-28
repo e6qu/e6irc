@@ -70,6 +70,8 @@
       form.add select { padding: 0.4rem 0.6rem; border: 1px solid var(--border);
         border-radius: 0.4rem; background: transparent; color: inherit; }
       .cell-form { display: inline; margin: 0; }
+      .row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem; }
+      .row-actions form { margin: 0; }
       a.rowlink { color: var(--accent); text-decoration: none; margin-right: 0.6rem; }
       a.rowlink:hover { text-decoration: underline; }
       .banner-error { background: color-mix(in srgb, var(--off) 15%, transparent);
@@ -226,6 +228,19 @@
       .marker-grid span { color: var(--muted); font-size: 0.8rem; }
       .refresh-status { color: var(--muted); font-size: 0.78rem; min-height: 1.3rem; }
       .refresh-status.refresh-error { color: var(--off); }
+      .network-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 1px; overflow: hidden; background: var(--border); border: 1px solid var(--border);
+        border-radius: 0.7rem; margin: 1rem 0 1.4rem; }
+      .network-summary > div { display: flex; flex-direction: column; min-width: 0;
+        padding: 0.7rem 0.85rem; background: var(--panel); }
+      .network-summary span { color: var(--muted); font-size: 0.72rem; }
+      .network-summary code, .network-summary strong { overflow-wrap: anywhere; }
+      .backlog { max-height: 28rem; overflow: auto; margin-top: 1rem; border: 1px solid var(--border);
+        border-radius: 0.55rem; background: #0b1020; color: #dbeafe; }
+      .backlog code { display: block; padding: 0.35rem 0.6rem; border-bottom: 1px solid #1e293b;
+        white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.76rem; line-height: 1.45; }
+      .backlog code:last-child { border-bottom: 0; }
+      .page-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; }
       @media (max-width: 40rem) {
         .layout { flex-direction: column; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
@@ -240,6 +255,7 @@
         .monitoring-columns, .access-grid, .secret-reveal { grid-template-columns: 1fr; }
         .error-grid { grid-template-columns: 1fr; }
         .inline-create, .marker-grid { grid-template-columns: 1fr; }
+        .network-summary { grid-template-columns: 1fr; }
         .identity-list article, .secret-value { align-items: stretch; flex-direction: column; }
         .field-wide { grid-column: auto; }
       }
