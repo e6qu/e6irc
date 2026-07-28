@@ -1,0 +1,48 @@
+{% extends "console_base.html" %}
+{% block main %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">{{ kind }} network</p>
+      <h1>{{ name }}</h1>
+      <p class="lede">Live connection diagnostics, traffic, attached clients, and the persisted detached backlog.</p>
+    </div>
+    <div class="page-actions">
+      <button type="button" data-refresh-target="#network-operations">Refresh</button>
+      {% if editable %}<a class="button-link secondary-link" href="/console/networks/{{ name }}/edit">Edit configuration</a>{% endif %}
+      <form method="post" action="/console/networks/{{ name }}/toggle">
+        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <input type="hidden" name="enabled" value="{% if enabled %}false{% else %}true{% endif %}" />
+        <button type="submit">{% if enabled %}Disable{% else %}Enable{% endif %}</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="network-summary" aria-label="Stored network configuration">
+    <div><span>Driver</span><strong>{{ kind }}</strong></div>
+    <div><span>Upstream</span>{% if addr.is_empty() %}<strong>Provider API</strong>{% else %}<code>{{ addr }}</code>{% endif %}</div>
+    <div><span>Transport</span><strong>{% if tls %}TLS{% else if addr.is_empty() %}Provider-managed{% else %}Plaintext{% endif %}</strong></div>
+    <div><span>Identity</span>{% if nick.is_empty() %}<strong>Provider account</strong>{% else %}<code>{{ nick }}</code>{% endif %}</div>
+    <div><span>Real name</span>{% if realname.is_empty() %}<strong>Not set</strong>{% else %}<code>{{ realname }}</code>{% endif %}</div>
+    <div><span>Autojoin</span>{% if autojoin.is_empty() %}<strong>None</strong>{% else %}<code>{{ autojoin }}</code>{% endif %}</div>
+    <div><span>Account credential</span><strong>{% if has_sasl_account %}Stored{% else %}Not set{% endif %}</strong></div>
+    <div><span>Secret credential</span><strong>{% if has_sasl_password %}Stored encrypted{% else %}Not set{% endif %}</strong></div>
+    <div><span>Configured state</span><strong>{% if enabled %}Enabled{% else %}Disabled{% endif %}</strong></div>
+  </div>
+
+  <div id="network-operations"
+       data-refresh-url="/console/networks/{{ name }}/operations"
+       data-refresh-seconds="10"
+       data-refresh-status="network-refresh-status">
+    {% include "_network_operations.html" %}
+  </div>
+  <p id="network-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
+
+  <div class="page-actions">
+    <a class="rowlink" href="/console/networks">Back to networks</a>
+    <form method="post" action="/console/networks/{{ name }}/delete"
+          data-confirm="Remove network {{ name }}? Its live connection and stored backlog will be deleted.">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <button class="danger" type="submit">Remove network</button>
+    </form>
+  </div>
+{% endblock %}

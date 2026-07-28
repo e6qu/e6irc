@@ -26,6 +26,63 @@ pub(super) struct CreateNetwork {
     pub(super) sasl_password: Option<String>,
 }
 
+fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json::Value {
+    let timestamp =
+        |value: Option<e6irc_proto::time::Millis>| value.map(e6irc_proto::time::server_time);
+    serde_json::json!({
+        "state": runtime.lifecycle.as_str(),
+        "state_changed_at": e6irc_proto::time::server_time(runtime.state_changed_at),
+        "connected_at": timestamp(runtime.connected_at),
+        "last_input_at": timestamp(runtime.last_input_at),
+        "last_output_at": timestamp(runtime.last_output_at),
+        "last_error_at": timestamp(runtime.last_error_at),
+        "connect_latency_ms": runtime.connect_latency_ms,
+        "connection_attempts": runtime.connection_attempts,
+        "errors": runtime.errors,
+        "attached_clients": runtime.attached_clients,
+        "traffic": {
+            "lines_in": runtime.lines_in,
+            "bytes_in": runtime.bytes_in,
+            "lines_out": runtime.lines_out,
+            "bytes_out": runtime.bytes_out,
+        },
+        "buffer": {
+            "lines": runtime.buffer_lines,
+            "capacity": runtime.buffer_capacity,
+        },
+    })
+}
+
+fn network_json(
+    network: crate::db::BncNetworkRow,
+    runtime: Option<&crate::bouncer::NetworkRuntimeSnapshot>,
+) -> serde_json::Value {
+    let has_sasl_account = network.sasl_account.is_some();
+    let has_sasl_password = network.sasl_password_sealed.is_some();
+    let account = if network.kind.account_is_secret() {
+        serde_json::Value::Null
+    } else {
+        serde_json::json!(&network.sasl_account)
+    };
+    serde_json::json!({
+        "name": network.name,
+        "kind": network.kind.as_db_str(),
+        "addr": network.addr,
+        "tls": network.tls,
+        "nick": network.nick,
+        "realname": network.realname,
+        "autojoin": network.autojoin,
+        "sasl_account": account,
+        "has_sasl_account": has_sasl_account,
+        "has_sasl_password": has_sasl_password,
+        "enabled": network.enabled,
+        "connected": runtime.map(|r| {
+            r.lifecycle == crate::bouncer::NetworkLifecycle::Connected
+        }),
+        "runtime": runtime.map(runtime_json),
+    })
+}
+
 /// The account's own networks (metadata only — never the secret).
 pub(super) async fn list_networks(
     State(state): State<Arc<AppState>>,
@@ -48,35 +105,9 @@ pub(super) async fn list_networks(
             let nets: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|n| {
-                    // Live upstream state from the always-on driver, if the
-                    // registry is holding a handle for this account's own network
-                    // (never a shared network of the same name).
-                    let connected = registry
-                        .get_owned(&account, &n.name)
-                        .map(|h| h.is_connected());
-                    // `sasl_account` is a public login name for IRC, but a
-                    // *secret* (sealed) for a kind like Slack — never echo the
-                    // sealed ciphertext; expose only its presence, like the
-                    // password. IRC keeps returning the plaintext name.
-                    let account = if n.kind.account_is_secret() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::json!(n.sasl_account)
-                    };
-                    serde_json::json!({
-                        "name": n.name,
-                        "kind": n.kind.as_db_str(),
-                        "addr": n.addr,
-                        "tls": n.tls,
-                        "nick": n.nick,
-                        "realname": n.realname,
-                        "autojoin": n.autojoin,
-                        "sasl_account": account,
-                        "has_sasl_account": n.sasl_account.is_some(),
-                        "has_sasl_password": n.sasl_password_sealed.is_some(),
-                        "enabled": n.enabled,
-                        "connected": connected,
-                    })
+                    let handle = registry.get_owned(&account, &n.name);
+                    let runtime = handle.as_ref().map(|handle| handle.runtime_snapshot());
+                    network_json(n, runtime.as_ref())
                 })
                 .collect();
             (
@@ -94,6 +125,38 @@ pub(super) async fn list_networks(
             )
         }
     }
+}
+
+/// One owner-scoped network with its stored configuration and live runtime
+/// diagnostics. Secret material is represented only by presence booleans.
+pub(super) async fn get_network(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    Path(name): Path<String>,
+) -> Response {
+    let pool = pool_of(&state);
+    let network = match crate::db::get_bnc_network(pool, &account, &name).await {
+        Ok(Some(network)) => network,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+        Err(e) => {
+            eprintln!("http: network read failed: {e}");
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            );
+        }
+    };
+    let handle = state
+        .bnc_registry
+        .as_ref()
+        .and_then(|registry| registry.get_owned(&account, &name));
+    let runtime = handle.as_ref().map(|handle| handle.runtime_snapshot());
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        network_json(network, runtime.as_ref()).to_string(),
+    )
+        .into_response()
 }
 
 /// Create a network the caller owns, persist it, and start its always-on
@@ -199,11 +262,6 @@ pub(super) fn network_name_ok(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Validate the connection/identity fields shared by network create and edit:
-/// `addr` and `nick` required and length-bounded, `realname`/`autojoin`
-/// bounded, none carrying CR/LF/NUL (a line-injection primitive into the
-/// upstream NICK/USER/JOIN), and `addr` not an obviously-internal SSRF target.
-/// Returns a problem+json response on the first violation.
 /// Bounds/injection/SSRF checks on the connection/identity fields, shared by
 /// create (all kinds) and edit. Length-bounds `addr`/`nick`/`realname`/
 /// `autojoin`, rejects CR/LF/NUL in them (a line-injection primitive into the
@@ -245,7 +303,9 @@ pub(super) fn check_upstream_bounds(
         return Err(problem(
             StatusCode::BAD_REQUEST,
             "Disallowed upstream address",
-            Some("addr must not be a loopback, link-local, unspecified or multicast IP"),
+            Some(
+                "addr must not be a link-local, unspecified, multicast, broadcast, or documentation IP",
+            ),
         ));
     }
     Ok(())

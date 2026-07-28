@@ -278,6 +278,7 @@ pub(super) async fn ws_ui_conn(
     if *shutdown.borrow() {
         return;
     }
+    let _attachment = handle.track_attachment();
 
     // Send the current connection status up front: a driver is always-on, so a
     // client attaching to an already-connected network would otherwise see no
