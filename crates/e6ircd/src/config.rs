@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 fn default_nicklen() -> usize {
     16
@@ -21,7 +21,7 @@ fn default_description() -> String {
 
 /// `draft/account-registration` policy, advertised as the capability's value
 /// so a client knows the rules before it tries.
-#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationConfig {
     /// Allow REGISTER before the connection completes registration
@@ -106,7 +106,7 @@ pub struct Config {
     pub limits: LimitsConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Maximum simultaneous connections from one IP; `None` = unlimited.
@@ -136,6 +136,158 @@ pub struct LimitsConfig {
     pub registration_burst: Option<usize>,
 }
 
+/// Operational settings owned by the database-backed control plane.
+///
+/// Values needed to reach the control plane itself deliberately do not appear
+/// here: the database URL, master-key source, HTTP bind address, and immutable
+/// release revision remain bootstrap configuration. Every field in this type is
+/// rendered and editable by the admin console, stored as one revision, and
+/// applied on the next process start; the BNC listener is additionally applied
+/// live by its runtime controller.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConfig {
+    pub server_name: String,
+    pub network_name: String,
+    pub description: String,
+    pub motd: Vec<String>,
+    pub nicklen: usize,
+    pub sendq: usize,
+    pub core_queue: usize,
+    pub max_hot_channels: usize,
+    pub listeners: Vec<ListenerConfig>,
+    pub registration: RegistrationConfig,
+    pub limits: LimitsConfig,
+    pub bnc_addr: Option<SocketAddr>,
+    pub public_url: Option<String>,
+    pub secure_cookies: bool,
+    pub admin_accounts: Vec<String>,
+    pub oidc_providers: Vec<OidcProviderConfig>,
+    pub opers: Vec<OperConfig>,
+    pub networks: Vec<NetworkEntry>,
+    /// Legacy deployments may have plaintext credential-bearing values only in
+    /// bootstrap config and no master key yet. Their public metadata is shown in
+    /// the console, but this flag prevents redacted placeholders from replacing
+    /// the working bootstrap credentials. Supplying a key on a later start
+    /// atomically imports sealed values and clears the flag.
+    pub credentials_from_bootstrap: bool,
+}
+
+impl ManagedConfig {
+    pub fn from_config(
+        config: &Config,
+        key: Option<&crate::secret::SecretKey>,
+    ) -> Result<Self, ConfigError> {
+        let network_has_secret = config.networks.iter().any(|network| {
+            network.sasl_password.is_some()
+                || (network.kind.account_is_secret() && network.sasl_account.is_some())
+        });
+        let credentials_from_bootstrap = key.is_none()
+            && (!config.oidc_providers.is_empty()
+                || !config.opers.is_empty()
+                || network_has_secret);
+        let seal = |value: &str| -> String {
+            key.map_or_else(String::new, |key| {
+                key.seal(value, crate::secret::CONFIG_CONTEXT)
+            })
+        };
+        let mut oidc_providers = config.oidc_providers.clone();
+        for provider in &mut oidc_providers {
+            provider.client_secret = seal(&provider.client_secret);
+        }
+        let mut opers = config.opers.clone();
+        for oper in &mut opers {
+            oper.password = seal(&oper.password);
+        }
+        let mut networks = config.networks.clone();
+        for network in &mut networks {
+            if let Some(password) = &network.sasl_password {
+                network.sasl_password = Some(seal(password));
+            }
+            if network.kind.account_is_secret()
+                && let Some(account) = &network.sasl_account
+            {
+                network.sasl_account = Some(seal(account));
+            }
+        }
+        Ok(Self {
+            server_name: config.server_name.clone(),
+            network_name: config.network_name.clone(),
+            description: config.description.clone(),
+            motd: config.motd.clone(),
+            nicklen: config.nicklen,
+            sendq: config.sendq,
+            core_queue: config.core_queue,
+            max_hot_channels: config.max_hot_channels,
+            listeners: config.listeners.clone(),
+            registration: config.registration.clone(),
+            limits: config.limits.clone(),
+            bnc_addr: config.bnc.as_ref().map(|bnc| bnc.addr),
+            public_url: config
+                .http
+                .as_ref()
+                .and_then(|http| http.public_url.clone()),
+            secure_cookies: config.http.as_ref().is_none_or(|http| http.secure_cookies),
+            admin_accounts: config
+                .http
+                .as_ref()
+                .map(|http| http.admin_accounts.clone())
+                .unwrap_or_default(),
+            oidc_providers,
+            opers,
+            networks,
+            credentials_from_bootstrap,
+        })
+    }
+
+    pub fn apply_to(&self, config: &mut Config) {
+        config.server_name.clone_from(&self.server_name);
+        config.network_name.clone_from(&self.network_name);
+        config.description.clone_from(&self.description);
+        config.motd.clone_from(&self.motd);
+        config.nicklen = self.nicklen;
+        config.sendq = self.sendq;
+        config.core_queue = self.core_queue;
+        config.max_hot_channels = self.max_hot_channels;
+        config.listeners.clone_from(&self.listeners);
+        config.registration = self.registration.clone();
+        config.limits = self.limits.clone();
+        config.bnc = self.bnc_addr.map(|addr| BncConfig { addr });
+        if let Some(http) = &mut config.http {
+            http.public_url.clone_from(&self.public_url);
+            http.secure_cookies = self.secure_cookies;
+            http.admin_accounts.clone_from(&self.admin_accounts);
+        }
+        if !self.credentials_from_bootstrap {
+            config.oidc_providers.clone_from(&self.oidc_providers);
+            config.opers.clone_from(&self.opers);
+            config.networks.clone_from(&self.networks);
+        }
+    }
+
+    /// Validate through the startup parser's one configuration choke point.
+    /// Bootstrap prerequisites are supplied with inert, valid values solely so
+    /// this operational subset can be checked without reimplementing its
+    /// invariants in an HTTP handler.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut config = Config {
+            database: Some(DatabaseConfig {
+                url: "postgresql://control-plane-validation".into(),
+            }),
+            http: Some(HttpConfig {
+                addr: "127.0.0.1:0".parse().expect("literal socket address"),
+                public_url: None,
+                secure_cookies: false,
+                admin_accounts: Vec::new(),
+            }),
+            application_release_revision: Some("0123456789ab".into()),
+            ..Config::default()
+        };
+        self.apply_to(&mut config);
+        config.validate()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
@@ -143,7 +295,7 @@ pub struct SecretsConfig {
     pub key_file: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkEntry {
     /// Selector used by clients (the /network suffix on the nick).
@@ -182,7 +334,7 @@ fn default_bnc_buffer() -> usize {
 }
 
 /// Which driver backs a BNC network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkKind {
     /// A persistent outbound IRC client to an external network.
@@ -255,7 +407,7 @@ pub struct BncConfig {
     pub addr: SocketAddr,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperConfig {
     pub name: String,
@@ -284,7 +436,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OidcProviderConfig {
     /// URL path segment and display name, e.g. "corp".
@@ -314,7 +466,7 @@ pub struct OidcProviderConfig {
 }
 
 /// Client authentication methods e6irc supports at the token endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenEndpointAuthMethod {
     /// HTTP Basic credentials, the OAuth 2.0 default.
@@ -356,7 +508,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
     pub addr: SocketAddr,
@@ -369,7 +521,7 @@ pub struct ListenerConfig {
     pub websocket: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert_path: PathBuf,
@@ -455,9 +607,16 @@ impl Config {
     /// that fails to decrypt, is a hard startup error.
     fn resolve_secrets(&mut self) -> Result<(), ConfigError> {
         let key = self.secret_key()?;
+        self.resolve_secrets_with_key(key.as_ref())
+    }
+
+    pub(crate) fn resolve_secrets_with_key(
+        &mut self,
+        key: Option<&crate::secret::SecretKey>,
+    ) -> Result<(), ConfigError> {
         for net in &mut self.networks {
             if let Some(pw) = net.sasl_password.take() {
-                net.sasl_password = Some(open_secret(&pw, key.as_ref())?);
+                net.sasl_password = Some(open_secret(&pw, key)?);
             }
             // `sasl_account` carries the Slack driver's `xoxb-` bot token (a
             // documented secret), so it must be unsealed too — otherwise a
@@ -465,14 +624,14 @@ impl Config {
             // fails with no hint the seal was ignored. A plaintext IRC account
             // name passes through `open_secret` unchanged.
             if let Some(account) = net.sasl_account.take() {
-                net.sasl_account = Some(open_secret(&account, key.as_ref())?);
+                net.sasl_account = Some(open_secret(&account, key)?);
             }
         }
         for oper in &mut self.opers {
-            oper.password = open_secret(&oper.password, key.as_ref())?;
+            oper.password = open_secret(&oper.password, key)?;
         }
         for provider in &mut self.oidc_providers {
-            provider.client_secret = open_secret(&provider.client_secret, key.as_ref())?;
+            provider.client_secret = open_secret(&provider.client_secret, key)?;
         }
         Ok(())
     }
@@ -789,35 +948,37 @@ impl Config {
                 "http.public_url must be an http(s) URL with a host".into(),
             ));
         }
-        // Configured `[[network]]`s are only ever reached through the BNC
-        // registry (net.rs starts them, the BNC listener attaches to them),
-        // and that registry is created only when `[bnc]` is present. Without
-        // it every configured network is parsed, secret-resolved, and then
-        // silently dropped — the server boots and runs as if they weren't
-        // there. Reject it loudly like the sibling feature guards above, so a
-        // forgotten `[bnc]` fails at load instead of vanishing at runtime.
-        if !self.networks.is_empty() && self.bnc.is_none() {
+        // Configured networks need an authenticated management/attach surface.
+        // The registry is available with a database even when the raw BNC
+        // listener is disabled, because the web client and console use it too.
+        // Requiring the listener here made "enable BNC from the console"
+        // structurally impossible and caused the active-looking network form to
+        // fail with "Bouncer not enabled".
+        if !self.networks.is_empty() && self.database.is_none() {
             return Err(ConfigError::Invalid(
-                "[[network]] entries require [bnc] — without it they are unreachable".into(),
+                "[[network]] entries require [database] for authenticated access".into(),
             ));
         }
         // Network selection by (owner, name) must be unambiguous: no two
         // entries may share an (owner, name), and a name cannot be both
         // shared and owned (an authenticated client resolves one network).
-        let mut seen: std::collections::HashSet<(Option<&str>, &str)> =
+        let case_mapping = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        let mut seen: std::collections::HashSet<(Option<String>, String)> =
             std::collections::HashSet::new();
-        let mut shared: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        let mut owned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut shared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut owned: std::collections::HashSet<String> = std::collections::HashSet::new();
         for n in &self.networks {
-            if !seen.insert((n.owner.as_deref(), n.name.as_str())) {
+            let owner = n.owner.as_deref().map(|value| case_mapping.casefold(value));
+            let name = case_mapping.casefold(&n.name);
+            if !seen.insert((owner.clone(), name.clone())) {
                 return Err(ConfigError::Invalid(format!(
                     "duplicate network '{}' for the same owner",
                     n.name
                 )));
             }
-            match &n.owner {
-                Some(_) => owned.insert(n.name.as_str()),
-                None => shared.insert(n.name.as_str()),
+            match owner {
+                Some(_) => owned.insert(name),
+                None => shared.insert(name),
             };
         }
         if let Some(name) = owned.intersection(&shared).next() {
@@ -1245,7 +1406,7 @@ mod tests {
                 tls: None,
                 websocket: false,
             }],
-            networks: vec![net("libera", Some("alice")), net("libera", Some("alice"))],
+            networks: vec![net("Libera", Some("Alice")), net("libera", Some("alice"))],
             bnc: bnc(),
             database: db(),
             ..Config::default()
@@ -1261,7 +1422,7 @@ mod tests {
                 tls: None,
                 websocket: false,
             }],
-            networks: vec![net("libera", None), net("libera", Some("alice"))],
+            networks: vec![net("Libera", None), net("libera", Some("alice"))],
             bnc: bnc(),
             database: db(),
             ..Config::default()
@@ -1271,10 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn networks_without_bnc_are_rejected() {
-        // The only consumer of `config.networks` is gated behind `bnc.is_some()`,
-        // so a `[[network]]` without `[bnc]` would parse and then be silently
-        // dropped at runtime. Reject it at load instead.
+    fn networks_without_database_are_rejected() {
         let cfg = Config {
             listeners: vec![ListenerConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
@@ -1285,7 +1443,22 @@ mod tests {
             ..Config::default()
         };
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("require [bnc]"), "{err}");
+        assert!(err.contains("require [database]"), "{err}");
+    }
+
+    #[test]
+    fn database_networks_do_not_require_raw_attach_listener() {
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+                websocket: false,
+            }],
+            networks: vec![net("libera", None)],
+            database: db(),
+            ..Config::default()
+        };
+        cfg.validate().unwrap();
     }
 
     #[test]

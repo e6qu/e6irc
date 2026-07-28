@@ -7,10 +7,14 @@
     <title>e6irc — console</title>
     <script src="/htmx.min.js" defer></script>
     <style>
-      :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2f6feb;
-        --bg: #f6f7f9; --fg: #16181d; --panel: #fff; --ok: #1a8f4c; --off: #b23b3b; }
+      :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2563eb;
+        --accent-strong: #1d4ed8; --bg: #f5f7fa; --fg: #16181d; --panel: #fff;
+        --panel-subtle: #f9fafb; --ok: #168447; --off: #b33434; --info: #245ea8;
+        --shadow: 0 1px 2px rgb(15 23 42 / 0.05), 0 8px 24px rgb(15 23 42 / 0.04); }
       @media (prefers-color-scheme: dark) { :root { --border: #262b33; --muted: #9aa3b1;
-        --bg: #0f1115; --fg: #e6e8ec; --panel: #14171d; --ok: #3fbf72; --off: #e06666; } }
+        --bg: #0d1015; --fg: #e6e8ec; --panel: #151920; --panel-subtle: #11151b;
+        --ok: #3fbf72; --off: #e06666; --info: #78aaf2;
+        --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 30px rgb(0 0 0 / 0.18); } }
       * { box-sizing: border-box; }
       body { margin: 0; font: 15px/1.6 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
       header { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
@@ -27,9 +31,10 @@
       nav a.active { background: color-mix(in srgb, var(--accent) 18%, transparent); font-weight: 600; }
       nav .section { color: var(--muted); font-size: 0.72rem; text-transform: uppercase;
         letter-spacing: 0.06em; margin: 1rem 0.7rem 0.35rem; }
-      main { flex: 1 1 auto; padding: 1.25rem 1.5rem; min-width: 0; max-width: 64rem; }
-      h1 { font-size: 1.3rem; margin: 0 0 1rem; }
-      h2 { font-size: 1.05rem; margin: 2rem 0 0.5rem; padding-top: 0.5rem; }
+      main { flex: 1 1 auto; padding: 2rem clamp(1rem, 3vw, 3rem) 4rem; min-width: 0; max-width: 82rem; }
+      h1 { font-size: clamp(1.65rem, 3vw, 2.15rem); line-height: 1.15; letter-spacing: -0.025em; margin: 0; }
+      h2 { font-size: 1.1rem; line-height: 1.3; margin: 0; }
+      p { margin-top: 0; }
       .cards { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.5rem 0 0.5rem; }
       .card { flex: 1 1 8rem; background: var(--panel); border: 1px solid var(--border);
         border-radius: 0.6rem; padding: 0.8rem 1rem; }
@@ -53,8 +58,12 @@
       form.add input[type=text] { padding: 0.4rem 0.6rem; border: 1px solid var(--border);
         border-radius: 0.4rem; background: transparent; color: inherit; }
       form.add label { display: flex; align-items: center; gap: 0.3rem; color: var(--muted); }
-      button { padding: 0.4rem 0.9rem; border: 1px solid var(--border); border-radius: 0.4rem;
+      button, .button-link { padding: 0.55rem 0.95rem; border: 1px solid var(--border); border-radius: 0.45rem;
         background: transparent; color: inherit; cursor: pointer; }
+      button:hover, .button-link:hover { border-color: var(--accent); }
+      button.primary, .button-link { background: var(--accent); color: #fff; border-color: var(--accent);
+        font-weight: 650; text-decoration: none; }
+      button.primary:hover, .button-link:hover { background: var(--accent-strong); }
       form.add button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
       button.danger { color: var(--off); border-color: var(--off); background: transparent; }
       form.add select { padding: 0.4rem 0.6rem; border: 1px solid var(--border);
@@ -65,6 +74,78 @@
       .banner-error { background: color-mix(in srgb, var(--off) 15%, transparent);
         border: 1px solid var(--off); color: var(--fg); padding: 0.5rem 0.8rem;
         border-radius: 0.5rem; margin: 0 0 1rem; }
+      .banner-success { background: color-mix(in srgb, var(--ok) 13%, transparent);
+        border: 1px solid var(--ok); padding: 0.65rem 0.85rem; border-radius: 0.55rem; margin: 0 0 1rem; }
+      .banner-info { display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+        background: color-mix(in srgb, var(--info) 10%, var(--panel)); border: 1px solid
+        color-mix(in srgb, var(--info) 35%, var(--border)); padding: 0.85rem 1rem;
+        border-radius: 0.65rem; margin: 1.25rem 0; }
+      .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem;
+        margin-bottom: 1.4rem; }
+      .eyebrow { color: var(--accent); font-size: 0.72rem; font-weight: 750; text-transform: uppercase;
+        letter-spacing: 0.09em; margin: 0 0 0.25rem; }
+      .lede { color: var(--muted); max-width: 50rem; font-size: 0.98rem; margin: 0.5rem 0 0; }
+      .revision, .count { border: 1px solid var(--border); background: var(--panel); border-radius: 999px;
+        padding: 0.25rem 0.65rem; color: var(--muted); font-size: 0.78rem; white-space: nowrap; }
+      .provenance { display: flex; justify-content: space-between; gap: 1rem; color: var(--muted);
+        background: var(--panel-subtle); border: 1px solid var(--border); border-radius: 0.55rem;
+        padding: 0.65rem 0.85rem; margin-bottom: 1rem; font-size: 0.82rem; }
+      .bootstrap-card { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+        overflow: hidden; background: var(--border); border: 1px solid var(--border);
+        border-radius: 0.7rem; margin-bottom: 1rem; }
+      .bootstrap-card > div { display: flex; flex-direction: column; background: var(--panel);
+        padding: 0.75rem 0.85rem; min-width: 0; }
+      .bootstrap-card > div > span { color: var(--muted); font-size: 0.72rem; }
+      .bootstrap-card code { overflow-wrap: anywhere; }
+      .bootstrap-card > p { grid-column: 1 / -1; background: var(--panel-subtle);
+        color: var(--muted); font-size: 0.78rem; margin: 0; padding: 0.55rem 0.85rem; }
+      .panel, .settings-section { background: var(--panel); border: 1px solid var(--border);
+        border-radius: 0.75rem; box-shadow: var(--shadow); }
+      .panel { padding: clamp(1rem, 2.5vw, 1.5rem); margin: 1.25rem 0 1.75rem; }
+      .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+      .panel-head p, .section-copy p { color: var(--muted); font-size: 0.84rem; margin: 0.25rem 0 0; }
+      .list-head { margin: 0 0 0.65rem; }
+      .network-form, .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem; margin-top: 1.25rem; }
+      .field { display: flex; min-width: 0; flex-direction: column; gap: 0.32rem; color: var(--fg);
+        font-size: 0.83rem; font-weight: 650; }
+      .field em { color: var(--muted); font-style: normal; font-weight: 400; }
+      .field small, .check small { display: block; color: var(--muted); font-weight: 400; line-height: 1.4; }
+      .field input, .field textarea, .field select { width: 100%; border: 1px solid var(--border);
+        border-radius: 0.5rem; background: var(--panel-subtle); color: var(--fg); font: inherit;
+        padding: 0.62rem 0.72rem; min-height: 2.55rem; }
+      .field textarea { resize: vertical; line-height: 1.45; }
+      .field input:focus, .field textarea:focus, .field select:focus { outline: 3px solid
+        color-mix(in srgb, var(--accent) 22%, transparent); border-color: var(--accent); }
+      .field-wide { grid-column: 1 / -1; }
+      .check { display: flex; align-items: flex-start; gap: 0.65rem; color: var(--fg); }
+      .check input { width: 1.05rem; height: 1.05rem; margin-top: 0.18rem; accent-color: var(--accent); }
+      .form-actions { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.2rem; }
+      .settings-form { display: grid; gap: 1rem; }
+      .settings-section { display: grid; grid-template-columns: minmax(11rem, 0.38fr) minmax(0, 1fr);
+        gap: clamp(1rem, 3vw, 2rem); padding: clamp(1rem, 2.5vw, 1.5rem); }
+      .settings-section .field-grid { margin-top: 0; }
+      .runtime-status { background: var(--panel-subtle); border: 1px solid var(--border);
+        border-radius: 0.5rem; padding: 0.7rem 0.8rem; }
+      .credential-section { margin-top: 1rem; }
+      .compact-list, .provider-list { display: grid; gap: 0.55rem; }
+      .compact-list > div, .provider-list article { display: flex; align-items: center; gap: 0.7rem;
+        background: var(--panel-subtle); border: 1px solid var(--border); border-radius: 0.55rem;
+        padding: 0.65rem 0.75rem; }
+      .compact-list form, .provider-list article > form { margin-left: auto; }
+      .provider-list article { align-items: flex-start; flex-direction: column; position: relative; }
+      .provider-list article > form { position: absolute; right: 0.65rem; top: 0.65rem; }
+      .provider-list article > div { display: flex; align-items: center; gap: 0.5rem; }
+      .inline-config-form, .oidc-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.8rem; align-items: end; margin-top: 1rem; }
+      .inline-config-form button { justify-self: start; }
+      .connection-card { display: grid; grid-template-columns: minmax(12rem, 0.4fr) minmax(0, 1fr);
+        align-items: center; gap: 1.25rem; background: color-mix(in srgb, var(--ok) 8%, var(--panel));
+        border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border)); border-radius: 0.7rem;
+        padding: 0.9rem 1rem; margin: 1.25rem 0; }
+      .connection-card div { display: flex; flex-direction: column; }
+      .connection-card p { color: var(--muted); margin: 0; }
+      .status-label { color: var(--muted); font-size: 0.76rem; }
       @media (max-width: 40rem) {
         .layout { flex-direction: column; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
@@ -72,6 +153,11 @@
           display: flex; flex-wrap: wrap; gap: 0.25rem; }
         nav .section { width: 100%; margin: 0.5rem 0.7rem 0.15rem; }
         main { padding: 1rem; }
+        .page-head, .banner-info, .provenance { align-items: stretch; flex-direction: column; }
+        .network-form, .field-grid, .settings-section, .connection-card,
+        .inline-config-form, .oidc-form { grid-template-columns: 1fr; }
+        .bootstrap-card { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .field-wide { grid-column: auto; }
       }
     </style>
   </head>
@@ -89,6 +175,7 @@
         {% if is_admin %}
           <div class="section">Server</div>
           <a href="/console"{% if active == "overview" %} class="active"{% endif %}>Overview</a>
+          <a href="/console/configuration"{% if active == "configuration" %} class="active"{% endif %}>Configuration</a>
           <a href="/console/sessions"{% if active == "sessions" %} class="active"{% endif %}>Sessions</a>
           <a href="/console/integrations"{% if active == "integrations" %} class="active"{% endif %}>Integrations</a>
         {% endif %}

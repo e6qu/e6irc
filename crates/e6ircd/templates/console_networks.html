@@ -1,27 +1,89 @@
 {% extends "console_base.html" %}
 {% block main %}
-        <h1>BNC networks</h1>
-        <p class="meta">
-          Your always-on upstream connections. Attach any IRC client over SASL as
-          <code>{{ account }}/&lt;network&gt;</code> to resume where you left off.
-        </p>
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Always-on connections</p>
+            <h1>Your networks</h1>
+            <p class="lede">Connect once, keep receiving messages while every client is away, and resume from the same backlog anywhere.</p>
+          </div>
+        </div>
+
+        {% if let Some(addr) = attach_addr %}
+          <div class="connection-card">
+            <div>
+              <span class="status-label"><span class="dot on"></span>Attach listener online</span>
+              <strong>{{ addr }}</strong>
+            </div>
+            <p>Sign in with SASL PLAIN using <code>{{ account }}/&lt;network&gt;</code> as the account name and your e6irc app password.</p>
+          </div>
+        {% else %}
+          <div class="banner-info">
+            <div><strong>Raw IRC attachment is currently off.</strong> Your networks still run and remain available to the web client.</div>
+            {% if is_admin %}<a class="button-link" href="/console/configuration">Enable attach listener</a>{% endif %}
+          </div>
+        {% endif %}
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Add an IRC network</h2>
+              <p>Credentials are encrypted before they are stored. The connection starts immediately.</p>
+            </div>
+          </div>
         <form
-          class="add"
+          class="network-form"
           hx-post="/console/networks"
           hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
           hx-target="#cnetworks"
           hx-swap="outerHTML"
         >
-          <input type="text" name="name" placeholder="name" required />
-          <input type="text" name="addr" placeholder="host:port" required />
-          <input type="text" name="nick" placeholder="nick" required />
-          <input type="text" name="realname" placeholder="real name (optional)" />
-          <input type="text" name="autojoin" placeholder="#chan,#chan2" />
-          <input type="text" name="sasl_account" placeholder="SASL account (optional)" />
-          <input type="password" name="sasl_password" placeholder="SASL password (optional)" />
-          <label><input type="checkbox" name="tls" /> TLS</label>
-          <button type="submit">Add network</button>
+          <label class="field">
+            <span>Network name</span>
+            <input name="name" autocomplete="off" placeholder="Libera Chat" required />
+            <small>The short name used when attaching a client.</small>
+          </label>
+          <label class="field">
+            <span>Server and port</span>
+            <input name="addr" autocomplete="off" placeholder="irc.libera.chat:6697" required />
+          </label>
+          <label class="field">
+            <span>Nickname</span>
+            <input name="nick" autocomplete="nickname" placeholder="{{ account }}" required />
+          </label>
+          <label class="field">
+            <span>Real name <em>optional</em></span>
+            <input name="realname" autocomplete="name" />
+          </label>
+          <label class="field field-wide">
+            <span>Channels to join <em>optional</em></span>
+            <input name="autojoin" autocomplete="off" placeholder="#e6irc, #rust" />
+            <small>Comma-separated channel names.</small>
+          </label>
+          <label class="field">
+            <span>Upstream SASL account <em>optional</em></span>
+            <input name="sasl_account" autocomplete="username" />
+          </label>
+          <label class="field">
+            <span>Upstream SASL password <em>optional</em></span>
+            <input type="password" name="sasl_password" autocomplete="new-password" />
+          </label>
+          <label class="check field-wide">
+            <input type="checkbox" name="tls" checked />
+            <span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span>
+          </label>
+          <div class="form-actions field-wide">
+            <button class="primary" type="submit">Add network</button>
+          </div>
         </form>
+        </section>
+
+        <div class="panel-head list-head">
+          <div>
+            <h2>Configured networks</h2>
+            <p>Live status from the running connection, not just stored configuration.</p>
+          </div>
+          <span class="count">{{ networks.len() }}</span>
+        </div>
         <div class="scroll">
           <table>
             <thead>

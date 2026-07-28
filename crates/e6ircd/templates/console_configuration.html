@@ -1,0 +1,276 @@
+{% extends "console_base.html" %}
+{% block main %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">Server administration</p>
+      <h1>Configuration</h1>
+      <p class="lede">Operational settings are versioned in PostgreSQL. The attach listener applies immediately; core identity and limits apply on restart.</p>
+    </div>
+    <span class="revision">Revision {{ revision }}</span>
+  </div>
+
+  {% if let Some(message) = outcome %}
+    <div class="{% if success %}banner-success{% else %}banner-error{% endif %}" role="status">{{ message }}</div>
+  {% endif %}
+
+  <div class="provenance">
+    <span>Last changed by <strong>{{ updated_by }}</strong></span>
+    <span>{{ updated_at }}</span>
+  </div>
+
+  <section class="bootstrap-card">
+    <div><span>PostgreSQL</span><strong><span class="dot on"></span>Connected</strong></div>
+    <div><span>HTTP bind</span><strong><code>{{ http_bind }}</code></strong></div>
+    <div><span>Master key</span><strong>{% if has_master_key %}<span class="dot on"></span>Available{% else %}<span class="dot off"></span>Not configured{% endif %}</strong></div>
+    <div><span>Release revision</span><strong><code>{{ release_revision }}</code></strong></div>
+    <p>These bootstrap values must exist before the console can start. Their effective state is shown here; operational configuration below is UI-managed.</p>
+  </section>
+
+  <form class="settings-form" method="post" action="/console/configuration">
+    <input type="hidden" name="csrf" value="{{ csrf }}" />
+    <input type="hidden" name="revision" value="{{ revision }}" />
+
+    <section class="settings-section">
+      <div class="section-copy">
+        <h2>Identity</h2>
+        <p>Names and text advertised to IRC clients.</p>
+      </div>
+      <div class="field-grid">
+        <label class="field">
+          <span>Server hostname</span>
+          <input name="server_name" value="{{ settings.server_name }}" maxlength="64" required />
+          <small>Used as the source of server messages.</small>
+        </label>
+        <label class="field">
+          <span>Network name</span>
+          <input name="network_name" value="{{ settings.network_name }}" maxlength="64" required />
+          <small>Advertised in ISUPPORT.</small>
+        </label>
+        <label class="field field-wide">
+          <span>Description</span>
+          <input name="description" value="{{ settings.description }}" required />
+        </label>
+        <label class="field field-wide">
+          <span>Message of the day</span>
+          <textarea name="motd" rows="6">{{ motd }}</textarea>
+          <small>One line per row.</small>
+        </label>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-copy">
+        <h2>BNC attach listener</h2>
+        <p>Enable the raw IRC endpoint clients use to attach to their always-on networks.</p>
+      </div>
+      <div class="field-grid">
+        <label class="check field-wide">
+          <input type="checkbox" name="bnc_enabled"{% if settings.bnc_addr.is_some() %} checked{% endif %} />
+          <span><strong>Accept BNC client connections</strong><small>Network management and web chat remain available while this is off.</small></span>
+        </label>
+        <label class="field field-wide">
+          <span>Listen address</span>
+          <input name="bnc_addr" value="{{ bnc_addr }}" placeholder="0.0.0.0:6697" inputmode="url" />
+          <small>The replacement address is bound before the current listener is stopped.</small>
+        </label>
+        {% if let Some(bound) = bound_bnc_addr %}
+          <div class="runtime-status field-wide"><span class="dot on"></span>Accepting clients on <code>{{ bound }}</code></div>
+        {% else %}
+          <div class="runtime-status field-wide"><span class="dot off"></span>Attach listener is disabled</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-copy">
+        <h2>IRC listeners</h2>
+        <p>Raw, TLS, and dedicated WebSocket endpoints. Listener changes are checked now and applied after restart.</p>
+      </div>
+      <div class="field-grid">
+        <label class="field field-wide">
+          <span>Listener definitions</span>
+          <textarea name="listeners" rows="5" spellcheck="false" required>{{ listeners }}</textarea>
+          <small>One per line: <code>address | plain</code>, <code>address | websocket</code>, or <code>address | tls | certificate path | private-key path</code>.</small>
+        </label>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-copy">
+        <h2>Web and administrator access</h2>
+        <p>The HTTP bind and database remain bootstrap settings. Public identity, cookie policy, and administrator grants are UI-managed.</p>
+      </div>
+      <div class="field-grid">
+        <label class="field field-wide">
+          <span>Public URL</span>
+          <input type="url" name="public_url" value="{{ public_url }}" placeholder="https://irc.example.com" />
+          <small>Used for OpenID Connect callbacks and device authorization.</small>
+        </label>
+        <label class="check field-wide">
+          <input type="checkbox" name="secure_cookies"{% if settings.secure_cookies %} checked{% endif %} />
+          <span><strong>Require secure session cookies</strong><small>Enable for HTTPS deployments.</small></span>
+        </label>
+        <label class="field field-wide">
+          <span>Administrator accounts</span>
+          <textarea name="admin_accounts" rows="4">{{ admin_accounts }}</textarea>
+          <small>One e6irc account per line. Access changes take effect after restart.</small>
+        </label>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-copy">
+        <h2>Capacity</h2>
+        <p>Process and per-connection resource bounds. Blank optional limits are unlimited.</p>
+      </div>
+      <div class="field-grid">
+        <label class="field"><span>Nickname length</span><input type="number" min="1" max="64" name="nicklen" value="{{ settings.nicklen }}" required /></label>
+        <label class="field"><span>Send queue</span><input type="number" min="1" name="sendq" value="{{ settings.sendq }}" required /></label>
+        <label class="field"><span>Core queue</span><input type="number" min="1" name="core_queue" value="{{ settings.core_queue }}" required /></label>
+        <label class="field"><span>Hot channels</span><input type="number" min="1" name="max_hot_channels" value="{{ settings.max_hot_channels }}" required /></label>
+        <label class="field"><span>Connections per IP</span><input type="number" min="1" name="max_connections_per_ip" value="{{ max_connections_per_ip }}" /></label>
+        <label class="field"><span>Command burst</span><input type="number" min="1" name="command_burst" value="{{ command_burst }}" /></label>
+        <label class="field"><span>Authentication burst</span><input type="number" min="1" name="auth_rate_burst" value="{{ auth_rate_burst }}" /></label>
+        <label class="field"><span>Registration burst</span><input type="number" min="1" name="registration_burst" value="{{ registration_burst }}" /></label>
+        <label class="field field-wide"><span>Trusted proxies</span><textarea name="trusted_proxies" rows="3">{{ trusted_proxies }}</textarea><small>One CIDR per line.</small></label>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="section-copy">
+        <h2>Account registration</h2>
+        <p>Policy advertised through the IRC account-registration capability.</p>
+      </div>
+      <div class="field-grid">
+        <label class="check field-wide"><input type="checkbox" name="registration_before_connect"{% if settings.registration.before_connect %} checked{% endif %} /><span>Allow registration before connection registration completes</span></label>
+        <label class="check field-wide"><input type="checkbox" name="registration_require_email"{% if settings.registration.require_email %} checked{% endif %} /><span>Require an email field</span></label>
+      </div>
+    </section>
+
+    <div class="form-actions">
+      <button class="primary" type="submit">Save configuration</button>
+      <span class="meta">Changes are audited. No value is silently ignored.</span>
+    </div>
+  </form>
+
+  <section class="settings-section credential-section">
+    <div class="section-copy">
+      <h2>Server networks</h2>
+      <p>Shared or account-owned networks imported from <code>[[network]]</code>. They start from the persisted configuration after restart.</p>
+    </div>
+    <div>
+      {% if settings.credentials_from_bootstrap %}
+        <div class="banner-info"><div><strong>Credential-bearing networks still come from bootstrap configuration.</strong> Configure the master key and restart once to enable UI changes.</div></div>
+      {% endif %}
+      {% if shared_networks.is_empty() %}
+        <p class="empty">No server-level networks configured.</p>
+      {% else %}
+        <div class="provider-list">
+          {% for network in shared_networks %}
+            <article>
+              <div><strong>{{ network.name }}</strong><span class="tag">{{ network.kind }}</span></div>
+              <code>{{ network.addr }}</code>
+              <span class="meta">Available to {{ network.owner_display }}</span>
+              <form method="post" action="/console/configuration/shared-networks/delete">
+                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="name" value="{{ network.name }}" />
+                <input type="hidden" name="owner" value="{{ network.owner_value }}" />
+                <button class="danger" type="submit">Remove</button>
+              </form>
+            </article>
+          {% endfor %}
+        </div>
+      {% endif %}
+      <form class="oidc-form" method="post" action="/console/configuration/shared-networks">
+        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <label class="field"><span>Network name</span><input name="name" required /></label>
+        <label class="field"><span>Owner <em>blank for shared</em></span><input name="owner" /></label>
+        <label class="field"><span>Driver</span><select name="kind"><option value="irc">IRC</option><option value="local">Local e6irc</option>{% if matrix_built %}<option value="matrix">Matrix</option>{% endif %}{% if discord_built %}<option value="discord">Discord</option>{% endif %}{% if slack_built %}<option value="slack">Slack</option>{% endif %}</select></label>
+        <label class="field"><span>Address</span><input name="addr" /></label>
+        <label class="field"><span>Nickname / user</span><input name="nick" required /></label>
+        <label class="field"><span>Real name</span><input name="realname" /></label>
+        <label class="field field-wide"><span>Autojoin</span><input name="autojoin" placeholder="#channel, #other" /></label>
+        <label class="field"><span>Buffer capacity</span><input type="number" name="buffer_cap" min="1" value="1000" /></label>
+        <label class="check"><input type="checkbox" name="tls" checked /><span>Use TLS</span></label>
+        <label class="field"><span>SASL account</span><input name="sasl_account" /></label>
+        <label class="field"><span>SASL password</span><input type="password" name="sasl_password" autocomplete="new-password" /></label>
+        <div class="form-actions field-wide"><button class="primary" type="submit">Add server network</button></div>
+      </form>
+    </div>
+  </section>
+
+  <section class="settings-section credential-section">
+    <div class="section-copy">
+      <h2>IRC operators</h2>
+      <p>Passwords are encrypted with the deployment master key and are never rendered back to the browser.</p>
+    </div>
+    <div>
+      {% if settings.credentials_from_bootstrap %}
+        <div class="banner-info"><div><strong>Credentials still come from bootstrap configuration.</strong> Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.</div></div>
+      {% endif %}
+      {% if opers.is_empty() %}
+        <p class="empty">No IRC operators configured.</p>
+      {% else %}
+        <div class="compact-list">
+          {% for name in opers %}
+            <div>
+              <code>{{ name }}</code>
+              <form method="post" action="/console/configuration/opers/delete">
+                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="name" value="{{ name }}" />
+                <button class="danger" type="submit">Remove</button>
+              </form>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+      <form class="inline-config-form" method="post" action="/console/configuration/opers">
+        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <label class="field"><span>Operator name</span><input name="name" required /></label>
+        <label class="field"><span>New password</span><input type="password" name="password" autocomplete="new-password" required /></label>
+        <button class="primary" type="submit">Add operator</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="settings-section credential-section">
+    <div class="section-copy">
+      <h2>OpenID Connect</h2>
+      <p>Identity providers used for browser sign-in. Client secrets are encrypted and replace-only.</p>
+    </div>
+    <div>
+      {% if settings.credentials_from_bootstrap %}
+        <div class="banner-info"><div><strong>Credentials still come from bootstrap configuration.</strong> Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.</div></div>
+      {% endif %}
+      {% if oidc_providers.is_empty() %}
+        <p class="empty">No identity providers configured.</p>
+      {% else %}
+        <div class="provider-list">
+          {% for provider in oidc_providers %}
+            <article>
+              <div><strong>{{ provider.name }}</strong><span class="tag">{{ provider.token_method }}</span></div>
+              <code>{{ provider.issuer_url }}</code>
+              <span class="meta">Client {{ provider.client_id }} · scopes {{ provider.scopes }}</span>
+              <form method="post" action="/console/configuration/oidc/delete">
+                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="name" value="{{ provider.name }}" />
+                <button class="danger" type="submit">Remove</button>
+              </form>
+            </article>
+          {% endfor %}
+        </div>
+      {% endif %}
+      <form class="oidc-form" method="post" action="/console/configuration/oidc">
+        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <label class="field"><span>Provider name</span><input name="name" placeholder="corp" required /></label>
+        <label class="field"><span>Issuer URL</span><input type="url" name="issuer_url" required /></label>
+        <label class="field"><span>Client ID</span><input name="client_id" required /></label>
+        <label class="field"><span>Client secret</span><input type="password" name="client_secret" autocomplete="new-password" required /></label>
+        <label class="field"><span>Scopes</span><input name="scopes" value="profile email" /></label>
+        <label class="field"><span>Token authentication</span><select name="token_endpoint_auth_method"><option value="client_secret_basic">client_secret_basic</option><option value="client_secret_post">client_secret_post</option></select></label>
+        <label class="field field-wide"><span>End-session endpoint <em>optional</em></span><input type="url" name="end_session_endpoint" /></label>
+        <div class="form-actions field-wide"><button class="primary" type="submit">Add identity provider</button></div>
+      </form>
+    </div>
+  </section>
+{% endblock %}

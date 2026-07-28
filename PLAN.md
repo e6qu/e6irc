@@ -16,6 +16,22 @@ SET options) is now fully built and tested — the only open work is the two
 environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
 ⛔ blocked (reason).
 
+Control-plane console (2026-07-28): `/console/configuration` now owns typed,
+revisioned operational settings in PostgreSQL with redacted same-transaction
+audit entries and optimistic concurrency. The database URL, master-key source,
+HTTP bind, release revision, and initial administrator are the minimal
+bootstrap; server identity/MOTD, IRC listeners, BNC attach address,
+registration and resource limits, proxy policy, public URL/cookies,
+administrator grants, OIDC providers, IRC operators, and server-level networks
+are UI-managed.
+Credential fields are sealed and replace-only. The BNC registry is independent
+of its raw attach listener, so `/console/networks` creates always-on networks
+when the listener is off; administrators can bind, rebind, or disable that
+listener from the UI with bind-before-swap rollback. The console layout now
+uses labeled responsive field grids, explicit capability/status banners, live
+listener state, provenance, and accessible error/success regions instead of
+the clipped placeholder-only form.
+
 Hardening sweep (2026-07-20): closed several bug classes across the tree —
 client-triggerable memory-growth DoS on the single core worker (unbounded
 `+b/+q/+e/+I` lists → MAXLIST/478, unbounded channel joins → CHANLIMIT/405,

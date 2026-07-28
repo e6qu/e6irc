@@ -15,13 +15,22 @@ workflow publishes `ghcr.io/e6qu/e6irc:<short-sha>` plus the direct
 It publishes no mutable branch or `latest` tag and retains the newest 20
 release groups.
 
-## Runtime configuration (env → TOML)
+## Bootstrap configuration (env → TOML)
 
 `e6ircd` reads a TOML config file. `deploy/docker-entrypoint.sh` renders that
 file from environment at container start (the deployment injects secrets —
 `E6IRC_DATABASE_URL`, `E6IRC_OIDC_CLIENT_SECRET` — from AWS Secrets Manager)
 and then execs the server. Missing required values fail the container loudly
-rather than starting half-configured.
+rather than starting half-configured. On the first database-backed start,
+operational values are imported into the revisioned `server_settings` row.
+After that, administrators manage them at `/console/configuration`; the
+database URL, secrets-key source, HTTP bind, immutable release revision, and
+initial administrator stay in bootstrap because the console depends on them.
+
+Deployments that still carry plaintext OIDC/operator credentials need a master
+key before the console can own those secrets. Until then, bootstrap credentials
+remain authoritative and the UI labels them accordingly. Once a key is
+configured, the next start seals and imports them atomically.
 
 | Variable | Required | Meaning |
 |---|---|---|

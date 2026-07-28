@@ -3,19 +3,17 @@
         {% if let Some(err) = error %}
           <p class="banner-error" role="alert">{{ err }}</p>
         {% endif %}
-        <h1>Edit network <code>{{ name }}</code></h1>
-        <p class="meta">
-          Change the upstream connection and identity. SASL credentials are not
-          edited here — to change them, remove and re-add the network.
-        </p>
-        <form class="add" method="post" action="/console/networks/{{ name }}/edit">
+        <div class="page-head"><div><p class="eyebrow">IRC network</p><h1>Edit {{ name }}</h1><p class="lede">Saving replaces the live upstream connection after the new values are validated.</p></div></div>
+        <section class="panel">
+        <form class="network-form" method="post" action="/console/networks/{{ name }}/edit">
           <input type="hidden" name="csrf" value="{{ csrf }}" />
-          <input type="text" name="addr" value="{{ addr }}" placeholder="host:port" required />
-          <input type="text" name="nick" value="{{ nick }}" placeholder="nick" required />
-          <input type="text" name="realname" value="{{ realname }}" placeholder="real name (optional)" />
-          <input type="text" name="autojoin" value="{{ autojoin }}" placeholder="#chan,#chan2" />
-          <label><input type="checkbox" name="tls"{% if tls %} checked{% endif %} /> TLS</label>
-          <button type="submit">Save changes</button>
-          <a href="/console/networks">Cancel</a>
+          <label class="field"><span>Server and port</span><input name="addr" value="{{ addr }}" required /></label>
+          <label class="field"><span>Nickname</span><input name="nick" value="{{ nick }}" required /></label>
+          <label class="field field-wide"><span>Real name <em>optional</em></span><input name="realname" value="{{ realname }}" /></label>
+          <label class="field field-wide"><span>Channels to join <em>optional</em></span><input name="autojoin" value="{{ autojoin }}" /><small>Comma-separated channel names.</small></label>
+          <label class="check field-wide"><input type="checkbox" name="tls"{% if tls %} checked{% endif %} /><span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span></label>
+          <div class="banner-info field-wide"><div><strong>Upstream credentials are replace-only.</strong> Remove and recreate this network to change its SASL password; the old secret is never returned to the browser.</div></div>
+          <div class="form-actions field-wide"><button class="primary" type="submit">Save changes</button><a class="rowlink" href="/console/networks">Cancel</a></div>
         </form>
+        </section>
 {% endblock %}
