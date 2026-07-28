@@ -3359,21 +3359,122 @@ async fn oidc_identity_link_list_and_conflict() {
     db::link_oidc_identity(&pool, "alice", "https://idp.example", "sub-0")
         .await
         .expect("link2");
-    assert_eq!(
-        db::list_oidc_identities(&pool, "alice")
-            .await
-            .expect("list"),
-        vec![
-            ("https://idp.example".to_string(), "sub-0".to_string()),
-            ("https://idp.example".to_string(), "sub-1".to_string()),
-        ]
-    );
+    let identities = db::list_oidc_identities(&pool, "alice")
+        .await
+        .expect("list");
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0].1, "https://idp.example");
+    assert_eq!(identities[0].2, "sub-0");
+    assert!(identities[0].3.ends_with('Z'), "{identities:?}");
+    assert_eq!(identities[1].1, "https://idp.example");
+    assert_eq!(identities[1].2, "sub-1");
+    assert!(identities[1].3.ends_with('Z'), "{identities:?}");
     // bob got nothing.
     assert!(
         db::list_oidc_identities(&pool, "bob")
             .await
             .expect("list")
             .is_empty()
+    );
+
+    // Removing an identity also revokes only the sessions asserted by that
+    // identity. A local session and the other identity's session survive.
+    let removed_session = db::create_oidc_web_session(
+        &pool,
+        "alice",
+        db::OidcSessionIdentity {
+            issuer: Some("https://idp.example"),
+            subject: Some("sub-0"),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("removed identity session");
+    let retained_session = db::create_oidc_web_session(
+        &pool,
+        "alice",
+        db::OidcSessionIdentity {
+            issuer: Some("https://idp.example"),
+            subject: Some("sub-1"),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("retained identity session");
+    let local_session = db::create_web_session(&pool, "alice")
+        .await
+        .expect("local session");
+    assert_eq!(
+        db::unlink_oidc_identity(&pool, "alice", identities[0].0)
+            .await
+            .expect("unlink"),
+        db::UnlinkIdentityOutcome::Unlinked
+    );
+    assert_eq!(
+        db::session_account(&pool, &removed_session)
+            .await
+            .expect("removed session"),
+        None
+    );
+    for session in [&retained_session, &local_session] {
+        assert_eq!(
+            db::session_account(&pool, session)
+                .await
+                .expect("retained session"),
+            Some("alice".to_string())
+        );
+    }
+    assert_eq!(
+        db::unlink_oidc_identity(&pool, "alice", identities[1].0)
+            .await
+            .expect("last identity"),
+        db::UnlinkIdentityOutcome::LastIdentity
+    );
+    assert_eq!(
+        db::unlink_oidc_identity(&pool, "alice", i64::MAX)
+            .await
+            .expect("missing identity"),
+        db::UnlinkIdentityOutcome::NotFound
+    );
+
+    // The account-row lock makes the last-identity rule hold under concurrent
+    // requests too: exactly one of two removals succeeds.
+    db::link_oidc_identity(&pool, "bob", "https://idp.example", "bob-0")
+        .await
+        .expect("bob identity 0");
+    db::link_oidc_identity(&pool, "bob", "https://idp.example", "bob-1")
+        .await
+        .expect("bob identity 1");
+    let bob = db::list_oidc_identities(&pool, "bob")
+        .await
+        .expect("bob identities");
+    let (first, second) = tokio::join!(
+        db::unlink_oidc_identity(&pool, "bob", bob[0].0),
+        db::unlink_oidc_identity(&pool, "bob", bob[1].0),
+    );
+    let outcomes = [first.expect("first unlink"), second.expect("second unlink")];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == db::UnlinkIdentityOutcome::Unlinked)
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == db::UnlinkIdentityOutcome::LastIdentity)
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        db::list_oidc_identities(&pool, "bob")
+            .await
+            .expect("bob remaining")
+            .len(),
+        1
     );
 }
 

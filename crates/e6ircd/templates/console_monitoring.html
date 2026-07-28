@@ -6,12 +6,16 @@
       <h1>Monitoring</h1>
       <p class="lede">Live process health, IRC traffic, connection pressure, upstream availability, latency, and errors.</p>
     </div>
-    <span class="live-pill"><span class="pulse"></span>Live</span>
+    <div>
+      <span class="live-pill"><span class="pulse"></span>Live</span>
+      <button type="button" data-refresh-target="#monitoring-panel">Refresh</button>
+    </div>
   </div>
   <div id="monitoring-panel"
-       hx-get="/console/monitoring/panel"
-       hx-trigger="every 10s"
-       hx-swap="innerHTML">
+       data-refresh-url="/console/monitoring/panel"
+       data-refresh-seconds="10"
+       data-refresh-status="monitoring-refresh-status">
     {% include "_monitoring_panel.html" %}
   </div>
+  <p id="monitoring-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
 {% endblock %}

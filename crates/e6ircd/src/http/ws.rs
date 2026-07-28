@@ -296,7 +296,7 @@ pub(super) async fn ws_ui_conn(
         return;
     }
 
-    // Playback: everything buffered while detached, as fragments.
+    // Playback: everything buffered while detached, as JSON line events.
     for line in handle.buffer_snapshot() {
         if socket
             .send(WsMessage::text(line_event(&line)))
@@ -411,8 +411,8 @@ pub(super) fn sanitize_composer_line(line: &str) -> String {
     line
 }
 
-/// Translate a composer frame into an IRC line. The htmx web composer
-/// sends a JSON form (`{"target": "#c", "message": "hi", ...}`) which
+/// Translate a composer frame into an IRC line. The web composer sends a JSON
+/// object (`{"target": "#c", "message": "hi", ...}`) which
 /// becomes `PRIVMSG #c :hi`, with a small set of slash-commands. A
 /// non-JSON frame (e.g. a raw line from a script or test) is relayed
 /// unchanged.

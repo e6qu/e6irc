@@ -4,17 +4,13 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.15.1",
-  "description": "e6irc web client (HTMX + Vite)",
+  "description": "e6irc vanilla JavaScript web client bundled by Vite",
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "dev": "vite",
-    "build": "mkdir -p public && cp node_modules/htmx.org/dist/htmx.min.js public/ && cp node_modules/htmx-ext-ws/dist/ws.min.js public/ && vite build",
+    "build": "vite build",
     "preview": "vite preview",
     "test:oidc-browser": "node ../tools/test-oidc-browser.mjs"
-  },
-  "dependencies": {
-    "htmx-ext-ws": "2.0.4",
-    "htmx.org": "2.0.10"
   },
   "devDependencies": {
     "playwright": "1.61.1",

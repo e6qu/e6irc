@@ -50,6 +50,13 @@ fn get(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
 }
 
+fn csrf_from_html(html: &str) -> &str {
+    html.split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .expect("csrf token in page")
+}
+
 #[tokio::test]
 async fn healthz_is_public_and_ok() {
     let running = net::start(test_config()).await.expect("start");
@@ -420,12 +427,6 @@ async fn web_shell_is_served_at_root_when_embedded() {
     assert_eq!(status, 503);
     assert!(head.to_lowercase().contains("problem+json"), "{head}");
     assert!(body.contains("No database configured"), "{body}");
-
-    // Public runtime assets remain available so the login and account pages
-    // can use the same vendored client code without opening the application.
-    let (status, head, _) = request(http, &get("/htmx.min.js")).await;
-    assert_eq!(status, 200);
-    assert!(head.to_lowercase().contains("javascript"), "{head}");
 }
 
 #[cfg(not(feature = "embed-web"))]
@@ -436,6 +437,25 @@ async fn root_is_not_served_without_embed_web() {
     let http = running.http_addr.expect("http bound");
     let (status, _, _) = request(http, &get("/")).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn console_runtime_is_served_in_every_build() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let (status, headers, body) = request(http, &get("/console.js")).await;
+    assert_eq!(status, 200, "{headers}");
+    let headers = headers.to_ascii_lowercase();
+    assert!(
+        headers.contains("content-type: text/javascript; charset=utf-8"),
+        "{headers}"
+    );
+    assert!(
+        headers.contains("x-content-type-options: nosniff"),
+        "{headers}"
+    );
+    assert!(body.contains("dataset.confirm"), "{body}");
+    assert!(body.contains("data-refresh-url"), "{body}");
 }
 
 #[tokio::test]
@@ -456,6 +476,7 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/me/identities/{id}"]["delete"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/frontchannel-logout"]["get"].is_object());
     assert!(v["components"]["securitySchemes"]["bearer"].is_object());
@@ -486,32 +507,14 @@ async fn account_page_redirects_when_unauthenticated() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn account_page_lists_networks_for_a_session() {
-    let url = support::test_db("account_page_lists_networks_for_a_session").await;
+async fn account_url_redirects_to_the_complete_account_console() {
+    let url = support::test_db("account_url_redirects_to_the_complete_account_console").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    e6ircd::db::create_bnc_network(
-        &pool,
-        "alice",
-        &e6ircd::db::BncNetworkRow {
-            kind: Default::default(),
-            name: "libera".into(),
-            addr: "irc.libera.chat:6697".into(),
-            tls: true,
-            nick: "alice_".into(),
-            realname: None,
-            autojoin: vec![],
-            sasl_account: None,
-            sasl_password_sealed: None,
-            enabled: true,
-        },
-    )
-    .await
-    .expect("network");
     let session = e6ircd::db::create_web_session(&pool, "alice")
         .await
         .expect("session");
@@ -537,13 +540,34 @@ async fn account_page_lists_networks_for_a_session() {
     let running = net::start(config).await.expect("start");
     let http = running.http_addr.expect("http bound");
 
-    let req = format!(
+    let old_url = format!(
         "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let (status, head, body) = request(http, &req).await;
+    let (status, head, _) = request(http, &old_url).await;
+    assert_eq!(status, 303, "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("location: /console/account"),
+        "{head}"
+    );
+
+    let console = format!(
+        "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &console).await;
     assert_eq!(status, 200, "{head}");
-    assert!(body.contains("alice"), "account name: {body}");
-    assert!(body.contains("libera"), "network listed: {body}");
+    assert!(body.contains("Account &amp; access"), "{body}");
+    assert!(body.contains("<strong>alice</strong>"), "{body}");
+    assert!(body.contains("IRC app passwords"), "{body}");
+    assert!(body.contains("Personal access tokens"), "{body}");
+    assert!(body.contains("Login identities"), "{body}");
+    assert!(body.contains("Read state"), "{body}");
+    assert!(body.contains("src=\"/console.js\""), "{body}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-security-policy: default-src 'none'; script-src 'self'"),
+        "{head}"
+    );
 }
 
 /// The console BNC networks page lists the caller's own networks (with a live
@@ -631,7 +655,7 @@ async fn console_networks_page_lists_the_callers_networks() {
     }
 }
 
-/// The console networks page can add and remove a network via htmx even before
+/// The console networks page can add and remove a network with standard forms even before
 /// the raw attach listener is enabled. Network management depends on the
 /// database-backed registry, not on an unrelated startup listener flag.
 #[tokio::test(flavor = "multi_thread")]
@@ -681,87 +705,90 @@ async fn console_add_and_delete_network_via_the_console() {
         page.contains("Raw IRC attachment is currently off"),
         "{page}"
     );
-    let csrf = page
-        .split("X-CSRF-Token\": \"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token in page")
-        .to_string();
+    let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
-    // Add a network with the CSRF header -> 200 rows fragment carrying it.
-    let body = "name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby&tls=on";
+    // Add a network with body CSRF -> redirect back to the canonical list.
+    let body =
+        format!("csrf={csrf}&name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby&tls=on");
     let add = format!(
-        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let (status, _, frag) = request(http, &add).await;
-    assert_eq!(status, 200, "{frag}");
-    assert!(
-        frag.contains("work") && frag.contains("irc.example:6667"),
-        "{frag}"
-    );
-
-    // Disable the network via the toggle button -> 200 fragment showing it
-    // stopped and offering to Enable it again.
-    let off = "enabled=false";
-    let toggle_off = format!(
-        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{off}",
-        off.len()
-    );
-    let (status, _, frag) = request(http, &toggle_off).await;
-    assert_eq!(status, 200, "{frag}");
-    assert!(
-        frag.contains("Enable") && frag.contains("stopped"),
-        "{frag}"
-    );
-
-    // Re-enable it -> 200 fragment offering to Disable.
-    let on = "enabled=true";
-    let toggle_on = format!(
-        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{on}",
-        on.len()
-    );
-    let (status, _, frag) = request(http, &toggle_on).await;
-    assert_eq!(status, 200, "{frag}");
-    assert!(frag.contains("Disable"), "{frag}");
-
-    // A name outside the token charset is refused (this is what breaks the htmx
-    // delete path and the JS-string confirm) -> 400, nothing created.
-    let bad = "name=bad%3Fname&addr=irc.example:6667&nick=z";
-    let add_bad = format!(
-        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{bad}",
-        bad.len()
-    );
-    let (status, _, _) = request(http, &add_bad).await;
-    assert_eq!(status, 400);
-
-    // Without the CSRF header -> 403.
-    let no_csrf = format!(
         "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );
+    let (status, headers, _) = request(http, &add).await;
+    assert_eq!(status, 303, "{headers}");
+    let (_, _, page) = request(http, &page_req).await;
+    assert!(
+        page.contains("work") && page.contains("irc.example:6667"),
+        "{page}"
+    );
+
+    // Disable the network via the toggle form, then read its stopped state.
+    let off = format!("csrf={csrf}&enabled=false");
+    let toggle_off = format!(
+        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{off}",
+        off.len()
+    );
+    let (status, _, _) = request(http, &toggle_off).await;
+    assert_eq!(status, 303);
+    let (_, _, page) = request(http, &page_req).await;
+    assert!(
+        page.contains("Enable") && page.contains("stopped"),
+        "{page}"
+    );
+
+    // Re-enable it and verify the rendered action changes back.
+    let on = format!("csrf={csrf}&enabled=true");
+    let toggle_on = format!(
+        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{on}",
+        on.len()
+    );
+    let (status, _, _) = request(http, &toggle_on).await;
+    assert_eq!(status, 303);
+    let (_, _, page) = request(http, &page_req).await;
+    assert!(page.contains("Disable"), "{page}");
+
+    // A name outside the token charset is refused before it can become an
+    // ambiguous path component.
+    let bad = format!("csrf={csrf}&name=bad%3Fname&addr=irc.example:6667&nick=z");
+    let add_bad = format!(
+        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad}",
+        bad.len()
+    );
+    let (status, _, _) = request(http, &add_bad).await;
+    assert_eq!(status, 400);
+
+    // A forged body token is rejected.
+    let forged = body.replace(&format!("csrf={csrf}"), "csrf=wrong");
+    let no_csrf = format!(
+        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{forged}",
+        forged.len()
+    );
     let (status, _, _) = request(http, &no_csrf).await;
     assert_eq!(status, 403);
 
-    // Delete it with the CSRF header -> 200 rows fragment without it.
+    // Delete it with a standard POST form, then verify the canonical list.
+    let delete_body = format!("csrf={csrf}");
     let del = format!(
-        "DELETE /console/networks/work HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nConnection: close\r\n\r\n"
+        "POST /console/networks/work/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_body}",
+        delete_body.len()
     );
-    let (status, _, frag) = request(http, &del).await;
-    assert_eq!(status, 200, "{frag}");
-    assert!(!frag.contains("irc.example:6667"), "still present: {frag}");
+    let (status, _, _) = request(http, &del).await;
+    assert_eq!(status, 303);
+    let (_, _, page) = request(http, &page_req).await;
+    assert!(!page.contains("irc.example:6667"), "still present: {page}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1014,28 +1041,23 @@ async fn console_edit_network_updates_fields() {
         .http_addr
         .expect("http");
 
-    // Extract the session CSRF from the networks page (add form's header value).
+    // Extract the session CSRF from the networks page.
     let page_req = format!(
         "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (_, _, page) = request(http, &page_req).await;
-    let csrf = page
-        .split("X-CSRF-Token\": \"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf")
-        .to_string();
+    let csrf = csrf_from_html(&page).to_string();
 
     // Create the network to edit.
-    let body = "name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby";
+    let body = format!("csrf={csrf}&name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby");
     let add = format!(
         "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
         body.len()
     );
     let (status, _, _) = request(http, &add).await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 303);
 
     // The edit form is pre-filled with the current values.
     let edit_get = format!(
@@ -1851,15 +1873,10 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
 
     // The CSRF token is session-bound; read it from the account page.
     let page = format!(
-        "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (_, _, body) = request(http, &page).await;
-    let csrf = body
-        .split("X-CSRF-Token\": \"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token")
-        .to_string();
+    let csrf = csrf_from_html(&body).to_string();
 
     let form = format!(
         "csrf={csrf}&kind=matrix&name=hq&addr=https://matrix.example&nick=e6bot&sasl_password=secret"
@@ -1894,18 +1911,23 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn account_page_add_network_form_with_csrf() {
-    let url = support::test_db("account_page_add_network_form_with_csrf").await;
+async fn account_console_manages_credentials_tokens_and_identities() {
+    let url = support::test_db("account_console_manages_credentials_tokens_and_identities").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
+    e6ircd::db::link_oidc_identity(&pool, "alice", "https://idp.example", "alice-primary")
+        .await
+        .expect("primary identity");
+    e6ircd::db::link_oidc_identity(&pool, "alice", "https://idp.example", "alice-secondary")
+        .await
+        .expect("secondary identity");
     let session = e6ircd::db::create_web_session(&pool, "alice")
         .await
         .expect("session");
-    drop(pool);
 
     let config = Config {
         server_name: "irc.form.example".into(),
@@ -1933,43 +1955,141 @@ async fn account_page_add_network_form_with_csrf() {
         .http_addr
         .expect("http");
 
-    // Load the account page and extract the session-bound CSRF token.
+    // The account console is usable with the default build: its runtime is
+    // always served, and every mutation carries the session-bound form token.
     let page_req = format!(
-        "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let (_, _, page) = request(http, &page_req).await;
-    let csrf = page
-        .split("X-CSRF-Token\": \"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token in page")
-        .to_string();
+    let (status, headers, page) = request(http, &page_req).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(page.contains("alice-primary"), "{page}");
+    assert!(page.contains("alice-secondary"), "{page}");
+    let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
-    // Add a network via the form with the CSRF header -> 200 fragment.
-    let body = "name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby&tls=on";
-    let add = format!(
-        "POST /account/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         X-CSRF-Token: {csrf}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+    let app_form = format!("csrf={csrf}&label=Laptop");
+    let create_app = format!(
+        "POST /console/account/app-passwords HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{app_form}",
+        app_form.len()
     );
-    let (status, _, frag) = request(http, &add).await;
-    assert_eq!(status, 200, "{frag}");
+    let (status, _, body) = request(http, &create_app).await;
+    assert_eq!(status, 201, "{body}");
     assert!(
-        frag.contains("work") && frag.contains("irc.example:6667"),
-        "{frag}"
+        body.contains("App password created")
+            && body.contains("id=\"issued-secret\"")
+            && body.contains(">Laptop<"),
+        "{body}"
+    );
+    let credentials = e6ircd::db::list_credentials(&pool, "alice")
+        .await
+        .expect("credentials");
+    let app_id = credentials
+        .iter()
+        .find(|(_, kind, label, _, _)| kind == "app_password" && label.as_deref() == Some("Laptop"))
+        .map(|row| row.0)
+        .expect("created app password");
+
+    let token_form = format!("csrf={csrf}&label=Automation");
+    let create_token = format!(
+        "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{token_form}",
+        token_form.len()
+    );
+    let (status, _, body) = request(http, &create_token).await;
+    assert_eq!(status, 201, "{body}");
+    assert!(
+        body.contains("Personal access token created")
+            && body.contains("e6p_")
+            && body.contains(">Automation<"),
+        "{body}"
+    );
+    let tokens = e6ircd::db::list_api_tokens(&pool, "alice")
+        .await
+        .expect("tokens");
+    let token_id = tokens
+        .iter()
+        .find(|(_, label, _, _)| label == "Automation")
+        .map(|row| row.0)
+        .expect("created token");
+
+    let bad_form = "csrf=wrong&label=Rejected";
+    let bad_create = format!(
+        "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad_form}",
+        bad_form.len()
+    );
+    let (status, _, _) = request(http, &bad_create).await;
+    assert_eq!(status, 403);
+
+    for (path, id) in [
+        ("/console/account/app-passwords", app_id),
+        ("/console/account/tokens", token_id),
+    ] {
+        let revoke_form = format!("csrf={csrf}");
+        let revoke = format!(
+            "POST {path}/{id}/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{revoke_form}",
+            revoke_form.len()
+        );
+        let (status, _, body) = request(http, &revoke).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("revoked"), "{body}");
+    }
+    assert!(
+        e6ircd::db::list_credentials(&pool, "alice")
+            .await
+            .expect("credentials after revoke")
+            .iter()
+            .all(|row| row.0 != app_id)
+    );
+    assert!(
+        e6ircd::db::list_api_tokens(&pool, "alice")
+            .await
+            .expect("tokens after revoke")
+            .iter()
+            .all(|row| row.0 != token_id)
     );
 
-    // Same request without the CSRF header -> 403.
-    let no_csrf = format!(
-        "POST /account/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
+    let identities = e6ircd::db::list_oidc_identities(&pool, "alice")
+        .await
+        .expect("identities");
+    let unlink_id = identities
+        .iter()
+        .find(|row| row.2 == "alice-secondary")
+        .map(|row| row.0)
+        .expect("secondary identity");
+    let unlink_form = format!("csrf={csrf}");
+    let unlink = format!(
+        "POST /console/account/identities/{unlink_id}/delete HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{unlink_form}",
+        unlink_form.len()
     );
-    let (status, _, _) = request(http, &no_csrf).await;
-    assert_eq!(status, 403);
+    let (status, headers, _) = request(http, &unlink).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(
+        headers.to_ascii_lowercase().contains("location: /login"),
+        "{headers}"
+    );
+    assert!(headers.contains("Max-Age=0"), "{headers}");
+
+    let remaining = e6ircd::db::list_oidc_identities(&pool, "alice")
+        .await
+        .expect("remaining identity");
+    assert_eq!(remaining.len(), 1);
+    let last_delete = format!(
+        "DELETE /api/v1/me/identities/{} HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n",
+        remaining[0].0
+    );
+    let (status, _, body) = request(http, &last_delete).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("Last login identity"), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2475,16 +2595,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
     let (_, _, page) = request(
         http,
         &format!(
-            "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
-    let csrf = page
-        .split("X-CSRF-Token\": \"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token in page")
-        .to_string();
+    let csrf = csrf_from_html(&page).to_string();
     // Without the token, the destructive logout GET is refused (a cross-site
     // navigation can't forge it): anti-forced-logout CSRF.
     let (no_csrf, _, _) = request(
@@ -2604,15 +2719,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
                 let (_, _, page) = request(
                     http,
                     &format!(
-                        "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={value}\r\nConnection: close\r\n\r\n"
+                        "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={value}\r\nConnection: close\r\n\r\n"
                     ),
                 )
                 .await;
-                let token = page
-                    .split("X-CSRF-Token\": \"")
-                    .nth(1)
-                    .and_then(|s| s.split('"').next())
-                    .expect("csrf token in page");
+                let token = csrf_from_html(&page);
                 format!("?csrf={token}")
             }
             None => String::new(),
@@ -2767,16 +2878,11 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
     let (_, _, page) = request(
         http,
         &format!(
-            "GET /account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+            "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
-    let csrf = page
-        .split("X-CSRF-Token\": \"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token in page")
-        .to_string();
+    let csrf = csrf_from_html(&page).to_string();
     let logout = format!(
         "GET /api/v1/auth/logout?csrf={csrf} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );

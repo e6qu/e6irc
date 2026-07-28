@@ -49,6 +49,23 @@ the sampler's insert transaction, while metrics remain available when history
 sampling is disabled. The console landing page now carries live operational
 summary cards instead of only database inventory counts.
 
+Account and console completion (2026-07-28): `/account` now redirects
+authenticated users to the canonical `/console/account` self-service page.
+That page creates and revokes IRC app passwords and personal access tokens,
+shows each new secret once, links and unlinks OpenID Connect identities, lists
+read markers, and explains BNC SASL attachment. Identity removal refuses the
+last login identity under an account-row lock and revokes every browser session
+asserted by the removed identity in the same transaction. The REST identity
+list now includes stable identifiers and creation times and exposes the same
+owner-scoped unlink operation.
+
+Every console mutation now uses a standard body-CSRF form and
+Post/Redirect/Get. The always-served `/console.js` provides confirmation,
+one-time-secret copy, and monitoring refresh in both default and `embed-web`
+builds under a same-origin script CSP. The unused HTMX/HTMX-WebSocket packages,
+embedded assets, and feature-gated routes were removed; the Vite chat bundle
+has no production package dependencies.
+
 Hardening sweep (2026-07-20): closed several bug classes across the tree —
 client-triggerable memory-growth DoS on the single core worker (unbounded
 `+b/+q/+e/+I` lists → MAXLIST/478, unbounded channel joins → CHANLIMIT/405,
@@ -4892,18 +4909,16 @@ Done:
   404 without).
 Done (this phase's remaining, now landed):
 - `/ws/ui` live path (DESIGN §13.2): cookie/bearer WebSocket attaching
-  over the multiplexer path; pushes upstream lines as `hx-swap-oob` HTML
-  fragments and relays composer input. The htmx composer JSON
-  ({target, message}) becomes PRIVMSG (`/raw ` sends literally); raw
-  frames pass through. Buffer snapshot replayed on attach; connected/
-  disconnected status fragments. e2e (crates/e6ircd/tests/ws_ui.rs:
-  authed attach + relay both ways, unauthenticated refused) + composer
-  unit tests.
-- Vite frontend (`web/`): htmx 2.0.10 + htmx-ext-ws 2.0.4 (both 0BSD,
-  provenance in web/VENDOR.md + pnpm-lock), chat shell (index.html +
-  main.js + style.css, theme-aware) that connects `/ws/ui`, applies the
-  server's OOB fragments, and sends the composer form. `pnpm build` →
-  web/dist, embedded by rust-embed under `embed-web`.
+  over the multiplexer path; sends JSON line/status events and relays
+  composer input. Composer JSON ({target, message}) becomes PRIVMSG
+  (`/raw ` sends literally); raw frames pass through. Buffer snapshot is
+  replayed on attach. e2e (`crates/e6ircd/tests/ws_ui.rs`: authenticated
+  attach + relay both ways, unauthenticated refused) + composer unit tests.
+- Vite frontend (`web/`): dependency-free production chat shell
+  (`index.html` + `main.js` + `style.css`, theme-aware) that connects
+  `/ws/ui`, parses IRC lines into buffers/member state, and sends composer
+  JSON. `pnpm build` → `web/dist`, embedded by rust-embed under
+  `embed-web`.
 - The production container built the pinned pnpm/Vite frontend and compiled
   e6ircd with `embed-web`, so the deployable image contained the complete UI
   and performed no build work at startup. The chat shell exposed the signed-in
@@ -4914,17 +4929,15 @@ Done (this phase's remaining, now landed):
   real-browser coverage exercised catalog launch, direct SSO, logout
   landing reload, and application-local sign-in recovery.
 - askama server-rendered pages (DESIGN §13.1): `/login` (OIDC provider
-  buttons) and `/account` (cookie-authed user section listing the
-  account's networks + credentials; redirects to /login when
-  unauthenticated). Read-only for now; DB errors fail loudly.
-- Account-page mutations: htmx add-network form + per-row delete
-  buttons hit /account/networks (fragment endpoints returning the
-  refreshed table), guarded by an HMAC(csrf_key, session) CSRF token
-  (X-CSRF-Token header; constant-time verify; missing/bad -> 403). The
-  JSON create path was refactored to a shared create_network_core. htmx
-  served standalone at /htmx.min.js (copied into dist by the build) for
-  the askama pages. Composer slash-commands DONE (see Phase 4). (DESIGN
-  §13)
+  buttons) and the complete `/console/account` self-service page
+  (credentials, tokens, identities, read markers; `/account` redirects
+  there after authentication). Database errors fail loudly.
+- Console mutations use standard body-CSRF forms and Post/Redirect/Get,
+  guarded by HMAC(csrf_key, session) with constant-time verification.
+  Network CRUD shares the JSON endpoint's core. A small always-served
+  `/console.js` owns confirmation, secret-copy, and live monitoring refresh;
+  the Vite chat client remains a separate vanilla-JavaScript bundle. Composer
+  slash-commands DONE (see Phase 4). (DESIGN §13)
 
 ## Phase 8 — Native clients ✅ (2026-07-19)
 Done:

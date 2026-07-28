@@ -744,7 +744,7 @@ mod tests {
         assert!(network_name_ok("libera"));
         assert!(network_name_ok("my-net_1"));
         assert!(network_name_ok("irc.example"));
-        // URL-significant characters — these broke the htmx delete path.
+        // URL-significant characters cannot become ambiguous route components.
         assert!(!network_name_ok("foo?bar"));
         assert!(!network_name_ok("foo#bar"));
         assert!(!network_name_ok("foo%41"));

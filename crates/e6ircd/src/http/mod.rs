@@ -131,25 +131,22 @@ impl AppState {
 /// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
 pub(super) const MAX_LABEL_LEN: usize = 64;
 
+pub(super) fn label_validation_error(label: &str) -> Option<String> {
+    if label.chars().count() > MAX_LABEL_LEN {
+        return Some(format!("Labels are at most {MAX_LABEL_LEN} characters."));
+    }
+    if label.chars().any(|c| c.is_control()) {
+        return Some("Labels must not contain control characters.".into());
+    }
+    None
+}
+
 /// Validate a client-supplied credential label: bounded and free of control
 /// characters (which would corrupt the account UI / logs). Returns a ready 400
 /// response when invalid, or `None` when the label is acceptable.
 pub(super) fn validate_label(label: &str) -> Option<Response> {
-    if label.chars().count() > MAX_LABEL_LEN {
-        return Some(problem(
-            StatusCode::BAD_REQUEST,
-            "Label too long",
-            Some(&format!("Labels are at most {MAX_LABEL_LEN} characters.")),
-        ));
-    }
-    if label.chars().any(|c| c.is_control()) {
-        return Some(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid label",
-            Some("Labels must not contain control characters."),
-        ));
-    }
-    None
+    label_validation_error(label)
+        .map(|detail| problem(StatusCode::BAD_REQUEST, "Invalid label", Some(&detail)))
 }
 
 /// Unwrap a JSON request body, turning a rejection into a 400 problem response.
@@ -337,8 +334,30 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/validation", get(pages::validation))
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
         .route("/auth.css", get(pages::auth_styles))
-        .route("/account", get(pages::account))
+        .route("/console.js", get(pages::console_script))
+        .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
+        .route("/console/account", get(pages::console_account))
+        .route(
+            "/console/account/app-passwords",
+            post(pages::console_create_app_password),
+        )
+        .route(
+            "/console/account/app-passwords/{id}/delete",
+            post(pages::console_revoke_app_password),
+        )
+        .route(
+            "/console/account/tokens",
+            post(pages::console_create_api_token),
+        )
+        .route(
+            "/console/account/tokens/{id}/delete",
+            post(pages::console_revoke_api_token),
+        )
+        .route(
+            "/console/account/identities/{id}/delete",
+            post(pages::console_unlink_identity),
+        )
         .route("/console/monitoring", get(pages::console_monitoring))
         .route(
             "/console/monitoring/panel",
@@ -374,8 +393,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(pages::console_networks).post(pages::console_add_network),
         )
         .route(
-            "/console/networks/{name}",
-            axum::routing::delete(pages::console_delete_network),
+            "/console/networks/{name}/delete",
+            post(pages::console_delete_network),
         )
         .route(
             "/console/networks/{name}/toggle",
@@ -407,11 +426,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         )
-        .route("/account/networks", post(pages::add_network_form))
-        .route(
-            "/account/networks/{name}",
-            axum::routing::delete(pages::delete_network_form),
-        )
         .route("/api/v1/server", get(server_info))
         .route("/api/v1/openapi.json", get(openapi))
         .route("/api/v1/auth/app-passwords", post(create_app_password))
@@ -428,6 +442,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(oidc_frontchannel_logout),
         )
         .route("/api/v1/me/identities", get(me_identities))
+        .route(
+            "/api/v1/me/identities/{id}",
+            axum::routing::delete(me_identity_unlink),
+        )
         .route("/api/v1/auth/logout", post(logout).get(logout_sso))
         .route("/api/v1/auth/device/start", post(device_start))
         .route("/api/v1/auth/device/token", post(device_token))
@@ -473,8 +491,6 @@ pub fn router(state: Arc<AppState>) -> Router {
     #[cfg(feature = "embed-web")]
     let router = router
         .route("/", get(web::index))
-        .route("/htmx.min.js", get(web::htmx))
-        .route("/ws.min.js", get(web::htmx_ws))
         .route("/assets/{*path}", get(web::asset));
     router
         .fallback(async || problem(StatusCode::NOT_FOUND, "Not Found", None))
@@ -590,20 +606,10 @@ mod web {
     pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
         serve(&format!("assets/{path}"))
     }
-
-    /// Standalone htmx (copied into web/dist by the build) for the
-    /// server-rendered askama pages, which aren't part of the Vite bundle.
-    pub async fn htmx() -> Response {
-        serve("htmx.min.js")
-    }
-
-    pub async fn htmx_ws() -> Response {
-        serve("ws.min.js")
-    }
 }
 
-/// Server-rendered HTML pages (askama). Complements the Vite/htmx chat
-/// client with a login landing and a read-only user section.
+/// Server-rendered HTML pages (askama). Complements the Vite chat client with
+/// authentication, self-service, and operational management surfaces.
 mod pages {
     use super::*;
     use askama::Template;
@@ -727,19 +733,25 @@ mod pages {
             .into_response()
     }
 
-    struct NetworkView {
-        name: String,
-        addr: String,
-        tls: bool,
-        nick: String,
+    pub async fn console_script() -> Response {
+        (
+            [
+                (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            include_str!("../../assets/console.js"),
+        )
+            .into_response()
     }
 
-    /// The account page's add-network form (urlencoded). `tls` is an
+    /// The console add-network form (urlencoded). `tls` is an
     /// HTML checkbox (`"on"` when checked, absent otherwise). The SASL pair and
     /// realname are optional text inputs that submit as empty strings when left
     /// blank, so `into_create` maps blank → `None`.
     #[derive(Deserialize)]
     pub struct NetworkFormFields {
+        csrf: String,
         name: String,
         addr: String,
         nick: String,
@@ -758,7 +770,7 @@ mod pages {
     impl NetworkFormFields {
         /// Build the `CreateNetwork` for an IRC upstream from the submitted form,
         /// treating a blank optional text input as absent. Shared by the account
-        /// page and the console so the two forms map identically.
+        /// page.
         fn into_create(self) -> CreateNetwork {
             let opt = |s: String| {
                 let s = s.trim().to_string();
@@ -784,52 +796,124 @@ mod pages {
         }
     }
 
-    struct CredView {
+    struct CredentialView {
+        id: i64,
         kind: String,
         label: String,
         created: String,
+        last_used: String,
+        revocable: bool,
+    }
+
+    struct ApiTokenView {
+        id: i64,
+        label: String,
+        created: String,
+        expires: String,
+    }
+
+    struct IdentityView {
+        id: i64,
+        issuer: String,
+        subject: String,
+        created: String,
+    }
+
+    struct ReadMarkerView {
+        target: String,
+        timestamp: String,
     }
 
     #[derive(Template)]
-    #[template(path = "account.html")]
-    struct Account {
+    #[template(path = "console_account.html")]
+    struct ConsoleAccount {
         account: String,
         csrf: String,
-        /// Whether this account may reach the admin `/console` — controls the
-        /// header link, so a non-admin is never shown a door that 403s.
         is_admin: bool,
-        networks: Vec<NetworkView>,
-        credentials: Vec<CredView>,
+        active: &'static str,
+        credentials: Vec<CredentialView>,
+        tokens: Vec<ApiTokenView>,
+        identities: Vec<IdentityView>,
+        read_markers: Vec<ReadMarkerView>,
+        link_providers: Vec<String>,
+        outcome: Option<String>,
+        success: bool,
+        secret: Option<String>,
+        secret_kind: &'static str,
     }
 
-    #[derive(Template)]
-    #[template(path = "network_rows.html")]
-    struct NetworkRows {
+    async fn account_build(
+        state: &AppState,
+        account: String,
         csrf: String,
-        networks: Vec<NetworkView>,
-    }
-
-    async fn network_views(pool: &PgPool, account: &str) -> Result<Vec<NetworkView>, Response> {
-        crate::db::list_bnc_networks(pool, account)
+        outcome: Option<String>,
+        success: bool,
+        secret: Option<String>,
+        secret_kind: &'static str,
+    ) -> Result<ConsoleAccount, Response> {
+        let pool = pool_of(state);
+        let credentials = crate::db::list_credentials(pool, &account)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|n| NetworkView {
-                        name: n.name,
-                        addr: n.addr,
-                        tls: n.tls,
-                        nick: n.nick,
-                    })
-                    .collect()
+            .map_err(|e| super::device::admin_db_error("credential list", e))?
+            .into_iter()
+            .map(|(id, kind, label, created, last_used)| CredentialView {
+                id,
+                revocable: kind == "app_password",
+                kind,
+                label: label.unwrap_or_default(),
+                created,
+                last_used: last_used.unwrap_or_else(|| "Never".into()),
             })
-            .map_err(|e| {
-                eprintln!("account: networks: {e}");
-                problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                )
+            .collect();
+        let tokens = crate::db::list_api_tokens(pool, &account)
+            .await
+            .map_err(|e| super::device::admin_db_error("token list", e))?
+            .into_iter()
+            .map(|(id, label, created, expires)| ApiTokenView {
+                id,
+                label,
+                created,
+                expires: expires.unwrap_or_else(|| "No expiry".into()),
             })
+            .collect();
+        let identities = crate::db::list_oidc_identities(pool, &account)
+            .await
+            .map_err(|e| super::device::admin_db_error("identity list", e))?
+            .into_iter()
+            .map(|(id, issuer, subject, created)| IdentityView {
+                id,
+                issuer,
+                subject,
+                created,
+            })
+            .collect();
+        let read_markers = crate::db::list_read_markers(pool, &account)
+            .await
+            .map_err(|e| super::device::admin_db_error("read-marker list", e))?
+            .into_iter()
+            .map(|(target, timestamp)| ReadMarkerView { target, timestamp })
+            .collect();
+        let is_admin = is_admin_account(state, &account);
+        let link_providers = state
+            .oidc_providers
+            .iter()
+            .map(|provider| provider.name.clone())
+            .collect();
+        Ok(ConsoleAccount {
+            account,
+            csrf,
+            is_admin,
+            active: "account",
+            credentials,
+            tokens,
+            identities,
+            read_markers,
+            link_providers,
+            outcome,
+            success,
+            secret,
+            secret_kind,
+        })
     }
 
     /// Authenticate a cookie session for a server-rendered page and derive its
@@ -853,51 +937,359 @@ mod pages {
         Ok((account, csrf))
     }
 
-    /// User section: the signed-in account's networks and credentials,
-    /// with htmx forms to add/remove networks. Cookie-authenticated;
-    /// unauthenticated visitors go to `/login`.
-    pub async fn account(
+    /// Preserve the old account-page URL while keeping one canonical
+    /// self-service console.
+    pub async fn account_redirect(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        let pool = pool_of(&state);
+        if let Err(response) = page_actor(&state, &headers, false).await {
+            return response;
+        }
+        Redirect::to("/console/account").into_response()
+    }
 
-        let networks = match network_views(pool, &account).await {
-            Ok(n) => n,
-            Err(r) => return r,
+    pub async fn console_account(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
         };
-        let credentials = match crate::db::list_credentials(pool, &account).await {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|(_, kind, label, created, _)| CredView {
-                    kind,
-                    label: label.unwrap_or_default(),
-                    created,
-                })
-                .collect(),
-            Err(e) => {
-                eprintln!("account page: credentials: {e}");
-                return problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                );
+        match account_build(&state, account, csrf, None, true, None, "").await {
+            Ok(view) => render_private(view),
+            Err(response) => response,
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountLabelForm {
+        csrf: String,
+        label: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountDeleteForm {
+        csrf: String,
+    }
+
+    trait AccountForm {
+        fn csrf(&self) -> &str;
+    }
+
+    impl AccountForm for AccountLabelForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    impl AccountForm for AccountDeleteForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    async fn account_form_actor<T: AccountForm>(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(String, T), Response> {
+        let fields = parse_form(form)?;
+        let account = require_form_actor(state, headers, fields.csrf()).await?;
+        Ok((account, fields))
+    }
+
+    async fn account_label_actor(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(String, String), Response> {
+        let (account, form) = account_form_actor(state, headers, form).await?;
+        if let Some(error) = label_validation_error(&form.label) {
+            return Err(account_result(
+                state,
+                account,
+                headers,
+                AccountResult::message(StatusCode::BAD_REQUEST, error),
+            )
+            .await);
+        }
+        Ok((account, form.label))
+    }
+
+    struct AccountResult {
+        status: StatusCode,
+        message: String,
+        secret: Option<String>,
+        secret_kind: &'static str,
+    }
+
+    impl AccountResult {
+        fn message(status: StatusCode, message: impl Into<String>) -> Self {
+            Self {
+                status,
+                message: message.into(),
+                secret: None,
+                secret_kind: "",
             }
-        };
-        let is_admin = is_admin_account(&state, &account);
-        render_private(Account {
+        }
+
+        fn issued(
+            status: StatusCode,
+            message: impl Into<String>,
+            secret: String,
+            secret_kind: &'static str,
+        ) -> Self {
+            Self {
+                status,
+                message: message.into(),
+                secret: Some(secret),
+                secret_kind,
+            }
+        }
+    }
+
+    async fn account_result(
+        state: &AppState,
+        account: String,
+        headers: &axum::http::HeaderMap,
+        result: AccountResult,
+    ) -> Response {
+        let csrf = session_token(headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        match account_build(
+            state,
             account,
             csrf,
-            is_admin,
-            networks,
-            credentials,
-        })
+            Some(result.message),
+            result.status.is_success(),
+            result.secret,
+            result.secret_kind,
+        )
+        .await
+        {
+            Ok(view) => {
+                let mut response = render_private(view);
+                *response.status_mut() = result.status;
+                response
+            }
+            Err(response) => response,
+        }
+    }
+
+    struct AccountDeleteMessages {
+        success: &'static str,
+        missing: &'static str,
+        operation: &'static str,
+    }
+
+    async fn account_delete_result(
+        state: &AppState,
+        account: String,
+        headers: &axum::http::HeaderMap,
+        result: Result<bool, crate::db::DbError>,
+        messages: AccountDeleteMessages,
+    ) -> Response {
+        match result {
+            Ok(true) => {
+                account_result(
+                    state,
+                    account,
+                    headers,
+                    AccountResult::message(StatusCode::OK, messages.success),
+                )
+                .await
+            }
+            Ok(false) => {
+                account_result(
+                    state,
+                    account,
+                    headers,
+                    AccountResult::message(StatusCode::NOT_FOUND, messages.missing),
+                )
+                .await
+            }
+            Err(error) => super::device::admin_db_error(messages.operation, error),
+        }
+    }
+
+    pub async fn console_create_app_password(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, label) = match account_label_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        match crate::db::issue_app_password_for_account(pool_of(&state), &account, &label).await {
+            Ok(secret) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::issued(
+                        StatusCode::CREATED,
+                        "App password created. Copy it now; it cannot be shown again.",
+                        secret,
+                        "App password",
+                    ),
+                )
+                .await
+            }
+            Err(crate::db::DbError::TooManyCredentials) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::message(
+                        StatusCode::CONFLICT,
+                        "Too many app passwords. Revoke one before creating another.",
+                    ),
+                )
+                .await
+            }
+            Err(error) => super::device::admin_db_error("app-password creation", error),
+        }
+    }
+
+    pub async fn console_revoke_app_password(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(id): Path<i64>,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, _) = match account_form_actor(&state, &headers, form).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let result = crate::db::revoke_credential(pool_of(&state), &account, id).await;
+        account_delete_result(
+            &state,
+            account,
+            &headers,
+            result,
+            AccountDeleteMessages {
+                success: "App password revoked.",
+                missing: "No revocable app password with that identifier.",
+                operation: "app-password revocation",
+            },
+        )
+        .await
+    }
+
+    pub async fn console_create_api_token(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, label) = match account_label_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        match crate::db::issue_api_token(pool_of(&state), &account, &label).await {
+            Ok(secret) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::issued(
+                        StatusCode::CREATED,
+                        "Personal access token created. Copy it now; it cannot be shown again.",
+                        secret,
+                        "Personal access token",
+                    ),
+                )
+                .await
+            }
+            Err(crate::db::DbError::TooManyCredentials) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::message(
+                        StatusCode::CONFLICT,
+                        "Too many personal access tokens. Revoke one before creating another.",
+                    ),
+                )
+                .await
+            }
+            Err(error) => super::device::admin_db_error("token creation", error),
+        }
+    }
+
+    pub async fn console_revoke_api_token(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(id): Path<i64>,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, _) = match account_form_actor(&state, &headers, form).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let result = crate::db::delete_api_token(pool_of(&state), &account, id).await;
+        account_delete_result(
+            &state,
+            account,
+            &headers,
+            result,
+            AccountDeleteMessages {
+                success: "Personal access token revoked.",
+                missing: "No personal access token with that identifier.",
+                operation: "token revocation",
+            },
+        )
+        .await
+    }
+
+    pub async fn console_unlink_identity(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(id): Path<i64>,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, _) = match account_form_actor(&state, &headers, form).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        match crate::db::unlink_oidc_identity(pool_of(&state), &account, id).await {
+            Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => {
+                let mut response = Redirect::to("/login").into_response();
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    clear_session_cookie(state.secure_cookies)
+                        .parse()
+                        .expect("session clear cookie is valid"),
+                );
+                response
+            }
+            Ok(crate::db::UnlinkIdentityOutcome::LastIdentity) => account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(
+                    StatusCode::CONFLICT,
+                    "This is your last login identity. Link another provider before removing it.",
+                ),
+            )
+            .await,
+            Ok(crate::db::UnlinkIdentityOutcome::NotFound) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::message(
+                        StatusCode::NOT_FOUND,
+                        "No linked identity with that identifier.",
+                    ),
+                )
+                .await
+            }
+            Err(error) => super::device::admin_db_error("identity unlink", error),
+        }
     }
 
     struct ChannelRow {
@@ -2289,13 +2681,6 @@ mod pages {
     }
 
     #[derive(Template)]
-    #[template(path = "console_network_rows.html")]
-    struct ConsoleNetworkRows {
-        csrf: String,
-        networks: Vec<ConsoleNetView>,
-    }
-
-    #[derive(Template)]
     #[template(path = "console_network_edit.html")]
     struct ConsoleNetworkEdit {
         account: String,
@@ -2358,8 +2743,8 @@ mod pages {
 
     /// Build the caller's BNC networks with live upstream state from the
     /// registry (a network with no live handle — disabled, or not yet dialed —
-    /// reads as not connected). One place so the full page and the htmx
-    /// add/delete fragment render identical rows.
+    /// reads as not connected). One place keeps the list view consistent after
+    /// every form redirect.
     async fn console_network_views(
         state: &AppState,
         account: &str,
@@ -2434,56 +2819,41 @@ mod pages {
         })
     }
 
-    async fn console_networks_fragment(state: &AppState, account: &str, csrf: String) -> Response {
-        match console_network_views(state, account).await {
-            Ok(networks) => render_private(ConsoleNetworkRows { csrf, networks }),
-            Err(r) => r,
-        }
-    }
-
-    /// Shared body of the two add-network form handlers (console + account):
-    /// require the bouncer, parse the (identical) form, build the CreateNetwork,
-    /// and run `create_network_core`. The callers differ only in which table
-    /// fragment they render on success.
+    /// Validate an add-network form and run the same creation core as the REST
+    /// endpoint.
     async fn add_network_from_form(
         state: &AppState,
         account: &str,
-        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
+        fields: NetworkFormFields,
     ) -> Result<(), Response> {
         let Some(registry) = &state.bnc_registry else {
             return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
         };
-        let axum::Form(f) = form.map_err(|e| {
-            problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid form",
-                Some(&e.to_string()),
-            )
-        })?;
-        let req = f.into_create();
+        let req = fields.into_create();
         create_network_core(state, registry, account, &req).await
     }
 
-    /// Add a network from the console (htmx); returns the refreshed rows fragment.
-    /// Reuses the same `create_network_core` the REST API and account page use.
+    /// Add a network from the console and return to the canonical list.
     pub async fn console_add_network(
         State(state): State<Arc<AppState>>,
-        CsrfVerified(account): CsrfVerified,
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        if let Err(r) = add_network_from_form(&state, &account, form).await {
-            return r;
+        let fields = match parse_form(form) {
+            Ok(fields) => fields,
+            Err(response) => return response,
+        };
+        let account = match require_form_actor(&state, &headers, &fields.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        if let Err(response) = add_network_from_form(&state, &account, fields).await {
+            return response;
         }
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        console_networks_fragment(&state, &account, csrf).await
+        Redirect::to("/console/networks").into_response()
     }
 
-    /// Shared body of the two delete-network handlers (console + account):
-    /// require the bouncer, delete the row (owner-scoped), and stop its live
-    /// driver. The callers differ only in which fragment they render.
+    /// Delete an owner-scoped network and stop its live driver.
     async fn delete_network_by_name(
         state: &AppState,
         account: &str,
@@ -2509,34 +2879,39 @@ mod pages {
         }
     }
 
-    /// Delete a network from the console (htmx); returns the refreshed fragment.
+    /// Delete a network from the console and return to the canonical list.
     pub async fn console_delete_network(
         State(state): State<Arc<AppState>>,
-        CsrfVerified(account): CsrfVerified,
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        if let Err(r) = delete_network_by_name(&state, &account, &name).await {
-            return r;
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let account = match require_form_actor(&state, &headers, &form.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        if let Err(response) = delete_network_by_name(&state, &account, &name).await {
+            return response;
         }
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        console_networks_fragment(&state, &account, csrf).await
+        Redirect::to("/console/networks").into_response()
     }
 
     /// The console toggle button posts the *target* enabled state so the flip is
     /// not derived from a possibly-stale row (no read-then-write race).
     #[derive(Deserialize)]
     pub struct ToggleFields {
+        csrf: String,
         enabled: String,
     }
 
-    /// Enable/disable a network from the console (htmx); returns the refreshed
-    /// rows fragment. Reuses the same core the REST `PATCH` uses.
+    /// Enable/disable a network from the console. Reuses the same core the REST
+    /// `PATCH` uses.
     pub async fn console_toggle_network(
         State(state): State<Arc<AppState>>,
-        CsrfVerified(account): CsrfVerified,
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
         form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
@@ -2554,14 +2929,15 @@ mod pages {
                 );
             }
         };
+        let account = match require_form_actor(&state, &headers, &f.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
         let enabled = matches!(f.enabled.as_str(), "true" | "on" | "1");
         if let Err(r) = set_network_enabled_core(&state, registry, &account, &name, enabled).await {
             return r;
         }
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        console_networks_fragment(&state, &account, csrf).await
+        Redirect::to("/console/networks").into_response()
     }
 
     /// Render the edit-network form (shared by the GET and the failed-POST
@@ -2850,8 +3226,8 @@ mod pages {
         ))
     }
 
-    /// The console add-bridge form (urlencoded; hidden CSRF field — a plain form
-    /// can't set the `x-csrf-token` header htmx uses). Field meaning is per kind.
+    /// The console add-bridge form (urlencoded with a hidden CSRF field). Field
+    /// meaning is per kind.
     #[derive(Deserialize)]
     pub struct BridgeFormFields {
         csrf: String,
@@ -3381,8 +3757,7 @@ mod pages {
         })
     }
 
-    /// The `/device` form (urlencoded): code + CSRF token as form fields
-    /// (a plain HTML form cannot set the `x-csrf-token` header htmx uses).
+    /// The `/device` form (urlencoded): code + CSRF token as form fields.
     #[derive(Deserialize)]
     pub struct DeviceFormFields {
         user_code: String,
@@ -3431,86 +3806,6 @@ mod pages {
         })
     }
 
-    /// A cookie-authenticated account whose request also carries a valid
-    /// `x-csrf-token` header — the CSRF precondition for an htmx form mutation,
-    /// as an extractor. A state-changing form-POST handler is CSRF-protected
-    /// because it *asks for this in its signature*, not because the author
-    /// remembered to open the body with a check — the same way [`Authenticated`]
-    /// closed the authentication class. A new `pages::*` form handler that omits
-    /// it fails to compile for want of the account argument.
-    ///
-    /// Header-based by construction: a `FromRequestParts` extractor cannot read
-    /// a form-body field, so the one plain HTML form that carries its token in
-    /// the body (`approve_device_form`, which htmx can't drive) keeps its own
-    /// explicit `csrf_valid` check.
-    pub(crate) struct CsrfVerified(pub(crate) String);
-
-    impl axum::extract::FromRequestParts<Arc<AppState>> for CsrfVerified {
-        type Rejection = Response;
-
-        async fn from_request_parts(
-            parts: &mut axum::http::request::Parts,
-            state: &Arc<AppState>,
-        ) -> Result<Self, Self::Rejection> {
-            let account = authenticate(state, &parts.headers).await?;
-            let session = session_token(&parts.headers, state.secure_cookies)
-                .ok_or_else(|| problem(StatusCode::UNAUTHORIZED, "Session required", None))?;
-            let token = parts
-                .headers
-                .get("x-csrf-token")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if state.csrf_valid(&session, token) {
-                Ok(CsrfVerified(account))
-            } else {
-                Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None))
-            }
-        }
-    }
-
-    /// Add a network from the account page's htmx form; returns the
-    /// refreshed network table fragment.
-    pub async fn add_network_form(
-        State(state): State<Arc<AppState>>,
-        CsrfVerified(account): CsrfVerified,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        if let Err(r) = add_network_from_form(&state, &account, form).await {
-            return r;
-        }
-        networks_fragment(&state, &headers, &account).await
-    }
-
-    /// Delete a network from the account page; returns the refreshed
-    /// network table fragment.
-    pub async fn delete_network_form(
-        State(state): State<Arc<AppState>>,
-        CsrfVerified(account): CsrfVerified,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-    ) -> Response {
-        if let Err(r) = delete_network_by_name(&state, &account, &name).await {
-            return r;
-        }
-        networks_fragment(&state, &headers, &account).await
-    }
-
-    async fn networks_fragment(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: &str,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        let pool = state.pool.as_ref().expect("checked");
-        match network_views(pool, account).await {
-            Ok(networks) => render_private(NetworkRows { csrf, networks }),
-            Err(r) => r,
-        }
-    }
-
     fn render<T: Template>(t: T) -> Response {
         match t.render() {
             Ok(html) => {
@@ -3525,18 +3820,29 @@ mod pages {
         }
     }
 
-    /// Like [`render`], plus `Cache-Control: no-store` — for an authenticated
-    /// per-user page that carries a session-bound CSRF token and personal data
-    /// (account, network list) yet still runs scripts (htmx). It deliberately
-    /// keeps `render`'s script-permitting headers rather than `render_auth`'s
-    /// `default-src 'none'` CSP, which would block htmx; the point here is only
-    /// to keep the personalized response out of shared/bfcache, the same reason
-    /// `/me` sets `no_store` explicitly. Without this the browser's Back/bfcache
-    /// re-shows the previous user's account after logout on a shared machine.
+    /// Like [`render`], plus private-page caching and script policy. The console
+    /// has one same-origin runtime (`/console.js`) and no inline JavaScript, so
+    /// every personalized page can carry a useful CSP in every build. Inline
+    /// styles remain necessary for the server-rendered traffic bars.
     fn render_private<T: Template>(template: T) -> Response {
         let mut response = render(template);
         if response.status().is_success() {
-            no_store(response.headers_mut());
+            let headers = response.headers_mut();
+            no_store(headers);
+            headers.insert(
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+                    .parse()
+                    .expect("static header"),
+            );
+            headers.insert(
+                header::X_FRAME_OPTIONS,
+                "DENY".parse().expect("static header"),
+            );
+            headers.insert(
+                header::REFERRER_POLICY,
+                "no-referrer".parse().expect("static header"),
+            );
         }
         response
     }
@@ -3574,7 +3880,7 @@ mod composer_tests {
     use super::composer_to_irc;
 
     #[test]
-    fn htmx_form_becomes_privmsg() {
+    fn composer_json_form_becomes_privmsg() {
         let frame = r##"{"target":"#rust","message":"hi there","HEADERS":{}}"##;
         assert_eq!(composer_to_irc(frame), "PRIVMSG #rust :hi there");
     }

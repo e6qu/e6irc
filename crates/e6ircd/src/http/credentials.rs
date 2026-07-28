@@ -116,9 +116,14 @@ pub(super) async fn me_identities(
         Ok(rows) => {
             let identities: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(
-                    |(issuer, subject)| serde_json::json!({ "issuer": issuer, "subject": subject }),
-                )
+                .map(|(id, issuer, subject, created_at)| {
+                    serde_json::json!({
+                        "id": id,
+                        "issuer": issuer,
+                        "subject": subject,
+                        "created_at": created_at,
+                    })
+                })
                 .collect();
             (
                 [(header::CONTENT_TYPE, "application/json")],
@@ -128,6 +133,36 @@ pub(super) async fn me_identities(
         }
         Err(e) => {
             eprintln!("http: identity list failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
+/// Unlink one of the caller's OIDC identities. The database refuses the last
+/// identity and revokes every web session asserted by the removed identity in
+/// the same transaction.
+pub(super) async fn me_identity_unlink(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    Path(id): Path<i64>,
+) -> Response {
+    let pool = pool_of(&state);
+    match crate::db::unlink_oidc_identity(pool, &account, id).await {
+        Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::db::UnlinkIdentityOutcome::LastIdentity) => problem(
+            StatusCode::CONFLICT,
+            "Last login identity",
+            Some("Link another identity before removing this one."),
+        ),
+        Ok(crate::db::UnlinkIdentityOutcome::NotFound) => {
+            problem(StatusCode::NOT_FOUND, "No such identity", None)
+        }
+        Err(e) => {
+            eprintln!("http: identity unlink failed: {e}");
             problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",

@@ -2,7 +2,7 @@
 
 A monolithic Rust IRC ecosystem: one server binary that is at once a
 modern **IRCv3 daemon**, a versioned **REST API**, an **OIDC** web
-backend for a bundled HTMX/Vite web client, and a per-user **BNC host**
+backend for a bundled vanilla-JavaScript/Vite web client, and a per-user **BNC host**
 (always-on bouncer sessions to external IRC networks, plus bridges to
 non-IRC services such as Matrix) — shipped alongside native **CLI** and
 **TUI** clients.
@@ -41,8 +41,11 @@ written against Libera should work unchanged against e6ircd.
   replay, SASL to upstreams, encrypted credential storage, and a pluggable
   driver SPI. A **Matrix** bridge ships behind a feature flag; the local
   in-process network gives always-on presence with no external socket.
-- **Web client**: server-rendered HTMX pages (login, account) plus a live
-  `/ws/ui` socket that streams upstream lines as out-of-band fragments.
+- **Web client**: server-rendered login, self-service, and operational
+  console pages plus a vanilla-JavaScript chat client over `/ws/ui`.
+  Account access, BNC networks, integrations, configuration, sessions,
+  traffic, connections, latency, and errors are managed and inspected in the
+  UI. The Vite production bundle has no runtime package dependencies.
   Static assets deploy either from a CDN or embedded into the binary
   behind the `embed-web` feature.
 - **Cross-platform**: Linux, macOS, and Windows on both x86_64 and

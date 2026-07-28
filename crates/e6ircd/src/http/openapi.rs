@@ -139,6 +139,20 @@ pub(super) async fn openapi() -> Response {
                 "get": { "summary": "List OIDC identities linked to your account",
                     "security": bearer, "responses": ok_json }
             },
+            "/api/v1/me/identities/{id}": {
+                "delete": {
+                    "summary": "Unlink one of your OIDC identities and revoke its browser sessions",
+                    "security": bearer,
+                    "parameters": [{ "name": "id", "in": "path", "required": true,
+                        "schema": { "type": "integer" } }],
+                    "responses": {
+                        "204": { "description": "identity unlinked and its sessions revoked" },
+                        "404": { "description": "identity is not linked to this account" },
+                        "409": { "description": "last linked identity cannot be removed" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
             "/api/v1/auth/device/start": {
                 "post": { "summary": "Begin an RFC 8628 device authorization grant",
                     "responses": { "200": { "description": "device_code, user_code, verification_uri" } } }
