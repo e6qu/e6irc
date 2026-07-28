@@ -379,7 +379,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | OIDC | **openidconnect** crate | Certified-flow implementation of code+PKCE, discovery, JWKS. |
 | Config | **toml** + serde, `E6IRC_*` env overrides | No config-framework dependency. |
 | Logging | `eprintln!` operational lines on stderr (WARN-level) | Structured `tracing` + JSON output is deferred (§16, §19). |
-| Metrics | none yet | Prometheus endpoint deferred (§16, §19). |
+| Metrics | Fixed-cardinality in-process atomics + bounded histograms | One typed snapshot feeds the console, JSON API, Prometheus exposition, readiness, and PostgreSQL history (§16). |
 
 **Dependency policy — minimal, only what's really needed:**
 
@@ -424,8 +424,9 @@ Server (`e6ircd`) features:
 
 The hand-authored OpenAPI 3.1 document at `/api/v1/openapi.json` and the
 native IRC-over-WebSocket endpoint (§13.4, for third-party web IRC clients
-such as gamja) are always compiled in — neither is feature-gated. There is no
-`metrics`/Prometheus feature (see §16).
+such as gamja) are always compiled in — neither is feature-gated.
+Observability is also always compiled in, so the console and automation read
+the same process state (see §16).
 
 Release profile (workspace):
 
@@ -1097,8 +1098,9 @@ Surface (initial):
 - `channels`: registered-channel management (access flags, topic, mlock)
 - `history`: paged queries per §11.2
 - `admin`: accounts, global bans (kline-equivalents), server stats,
-  audit-log query
+  audit-log query, live/historical observability, Prometheus exposition
 - `healthz` (liveness; no auth)
+- `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
 
 The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored and
 always served (no feature gate, no utoipa dependency).
@@ -1236,16 +1238,33 @@ going quiet, which is the client-side form of a silent no-op (§2).
 
 ## 16. Observability
 
-Current state: operational events — SendQ overflows, DB write-queue full,
-driver connect/persist failures, credential-check DB errors, bouncer
-persistence lag — surface as WARN-level lines on stderr via `eprintln!`. This
-is deliberately loud: no slow-path loss is absorbed silently.
+Operational events remain loud WARN-level stderr lines; fixed-cardinality
+telemetry records the machine-readable side of the same failures without
+putting untrusted values or secrets in labels. One process-wide snapshot
+contains connection state and lifecycle totals, IRC and BNC line/byte traffic,
+HTTP and database operation totals, SendQ kills, fixed error categories, BNC
+driver up/down state, and cumulative core/database/HTTP latency histograms.
 
-Deferred (§19): structured `tracing` spans (connection lifecycle, message
-routing, driver connects, HTTP requests) with a `--log-format json` option,
-and a `metrics`/Prometheus endpoint (connections by state, messages/s,
-fan-out latency histogram, SendQ kills, Postgres batch latency, per-driver
-up/down). Neither `tracing` nor a metrics stack is a dependency yet.
+The snapshot is the sole source for:
+
+- `/console/monitoring`, an administrator-only htmx view refreshed every ten
+  seconds with health, traffic, connections, latency, upstreams, and errors;
+- `/api/v1/admin/observability`, authenticated JSON with the current snapshot
+  and at most 1,000 bounded historical points;
+- `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
+  fixed `state`/`kind` labels;
+- `/readyz`, which fails when the single core worker's heartbeat is stale or
+  configured PostgreSQL cannot answer `SELECT 1`.
+
+When PostgreSQL is configured, a sampler stores the typed JSON snapshot in
+`observability_samples`. The UI-managed `[observability]` interval (5–300
+seconds), enable switch, and retention (1–2160 hours) apply live. Every insert
+deletes rows older than the configured retention in the same transaction, so
+the history is bounded by construction rather than a separate best-effort
+cleanup job. `/healthz` remains a dependency-free liveness probe.
+
+Logging continues to use loud stderr lines; metrics do not depend on a
+third-party metrics stack.
 
 ---
 
@@ -1343,8 +1362,8 @@ Layers, bottom to top:
 - Relay-mode bridges (server-owned shared channels) — after per-user mode.
 - read-marker/draft caps tracked as drafts: pin exact spec revisions when
   implementing.
-- Structured logging (`tracing` spans, JSON output) and a `metrics`/Prometheus
-  endpoint — current observability is `eprintln!`/stderr (§16).
+- Structured logging (`tracing` spans and JSON output); machine-readable
+  telemetry and Prometheus exposition are complete (§16).
 
 ## 20. References
 

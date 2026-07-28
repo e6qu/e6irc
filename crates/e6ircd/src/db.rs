@@ -7,8 +7,12 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use e6irc_proto::casemap::CaseMapping;
 use sqlx::PgPool;
+use sqlx::Row;
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::core::{DbReply, DbRequest, Input};
+use crate::observability::Telemetry;
 use e6irc_queue::{Receiver, Sender};
 
 /// Migrations are compiled into the binary; startup refuses to run on
@@ -75,6 +79,81 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
     let pool = PgPool::connect(url).await.map_err(DbError::Connect)?;
     MIGRATOR.run(&pool).await.map_err(DbError::Migrate)?;
     Ok(pool)
+}
+
+pub(crate) async fn store_observability_sample(
+    pool: &PgPool,
+    snapshot: &crate::observability::Snapshot,
+    retention_hours: u64,
+) -> Result<(), DbError> {
+    let value = serde_json::to_value(snapshot)
+        .map_err(|error| DbError::InvalidServerSettings(error.to_string()))?;
+    let retention_ms = retention_hours
+        .saturating_mul(60)
+        .saturating_mul(60)
+        .saturating_mul(1_000);
+    let cutoff = snapshot.sampled_at_ms.saturating_sub(retention_ms);
+    let sampled_at = i64::try_from(snapshot.sampled_at_ms)
+        .map_err(|_| DbError::InvalidServerSettings("sample timestamp exceeds BIGINT".into()))?;
+    let cutoff = i64::try_from(cutoff)
+        .map_err(|_| DbError::InvalidServerSettings("retention cutoff exceeds BIGINT".into()))?;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    sqlx::query(
+        "INSERT INTO observability_samples (sampled_at_ms, snapshot)
+         VALUES ($1, $2)
+         ON CONFLICT (sampled_at_ms) DO UPDATE SET snapshot = EXCLUDED.snapshot",
+    )
+    .bind(sampled_at)
+    .bind(value)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM observability_samples WHERE sampled_at_ms < $1")
+        .bind(cutoff)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(())
+}
+
+pub(crate) async fn list_observability_samples(
+    pool: &PgPool,
+    since_ms: u64,
+    until_ms: u64,
+    limit: usize,
+) -> Result<Vec<crate::observability::Snapshot>, DbError> {
+    let since_ms = i64::try_from(since_ms)
+        .map_err(|_| DbError::InvalidServerSettings("history timestamp exceeds BIGINT".into()))?;
+    let until_ms = i64::try_from(until_ms)
+        .map_err(|_| DbError::InvalidServerSettings("history timestamp exceeds BIGINT".into()))?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::InvalidServerSettings("history limit exceeds BIGINT".into()))?;
+    let rows = sqlx::query(
+        "WITH params AS (
+             SELECT GREATEST(1, (($2 - $1) + $3 - 2) / ($3 - 1)) AS bucket_ms
+         ),
+         sampled AS (
+             SELECT DISTINCT ON ((sampled_at_ms - $1) / params.bucket_ms)
+                    sampled_at_ms, snapshot
+               FROM observability_samples, params
+              WHERE sampled_at_ms BETWEEN $1 AND $2
+              ORDER BY ((sampled_at_ms - $1) / params.bucket_ms), sampled_at_ms DESC
+         )
+         SELECT snapshot FROM sampled ORDER BY sampled_at_ms LIMIT $3",
+    )
+    .bind(since_ms)
+    .bind(until_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    rows.into_iter()
+        .map(|row| {
+            serde_json::from_value(row.get("snapshot"))
+                .map_err(|error| DbError::InvalidServerSettings(error.to_string()))
+        })
+        .collect()
 }
 
 /// One immutable view of the settings row. Callers must present `revision` on a
@@ -316,6 +395,24 @@ pub async fn issue_app_password(
 /// One worker loop; run as a task. Replies always reach the core (or
 /// the core is gone and the server is shutting down).
 pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Sender<Input>) {
+    run_worker_inner(pool, &mut rx, core_tx, None).await;
+}
+
+pub(crate) async fn run_worker_observed(
+    pool: PgPool,
+    mut rx: Receiver<DbRequest>,
+    core_tx: Sender<Input>,
+    telemetry: Arc<Telemetry>,
+) {
+    run_worker_inner(pool, &mut rx, core_tx, Some(telemetry)).await;
+}
+
+async fn run_worker_inner(
+    pool: PgPool,
+    rx: &mut Receiver<DbRequest>,
+    core_tx: Sender<Input>,
+    telemetry: Option<Arc<Telemetry>>,
+) {
     let mut log_batch: Vec<DbRequest> = Vec::new();
     while let Some(envelope) = rx.pop().await {
         let mut next = Some(envelope.payload);
@@ -339,10 +436,18 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                 } => {
                     let pool = pool.clone();
                     let core_tx = core_tx.clone();
+                    let telemetry = telemetry.clone();
                     tokio::spawn(async move {
-                        let reply = handle_verify(&pool, &account, &password)
-                            .await
-                            .into_reply(origin);
+                        let started = Instant::now();
+                        let outcome = handle_verify(&pool, &account, &password).await;
+                        let unavailable = matches!(&outcome, VerifyOutcome::Unavailable);
+                        let reply = outcome.into_reply(origin);
+                        if let Some(telemetry) = telemetry {
+                            telemetry.record_database_request(started.elapsed());
+                            if unavailable {
+                                telemetry.record_error(crate::observability::ErrorKind::Database);
+                            }
+                        }
                         // The core being gone (push fails) just means shutdown.
                         let _ = core_tx.push(Input::DbReply { conn, reply }).await;
                     });
@@ -373,8 +478,18 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                 } => {
                     let pool = pool.clone();
                     let core_tx = core_tx.clone();
+                    let telemetry = telemetry.clone();
                     tokio::spawn(async move {
+                        let started = Instant::now();
                         let reply = handle_create_account(&pool, name, &password, origin).await;
+                        let unavailable =
+                            matches!(&reply, DbReply::AccountRegisterUnavailable { .. });
+                        if let Some(telemetry) = telemetry {
+                            telemetry.record_database_request(started.elapsed());
+                            if unavailable {
+                                telemetry.record_error(crate::observability::ErrorKind::Database);
+                            }
+                        }
                         let _ = core_tx.push(Input::DbReply { conn, reply }).await;
                     });
                 }
@@ -387,9 +502,23 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
                     // Consecutive messages still batch; only a read forces the
                     // flush, which is exactly the ordering the queue promises.
                     if !log_batch.is_empty() {
-                        flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+                        let started = Instant::now();
+                        let succeeded =
+                            flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+                        if let Some(telemetry) = &telemetry {
+                            telemetry.record_database_request(started.elapsed());
+                            if !succeeded {
+                                telemetry.record_error(crate::observability::ErrorKind::Database);
+                            }
+                        }
                     }
-                    if !handle_request(&pool, &core_tx, request).await {
+                    let started = Instant::now();
+                    let keep_running =
+                        handle_request(&pool, &core_tx, request, telemetry.as_deref()).await;
+                    if let Some(telemetry) = &telemetry {
+                        telemetry.record_database_request(started.elapsed());
+                    }
+                    if !keep_running {
                         return;
                     }
                 }
@@ -398,7 +527,14 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
         }
         // Queue drained: flush accumulated history in one statement.
         if !log_batch.is_empty() {
-            flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+            let started = Instant::now();
+            let succeeded = flush_log_batch(&pool, std::mem::take(&mut log_batch)).await;
+            if let Some(telemetry) = &telemetry {
+                telemetry.record_database_request(started.elapsed());
+                if !succeeded {
+                    telemetry.record_error(crate::observability::ErrorKind::Database);
+                }
+            }
         }
     }
 }
@@ -406,7 +542,7 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
 /// Group-insert buffered LogMessage rows. Persistence is best-effort:
 /// chat delivery already happened, so a failed flush is logged loudly and
 /// dropped rather than retried into duplicate rows.
-async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
+async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) -> bool {
     let n = batch.len();
     let (mut msgids, mut targets, mut prefixes, mut accounts, mut kinds, mut bodies, mut tss) = (
         Vec::with_capacity(n),
@@ -483,11 +619,25 @@ async fn flush_log_batch(pool: &PgPool, batch: Vec<DbRequest>) {
         // DB-backed ring is *already* created `complete = false` (a target may
         // have older rows in `messages`), so CHATHISTORY always has Postgres as
         // its backstop and never presents the hot ring as a gap-free record.
+        false
+    } else {
+        true
+    }
+}
+
+fn record_database_error(telemetry: Option<&Telemetry>) {
+    if let Some(telemetry) = telemetry {
+        telemetry.record_error(crate::observability::ErrorKind::Database);
     }
 }
 
 /// Handle one non-history request; false = core gone, stop the worker.
-async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbRequest) -> bool {
+async fn handle_request(
+    pool: &PgPool,
+    core_tx: &Sender<Input>,
+    request: DbRequest,
+    telemetry: Option<&Telemetry>,
+) -> bool {
     match request {
         // `run_worker` intercepts VerifyPassword and spawns it off the loop before
         // ever reaching here (like LogMessage's batching). A duplicate inline path
@@ -502,6 +652,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                 Ok(Some(account)) => VerifyOutcome::Verified(account),
                 Ok(None) => VerifyOutcome::Rejected,
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: token lookup failed: {e}");
                     VerifyOutcome::Unavailable
                 }
@@ -522,6 +673,9 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
         } => {
             let reply =
                 handle_register_channel(pool, &channel, &founder_account, topic, label).await;
+            if matches!(&reply, DbReply::ChannelRegisterUnavailable { .. }) {
+                record_database_error(telemetry);
+            }
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::DropChannel { channel, requester } => {
@@ -537,6 +691,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                 Ok(true) => crate::core::ChannelDropResult::Dropped,
                 Ok(false) => crate::core::ChannelDropResult::Missing,
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: channel drop failed: {e}");
                     crate::core::ChannelDropResult::Unavailable
                 }
@@ -562,6 +717,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                 },
                 Ok(false) => DbReply::FounderChangeFailed { channel },
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: founder transfer failed: {e}");
                     DbReply::FounderChangeUnavailable { channel }
                 }
@@ -582,6 +738,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             }
             .await
             .map_err(|e| {
+                record_database_error(telemetry);
                 // The error string is logged here; the core only needs to know
                 // it failed so it can FAIL the CHATHISTORY rather than reply
                 // with a misleading empty page.
@@ -611,6 +768,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             let targets = query_targets(pool, &channels, &me, min_ts, max_ts, limit)
                 .await
                 .map_err(|e| {
+                    record_database_error(telemetry);
                     eprintln!("db: targets query failed: {e}");
                 });
             core_tx
@@ -640,6 +798,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     label,
                 },
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: read marker persistence failed: {e}");
                     crate::core::DbReply::ReadMarkerUnavailable {
                         account,
@@ -678,6 +837,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     failure: crate::core::ChannelTopicFailure::MissingRegistration,
                 },
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: channel topic persistence failed: {e}");
                     DbReply::ChannelTopicFailed {
                         channel,
@@ -709,6 +869,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     label,
                 },
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: channel keeptopic persistence failed: {e}");
                     DbReply::ChannelKeeptopicUnavailable { display, label }
                 }
@@ -731,6 +892,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     label,
                 },
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: channel mlock persistence failed: {e}");
                     DbReply::ChannelMlockUnavailable { display, label }
                 }
@@ -757,6 +919,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
                     DbReply::ChannelAccessLimitReached { channel }
                 }
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: channel access persistence failed: {e}");
                     DbReply::ChannelAccessUnavailable { channel }
                 }
@@ -770,6 +933,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             let result = match mutate_server_ban_audited(pool, &mutation).await {
                 Ok(()) => crate::core::ServerBanResult::Stored,
                 Err(e) => {
+                    record_database_error(telemetry);
                     eprintln!("db: audited server-ban mutation failed: {e}");
                     crate::core::ServerBanResult::Unavailable
                 }
@@ -790,6 +954,7 @@ async fn handle_request(pool: &PgPool, core_tx: &Sender<Input>, request: DbReque
             detail,
         } => {
             if let Err(e) = insert_audit_log(pool, &actor, &action, &target, &detail).await {
+                record_database_error(telemetry);
                 eprintln!("db: audit log write failed: {e}");
             }
             true

@@ -1,12 +1,14 @@
 //! All chat state, owned exclusively by the core worker.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
 use e6irc_queue::Sender;
 
 use super::{Output, WireLine, deliver};
+use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId(pub u64);
@@ -839,6 +841,7 @@ impl Channel {
 }
 
 pub(crate) struct ServerState {
+    pub telemetry: Arc<Telemetry>,
     pub config: CoreConfig,
     pub casemap: CaseMapping,
     pub sessions: HashMap<ConnId, Session>,
@@ -974,9 +977,14 @@ pub(crate) struct WhowasEntry {
 pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
-    pub fn new(config: CoreConfig, db_tx: Sender<super::DbRequest>) -> Self {
+    pub fn new(
+        config: CoreConfig,
+        db_tx: Sender<super::DbRequest>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         let started_at = (config.clock)();
         Self {
+            telemetry,
             config,
             casemap: CaseMapping::Rfc1459,
             sessions: HashMap::new(),
@@ -1620,8 +1628,11 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return; // events may race a close; the session is gone
         };
+        let byte_count = bytes.strip_suffix(b"\r\n").unwrap_or(&bytes).len();
         if deliver(&session.tx, WireLine::sanitized(bytes)).is_err() {
             self.doomed.push(conn);
+        } else {
+            self.telemetry.record_irc_output(byte_count);
         }
     }
 

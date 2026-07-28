@@ -10,5 +10,6 @@ pub mod core;
 pub mod db;
 pub mod http;
 pub mod net;
+pub(crate) mod observability;
 pub(crate) mod sanitize;
 pub mod secret;

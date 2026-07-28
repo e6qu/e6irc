@@ -60,6 +60,25 @@ async fn healthz_is_public_and_ok() {
 }
 
 #[tokio::test]
+async fn readyz_reports_core_and_optional_database_state() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+    let mut response = request(http, &get("/readyz")).await;
+    for _ in 0..20 {
+        if response.0 == 200 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        response = request(http, &get("/readyz")).await;
+    }
+    assert_eq!(response.0, 200, "{}", response.2);
+    let body: serde_json::Value = serde_json::from_str(&response.2).expect("readiness JSON");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["core"], "ready");
+    assert_eq!(body["database"], "not_configured");
+}
+
+#[tokio::test]
 async fn signed_out_page_is_public_reload_safe_and_accessible() {
     let running = net::start(test_config()).await.expect("start");
     let http = running.http_addr.expect("http bound");
@@ -434,6 +453,9 @@ async fn openapi_spec_is_served() {
         "{body}"
     );
     assert!(v["paths"]["/healthz"]["get"].is_object());
+    assert!(v["paths"]["/readyz"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/frontchannel-logout"]["get"].is_object());
     assert!(v["components"]["securitySchemes"]["bearer"].is_object());
@@ -784,17 +806,62 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("Configuration"), "{page}");
     assert!(page.contains("Revision 1"), "{page}");
+    assert!(page.contains("Monitoring history"), "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
         .nth(1)
         .and_then(|rest| rest.split('"').next())
         .expect("CSRF token");
 
+    let monitoring = format!(
+        "GET /console/monitoring HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, monitoring_page) = request(http, &monitoring).await;
+    assert_eq!(status, 200, "{monitoring_page}");
+    assert!(monitoring_page.contains("IRC traffic"), "{monitoring_page}");
+    assert!(monitoring_page.contains("Latency"), "{monitoring_page}");
+
+    let observability = format!(
+        "GET /api/v1/admin/observability?minutes=60 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &observability).await;
+    assert_eq!(status, 200, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("observability JSON");
+    assert!(body["current"]["active_connections"].is_u64());
+    assert!(body["current"]["core_latency"]["p95_us"].is_u64());
+    assert!(body["history"].is_array());
+    let mut old_snapshot = body["current"].clone();
+    let old_sampled_at = old_snapshot["sampled_at_ms"]
+        .as_u64()
+        .expect("sample timestamp")
+        .saturating_sub(2 * 60 * 60 * 1_000);
+    old_snapshot["sampled_at_ms"] = old_sampled_at.into();
+    let verification_pool = sqlx::PgPool::connect(&url)
+        .await
+        .expect("verification pool");
+    sqlx::query("INSERT INTO observability_samples (sampled_at_ms, snapshot) VALUES ($1, $2)")
+        .bind(i64::try_from(old_sampled_at).unwrap())
+        .bind(old_snapshot)
+        .execute(&verification_pool)
+        .await
+        .expect("seed expired monitoring sample");
+
+    let metrics = format!(
+        "GET /api/v1/admin/metrics HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, body) = request(http, &metrics).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(headers.contains("text/plain; version=0.0.4"), "{headers}");
+    assert!(body.contains("e6irc_connections{state=\"registered\"}"));
+    assert!(body.contains("e6irc_core_latency_seconds_bucket"));
+
     let form = format!(
         "csrf={csrf}&revision=1&server_name=irc.control.example&network_name=ControlNet&\
          description=e6irc+server&motd=&nicklen=16&sendq=1024&core_queue=65536&\
          max_hot_channels=8192&bnc_enabled=on&bnc_addr=127.0.0.1%3A0&\
-         listeners=127.0.0.1%3A0+%7C+plain&admin_accounts=alice"
+         listeners=127.0.0.1%3A0+%7C+plain&admin_accounts=alice&\
+         observability_enabled=on&observability_sample_interval_seconds=5&\
+         observability_retention_hours=1"
     );
     let post = format!(
         "POST /console/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -805,6 +872,64 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, page) = request(http, &post).await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("Configuration saved and applied"), "{page}");
+    let mut stored_history = false;
+    for _ in 0..14 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let (status, _, body) = request(http, &observability).await;
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value =
+            serde_json::from_str(&body).expect("observability history JSON");
+        if body["history"]
+            .as_array()
+            .is_some_and(|history| !history.is_empty())
+        {
+            stored_history = true;
+            break;
+        }
+    }
+    assert!(
+        stored_history,
+        "live sampler did not persist an observability sample"
+    );
+    let expired_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM observability_samples WHERE sampled_at_ms = $1")
+            .bind(i64::try_from(old_sampled_at).unwrap())
+            .fetch_one(&verification_pool)
+            .await
+            .expect("expired sample count");
+    assert_eq!(expired_count, 0, "sampler did not prune expired history");
+
+    let (status, _, body) = request(http, &observability).await;
+    assert_eq!(status, 200, "{body}");
+    let current: serde_json::Value = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("current monitoring JSON")["current"]
+        .clone();
+    let until = current["sampled_at_ms"]
+        .as_i64()
+        .expect("current timestamp");
+    sqlx::query(
+        "INSERT INTO observability_samples (sampled_at_ms, snapshot)
+         SELECT point, jsonb_set($1::jsonb, '{sampled_at_ms}', to_jsonb(point))
+           FROM generate_series($2::bigint, $3::bigint, 3000) AS point
+         ON CONFLICT (sampled_at_ms) DO NOTHING",
+    )
+    .bind(current)
+    .bind(until - 60 * 60 * 1_000)
+    .bind(until - 1)
+    .execute(&verification_pool)
+    .await
+    .expect("seed dense monitoring history");
+    let (status, _, body) = request(http, &observability).await;
+    assert_eq!(status, 200, "{body}");
+    let body: serde_json::Value =
+        serde_json::from_str(&body).expect("downsampled observability JSON");
+    let history = body["history"].as_array().expect("history array");
+    assert!(
+        (900..=1000).contains(&history.len()),
+        "dense history was not evenly bounded: {} samples",
+        history.len()
+    );
+    verification_pool.close().await;
     let bound = page
         .split("Accepting clients on <code>")
         .nth(1)

@@ -725,6 +725,8 @@ pub struct NetworkHandle {
     /// that subscribes just after it fires; this flag lets any observer
     /// read the current state regardless of subscribe timing.
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    telemetry:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
 }
 
 /// Bounded ring of recent upstream lines, for playback on attach.
@@ -877,7 +879,17 @@ impl NetworkHandle {
     /// core's SendQ uses — bound, then act, never silently block or drop).
     pub fn send(&self, line: &str) -> SendOutcome {
         match self.commands.try_send(line.to_string()) {
-            Ok(()) => SendOutcome::Sent,
+            Ok(()) => {
+                if let Some(telemetry) = self
+                    .telemetry
+                    .lock()
+                    .expect("telemetry hook poisoned")
+                    .as_ref()
+                {
+                    telemetry.record_bnc_output(line.len());
+                }
+                SendOutcome::Sent
+            }
             Err(mpsc::error::TrySendError::Full(_)) => SendOutcome::Full,
             Err(mpsc::error::TrySendError::Closed(_)) => SendOutcome::Closed,
         }
@@ -943,12 +955,14 @@ impl NetworkHandle {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
             shutdown: shutdown_tx,
             buffer: buffer.clone(),
             connected: connected.clone(),
+            telemetry: telemetry.clone(),
         };
         // A process-wide counter gives each driver a distinct, stable jitter
         // seed without an RNG — sequential ids, Fibonacci-hashed in `Backoff`.
@@ -960,6 +974,7 @@ impl NetworkHandle {
             shutdown: shutdown_rx,
             buffer,
             connected,
+            telemetry,
             reconnect_seed,
         };
         (handle, ends)
@@ -970,6 +985,10 @@ impl NetworkHandle {
     /// / `run_with_backoff` and tears down even while clients are attached.
     pub fn shutdown(&self) {
         self.shutdown.send_replace(true);
+    }
+
+    pub(crate) fn set_telemetry(&self, telemetry: std::sync::Arc<crate::observability::Telemetry>) {
+        *self.telemetry.lock().expect("telemetry hook poisoned") = Some(telemetry);
     }
 }
 
@@ -985,6 +1004,8 @@ pub struct DriverEnds {
     shutdown: tokio::sync::watch::Receiver<bool>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    telemetry:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
     /// Stable per-driver value seeding this driver's reconnect jitter, so
     /// concurrent drivers de-correlate (see [`Backoff`]). Assigned once at
     /// construction from a process-wide counter.
@@ -998,6 +1019,14 @@ impl DriverEnds {
     /// into an attached client's stream.
     pub fn emit_line(&self, line: String) {
         let line = crate::sanitize::upstream_line(line);
+        if let Some(telemetry) = self
+            .telemetry
+            .lock()
+            .expect("telemetry hook poisoned")
+            .as_ref()
+        {
+            telemetry.record_bnc_input(line.len());
+        }
         self.buffer
             .lock()
             .expect("buffer poisoned")
@@ -1019,8 +1048,18 @@ impl DriverEnds {
                 DriverEvent::Connected
             }
             ConnectionEvent::Disconnected => {
-                self.connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let was_connected = self
+                    .connected
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                if was_connected
+                    && let Some(telemetry) = self
+                        .telemetry
+                        .lock()
+                        .expect("telemetry hook poisoned")
+                        .as_ref()
+                {
+                    telemetry.record_error(crate::observability::ErrorKind::Bouncer);
+                }
                 DriverEvent::Disconnected
             }
         };

@@ -51,6 +51,7 @@ impl NetworkKey {
 pub struct Registry {
     networks: Mutex<HashMap<NetworkKey, Slot>>,
     pool: Option<PgPool>,
+    telemetry: Option<Arc<crate::observability::Telemetry>>,
 }
 
 /// A registered network: its driver handle plus the persistence task that
@@ -100,10 +101,29 @@ impl Registry {
         pool: Option<PgPool>,
         core: super::CoreHandles,
     ) -> Result<Self, String> {
+        Self::start_inner(entries, pool, core, None)
+    }
+
+    pub(crate) fn start_observed(
+        entries: &[NetworkEntry],
+        pool: Option<PgPool>,
+        core: super::CoreHandles,
+        telemetry: Arc<crate::observability::Telemetry>,
+    ) -> Result<Self, String> {
+        Self::start_inner(entries, pool, core, Some(telemetry))
+    }
+
+    fn start_inner(
+        entries: &[NetworkEntry],
+        pool: Option<PgPool>,
+        core: super::CoreHandles,
+        telemetry: Option<Arc<crate::observability::Telemetry>>,
+    ) -> Result<Self, String> {
         use crate::config::NetworkKind;
         let registry = Self {
             networks: Mutex::new(HashMap::new()),
             pool,
+            telemetry,
         };
         for e in entries {
             // `local` needs the in-process core handles, so it stays special; all
@@ -147,11 +167,20 @@ impl Registry {
         // Capture the kind before `start()` consumes the driver.
         let kind = driver.kind();
         let handle = Arc::new(driver.start());
+        if let Some(telemetry) = &self.telemetry {
+            handle.set_telemetry(telemetry.clone());
+        }
         // The persistence task keys `bnc_buffer` rows by the same casefolded
         // owner the registry uses, so a buffer cannot be written under one
         // spelling and looked up under another.
         let persistence = self.pool.clone().map(|pool| {
-            spawn_persistence(pool, key.owner.clone(), key.name.clone(), handle.clone())
+            spawn_persistence(
+                pool,
+                key.owner.clone(),
+                key.name.clone(),
+                handle.clone(),
+                self.telemetry.clone(),
+            )
         });
         let slot = Slot {
             handle,
@@ -235,6 +264,7 @@ fn spawn_persistence(
     owner: Option<String>,
     network: String,
     handle: Arc<NetworkHandle>,
+    telemetry: Option<Arc<crate::observability::Telemetry>>,
 ) -> tokio::task::JoinHandle<()> {
     use super::DriverEvent;
     let owner_key = owner.unwrap_or_else(|| "*".to_string());
@@ -255,6 +285,9 @@ fn spawn_persistence(
                     if let Err(e) =
                         crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
                     {
+                        if let Some(telemetry) = &telemetry {
+                            telemetry.record_error(crate::observability::ErrorKind::Bouncer);
+                        }
                         eprintln!("bnc: buffer persist failed for {owner_key}/{network}: {e}");
                         continue;
                     }
@@ -264,6 +297,9 @@ fn spawn_persistence(
                         if let Err(e) =
                             crate::db::trim_bnc_buffer(&pool, &owner_key, &network).await
                         {
+                            if let Some(telemetry) = &telemetry {
+                                telemetry.record_error(crate::observability::ErrorKind::Bouncer);
+                            }
                             eprintln!("bnc: buffer trim failed for {owner_key}/{network}: {e}");
                         }
                     }
@@ -273,6 +309,9 @@ fn spawn_persistence(
                 // the stored backlog now has a gap. Surface it rather than
                 // dropping it silently.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    if let Some(telemetry) = &telemetry {
+                        telemetry.record_error(crate::observability::ErrorKind::Bouncer);
+                    }
                     eprintln!(
                         "bnc: persistence lagged for {owner_key}/{network}; {n} upstream \
                          line(s) missing from stored backlog"

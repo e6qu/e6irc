@@ -1,0 +1,17 @@
+{% extends "console_base.html" %}
+{% block main %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">Operations</p>
+      <h1>Monitoring</h1>
+      <p class="lede">Live process health, IRC traffic, connection pressure, upstream availability, latency, and errors.</p>
+    </div>
+    <span class="live-pill"><span class="pulse"></span>Live</span>
+  </div>
+  <div id="monitoring-panel"
+       hx-get="/console/monitoring/panel"
+       hx-trigger="every 10s"
+       hx-swap="innerHTML">
+    {% include "_monitoring_panel.html" %}
+  </div>
+{% endblock %}

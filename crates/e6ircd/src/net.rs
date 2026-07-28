@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, TlsConfig};
 use crate::core::{ConnId, Core, CoreConfig, Input, Output};
+use crate::observability::{ErrorKind, Telemetry};
 use e6irc_proto::framing::{LineBuffer, LineEvent};
 use e6irc_queue::{Policy, Receiver, Sender, queue};
 
@@ -148,6 +149,7 @@ pub struct BncListenerController {
     pool: sqlx::PgPool,
     server_name: String,
     limiter: ConnLimiter,
+    telemetry: Arc<Telemetry>,
 }
 
 impl BncListenerController {
@@ -156,6 +158,7 @@ impl BncListenerController {
         pool: sqlx::PgPool,
         server_name: String,
         limiter: ConnLimiter,
+        telemetry: Arc<Telemetry>,
     ) -> Self {
         Self {
             state: tokio::sync::Mutex::new(None),
@@ -163,6 +166,7 @@ impl BncListenerController {
             pool,
             server_name,
             limiter,
+            telemetry,
         }
     }
 
@@ -178,14 +182,19 @@ impl BncListenerController {
     /// Enable or atomically replace the listener. The old listener remains
     /// active when the new address cannot be bound.
     pub async fn enable(&self, requested: SocketAddr) -> io::Result<SocketAddr> {
-        let listener = TcpListener::bind(requested).await?;
-        let bound = listener.local_addr()?;
+        let listener = TcpListener::bind(requested).await.inspect_err(|_error| {
+            self.telemetry.record_error(ErrorKind::Bouncer);
+        })?;
+        let bound = listener.local_addr().inspect_err(|_error| {
+            self.telemetry.record_error(ErrorKind::ConnectionSetup);
+        })?;
         let task = spawn_bnc_listener(
             listener,
             self.registry.clone(),
             self.pool.clone(),
             self.server_name.clone(),
             self.limiter.clone(),
+            self.telemetry.clone(),
         );
         let replacement = BncListenerState {
             requested,
@@ -215,32 +224,39 @@ fn spawn_bnc_listener(
     pool: sqlx::PgPool,
     server_name: String,
     limiter: ConnLimiter,
+    telemetry: Arc<Telemetry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let Some(guard) = limiter.try_acquire(peer.ip()) else {
+                        telemetry.record_connection_rejected();
                         eprintln!("bnc refused {peer}: per-IP connection limit reached");
                         continue;
                     };
                     let registry = registry.clone();
                     let server_name = server_name.clone();
                     let pool = pool.clone();
+                    let telemetry = telemetry.clone();
                     tokio::spawn(async move {
                         let _guard = guard;
+                        let _observed_connection = telemetry.observe_bnc_client();
                         if let Err(e) = stream.set_nodelay(true) {
+                            telemetry.record_error(ErrorKind::ConnectionSetup);
                             eprintln!("bnc socket setup failed for {peer}: {e}");
                             return;
                         }
                         if let Err(e) =
                             crate::bouncer::bnc_serve(stream, registry, &pool, &server_name).await
                         {
+                            telemetry.record_error(ErrorKind::Bouncer);
                             eprintln!("bnc connection from {peer} failed: {e}");
                         }
                     });
                 }
                 Err(e) => {
+                    telemetry.record_error(ErrorKind::Accept);
                     eprintln!("bnc accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
@@ -350,15 +366,19 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         capacity: 1024,
         policy: Policy::Fifo,
     });
+    let telemetry = Arc::new(Telemetry::new());
+    let managed_config =
+        managed_config.map(|snapshot| Arc::new(tokio::sync::RwLock::new(snapshot)));
     // SASL is only advertised when a database exists to answer verification
     // requests. Keep the worker handle so graceful shutdown can guarantee its
     // buffered `log_batch` is flushed before the process exits (DESIGN §18).
     let sasl_enabled = pool.is_some();
     let db_worker = match &pool {
-        Some(pool) => Some(tokio::spawn(crate::db::run_worker(
+        Some(pool) => Some(tokio::spawn(crate::db::run_worker_observed(
             pool.clone(),
             db_rx,
             core_tx.clone(),
+            telemetry.clone(),
         ))),
         None => {
             drop(db_rx);
@@ -377,7 +397,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // persisted networks are loaded and started.
     let bnc_registry = if pool.is_some() || !config.networks.is_empty() {
         let reg = Arc::new(
-            crate::bouncer::Registry::start(
+            crate::bouncer::Registry::start_observed(
                 &config.networks,
                 pool.clone(),
                 crate::bouncer::CoreHandles {
@@ -385,6 +405,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     next_conn: next_conn.clone(),
                     sendq: config.sendq,
                 },
+                telemetry.clone(),
             )
             .map_err(io::Error::other)?,
         );
@@ -402,10 +423,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 // hard (they are the operator's own, checked at start).
                 match crate::bouncer::driver_from_row(&row, secret_key.as_deref(), &owner) {
                     Ok(driver) => reg.add(Some(&owner), &row.name, driver),
-                    Err(e) => eprintln!(
-                        "bnc: not starting network {owner}/{} at boot: {e}",
-                        row.name
-                    ),
+                    Err(e) => {
+                        telemetry.record_error(ErrorKind::Bouncer);
+                        eprintln!(
+                            "bnc: not starting network {owner}/{} at boot: {e}",
+                            row.name
+                        );
+                    }
                 }
             }
         }
@@ -429,6 +453,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             pool.clone(),
             config.server_name.clone(),
             limiter.clone(),
+            telemetry.clone(),
         ))),
         _ => None,
     };
@@ -438,6 +463,14 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             .as_ref()
             .expect("config validation guarantees [database] when [bnc] is set");
         bnc_addr = Some(controller.enable(bnc.addr).await?);
+    }
+    if let (Some(pool), Some(settings)) = (&pool, &managed_config) {
+        tokio::spawn(crate::observability::run_sampler(
+            pool.clone(),
+            telemetry.clone(),
+            bnc_registry.clone(),
+            settings.clone(),
+        ));
     }
 
     // One shared HTTP `AppState`, built when either the HTTP server or any
@@ -484,7 +517,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             sendq: config.sendq,
             bnc_registry: bnc_registry.clone(),
             bnc_listener: bnc_listener.clone(),
-            managed_config: managed_config.clone().map(tokio::sync::RwLock::new),
+            managed_config: managed_config.clone(),
+            telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
             admin_accounts,
             csrf_key: {
@@ -526,7 +560,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         None => None,
     };
 
-    let mut core = Core::new(
+    let mut core = Core::with_telemetry(
         CoreConfig {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -549,6 +583,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             registration_burst: config.limits.registration_burst,
         },
         db_tx,
+        telemetry.clone(),
     );
     // Seed registered-channel ownership and retained topics so a founder
     // is re-opped and the topic restored on join after a restart, not only
@@ -654,6 +689,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             next_conn.clone(),
             config.sendq,
             limiter.clone(),
+            telemetry.clone(),
         ));
         listeners.push(accept_task.abort_handle());
     }
@@ -768,6 +804,7 @@ async fn accept_loop(
     next_conn: Arc<AtomicU64>,
     sendq: usize,
     limiter: ConnLimiter,
+    telemetry: Arc<Telemetry>,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -776,6 +813,7 @@ async fn accept_loop(
                 // Transient accept errors (EMFILE etc.) must not kill
                 // the listener; retrying is the correct handling.
                 eprintln!("accept error: {e}");
+                telemetry.record_error(ErrorKind::Accept);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
@@ -785,16 +823,19 @@ async fn accept_loop(
         // on drop.
         let Some(guard) = limiter.try_acquire(peer.ip()) else {
             eprintln!("refused {peer}: per-IP connection limit reached");
+            telemetry.record_connection_rejected();
             drop(stream); // closes the socket; the client sees EOF
             continue;
         };
         let conn = ConnId(next_conn.fetch_add(1, Ordering::Relaxed));
         let core_tx = core_tx.clone();
         let tls = tls.clone();
+        let telemetry = telemetry.clone();
         tokio::spawn(async move {
             let _guard = guard; // released when this task ends
             if let Err(e) = stream.set_nodelay(true) {
                 eprintln!("socket setup failed for {peer}: {e}");
+                telemetry.record_error(ErrorKind::ConnectionSetup);
                 return;
             }
             match tls {
@@ -808,13 +849,19 @@ async fn accept_loop(
                     .await;
                     match handshake {
                         Ok(Ok(tls_stream)) => {
-                            serve_conn(tls_stream, conn, peer, core_tx, sendq).await
+                            serve_conn(tls_stream, conn, peer, core_tx, sendq, telemetry).await
                         }
-                        Ok(Err(e)) => eprintln!("TLS handshake failed from {peer}: {e}"),
-                        Err(_) => eprintln!("TLS handshake from {peer} timed out"),
+                        Ok(Err(e)) => {
+                            telemetry.record_error(ErrorKind::TlsHandshake);
+                            eprintln!("TLS handshake failed from {peer}: {e}");
+                        }
+                        Err(_) => {
+                            telemetry.record_error(ErrorKind::TlsHandshake);
+                            eprintln!("TLS handshake from {peer} timed out");
+                        }
                     }
                 }
-                None => serve_conn(stream, conn, peer, core_tx, sendq).await,
+                None => serve_conn(stream, conn, peer, core_tx, sendq, telemetry).await,
             }
         });
     }
@@ -826,6 +873,7 @@ async fn serve_conn<S>(
     peer: SocketAddr,
     core_tx: Sender<Input>,
     sendq: usize,
+    telemetry: Arc<Telemetry>,
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -853,11 +901,11 @@ async fn serve_conn<S>(
     {
         return; // core gone: shutting down
     }
-    let mut writer = tokio::spawn(write_loop(write_half, out_rx));
+    let mut writer = tokio::spawn(write_loop(write_half, out_rx, telemetry.clone()));
     tokio::select! {
         // The client closed/errored, or the core queue is gone: the read side
         // is done — stop the (possibly parked) writer.
-        () = read_loop(read_half, conn, &core_tx) => writer.abort(),
+        () = read_loop(read_half, conn, &core_tx, &telemetry) => writer.abort(),
         // The writer returned. Two causes: the core dropped this session's
         // `Sender<Output>` (session already gone core-side), OR a *write error*
         // on a still-present session (broken pipe / RST while output was queued).
@@ -884,8 +932,12 @@ async fn serve_conn<S>(
     }
 }
 
-async fn read_loop<R>(mut read_half: R, conn: ConnId, core_tx: &Sender<Input>)
-where
+async fn read_loop<R>(
+    mut read_half: R,
+    conn: ConnId,
+    core_tx: &Sender<Input>,
+    telemetry: &Telemetry,
+) where
     R: AsyncRead + Unpin,
 {
     let mut framing = LineBuffer::new(LINE_LIMIT);
@@ -906,7 +958,10 @@ where
                     }
                 }
             }
-            Err(e) => break format!("Read error: {e}"),
+            Err(e) => {
+                telemetry.record_error(ErrorKind::Read);
+                break format!("Read error: {e}");
+            }
         }
     };
     // Queue closure means the core has already removed all connection state.
@@ -917,7 +972,11 @@ where
 /// caller turns into the session's `Input::Closed` — distinguishing a core-side
 /// close (sender dropped) from a write error (peer gone) so neither is conflated
 /// nor silently skipped.
-async fn write_loop<W>(mut write_half: W, mut rx: Receiver<Output>) -> &'static str
+async fn write_loop<W>(
+    mut write_half: W,
+    mut rx: Receiver<Output>,
+    telemetry: Arc<Telemetry>,
+) -> &'static str
 where
     W: AsyncWrite + Unpin,
 {
@@ -934,9 +993,11 @@ where
             batch.extend_from_slice(&e.payload.0);
         }
         if write_half.write_all(&batch).await.is_err() {
+            telemetry.record_error(ErrorKind::Write);
             return "Write error"; // broken pipe / RST: the session is still live
         }
         if write_half.flush().await.is_err() {
+            telemetry.record_error(ErrorKind::Write);
             return "Write error";
         }
     }
@@ -1022,14 +1083,24 @@ mod tests {
             .await
             .expect("test output");
 
-        assert_eq!(write_loop(FlushFails, rx).await, "Write error");
+        assert_eq!(
+            write_loop(FlushFails, rx, Arc::new(Telemetry::new())).await,
+            "Write error"
+        );
     }
 
     #[tokio::test]
     async fn core_close_cancels_a_parked_read() {
         let (core_tx, mut core_rx) = test_core_channel();
         let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let served = tokio::spawn(serve_conn(DeadPeer, ConnId(1), peer, core_tx, 8));
+        let served = tokio::spawn(serve_conn(
+            DeadPeer,
+            ConnId(1),
+            peer,
+            core_tx,
+            8,
+            Arc::new(Telemetry::new()),
+        ));
 
         // The connection registered its sendq via Open; take that sender.
         let env = core_rx.pop().await.expect("Open event");
@@ -1055,7 +1126,14 @@ mod tests {
         // `DLINE 203.0.113.7` in natural notation would silently not match.
         let (core_tx, mut core_rx) = test_core_channel();
         let peer: SocketAddr = "[::ffff:203.0.113.7]:5000".parse().unwrap();
-        let served = tokio::spawn(serve_conn(DeadPeer, ConnId(1), peer, core_tx, 8));
+        let served = tokio::spawn(serve_conn(
+            DeadPeer,
+            ConnId(1),
+            peer,
+            core_tx,
+            8,
+            Arc::new(Telemetry::new()),
+        ));
         let env = core_rx.pop().await.expect("Open event");
         let Input::Open { host, tx, .. } = env.payload else {
             panic!("expected Open");
