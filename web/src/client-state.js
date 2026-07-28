@@ -131,6 +131,13 @@ export function networksFrom(payload) {
   return payload.networks;
 }
 
+export function networkStateLabel(network) {
+  if (network.enabled === false) return "disabled";
+  if (network.connected === true) return "connected";
+  const state = network.runtime?.state;
+  return typeof state === "string" ? state.replaceAll("_", " ") : "starting";
+}
+
 export function errorMessage(action, error) {
   if (error instanceof ApiError && error.status === 401) {
     return `Your session expired while trying to ${action}. Sign in again.`;

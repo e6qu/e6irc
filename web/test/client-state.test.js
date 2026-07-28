@@ -11,6 +11,7 @@ import {
   getJson,
   loadSettings,
   networksFrom,
+  networkStateLabel,
   saveSettings,
 } from "../src/client-state.js";
 
@@ -108,6 +109,20 @@ test("network collection validation separates an empty list from a broken contra
     { name: "Libera", enabled: true },
   ]);
   assert.throws(() => networksFrom({ networks: [{ enabled: true }] }), /invalid network list/);
+});
+
+test("network labels use the API's typed runtime state", () => {
+  assert.equal(networkStateLabel({ enabled: false }), "disabled");
+  assert.equal(networkStateLabel({ enabled: true, connected: true }), "connected");
+  assert.equal(
+    networkStateLabel({
+      enabled: true,
+      connected: false,
+      runtime: { state: "reconnect_backoff" },
+    }),
+    "reconnect backoff",
+  );
+  assert.equal(networkStateLabel({ enabled: true, connected: false, runtime: {} }), "starting");
 });
 
 test("API error messages distinguish expired sessions", () => {

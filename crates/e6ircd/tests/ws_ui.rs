@@ -1,7 +1,8 @@
 //! e2e for the live web-UI socket (`/ws/ui`): a cookie/bearer-auth'd
 //! WebSocket attaches to one of the caller's BNC networks, receives
-//! upstream traffic as JSON line events, and relays composer input back to
-//! the upstream. PG-gated (auth needs the account store).
+//! upstream traffic as JSON line events, receives a typed replay-complete
+//! boundary, and relays composer input back to the upstream. PG-gated (auth
+//! needs the account store).
 
 use e6ircd::config::{BncConfig, Config, DatabaseConfig, HttpConfig, ListenerConfig, NetworkEntry};
 use e6ircd::net;
@@ -103,6 +104,31 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         .await
         .expect("ws/ui connect");
 
+    // Initial status and detached-buffer playback end at an explicit typed
+    // boundary. The browser waits for this before asking for current NAMES, so
+    // a replayed stale NAMES reply can never win an ordering race.
+    let boundary = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Text(t))) => {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&t).expect("initial ws/ui event");
+                    if event == serde_json::json!({ "t": "snapshot", "v": "complete" }) {
+                        return event;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => panic!("ws/ui closed before the replay boundary"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for replay boundary");
+    assert_eq!(
+        boundary,
+        serde_json::json!({ "t": "snapshot", "v": "complete" })
+    );
+
     // upstream -> UI: the peer posts, the UI receives a JSON line event
     // carrying the raw IRC line (the browser client parses it into a buffer).
     peer.send_line("PRIVMSG #lobby :hello web").await.unwrap();
@@ -125,6 +151,11 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
             .unwrap_or("")
             .contains("PRIVMSG #lobby :hello web"),
         "line event missing the raw line: {event}"
+    );
+    let raw = v["v"].as_str().expect("line value");
+    assert!(
+        raw.starts_with("@") && raw.contains("time=") && raw.contains("msgid="),
+        "live UI event lost the tags needed to reconcile history: {event}"
     );
 
     // UI composer -> upstream: text up the socket reaches the peer

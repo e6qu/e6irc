@@ -1,11 +1,10 @@
 // e6irc web client: a small in-browser IRC client over the /ws/ui socket.
 //
-// The socket streams JSON events ({t:"line",v:"<raw IRC line>"} and
-// {t:"status",v:"connected"}). This module parses each IRC line, routes it to
-// the right buffer (a channel, a direct message, or the server buffer), keeps a
-// per-channel member list, and renders the active buffer. All rendering uses
-// textContent / DOM APIs — never innerHTML with server text — so a hostile
-// upstream line cannot inject markup.
+// The socket streams line, status, and replay-complete JSON events. This module
+// parses each IRC line, routes it to the right buffer (a channel, a direct
+// message, or the server buffer), keeps a per-channel member list, and renders
+// the active buffer. All rendering uses textContent / DOM APIs — never
+// innerHTML with server text — so a hostile upstream line cannot inject markup.
 //
 // Query parameters:
 //   network — the BNC network to attach to (required)
@@ -16,9 +15,23 @@ import {
   errorMessage,
   getJson,
   loadSettings,
+  networkStateLabel,
   networksFrom,
   saveSettings,
 } from "./client-state.js";
+import {
+  MEMBER_RANKS,
+  asMessage,
+  fold,
+  isChannel,
+  mergeTimeline,
+  messageIdentity,
+  nickPrefix,
+  parseIrc,
+  splitSigil,
+  stripSigil,
+  tagValue,
+} from "./irc-state.js";
 
 const params = new URLSearchParams(window.location.search);
 const network = params.get("network");
@@ -29,6 +42,7 @@ const buffersEl = el("buffers");
 const messagesEl = el("messages");
 const bufnameEl = el("bufname");
 const buftopicEl = el("buftopic");
+const bufferActionEl = el("buffer-action");
 const nicklistEl = el("nicklist");
 const nicksEl = el("nicks");
 const nickcountEl = el("nickcount");
@@ -112,27 +126,16 @@ function applyTheme() {
 }
 applyTheme();
 
-// RFC1459 casefold, matching the server's CaseMapping::Rfc1459, so a nick or
-// channel is deduplicated case-insensitively (`Alice`/`alice`, `#Chan`/`#chan`).
-function fold(s) {
-  let out = "";
-  for (const ch of s) {
-    const c = ch.charCodeAt(0);
-    if (c >= 65 && c <= 90) out += String.fromCharCode(c + 32);
-    else if (ch === "[") out += "{";
-    else if (ch === "]") out += "}";
-    else if (ch === "\\") out += "|";
-    else if (ch === "~") out += "^";
-    else out += ch;
-  }
-  return out;
-}
-
 // name -> { name, kind: "server"|"channel"|"dm", lines: [], nicks: Map, topic, unread }
 const buffers = new Map();
+const namesSnapshots = new Set();
+const namesRequested = new Set();
 let active = null;
 let myNick = null;
 let socket = null;
+let upstreamConnected = false;
+let snapshotComplete = false;
+let memberTracking = true;
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -158,6 +161,35 @@ if (sidebarToggle) {
   });
 }
 
+function requestNames(buffer) {
+  if (
+    !memberTracking ||
+    buffer.kind !== "channel" ||
+    !upstreamConnected ||
+    !snapshotComplete ||
+    !socket ||
+    socket.readyState !== WebSocket.OPEN ||
+    namesRequested.has(buffer.key)
+  ) {
+    return;
+  }
+  namesRequested.add(buffer.key);
+  socket.send(JSON.stringify({ target: "", message: `/raw NAMES ${buffer.display}` }));
+}
+
+function resyncMemberships() {
+  namesRequested.clear();
+  namesSnapshots.clear();
+  for (const buffer of buffers.values()) {
+    if (buffer.kind !== "channel") continue;
+    buffer.nicks.clear();
+    buffer.membershipKnown = false;
+    buffer.membersTruncated = false;
+    requestNames(buffer);
+  }
+  renderNickList();
+}
+
 // Buffers and nicks are keyed by their casefold; the original casing is kept in
 // `.display` (buffers) / the nick map's value for rendering.
 function ensureBuffer(name, kind) {
@@ -166,27 +198,31 @@ function ensureBuffer(name, kind) {
   if (b) return b;
   // At the cap, a *new* buffer overflows into the server buffer rather than
   // growing the map without bound — the content is still shown, never dropped.
-  if (buffers.size >= MAX_BUFFERS) return buffers.get(SERVER);
-  b = { key, display: name, kind, lines: [], nicks: new Map(), topic: "", unread: 0 };
+  if (buffers.size >= MAX_BUFFERS) {
+    showAlert(
+      "buffers",
+      `The ${MAX_BUFFERS}-conversation display limit was reached. New conversation lines are being shown in the server buffer.`,
+    );
+    return buffers.get(SERVER);
+  }
+  b = {
+    key,
+    display: name,
+    kind,
+    lines: [],
+    nicks: new Map(),
+    topic: "",
+    unread: 0,
+    historyLoaded: false,
+    membershipKnown: false,
+    membersTruncated: false,
+  };
   buffers.set(key, b);
   renderBufferList();
+  requestNames(b);
   return b;
 }
 
-function isChannel(target) {
-  return target.startsWith("#") || target.startsWith("&");
-}
-
-// Channel membership sigils and their underlying modes, highest rank first.
-// `~`=owner(+q), `&`=admin(+a), `@`=op(+o), `%`=halfop(+h), `+`=voice(+v).
-const RANKS = [
-  ["q", "~"],
-  ["a", "&"],
-  ["o", "@"],
-  ["h", "%"],
-  ["v", "+"],
-];
-const SIGIL_MODE = { "~": "q", "&": "a", "@": "o", "%": "h", "+": "v" };
 // Membership modes (each consumes a nick argument in a MODE line).
 const SIGIL_MODE_CHARS = "qaohv";
 // Modes that consume a parameter whether set or unset (membership + list +
@@ -194,27 +230,6 @@ const SIGIL_MODE_CHARS = "qaohv";
 // mixed line like `+o-l nick` maps the nick to `o`, not `l`.
 const MODE_ALWAYS_ARG = new Set(["q", "a", "o", "h", "v", "b", "e", "I", "k"]);
 const MODE_SET_ARG = new Set(["l"]);
-
-// Split a NAMES/prefix nick into its leading sigils and the bare nick, and seed
-// the mode set the sigils imply.
-function splitSigil(nick) {
-  const s = nick || "";
-  let i = 0;
-  while (i < s.length && SIGIL_MODE[s[i]] !== undefined) i += 1;
-  const modes = new Set();
-  for (const c of s.slice(0, i)) modes.add(SIGIL_MODE[c]);
-  return { name: s.slice(i), modes };
-}
-
-function stripSigil(nick) {
-  return splitSigil(nick).name;
-}
-
-// The single highest-rank sigil for a set of membership modes ("" if none).
-function nickPrefix(modes) {
-  for (const [mode, sigil] of RANKS) if (modes.has(mode)) return sigil;
-  return "";
-}
 
 // ---- rendering ----------------------------------------------------------
 
@@ -314,6 +329,14 @@ function renderActive() {
   const b = buffers.get(active);
   bufnameEl.textContent = !b || b.key === SERVER ? "server" : b.display;
   buftopicEl.textContent = b ? b.topic : "";
+  if (!b || b.kind === "server") {
+    bufferActionEl.hidden = true;
+  } else {
+    bufferActionEl.hidden = false;
+    bufferActionEl.textContent = b.kind === "channel" ? "Leave" : "Close";
+    bufferActionEl.title =
+      b.kind === "channel" ? `Leave ${b.display}` : `Close conversation with ${b.display}`;
+  }
   // "Load earlier" is offered for a real conversation buffer (channel/DM) whose
   // persisted backlog hasn't been pulled yet, and only when attached (network set).
   const loadEarlierEl = el("load-earlier");
@@ -329,21 +352,32 @@ function renderActive() {
 
 function renderNickList() {
   const b = buffers.get(active);
-  if (!b || b.kind !== "channel") {
+  if (!memberTracking || !b || b.kind !== "channel") {
     nicklistEl.hidden = true;
+    clearAlert("members");
     return;
   }
   nicklistEl.hidden = false;
   // Sort by rank (owner/op/… first) then name, and show the sigil.
   const rankOf = (m) => {
     const p = nickPrefix(m);
-    const i = RANKS.findIndex(([, s]) => s === p);
-    return i === -1 ? RANKS.length : i;
+    const i = MEMBER_RANKS.findIndex(([, s]) => s === p);
+    return i === -1 ? MEMBER_RANKS.length : i;
   };
   const members = [...b.nicks.values()].sort(
     (a, c) => rankOf(a.modes) - rankOf(c.modes) || a.name.localeCompare(c.name),
   );
-  nickcountEl.textContent = String(members.length);
+  nickcountEl.textContent = b.membershipKnown
+    ? `${members.length}${b.membersTruncated ? "+" : ""}`
+    : "…";
+  if (b.membersTruncated) {
+    showAlert(
+      "members",
+      `${b.display} has more than ${MAX_NICKS} members. The list is capped at ${MAX_NICKS}; messages remain unaffected.`,
+    );
+  } else {
+    clearAlert("members");
+  }
   nicksEl.replaceChildren();
   for (const m of members) {
     const li = document.createElement("li");
@@ -375,6 +409,29 @@ function setActive(name) {
   if (!messageInput.disabled) messageInput.focus();
 }
 
+function closeBuffer(name) {
+  const key = fold(name);
+  if (key === SERVER || !buffers.delete(key)) return;
+  namesSnapshots.delete(key);
+  namesRequested.delete(key);
+  if (active === key) setActive(SERVER);
+  else renderBufferList();
+}
+
+bufferActionEl.addEventListener("click", () => {
+  const buffer = buffers.get(active);
+  if (!buffer || buffer.kind === "server") return;
+  if (buffer.kind === "dm") {
+    closeBuffer(buffer.key);
+    return;
+  }
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    addServer(`Not connected — ${buffer.display} was not left.`);
+    return;
+  }
+  socket.send(JSON.stringify({ target: "", message: `/part ${buffer.display}` }));
+});
+
 // ---- buffer mutation ----------------------------------------------------
 
 function nowHm() {
@@ -383,11 +440,33 @@ function nowHm() {
   return `${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-function addLine(bufName, kind, bufKind, from, text) {
+function lineTime(tags, useCurrentTime = true) {
+  const iso = tagValue(tags, "time");
+  const date = iso ? new Date(iso) : null;
+  if (!date || Number.isNaN(date.getTime())) {
+    return useCurrentTime
+      ? { time: nowHm(), title: new Date().toLocaleString() }
+      : { time: "", title: "" };
+  }
+  const pad = (value) => String(value).padStart(2, "0");
+  return {
+    time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    title: date.toLocaleString(),
+  };
+}
+
+function addLine(bufName, kind, bufKind, from, text, tags = null) {
   const b = ensureBuffer(bufName, bufKind);
   // A highlight: someone else's channel/DM message that names us.
   const mention = kind === "msg" && from != null && !isMe(from) && mentionsMe(text);
-  const line = { time: nowHm(), title: new Date().toLocaleString(), from, text, kind, mention };
+  const line = {
+    ...lineTime(tags),
+    from,
+    text,
+    kind,
+    mention,
+    identity: messageIdentity(tags),
+  };
   maybeNotify(b, line);
   b.lines.push(line);
   if (b.lines.length > MAX_LINES) b.lines.shift();
@@ -411,12 +490,17 @@ function addLine(bufName, kind, bufKind, from, text) {
 const addServer = (text) => addLine(SERVER, "server", "server", null, text);
 const addEvent = (chan, text) => addLine(chan, "event", "channel", null, text);
 
-function addNick(chan, nick) {
+function addNick(chan, nick, render = true) {
   const { name, modes } = splitSigil(nick);
   if (!name) return;
   const b = ensureBuffer(chan, "channel");
+  if (b.kind !== "channel") return;
   const key = fold(name);
-  if (b.nicks.size >= MAX_NICKS && !b.nicks.has(key)) return;
+  if (b.nicks.size >= MAX_NICKS && !b.nicks.has(key)) {
+    b.membersTruncated = true;
+    if (render && b.key === active) renderNickList();
+    return;
+  }
   const existing = b.nicks.get(key);
   if (existing) {
     existing.name = name;
@@ -424,7 +508,7 @@ function addNick(chan, nick) {
   } else {
     b.nicks.set(key, { name, modes });
   }
-  if (b.key === active) renderNickList();
+  if (render && b.key === active) renderNickList();
 }
 
 // Apply a membership mode change from a channel MODE line: `add` (true for `+`)
@@ -472,55 +556,12 @@ function renameNick(from, to) {
 
 function setTopic(chan, topic) {
   const b = ensureBuffer(chan, "channel");
+  if (b.kind !== "channel") return;
   b.topic = topic || "";
   if (b.key === active) buftopicEl.textContent = b.topic;
 }
 
 // ---- IRC line parsing + routing ----------------------------------------
-
-// Extract the `time` IRCv3 tag (server-time, ISO-8601) from a tag section, or
-// null. Live /ws/ui lines have their tags stripped server-side, but the buffer
-// REST endpoint returns raw lines with tags, so history can show real times.
-function tagTime(tags) {
-  if (!tags) return null;
-  for (const t of tags.split(";")) {
-    const eq = t.indexOf("=");
-    if (eq > 0 && t.slice(0, eq) === "time") return t.slice(eq + 1) || null;
-  }
-  return null;
-}
-
-function parseIrc(line) {
-  let rest = line;
-  let tags = null;
-  if (rest.startsWith("@")) {
-    const sp = rest.indexOf(" ");
-    tags = rest.slice(1, sp === -1 ? undefined : sp);
-    rest = sp === -1 ? "" : rest.slice(sp + 1);
-  }
-  let prefix = null;
-  if (rest.startsWith(":")) {
-    const sp = rest.indexOf(" ");
-    prefix = rest.slice(1, sp === -1 ? undefined : sp);
-    rest = sp === -1 ? "" : rest.slice(sp + 1);
-  }
-  let trailing = null;
-  if (rest.startsWith(":")) {
-    trailing = rest.slice(1);
-    rest = "";
-  } else {
-    const ti = rest.indexOf(" :");
-    if (ti >= 0) {
-      trailing = rest.slice(ti + 2);
-      rest = rest.slice(0, ti);
-    }
-  }
-  const parts = rest.split(" ").filter((s) => s.length);
-  const command = (parts.shift() || "").toUpperCase();
-  if (trailing !== null) parts.push(trailing);
-  const nick = prefix ? prefix.split("!")[0] : null;
-  return { tags, nick, command, params: parts };
-}
 
 // Is this our own nick? Compared under the casefold, since the upstream may
 // echo a different casing than our configured nick.
@@ -568,14 +609,6 @@ function maybeNotify(b, line) {
   }
 }
 
-// A CTCP ACTION (`\x01ACTION text\x01`) renders as "* nick text"; a plain
-// message is unchanged. Returns { kind, from, text } for addLine.
-function asMessage(kind, from, text) {
-  const action = text.match(/^ACTION (.*?)?$/s);
-  if (action) return { kind: "event", from: null, text: `* ${from} ${action[1]}` };
-  return { kind, from, text };
-}
-
 function handleLine(raw) {
   const m = parseIrc(raw);
   switch (m.command) {
@@ -590,16 +623,16 @@ function handleLine(raw) {
       const kind = m.command === "NOTICE" ? "notice" : "msg";
       const r = asMessage(kind, m.nick, text);
       if (isChannel(target)) {
-        addLine(target, r.kind, "channel", r.from, r.text);
+        addLine(target, r.kind, "channel", r.from, r.text, m.tags);
       } else if (target === "*" || target === "") {
         // A server / global notice (e.g. the bouncer's *bnc* control messages):
         // show it in the server buffer, not a phantom DM keyed on the sender.
-        addLine(SERVER, r.kind, "server", r.from, r.text);
+        addLine(SERVER, r.kind, "server", r.from, r.text, m.tags);
       } else {
         // A direct message: key the buffer by the other party — the sender,
         // unless the sender is us (a message we sent to `target`).
         const buf = isMe(m.nick) ? target : m.nick || target;
-        addLine(buf, r.kind, "dm", r.from, r.text);
+        addLine(buf, r.kind, "dm", r.from, r.text, m.tags);
       }
       break;
     }
@@ -618,16 +651,28 @@ function handleLine(raw) {
     case "PART":
       if (m.params[0]) {
         const reason = m.params[1] ? ` (${m.params[1]})` : "";
-        removeNick(m.params[0], m.nick);
-        addEvent(m.params[0], `${m.nick || "?"} left${reason}`);
+        if (isMe(m.nick)) {
+          const channel = m.params[0];
+          closeBuffer(channel);
+          addServer(`You left ${channel}${reason}.`);
+        } else {
+          removeNick(m.params[0], m.nick);
+          addEvent(m.params[0], `${m.nick || "?"} left${reason}`);
+        }
       }
       break;
     case "KICK":
       if (m.params[0] && m.params[1]) {
         const reason = m.params[2] ? ` (${m.params[2]})` : "";
         const by = m.nick ? ` by ${m.nick}` : "";
-        removeNick(m.params[0], m.params[1]);
-        addEvent(m.params[0], `${m.params[1]} was kicked${by}${reason}`);
+        if (isMe(m.params[1])) {
+          const channel = m.params[0];
+          closeBuffer(channel);
+          addServer(`You were kicked from ${channel}${by}${reason}.`);
+        } else {
+          removeNick(m.params[0], m.params[1]);
+          addEvent(m.params[0], `${m.params[1]} was kicked${by}${reason}`);
+        }
       }
       break;
     case "QUIT":
@@ -676,11 +721,31 @@ function handleLine(raw) {
     case "353": {
       // RPL_NAMREPLY: <me> <sym> <chan> :n1 n2 ...
       const chan = m.params[2];
-      for (const n of (m.params[3] || "").split(" ").filter(Boolean)) addNick(chan, n);
+      if (!chan) break;
+      const buffer = ensureBuffer(chan, "channel");
+      if (buffer.kind !== "channel") break;
+      if (!namesSnapshots.has(buffer.key)) {
+        namesSnapshots.add(buffer.key);
+        buffer.nicks.clear();
+        buffer.membershipKnown = false;
+        buffer.membersTruncated = false;
+      }
+      for (const nick of (m.params[3] || "").split(" ").filter(Boolean)) {
+        addNick(chan, nick, false);
+      }
+      if (buffer.key === active) renderNickList();
       break;
     }
-    case "366": // end of NAMES
+    case "366": { // end of NAMES: <me> <chan> :End of /NAMES list
+      const channel = m.params[1];
+      const buffer = channel ? buffers.get(fold(channel)) : null;
+      if (buffer) {
+        buffer.membershipKnown = true;
+        namesSnapshots.delete(buffer.key);
+        if (buffer.key === active) renderNickList();
+      }
       break;
+    }
     default:
       // Numerics and everything else land in the server buffer. Show the human
       // part (the trailing) when there is one, else the whole line.
@@ -759,6 +824,8 @@ async function reconcileUnavailableNetwork() {
 
 function connect() {
   terminalSocket = false;
+  upstreamConnected = false;
+  snapshotComplete = false;
   setComposerAvailable(false);
   setStatus(`attaching to ${network}…`, "connecting");
   // Drop any previous socket so overlapping connections can't both feed events.
@@ -796,6 +863,7 @@ function connect() {
   liveSocket.addEventListener("close", (event) => {
     if (socket !== liveSocket) return;
     socket = null;
+    upstreamConnected = false;
     setComposerAvailable(false);
     if (terminalSocket) {
       setStatus(`${network} unavailable`, "error");
@@ -820,11 +888,19 @@ function connect() {
     }
     if (event.t === "line" && typeof event.v === "string") handleLine(event.v);
     else if (event.t === "status" && event.v === "connected") {
+      const becameConnected = !upstreamConnected;
+      upstreamConnected = true;
       setStatus(`${network}: upstream connected`, "ok");
+      if (becameConnected && snapshotComplete) resyncMemberships();
     } else if (event.t === "status" && event.v === "disconnected") {
+      upstreamConnected = false;
       setStatus(`${network}: upstream reconnecting`, "error");
+    } else if (event.t === "snapshot" && event.v === "complete") {
+      snapshotComplete = true;
+      if (upstreamConnected) resyncMemberships();
     } else if (event.t === "status" && event.v === "unavailable") {
       terminalSocket = true;
+      upstreamConnected = false;
       setComposerAvailable(false);
       reconcileUnavailableNetwork();
     } else {
@@ -921,13 +997,6 @@ if (joinForm) {
   });
 }
 
-function networkLabel(item) {
-  if (item.enabled === false) return "disabled";
-  if (item.connected === true) return "connected";
-  const lifecycle = item.runtime?.lifecycle;
-  return typeof lifecycle === "string" ? lifecycle.replaceAll("_", " ") : "starting";
-}
-
 function populateNetworkSelector(networks, failure = null) {
   networkSelect.replaceChildren();
   const choose = document.createElement("option");
@@ -941,7 +1010,7 @@ function populateNetworkSelector(networks, failure = null) {
   for (const item of networks) {
     const option = document.createElement("option");
     option.value = item.name;
-    option.textContent = `${item.name} · ${networkLabel(item)}`;
+    option.textContent = `${item.name} · ${networkStateLabel(item)}`;
     option.selected = network !== null && fold(item.name) === fold(network);
     networkSelect.appendChild(option);
   }
@@ -989,7 +1058,7 @@ function renderNetworkPicker(networks, failure = null) {
     const name = document.createElement("span");
     name.textContent = item.name;
     const state = document.createElement("small");
-    state.textContent = networkLabel(item);
+    state.textContent = networkStateLabel(item);
     a.append(name, state);
     li.appendChild(a);
     messagesEl.appendChild(li);
@@ -1015,10 +1084,10 @@ function renderNetworkPicker(networks, failure = null) {
 
 // ---- load earlier history ----------------------------------------------
 
-// Pull the network's persisted backlog (raw lines, which carry the server-time
-// tags the live socket strips) and rebuild the active buffer's message history
-// from it — so the user sees older messages than the in-memory ring the socket
-// replayed. One-shot per buffer.
+// Pull the network's persisted backlog and prepend the active buffer's older
+// messages. Both persisted and live raw lines retain server-time and msgid
+// tags, so overlap has a stable identity and a consistent clock. One-shot per
+// buffer.
 async function loadEarlier() {
   const b = buffers.get(active);
   if (!network || !b || b.kind === "server" || b.historyLoaded) return;
@@ -1048,7 +1117,6 @@ async function loadEarlier() {
     }
     return;
   }
-  const pad = (n) => String(n).padStart(2, "0");
   const rebuilt = [];
   for (const raw of lines) {
     const m = parseIrc(raw);
@@ -1061,21 +1129,20 @@ async function loadEarlier() {
     if (!belongs) continue;
     const kind = m.command === "NOTICE" ? "notice" : "msg";
     const rendered = asMessage(kind, m.nick, m.params[1] ?? "");
-    const iso = tagTime(m.tags);
-    const d = iso ? new Date(iso) : null;
-    const ok = d && !Number.isNaN(d.getTime());
     rebuilt.push({
-      time: ok ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : "",
-      title: ok ? d.toLocaleString() : "",
+      ...lineTime(m.tags, false),
       from: rendered.from,
       text: rendered.text,
       kind: rendered.kind,
       mention: false,
+      identity: messageIdentity(m.tags),
     });
   }
-  // The persisted backlog is a superset of what the socket replayed, so replace
-  // (rather than risk duplicating) and keep only the most recent MAX_LINES.
-  b.lines = rebuilt.slice(-MAX_LINES);
+  // History is older context, never authority over the live buffer. Messages
+  // can arrive while this request is in flight, and local echoes may not exist
+  // in persisted input at all, so replacing `b.lines` loses user-visible data.
+  // Stable msgids suppress true overlap; unidentified rows are retained.
+  b.lines = mergeTimeline(rebuilt, b.lines, MAX_LINES);
   b.historyLoaded = true;
   if (b.key === active) renderActive();
 }
@@ -1230,6 +1297,10 @@ async function boot() {
     }
     // Seed our nick from the stored configuration (overridden by 001/NICK).
     if (typeof selected.nick === "string") myNick = selected.nick;
+    memberTracking =
+      typeof selected.kind !== "string" ||
+      selected.kind === "irc" ||
+      selected.kind === "local";
   }
 
   connect();
