@@ -42,12 +42,22 @@ Observability console (2026-07-28): the same UI-managed control plane now
 owns live sampling and bounded retention. `/console/monitoring` presents core
 and database health, IRC/BNC traffic, client and upstream connections,
 cumulative latency percentiles, SendQ pressure, and a fixed-category error
-ledger; its overview refreshes every ten seconds. The typed snapshot also
-drives authenticated JSON and Prometheus endpoints plus a dependency-aware
-readiness probe. PostgreSQL history is capped to 1,000 API points and pruned in
-the sampler's insert transaction, while metrics remain available when history
-sampling is disabled. The console landing page now carries live operational
-summary cards instead of only database inventory counts.
+ledger; its overview refreshes every ten seconds. Selectable 1-hour, 6-hour,
+24-hour, and 7-day views now graph IRC traffic, live IRC/BNC attachments,
+upstream availability, new errors, and P95 core/database/HTTP latency from the
+same stored snapshots. The selected range survives live panel refresh and
+flows into the JSON link. Raw IRC and web clients share one authenticated
+network-attachment guard, so the global and per-network attachment gauges
+agree and unauthenticated accepted sockets are excluded. Snapshot schema
+version 2 makes that semantic change explicit and keeps the connection chart
+from mixing old raw-socket gauges with authenticated attachments. The typed
+snapshot also drives authenticated JSON and Prometheus endpoints plus a
+dependency-aware readiness probe. PostgreSQL history is capped to 1,000 API
+points and pruned in the sampler's insert transaction; direct API ranges
+outside 1 minute–7 days fail explicitly instead of being silently clamped,
+while metrics remain available when history sampling is disabled. The console
+landing page now carries live operational summary cards instead of only
+database inventory counts.
 
 Account and console completion (2026-07-28): `/account` now redirects
 authenticated users to the canonical `/console/account` self-service page.

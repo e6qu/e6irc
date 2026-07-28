@@ -917,8 +917,44 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     );
     let (status, _, monitoring_page) = request(http, &monitoring).await;
     assert_eq!(status, 200, "{monitoring_page}");
-    assert!(monitoring_page.contains("IRC traffic"), "{monitoring_page}");
-    assert!(monitoring_page.contains("Latency"), "{monitoring_page}");
+    for needle in [
+        "IRC traffic",
+        "Upstream traffic",
+        "Connections",
+        "Upstream availability",
+        "New errors",
+        "P95 latency",
+        "data-refresh-url=\"/console/monitoring/panel?minutes=60\"",
+        "/api/v1/admin/observability?minutes=60",
+        "Authenticated raw IRC and web attachments",
+    ] {
+        assert!(
+            monitoring_page.contains(needle),
+            "monitoring console missing {needle:?}: {monitoring_page}"
+        );
+    }
+
+    let six_hour_monitoring = format!(
+        "GET /console/monitoring?minutes=360 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, six_hour_page) = request(http, &six_hour_monitoring).await;
+    assert_eq!(status, 200, "{six_hour_page}");
+    assert!(
+        six_hour_page.contains("data-refresh-url=\"/console/monitoring/panel?minutes=360\""),
+        "{six_hour_page}"
+    );
+    assert!(
+        six_hour_page.contains("/api/v1/admin/observability?minutes=360"),
+        "{six_hour_page}"
+    );
+    assert!(six_hour_page.contains("6 hours"), "{six_hour_page}");
+
+    let invalid_monitoring = format!(
+        "GET /console/monitoring?minutes=17 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &invalid_monitoring).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("Invalid monitoring window"), "{body}");
 
     let observability = format!(
         "GET /api/v1/admin/observability?minutes=60 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -929,6 +965,15 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     assert!(body["current"]["active_connections"].is_u64());
     assert!(body["current"]["core_latency"]["p95_us"].is_u64());
     assert!(body["history"].is_array());
+    let invalid_observability = format!(
+        "GET /api/v1/admin/observability?minutes=10081 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, invalid_body) = request(http, &invalid_observability).await;
+    assert_eq!(status, 400, "{invalid_body}");
+    assert!(
+        invalid_body.contains("Invalid monitoring range"),
+        "{invalid_body}"
+    );
     let mut old_snapshot = body["current"].clone();
     let old_sampled_at = old_snapshot["sampled_at_ms"]
         .as_u64()

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+
 const LATENCY_BUCKETS_US: [u64; 15] = [
     100,
     250,
@@ -423,7 +425,7 @@ impl Telemetry {
             })
             .collect();
         Snapshot {
-            schema_version: 1,
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
             sampled_at_ms: epoch_millis(),
             uptime_seconds: elapsed_ms / 1000,
             core_heartbeat_age_ms: elapsed_ms
@@ -545,7 +547,7 @@ impl Telemetry {
             ),
             (
                 "e6irc_bnc_client_connections_opened_total",
-                "BNC client attach connections opened since process start.",
+                "Authenticated raw IRC and web BNC attachments opened since process start.",
                 snapshot.bnc_client_connections_opened_total,
             ),
             (
@@ -583,7 +585,7 @@ impl Telemetry {
         one_metric(
             &mut out,
             "e6irc_bnc_client_connections",
-            "Current BNC client attach connections.",
+            "Current authenticated raw IRC and web BNC attachments.",
             "gauge",
             snapshot.bnc_client_connections,
         );
@@ -712,6 +714,7 @@ mod tests {
         telemetry.update_core_gauges(3, 2, 1);
 
         let snapshot = telemetry.snapshot(4, 3);
+        assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
         assert_eq!(snapshot.active_connections, 3);
         assert_eq!(snapshot.registered_connections, 2);
         assert_eq!(snapshot.irc_bytes_in_total, 42);
@@ -764,5 +767,14 @@ mod tests {
         assert_eq!(snapshot.bnc_lines_in_total, 1);
         assert_eq!(snapshot.bnc_lines_out_total, 1);
         assert!(snapshot.bnc_bytes_in_total > snapshot.bnc_bytes_out_total);
+
+        let attachment = handle.track_attachment();
+        let snapshot = telemetry.snapshot(1, 1);
+        assert_eq!(snapshot.bnc_client_connections, 1);
+        assert_eq!(snapshot.bnc_client_connections_opened_total, 1);
+        drop(attachment);
+        let snapshot = telemetry.snapshot(1, 1);
+        assert_eq!(snapshot.bnc_client_connections, 0);
+        assert_eq!(snapshot.bnc_client_connections_opened_total, 1);
     }
 }

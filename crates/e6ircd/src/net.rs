@@ -241,7 +241,6 @@ fn spawn_bnc_listener(
                     let telemetry = telemetry.clone();
                     tokio::spawn(async move {
                         let _guard = guard;
-                        let _observed_connection = telemetry.observe_bnc_client();
                         if let Err(e) = stream.set_nodelay(true) {
                             telemetry.record_error(ErrorKind::ConnectionSetup);
                             eprintln!("bnc socket setup failed for {peer}: {e}");
