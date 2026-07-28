@@ -122,6 +122,28 @@ line-delivery, and shutdown phase boundaries instead of depending on kernel
 socket buffering; loaded CI runners can no longer turn that protocol test into
 a five-second ordering race.
 
+Registered-channel control plane (2026-07-28): the documented owner channel
+surface is now complete instead of existing only as administrator inventory and
+IRC ChanServ commands. `POST /api/v1/me/channels` registers a live channel only
+when an identified session for the actor currently operates it; the owner-scoped
+inventory, detail, mutation, access, and delete routes expose retained topic,
+KEEPTOPIC, canonical MLOCK, auto-op/auto-voice grants, founder transfer, and
+unregister lifecycle. `/console/channels` provides the same complete workflow
+without sending users back to ChanServ, with responsive labeled forms, visible
+validation/storage failures, destructive confirmations, empty-state guidance,
+and session-bound CSRF.
+The HTTP path submits typed mutations to the single live core; the serial
+database worker locks and re-checks founder ownership, commits the mutation and
+its audit record together, and only then returns the typed verdict that updates
+hot channel state. A non-founder therefore reaches neither storage nor another
+account's inventory, and a failed write cannot appear live until restart. The
+same pass fixed MLOCK's false canonicalization: input order no
+longer leaks into storage/API output, so `+tn-i` and `+nt-i` are one policy and
+one spelling. Migration 0038 normalizes historical locks and constrains future
+writes; a corrupt or non-canonical preload now aborts startup rather than
+logging and silently dropping the promised policy. Database, core, owner API,
+and server-rendered console regression tests cover the complete lifecycle.
+
 Network removal, disable, and replacement now send a typed terminal
 `unavailable` WebSocket status. The browser reconciles that name against the
 REST inventory, attaches a live replacement automatically, and stops retries

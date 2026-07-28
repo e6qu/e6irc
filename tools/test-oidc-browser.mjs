@@ -115,6 +115,19 @@ try {
   assert.match(await page.locator("#messages").innerText(), /No networks are configured/);
   assert.equal(await page.getByText("Preferences", { exact: true }).count(), 1);
   assert.equal(await page.getByRole("link", { name: "Manage", exact: true }).getAttribute("href"), "/console/networks");
+  // The same authenticated browser owns the server-rendered registered-channel
+  // control plane. A new account has an explicit empty state and the complete
+  // founder workflow remains discoverable in console navigation.
+  await page.goto(`${applicationOrigin}/console/channels`);
+  await page.getByRole("heading", { name: "Registered channels", exact: true }).waitFor();
+  assert.match(await page.locator("main").innerText(), /No channels registered to this account/);
+  await page.getByRole("button", { name: "Register channel", exact: true }).waitFor();
+  assert.equal(
+    await page.getByRole("link", { name: "Registered channels", exact: true }).getAttribute("class"),
+    "active",
+  );
+  await page.goto(`${applicationOrigin}/`);
+  await page.locator("#network-select").waitFor();
   await page.route(`${applicationOrigin}/api/v1/me/networks`, async (route) => {
     await route.fulfill({
       status: 503,

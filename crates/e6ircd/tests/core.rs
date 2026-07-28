@@ -6731,6 +6731,19 @@ fn chanserv_set_mlock_enforces_modes() {
 }
 
 #[test]
+fn corrupt_or_noncanonical_persisted_mlock_aborts_preload() {
+    for spec in ["+k", "+tn", ""] {
+        let mut s = TestServer::new();
+        assert!(
+            s.core
+                .preload_mlock(vec![("#reg".into(), spec.into())])
+                .is_err(),
+            "persisted MLOCK {spec:?} was silently accepted"
+        );
+    }
+}
+
+#[test]
 fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
     let mut s = TestServer::new();
     s.core
@@ -6742,7 +6755,8 @@ fn chanserv_metadata_store_failures_are_loud_labeled_and_non_mutating() {
         1,
     )]);
     s.core
-        .preload_mlock(vec![("#reg".to_string(), "+m".to_string())]);
+        .preload_mlock(vec![("#reg".to_string(), "+m".to_string())])
+        .expect("valid MLOCK");
     let boss = register_with_caps(&mut s, 1, "boss", "labeled-response");
     identify(&mut s, boss, "boss");
     s.line(boss, "JOIN #reg");
@@ -7472,7 +7486,8 @@ fn chanserv_drop_clears_the_mode_lock() {
     s.core
         .preload_founders(vec![("#reg2".to_string(), "boss".to_string())]);
     s.core
-        .preload_mlock(vec![("#reg2".to_string(), "+s".to_string())]);
+        .preload_mlock(vec![("#reg2".to_string(), "+s".to_string())])
+        .expect("valid MLOCK");
     let boss = s.register(1, "boss");
     identify(&mut s, boss, "boss");
     s.db_requests();
@@ -7603,6 +7618,183 @@ fn admin_channel_drop_waits_for_the_database_verdict() {
     assert!(
         s.db_requests().is_empty(),
         "admin DROP audit must be part of the delete transaction, not a second write"
+    );
+}
+
+#[test]
+fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::MutateOwnedChannel {
+            channel: "#ROOM".into(),
+            actor: "BoSs".into(),
+            mutation: e6ircd::core::ChannelMutation::SetAccess {
+                account: "alice".into(),
+                flags: Some("vo".into()),
+            },
+        },
+        reply: reply_tx,
+    });
+    assert!(matches!(
+        reply_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let request = s.db_requests();
+    let (request_id, mutation) = match request.as_slice() {
+        [
+            e6ircd::core::DbRequest::MutateOwnedChannel {
+                request_id,
+                channel,
+                actor,
+                mutation,
+            },
+        ] => {
+            assert_eq!(channel, "#room");
+            assert_eq!(actor, "BoSs");
+            (*request_id, mutation.clone())
+        }
+        other => panic!("channel control did not queue its typed write: {other:#?}"),
+    };
+    assert_eq!(
+        mutation,
+        e6ircd::core::PersistedChannelMutation::SetAccess {
+            account: "alice".into(),
+            flags: Some("ov".into()),
+        },
+        "access flags were not canonicalized at the core boundary"
+    );
+    s.core.handle(Input::ChannelControlResult {
+        request_id,
+        channel: "#room".into(),
+        mutation,
+        result: e6ircd::core::ChannelControlResult::Applied,
+    });
+    assert!(matches!(
+        reply_rx.try_recv(),
+        Ok(e6ircd::core::AdminReply::Ok(_))
+    ));
+
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #room");
+    s.drain(boss);
+    s.db_requests();
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "alice");
+    s.db_requests();
+    s.line(alice, "JOIN #room");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|line| line.contains(" 353 ") && line.contains("@alice")),
+        "committed web grant did not reach the hot map: {out:#?}"
+    );
+
+    let (deny_tx, mut deny_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::MutateOwnedChannel {
+            channel: "#room".into(),
+            actor: "mallory".into(),
+            mutation: e6ircd::core::ChannelMutation::Drop,
+        },
+        reply: deny_tx,
+    });
+    assert!(matches!(
+        deny_rx.try_recv(),
+        Ok(e6ircd::core::AdminReply::ChannelErr {
+            kind: e6ircd::core::ChannelControlError::NotFound,
+            ..
+        })
+    ));
+    assert!(
+        s.db_requests().is_empty(),
+        "a non-founder request reached persistence"
+    );
+}
+
+#[test]
+fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
+    let mut s = TestServer::new();
+    let boss = s.register(1, "boss");
+    identify(&mut s, boss, "boss");
+    s.line(boss, "JOIN #web");
+    s.line(boss, "TOPIC #web :from the console");
+    s.drain(boss);
+    s.db_requests();
+
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::RegisterOwnedChannel {
+            channel: "#WEB".into(),
+            actor: "BoSs".into(),
+        },
+        reply: reply_tx,
+    });
+    assert!(matches!(
+        reply_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let requests = s.db_requests();
+    let (request_id, topic) = match requests.as_slice() {
+        [
+            e6ircd::core::DbRequest::RegisterOwnedChannel {
+                request_id,
+                channel,
+                founder_account,
+                topic,
+            },
+        ] => {
+            assert_eq!(channel, "#web");
+            assert_eq!(founder_account, "BoSs");
+            (*request_id, topic.clone())
+        }
+        other => panic!("owner registration did not queue its typed write: {other:#?}"),
+    };
+    assert_eq!(
+        topic.as_ref().map(|topic| topic.0.as_str()),
+        Some("from the console")
+    );
+    s.core.handle(Input::OwnedChannelRegistrationResult {
+        request_id,
+        channel: "#web".into(),
+        founder_account: "BoSs".into(),
+        topic,
+        result: e6ircd::core::ChannelRegistrationResult::Registered,
+    });
+    assert!(matches!(
+        reply_rx.try_recv(),
+        Ok(e6ircd::core::AdminReply::Ok(_))
+    ));
+
+    let alice = s.register(2, "alice");
+    identify(&mut s, alice, "alice");
+    s.db_requests();
+    s.line(alice, "JOIN #blocked");
+    s.line(boss, "JOIN #blocked");
+    s.drain(alice);
+    s.drain(boss);
+    let (denied_tx, mut denied_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::RegisterOwnedChannel {
+            channel: "#blocked".into(),
+            actor: "boss".into(),
+        },
+        reply: denied_tx,
+    });
+    assert!(matches!(
+        denied_rx.try_recv(),
+        Ok(e6ircd::core::AdminReply::ChannelErr {
+            kind: e6ircd::core::ChannelControlError::Conflict,
+            ..
+        })
+    ));
+    assert!(
+        s.db_requests().is_empty(),
+        "a non-operator registration reached persistence"
     );
 }
 

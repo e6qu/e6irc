@@ -9,6 +9,16 @@ pub(super) async fn openapi() -> Response {
     let ok_json = serde_json::json!({
         "200": { "description": "OK", "content": { "application/json": {} } }
     });
+    let channel_name_parameter = serde_json::json!([
+        { "name": "name", "in": "path", "required": true,
+            "schema": { "type": "string" } }
+    ]);
+    let channel_access_parameters = serde_json::json!([
+        { "name": "name", "in": "path", "required": true,
+            "schema": { "type": "string" } },
+        { "name": "account", "in": "path", "required": true,
+            "schema": { "type": "string" } }
+    ]);
     let spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -182,6 +192,151 @@ pub(super) async fn openapi() -> Response {
             "/api/v1/me/read-markers": {
                 "get": { "summary": "List your read markers (draft/read-marker) per target",
                     "security": bearer, "responses": ok_json }
+            },
+            "/api/v1/me/channels": {
+                "get": {
+                    "summary": "List registered channels you founded with durable configuration",
+                    "security": bearer,
+                    "responses": {
+                        "200": { "description": "channels, retained topics, KEEPTOPIC, MLOCK, and access grants" },
+                        "503": { "description": "database unavailable" }
+                    }
+                },
+                "post": {
+                    "summary": "Register a live channel currently operated by your account",
+                    "description": "An identified live session for the authenticated account must be a channel operator. The current topic, founder row, and audit record are stored before the live ownership map changes.",
+                    "security": bearer,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["name"],
+                            "properties": {
+                                "name": { "type": "string", "pattern": "^[#&+!]" }
+                            }
+                        }
+                    } } },
+                    "responses": {
+                        "201": { "description": "registered and applied" },
+                        "400": { "description": "invalid channel name" },
+                        "409": { "description": "not joined as an operator, already registered, registration pending, or account cap reached" },
+                        "503": { "description": "core or database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/channels/{name}": {
+                "get": {
+                    "summary": "Read one registered channel you founded",
+                    "security": bearer,
+                    "parameters": channel_name_parameter,
+                    "responses": {
+                        "200": { "description": "durable channel configuration" },
+                        "404": { "description": "no such channel owned by this account" }
+                    }
+                },
+                "patch": {
+                    "summary": "Change a retained topic, KEEPTOPIC, MLOCK, or founder",
+                    "description": "The body is a tagged operation: set_topic, set_keeptopic, set_mlock, or transfer_founder. Exactly one storage-confirmed mutation is applied.",
+                    "security": bearer,
+                    "parameters": channel_name_parameter,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["action"],
+                                    "properties": {
+                                        "action": { "const": "set_topic" },
+                                        "topic": {
+                                            "type": ["string", "null"],
+                                            "description": "Retained topic, at most 390 UTF-8 bytes"
+                                        }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["action", "enabled"],
+                                    "properties": {
+                                        "action": { "const": "set_keeptopic" },
+                                        "enabled": { "type": "boolean" }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["action"],
+                                    "properties": {
+                                        "action": { "const": "set_mlock" },
+                                        "mlock": { "type": ["string", "null"] }
+                                    }
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["action", "account"],
+                                    "properties": {
+                                        "action": { "const": "transfer_founder" },
+                                        "account": {
+                                            "type": "string",
+                                            "minLength": 1,
+                                            "description": "Registered account name, at most 64 UTF-8 bytes"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    } } },
+                    "responses": {
+                        "200": { "description": "stored and applied" },
+                        "400": { "description": "invalid operation or value" },
+                        "404": { "description": "no such owned channel or target account" },
+                        "409": { "description": "retained topic requested while KEEPTOPIC is off" },
+                        "503": { "description": "core or database unavailable" }
+                    }
+                },
+                "delete": {
+                    "summary": "Unregister a channel you founded and remove all durable settings",
+                    "security": bearer,
+                    "parameters": channel_name_parameter,
+                    "responses": {
+                        "200": { "description": "unregistered" },
+                        "404": { "description": "no such owned channel" },
+                        "503": { "description": "core or database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/channels/{name}/access/{account}": {
+                "put": {
+                    "summary": "Set auto-op/auto-voice access for a registered account",
+                    "security": bearer,
+                    "parameters": channel_access_parameters,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "additionalProperties": false, "required": ["flags"],
+                            "properties": {
+                                "flags": {
+                                    "type": "string",
+                                    "pattern": "^(o|v|ov|vo)$"
+                                }
+                            } }
+                    } } },
+                    "responses": {
+                        "200": { "description": "stored and applied" },
+                        "400": { "description": "invalid flags" },
+                        "404": { "description": "no such owned channel or registered account" },
+                        "409": { "description": "access list is full" }
+                    }
+                },
+                "delete": {
+                    "summary": "Remove one channel access grant",
+                    "security": bearer,
+                    "parameters": channel_access_parameters,
+                    "responses": {
+                        "200": { "description": "removed" },
+                        "404": { "description": "no such owned channel" }
+                    }
+                }
             },
             "/api/v1/me/credentials": {
                 "get": { "summary": "List the account's credentials", "security": bearer,

@@ -879,21 +879,7 @@ pub(super) fn channel_keeptopic_set(
     if applied && state.is_registered(&key) {
         if keeptopic {
             state.keeptopic_off.remove(&key);
-            match topic {
-                Some((text, set_by, set_at_secs)) => {
-                    state.registered_topics.insert(
-                        key.clone(),
-                        Topic {
-                            text,
-                            set_by,
-                            set_at_secs,
-                        },
-                    );
-                }
-                None => {
-                    state.registered_topics.remove(&key);
-                }
-            }
+            replace_registered_topic(state, &key, topic);
         } else {
             state.keeptopic_off.insert(key.clone());
             state.registered_topics.remove(&key);

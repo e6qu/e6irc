@@ -98,12 +98,32 @@ pub enum Input {
         requester: ServerBanRequester,
         result: ServerBanResult,
     },
+    /// A founder-owned registered-channel mutation verdict. The database
+    /// re-checks ownership before writing; only an applied verdict changes the
+    /// core's hot founder/topic/mode/access mirrors.
+    ChannelControlResult {
+        request_id: u64,
+        channel: String,
+        mutation: PersistedChannelMutation,
+        result: ChannelControlResult,
+    },
+    /// A founder registration requested through the owner REST/console
+    /// control plane. Authorization happens against live operator membership;
+    /// the typed verdict applies the same hot founder/topic transition as
+    /// ChanServ only after PostgreSQL confirms the insert.
+    OwnedChannelRegistrationResult {
+        request_id: u64,
+        channel: String,
+        founder_account: String,
+        topic: Option<(String, String, u64)>,
+        result: ChannelRegistrationResult,
+    },
 }
 
-/// A privileged action requested by the HTTP admin console (DESIGN §9.4).
-/// Processed on the core thread via [`Input::Admin`], reusing the same live
-/// state, hot lists and persistence path as the equivalent IRC oper/services
-/// command — so a console ban enforces (and disconnects) identically.
+/// A mutation or live-state query requested by an authenticated HTTP console
+/// or API surface (DESIGN §9.4). Processed on the core thread via
+/// [`Input::Admin`], reusing the same live state, hot lists and persistence
+/// path as the equivalent IRC oper/services command.
 #[derive(Debug)]
 pub enum AdminRequest {
     /// Add a K/D/X-line (`kind` is "kline"/"dline"/"xline"). Persisted,
@@ -141,6 +161,84 @@ pub enum AdminRequest {
         reason: String,
         account: String,
     },
+    /// Mutate one registered channel owned by `actor`. This is the shared
+    /// control-plane entry used by the owner API and console.
+    MutateOwnedChannel {
+        channel: String,
+        actor: String,
+        mutation: ChannelMutation,
+    },
+    /// Register a live channel currently operated by an authenticated session
+    /// belonging to `actor`.
+    RegisterOwnedChannel { channel: String, actor: String },
+}
+
+/// User-facing registered-channel mutations accepted by the HTTP control
+/// plane. The core validates and converts these into
+/// [`PersistedChannelMutation`] before they cross the database queue.
+#[derive(Debug)]
+pub enum ChannelMutation {
+    SetTopic {
+        topic: Option<String>,
+    },
+    SetKeeptopic {
+        enabled: bool,
+    },
+    SetMlock {
+        mlock: Option<String>,
+    },
+    SetAccess {
+        account: String,
+        flags: Option<String>,
+    },
+    TransferFounder {
+        account: String,
+    },
+    Drop,
+}
+
+/// A validated registered-channel mutation ready for persistence and hot-state
+/// application. Topic provenance and canonical MLOCK/access values are fixed
+/// here, so the database and live core cannot interpret the same request
+/// differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistedChannelMutation {
+    SetTopic {
+        topic: Option<(String, String, u64)>,
+    },
+    SetKeeptopic {
+        enabled: bool,
+        topic: Option<(String, String, u64)>,
+    },
+    SetMlock {
+        mlock: Option<String>,
+    },
+    SetAccess {
+        account: String,
+        flags: Option<String>,
+    },
+    TransferFounder {
+        account: String,
+    },
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelControlResult {
+    Applied,
+    MissingOrNotOwner,
+    AccountMissing,
+    AccessLimitReached,
+    KeeptopicDisabled,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelRegistrationResult {
+    Registered,
+    Exists,
+    AccountMissing,
+    Unavailable,
 }
 
 /// A snapshot of one live client session, for the admin console's sessions view.
@@ -161,8 +259,22 @@ pub enum AdminReply {
     Ok(String),
     /// Rejected: bad input, nothing matched, or persistence unavailable.
     Err(String),
+    /// A founder channel-control rejection with a stable machine category for
+    /// the REST problem response.
+    ChannelErr {
+        kind: ChannelControlError,
+        message: String,
+    },
     /// A live-sessions snapshot (answer to [`AdminRequest::ListSessions`]).
     Sessions(Vec<SessionInfo>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelControlError {
+    Invalid,
+    NotFound,
+    Conflict,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +373,14 @@ pub enum DbRequest {
         topic: Option<(String, String, u64)>,
         /// Escaped labeled-response label carried onto the deferred verdict.
         label: Option<String>,
+    },
+    /// Register a channel through the owner HTTP control plane. The core has
+    /// already verified that an `actor` session operates the live channel.
+    RegisterOwnedChannel {
+        request_id: u64,
+        channel: String,
+        founder_account: String,
+        topic: Option<(String, String, u64)>,
     },
     /// Unregister a channel (ChanServ DROP).
     DropChannel {
@@ -371,6 +491,15 @@ pub enum DbRequest {
         channel: String,
         account: String,
         flags: Option<String>,
+    },
+    /// Persist a founder-owned HTTP control-plane mutation. The numeric request
+    /// id maps the verdict back to a core-owned oneshot sender without putting
+    /// the non-clonable sender on this queue.
+    MutateOwnedChannel {
+        request_id: u64,
+        channel: String,
+        actor: String,
+        mutation: PersistedChannelMutation,
     },
     /// Persist a server-ban mutation and its audit row atomically, then return
     /// a typed verdict before the core mutates or enforces its hot list.
@@ -828,8 +957,8 @@ impl Core {
     }
 
     /// Seed the mode-lock map from persisted `(name_folded, spec)` rows.
-    pub fn preload_mlock(&mut self, rows: Vec<(String, String)>) {
-        self.state.preload_mlock(rows);
+    pub fn preload_mlock(&mut self, rows: Vec<(String, String)>) -> Result<(), String> {
+        self.state.preload_mlock(rows)
     }
 
     /// Seed the channel-access map from persisted rows before the worker
@@ -920,6 +1049,36 @@ impl Core {
                 result,
             } => {
                 handler::oper::server_ban_result(&mut self.state, mutation, requester, result);
+            }
+            Input::ChannelControlResult {
+                request_id,
+                channel,
+                mutation,
+                result,
+            } => {
+                handler::admin::channel_control_result(
+                    &mut self.state,
+                    request_id,
+                    channel,
+                    mutation,
+                    result,
+                );
+            }
+            Input::OwnedChannelRegistrationResult {
+                request_id,
+                channel,
+                founder_account,
+                topic,
+                result,
+            } => {
+                handler::admin::owned_channel_registration_result(
+                    &mut self.state,
+                    request_id,
+                    channel,
+                    founder_account,
+                    topic,
+                    result,
+                );
             }
         }
         // Sweep connections whose SendQ overflowed while handling the

@@ -33,6 +33,28 @@ use registration::*;
 pub(crate) use sasl::*;
 use services::*;
 
+fn replace_registered_topic(
+    state: &mut ServerState,
+    key: &ChanKey,
+    topic: Option<(String, String, u64)>,
+) {
+    match topic {
+        Some((text, set_by, set_at_secs)) => {
+            state.registered_topics.insert(
+                key.clone(),
+                Topic {
+                    text,
+                    set_by,
+                    set_at_secs,
+                },
+            );
+        }
+        None => {
+            state.registered_topics.remove(key);
+        }
+    }
+}
+
 pub(crate) fn overlong(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
 }

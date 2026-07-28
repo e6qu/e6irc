@@ -501,6 +501,21 @@ async fn openapi_spec_is_served() {
         v["paths"]["/api/v1/me/networks/{name}"]["get"].is_object(),
         "{body}"
     );
+    assert!(v["paths"]["/api/v1/me/channels"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/me/channels/{name}"]["patch"].is_object());
+    assert!(v["paths"]["/api/v1/me/channels/{name}/access/{account}"]["put"].is_object());
+    assert_eq!(
+        v["paths"]["/api/v1/me/channels/{name}"]["patch"]["requestBody"]["content"]
+            ["application/json"]["schema"]["oneOf"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    assert_eq!(
+        v["paths"]["/api/v1/me/channels/{name}/access/{account}"]["put"]["requestBody"]["content"]
+            ["application/json"]["schema"]["additionalProperties"],
+        false
+    );
     assert!(v["paths"]["/healthz"]["get"].is_object());
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
@@ -748,11 +763,8 @@ async fn console_add_and_delete_network_via_the_console() {
         database: Some(DatabaseConfig { url }),
         ..Config::default()
     };
-    let http = net::start(config)
-        .await
-        .expect("start")
-        .http_addr
-        .expect("http");
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
 
     // Load the page and extract the session-bound CSRF token.
     let page_req = format!(
@@ -1152,11 +1164,8 @@ async fn console_edit_network_updates_fields() {
         }),
         ..Config::default()
     };
-    let http = net::start(config)
-        .await
-        .expect("start")
-        .http_addr
-        .expect("http");
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
 
     // Extract the session CSRF from the networks page.
     let page_req = format!(
@@ -1261,6 +1270,404 @@ async fn console_edit_network_updates_fields() {
     assert!(
         !page3.contains("irc.x.example"),
         "bridge addr was clobbered: {page3}"
+    );
+}
+
+// ---- registered-channel owner control plane (PG-gated) ------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn owned_channel_api_covers_configuration_access_transfer_and_drop() {
+    let url =
+        support::test_db("owned_channel_api_covers_configuration_access_transfer_and_drop").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    for account in ["boss", "alice", "mallory"] {
+        e6ircd::db::create_account(&pool, account, "pw")
+            .await
+            .expect("account");
+    }
+    let boss_token = e6ircd::db::issue_api_token(&pool, "boss", "test")
+        .await
+        .expect("boss token");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "alice", "test")
+        .await
+        .expect("alice token");
+    let mallory_token = e6ircd::db::issue_api_token(&pool, "mallory", "test")
+        .await
+        .expect("mallory token");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#Control', '#control', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.channels.example".into(),
+        network_name: "ChannelNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
+
+    let api = |method: &str, path: &str, token: &str, body: Option<&str>| {
+        let body = body.unwrap_or("");
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+
+    let (status, _, body) =
+        request(http, &api("GET", "/api/v1/me/channels", &boss_token, None)).await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("inventory");
+    assert_eq!(json["channels"][0]["name"], "#Control");
+    assert_eq!(json["channels"][0]["access"], serde_json::json!([]));
+
+    let (status, _, body) = request(
+        http,
+        &api(
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            &mallory_token,
+            Some(r#"{"action":"set_mlock","mlock":"+nt"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 404, "non-founder mutation leaked scope: {body}");
+
+    let mut live_owner = e6irc_client::Connection::connect(&running.addrs[0].to_string())
+        .await
+        .expect("owner client");
+    live_owner
+        .register_sasl("boss-live", "Boss", "boss", "pw")
+        .await
+        .expect("owner SASL");
+    live_owner.send_line("JOIN #Api").await.expect("join");
+    loop {
+        let message = live_owner
+            .next_message()
+            .await
+            .expect("join reply")
+            .expect("join EOF");
+        if message.command == "366" {
+            break;
+        }
+    }
+    let (status, _, body) = request(
+        http,
+        &api(
+            "POST",
+            "/api/v1/me/channels",
+            &boss_token,
+            Some(r##"{"name":"#Api"}"##),
+        ),
+    )
+    .await;
+    assert_eq!(status, 201, "owner API registration failed: {body}");
+
+    for body in [r#"{"flags":""}"#, r#"{"flags":"oo"}"#] {
+        let (status, _, response) = request(
+            http,
+            &api(
+                "PUT",
+                "/api/v1/me/channels/%23Control/access/alice",
+                &boss_token,
+                Some(body),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "invalid PUT {body} became an access mutation: {response}"
+        );
+    }
+
+    for (method, path, body) in [
+        (
+            "PUT",
+            "/api/v1/me/channels/%23Control/access/alice",
+            r#"{"flags":"vo"}"#,
+        ),
+        (
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            r#"{"action":"set_topic","topic":"Welcome"}"#,
+        ),
+        (
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            r#"{"action":"set_mlock","mlock":"+tn-i"}"#,
+        ),
+    ] {
+        let (status, _, response) =
+            request(http, &api(method, path, &boss_token, Some(body))).await;
+        assert_eq!(status, 200, "{method} {path}: {response}");
+    }
+    let (status, _, body) = request(
+        http,
+        &api(
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            &boss_token,
+            Some(r#"{"action":"set_keeptopic","enabled":false}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, headers, body) = request(
+        http,
+        &api(
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            &boss_token,
+            Some(r#"{"action":"set_topic","topic":"must fail"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: application/problem+json"),
+        "{headers}"
+    );
+
+    let (status, _, body) = request(
+        http,
+        &api("GET", "/api/v1/me/channels/%23CONTROL", &boss_token, None),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("channel");
+    assert_eq!(json["keeptopic"], false);
+    assert_eq!(json["topic"], serde_json::Value::Null);
+    assert_eq!(json["mlock"], "+nt-i");
+    assert_eq!(json["access"][0]["account"], "alice");
+    assert_eq!(json["access"][0]["flags"], "ov");
+
+    let (status, _, body) = request(
+        http,
+        &api(
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            &boss_token,
+            Some(r#"{"action":"transfer_founder","account":"alice"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (_, _, body) = request(http, &api("GET", "/api/v1/me/channels", &boss_token, None)).await;
+    let inventory = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert_eq!(inventory["channels"].as_array().map(Vec::len), Some(1));
+    assert_eq!(inventory["channels"][0]["name"], "#Api");
+    let (_, _, body) = request(http, &api("GET", "/api/v1/me/channels", &alice_token, None)).await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["channels"][0]["founder"],
+        "alice"
+    );
+    let (status, _, body) = request(
+        http,
+        &api(
+            "DELETE",
+            "/api/v1/me/channels/%23Control",
+            &alice_token,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api("DELETE", "/api/v1/me/channels/%23Api", &boss_token, None),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
+    let url = support::test_db("owned_channel_console_is_complete_scoped_and_csrf_protected").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    for account in ["boss", "alice", "mallory"] {
+        e6ircd::db::create_account(&pool, account, "pw")
+            .await
+            .expect("account");
+    }
+    let boss_session = e6ircd::db::create_web_session(&pool, "boss")
+        .await
+        .expect("boss session");
+    let mallory_session = e6ircd::db::create_web_session(&pool, "mallory")
+        .await
+        .expect("mallory session");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#Control', '#control', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.channel-console.example".into(),
+        network_name: "ChannelConsoleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
+    let page_request = |session: &str| {
+        format!(
+            "GET /console/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    let (status, _, page) = request(http, &page_request(&boss_session)).await;
+    assert_eq!(status, 200, "{page}");
+    for needle in [
+        "Registered channels",
+        "#Control",
+        "Retained topic",
+        "Mode lock",
+        "Channel access",
+        "Transfer ownership",
+        "Unregister channel",
+    ] {
+        assert!(page.contains(needle), "page missing {needle:?}: {page}");
+    }
+    let csrf = csrf_from_html(&page).to_string();
+    let (_, _, mallory_page) = request(http, &page_request(&mallory_session)).await;
+    assert!(
+        mallory_page.contains("No channels registered to this account"),
+        "another account's channel leaked: {mallory_page}"
+    );
+
+    let post_form = |path: &str, body: String| {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let mut live_owner = e6irc_client::Connection::connect(&running.addrs[0].to_string())
+        .await
+        .expect("owner client");
+    live_owner
+        .register_sasl("boss-console", "Boss", "boss", "pw")
+        .await
+        .expect("owner SASL");
+    live_owner.send_line("JOIN #Web").await.expect("join");
+    loop {
+        let message = live_owner
+            .next_message()
+            .await
+            .expect("join reply")
+            .expect("join EOF");
+        if message.command == "366" {
+            break;
+        }
+    }
+    let register = format!("csrf={csrf}&channel=%23Web");
+    let (status, headers, body) =
+        request(http, &post_form("/console/channels/register", register)).await;
+    assert_eq!(status, 303, "{headers}\n{body}");
+
+    let empty_access = format!("csrf={csrf}&channel=%23Control&account=alice");
+    let (status, _, body) =
+        request(http, &post_form("/console/channels/access", empty_access)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("access flags must be one of o, v, ov, or vo")
+            && body.contains("role=\"alert\""),
+        "empty access grant was not visibly rejected: {body}"
+    );
+
+    for (path, body) in [
+        (
+            "/console/channels/topic",
+            format!("csrf={csrf}&channel=%23Control&topic=Welcome+operators"),
+        ),
+        (
+            "/console/channels/mlock",
+            format!("csrf={csrf}&channel=%23Control&mlock=%2Bnt-i"),
+        ),
+        (
+            "/console/channels/access",
+            format!("csrf={csrf}&channel=%23Control&account=alice&auto_op=on&auto_voice=on"),
+        ),
+    ] {
+        let (status, headers, body) = request(http, &post_form(path, body)).await;
+        assert_eq!(status, 303, "{path}: {headers}\n{body}");
+    }
+    let (_, _, updated) = request(http, &page_request(&boss_session)).await;
+    for needle in ["Welcome operators", "+nt-i", "alice", "+ov"] {
+        assert!(
+            updated.contains(needle),
+            "updated page missing {needle:?}: {updated}"
+        );
+    }
+
+    let invalid = format!("csrf={csrf}&channel=%23Control&mlock=%2Bk");
+    let (status, _, body) = request(http, &post_form("/console/channels/mlock", invalid)).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("not a lockable mode") && body.contains("role=\"alert\""),
+        "invalid MLOCK was not visibly rejected: {body}"
+    );
+
+    let bad_csrf = "csrf=wrong&channel=%23Control";
+    let (status, _, _) = request(http, &post_form("/console/channels/drop", bad_csrf.into())).await;
+    assert_eq!(status, 403);
+
+    let drop_body = format!("csrf={csrf}&channel=%23Control");
+    let (status, _, body) = request(http, &post_form("/console/channels/drop", drop_body)).await;
+    assert_eq!(status, 303, "{body}");
+    let (_, _, empty) = request(http, &page_request(&boss_session)).await;
+    assert!(
+        !empty.contains("#Control") && empty.contains("#Web"),
+        "drop affected the wrong owner channel: {empty}"
+    );
+    let drop_web = format!("csrf={csrf}&channel=%23Web");
+    let (status, _, body) = request(http, &post_form("/console/channels/drop", drop_web)).await;
+    assert_eq!(status, 303, "{body}");
+    let (_, _, empty) = request(http, &page_request(&boss_session)).await;
+    assert!(
+        empty.contains("No channels registered to this account"),
+        "registered channel remained after both drops: {empty}"
     );
 }
 
@@ -1896,8 +2303,7 @@ async fn my_sessions_are_scoped_to_the_caller() {
 }
 
 /// The console Integrations page is admin-gated and lists every chat-platform
-/// bridge with its build availability. This default (no-bridge-feature) build
-/// reports all three as not built.
+/// bridge with build availability matching the exact feature configuration.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn console_integrations_page_lists_platforms_for_admins_only() {
@@ -1971,7 +2377,7 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
     // Signed-in non-admin -> 403.
     let (status, _, _) = request(http, &auth(&bob_token)).await;
     assert_eq!(status, 403);
-    // Admin -> 200 listing all three platforms; none is built in this binary.
+    // Admin -> 200 listing all three platforms and the exact build status.
     let (status, _, body) = request(http, &auth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
     for needle in [
@@ -1979,7 +2385,6 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         "Matrix",
         "Discord",
         "Slack",
-        "not built",
         "matrix-archive",
         "disabled",
         "Inspect",
@@ -1989,11 +2394,22 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
             "integrations missing {needle:?}: {body}"
         );
     }
+    let built = [
+        cfg!(feature = "matrix"),
+        cfg!(feature = "discord"),
+        cfg!(feature = "slack"),
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+    assert_eq!(body.matches(">built in<").count(), built, "{body}");
+    assert_eq!(body.matches(">not built<").count(), 3 - built, "{body}");
 }
 
-/// Adding a bridge from the console is admin + CSRF gated and refuses a kind
-/// whose build feature is absent (this default build has none) — proving the
-/// POST plumbing and the feature gate without needing a live bridge service.
+/// Adding a bridge from the console is admin + CSRF gated and follows the
+/// selected kind's compile-time availability. A build without Matrix refuses
+/// it at the feature gate; a Matrix build reaches the shared create path and
+/// fails loudly because this fixture deliberately has no token-sealing key.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn console_add_bridge_is_gated_and_feature_checked() {
@@ -2085,15 +2501,16 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
          Connection: close\r\n\r\n{form}",
         form.len()
     );
-    // Feature not built in this binary -> the integrations page is re-rendered
-    // (200) with an error banner naming the feature, rather than a raw
-    // problem+json page.
+    // The integrations page is re-rendered (200) with a specific error banner,
+    // rather than navigating a form submission to a raw problem+json page.
     let (status, _, body) = request(http, &post).await;
     assert_eq!(status, 200, "{body}");
-    assert!(
-        body.contains("feature") && body.contains("banner-error"),
-        "{body}"
-    );
+    assert!(body.contains("banner-error"), "{body}");
+    if cfg!(feature = "matrix") {
+        assert!(body.contains("master key"), "{body}");
+    } else {
+        assert!(body.contains("matrix feature"), "{body}");
+    }
 
     // A wrong CSRF token -> 403.
     let form_nocsrf = "csrf=wrong&kind=matrix&name=hq&sasl_password=x";
