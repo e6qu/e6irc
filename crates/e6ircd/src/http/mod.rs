@@ -262,8 +262,21 @@ struct ObservabilityQuery {
     minutes: u64,
 }
 
+const MAX_OBSERVABILITY_MINUTES: u64 = 7 * 24 * 60;
+
+#[derive(Debug, Clone, Copy)]
+struct InvalidObservabilityRange;
+
 fn default_observability_minutes() -> u64 {
     60
+}
+
+fn validate_observability_minutes(minutes: u64) -> Result<u64, InvalidObservabilityRange> {
+    if (1..=MAX_OBSERVABILITY_MINUTES).contains(&minutes) {
+        Ok(minutes)
+    } else {
+        Err(InvalidObservabilityRange)
+    }
 }
 
 #[derive(Serialize)]
@@ -277,7 +290,16 @@ async fn admin_observability(
     _admin: AdminAccount,
     Query(query): Query<ObservabilityQuery>,
 ) -> Response {
-    let minutes = query.minutes.clamp(1, 10_080);
+    let minutes = match validate_observability_minutes(query.minutes) {
+        Ok(minutes) => minutes,
+        Err(InvalidObservabilityRange) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid monitoring range",
+                Some("The history range must be between 1 and 10,080 minutes."),
+            );
+        }
+    };
     let (networks, connected) = bnc_counts(&state);
     let current = state.telemetry.snapshot(networks, connected);
     let Some(pool) = &state.pool else {
@@ -1427,7 +1449,93 @@ mod pages {
     struct TrafficBar {
         inbound_height: u64,
         outbound_height: u64,
-        age: String,
+        title: String,
+    }
+
+    struct ConnectionBar {
+        irc_height: u64,
+        bnc_height: u64,
+        title: String,
+    }
+
+    struct UpstreamBar {
+        height: u64,
+        status_class: &'static str,
+        title: String,
+    }
+
+    struct ErrorBar {
+        height: u64,
+        title: String,
+    }
+
+    struct LatencyBar {
+        core_height: u64,
+        database_height: u64,
+        http_height: u64,
+        title: String,
+    }
+
+    struct MonitoringWindowLink {
+        label: &'static str,
+        minutes: u64,
+        active: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    enum MonitoringWindow {
+        Hour,
+        SixHours,
+        Day,
+        Week,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct InvalidMonitoringWindow;
+
+    impl MonitoringWindow {
+        const ALL: [Self; 4] = [Self::Hour, Self::SixHours, Self::Day, Self::Week];
+
+        fn from_query(minutes: Option<u64>) -> Result<Self, InvalidMonitoringWindow> {
+            match minutes.unwrap_or(60) {
+                60 => Ok(Self::Hour),
+                360 => Ok(Self::SixHours),
+                1_440 => Ok(Self::Day),
+                super::MAX_OBSERVABILITY_MINUTES => Ok(Self::Week),
+                _ => Err(InvalidMonitoringWindow),
+            }
+        }
+
+        const fn minutes(self) -> u64 {
+            match self {
+                Self::Hour => 60,
+                Self::SixHours => 360,
+                Self::Day => 1_440,
+                Self::Week => super::MAX_OBSERVABILITY_MINUTES,
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Hour => "1 hour",
+                Self::SixHours => "6 hours",
+                Self::Day => "24 hours",
+                Self::Week => "7 days",
+            }
+        }
+    }
+
+    #[derive(Deserialize, Default)]
+    pub struct ConsoleMonitoringQuery {
+        minutes: Option<u64>,
+    }
+
+    fn invalid_monitoring_window_response() -> Response {
+        problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid monitoring window",
+            Some("Choose one of 60, 360, 1,440, or 10,080 minutes."),
+        )
     }
 
     struct ErrorView {
@@ -1450,10 +1558,14 @@ mod pages {
         upstream_out: String,
         inbound_rate: String,
         outbound_rate: String,
+        upstream_inbound_rate: String,
+        upstream_outbound_rate: String,
         http_requests: u64,
         database_requests: u64,
         bnc_connected: u64,
         bnc_networks: u64,
+        upstreams_ready: bool,
+        upstreams_degraded: bool,
         bnc_clients: u64,
         error_total: u64,
         sendq_kills: u64,
@@ -1466,10 +1578,18 @@ mod pages {
         http_p50: String,
         http_p95: String,
         http_p99: String,
-        bars: Vec<TrafficBar>,
+        traffic_bars: Vec<TrafficBar>,
+        upstream_traffic_bars: Vec<TrafficBar>,
+        connection_bars: Vec<ConnectionBar>,
+        upstream_bars: Vec<UpstreamBar>,
+        error_bars: Vec<ErrorBar>,
+        latency_bars: Vec<LatencyBar>,
         errors: Vec<ErrorView>,
         sampled_age: String,
         history_samples: usize,
+        window_label: &'static str,
+        window_minutes: u64,
+        window_links: Vec<MonitoringWindowLink>,
     }
 
     #[derive(Template)]
@@ -1529,14 +1649,68 @@ mod pages {
         }
     }
 
-    async fn monitoring_view(state: &AppState) -> MonitoringView {
+    fn chart_height(value: u64, peak: u64) -> u64 {
+        if value == 0 {
+            0
+        } else {
+            (value.saturating_mul(100) / peak.max(1)).max(1)
+        }
+    }
+
+    fn snapshot_error_total(snapshot: &crate::observability::Snapshot) -> u64 {
+        snapshot.errors.values().copied().sum()
+    }
+
+    fn traffic_history_bars(
+        history: &[crate::observability::Snapshot],
+        now_ms: u64,
+        inbound: impl Fn(&crate::observability::Snapshot) -> u64,
+        outbound: impl Fn(&crate::observability::Snapshot) -> u64,
+        inbound_label: &str,
+        outbound_label: &str,
+    ) -> Vec<TrafficBar> {
+        let deltas: Vec<(u64, u64, u64)> = history
+            .windows(2)
+            .map(|pair| {
+                (
+                    inbound(&pair[1]).saturating_sub(inbound(&pair[0])),
+                    outbound(&pair[1]).saturating_sub(outbound(&pair[0])),
+                    pair[1].sampled_at_ms,
+                )
+            })
+            .collect();
+        let peak = deltas
+            .iter()
+            .map(|(inbound, outbound, _)| inbound.max(outbound))
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        deltas
+            .into_iter()
+            .map(|(inbound, outbound, sampled_at)| TrafficBar {
+                inbound_height: chart_height(inbound, peak),
+                outbound_height: chart_height(outbound, peak),
+                title: format!(
+                    "{} {inbound_label} · {} {outbound_label} · {}",
+                    format_bytes(inbound),
+                    format_bytes(outbound),
+                    format_age(now_ms, sampled_at)
+                ),
+            })
+            .collect()
+    }
+
+    async fn monitoring_view(state: &AppState, window: MonitoringWindow) -> MonitoringView {
         let (networks, connected) = bnc_counts(state);
         let current = state.telemetry.snapshot(networks, connected);
         let pool = pool_of(state);
-        let since_ms = current.sampled_at_ms.saturating_sub(60 * 60 * 1_000);
+        let since_ms = current
+            .sampled_at_ms
+            .saturating_sub(window.minutes().saturating_mul(60_000));
         let started = Instant::now();
         let (mut history, database_ready) =
-            match crate::db::list_observability_samples(pool, since_ms, current.sampled_at_ms, 240)
+            match crate::db::list_observability_samples(pool, since_ms, current.sampled_at_ms, 60)
                 .await
             {
                 Ok(history) => (history, true),
@@ -1549,6 +1723,12 @@ mod pages {
                 }
             };
         state.telemetry.record_database_request(started.elapsed());
+        if history
+            .last()
+            .is_some_and(|snapshot| snapshot.sampled_at_ms == current.sampled_at_ms)
+        {
+            history.pop();
+        }
         history.push(current.clone());
 
         let elapsed_seconds = history
@@ -1565,39 +1745,136 @@ mod pages {
             .irc_bytes_out_total
             .saturating_sub(first.irc_bytes_out_total)
             / elapsed_seconds;
+        let upstream_inbound_rate = current
+            .bnc_bytes_in_total
+            .saturating_sub(first.bnc_bytes_in_total)
+            / elapsed_seconds;
+        let upstream_outbound_rate = current
+            .bnc_bytes_out_total
+            .saturating_sub(first.bnc_bytes_out_total)
+            / elapsed_seconds;
 
-        let deltas: Vec<(u64, u64, u64)> = history
-            .windows(2)
-            .map(|pair| {
-                (
-                    pair[1]
-                        .irc_bytes_in_total
-                        .saturating_sub(pair[0].irc_bytes_in_total),
-                    pair[1]
-                        .irc_bytes_out_total
-                        .saturating_sub(pair[0].irc_bytes_out_total),
-                    pair[1].sampled_at_ms,
-                )
-            })
-            .rev()
-            .take(48)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        let peak = deltas
+        let traffic_bars = traffic_history_bars(
+            &history,
+            current.sampled_at_ms,
+            |snapshot| snapshot.irc_bytes_in_total,
+            |snapshot| snapshot.irc_bytes_out_total,
+            "inbound",
+            "outbound",
+        );
+        let upstream_traffic_bars = traffic_history_bars(
+            &history,
+            current.sampled_at_ms,
+            |snapshot| snapshot.bnc_bytes_in_total,
+            |snapshot| snapshot.bnc_bytes_out_total,
+            "received",
+            "sent",
+        );
+
+        let connection_history: Vec<_> = history
             .iter()
-            .map(|(inbound, outbound, _)| inbound.max(outbound))
-            .copied()
+            .filter(|snapshot| snapshot.schema_version == current.schema_version)
+            .collect();
+        let connection_peak = connection_history
+            .iter()
+            .map(|snapshot| {
+                snapshot
+                    .active_connections
+                    .max(snapshot.bnc_client_connections)
+            })
             .max()
             .unwrap_or(1)
             .max(1);
-        let bars = deltas
+        let connection_bars = connection_history
+            .iter()
+            .map(|snapshot| ConnectionBar {
+                irc_height: chart_height(snapshot.active_connections, connection_peak),
+                bnc_height: chart_height(snapshot.bnc_client_connections, connection_peak),
+                title: format!(
+                    "{} IRC · {} BNC · {}",
+                    snapshot.active_connections,
+                    snapshot.bnc_client_connections,
+                    format_age(current.sampled_at_ms, snapshot.sampled_at_ms)
+                ),
+            })
+            .collect();
+
+        let upstream_bars = history
+            .iter()
+            .map(|snapshot| UpstreamBar {
+                height: match std::num::NonZeroU64::new(snapshot.bnc_networks) {
+                    Some(networks) => snapshot.bnc_connected.saturating_mul(100) / networks.get(),
+                    None => 0,
+                },
+                status_class: if snapshot.bnc_networks == 0 {
+                    "bar-off"
+                } else if snapshot.bnc_connected == snapshot.bnc_networks {
+                    "bar-ok"
+                } else if snapshot.bnc_connected > 0 {
+                    "bar-warn"
+                } else {
+                    "bar-off"
+                },
+                title: format!(
+                    "{} of {} connected · {}",
+                    snapshot.bnc_connected,
+                    snapshot.bnc_networks,
+                    format_age(current.sampled_at_ms, snapshot.sampled_at_ms)
+                ),
+            })
+            .collect();
+
+        let error_deltas: Vec<(u64, u64)> = history
+            .windows(2)
+            .map(|pair| {
+                (
+                    snapshot_error_total(&pair[1]).saturating_sub(snapshot_error_total(&pair[0])),
+                    pair[1].sampled_at_ms,
+                )
+            })
+            .collect();
+        let error_peak = error_deltas
+            .iter()
+            .map(|(count, _)| *count)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let error_bars = error_deltas
             .into_iter()
-            .map(|(inbound, outbound, sampled_at)| TrafficBar {
-                inbound_height: (inbound.saturating_mul(100) / peak).max(u64::from(inbound > 0)),
-                outbound_height: (outbound.saturating_mul(100) / peak).max(u64::from(outbound > 0)),
-                age: format_age(current.sampled_at_ms, sampled_at),
+            .map(|(count, sampled_at)| ErrorBar {
+                height: chart_height(count, error_peak),
+                title: format!(
+                    "{count} new errors · {}",
+                    format_age(current.sampled_at_ms, sampled_at)
+                ),
+            })
+            .collect();
+
+        let latency_peak = history
+            .iter()
+            .map(|snapshot| {
+                snapshot
+                    .core_latency
+                    .p95_us
+                    .max(snapshot.database_latency.p95_us)
+                    .max(snapshot.http_latency.p95_us)
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let latency_bars = history
+            .iter()
+            .map(|snapshot| LatencyBar {
+                core_height: chart_height(snapshot.core_latency.p95_us, latency_peak),
+                database_height: chart_height(snapshot.database_latency.p95_us, latency_peak),
+                http_height: chart_height(snapshot.http_latency.p95_us, latency_peak),
+                title: format!(
+                    "Core {} · PostgreSQL {} · HTTP {} · {}",
+                    format_latency(snapshot.core_latency.p95_us),
+                    format_latency(snapshot.database_latency.p95_us),
+                    format_latency(snapshot.http_latency.p95_us),
+                    format_age(current.sampled_at_ms, snapshot.sampled_at_ms)
+                ),
             })
             .collect();
         let errors = current
@@ -1628,10 +1905,16 @@ mod pages {
             upstream_out: format_bytes(current.bnc_bytes_out_total),
             inbound_rate: format!("{}/s", format_bytes(inbound_rate)),
             outbound_rate: format!("{}/s", format_bytes(outbound_rate)),
+            upstream_inbound_rate: format!("{}/s", format_bytes(upstream_inbound_rate)),
+            upstream_outbound_rate: format!("{}/s", format_bytes(upstream_outbound_rate)),
             http_requests: current.http_requests_total,
             database_requests: current.database_requests_total,
             bnc_connected: current.bnc_connected,
             bnc_networks: current.bnc_networks,
+            upstreams_ready: current.bnc_networks > 0
+                && current.bnc_connected == current.bnc_networks,
+            upstreams_degraded: current.bnc_connected > 0
+                && current.bnc_connected < current.bnc_networks,
             bnc_clients: current.bnc_client_connections,
             error_total,
             sendq_kills: current.sendq_kills_total,
@@ -1644,22 +1927,42 @@ mod pages {
             http_p50: format_latency(current.http_latency.p50_us),
             http_p95: format_latency(current.http_latency.p95_us),
             http_p99: format_latency(current.http_latency.p99_us),
-            bars,
+            traffic_bars,
+            upstream_traffic_bars,
+            connection_bars,
+            upstream_bars,
+            error_bars,
+            latency_bars,
             errors,
             sampled_age: format_age(current.sampled_at_ms, current.sampled_at_ms),
             history_samples: history.len().saturating_sub(1),
+            window_label: window.label(),
+            window_minutes: window.minutes(),
+            window_links: MonitoringWindow::ALL
+                .into_iter()
+                .map(|candidate| MonitoringWindowLink {
+                    label: candidate.label(),
+                    minutes: candidate.minutes(),
+                    active: candidate.minutes() == window.minutes(),
+                })
+                .collect(),
         }
     }
 
     pub async fn console_monitoring(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
+        Query(query): Query<ConsoleMonitoringQuery>,
     ) -> Response {
         let (account, csrf) = match page_actor(&state, &headers, true).await {
             Ok(actor) => actor,
             Err(response) => return response,
         };
-        let view = monitoring_view(&state).await;
+        let window = match MonitoringWindow::from_query(query.minutes) {
+            Ok(window) => window,
+            Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
+        };
+        let view = monitoring_view(&state, window).await;
         render_private(ConsoleMonitoring {
             account,
             csrf,
@@ -1672,12 +1975,17 @@ mod pages {
     pub async fn console_monitoring_panel(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
+        Query(query): Query<ConsoleMonitoringQuery>,
     ) -> Response {
         if let Err(response) = page_actor(&state, &headers, true).await {
             return response;
         }
+        let window = match MonitoringWindow::from_query(query.minutes) {
+            Ok(window) => window,
+            Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
+        };
         render_private(ConsoleMonitoringPanel {
-            view: monitoring_view(&state).await,
+            view: monitoring_view(&state, window).await,
         })
     }
 

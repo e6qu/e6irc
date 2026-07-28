@@ -292,6 +292,7 @@ pub(super) async fn openapi() -> Response {
                         "schema": { "type": "integer", "minimum": 1, "maximum": 10080,
                             "default": 60 } }],
                     "responses": { "200": { "description": "current snapshot and historical samples" },
+                        "400": { "description": "history range outside 1–10080 minutes" },
                         "403": { "description": "not an admin account" },
                         "503": { "description": "monitoring storage unavailable" } } }
             },

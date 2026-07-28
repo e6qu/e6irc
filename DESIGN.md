@@ -1275,7 +1275,13 @@ telemetry records the machine-readable side of the same failures without
 putting untrusted values or secrets in labels. One process-wide snapshot
 contains connection state and lifecycle totals, IRC and BNC line/byte traffic,
 HTTP and database operation totals, SendQ kills, fixed error categories, BNC
-driver up/down state, and cumulative core/database/HTTP latency histograms.
+driver up/down state, authenticated raw-IRC and web attachment gauges, and
+cumulative core/database/HTTP latency histograms. The attachment guard belongs
+to the resolved network handle, so both client transports enter and leave the
+same counter only after authentication; accepted but unauthenticated sockets
+cannot inflate it. This semantic correction is snapshot schema version 2; the
+console does not plot version-1 raw-socket gauges as authenticated attachment
+history, while unaffected version-1 counters remain usable.
 Each running BNC handle additionally keeps owner-scoped per-network counters
 and lifecycle timing. Those values are deliberately not process-wide metric
 labels: account and network names are unbounded label cardinality. They are
@@ -1284,10 +1290,14 @@ served only through the authenticated network API and console operations page.
 The snapshot is the sole source for:
 
 - `/console/monitoring`, an administrator-only server-rendered view refreshed
-  every ten seconds by `/console.js`, with health, traffic, connections,
-  latency, upstreams, and errors; refresh failures remain visibly actionable;
+  every ten seconds by `/console.js`, with selectable 1-hour, 6-hour, 24-hour,
+  and 7-day windows across IRC/BNC traffic, live IRC/BNC connections, upstream
+  availability, new errors, and P95 core/database/HTTP latency; current
+  percentile tables and the error ledger remain alongside the trends, and
+  refresh failures remain visibly actionable;
 - `/api/v1/admin/observability`, authenticated JSON with the current snapshot
-  and at most 1,000 bounded historical points;
+  and at most 1,000 bounded historical points over an explicit 1-minute to
+  7-day range; invalid ranges fail with HTTP 400 rather than being clamped;
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
   fixed `state`/`kind` labels;
 - `/readyz`, which fails when the single core worker's heartbeat is stale or

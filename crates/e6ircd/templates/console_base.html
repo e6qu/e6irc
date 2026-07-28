@@ -10,10 +10,12 @@
       :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2563eb;
         --accent-strong: #1d4ed8; --bg: #f5f7fa; --fg: #16181d; --panel: #fff;
         --panel-subtle: #f9fafb; --ok: #168447; --off: #b33434; --warn: #d97706; --info: #245ea8;
+        --violet: #7c3aed;
         --shadow: 0 1px 2px rgb(15 23 42 / 0.05), 0 8px 24px rgb(15 23 42 / 0.04); }
       @media (prefers-color-scheme: dark) { :root { --border: #262b33; --muted: #9aa3b1;
         --bg: #0d1015; --fg: #e6e8ec; --panel: #151920; --panel-subtle: #11151b;
         --ok: #3fbf72; --off: #e06666; --warn: #f3a93b; --info: #78aaf2;
+        --violet: #a78bfa;
         --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 30px rgb(0 0 0 / 0.18); } }
       * { box-sizing: border-box; }
       body { margin: 0; font: 15px/1.6 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
@@ -171,15 +173,33 @@
       .metric-alert { border-color: color-mix(in srgb, var(--warn) 45%, var(--border)); }
       .overview-metrics { margin-top: 0; }
       .inventory-cards { margin-bottom: 1.5rem; }
-      .monitoring-columns { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(18rem, 0.8fr); gap: 0.9rem; }
-      .monitoring-columns .panel { margin: 0 0 0.9rem; }
-      .monitoring-chart { min-height: 18rem; }
+      .monitoring-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+        margin: 0.85rem 0; padding: 0.7rem 0.8rem; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 0.65rem; box-shadow: var(--shadow); }
+      .monitoring-toolbar > strong { font-size: 0.78rem; color: var(--muted); text-transform: uppercase;
+        letter-spacing: 0.05em; }
+      .window-picker { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+      .window-picker a { padding: 0.4rem 0.65rem; color: var(--muted); text-decoration: none;
+        border: 1px solid transparent; border-radius: 0.45rem; font-size: 0.8rem; font-weight: 700; }
+      .window-picker a:hover { color: var(--fg); border-color: var(--border); }
+      .window-picker a.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+        border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+      .monitoring-history-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.9rem; }
+      .monitoring-history-grid .panel { margin: 0; }
+      .monitoring-chart { min-height: 17rem; }
       .bar-chart { height: 12rem; display: flex; align-items: end; gap: 3px; border-bottom: 1px solid var(--border);
         background: repeating-linear-gradient(to top, transparent 0, transparent calc(25% - 1px),
         var(--border) 25%); margin-top: 1rem; padding: 0 0.2rem; }
-      .bar-pair { height: 100%; min-width: 3px; flex: 1; display: flex; align-items: end; gap: 1px; }
-      .bar-pair i { display: block; flex: 1; min-height: 1px; border-radius: 2px 2px 0 0; }
+      .bar-pair, .bar-triplet, .bar-single { height: 100%; min-width: 3px; flex: 1; display: flex;
+        align-items: end; gap: 1px; }
+      .bar-pair i, .bar-triplet i, .bar-single i { display: block; flex: 1; min-height: 0;
+        border-radius: 2px 2px 0 0; }
       .bar-in { background: var(--accent); } .bar-out { background: var(--ok); }
+      .bar-irc, .bar-core { background: var(--accent); }
+      .bar-bnc, .bar-http { background: var(--violet); }
+      .bar-database, .bar-warn { background: var(--warn); }
+      .bar-ok { background: var(--ok); }
+      .bar-off, .bar-errors { background: var(--off); }
       .chart-empty { display: grid; place-items: center; height: 12rem; color: var(--muted);
         border: 1px dashed var(--border); border-radius: 0.55rem; margin-top: 1rem; }
       .latency-table { display: grid; margin-top: 1rem; }
@@ -252,7 +272,8 @@
         .network-form, .field-grid, .settings-section, .connection-card,
         .inline-config-form, .oidc-form { grid-template-columns: 1fr; }
         .bootstrap-card, .health-strip, .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .monitoring-columns, .access-grid, .secret-reveal { grid-template-columns: 1fr; }
+        .monitoring-history-grid, .access-grid, .secret-reveal { grid-template-columns: 1fr; }
+        .monitoring-toolbar { align-items: stretch; flex-direction: column; }
         .error-grid { grid-template-columns: 1fr; }
         .inline-create, .marker-grid { grid-template-columns: 1fr; }
         .network-summary { grid-template-columns: 1fr; }

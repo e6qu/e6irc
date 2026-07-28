@@ -931,6 +931,7 @@ fn atomic_millis(value: &std::sync::atomic::AtomicU64) -> Option<e6irc_proto::ti
 /// Counts an attached raw-IRC or web client for exactly the guard's lifetime.
 pub struct NetworkAttachment {
     runtime: std::sync::Arc<NetworkRuntime>,
+    _telemetry: Option<crate::observability::BncClientConnection>,
 }
 
 impl Drop for NetworkAttachment {
@@ -1161,11 +1162,18 @@ impl NetworkHandle {
 
     /// Count one attached client until the returned guard is dropped.
     pub fn track_attachment(&self) -> NetworkAttachment {
+        let telemetry = self
+            .telemetry
+            .lock()
+            .expect("telemetry hook poisoned")
+            .clone()
+            .map(|telemetry| telemetry.observe_bnc_client());
         self.runtime
             .attached_clients
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         NetworkAttachment {
             runtime: self.runtime.clone(),
+            _telemetry: telemetry,
         }
     }
 
