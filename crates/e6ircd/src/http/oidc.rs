@@ -645,7 +645,10 @@ pub(super) fn verify_logout_token_with_metadata(
     }
     let header: LogoutTokenHeader = serde_json::from_slice(&base64url_decode(segments[0])?)
         .map_err(|_| "logout token header is invalid")?;
-    if header.typ.as_deref().is_some_and(|typ| typ != "logout+jwt") {
+    if !matches!(
+        header.typ.as_deref(),
+        None | Some("JWT") | Some("logout+jwt")
+    ) {
         return Err("logout token type is invalid".into());
     }
     if !supported_algorithms.contains(&header.alg) {
