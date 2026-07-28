@@ -3797,14 +3797,21 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             .to_string()
     }
 
-    fn logout_token(payload: serde_json::Value) -> (String, openidconnect::core::CoreJsonWebKey) {
+    fn logout_token_with_type(
+        payload: serde_json::Value,
+        token_type: Option<&str>,
+    ) -> (String, openidconnect::core::CoreJsonWebKey) {
         let key = CoreRsaPrivateSigningKey::from_pem(
             TEST_RSA_KEY,
             Some(JsonWebKeyId::new("logout-key".into())),
         )
         .expect("test RSA key");
         let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
-        let header = base64url(br#"{"alg":"RS256","kid":"logout-key","typ":"logout+jwt"}"#);
+        let mut header = serde_json::json!({"alg": "RS256", "kid": "logout-key"});
+        if let Some(token_type) = token_type {
+            header["typ"] = serde_json::Value::String(token_type.into());
+        }
+        let header = base64url(&serde_json::to_vec(&header).expect("header"));
         let payload = base64url(&serde_json::to_vec(&payload).expect("payload"));
         let input = format!("{header}.{payload}");
         let signature = key.sign(&algorithm, input.as_bytes()).expect("sign");
@@ -3812,6 +3819,10 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             format!("{input}.{}", base64url(&signature)),
             key.as_verification_key(),
         )
+    }
+
+    fn logout_token(payload: serde_json::Value) -> (String, openidconnect::core::CoreJsonWebKey) {
+        logout_token_with_type(payload, Some("logout+jwt"))
     }
 
     #[test]
@@ -3846,6 +3857,40 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
         )
         .expect("valid logout token");
         assert_eq!(claims.sid.as_deref(), Some("session-1"));
+
+        let payload = serde_json::json!({
+            "iss": "https://auth.example",
+            "aud": "e6irc",
+            "sid": "session-1",
+            "iat": now,
+            "exp": now + 600,
+            "jti": "logout-provider-type",
+            "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
+        });
+        for token_type in [None, Some("JWT")] {
+            let (provider_token, provider_key) =
+                logout_token_with_type(payload.clone(), token_type);
+            verify_logout_token_with_metadata(
+                &provider_token,
+                &provider,
+                std::slice::from_ref(&algorithm),
+                std::slice::from_ref(&provider_key),
+                now,
+            )
+            .expect("standard provider logout token type");
+        }
+        let (wrong_type, wrong_type_key) = logout_token_with_type(payload, Some("at+jwt"));
+        assert!(
+            verify_logout_token_with_metadata(
+                &wrong_type,
+                &provider,
+                std::slice::from_ref(&algorithm),
+                std::slice::from_ref(&wrong_type_key),
+                now,
+            )
+            .is_err(),
+            "a token explicitly typed for another protocol must be rejected"
+        );
 
         let mut tampered = raw.into_bytes();
         let last = tampered.len() - 1;

@@ -16,6 +16,12 @@ SET options) is now fully built and tested — the only open work is the two
 environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
 ⛔ blocked (reason).
 
+OIDC provider interoperability (2026-07-28): back-channel logout now accepts
+the generic `typ: JWT` emitted by Hydra as well as the recommended
+`typ: logout+jwt` and an omitted type. Tokens explicitly typed for another
+protocol remain rejected, while the signed event, issuer, audience, time,
+session identifier, and replay checks continue to identify logout tokens.
+
 Control-plane console (2026-07-28): `/console/configuration` now owns typed,
 revisioned operational settings in PostgreSQL with redacted same-transaction
 audit entries and optimistic concurrency. The database URL, master-key source,
