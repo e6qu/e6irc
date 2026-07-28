@@ -32,6 +32,17 @@ uses labeled responsive field grids, explicit capability/status banners, live
 listener state, provenance, and accessible error/success regions instead of
 the clipped placeholder-only form.
 
+Observability console (2026-07-28): the same UI-managed control plane now
+owns live sampling and bounded retention. `/console/monitoring` presents core
+and database health, IRC/BNC traffic, client and upstream connections,
+cumulative latency percentiles, SendQ pressure, and a fixed-category error
+ledger; its overview refreshes every ten seconds. The typed snapshot also
+drives authenticated JSON and Prometheus endpoints plus a dependency-aware
+readiness probe. PostgreSQL history is capped to 1,000 API points and pruned in
+the sampler's insert transaction, while metrics remain available when history
+sampling is disabled. The console landing page now carries live operational
+summary cards instead of only database inventory counts.
+
 Hardening sweep (2026-07-20): closed several bug classes across the tree —
 client-triggerable memory-growth DoS on the single core worker (unbounded
 `+b/+q/+e/+I` lists → MAXLIST/478, unbounded channel joins → CHANLIMIT/405,

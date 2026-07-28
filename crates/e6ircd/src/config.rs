@@ -18,6 +18,36 @@ fn default_core_queue() -> usize {
 fn default_description() -> String {
     "e6irc server".into()
 }
+fn default_observability_enabled() -> bool {
+    true
+}
+fn default_observability_sample_interval() -> u64 {
+    15
+}
+fn default_observability_retention() -> u64 {
+    168
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    #[serde(default = "default_observability_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_observability_sample_interval")]
+    pub sample_interval_seconds: u64,
+    #[serde(default = "default_observability_retention")]
+    pub retention_hours: u64,
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_observability_enabled(),
+            sample_interval_seconds: default_observability_sample_interval(),
+            retention_hours: default_observability_retention(),
+        }
+    }
+}
 
 /// `draft/account-registration` policy, advertised as the capability's value
 /// so a client knows the rules before it tries.
@@ -104,6 +134,9 @@ pub struct Config {
     /// Abuse limits. All off by default.
     #[serde(default)]
     pub limits: LimitsConfig,
+    /// In-process operational metrics and bounded historical samples.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -158,6 +191,8 @@ pub struct ManagedConfig {
     pub listeners: Vec<ListenerConfig>,
     pub registration: RegistrationConfig,
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
     pub bnc_addr: Option<SocketAddr>,
     pub public_url: Option<String>,
     pub secure_cookies: bool,
@@ -222,6 +257,7 @@ impl ManagedConfig {
             listeners: config.listeners.clone(),
             registration: config.registration.clone(),
             limits: config.limits.clone(),
+            observability: config.observability.clone(),
             bnc_addr: config.bnc.as_ref().map(|bnc| bnc.addr),
             public_url: config
                 .http
@@ -252,6 +288,7 @@ impl ManagedConfig {
         config.listeners.clone_from(&self.listeners);
         config.registration = self.registration.clone();
         config.limits = self.limits.clone();
+        config.observability = self.observability.clone();
         config.bnc = self.bnc_addr.map(|addr| BncConfig { addr });
         if let Some(http) = &mut config.http {
             http.public_url.clone_from(&self.public_url);
@@ -504,6 +541,7 @@ impl Default for Config {
             bnc: None,
             secrets: None,
             limits: LimitsConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 }
@@ -716,6 +754,16 @@ impl Config {
         if self.max_hot_channels == 0 {
             return Err(ConfigError::Invalid(
                 "max_hot_channels must be nonzero (0 retains no channel history)".into(),
+            ));
+        }
+        if !(5..=300).contains(&self.observability.sample_interval_seconds) {
+            return Err(ConfigError::Invalid(
+                "observability.sample_interval_seconds must be between 5 and 300".into(),
+            ));
+        }
+        if !(1..=2160).contains(&self.observability.retention_hours) {
+            return Err(ConfigError::Invalid(
+                "observability.retention_hours must be between 1 and 2160".into(),
             ));
         }
         if self.limits.command_burst == Some(0) {
@@ -1700,6 +1748,48 @@ mod tests {
                 .contains("duplicate OIDC issuer"),
             "duplicate issuer must be rejected"
         );
+    }
+
+    #[test]
+    fn observability_bounds_are_validated() {
+        let mut config = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+                websocket: false,
+            }],
+            ..Config::default()
+        };
+        config.observability.sample_interval_seconds = 4;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sample_interval_seconds")
+        );
+        config.observability.sample_interval_seconds = 15;
+        config.observability.retention_hours = 2161;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("retention_hours")
+        );
+    }
+
+    #[test]
+    fn persisted_settings_without_observability_use_safe_defaults() {
+        let settings = ManagedConfig::from_config(&Config::default(), None).unwrap();
+        let mut value = serde_json::to_value(settings).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("observability")
+            .expect("serialized field");
+        let decoded: ManagedConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.observability, ObservabilityConfig::default());
     }
 
     #[test]

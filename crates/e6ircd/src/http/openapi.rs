@@ -30,6 +30,11 @@ pub(super) async fn openapi() -> Response {
                 "get": { "summary": "Liveness probe", "responses": {
                     "200": { "description": "the literal string \"ok\"" } } }
             },
+            "/readyz": {
+                "get": { "summary": "Core and PostgreSQL readiness probe", "responses": {
+                    "200": { "description": "all configured dependencies are ready" },
+                    "503": { "description": "the core heartbeat is stale or PostgreSQL is unavailable" } } }
+            },
             "/api/v1/server": {
                 "get": { "summary": "Server name, network name, version", "responses": ok_json }
             },
@@ -258,6 +263,22 @@ pub(super) async fn openapi() -> Response {
                 "get": { "summary": "Aggregate server counts (admin only)",
                     "security": bearer,
                     "responses": { "200": { "description": "counts" },
+                        "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/observability": {
+                "get": { "summary": "Live telemetry and bounded history (admin only)",
+                    "security": bearer,
+                    "parameters": [{ "name": "minutes", "in": "query",
+                        "schema": { "type": "integer", "minimum": 1, "maximum": 10080,
+                            "default": 60 } }],
+                    "responses": { "200": { "description": "current snapshot and historical samples" },
+                        "403": { "description": "not an admin account" },
+                        "503": { "description": "monitoring storage unavailable" } } }
+            },
+            "/api/v1/admin/metrics": {
+                "get": { "summary": "Prometheus exposition (admin only)",
+                    "security": bearer,
+                    "responses": { "200": { "description": "Prometheus text exposition" },
                         "403": { "description": "not an admin account" } } }
             }
         }

@@ -13,9 +13,14 @@ mod state;
 
 pub use state::{ConnId, CoreConfig, dm_conversation_key};
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use bytes::Bytes;
 use e6irc_queue::{PushError, Sender};
 use state::ServerState;
+
+use crate::observability::{LatencyKind, Telemetry};
 
 /// Events into the core worker.
 #[derive(Debug)]
@@ -792,8 +797,16 @@ pub struct Core {
 
 impl Core {
     pub fn new(config: CoreConfig, db_tx: Sender<DbRequest>) -> Self {
+        Self::with_telemetry(config, db_tx, Arc::new(Telemetry::new()))
+    }
+
+    pub(crate) fn with_telemetry(
+        config: CoreConfig,
+        db_tx: Sender<DbRequest>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         Self {
-            state: ServerState::new(config, db_tx),
+            state: ServerState::new(config, db_tx, telemetry),
         }
     }
 
@@ -840,6 +853,15 @@ impl Core {
     /// Process one event. All state transitions happen here, on one
     /// thread, in queue order.
     pub fn handle(&mut self, input: Input) {
+        let started = Instant::now();
+        let sessions_before = self.state.sessions.len();
+        let opened = matches!(input, Input::Open { .. });
+        if let Input::Line { line, .. } = &input {
+            self.state.telemetry.record_irc_input(line.len());
+        }
+        if opened {
+            self.state.telemetry.record_connection_opened();
+        }
         match input {
             Input::Open { conn, tx, host } => self.state.open(conn, tx, host),
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
@@ -906,8 +928,29 @@ impl Core {
         // session drops its queue Sender, which is what closes the
         // socket: write_loop drains, flushes, and shuts down on None.
         while let Some(conn) = self.state.doomed.pop() {
+            if self.state.sessions.contains_key(&conn) {
+                self.state.telemetry.record_sendq_kill();
+            }
             self.state.close(conn, "SendQ exceeded");
         }
+        let sessions_after = self.state.sessions.len();
+        self.state.telemetry.record_connections_closed(
+            (sessions_before + usize::from(opened)).saturating_sub(sessions_after),
+        );
+        let registered = self
+            .state
+            .sessions
+            .values()
+            .filter(|session| session.is_registered())
+            .count();
+        self.state.telemetry.update_core_gauges(
+            sessions_after,
+            registered,
+            self.state.channels.len(),
+        );
+        self.state
+            .telemetry
+            .observe_latency(LatencyKind::Core, started.elapsed());
     }
 }
 

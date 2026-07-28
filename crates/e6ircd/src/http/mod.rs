@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::config::OidcProviderConfig;
@@ -72,7 +73,10 @@ pub struct AppState {
     /// database-backed registry exists, even while the listener is disabled.
     pub bnc_listener: Option<std::sync::Arc<crate::net::BncListenerController>>,
     /// Latest persisted operational settings revision. Absent with no database.
-    pub managed_config: Option<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>,
+    pub managed_config:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>>,
+    /// Fixed-cardinality counters, gauges, and latency histograms.
+    pub(crate) telemetry: std::sync::Arc<crate::observability::Telemetry>,
     /// Master key for sealing upstream secrets at rest; `None` when no
     /// key is configured (then networks with an upstream password are
     /// refused rather than stored in the clear).
@@ -180,9 +184,154 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         .into_response()
 }
 
+fn bnc_counts(state: &AppState) -> (u64, u64) {
+    state
+        .bnc_registry
+        .as_ref()
+        .map(|registry| {
+            let statuses = registry.list();
+            (
+                statuses.len() as u64,
+                statuses.iter().filter(|network| network.connected).count() as u64,
+            )
+        })
+        .unwrap_or_default()
+}
+
+async fn observe_http(
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    state
+        .telemetry
+        .record_http_request(started.elapsed(), response.status().is_server_error());
+    response
+}
+
+#[derive(Serialize)]
+struct Readiness {
+    ready: bool,
+    core: &'static str,
+    database: &'static str,
+}
+
+async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    let core_ready = state.telemetry.core_is_fresh(Duration::from_secs(45));
+    let database_ready = match &state.pool {
+        Some(pool) => {
+            let started = Instant::now();
+            let ready = sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(pool)
+                .await
+                .is_ok();
+            state.telemetry.record_database_request(started.elapsed());
+            if !ready {
+                state
+                    .telemetry
+                    .record_error(crate::observability::ErrorKind::Database);
+            }
+            ready
+        }
+        None => true,
+    };
+    let ready = core_ready && database_ready;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        axum::Json(Readiness {
+            ready,
+            core: if core_ready { "ready" } else { "stale" },
+            database: if state.pool.is_none() {
+                "not_configured"
+            } else if database_ready {
+                "ready"
+            } else {
+                "unavailable"
+            },
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ObservabilityQuery {
+    #[serde(default = "default_observability_minutes")]
+    minutes: u64,
+}
+
+fn default_observability_minutes() -> u64 {
+    60
+}
+
+#[derive(Serialize)]
+struct ObservabilityResponse {
+    current: crate::observability::Snapshot,
+    history: Vec<crate::observability::Snapshot>,
+}
+
+async fn admin_observability(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAccount,
+    Query(query): Query<ObservabilityQuery>,
+) -> Response {
+    let minutes = query.minutes.clamp(1, 10_080);
+    let (networks, connected) = bnc_counts(&state);
+    let current = state.telemetry.snapshot(networks, connected);
+    let Some(pool) = &state.pool else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Monitoring history unavailable",
+            Some("PostgreSQL is required for historical monitoring."),
+        );
+    };
+    let since_ms = current
+        .sampled_at_ms
+        .saturating_sub(minutes.saturating_mul(60_000));
+    let started = Instant::now();
+    match crate::db::list_observability_samples(pool, since_ms, current.sampled_at_ms, 1_000).await
+    {
+        Ok(history) => {
+            state.telemetry.record_database_request(started.elapsed());
+            axum::Json(ObservabilityResponse { current, history }).into_response()
+        }
+        Err(error) => {
+            state.telemetry.record_database_request(started.elapsed());
+            state
+                .telemetry
+                .record_error(crate::observability::ErrorKind::Database);
+            eprintln!("monitoring history query failed: {error}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Monitoring history unavailable",
+                None,
+            )
+        }
+    }
+}
+
+async fn admin_metrics(State(state): State<Arc<AppState>>, _admin: AdminAccount) -> Response {
+    let (networks, connected) = bnc_counts(&state);
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.telemetry.prometheus(networks, connected),
+    )
+        .into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/healthz", get(async || "ok"))
+        .route("/readyz", get(readiness))
         .route("/login", get(pages::login))
         .route("/auth/signed-out", get(pages::signed_out))
         .route("/auth/validation", get(pages::validation))
@@ -190,6 +339,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth.css", get(pages::auth_styles))
         .route("/account", get(pages::account))
         .route("/console", get(pages::console))
+        .route("/console/monitoring", get(pages::console_monitoring))
+        .route(
+            "/console/monitoring/panel",
+            get(pages::console_monitoring_panel),
+        )
         .route(
             "/console/configuration",
             get(pages::console_configuration).post(pages::console_update_configuration),
@@ -308,6 +462,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/admin/bans", get(admin_server_bans))
         .route("/api/v1/admin/audit", get(admin_audit))
         .route("/api/v1/admin/stats", get(admin_stats))
+        .route("/api/v1/admin/observability", get(admin_observability))
+        .route("/api/v1/admin/metrics", get(admin_metrics))
         .route("/ws/irc", get(ws_irc))
         .route("/ws/ui", get(ws_ui));
     // With the `embed-web` feature the built web client (web/dist) is
@@ -332,6 +488,10 @@ pub fn router(state: Arc<AppState>) -> Router {
                     .or_insert(header::HeaderValue::from_static("nosniff"));
                 resp
             },
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            observe_http,
         ))
         .with_state(state)
 }
@@ -772,6 +932,10 @@ mod pages {
         stat_accounts: i64,
         stat_channels: i64,
         stat_server_bans: i64,
+        live_connections: u64,
+        live_upstreams: String,
+        live_traffic: String,
+        live_errors: u64,
         accounts: Vec<String>,
         channels: Vec<ChannelRow>,
         bans: Vec<BanRow>,
@@ -826,6 +990,8 @@ mod pages {
                 detail,
             })
             .collect();
+        let (networks, connected) = bnc_counts(state);
+        let live = state.telemetry.snapshot(networks, connected);
         Ok(Console {
             account,
             csrf,
@@ -837,11 +1003,277 @@ mod pages {
             stat_accounts,
             stat_channels,
             stat_server_bans,
+            live_connections: live.active_connections,
+            live_upstreams: format!("{} / {}", live.bnc_connected, live.bnc_networks),
+            live_traffic: format_bytes(
+                live.irc_bytes_in_total
+                    .saturating_add(live.irc_bytes_out_total)
+                    .saturating_add(live.bnc_bytes_in_total)
+                    .saturating_add(live.bnc_bytes_out_total),
+            ),
+            live_errors: live.errors.values().sum(),
             accounts,
             channels,
             bans,
             audit,
             error,
+        })
+    }
+
+    struct TrafficBar {
+        inbound_height: u64,
+        outbound_height: u64,
+        age: String,
+    }
+
+    struct ErrorView {
+        kind: String,
+        count: u64,
+        last_seen: String,
+    }
+
+    struct MonitoringView {
+        core_ready: bool,
+        database_ready: bool,
+        active_connections: u64,
+        registered_connections: u64,
+        channels: u64,
+        opened_total: u64,
+        rejected_total: u64,
+        traffic_in: String,
+        traffic_out: String,
+        upstream_in: String,
+        upstream_out: String,
+        inbound_rate: String,
+        outbound_rate: String,
+        http_requests: u64,
+        database_requests: u64,
+        bnc_connected: u64,
+        bnc_networks: u64,
+        bnc_clients: u64,
+        error_total: u64,
+        sendq_kills: u64,
+        core_p50: String,
+        core_p95: String,
+        core_p99: String,
+        database_p50: String,
+        database_p95: String,
+        database_p99: String,
+        http_p50: String,
+        http_p95: String,
+        http_p99: String,
+        bars: Vec<TrafficBar>,
+        errors: Vec<ErrorView>,
+        sampled_age: String,
+        history_samples: usize,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_monitoring.html")]
+    struct ConsoleMonitoring {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        view: MonitoringView,
+    }
+
+    #[derive(Template)]
+    #[template(path = "_monitoring_panel.html")]
+    struct ConsoleMonitoringPanel {
+        view: MonitoringView,
+    }
+
+    fn format_bytes(bytes: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+        let mut value = bytes as f64;
+        let mut unit = 0;
+        while value >= 1024.0 && unit < UNITS.len() - 1 {
+            value /= 1024.0;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{bytes} {}", UNITS[unit])
+        } else {
+            format!("{value:.1} {}", UNITS[unit])
+        }
+    }
+
+    fn format_latency(micros: u64) -> String {
+        if micros == u64::MAX {
+            return "> 5 s".into();
+        }
+        if micros >= 1_000_000 {
+            format!("{:.2} s", micros as f64 / 1_000_000.0)
+        } else if micros >= 1_000 {
+            format!("{:.1} ms", micros as f64 / 1_000.0)
+        } else {
+            format!("{micros} µs")
+        }
+    }
+
+    fn format_age(now_ms: u64, then_ms: u64) -> String {
+        if then_ms == 0 {
+            return "never".into();
+        }
+        let seconds = now_ms.saturating_sub(then_ms) / 1_000;
+        match seconds {
+            0..=59 => format!("{seconds}s ago"),
+            60..=3_599 => format!("{}m ago", seconds / 60),
+            3_600..=86_399 => format!("{}h ago", seconds / 3_600),
+            _ => format!("{}d ago", seconds / 86_400),
+        }
+    }
+
+    async fn monitoring_view(state: &AppState) -> MonitoringView {
+        let (networks, connected) = bnc_counts(state);
+        let current = state.telemetry.snapshot(networks, connected);
+        let pool = pool_of(state);
+        let since_ms = current.sampled_at_ms.saturating_sub(60 * 60 * 1_000);
+        let started = Instant::now();
+        let (mut history, database_ready) =
+            match crate::db::list_observability_samples(pool, since_ms, current.sampled_at_ms, 240)
+                .await
+            {
+                Ok(history) => (history, true),
+                Err(error) => {
+                    state
+                        .telemetry
+                        .record_error(crate::observability::ErrorKind::Database);
+                    eprintln!("monitoring console history query failed: {error}");
+                    (Vec::new(), false)
+                }
+            };
+        state.telemetry.record_database_request(started.elapsed());
+        history.push(current.clone());
+
+        let elapsed_seconds = history
+            .first()
+            .map(|first| current.sampled_at_ms.saturating_sub(first.sampled_at_ms) / 1_000)
+            .unwrap_or(0)
+            .max(1);
+        let first = history.first().unwrap_or(&current);
+        let inbound_rate = current
+            .irc_bytes_in_total
+            .saturating_sub(first.irc_bytes_in_total)
+            / elapsed_seconds;
+        let outbound_rate = current
+            .irc_bytes_out_total
+            .saturating_sub(first.irc_bytes_out_total)
+            / elapsed_seconds;
+
+        let deltas: Vec<(u64, u64, u64)> = history
+            .windows(2)
+            .map(|pair| {
+                (
+                    pair[1]
+                        .irc_bytes_in_total
+                        .saturating_sub(pair[0].irc_bytes_in_total),
+                    pair[1]
+                        .irc_bytes_out_total
+                        .saturating_sub(pair[0].irc_bytes_out_total),
+                    pair[1].sampled_at_ms,
+                )
+            })
+            .rev()
+            .take(48)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let peak = deltas
+            .iter()
+            .map(|(inbound, outbound, _)| inbound.max(outbound))
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let bars = deltas
+            .into_iter()
+            .map(|(inbound, outbound, sampled_at)| TrafficBar {
+                inbound_height: (inbound.saturating_mul(100) / peak).max(u64::from(inbound > 0)),
+                outbound_height: (outbound.saturating_mul(100) / peak).max(u64::from(outbound > 0)),
+                age: format_age(current.sampled_at_ms, sampled_at),
+            })
+            .collect();
+        let errors = current
+            .errors
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(kind, count)| ErrorView {
+                kind: kind.replace('_', " "),
+                count: *count,
+                last_seen: format_age(
+                    current.sampled_at_ms,
+                    current.error_last_seen_ms.get(kind).copied().unwrap_or(0),
+                ),
+            })
+            .collect();
+        let error_total = current.errors.values().sum();
+        MonitoringView {
+            core_ready: state.telemetry.core_is_fresh(Duration::from_secs(45)),
+            database_ready,
+            active_connections: current.active_connections,
+            registered_connections: current.registered_connections,
+            channels: current.channels,
+            opened_total: current.connections_opened_total,
+            rejected_total: current.connections_rejected_total,
+            traffic_in: format_bytes(current.irc_bytes_in_total),
+            traffic_out: format_bytes(current.irc_bytes_out_total),
+            upstream_in: format_bytes(current.bnc_bytes_in_total),
+            upstream_out: format_bytes(current.bnc_bytes_out_total),
+            inbound_rate: format!("{}/s", format_bytes(inbound_rate)),
+            outbound_rate: format!("{}/s", format_bytes(outbound_rate)),
+            http_requests: current.http_requests_total,
+            database_requests: current.database_requests_total,
+            bnc_connected: current.bnc_connected,
+            bnc_networks: current.bnc_networks,
+            bnc_clients: current.bnc_client_connections,
+            error_total,
+            sendq_kills: current.sendq_kills_total,
+            core_p50: format_latency(current.core_latency.p50_us),
+            core_p95: format_latency(current.core_latency.p95_us),
+            core_p99: format_latency(current.core_latency.p99_us),
+            database_p50: format_latency(current.database_latency.p50_us),
+            database_p95: format_latency(current.database_latency.p95_us),
+            database_p99: format_latency(current.database_latency.p99_us),
+            http_p50: format_latency(current.http_latency.p50_us),
+            http_p95: format_latency(current.http_latency.p95_us),
+            http_p99: format_latency(current.http_latency.p99_us),
+            bars,
+            errors,
+            sampled_age: format_age(current.sampled_at_ms, current.sampled_at_ms),
+            history_samples: history.len().saturating_sub(1),
+        }
+    }
+
+    pub async fn console_monitoring(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let (account, csrf) = match page_actor(&state, &headers, true).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+        let view = monitoring_view(&state).await;
+        render_private(ConsoleMonitoring {
+            account,
+            csrf,
+            is_admin: true,
+            active: "monitoring",
+            view,
+        })
+    }
+
+    pub async fn console_monitoring_panel(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        if let Err(response) = page_actor(&state, &headers, true).await {
+            return response;
+        }
+        render_private(ConsoleMonitoringPanel {
+            view: monitoring_view(&state).await,
         })
     }
 
@@ -950,6 +1382,10 @@ mod pages {
         registration_before_connect: Option<String>,
         #[serde(default)]
         registration_require_email: Option<String>,
+        #[serde(default)]
+        observability_enabled: Option<String>,
+        observability_sample_interval_seconds: u64,
+        observability_retention_hours: u64,
     }
 
     fn optional_number(value: &str, field: &str) -> Result<Option<usize>, String> {
@@ -1087,6 +1523,11 @@ mod pages {
                     &form.registration_burst,
                     "Registration burst",
                 )?,
+            },
+            observability: crate::config::ObservabilityConfig {
+                enabled: form.observability_enabled.is_some(),
+                sample_interval_seconds: form.observability_sample_interval_seconds,
+                retention_hours: form.observability_retention_hours,
             },
             bnc_addr,
             public_url: (!form.public_url.trim().is_empty())
@@ -1330,6 +1771,7 @@ mod pages {
         }
         let mut restart_comparison = current.settings.clone();
         restart_comparison.bnc_addr = settings.bnc_addr;
+        restart_comparison.observability = settings.observability.clone();
         let restart_required = restart_comparison != settings;
         let detail = format!(
             "revision {}; BNC listener {}; restart {}",

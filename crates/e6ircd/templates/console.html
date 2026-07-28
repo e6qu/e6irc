@@ -3,9 +3,21 @@
         {% if let Some(err) = error %}
           <p class="banner-error" role="alert">{{ err }}</p>
         {% endif %}
-        <h1 id="overview">{{ server_name }}</h1>
-        <p class="meta">Network <strong>{{ network_name }}</strong> · e6ircd {{ version }}</p>
-        <div class="cards">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Server administration</p>
+            <h1 id="overview">{{ server_name }}</h1>
+            <p class="lede">Network <strong>{{ network_name }}</strong> · e6ircd {{ version }}</p>
+          </div>
+          <a class="button-link" href="/console/monitoring">Open monitoring</a>
+        </div>
+        <div class="metric-grid overview-metrics">
+          <div class="metric-card"><span class="metric-label">Live IRC connections</span><strong>{{ live_connections }}</strong><small>Current core sessions</small></div>
+          <div class="metric-card"><span class="metric-label">Connected upstreams</span><strong>{{ live_upstreams }}</strong><small>Always-on networks</small></div>
+          <div class="metric-card"><span class="metric-label">Traffic since start</span><strong>{{ live_traffic }}</strong><small>IRC and BNC, both directions</small></div>
+          <div class="metric-card {% if live_errors > 0 %}metric-alert{% endif %}"><span class="metric-label">Operational errors</span><strong>{{ live_errors }}</strong><small>Since process start</small></div>
+        </div>
+        <div class="cards inventory-cards">
           <div class="card"><div class="n">{{ stat_accounts }}</div><div class="l">Accounts</div></div>
           <div class="card"><div class="n">{{ stat_channels }}</div><div class="l">Registered channels</div></div>
           <div class="card"><div class="n">{{ stat_server_bans }}</div><div class="l">Server bans</div></div>

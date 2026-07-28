@@ -43,6 +43,7 @@ pub(super) async fn ws_irc(
     // connection's lifetime and releases the slot on drop.
     let ip = client_ip(peer.ip(), &headers, &state.trusted_proxies);
     let Some(guard) = state.conn_limiter.try_acquire(ip) else {
+        state.telemetry.record_connection_rejected();
         return problem(
             StatusCode::TOO_MANY_REQUESTS,
             "Per-IP connection limit reached",
@@ -151,6 +152,9 @@ pub(super) async fn ws_irc_conn(
                     },
                 };
                 if sent.is_err() {
+                    state
+                        .telemetry
+                        .record_error(crate::observability::ErrorKind::Write);
                     break;
                 }
             }
@@ -160,7 +164,13 @@ pub(super) async fn ws_irc_conn(
                     Some(Ok(WsMessage::Text(t))) => t.as_bytes().to_vec(),
                     Some(Ok(WsMessage::Binary(b))) => b.to_vec(),
                     Some(Ok(_)) => continue,
-                    _ => break, // close or error
+                    Some(Err(_)) => {
+                        state
+                            .telemetry
+                            .record_error(crate::observability::ErrorKind::Read);
+                        break;
+                    }
+                    None => break,
                 };
                 let mut with_nl = data;
                 with_nl.push(b'\n');
