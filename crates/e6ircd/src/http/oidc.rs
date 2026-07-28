@@ -1128,7 +1128,7 @@ pub(super) fn same_origin(a: &str, b: &str) -> bool {
 
 /// Frame/MIME/referrer protections for every HTML/app response. Uses only
 /// `frame-ancestors 'none'` (not a resource-restricting CSP), so it stops
-/// clickjacking without breaking the htmx app's script/style/WebSocket loads.
+/// clickjacking without breaking the chat app's script/style/WebSocket loads.
 /// The auth pages layer a stricter `default-src 'none'` CSP on top.
 pub(super) fn security_headers(headers: &mut axum::http::HeaderMap) {
     headers.insert(

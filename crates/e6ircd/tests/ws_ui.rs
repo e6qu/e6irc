@@ -27,8 +27,8 @@ async fn upstream() -> std::net::SocketAddr {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn ws_ui_streams_fragments_and_relays_composer() {
-    let url = support::test_db("ws_ui_streams_fragments_and_relays_composer").await;
+async fn ws_ui_streams_json_events_and_relays_composer() {
+    let url = support::test_db("ws_ui_streams_json_events_and_relays_composer").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -273,7 +273,7 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     let (mut ws, _) = tokio_tungstenite::connect_async(req)
         .await
         .expect("ws/ui connect");
-    // Drain the initial status/backlog fragments.
+    // Drain the initial status/backlog event.
     let _ = tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await;
 
     // Remove the network.
@@ -286,7 +286,7 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     .await;
     assert_eq!(status, 204, "network delete");
 
-    // The socket must detach promptly — either a "network removed" fragment or a
+    // The socket must detach promptly — either a "network removed" event or a
     // clean close — not hang open forever.
     let detached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

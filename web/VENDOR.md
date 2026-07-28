@@ -11,12 +11,8 @@ Build:
 cd web && pnpm install && pnpm build   # -> web/dist (content-hashed)
 ```
 
-## Runtime dependencies (bundled into `dist`)
-
-| Package         | Version | License | Source |
-|-----------------|---------|---------|--------|
-| htmx.org        | 2.0.10  | 0BSD    | https://github.com/bigskysoftware/htmx |
-| htmx-ext-ws     | 2.0.4   | 0BSD    | https://github.com/bigskysoftware/htmx-extensions |
+The production bundle has no runtime package dependencies; the chat client is
+implemented with browser DOM and WebSocket APIs.
 
 Build-only: `vite` 8.1.5 (MIT). Test-only: `playwright` 1.61.1
 (Apache-2.0, published 2026-06-23). Playwright drives a real Chromium browser
@@ -26,4 +22,4 @@ clients cannot verify browser cookies, redirects, accessible controls, reload,
 and click navigation together, which is why this development dependency is
 needed. All licenses are permissive and compatible with e6irc's
 AGPL-3.0-or-later. Exact integrity hashes are in `pnpm-lock.yaml`; update it
-(and this table) whenever a version changes.
+whenever a version changes.

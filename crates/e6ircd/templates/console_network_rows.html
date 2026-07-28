@@ -1,4 +1,3 @@
-{# The BNC networks table body — swapped in by htmx after add/delete. #}
 {% if networks.is_empty() %}
   <tbody id="cnetworks"><tr><td colspan="6" class="empty">No networks yet. Add one above.</td></tr></tbody>
 {% else %}
@@ -13,23 +12,17 @@
         <td><code>{{ n.addr }}</code>{% if n.tls %} <span class="tag">TLS</span>{% endif %}</td>
         <td><code>{{ n.nick }}</code></td>
         <td>{% if n.autojoin.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ n.autojoin }}</code>{% endif %}</td>
-        <td>
+        <td class="row-actions">
           {% if n.editable %}<a class="rowlink" href="/console/networks/{{ n.name }}/edit">Edit</a>{% endif %}
-          <button
-            hx-post="/console/networks/{{ n.name }}/toggle"
-            hx-vals='{"enabled": "{% if n.enabled %}false{% else %}true{% endif %}"}'
-            hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
-            hx-target="#cnetworks"
-            hx-swap="outerHTML"
-          >{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
-          <button
-            class="danger"
-            hx-delete="/console/networks/{{ n.name }}"
-            hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
-            hx-target="#cnetworks"
-            hx-swap="outerHTML"
-            hx-confirm="Remove network {{ n.name }}?"
-          >Remove</button>
+          <form method="post" action="/console/networks/{{ n.name }}/toggle">
+            <input type="hidden" name="csrf" value="{{ csrf }}" />
+            <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
+            <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
+          </form>
+          <form method="post" action="/console/networks/{{ n.name }}/delete" data-confirm="Remove network {{ n.name }}? This also stops its live connection.">
+            <input type="hidden" name="csrf" value="{{ csrf }}" />
+            <button class="danger" type="submit">Remove</button>
+          </form>
         </td>
       </tr>
     {% endfor %}

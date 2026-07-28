@@ -30,13 +30,8 @@
               <p>Credentials are encrypted before they are stored. The connection starts immediately.</p>
             </div>
           </div>
-        <form
-          class="network-form"
-          hx-post="/console/networks"
-          hx-headers='{"X-CSRF-Token": "{{ csrf }}"}'
-          hx-target="#cnetworks"
-          hx-swap="outerHTML"
-        >
+        <form class="network-form" method="post" action="/console/networks">
+          <input type="hidden" name="csrf" value="{{ csrf }}" />
           <label class="field">
             <span>Network name</span>
             <input name="name" autocomplete="off" placeholder="Libera Chat" required />

@@ -303,7 +303,8 @@ interface client (`e6irc-tui`).
 admin, OpenAPI spec).
 
 **embed-web** — the build feature that bakes the built web client
-(`web/dist`, a Vite + htmx bundle) into the binary and serves it at `/`;
+(`web/dist`, a vanilla JavaScript bundle produced by Vite) into the binary and
+serves it at `/`;
 off by default so assets can be hosted separately.
 
 ---

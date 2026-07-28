@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>e6irc — console</title>
-    <script src="/htmx.min.js" defer></script>
+    <script src="/console.js" defer></script>
     <style>
       :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2563eb;
         --accent-strong: #1d4ed8; --bg: #f5f7fa; --fg: #16181d; --panel: #fff;
@@ -196,6 +196,36 @@
       .monitoring-foot { display: flex; gap: 0.8rem; justify-content: flex-end; color: var(--muted);
         font-size: 0.78rem; margin-top: -0.75rem; }
       .monitoring-foot a { color: var(--accent); text-decoration: none; }
+      .access-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+      .access-grid .panel { margin-top: 0; }
+      .inline-create { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end;
+        gap: 0.65rem; margin: 1rem 0; }
+      .secret-reveal { display: grid; grid-template-columns: minmax(12rem, 0.55fr) minmax(0, 1fr);
+        gap: 1rem; align-items: center; padding: 1rem 1.2rem; margin: 0 0 1.2rem;
+        color: var(--fg); background: color-mix(in srgb, var(--ok) 10%, var(--panel));
+        border: 1px solid color-mix(in srgb, var(--ok) 45%, var(--border)); border-radius: 0.75rem; }
+      .secret-reveal p { margin: 0.25rem 0 0; color: var(--muted); }
+      .secret-value { display: flex; gap: 0.6rem; align-items: center; min-width: 0; }
+      .secret-value code { flex: 1; min-width: 0; overflow-wrap: anywhere; padding: 0.7rem 0.8rem;
+        background: var(--panel); border: 1px solid var(--border); border-radius: 0.5rem; user-select: all; }
+      .provider-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; margin: 1rem 0; }
+      .secondary-link { background: transparent; color: var(--accent); }
+      .identity-list { display: grid; gap: 0.6rem; margin-top: 1rem; }
+      .identity-list article { display: flex; justify-content: space-between; align-items: center;
+        gap: 1rem; padding: 0.75rem 0.85rem; background: var(--panel-subtle);
+        border: 1px solid var(--border); border-radius: 0.55rem; }
+      .identity-list article > div { display: grid; min-width: 0; }
+      .identity-list code { overflow-wrap: anywhere; color: var(--muted); }
+      .identity-list small, .section-note { color: var(--muted); }
+      .section-note { margin: 0.8rem 0 0; font-size: 0.82rem; }
+      .marker-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px; margin-top: 1rem; overflow: hidden; background: var(--border);
+        border: 1px solid var(--border); border-radius: 0.55rem; }
+      .marker-grid > div { display: flex; justify-content: space-between; gap: 0.75rem;
+        padding: 0.6rem 0.75rem; background: var(--panel-subtle); }
+      .marker-grid span { color: var(--muted); font-size: 0.8rem; }
+      .refresh-status { color: var(--muted); font-size: 0.78rem; min-height: 1.3rem; }
+      .refresh-status.refresh-error { color: var(--off); }
       @media (max-width: 40rem) {
         .layout { flex-direction: column; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
@@ -207,8 +237,10 @@
         .network-form, .field-grid, .settings-section, .connection-card,
         .inline-config-form, .oidc-form { grid-template-columns: 1fr; }
         .bootstrap-card, .health-strip, .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .monitoring-columns { grid-template-columns: 1fr; }
+        .monitoring-columns, .access-grid, .secret-reveal { grid-template-columns: 1fr; }
         .error-grid { grid-template-columns: 1fr; }
+        .inline-create, .marker-grid { grid-template-columns: 1fr; }
+        .identity-list article, .secret-value { align-items: stretch; flex-direction: column; }
         .field-wide { grid-column: auto; }
       }
     </style>
@@ -235,12 +267,11 @@
         <div class="section">You</div>
         <a href="/console/networks"{% if active == "networks" %} class="active"{% endif %}>BNC networks</a>
         <a href="/console/my-sessions"{% if active == "my-sessions" %} class="active"{% endif %}>Your sessions</a>
-        <a href="/account">Account &amp; keys</a>
+        <a href="/console/account"{% if active == "account" %} class="active"{% endif %}>Account &amp; access</a>
       </nav>
       <main>
         {% block main %}{% endblock %}
       </main>
     </div>
-    {% include "_toast.html" %}
   </body>
 </html>

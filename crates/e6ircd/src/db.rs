@@ -339,6 +339,19 @@ pub async fn issue_app_password(
         VerifyOutcome::Rejected => return Err(DbError::BadCredentials),
         VerifyOutcome::Unavailable => return Err(DbError::Query(sqlx::Error::PoolClosed)),
     }
+    issue_app_password_for_account(pool, account, label).await
+}
+
+/// Mint an app password for an account whose browser session has already been
+/// authenticated. The HTTP console exposes this only after cookie
+/// authentication and body-CSRF verification; keeping the minting primitive
+/// here lets the password-verified REST path and session-verified UI path share
+/// the same cap, lock, hashing, and storage transaction.
+pub async fn issue_app_password_for_account(
+    pool: &PgPool,
+    account: &str,
+    label: &str,
+) -> Result<String, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut secret_bytes = [0u8; 32];
     use argon2::password_hash::rand_core::RngCore;
@@ -362,8 +375,8 @@ pub async fn issue_app_password(
             .fetch_optional(&mut *tx)
             .await
             .map_err(DbError::Query)?;
-    // The account row was gone (deleted since the password verify): reject
-    // rather than hand back an app password that was never stored.
+    // The account row was gone (deleted since authentication): reject rather
+    // than hand back an app password that was never stored.
     let Some(account_id) = account_id else {
         return Err(DbError::BadCredentials);
     };
@@ -1036,22 +1049,95 @@ pub enum LinkOutcome {
     Conflict,
 }
 
-/// Every OIDC identity linked to `account` as `(issuer, subject)`, ordered
-/// for stable listing.
+/// One linked OIDC identity: `(id, issuer, subject, created_at RFC3339)`.
+pub type OidcIdentityRow = (i64, String, String, String);
+
+/// Every OIDC identity linked to `account`, ordered for stable listing.
 pub async fn list_oidc_identities(
     pool: &PgPool,
     account: &str,
-) -> Result<Vec<(String, String)>, DbError> {
+) -> Result<Vec<OidcIdentityRow>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     sqlx::query_as(
-        "SELECT o.issuer, o.subject
+        "SELECT o.id, o.issuer, o.subject,
+                to_char(o.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
          FROM oidc_identities o JOIN accounts a ON a.id = o.account_id
-         WHERE a.name_folded = $1 ORDER BY o.issuer, o.subject",
+         WHERE a.name_folded = $1 ORDER BY o.issuer, o.subject, o.id",
     )
     .bind(&folded)
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnlinkIdentityOutcome {
+    Unlinked,
+    LastIdentity,
+    NotFound,
+}
+
+/// Remove one linked identity owned by `account`, refusing to remove the last
+/// browser-login path. The account row serializes concurrent unlinks, so two
+/// requests cannot both observe a count of two and remove both identities.
+/// Sessions asserted by the removed identity are revoked in the same
+/// transaction; unlinking cannot leave an already-authenticated back door.
+pub async fn unlink_oidc_identity(
+    pool: &PgPool,
+    account: &str,
+    identity_id: i64,
+) -> Result<UnlinkIdentityOutcome, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+    let Some(account_id) = account_id else {
+        return Ok(UnlinkIdentityOutcome::NotFound);
+    };
+    let identity: Option<(String, String)> = sqlx::query_as(
+        "SELECT issuer, subject FROM oidc_identities
+         WHERE id = $1 AND account_id = $2",
+    )
+    .bind(identity_id)
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((issuer, subject)) = identity else {
+        return Ok(UnlinkIdentityOutcome::NotFound);
+    };
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM oidc_identities WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+    if count <= 1 {
+        return Ok(UnlinkIdentityOutcome::LastIdentity);
+    }
+    sqlx::query("DELETE FROM oidc_identities WHERE id = $1 AND account_id = $2")
+        .bind(identity_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM web_sessions
+         WHERE account_id = $1 AND oidc_issuer = $2 AND oidc_subject = $3",
+    )
+    .bind(account_id)
+    .bind(issuer)
+    .bind(subject)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(UnlinkIdentityOutcome::Unlinked)
 }
 
 /// Attach an OIDC `(issuer, subject)` to `account`. Because the pair is

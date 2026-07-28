@@ -24,8 +24,7 @@
                       {# nick read from the data-attribute at runtime, never
                          concatenated into JS source. #}
                       <form class="cell-form" method="post" action="{{ kill_action }}"
-                            data-nick="{{ s.nick }}"
-                            onsubmit="return confirm('Disconnect ' + this.dataset.nick + '?')">
+                            data-confirm="Disconnect {{ s.nick }}?">
                         <input type="hidden" name="csrf" value="{{ csrf }}" />
                         <input type="hidden" name="nick" value="{{ s.nick }}" />
                         <input type="text" name="reason" placeholder="reason" />

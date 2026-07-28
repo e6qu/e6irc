@@ -53,12 +53,8 @@
                         <td><code>{{ n.owner }}</code></td>
                         <td>
                           {% if n.deletable %}
-                            {# name is read from the data-attribute at runtime (a DOM
-                               string), never concatenated into JS source, so it cannot
-                               break out of the confirm() call's string context. #}
                             <form method="post" action="/console/integrations/delete"
-                                  data-name="{{ n.name }}"
-                                  onsubmit="return confirm('Remove bridge ' + this.dataset.name + '?')">
+                                  data-confirm="Remove bridge {{ n.name }}?">
                               <input type="hidden" name="csrf" value="{{ csrf }}" />
                               <input type="hidden" name="name" value="{{ n.name }}" />
                               <button class="danger" type="submit">Remove</button>

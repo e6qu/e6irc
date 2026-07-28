@@ -1,8 +1,8 @@
 # e6irc — Design
 
 A monolithic Rust IRC daemon with a built-in REST API, web backend (OIDC login),
-and per-user BNC hosting — plus a CLI client, a TUI client, and an HTMX web
-client bundled with Vite.
+and per-user BNC hosting — plus a CLI client, a TUI client, and a vanilla
+JavaScript web client bundled with Vite.
 
 License: **AGPL-3.0-or-later**. All compiled-in dependencies must be
 AGPL-compatible (permissive licenses are fine; license compliance is enforced
@@ -18,7 +18,7 @@ glossary of IRC, OpenID Connect, and deployment vocabulary used here.
 - **One binary** (`e6ircd`) that is simultaneously:
   - a modern IRCv3 server (single server = the whole network, no S2S linking),
   - an HTTP server exposing a versioned REST API,
-  - the web backend for the HTMX web client (server-rendered fragments),
+  - the web backend for the browser chat client and server-rendered console,
   - an OIDC relying party (web users log in via registered OIDC providers),
   - a BNC host: always-on sessions on the local server, ZNC/soju-style
     bouncer connections to **external IRC networks**, and (via the same
@@ -202,12 +202,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     `deny_hidden` helper, which answers `ERR_NOSUCHCHANNEL`. No surface can
     hand-pick a different numeric (a `TOPIC` query once returned 442, confirming
     the channel exists — an existence oracle); the token has no other consumer.
-  - `CsrfVerified` — a cookie-authenticated request whose `x-csrf-token` header
-    validates, as a `FromRequestParts` extractor. An htmx form-POST handler is
-    CSRF-checked because it *asks for* the type in its signature, not because
-    the author opened the body with a manual check — the same shape as
-    `Authenticated`/`AdminAccount`, one rung over (a new `pages::*` form handler
-    that omits it fails to compile for want of the account argument).
+  - `require_form_actor` — the one precondition shared by every
+    server-rendered mutation: resolve the cookie account and verify the
+    submitted session-bound CSRF token before returning an actor. Forms carry
+    the token in their body, so standard browser submissions work without a
+    feature-gated client runtime.
   - `RateLimited` — a request that has spent one token from the per-IP
     auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
     work-inducing route declares the throttle by asking for `_: RateLimited`
@@ -312,8 +311,8 @@ shared helpers through `use super::*`, and items crossing a module boundary are
  (irssi, weechat,       │        │                           │  IRC core     │                     │
   e6irc-cli/tui)        │        ▼                           │  (channels,   │                     │
                         │  Session multiplexer ◀────────────▶│   users,      │                     │
- Browsers ──443────────▶│  (attach/detach, playback)         │   modes,      │                     │
-  (HTMX web client)     │        │                           │   services)   │                     │
+Browsers ──443────────▶│  (attach/detach, playback)         │   modes,      │                     │
+  (chat + console)      │        │                           │   services)   │                     │
                         │        │ network drivers           └───────┬───────┘                     │
                         │        ├─ local     (in-process)           │                             │
                         │        ├─ irc       (Libera, OFTC, …) ─────┼──────▶ outbound TLS         │
@@ -321,7 +320,7 @@ shared helpers through `use super::*`, and items crossing a module boundary are
                         │        ├─ discord   (feature flag)         │                             │
                         │        └─ slack     (feature flag)         │                             │
                         │                                            │                             │
-                        │  HTTP (axum): REST /api/v1 · OIDC · HTMX fragments · WS · [static]      │
+                        │  HTTP (axum): REST /api/v1 · OIDC · askama pages · WS · [static]        │
                         │                                            │                             │
                         │  History/write pipeline ── batched ────────┴──▶ PostgreSQL              │
                         └──────────────────────────────────────────────────────────────────────────┘
@@ -351,7 +350,7 @@ e6irc/
 │   │                         #   OAUTHBEARER device flow), chathistory (shared by CLI/TUI)
 │   ├── e6irc-cli/            # scripting-oriented CLI client binary
 │   └── e6irc-tui/            # ratatui TUI client binary
-├── web/                      # Vite project (HTMX shell, CSS, minimal JS)
+├── web/                      # Vite project (vanilla JavaScript chat client)
 ├── migrations/               # sqlx migrations (embedded in binary)
 ├── tools/                    # dev/CI scripts (compat harness, load generator)
 ├── DESIGN.md · PLAN.md · BUGS.md
@@ -373,7 +372,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | HTTP | **axum** + tower | Thin over hyper, tower middleware for auth/rate limits; no needless layers. |
 | Database | **sqlx** (postgres + rustls features only) | Async, compile-time-checked queries, embedded migrations. |
 | Templates | **askama** | Compile-time templates → fast, no runtime template engine in the binary. |
-| Web client | **HTMX** for the server-rendered management pages; a small vanilla-JS IRC client for live chat, bundled by **Vite** | No SPA framework; server-rendered where state is the server's, client-parsed where it's the client's (chat buffers/nick lists). |
+| Web client | **askama + standard forms** for server-rendered management; a small first-party runtime for confirmation/copy/refresh; vanilla-JS live chat bundled by **Vite** | No SPA framework or production package dependency; server-rendered where state is the server's, client-parsed where it is the client's (chat buffers/nick lists). |
 | TUI | **ratatui** + crossterm | Standard, portable. |
 | Passwords | **argon2** (argon2id) | For local passwords and hashed app passwords. |
 | OIDC | **openidconnect** crate | Certified-flow implementation of code+PKCE, discovery, JWKS. |
@@ -840,9 +839,9 @@ supplied.
   never on email.
 - Local-account login form (argon2id verify) for accounts without OIDC.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
-  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing fragment/API
-  routes require the custom header htmx always sends (`HX-Request`) plus
-  origin check; plain-form POSTs carry a per-session token.
+  `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
+  server-rendered forms carry a per-session HMAC token in the request body and
+  reject a missing or invalid token before mutation.
 - The embedded application entry point was an authentication boundary. A
   valid local session rendered the client; otherwise a single configured
   provider's ordinary authorization flow began immediately. An existing
@@ -882,7 +881,7 @@ CERTFP is explicitly out of scope for v1 (not selected).
 ### 9.4 REST API authentication
 
 Personal access tokens (hashed at rest, scoped, expiring) via
-`Authorization: Bearer`, or the web session cookie (for the HTMX client,
+`Authorization: Bearer`, or the web session cookie (for the browser clients,
 with the CSRF rules above). Admin endpoints additionally require the
 account's admin flag. The same admin-gated data is also served as a
 server-rendered management **console** at `/console` (accounts, registered
@@ -903,7 +902,16 @@ counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
 *their own* connected clients: the core scopes the snapshot to the caller's
 account and refuses a self-service kill of a session not authenticated as the
 caller, so it can never touch anyone else's. The console shell (`console_base.html`) is
-also contains `/console/configuration`, the database-backed operational control
+also home to `/console/account`, the complete self-service surface for creating
+and revoking app passwords and personal access tokens, linking and safely
+unlinking login identities, and inspecting persisted read markers. App
+passwords and tokens are displayed exactly once; only hashes are retained.
+Identity unlink is transactional: the account row serializes concurrent
+requests, the last login identity cannot be removed, and sessions asserted by
+the removed identity are revoked in the same transaction. The old `/account`
+URL is an authenticated redirect to this canonical page.
+
+The shell also contains `/console/configuration`, the database-backed operational control
 plane. Its singleton `server_settings` row is a typed JSON document with an
 optimistic-concurrency revision, actor, and timestamp; every committed revision
 also writes a redacted `CONFIG` audit entry in the same transaction. The
@@ -1095,7 +1103,7 @@ Surface (initial):
 
 - `auth`: OIDC start/callback, device-flow bootstrap, logout
 - `me`: profile, credentials (app passwords CRUD — secret shown once),
-  API tokens CRUD, OIDC identity linking
+  API tokens CRUD, OIDC identity link/list/unlink
 - `networks`: BNC network CRUD (+ enable/disable, status), buffers list,
   read-marker get/set
 - `channels`: registered-channel management (access flags, topic, mlock)
@@ -1110,14 +1118,19 @@ always served (no feature gate, no utoipa dependency).
 
 ---
 
-## 13. Web client (HTMX + Vite)
+## 13. Web client (askama + vanilla JavaScript + Vite)
 
 ### 13.1 Model
 
 Two surfaces, both without an SPA framework. The **management** pages —
 login, the user account section, and the `/console` admin/BNC/integrations
-console — are server-rendered askama pages/fragments driven by **htmx**. The
-**live chat client** is a small hand-written vanilla-JS IRC client (`web/src`,
+console — are server-rendered askama pages using standard form submissions and
+Post/Redirect/Get. An always-served, same-origin `/console.js` handles only
+progressive enhancements: destructive-action confirmation, one-time-secret
+copying, and monitoring refresh with explicit failure state. The console
+therefore works in the default build as well as `embed-web`, and its private
+pages use a CSP that permits only that same-origin script. The **live chat
+client** is a small hand-written vanilla-JS IRC client (`web/src`,
 bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list
 state are naturally client state. The socket reconnects with backoff so a
@@ -1147,14 +1160,14 @@ same artifact:
    binary at `/`, immutable cache headers keyed on the content hashes.
 2. **Static storage (S3/CDN)**: `dist/` is uploaded as-is;
    `VITE_API_BASE` is injected at build time so the shell targets the API
-   origin. Because fragments/WS must hit the server anyway, the recommended
+   origin. Because the WebSocket and console must hit the server anyway, the recommended
    topology is same-origin via CDN path routing (`/assets/*` → S3, rest →
    e6ircd); a true cross-origin split is supported (CORS allowlist +
    `SameSite=None` cookies) but documented as second choice.
 
 ### 13.4 IRC-over-WebSocket (always compiled)
 
-Separately from the HTMX UI socket, expose the IRCv3 WebSocket text
+Alongside the application-specific `/ws/ui` socket, expose the IRCv3 WebSocket text
 encoding at `/ws/irc` so existing web IRC clients (e.g. gamja) can connect
 directly. Cheap to provide (same parser, same session path as TCP).
 
@@ -1250,8 +1263,9 @@ driver up/down state, and cumulative core/database/HTTP latency histograms.
 
 The snapshot is the sole source for:
 
-- `/console/monitoring`, an administrator-only htmx view refreshed every ten
-  seconds with health, traffic, connections, latency, upstreams, and errors;
+- `/console/monitoring`, an administrator-only server-rendered view refreshed
+  every ten seconds by `/console.js`, with health, traffic, connections,
+  latency, upstreams, and errors; refresh failures remain visibly actionable;
 - `/api/v1/admin/observability`, authenticated JSON with the current snapshot
   and at most 1,000 bounded historical points;
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
@@ -1311,9 +1325,9 @@ Layers, bottom to top:
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
    running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
    over real sockets, including TLS.
-8. **UI tests**: Playwright (dev tooling inside `web/`) drives the HTMX
-   client in a headless browser against a running server — login, live
-   message receive over `/ws/ui`, user-section CRUD.
+8. **UI tests**: Playwright (dev tooling inside `web/`) drives the browser
+   client in headless Chromium against a running server — login, live
+   message receive over `/ws/ui`, and self-service CRUD.
 9. **Load**: `tools/load/` tokio flood-client; CI perf job at reduced scale,
    manual 100k-connection benchmark procedure documented with target
    numbers (connect rate, fan-out p99, RSS/connection).
@@ -1378,5 +1392,4 @@ Layers, bottom to top:
 - irctest: https://github.com/progval/irctest
 - soju (BNC prior art): https://soju.im · ZNC: https://znc.in
 - SASL OAUTHBEARER: RFC 7628 · OAuth device grant: RFC 8628
-- htmx WebSocket extension: https://htmx.org/extensions/ws/
 - Terminology glossary: [`docs/terminology.md`](docs/terminology.md)
