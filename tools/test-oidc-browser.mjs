@@ -122,13 +122,30 @@ try {
       body: JSON.stringify({ status: 503, title: "Database unavailable" }),
     });
   });
+  const deliberateFailureErrorStart = browserErrors.length;
+  const deliberateFailureResponse = page.waitForResponse(
+    (response) =>
+      response.url() === `${applicationOrigin}/api/v1/me/networks` &&
+      response.status() === 503,
+  );
   await page.reload();
+  await deliberateFailureResponse;
   await page.locator('[data-alert="networks"]').waitFor();
   assert.match(await page.locator("#messages").innerText(), /API failure, not an empty account/);
   assert.match(await page.locator('[data-alert="networks"]').innerText(), /Database unavailable/);
   assert.equal(
     await page.locator("#network-select option").first().textContent(),
     "Networks unavailable",
+  );
+  const deliberateFailureErrors = browserErrors.splice(deliberateFailureErrorStart);
+  assert.equal(
+    deliberateFailureErrors.length,
+    1,
+    `the deliberate 503 produced unexpected browser errors: ${deliberateFailureErrors.join("; ")}`,
+  );
+  assert.match(
+    deliberateFailureErrors[0],
+    /^Failed to load resource: the server responded with a status of 503 \(Service Unavailable\)$/,
   );
   await page.unroute(`${applicationOrigin}/api/v1/me/networks`);
   await page.reload();
