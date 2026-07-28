@@ -159,30 +159,50 @@ async fn driver_reconnects_after_upstream_drop() {
 /// victim's bouncer flapping by sending one high-byte message.
 #[tokio::test(flavor = "multi_thread")]
 async fn upstream_non_utf8_line_is_relayed_not_fatal() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        // The driver's handshake is small and fits the socket buffer, so its
-        // writes never block before we start reading.
-        sock.write_all(b":up 001 bncbot :welcome\r\n")
+    let (send_lines, lines_requested) = tokio::sync::oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let (read, mut write) = sock.into_split();
+        let mut read = tokio::io::BufReader::new(read);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let bytes_read = read.read_until(b'\n', &mut line).await.unwrap();
+            assert_ne!(bytes_read, 0, "driver closed during registration");
+            if line == b"CAP END\r\n" {
+                break;
+            }
+        }
+        // Behave like an IRC server: welcome only after the complete client
+        // registration burst. The old test wrote every reply immediately after
+        // accept, then relied on socket buffering to impose its phases; under a
+        // loaded runner that made the integration assertion timing-dependent.
+        write
+            .write_all(b":up 001 bncbot :welcome\r\n")
             .await
             .unwrap();
+        lines_requested
+            .await
+            .expect("test stopped before line phase");
         // A non-UTF-8 channel-message body (0xE9 = Latin-1 'e-acute').
-        sock.write_all(b":speaker!s@h PRIVMSG #bnc :caf\xe9\r\n")
+        write
+            .write_all(b":speaker!s@h PRIVMSG #bnc :caf\xe9\r\n")
             .await
             .unwrap();
         // A following, ordinary line — its arrival on the SAME connection proves
         // the bad line did not drop the session.
-        sock.write_all(b":speaker!s@h PRIVMSG #bnc :after the bad line\r\n")
+        write
+            .write_all(b":speaker!s@h PRIVMSG #bnc :after the bad line\r\n")
             .await
             .unwrap();
         // Keep the connection open and drain anything the driver sends, so no
         // EOF is observed (which would legitimately reconnect).
         let mut buf = [0u8; 1024];
-        while sock.read(&mut buf).await.unwrap_or(0) != 0 {}
+        while read.read(&mut buf).await.unwrap_or(0) != 0 {}
     });
 
     let handle = IrcNetwork::start(NetworkConfig {
@@ -193,6 +213,23 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
+
+    // Establish a causal phase boundary instead of racing the test's line burst
+    // against registration. Once Connected is observed, the same established
+    // socket is instructed to send the malformed and ordinary lines.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DriverEvent::Connected) => return,
+                Ok(DriverEvent::Disconnected) => panic!("driver disconnected during registration"),
+                Ok(_) => {}
+                Err(_) => panic!("driver stopped"),
+            }
+        }
+    })
+    .await
+    .expect("driver never completed registration");
+    send_lines.send(()).expect("mock upstream stopped");
 
     // Collect events until the post-bad-line message arrives; assert no
     // Disconnected (reconnect) happened in between.
@@ -222,6 +259,12 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
         !outcome.1,
         "the bad line must not disconnect/reconnect the session"
     );
+    drop(events);
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), upstream)
+        .await
+        .expect("mock upstream did not observe driver shutdown")
+        .expect("mock upstream task failed");
 }
 
 /// Provision a fresh single-account database and return its URL. `test` is the

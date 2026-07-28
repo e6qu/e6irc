@@ -117,6 +117,10 @@ actual typed runtime state rather than looking for a nonexistent lifecycle
 field. The pure IRC/timeline rules have Node regression tests, while the
 browser harness covers replay synchronization, history/live races, member
 replacement, and both conversation close paths.
+The non-UTF-8 upstream driver integration test now uses explicit registration,
+line-delivery, and shutdown phase boundaries instead of depending on kernel
+socket buffering; loaded CI runners can no longer turn that protocol test into
+a five-second ordering race.
 
 Network removal, disable, and replacement now send a typed terminal
 `unavailable` WebSocket status. The browser reconciles that name against the
