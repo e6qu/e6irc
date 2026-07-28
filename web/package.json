@@ -10,6 +10,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "node --test test/*.test.js",
     "test:oidc-browser": "node ../tools/test-oidc-browser.mjs"
   },
   "devDependencies": {

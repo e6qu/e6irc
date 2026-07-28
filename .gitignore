@@ -3,6 +3,7 @@
 /fuzz/corpus
 /fuzz/artifacts
 node_modules/
+/.pnpm-store/
 /web/dist
 .DS_Store
 

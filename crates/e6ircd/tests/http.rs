@@ -1378,6 +1378,23 @@ async fn admin_accounts_endpoint_is_gated() {
         );
     }
 
+    // Collection limits are a contract, not a suggestion: out-of-range audit
+    // windows fail rather than being silently clamped to a different query.
+    for limit in [0, 1001] {
+        let req = format!(
+            "GET /api/v1/admin/audit?limit={limit} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+        );
+        let (status, headers, body) = request(http, &req).await;
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/problem+json"),
+            "{headers}"
+        );
+        assert!(body.contains("Invalid audit limit"), "{body}");
+    }
+
     // Stats reflects the seeded data (2 accounts, 1 channel, 1 server ban).
     let stats_auth = format!(
         "GET /api/v1/admin/stats HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
@@ -2596,6 +2613,30 @@ async fn network_buffer_read() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(v["lines"].as_array().unwrap().len(), 1, "{body}");
     assert_eq!(v["lines"][0], ":a!u@h PRIVMSG #x :two", "{body}");
+
+    // Limits outside the documented contract fail instead of silently
+    // returning a different window than the caller requested.
+    for limit in [0, 1001] {
+        let (status, headers, body) = request(
+            http,
+            &auth(&format!("/api/v1/me/networks/work/buffer?limit={limit}")),
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(
+            headers
+                .lines()
+                .find(|line| line.to_ascii_lowercase().starts_with("content-type:"))
+                .map(|line| line
+                    .split_once(':')
+                    .expect("content-type separator")
+                    .1
+                    .trim()),
+            Some("application/problem+json"),
+            "{headers:?}"
+        );
+        assert!(body.contains("Invalid buffer limit"), "{body}");
+    }
 
     // A network the caller doesn't own → 404.
     let (status, _, _) = request(http, &auth("/api/v1/me/networks/nope/buffer")).await;

@@ -286,14 +286,19 @@ async fn ws_ui_detaches_when_its_network_is_removed() {
     .await;
     assert_eq!(status, 204, "network delete");
 
-    // The socket must detach promptly — either a "network removed" event or a
-    // clean close — not hang open forever.
+    // The socket must send a typed terminal status and detach promptly. The
+    // browser uses this event to stop reconnecting a removed/disabled network.
     let detached = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match ws.next().await {
-                Some(Ok(Tung::Text(t))) if t.contains("network removed") => return true,
+                Some(Ok(Tung::Text(t))) => {
+                    let event: serde_json::Value = serde_json::from_str(&t).expect("JSON event");
+                    if event["t"] == "status" && event["v"] == "unavailable" {
+                        return true;
+                    }
+                }
                 Some(Ok(_)) => {}
-                None | Some(Err(_)) => return true, // socket closed
+                None | Some(Err(_)) => panic!("socket closed without terminal status"),
             }
         }
     })

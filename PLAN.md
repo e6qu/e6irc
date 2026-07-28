@@ -93,6 +93,30 @@ paused network remains paused across every creation path and process restart.
 Both network and bridge controls reject an invalid target state instead of
 silently treating malformed form input as a disable request.
 
+Browser client completion (2026-07-28): the Vite chat shell now has a persistent
+network selector, a focused preferences menu, visible account/network/history/
+storage/notification/socket errors, a disabled composer until attachment, and a
+collapsible conversation rail on phones. The network picker distinguishes a
+real empty collection from an API failure, validates the response shape, and
+links directly to network creation and management. Browser settings accept only
+the typed theme and notification values; corrupt, unavailable, or write-denied
+storage is repaired for the tab and surfaced to the user rather than swallowed.
+The shared JSON request boundary preserves HTTP status and problem detail, and
+malformed or unknown WebSocket events are rejected visibly.
+
+Network removal, disable, and replacement now send a typed terminal
+`unavailable` WebSocket status. The browser reconciles that name against the
+REST inventory, attaches a live replacement automatically, and stops retries
+for a real disable/removal; ordinary socket loss keeps exponential backoff and
+upstream `disconnected` remains a live driver state. The backlog and administrator audit
+APIs share one bounded query-limit boundary: values outside 1–1,000 return
+problem+json 400 instead of being silently clamped, and the web client requests
+the documented 1,000-line maximum. Node tests cover settings, storage denial,
+JSON/problem handling, and response validation; the real OIDC browser test also
+asserts the embedded shell's honest zero-network state and navigation. The
+deployment contract is now honest as well: both embedded and static-CDN builds
+use one browser origin for the shell, API, cookie, console, and WebSocket.
+
 Hardening sweep (2026-07-20): closed several bug classes across the tree —
 client-triggerable memory-growth DoS on the single core worker (unbounded
 `+b/+q/+e/+I` lists → MAXLIST/478, unbounded channel joins → CHANLIMIT/405,

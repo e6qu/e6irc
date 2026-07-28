@@ -149,6 +149,37 @@ pub(super) fn validate_label(label: &str) -> Option<Response> {
         .map(|detail| problem(StatusCode::BAD_REQUEST, "Invalid label", Some(&detail)))
 }
 
+/// Resolve a bounded integer query parameter without silently changing the
+/// caller's requested window. HTTP collection endpoints share this boundary so
+/// a new `?limit=` cannot accidentally reintroduce clamp-and-pretend behavior.
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+pub(super) fn bounded_query_limit(
+    requested: Option<usize>,
+    default: usize,
+    maximum: usize,
+    collection: &str,
+) -> Result<i64, Response> {
+    let limit = requested.unwrap_or(default);
+    if !(1..=maximum).contains(&limit) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid {collection} limit"),
+            Some(&format!(
+                "The {collection} limit must be between 1 and {maximum}."
+            )),
+        ));
+    }
+    i64::try_from(limit).map_err(|_| {
+        problem(
+            StatusCode::BAD_REQUEST,
+            &format!("Invalid {collection} limit"),
+            Some(&format!(
+                "The {collection} limit must be between 1 and {maximum}."
+            )),
+        )
+    })
+}
+
 /// Unwrap a JSON request body, turning a rejection into a 400 problem response.
 /// Shared by the JSON POST handlers so the parse boilerplate isn't copied.
 #[allow(clippy::result_large_err)] // Err is a full problem Response, as throughout this module
@@ -179,6 +210,25 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod query_limit_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_limits_default_accept_and_reject_without_clamping() {
+        assert_eq!(bounded_query_limit(None, 100, 1000, "audit").unwrap(), 100);
+        assert_eq!(bounded_query_limit(Some(1), 100, 1000, "audit").unwrap(), 1);
+        assert_eq!(
+            bounded_query_limit(Some(1000), 100, 1000, "audit").unwrap(),
+            1000
+        );
+        for value in [0, 1001] {
+            let response = bounded_query_limit(Some(value), 100, 1000, "audit").unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
 }
 
 fn bnc_counts(state: &AppState) -> (u64, u64) {

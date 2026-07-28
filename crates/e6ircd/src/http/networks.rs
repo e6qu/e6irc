@@ -637,7 +637,10 @@ pub(super) async fn network_buffer(
             );
         }
     }
-    let limit = params.limit.unwrap_or(200).clamp(1, 1000) as i64;
+    let limit = match bounded_query_limit(params.limit, 200, 1000, "buffer") {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
     // The DB buffer API canonicalizes the owner/network composite key, matching
     // the live registry even when this URL uses a different case.
     match crate::db::recent_bnc_lines(pool, &account, &name, limit).await {

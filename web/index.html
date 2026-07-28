@@ -10,17 +10,37 @@
   <body>
     <main id="app">
       <header id="topbar">
-        <span id="brand">e6irc</span>
-        <span id="status" class="status status-connecting">connecting…</span>
-        <span id="settings">
-          <select id="theme-select" title="Theme" aria-label="Theme">
-            <option value="auto">Auto</option>
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
+        <a id="brand" href="/">e6irc</a>
+        <button
+          id="sidebar-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="sidebar"
+        >Conversations</button>
+        <label id="network-control">
+          <span>Network</span>
+          <select id="network-select" aria-label="Active network">
+            <option value="">Choose a network</option>
           </select>
-          <button id="notify-toggle" type="button" title="Toggle desktop notifications">🔕 Off</button>
-        </span>
+        </label>
+        <span id="status" class="status status-connecting" role="status" aria-live="polite">starting…</span>
+        <details id="settings">
+          <summary>Preferences</summary>
+          <div class="settings-menu">
+            <label>
+              <span>Theme</span>
+              <select id="theme-select">
+                <option value="auto">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+            </label>
+            <button id="notify-toggle" type="button">Desktop notifications: off</button>
+            <span id="storage-state" class="settings-note" hidden></span>
+          </div>
+        </details>
         <nav id="user-nav" aria-label="User">
+          <a id="manage-link" href="/console/networks">Manage</a>
           <a id="account-link" href="/console/account" aria-label="Open my account">
             <span id="account-name" aria-live="polite">signed in</span>
             <span id="account-role" class="user-role" aria-live="polite"></span>
@@ -29,13 +49,15 @@
         </nav>
       </header>
 
+      <div id="alerts" aria-live="polite" aria-relevant="additions text"></div>
+
       <div id="workspace">
         <!-- Buffer list: the server buffer plus one per channel / DM. -->
         <aside id="sidebar" aria-label="Buffers">
           <div class="side-head">Buffers</div>
           <form id="join-form" autocomplete="off">
             <input type="text" id="join-input" placeholder="join #channel" aria-label="Join a channel" autocomplete="off" />
-            <button type="submit" title="Join channel">+</button>
+            <button type="submit" title="Join channel" disabled>+</button>
           </form>
           <ul id="buffers"></ul>
         </aside>
@@ -54,8 +76,9 @@
               placeholder="message… (/join #chan, /msg nick text, /raw LINE)"
               autocomplete="off"
               autofocus
+              disabled
             />
-            <button type="submit">Send</button>
+            <button type="submit" disabled>Send</button>
           </form>
         </section>
 
