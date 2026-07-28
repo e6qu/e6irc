@@ -152,6 +152,179 @@ try {
   await page.waitForFunction(
     () => document.getElementById("account-name")?.textContent !== "signed in",
   );
+
+  // Exercise the chat shell against a deterministic browser-side network. This
+  // covers conversation lifecycle without depending on a live external IRC
+  // server: tagged overlap is merged once, a line arriving while history is
+  // loading survives, NAMES replaces stale membership, DMs close locally, and
+  // a confirmed self-PART removes the channel.
+  const networkURL = `${applicationOrigin}/api/v1/me/networks`;
+  const historyURL = `${applicationOrigin}/api/v1/me/networks/demo/buffer?limit=1000`;
+  await page.route(networkURL, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        networks: [
+          {
+            name: "demo",
+            kind: "irc",
+            nick: "webnick",
+            enabled: true,
+            connected: false,
+            runtime: { state: "reconnect_backoff" },
+          },
+        ],
+      }),
+    });
+  });
+  let mockSocket;
+  const clientFrames = [];
+  let snapshotSent = false;
+  let namesRequestedBeforeSnapshot = false;
+  await page.routeWebSocket(/\/ws\/ui\?network=demo$/, (webSocket) => {
+    mockSocket = webSocket;
+    webSocket.onMessage((frame) => {
+      const value = typeof frame === "string" ? frame : frame.toString();
+      clientFrames.push(value);
+      const command = JSON.parse(value).message;
+      if (command === "/raw NAMES #room") {
+        if (!snapshotSent) namesRequestedBeforeSnapshot = true;
+        webSocket.send(
+          JSON.stringify({
+            t: "line",
+            v: ":irc.example 353 webnick = #room :@webnick +alice bob",
+          }),
+        );
+        webSocket.send(
+          JSON.stringify({
+            t: "line",
+            v: ":irc.example 366 webnick #room :End of /NAMES list",
+          }),
+        );
+      } else if (command === "/part #room") {
+        webSocket.send(
+          JSON.stringify({
+            t: "line",
+            v: ":webnick!u@h PART #room :leaving",
+          }),
+        );
+      }
+    });
+    webSocket.send(JSON.stringify({ t: "status", v: "connected" }));
+    webSocket.send(
+      JSON.stringify({
+        t: "line",
+        v: ":irc.example 001 webnick :Welcome",
+      }),
+    );
+    webSocket.send(
+      JSON.stringify({
+        t: "line",
+        v: ":webnick!u@h JOIN #room",
+      }),
+    );
+    webSocket.send(
+      JSON.stringify({
+        t: "line",
+        v: "@time=2026-07-28T20:00:00.000Z;msgid=shared :alice!u@h PRIVMSG #room :initial tagged",
+      }),
+    );
+    // Leave a real scheduling gap: a regression that requests NAMES while
+    // replay is still arriving is observable rather than hidden by a
+    // synchronous mock burst.
+    setTimeout(() => {
+      snapshotSent = true;
+      webSocket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+    }, 25);
+  });
+  await page.goto(`${applicationOrigin}/?network=demo`);
+  await page.getByText("#room", { exact: true }).first().waitFor();
+  await page.locator("#nickcount").waitFor({ state: "visible" });
+  assert.equal(await page.locator("#nickcount").textContent(), "3");
+  assert.equal(namesRequestedBeforeSnapshot, false, "NAMES was requested before replay completed");
+  assert.match(await page.locator("#network-select").innerText(), /reconnect backoff/);
+  const expectedTaggedTime = await page.evaluate(() => {
+    const date = new Date("2026-07-28T20:00:00.000Z");
+    return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  });
+  assert.equal(
+    await page.getByText("initial tagged", { exact: true }).locator("..").locator(".ts").textContent(),
+    expectedTaggedTime,
+  );
+
+  let resolveHistoryRoute;
+  const historyRouteReached = new Promise((resolve) => {
+    resolveHistoryRoute = resolve;
+  });
+  await page.route(historyURL, (route) => {
+    resolveHistoryRoute(route);
+  });
+  await page.locator("#load-earlier").click();
+  await page.getByRole("button", { name: "Loading…" }).waitFor();
+  const pendingHistoryRoute = await historyRouteReached;
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: "@time=2026-07-28T20:00:02.000Z;msgid=live :alice!u@h PRIVMSG #room :arrived while loading",
+    }),
+  );
+  await pendingHistoryRoute.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      lines: [
+        "@time=2026-07-28T19:59:00.000Z;msgid=older :alice!u@h PRIVMSG #room :older context",
+        "@time=2026-07-28T20:00:00.000Z;msgid=shared :alice!u@h PRIVMSG #room :initial tagged",
+      ],
+    }),
+  });
+  await page.locator("#load-earlier").waitFor({ state: "hidden" });
+  assert.equal(await page.getByText("initial tagged", { exact: true }).count(), 1);
+  assert.equal(await page.getByText("older context", { exact: true }).count(), 1);
+  assert.equal(await page.getByText("arrived while loading", { exact: true }).count(), 1);
+
+  // A later NAMES snapshot is authoritative: bob and alice disappear, carol
+  // appears, and the list/count cannot retain stale members.
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: ":irc.example 353 webnick = #room :@webnick carol",
+    }),
+  );
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: ":irc.example 366 webnick #room :End of /NAMES list",
+    }),
+  );
+  await page.getByText("carol", { exact: true }).waitFor();
+  assert.equal(await page.locator("#nickcount").textContent(), "2");
+  assert.equal(await page.getByText("bob", { exact: true }).count(), 0);
+
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: "@time=2026-07-28T20:00:03.000Z;msgid=dm :bob!u@h PRIVMSG webnick :private hello",
+    }),
+  );
+  await page.locator(".buf-name").filter({ hasText: /^bob$/ }).click();
+  assert.equal(await page.locator("#buffer-action").textContent(), "Close");
+  await page.locator("#buffer-action").click();
+  assert.equal(await page.locator(".buf-name").filter({ hasText: /^bob$/ }).count(), 0);
+
+  await page.locator(".buf-name").filter({ hasText: /^#room$/ }).click();
+  assert.equal(await page.locator("#buffer-action").textContent(), "Leave");
+  await page.locator("#buffer-action").click();
+  await page.getByText("You left #room (leaving).", { exact: true }).waitFor();
+  assert.equal(await page.locator(".buf-name").filter({ hasText: /^#room$/ }).count(), 0);
+  assert.ok(
+    clientFrames.some((frame) => JSON.parse(frame).message === "/part #room"),
+    "Leave did not send PART for the active channel",
+  );
+  await page.unroute(historyURL);
+  await page.unroute(networkURL);
+
   assert.ok(
     navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `portal flow bypassed the e6irc OpenID Connect starter:\n${navigationTrace.join("\n")}`,

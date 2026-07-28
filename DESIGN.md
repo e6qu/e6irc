@@ -1163,14 +1163,25 @@ client offers a join-channel input and click-to-query on nicks.
 ### 13.2 Live chat over WebSocket
 
 The chat page opens one WS (`/ws/ui`, cookie-authenticated). The server pushes
-JSON events — `{"t":"line","v":"<raw IRC line>"}` and `{"t":"status",...}` —
-and the client parses each line, routes it to the right buffer (channel / DM /
-server), maintains the per-channel member list, and renders the active buffer
-(all via DOM APIs, never `innerHTML` on server text, so a hostile upstream line
-can't inject markup). The composer sends `{target, message}` (with
+typed line, status, and `{"t":"snapshot","v":"complete"}` replay-boundary
+events. Raw line events preserve IRCv3 `time` and `msgid` tags so live and
+persisted timelines use the same clock and have stable overlap identity. The
+client parses each line, routes it to the right buffer (channel / DM / server),
+maintains the per-channel member list, and renders the active buffer (all via
+DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
+inject markup). The replay boundary precedes live traffic; only after it does
+the client request authoritative NAMES snapshots, preventing stale detached
+replay from overwriting current membership. The composer sends
+`{target, message}` (with
 slash-commands) up the same socket, which the server maps to an IRC line. This
 keeps the web client on the exact same multiplexer attach path as an IRC client
 — the web client *is* an attached client of the user's networks.
+Fetching persisted history prepends it without replacing live lines or local
+echoes that arrived while the request was in flight. Only matching non-empty
+`msgid` values are deduplicated; content equality is not identity because
+distinct IRC messages can have identical bodies. Self PART/KICK closes the
+channel buffer, direct-message buffers have an explicit local Close action,
+and channel buffers have a Leave action whose confirmed self PART closes them.
 Status values are the closed set `connected`, `disconnected`, and
 `unavailable`. The first two describe a live driver's upstream lifecycle;
 `unavailable` is terminal for that socket because the network was removed,

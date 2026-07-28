@@ -104,6 +104,24 @@ storage is repaired for the tab and surfaced to the user rather than swallowed.
 The shared JSON request boundary preserves HTTP status and problem detail, and
 malformed or unknown WebSocket events are rejected visibly.
 
+Browser conversation lifecycle (2026-07-28): `/ws/ui` now preserves IRCv3
+`time` and `msgid` tags and emits a typed boundary between detached replay and
+live traffic. The client waits for that boundary before requesting
+authoritative NAMES snapshots, replaces stale member collections in batches,
+and visibly caps hostile buffer/member growth. Persisted history is prepended
+without replacing live arrivals or local echoes, and only stable `msgid`
+overlap is deduplicated. Live server-time is rendered on the same clock as
+history. Channels expose Leave and close only on confirmed self PART/KICK;
+direct messages expose a local Close action. Network pickers now label the
+actual typed runtime state rather than looking for a nonexistent lifecycle
+field. The pure IRC/timeline rules have Node regression tests, while the
+browser harness covers replay synchronization, history/live races, member
+replacement, and both conversation close paths.
+The non-UTF-8 upstream driver integration test now uses explicit registration,
+line-delivery, and shutdown phase boundaries instead of depending on kernel
+socket buffering; loaded CI runners can no longer turn that protocol test into
+a five-second ordering race.
+
 Network removal, disable, and replacement now send a typed terminal
 `unavailable` WebSocket status. The browser reconciles that name against the
 REST inventory, attaches a live replacement automatically, and stops retries

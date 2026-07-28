@@ -189,6 +189,19 @@ body {
 }
 #bufname { font-weight: 600; }
 .topic { color: var(--muted); font-size: 0.85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#buffer-action {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+}
+#buffer-action:hover { border-color: var(--accent); color: var(--accent); }
 
 #messages {
   list-style: none;

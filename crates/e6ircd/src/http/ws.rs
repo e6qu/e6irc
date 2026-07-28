@@ -208,11 +208,11 @@ pub(super) struct UiParams {
 }
 
 /// The web client's live socket: cookie-authenticated, attaches to one
-/// of the caller's networks, and pushes JSON events (`{"t":"line",...}` /
-/// `{"t":"status",...}`) that the browser client parses into buffers and a
-/// member list. Composer text sent up the socket is relayed to the upstream
-/// network. This is the same multiplexer attach path an IRC client uses — the
-/// web client *is* an attached client.
+/// of the caller's networks, and pushes line, status, and replay-complete JSON
+/// events that the browser client parses into buffers and a member list.
+/// Composer text sent up the socket is relayed to the upstream network. This
+/// is the same multiplexer attach path an IRC client uses — the web client
+/// *is* an attached client.
 pub(super) async fn ws_ui(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -307,6 +307,16 @@ pub(super) async fn ws_ui_conn(
         {
             return;
         }
+    }
+    // Delimit replay from live traffic. The browser waits for this typed
+    // boundary before requesting authoritative NAMES snapshots, so old NAMES
+    // rows in the detached buffer cannot race and overwrite the fresh result.
+    if socket
+        .send(WsMessage::text(snapshot_event()))
+        .await
+        .is_err()
+    {
+        return;
     }
     loop {
         tokio::select! {
@@ -473,14 +483,16 @@ pub(super) fn slash_to_irc(message: &str, target: &str) -> String {
 /// One upstream line as a JSON event for the web client:
 /// `{"t":"line","v":"<raw IRC line>"}`. The client parses the IRC line itself
 /// (routing it to a buffer, updating the nick list) and renders via safe DOM
-/// APIs, so no HTML is produced here. The IRCv3 tag prefix is dropped — the
-/// client renders message content, not tags. `serde_json` handles all escaping.
+/// APIs, so no HTML is produced here. IRCv3 tags stay intact: `server-time`
+/// gives the live and persisted timelines the same clock, while `msgid` gives
+/// their overlap a stable identity. `serde_json` handles all escaping.
 pub(super) fn line_event(line: &str) -> String {
-    let line = line
-        .strip_prefix('@')
-        .and_then(|rest| rest.split_once(' '))
-        .map_or(line, |(_, body)| body);
     serde_json::json!({ "t": "line", "v": line }).to_string()
+}
+
+/// Marks the point after detached-buffer replay and before live traffic.
+pub(super) fn snapshot_event() -> String {
+    serde_json::json!({ "t": "snapshot", "v": "complete" }).to_string()
 }
 
 /// Connection state sent to the web client. An enum (not a free `&str`) so the
@@ -505,4 +517,28 @@ impl ConnStatus {
 /// A connection-status change as a JSON event: `{"t":"status","v":"connected"}`.
 pub(super) fn status_event(status: ConnStatus) -> String {
     serde_json::json!({ "t": "status", "v": status.label() }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_line_event_preserves_message_identity_and_server_time() {
+        let line = "@time=2026-07-28T20:00:00.000Z;msgid=m1 :alice!u@h PRIVMSG #chat :hello";
+        let event: serde_json::Value =
+            serde_json::from_str(&line_event(line)).expect("line event JSON");
+        assert_eq!(event["t"], "line");
+        assert_eq!(event["v"], line);
+    }
+
+    #[test]
+    fn ui_snapshot_event_is_a_closed_replay_boundary() {
+        let event: serde_json::Value =
+            serde_json::from_str(&snapshot_event()).expect("snapshot event JSON");
+        assert_eq!(
+            event,
+            serde_json::json!({ "t": "snapshot", "v": "complete" })
+        );
+    }
 }
