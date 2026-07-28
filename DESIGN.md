@@ -377,7 +377,7 @@ both native clients — one parser to fuzz, one behavior everywhere.
 | Passwords | **argon2** (argon2id) | For local passwords and hashed app passwords. |
 | OIDC | **openidconnect** crate | Certified-flow implementation of code+PKCE, discovery, JWKS. |
 | Config | **toml** + serde, `E6IRC_*` env overrides | No config-framework dependency. |
-| Logging | `eprintln!` operational lines on stderr (WARN-level) | Structured `tracing` + JSON output is deferred (§16, §19). |
+| Logging | Line-oriented operational messages on stderr | Human-readable process diagnostics; machine consumers use the typed JSON/Prometheus observability surfaces in §16. |
 | Metrics | Fixed-cardinality in-process atomics + bounded histograms | One typed snapshot feeds the console, JSON API, Prometheus exposition, readiness, and PostgreSQL history (§16). |
 
 **Dependency policy — minimal, only what's really needed:**
@@ -1000,10 +1000,10 @@ one implementation shared with the external-network path.
 - Auto-reconnect with exponential backoff + jitter, bounded so a repeatedly
   rejected upstream credential stops re-dialing rather than hammering the
   upstream forever. On reconnect the driver re-registers and re-joins the
-  *configured* autojoin channels under the configured nick; resyncing the
-  client's *runtime* channel/nick changes (a JOIN or NICK it issued this
-  session) is a planned enhancement, not yet implemented. Upstream SASL PLAIN
-  with credentials stored encrypted (§15).
+  *configured* autojoin channels under the configured nick. A JOIN or NICK
+  issued by an attached client changes only the current upstream session;
+  persistent reconnect behavior is edited explicitly in the network's stored
+  configuration. Upstream SASL PLAIN uses credentials stored encrypted (§15).
 - Every registration, auto-join, command, heartbeat, and protocol PONG emission
   is part of the session outcome: a failed upstream transport write drops and
   reconnects, while a closed in-process core queue stops the `local` driver
@@ -1032,10 +1032,10 @@ Design constraints recorded now:
 
 - Per-user ("personal bouncer", Bitlbee-style) mode is the primary mode and
   fits the multiplexer natively.
-- Server-level **relay mode** (one bridge instance mirroring a remote channel
-  into a public local channel for many users) is a planned extension of the
-  same trait (driver owned by the server, not an account); the SPI keeps
-  identity mapping (puppet vs. prefixed-relay) as a driver concern.
+- Server-level **relay mode** (mirroring a remote channel into a public local
+  channel with synthetic identities) is outside the bridge contract. Bridges
+  are attached networks, either account-owned or explicitly shared, and do not
+  inject remote identities into the local IRC namespace.
 - Driver-specific transports: Matrix client-server API (long-poll /sync),
   Discord gateway WebSocket + REST, Slack Socket Mode. Each stays inside its
   feature flag including its HTTP client code.
@@ -1151,9 +1151,14 @@ bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list
 state are naturally client state. The socket reconnects with backoff so a
 transient drop self-heals; opening the page without a `?network=` selector
-shows a picker of the caller's networks (its entry point); the member list is
-rank-ordered with sigils kept live from channel `MODE`; and it offers a
-join-channel input and click-to-query on nicks.
+shows a picker of the caller's networks (its entry point). The persistent
+top-bar selector changes networks from every chat view, the preferences menu
+owns validated theme/notification settings, and responsive conversation
+navigation preserves the full chat pane on phones. Identity, network-list,
+history, storage, notification, and socket-protocol failures have visible,
+actionable states; an API failure is never rendered as an empty account. The
+member list is rank-ordered with sigils kept live from channel `MODE`, and the
+client offers a join-channel input and click-to-query on nicks.
 
 ### 13.2 Live chat over WebSocket
 
@@ -1166,6 +1171,12 @@ can't inject markup). The composer sends `{target, message}` (with
 slash-commands) up the same socket, which the server maps to an IRC line. This
 keeps the web client on the exact same multiplexer attach path as an IRC client
 — the web client *is* an attached client of the user's networks.
+Status values are the closed set `connected`, `disconnected`, and
+`unavailable`. The first two describe a live driver's upstream lifecycle;
+`unavailable` is terminal for that socket because the network was removed,
+disabled, or replaced. The client reconciles the REST inventory and attaches a
+live replacement under the same name; if none exists, it stops its transport
+reconnect loop and offers the network console instead of retrying forever.
 
 ### 13.3 Build & deployment duality
 
@@ -1174,12 +1185,12 @@ same artifact:
 
 1. **Embedded** (`embed-web` feature): `rust-embed` serves `dist/` from the
    binary at `/`, immutable cache headers keyed on the content hashes.
-2. **Static storage (S3/CDN)**: `dist/` is uploaded as-is;
-   `VITE_API_BASE` is injected at build time so the shell targets the API
-   origin. Because the WebSocket and console must hit the server anyway, the recommended
-   topology is same-origin via CDN path routing (`/assets/*` → S3, rest →
-   e6ircd); a true cross-origin split is supported (CORS allowlist +
-   `SameSite=None` cookies) but documented as second choice.
+2. **Static storage (S3/CDN)**: `dist/` is uploaded as-is and served through a
+   same-origin CDN topology (`/assets/*` → static storage, application/API/
+   WebSocket/console paths → e6ircd). The browser session cookie and WebSocket
+   Origin check deliberately share that one origin; a cross-origin application
+   shell is not a supported deployment and no build-time variable pretends to
+   weaken that security boundary.
 
 ### 13.4 IRC-over-WebSocket (always compiled)
 
@@ -1400,17 +1411,15 @@ Layers, bottom to top:
 
 ---
 
-## 19. Open items (deliberately deferred, tracked in PLAN.md)
+## 19. Scope boundaries
 
-- Exact vendored snapshots: Libera 005/CAP reference capture, Solanum mode
-  documentation extract (with provenance) — first compat-phase task.
-- Visual design of the web client (CSS approach currently: hand-rolled,
-  design tokens, no framework) — revisit before the web phase.
-- Relay-mode bridges (server-owned shared channels) — after per-user mode.
-- read-marker/draft caps tracked as drafts: pin exact spec revisions when
-  implementing.
-- Structured logging (`tracing` spans and JSON output); machine-readable
-  telemetry and Prometheus exposition are complete (§16).
+- Bridges are account-owned or explicitly shared attached networks, not
+  synthetic-user relay bots in public local channels (§10.5).
+- IRCv3 capabilities whose standardized wire names include `draft/` retain
+  those names. Their implemented behavior is pinned and exercised through the
+  repository's irctest revision (§17).
+- Process diagnostics are human-readable stderr lines. Structured operational
+  consumers use the typed JSON and Prometheus telemetry contract (§16).
 
 ## 20. References
 

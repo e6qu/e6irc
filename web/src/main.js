@@ -11,6 +11,14 @@
 //   network — the BNC network to attach to (required)
 
 import "./style.css";
+import {
+  ApiError,
+  errorMessage,
+  getJson,
+  loadSettings,
+  networksFrom,
+  saveSettings,
+} from "./client-state.js";
 
 const params = new URLSearchParams(window.location.search);
 const network = params.get("network");
@@ -26,6 +34,11 @@ const nicksEl = el("nicks");
 const nickcountEl = el("nickcount");
 const composer = el("composer");
 const messageInput = el("message");
+const alertsEl = el("alerts");
+const networkSelect = el("network-select");
+const sidebarToggle = el("sidebar-toggle");
+const sendButton = composer.querySelector("button[type=submit]");
+const joinButton = el("join-form")?.querySelector("button[type=submit]");
 
 const MAX_LINES = 500;
 // Bounds against a hostile upstream that streams distinct channels/senders or a
@@ -35,23 +48,60 @@ const MAX_NICKS = 5000;
 const SERVER = "*server*";
 
 // ---- client settings (persisted in localStorage) -----------------------
-const SETTINGS_KEY = "e6irc.settings";
-const settings = loadSettings();
+const loadedSettings = loadSettings(() => window.localStorage);
+const settings = loadedSettings.settings;
 
-function loadSettings() {
-  const defaults = { theme: "auto", notifications: false };
-  try {
-    return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };
-  } catch {
-    return { ...defaults };
+function showAlert(key, text, tone = "warning", action = null) {
+  let alert = alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`);
+  if (!alert) {
+    alert = document.createElement("div");
+    alert.dataset.alert = key;
+    alert.className = `alert alert-${tone}`;
+    const copy = document.createElement("span");
+    alert.appendChild(copy);
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.textContent = "Dismiss";
+    dismiss.setAttribute("aria-label", "Dismiss message");
+    dismiss.addEventListener("click", () => alert.remove());
+    alert.appendChild(dismiss);
+    alertsEl.appendChild(alert);
+  }
+  alert.className = `alert alert-${tone}`;
+  alert.firstElementChild.textContent = text;
+  const existingAction = alert.querySelector("a");
+  if (existingAction) existingAction.remove();
+  if (action) {
+    const link = document.createElement("a");
+    link.href = action.href;
+    link.textContent = action.label;
+    alert.insertBefore(link, alert.lastElementChild);
   }
 }
-function saveSettings() {
-  try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  } catch {
-    /* private mode / disabled storage — settings just don't persist */
+
+function clearAlert(key) {
+  alertsEl.querySelector(`[data-alert="${CSS.escape(key)}"]`)?.remove();
+}
+
+function persistSettings() {
+  const warning = saveSettings(() => window.localStorage, settings);
+  const storageState = el("storage-state");
+  if (warning) {
+    storageState.textContent = warning;
+    storageState.hidden = false;
+    showAlert("storage", warning);
+  } else {
+    storageState.textContent = "";
+    storageState.hidden = true;
+    clearAlert("storage");
   }
+}
+
+if (loadedSettings.warning) {
+  const storageState = el("storage-state");
+  storageState.textContent = loadedSettings.warning;
+  storageState.hidden = false;
+  showAlert("storage", loadedSettings.warning);
 }
 // "light"/"dark" force the theme via data-theme (CSS overrides prefers-color-
 // scheme); "auto" removes it so the OS preference applies.
@@ -87,6 +137,25 @@ let socket = null;
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className = `status status-${cls}`;
+  statusEl.title = text;
+}
+
+function setComposerAvailable(available) {
+  messageInput.disabled = !available;
+  sendButton.disabled = !available;
+  if (joinButton) joinButton.disabled = !available;
+}
+
+function closeMobileSidebar() {
+  document.body.classList.remove("sidebar-open");
+  if (sidebarToggle) sidebarToggle.setAttribute("aria-expanded", "false");
+}
+
+if (sidebarToggle) {
+  sidebarToggle.addEventListener("click", () => {
+    const open = document.body.classList.toggle("sidebar-open");
+    sidebarToggle.setAttribute("aria-expanded", String(open));
+  });
 }
 
 // Buffers and nicks are keyed by their casefold; the original casing is kept in
@@ -302,7 +371,8 @@ function setActive(name) {
   if (b) b.unread = 0;
   renderBufferList();
   renderActive();
-  messageInput.focus();
+  closeMobileSidebar();
+  if (!messageInput.disabled) messageInput.focus();
 }
 
 // ---- buffer mutation ----------------------------------------------------
@@ -486,8 +556,15 @@ function maybeNotify(b, line) {
   try {
     // eslint-disable-next-line no-new
     new Notification(title, { body: line.text, tag: b.key });
-  } catch {
-    /* notifications are best-effort chrome */
+  } catch (error) {
+    settings.notifications = false;
+    persistSettings();
+    updateSettingsUI();
+    showAlert(
+      "notifications",
+      errorMessage("show a desktop notification", error),
+      "warning",
+    );
   }
 }
 
@@ -618,51 +695,145 @@ function handleLine(raw) {
 // user has to reload past. Backoff resets on a successful open.
 let reconnectDelay = 0;
 let reconnectTimer = null;
+let reconnectAttempt = 0;
+let terminalSocket = false;
 const RECONNECT_MIN = 1000;
 const RECONNECT_MAX = 30000;
 
 function scheduleReconnect() {
-  if (reconnectTimer) return; // one pending attempt at a time
+  if (reconnectTimer || terminalSocket) return; // one pending attempt at a time
   reconnectDelay = reconnectDelay ? Math.min(reconnectDelay * 2, RECONNECT_MAX) : RECONNECT_MIN;
+  reconnectAttempt += 1;
   const jitter = Math.floor(reconnectDelay * 0.25 * Math.random());
   const wait = reconnectDelay + jitter;
-  setStatus(`reconnecting in ${Math.round(wait / 1000)}s…`, "error");
+  setStatus(
+    `reconnect ${reconnectAttempt} in ${Math.max(1, Math.round(wait / 1000))}s`,
+    "error",
+  );
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
     connect();
   }, wait);
 }
 
+async function reconcileUnavailableNetwork() {
+  setStatus(`${network}: checking availability…`, "connecting");
+  try {
+    const networks = networksFrom(
+      await getJson(window.fetch.bind(window), "/api/v1/me/networks"),
+    );
+    populateNetworkSelector(networks);
+    const replacement = networks.find((item) => fold(item.name) === fold(network));
+    if (replacement && replacement.enabled !== false && replacement.runtime != null) {
+      terminalSocket = false;
+      clearAlert("network-unavailable");
+      setStatus(`${replacement.name}: reconfigured, reattaching…`, "connecting");
+      if (!reconnectTimer) {
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, 250);
+      }
+      return;
+    }
+    const reason = replacement
+      ? `${replacement.name} is disabled or has no running driver.`
+      : `No network named ${network} belongs to this account.`;
+    setStatus(`${network} unavailable`, "error");
+    showAlert(
+      "network-unavailable",
+      `${reason} Choose another network or update its configuration.`,
+      "error",
+      { href: "/console/networks", label: "Manage networks" },
+    );
+  } catch (error) {
+    setStatus(`${network} unavailable`, "error");
+    showAlert(
+      "network-unavailable",
+      `${errorMessage("verify the network after it stopped", error)} Automatic reattachment is paused.`,
+      "error",
+      { href: "/console/networks", label: "Manage networks" },
+    );
+  }
+}
+
 function connect() {
+  terminalSocket = false;
+  setComposerAvailable(false);
+  setStatus(`attaching to ${network}…`, "connecting");
   // Drop any previous socket so overlapping connections can't both feed events.
   if (socket) {
-    socket.onclose = null;
+    const previous = socket;
+    socket = null;
     try {
-      socket.close();
-    } catch {
-      /* already closed */
+      previous.close();
+    } catch (error) {
+      showAlert("socket-close", errorMessage("close the previous connection", error));
     }
   }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const url = `${proto}://${window.location.host}/ws/ui?network=${encodeURIComponent(network)}`;
-  socket = new WebSocket(url);
-  socket.addEventListener("open", () => {
+  const liveSocket = new WebSocket(url);
+  socket = liveSocket;
+  liveSocket.addEventListener("open", () => {
+    if (socket !== liveSocket) return;
     reconnectDelay = 0; // healthy connection: reset backoff
+    reconnectAttempt = 0;
+    setComposerAvailable(true);
     setStatus(`attached to ${network}`, "ok");
+    clearAlert("socket");
+    clearAlert("socket-close");
+    clearAlert("network-unavailable");
   });
-  socket.addEventListener("close", () => {
-    setStatus("disconnected — reconnecting…", "error");
+  liveSocket.addEventListener("error", () => {
+    if (socket !== liveSocket) return;
+    showAlert(
+      "socket",
+      `The live connection to ${network} failed. e6irc will keep retrying with bounded backoff.`,
+      "error",
+    );
+  });
+  liveSocket.addEventListener("close", (event) => {
+    if (socket !== liveSocket) return;
+    socket = null;
+    setComposerAvailable(false);
+    if (terminalSocket) {
+      setStatus(`${network} unavailable`, "error");
+      return;
+    }
+    const detail = event.reason ? `: ${event.reason}` : event.code === 1006 ? " unexpectedly" : "";
+    setStatus(`live connection closed${detail}`, "error");
     scheduleReconnect();
   });
-  socket.addEventListener("message", (ev) => {
+  liveSocket.addEventListener("message", (ev) => {
+    if (socket !== liveSocket) return;
     let event;
     try {
       event = JSON.parse(ev.data);
     } catch {
+      showAlert(
+        "protocol",
+        "The server sent a malformed live event. The event was rejected; other messages remain connected.",
+        "error",
+      );
       return;
     }
     if (event.t === "line" && typeof event.v === "string") handleLine(event.v);
-    else if (event.t === "status") setStatus(`${network}: ${event.v}`, event.v === "connected" ? "ok" : "error");
+    else if (event.t === "status" && event.v === "connected") {
+      setStatus(`${network}: upstream connected`, "ok");
+    } else if (event.t === "status" && event.v === "disconnected") {
+      setStatus(`${network}: upstream reconnecting`, "error");
+    } else if (event.t === "status" && event.v === "unavailable") {
+      terminalSocket = true;
+      setComposerAvailable(false);
+      reconcileUnavailableNetwork();
+    } else {
+      showAlert(
+        "protocol",
+        "The server sent an unsupported live event. The event was rejected; other messages remain connected.",
+        "error",
+      );
+    }
   });
 }
 
@@ -700,7 +871,11 @@ messageInput.addEventListener("keydown", (e) => {
 composer.addEventListener("submit", (e) => {
   e.preventDefault();
   const text = messageInput.value;
-  if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
+  if (!text) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    addServer("Not connected — your message was not sent.");
+    return;
+  }
   // The server maps {target, message} (with slash-commands) to an IRC line.
   const b = active !== SERVER ? buffers.get(active) : null;
   // In the server buffer there is no target, so plain text would be sent as a
@@ -746,46 +921,95 @@ if (joinForm) {
   });
 }
 
+function networkLabel(item) {
+  if (item.enabled === false) return "disabled";
+  if (item.connected === true) return "connected";
+  const lifecycle = item.runtime?.lifecycle;
+  return typeof lifecycle === "string" ? lifecycle.replaceAll("_", " ") : "starting";
+}
+
+function populateNetworkSelector(networks, failure = null) {
+  networkSelect.replaceChildren();
+  const choose = document.createElement("option");
+  choose.value = "";
+  choose.textContent = failure
+    ? "Networks unavailable"
+    : networks.length
+      ? "Choose a network"
+      : "No networks";
+  networkSelect.appendChild(choose);
+  for (const item of networks) {
+    const option = document.createElement("option");
+    option.value = item.name;
+    option.textContent = `${item.name} · ${networkLabel(item)}`;
+    option.selected = network !== null && fold(item.name) === fold(network);
+    networkSelect.appendChild(option);
+  }
+  if (network && !networks.some((item) => fold(item.name) === fold(network))) {
+    const missing = document.createElement("option");
+    missing.value = network;
+    missing.textContent = `${network} · unavailable`;
+    missing.selected = true;
+    networkSelect.appendChild(missing);
+  }
+}
+
+networkSelect.addEventListener("change", () => {
+  const selected = networkSelect.value;
+  if (selected && selected !== network) {
+    window.location.assign(`/?network=${encodeURIComponent(selected)}`);
+  } else if (!selected && network) {
+    window.location.assign("/");
+  }
+});
+
 // The network picker shown when the page is opened without ?network=<name>:
 // list the caller's networks as links, so the client has a real entry point
 // instead of requiring a hand-crafted URL.
-async function renderNetworkPicker() {
-  setStatus("choose a network", "error");
+function renderNetworkPicker(networks, failure = null) {
+  setStatus(failure ? "network list unavailable" : "choose a network", failure ? "error" : "connecting");
   bufnameEl.textContent = "Select a network";
   buftopicEl.textContent = "";
   nicklistEl.hidden = true;
   messagesEl.replaceChildren();
-  let nets = [];
-  try {
-    const list = await (await fetch("/api/v1/me/networks", { headers: { Accept: "application/json" } })).json();
-    nets = list.networks || [];
-  } catch {
-    /* fall through to the empty-state message */
-  }
   const intro = document.createElement("li");
   intro.className = "line line-server";
-  intro.textContent = nets.length
-    ? "Choose a network to open:"
-    : "You have no networks yet.";
+  intro.textContent = failure
+    ? "e6irc could not load your networks. This is an API failure, not an empty account."
+    : networks.length
+      ? "Choose an always-on network:"
+      : "No networks are configured for this account.";
   messagesEl.appendChild(intro);
-  for (const n of nets) {
+  for (const item of networks) {
     const li = document.createElement("li");
     li.className = "line";
     const a = document.createElement("a");
     a.className = "picker-net";
-    a.href = `?network=${encodeURIComponent(n.name)}`;
-    const tag = n.connected ? " · connected" : n.enabled === false ? " · disabled" : "";
-    a.textContent = `▸ ${n.name}${tag}`;
+    a.href = `/?network=${encodeURIComponent(item.name)}`;
+    const name = document.createElement("span");
+    name.textContent = item.name;
+    const state = document.createElement("small");
+    state.textContent = networkLabel(item);
+    a.append(name, state);
     li.appendChild(a);
     messagesEl.appendChild(li);
   }
   const manageLi = document.createElement("li");
-  manageLi.className = "line";
+  manageLi.className = "line picker-actions";
   const manage = document.createElement("a");
-  manage.className = "picker-net";
   manage.href = "/console/networks";
-  manage.textContent = nets.length ? "⚙ Manage networks" : "⚙ Add a network in the console";
+  manage.textContent = failure
+    ? "Open network console"
+    : networks.length
+      ? "Manage networks"
+      : "Add a network";
   manageLi.appendChild(manage);
+  if (failure) {
+    const retry = document.createElement("a");
+    retry.href = "/";
+    retry.textContent = "Retry";
+    manageLi.appendChild(retry);
+  }
   messagesEl.appendChild(manageLi);
 }
 
@@ -805,14 +1029,19 @@ async function loadEarlier() {
   }
   let lines = [];
   try {
-    const r = await fetch(
-      `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=5000`,
-      { headers: { Accept: "application/json" } },
+    const payload = await getJson(
+      window.fetch.bind(window),
+      `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
     );
-    if (!r.ok) throw new Error("http");
-    lines = (await r.json()).lines || [];
-  } catch {
-    addServer("Could not load earlier messages.");
+    if (!Array.isArray(payload.lines) || payload.lines.some((line) => typeof line !== "string")) {
+      throw new ApiError(200, "The server returned an invalid backlog");
+    }
+    lines = payload.lines;
+    clearAlert("history");
+  } catch (error) {
+    const message = errorMessage("load earlier messages", error);
+    addServer(message);
+    showAlert("history", message, "error");
     if (btn) {
       btn.disabled = false;
       btn.textContent = "Load earlier messages";
@@ -861,12 +1090,17 @@ const notifyBtn = el("notify-toggle");
 
 function updateSettingsUI() {
   if (themeSelect) themeSelect.value = settings.theme;
-  if (notifyBtn) notifyBtn.textContent = settings.notifications ? "🔔 On" : "🔕 Off";
+  if (notifyBtn) {
+    notifyBtn.textContent = settings.notifications
+      ? "Desktop notifications: on"
+      : "Desktop notifications: off";
+    notifyBtn.setAttribute("aria-pressed", String(settings.notifications));
+  }
 }
 if (themeSelect) {
   themeSelect.addEventListener("change", () => {
     settings.theme = themeSelect.value;
-    saveSettings();
+    persistSettings();
     applyTheme();
   });
 }
@@ -877,7 +1111,15 @@ if (notifyBtn) {
         addServer("This browser does not support desktop notifications.");
         return;
       }
-      const perm = await Notification.requestPermission();
+      let perm;
+      try {
+        perm = await Notification.requestPermission();
+      } catch (error) {
+        const message = errorMessage("request notification permission", error);
+        addServer(message);
+        showAlert("notifications", message);
+        return;
+      }
       if (perm !== "granted") {
         addServer("Notification permission was not granted.");
         return;
@@ -886,7 +1128,7 @@ if (notifyBtn) {
     } else {
       settings.notifications = false;
     }
-    saveSettings();
+    persistSettings();
     updateSettingsUI();
   });
 }
@@ -897,13 +1139,15 @@ updateSettingsUI();
 async function boot() {
   ensureBuffer(SERVER, "server");
   setActive(SERVER);
+  setComposerAvailable(false);
 
   try {
-    const me = await (await fetch("/api/v1/me", { headers: { Accept: "application/json" } })).json();
-    if (typeof me.account === "string") {
-      el("account-name").textContent = me.account;
-      el("account-link").dataset.shauthUser = me.account;
+    const me = await getJson(window.fetch.bind(window), "/api/v1/me");
+    if (me === null || typeof me !== "object" || typeof me.account !== "string") {
+      throw new ApiError(200, "The server returned an invalid identity");
     }
+    el("account-name").textContent = me.account;
+    el("account-link").dataset.shauthUser = me.account;
     // The email rides the account name's title attribute (the SSO validator
     // reads it there); role and the coordinated-logout coordinate likewise.
     el("account-name").title = typeof me.email === "string" ? me.email : "";
@@ -918,25 +1162,81 @@ async function boot() {
     ) {
       el("logout-link").href = me.logout_url;
     }
-  } catch {
-    /* identity is best-effort chrome; the chat still works without it */
+    clearAlert("identity");
+  } catch (error) {
+    el("account-name").textContent = "identity unavailable";
+    showAlert(
+      "identity",
+      errorMessage("load your signed-in identity", error),
+      "error",
+      error instanceof ApiError && error.status === 401
+        ? { href: "/login", label: "Sign in" }
+        : null,
+    );
   }
 
+  let networks = [];
+  let networkFailure = null;
+  try {
+    networks = networksFrom(
+      await getJson(window.fetch.bind(window), "/api/v1/me/networks"),
+    );
+    clearAlert("networks");
+  } catch (error) {
+    networkFailure = error;
+    showAlert(
+      "networks",
+      errorMessage("load your networks", error),
+      "error",
+      error instanceof ApiError && error.status === 401
+        ? { href: "/login", label: "Sign in" }
+        : { href: "/console/networks", label: "Open network console" },
+    );
+  }
+  populateNetworkSelector(networks, networkFailure);
+
   if (!network) {
-    await renderNetworkPicker();
+    renderNetworkPicker(networks, networkFailure);
     return;
   }
 
-  // Seed our nick from the network's configured nick (overridden by 001/NICK).
-  try {
-    const list = await (await fetch("/api/v1/me/networks", { headers: { Accept: "application/json" } })).json();
-    const net = (list.networks || []).find((n) => n.name === network);
-    if (net && typeof net.nick === "string") myNick = net.nick;
-  } catch {
-    /* fall back to learning the nick from 001 */
+  if (!networkFailure) {
+    const selected = networks.find((item) => fold(item.name) === fold(network));
+    if (!selected) {
+      setStatus(`${network} not found`, "error");
+      showAlert(
+        "network-unavailable",
+        `No network named ${network} belongs to this account.`,
+        "error",
+        { href: "/console/networks", label: "Manage networks" },
+      );
+      renderNetworkPicker(networks);
+      return;
+    }
+    if (selected.enabled === false || selected.runtime == null) {
+      const reason =
+        selected.enabled === false
+          ? `${selected.name} is disabled.`
+          : `${selected.name} has no running driver in this build.`;
+      setStatus(`${selected.name} unavailable`, "error");
+      showAlert(
+        "network-unavailable",
+        `${reason} Enable or reconfigure it before opening chat.`,
+        "error",
+        { href: `/console/networks/${encodeURIComponent(selected.name)}`, label: "Open network" },
+      );
+      addServer(`${reason} The live socket was not opened.`);
+      return;
+    }
+    // Seed our nick from the stored configuration (overridden by 001/NICK).
+    if (typeof selected.nick === "string") myNick = selected.nick;
   }
 
   connect();
 }
 
-boot();
+boot().catch((error) => {
+  setComposerAvailable(false);
+  setStatus("client startup failed", "error");
+  showAlert("boot", errorMessage("start the chat client", error), "error");
+});

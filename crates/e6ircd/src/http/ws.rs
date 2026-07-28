@@ -276,6 +276,7 @@ pub(super) async fn ws_ui_conn(
     // and close, or the socket would linger forever on a dead network. attach()
     // over raw IRC guards the same way.
     if *shutdown.borrow() {
+        send_unavailable(&mut socket).await;
         return;
     }
     let _attachment = handle.track_attachment();
@@ -309,19 +310,12 @@ pub(super) async fn ws_ui_conn(
     }
     loop {
         tokio::select! {
-            // Network removed/replaced/disabled: tell the client and detach,
-            // instead of dangling on a stopped network forever.
+            // Network removed/replaced/disabled: send a typed terminal status
+            // and detach. The browser uses it to stop its ordinary reconnect
+            // loop instead of retrying a network that cannot accept a socket.
             res = shutdown.changed() => {
                 if res.is_err() || *shutdown.borrow() {
-                    // This is a terminal courtesy notice; a failed send means
-                    // the peer has already detached.
-                    drop(
-                        socket
-                            .send(WsMessage::text(line_event(
-                                ":*bnc* NOTICE * :network removed; detaching",
-                            )))
-                            .await,
-                    );
+                    send_unavailable(&mut socket).await;
                     break;
                 }
             }
@@ -366,7 +360,10 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
-                Err(RecvError::Closed) => break,      // driver gone
+                Err(RecvError::Closed) => {
+                    send_unavailable(&mut socket).await;
+                    break;
+                }
             },
             frame = socket.recv() => match frame {
                 Some(Ok(WsMessage::Text(t))) => {
@@ -390,7 +387,10 @@ pub(super) async fn ws_ui_conn(
                                 break;
                             }
                         }
-                        crate::bouncer::SendOutcome::Closed => break, // driver gone
+                        crate::bouncer::SendOutcome::Closed => {
+                            send_unavailable(&mut socket).await;
+                            break;
+                        }
                     }
                 }
                 Some(Ok(_)) => {}
@@ -398,6 +398,16 @@ pub(super) async fn ws_ui_conn(
             },
         }
     }
+}
+
+async fn send_unavailable(socket: &mut WebSocket) {
+    // This is a terminal courtesy event; a failed send means the peer already
+    // detached, so there is no second observer to notify.
+    drop(
+        socket
+            .send(WsMessage::text(status_event(ConnStatus::Unavailable)))
+            .await,
+    );
 }
 
 /// Reduce a composer-derived line to exactly one framed IRC line: cut at the
@@ -479,6 +489,7 @@ pub(super) fn line_event(line: &str) -> String {
 pub(super) enum ConnStatus {
     Connected,
     Disconnected,
+    Unavailable,
 }
 
 impl ConnStatus {
@@ -486,6 +497,7 @@ impl ConnStatus {
         match self {
             ConnStatus::Connected => "connected",
             ConnStatus::Disconnected => "disconnected",
+            ConnStatus::Unavailable => "unavailable",
         }
     }
 }

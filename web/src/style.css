@@ -8,6 +8,8 @@
   --panel: #fff;
   --ok: #1a8f4c;
   --off: #b23b3b;
+  --warn: #b05c00;
+  --shadow: 0 10px 28px rgb(15 23 42 / 0.1);
 }
 /* Dark palette: applied by the OS preference under "auto", or forced by the
    theme toggle via :root[data-theme="dark"]. The forced selectors are more
@@ -21,6 +23,8 @@
     --panel: #14171d;
     --ok: #3fbf72;
     --off: #e06666;
+    --warn: #f0a54a;
+    --shadow: 0 12px 32px rgb(0 0 0 / 0.35);
   }
 }
 :root[data-theme="dark"] {
@@ -31,6 +35,8 @@
   --panel: #14171d;
   --ok: #3fbf72;
   --off: #e06666;
+  --warn: #f0a54a;
+  --shadow: 0 12px 32px rgb(0 0 0 / 0.35);
 }
 
 * { box-sizing: border-box; }
@@ -46,21 +52,92 @@ body {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.5rem 1rem;
+  padding: 0.55rem 1rem;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
+  background: var(--panel);
+  position: relative;
+  z-index: 5;
 }
-#brand { font-weight: 700; letter-spacing: 0.02em; }
+#brand { color: var(--fg); font-weight: 750; letter-spacing: 0.02em; text-decoration: none; }
 #user-nav { margin-left: auto; display: flex; gap: 0.9rem; align-items: center; }
 #user-nav a { color: var(--accent); text-decoration: none; }
 .user-role { color: var(--muted); font-size: 0.8rem; margin-left: 0.3rem; }
-.status { font-size: 0.8rem; padding: 0.1rem 0.5rem; border-radius: 0.6rem; border: 1px solid var(--border); color: var(--muted); }
-#settings { display: flex; gap: 0.4rem; align-items: center; }
-#settings select, #settings button {
-  font: inherit; font-size: 0.8rem; padding: 0.15rem 0.4rem; border-radius: 0.4rem;
-  border: 1px solid var(--border); background: transparent; color: inherit; cursor: pointer;
+.status {
+  font-size: 0.78rem;
+  padding: 0.18rem 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: min(22rem, 28vw);
+}
+#network-control { display: flex; align-items: center; gap: 0.4rem; color: var(--muted); font-size: 0.75rem; }
+#network-select, #settings select, #settings button, #settings summary, #sidebar-toggle {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.25rem 0.45rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: inherit;
+  cursor: pointer;
+}
+#network-select { max-width: 12rem; }
+#sidebar-toggle { display: none; }
+#settings { position: relative; }
+#settings summary { list-style: none; user-select: none; }
+#settings summary::-webkit-details-marker { display: none; }
+#settings[open] summary { border-color: var(--accent); }
+.settings-menu {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 0.45rem);
+  min-width: 16rem;
+  display: grid;
+  gap: 0.65rem;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.settings-menu label { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 1rem; }
+.settings-note { color: var(--warn); font-size: 0.75rem; line-height: 1.35; }
+#alerts:empty { display: none; }
+#alerts {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.alert {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border));
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, var(--warn) 9%, var(--panel));
+}
+.alert-error {
+  border-color: color-mix(in srgb, var(--off) 55%, var(--border));
+  background: color-mix(in srgb, var(--off) 9%, var(--panel));
+}
+.alert span { flex: 1 1 auto; }
+.alert a { color: var(--accent); font-weight: 650; text-decoration: none; }
+.alert button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
 }
 .status-ok { color: var(--ok); border-color: var(--ok); }
+.status-connecting { color: var(--muted); }
 .status-error { color: var(--off); border-color: var(--off); }
 
 #workspace { display: flex; flex: 1 1 auto; min-height: 0; }
@@ -168,6 +245,10 @@ body {
   font-weight: 600;
   cursor: pointer;
 }
+#composer :disabled, #join-form :disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
 
 #join-form { display: flex; gap: 0.3rem; padding: 0.4rem 0.5rem 0.2rem; }
 #join-input {
@@ -186,19 +267,41 @@ body {
   outline: 2px solid var(--accent); outline-offset: -2px;
 }
 .picker-net {
-  display: inline-block; color: var(--accent); text-decoration: none;
-  padding: 0.15rem 0; font-weight: 600;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  width: min(34rem, 100%);
+  color: var(--fg);
+  text-decoration: none;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: var(--panel);
+  font-weight: 650;
 }
-.picker-net:hover { text-decoration: underline; }
+.picker-net:hover { border-color: var(--accent); }
+.picker-net small { color: var(--muted); font-weight: 400; }
+.picker-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 0.6rem; }
+.picker-actions a { color: var(--accent); text-decoration: none; font-weight: 650; }
 
 @media (max-width: 42rem) {
   #sidebar, #nicklist { flex-basis: 8rem; }
+  #network-control > span, #account-role { display: none; }
+  #network-select { max-width: 9rem; }
 }
 /* Narrow / phone: stack the panes and let the member list collapse so the
    chat pane is usable instead of a sliver. */
 @media (max-width: 30rem) {
+  #topbar { flex-wrap: wrap; gap: 0.45rem; padding: 0.5rem 0.65rem; }
+  #sidebar-toggle { display: inline-block; }
+  #status { order: 5; max-width: none; width: 100%; }
+  #settings { margin-left: auto; }
+  .settings-menu { left: auto; right: 0; }
+  #user-nav { width: 100%; margin-left: 0; justify-content: flex-end; }
+  #alerts { padding: 0.45rem 0.65rem; }
   #workspace { flex-direction: column; }
-  #sidebar { flex: 0 0 auto; max-height: 30vh; border-right: none;
+  #sidebar { display: none; flex: 0 0 auto; max-height: 38vh; width: 100%; border-right: none;
     border-bottom: 1px solid var(--border); }
+  body.sidebar-open #sidebar { display: block; }
   #nicklist { display: none; }
 }

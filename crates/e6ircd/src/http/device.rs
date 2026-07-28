@@ -266,7 +266,10 @@ pub(super) async fn admin_audit(
     axum::extract::Query(params): axum::extract::Query<AuditQuery>,
 ) -> Response {
     let pool = pool_of(&state);
-    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as i64;
+    let limit = match bounded_query_limit(params.limit, 100, 1000, "audit") {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
     match crate::db::list_audit_log(pool, limit).await {
         Ok(rows) => admin_json(serde_json::json!({
             "audit": rows

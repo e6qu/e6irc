@@ -104,6 +104,54 @@ try {
     () => document.getElementById("account-name")?.textContent !== "signed in",
   );
   assert.notEqual(await page.locator("#account-name").textContent(), "signed in");
+  // The embedded client shell must render an honest, usable zero-network
+  // state: account navigation and preferences remain available, the picker
+  // distinguishes an empty collection from an API failure, and the composer
+  // cannot accept a message with no attached network.
+  await page.locator("#network-select").waitFor();
+  assert.equal(await page.locator("#network-select").inputValue(), "");
+  assert.equal(await page.locator("#message").isDisabled(), true);
+  assert.equal(await page.locator("#composer button").isDisabled(), true);
+  assert.match(await page.locator("#messages").innerText(), /No networks are configured/);
+  assert.equal(await page.getByText("Preferences", { exact: true }).count(), 1);
+  assert.equal(await page.getByRole("link", { name: "Manage", exact: true }).getAttribute("href"), "/console/networks");
+  await page.route(`${applicationOrigin}/api/v1/me/networks`, async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ status: 503, title: "Database unavailable" }),
+    });
+  });
+  const deliberateFailureErrorStart = browserErrors.length;
+  const deliberateFailureResponse = page.waitForResponse(
+    (response) =>
+      response.url() === `${applicationOrigin}/api/v1/me/networks` &&
+      response.status() === 503,
+  );
+  await page.reload();
+  await deliberateFailureResponse;
+  await page.locator('[data-alert="networks"]').waitFor();
+  assert.match(await page.locator("#messages").innerText(), /API failure, not an empty account/);
+  assert.match(await page.locator('[data-alert="networks"]').innerText(), /Database unavailable/);
+  assert.equal(
+    await page.locator("#network-select option").first().textContent(),
+    "Networks unavailable",
+  );
+  const deliberateFailureErrors = browserErrors.splice(deliberateFailureErrorStart);
+  assert.equal(
+    deliberateFailureErrors.length,
+    1,
+    `the deliberate 503 produced unexpected browser errors: ${deliberateFailureErrors.join("; ")}`,
+  );
+  assert.match(
+    deliberateFailureErrors[0],
+    /^Failed to load resource: the server responded with a status of 503 \(Service Unavailable\)$/,
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/me/networks`);
+  await page.reload();
+  await page.waitForFunction(
+    () => document.getElementById("account-name")?.textContent !== "signed in",
+  );
   assert.ok(
     navigationTrace.includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `portal flow bypassed the e6irc OpenID Connect starter:\n${navigationTrace.join("\n")}`,

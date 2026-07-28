@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       # embed-web (pulled in by --all-features) embeds web/dist, so build
       # the frontend first. Node is preinstalled on the runners.
-      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
       # `--all-features` is the union, so it never compiles a bridge on its

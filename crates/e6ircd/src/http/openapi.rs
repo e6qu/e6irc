@@ -248,6 +248,7 @@ pub(super) async fn openapi() -> Response {
                         { "name": "limit", "in": "query", "required": false,
                             "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }],
                     "responses": { "200": { "description": "buffered lines" },
+                        "400": { "description": "limit outside 1–1000" },
                         "404": { "description": "no such network" } } }
             },
             "/api/v1/history": {
@@ -275,8 +276,10 @@ pub(super) async fn openapi() -> Response {
                 "get": { "summary": "Query the oper audit log, newest-first (admin only)",
                     "security": bearer,
                     "parameters": [ { "name": "limit", "in": "query",
-                        "schema": { "type": "integer" } } ],
+                        "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
+                            "default": 100 } } ],
                     "responses": { "200": { "description": "audit entries" },
+                        "400": { "description": "limit outside 1–1000" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/stats": {
