@@ -2773,6 +2773,145 @@ pub async fn query_account_directory(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RegisteredChannelDirectoryRow {
+    pub id: i64,
+    pub name: String,
+    pub founder: String,
+    pub created_at: String,
+    pub keeptopic: bool,
+    pub topic_retained: bool,
+    pub mlock: Option<String>,
+    pub access_entries: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RegisteredChannelDirectoryFilter<'a> {
+    pub before_id: Option<i64>,
+    pub exact_name: Option<&'a str>,
+    pub exact_founder: Option<&'a str>,
+    pub page_size: RegisteredChannelDirectoryPageSize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegisteredChannelDirectoryPage {
+    pub entries: Vec<RegisteredChannelDirectoryRow>,
+    pub next_before_id: Option<i64>,
+}
+
+bounded_page_size!(
+    RegisteredChannelDirectoryPageSize,
+    "A non-zero registered-channel directory page size capped at the public API maximum."
+);
+
+/// Query administrator-safe registered-channel posture newest-first. Exact
+/// channel and founder filters use the same RFC1459 folding keys as live
+/// ownership and authentication.
+pub async fn query_registered_channel_directory(
+    pool: &PgPool,
+    filter: RegisteredChannelDirectoryFilter<'_>,
+) -> Result<RegisteredChannelDirectoryPage, DbError> {
+    let page_size = filter.page_size.value();
+    let fetch_limit = page_size + 1;
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT c.id, c.name, a.name AS founder,
+                to_char(c.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                c.keeptopic, c.topic IS NOT NULL AS topic_retained, c.mlock,
+                (SELECT count(*) FROM channel_access ca
+                 WHERE ca.channel_id = c.id) AS access_entries
+         FROM channels c
+         JOIN accounts a ON a.id = c.founder_account_id
+         WHERE TRUE",
+    );
+    if let Some(before_id) = filter.before_id {
+        query.push(" AND c.id < ").push_bind(before_id);
+    }
+    if let Some(exact_name) = filter.exact_name {
+        let folded = CaseMapping::Rfc1459.casefold(exact_name);
+        query.push(" AND c.name_folded = ").push_bind(folded);
+    }
+    if let Some(exact_founder) = filter.exact_founder {
+        let folded = CaseMapping::Rfc1459.casefold(exact_founder);
+        query.push(" AND a.name_folded = ").push_bind(folded);
+    }
+    query
+        .push(" ORDER BY c.id DESC LIMIT ")
+        .push_bind(fetch_limit as i64);
+    let (entries, next_before_id) =
+        fetch_keyset_page!(pool, query, RegisteredChannelDirectoryRow, page_size);
+    Ok(RegisteredChannelDirectoryPage {
+        entries,
+        next_before_id,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ServerBanDirectoryRow {
+    pub id: i64,
+    pub kind: String,
+    pub mask: String,
+    pub reason: String,
+    pub set_by: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ServerBanDirectoryFilter<'a> {
+    pub before_id: Option<i64>,
+    pub exact_kind: Option<&'a str>,
+    pub exact_mask: Option<&'a str>,
+    pub page_size: ServerBanDirectoryPageSize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ServerBanDirectoryPage {
+    pub entries: Vec<ServerBanDirectoryRow>,
+    pub next_before_id: Option<i64>,
+}
+
+bounded_page_size!(
+    ServerBanDirectoryPageSize,
+    "A non-zero server-ban directory page size capped at the public API maximum."
+);
+
+/// Query persisted server policy bans newest-first. Display casing is returned
+/// while exact mask matching uses the same folded key as enforcement and
+/// removal.
+pub async fn query_server_ban_directory(
+    pool: &PgPool,
+    filter: ServerBanDirectoryFilter<'_>,
+) -> Result<ServerBanDirectoryPage, DbError> {
+    let page_size = filter.page_size.value();
+    let fetch_limit = page_size + 1;
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT b.id, b.kind, COALESCE(b.mask_display, b.mask) AS mask,
+                b.reason, b.set_by,
+                to_char(b.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+         FROM server_bans b WHERE TRUE",
+    );
+    if let Some(before_id) = filter.before_id {
+        query.push(" AND b.id < ").push_bind(before_id);
+    }
+    if let Some(exact_kind) = filter.exact_kind {
+        query.push(" AND b.kind = ").push_bind(exact_kind);
+    }
+    if let Some(exact_mask) = filter.exact_mask {
+        let folded = CaseMapping::Rfc1459.casefold(exact_mask);
+        query.push(" AND b.mask = ").push_bind(folded);
+    }
+    query
+        .push(" ORDER BY b.id DESC LIMIT ")
+        .push_bind(fetch_limit as i64);
+    let (entries, next_before_id) =
+        fetch_keyset_page!(pool, query, ServerBanDirectoryRow, page_size);
+    Ok(ServerBanDirectoryPage {
+        entries,
+        next_before_id,
+    })
+}
+
 /// A fixed argon2id hash used only to spend a verification's worth of CPU on
 /// the no-such-account path of [`verify_credentials`], so that account
 /// existence is not a timing oracle. Computed once with the same parameters

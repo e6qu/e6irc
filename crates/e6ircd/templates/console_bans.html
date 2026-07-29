@@ -1,0 +1,136 @@
+{% extends "console_base.html" %}
+{% block main %}
+  {% if let Some(err) = error %}
+    <p class="banner-error" role="alert">{{ err }}</p>
+  {% endif %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">Connection policy</p>
+      <h1>Server bans</h1>
+      <p class="lede">Create, inspect, and remove K-Lines, D-Lines, and X-Lines through the same live core that enforces them.</p>
+    </div>
+    <a class="button-link" href="/api/v1/admin/bans">Open JSON API</a>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Add server ban</h2>
+        <p>Matching connected clients are disconnected only after the policy is durably stored.</p>
+      </div>
+    </div>
+    <form class="field-grid" method="post" action="/console/bans">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field">
+        <span>Policy kind</span>
+        <select name="kind" required>
+          <option value="kline">K-Line · user@host</option>
+          <option value="dline">D-Line · host or IP</option>
+          <option value="xline">X-Line · real name</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Mask</span>
+        <input name="mask" maxlength="512" placeholder="*@bad.example" required />
+      </label>
+      <label class="field field-wide">
+        <span>Reason</span>
+        <input name="reason" maxlength="512" placeholder="Policy reason (optional)" />
+      </label>
+      <div class="form-actions field-wide">
+        <button class="primary" type="submit">Add and enforce ban</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Exact lookup</h2>
+        <p>Mask matching uses the same RFC1459-folded key as enforcement and removal.</p>
+      </div>
+      {% if has_filters || has_cursor %}
+        <a class="secondary-link" href="/console/bans">Clear filters and cursor</a>
+      {% endif %}
+    </div>
+    <form class="field-grid" method="get" action="/console/bans">
+      <label class="field">
+        <span>Policy kind</span>
+        <select name="kind">
+          <option value="">All kinds</option>
+          <option value="kline"{% if kind == "kline" %} selected{% endif %}>K-Line</option>
+          <option value="dline"{% if kind == "dline" %} selected{% endif %}>D-Line</option>
+          <option value="xline"{% if kind == "xline" %} selected{% endif %}>X-Line</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Exact mask</span>
+        <input name="mask" value="{{ mask }}" maxlength="512" autocomplete="off"
+               placeholder="*@bad.example" />
+      </label>
+      <label class="field">
+        <span>Rows per page</span>
+        <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"
+               inputmode="numeric" required />
+      </label>
+      <div class="form-actions field-wide">
+        <button class="primary" type="submit">Apply lookup</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head list-head">
+      <div>
+        <h2>Persisted policy</h2>
+        <p>Newest rules first. Display casing is preserved while matching remains canonical.</p>
+      </div>
+      <span class="count">{{ entries.len() }}</span>
+    </div>
+    {% if entries.is_empty() %}
+      <p class="empty">{% if has_filters %}No server ban matches these exact filters.{% else %}No server bans are active.{% endif %}</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for entry in entries %}
+              <tr>
+                <td class="meta">{{ entry.id }}</td>
+                <td><span class="tag">{{ entry.kind }}</span></td>
+                <td><strong><code>{{ entry.mask }}</code></strong></td>
+                <td class="audit-detail">{{ entry.reason }}</td>
+                <td><code>{{ entry.set_by }}</code></td>
+                <td class="meta"><time datetime="{{ entry.created_at }}">{{ entry.created_at }}</time></td>
+                <td>
+                  <form class="cell-form" method="post" action="/console/bans/delete"
+                        data-confirm="Remove {{ entry.kind }} {{ entry.mask }}?">
+                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <input type="hidden" name="kind" value="{{ entry.kind }}" />
+                    <input type="hidden" name="mask" value="{{ entry.mask }}" />
+                    <button class="danger" type="submit">Remove</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+
+    <div class="pager">
+      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching rules.{% endif %}</span>
+      {% if let Some(before_id) = next_before_id %}
+        <form method="get" action="/console/bans">
+          <input type="hidden" name="kind" value="{{ kind }}" />
+          <input type="hidden" name="mask" value="{{ mask }}" />
+          <input type="hidden" name="limit" value="{{ limit }}" />
+          <input type="hidden" name="before_id" value="{{ before_id }}" />
+          <button type="submit">Older rules</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

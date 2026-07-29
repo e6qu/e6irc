@@ -73,6 +73,22 @@ handler extractor, so monitoring, audit, configuration, integrations, and the
 directory cannot compile without their login redirect, administrator gate, and
 session-bound CSRF derivation.
 
+Administrator policy directories (2026-07-29): the remaining unbounded
+persistent inventories are removed from the administrator request path.
+`/console/admin/channels` and `GET /api/v1/admin/channels` now expose stable,
+newest-first registration pages with exact RFC1459-folded channel/founder
+filters and retained topic, KEEPTOPIC, canonical MLOCK, and access-grant
+posture. `/console/bans` and `GET /api/v1/admin/bans` provide the same bounded
+contract for K/D/X-line policy, preserving display casing while exact mask
+lookup uses the enforcement key. Server-ban kind is a closed validated filter
+backed by `(kind, id DESC)`; founder-filtered channel pages use
+`(founder_account_id, id DESC)`. Both pages own their destructive controls and
+surface failures locally, while successful writes still cross the live core
+before Post/Redirect/Get. The overview requests only the newest ten channels
+and bans. Typed rows, distinct bounded page sizes, positive cursors, hostile
+stored-text escaping tests, and concurrent-append tests make the prior
+unbounded/unstable class mechanically visible.
+
 Conformance harness reliability (2026-07-29): the e6ircd irctest controller
 now gives commands crossing independent raw-TCP and WebSocket reader tasks a
 bounded settling window before inserting its recipient-side PING barrier.

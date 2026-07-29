@@ -21,6 +21,15 @@ fn account_page_size(value: usize) -> db::AccountDirectoryPageSize {
     db::AccountDirectoryPageSize::new(value).expect("test account page size is in range")
 }
 
+fn registered_channel_page_size(value: usize) -> db::RegisteredChannelDirectoryPageSize {
+    db::RegisteredChannelDirectoryPageSize::new(value)
+        .expect("test registered-channel page size is in range")
+}
+
+fn server_ban_page_size(value: usize) -> db::ServerBanDirectoryPageSize {
+    db::ServerBanDirectoryPageSize::new(value).expect("test server-ban page size is in range")
+}
+
 /// `query_history` now returns `Result` (a DB fault is surfaced, not folded
 /// into an empty page); these tests exercise the happy path, so a query error
 /// is a test failure — unwrap it here rather than at every call site.
@@ -3732,6 +3741,193 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
     assert_eq!(alice.networks, 1);
     assert_eq!(alice.founded_channels, 1);
     assert_eq!(exact.next_before_id, None);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn policy_directories_filter_posture_and_cursor_pages_are_stable() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("policy_directories_filter_posture_and_cursor_pages_are_stable").await,
+    )
+    .await
+    .expect("connect");
+    for name in ["Alice", "Bob"] {
+        db::create_account(&pool, name, "pw")
+            .await
+            .unwrap_or_else(|error| panic!("create {name}: {error}"));
+    }
+    for (channel, founder) in [
+        ("#Alpha", "alice"),
+        ("#Bravo", "bob"),
+        ("#Charlie", "alice"),
+    ] {
+        sqlx::query(
+            "INSERT INTO channels (name, name_folded, founder_account_id)
+             SELECT $1, $2, id FROM accounts WHERE name_folded = $3",
+        )
+        .bind(channel)
+        .bind(channel.to_ascii_lowercase())
+        .bind(founder)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("insert {channel}: {error}"));
+    }
+    sqlx::query(
+        "UPDATE channels
+         SET keeptopic = FALSE, topic = 'retained', topic_setter = 'Alice',
+             topic_set_at = now(), mlock = '+nt'
+         WHERE name_folded = '#alpha'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel retained policy");
+    sqlx::query(
+        "INSERT INTO channel_access (channel_id, account_id, flags)
+         SELECT c.id, a.id, 'ov'
+         FROM channels c, accounts a
+         WHERE c.name_folded = '#alpha' AND a.name_folded = 'bob'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel posture");
+
+    let first_channels = db::query_registered_channel_directory(
+        &pool,
+        db::RegisteredChannelDirectoryFilter {
+            before_id: None,
+            exact_name: None,
+            exact_founder: None,
+            page_size: registered_channel_page_size(2),
+        },
+    )
+    .await
+    .expect("first channel page");
+    assert_eq!(
+        first_channels
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["#Charlie", "#Bravo"]
+    );
+    let channel_cursor = first_channels.next_before_id.expect("older channel cursor");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#Delta', '#delta', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("concurrent channel");
+    let older_channels = db::query_registered_channel_directory(
+        &pool,
+        db::RegisteredChannelDirectoryFilter {
+            before_id: Some(channel_cursor),
+            exact_name: None,
+            exact_founder: None,
+            page_size: registered_channel_page_size(2),
+        },
+    )
+    .await
+    .expect("older channel page");
+    assert_eq!(older_channels.entries.len(), 1);
+    assert_eq!(older_channels.entries[0].name, "#Alpha");
+    assert!(
+        older_channels
+            .entries
+            .iter()
+            .all(|entry| entry.id < channel_cursor),
+        "channel cursor admitted a newer or duplicate row: {older_channels:#?}"
+    );
+    let exact_channel = db::query_registered_channel_directory(
+        &pool,
+        db::RegisteredChannelDirectoryFilter {
+            before_id: None,
+            exact_name: Some("#aLPHa"),
+            exact_founder: Some("aLiCe"),
+            page_size: registered_channel_page_size(10),
+        },
+    )
+    .await
+    .expect("exact channel");
+    assert_eq!(exact_channel.entries.len(), 1);
+    let alpha = &exact_channel.entries[0];
+    assert_eq!(alpha.founder, "Alice");
+    assert!(!alpha.keeptopic);
+    assert!(alpha.topic_retained);
+    assert_eq!(alpha.mlock.as_deref(), Some("+nt"));
+    assert_eq!(alpha.access_entries, 1);
+
+    for (mask, display, reason, setter, kind) in [
+        ("bad@host", "Bad@Host", "spam", "Alice", "kline"),
+        ("192.0.2.*", "192.0.2.*", "proxy", "Bob", "dline"),
+        ("*bot*", "*Bot*", "automation", "Alice", "xline"),
+    ] {
+        db::add_server_ban(&pool, mask, display, reason, setter, kind)
+            .await
+            .unwrap_or_else(|error| panic!("add {kind} {display}: {error}"));
+    }
+    let first_bans = db::query_server_ban_directory(
+        &pool,
+        db::ServerBanDirectoryFilter {
+            before_id: None,
+            exact_kind: None,
+            exact_mask: None,
+            page_size: server_ban_page_size(2),
+        },
+    )
+    .await
+    .expect("first ban page");
+    assert_eq!(
+        first_bans
+            .entries
+            .iter()
+            .map(|entry| entry.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["xline", "dline"]
+    );
+    let ban_cursor = first_bans.next_before_id.expect("older ban cursor");
+    db::add_server_ban(
+        &pool,
+        "new@host",
+        "New@Host",
+        "concurrent",
+        "Alice",
+        "kline",
+    )
+    .await
+    .expect("concurrent ban");
+    let older_bans = db::query_server_ban_directory(
+        &pool,
+        db::ServerBanDirectoryFilter {
+            before_id: Some(ban_cursor),
+            exact_kind: None,
+            exact_mask: None,
+            page_size: server_ban_page_size(2),
+        },
+    )
+    .await
+    .expect("older ban page");
+    assert_eq!(older_bans.entries.len(), 1);
+    assert_eq!(older_bans.entries[0].mask, "Bad@Host");
+    assert!(
+        older_bans.entries.iter().all(|entry| entry.id < ban_cursor),
+        "server-ban cursor admitted a newer or duplicate row: {older_bans:#?}"
+    );
+    let exact_ban = db::query_server_ban_directory(
+        &pool,
+        db::ServerBanDirectoryFilter {
+            before_id: None,
+            exact_kind: Some("kline"),
+            exact_mask: Some("BAD@HOST"),
+            page_size: server_ban_page_size(10),
+        },
+    )
+    .await
+    .expect("exact ban");
+    assert_eq!(exact_ban.entries.len(), 1);
+    assert_eq!(exact_ban.entries[0].mask, "Bad@Host");
+    assert_eq!(exact_ban.entries[0].reason, "spam");
+    assert_eq!(exact_ban.entries[0].set_by, "Alice");
 }
 
 #[tokio::test]

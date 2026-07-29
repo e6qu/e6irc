@@ -2,6 +2,27 @@
 
 use super::*;
 
+fn database_unavailable(operation: &str, error: impl std::fmt::Display) -> Response {
+    eprintln!("http: {operation} failed: {error}");
+    problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database unavailable",
+        None,
+    )
+}
+
+fn owner_scoped_delete_response(
+    result: Result<bool, crate::db::DbError>,
+    not_found_title: &'static str,
+    operation: &'static str,
+) -> Response {
+    match result {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => problem(StatusCode::NOT_FOUND, not_found_title, None),
+        Err(error) => database_unavailable(operation, error),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct AppPasswordRequest {
     pub(super) account: String,
@@ -62,14 +83,7 @@ pub(super) async fn create_app_password(
             "Too many app passwords",
             Some("Revoke an existing app password first."),
         ),
-        Err(e) => {
-            eprintln!("http: app password issuance failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("app password issuance", error),
     }
 }
 
@@ -119,14 +133,7 @@ pub(super) async fn change_password(
             "Current password is required",
             Some("This account already has a primary password."),
         ),
-        Err(error) => {
-            eprintln!("http: password rotation failed: {error}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("password rotation", error),
     }
 }
 
@@ -158,14 +165,7 @@ pub(super) async fn list_credentials(
             )
                 .into_response()
         }
-        Err(e) => {
-            eprintln!("http: credential list failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("credential list", error),
     }
 }
 
@@ -195,14 +195,7 @@ pub(super) async fn me_identities(
             )
                 .into_response()
         }
-        Err(e) => {
-            eprintln!("http: identity list failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("identity list", error),
     }
 }
 
@@ -225,14 +218,7 @@ pub(super) async fn me_identity_unlink(
         Ok(crate::db::UnlinkIdentityOutcome::NotFound) => {
             problem(StatusCode::NOT_FOUND, "No such identity", None)
         }
-        Err(e) => {
-            eprintln!("http: identity unlink failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("identity unlink", error),
     }
 }
 
@@ -257,14 +243,7 @@ pub(super) async fn me_read_markers(
             )
                 .into_response()
         }
-        Err(e) => {
-            eprintln!("http: read-marker list failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("read-marker list", error),
     }
 }
 
@@ -292,14 +271,7 @@ pub(super) async fn me_tokens_list(
             )
                 .into_response()
         }
-        Err(e) => {
-            eprintln!("http: token list failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+        Err(error) => database_unavailable("token list", error),
     }
 }
 
@@ -310,18 +282,11 @@ pub(super) async fn me_tokens_revoke(
     Path(id): Path<i64>,
 ) -> Response {
     let pool = pool_of(&state);
-    match crate::db::delete_api_token(pool, &account, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => problem(StatusCode::NOT_FOUND, "No such token", None),
-        Err(e) => {
-            eprintln!("http: token revoke failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
-    }
+    owner_scoped_delete_response(
+        crate::db::delete_api_token(pool, &account, id).await,
+        "No such token",
+        "token revoke",
+    )
 }
 
 /// Revoke one of the authenticated account's app passwords by id.
@@ -331,16 +296,9 @@ pub(super) async fn revoke_credential(
     Path(id): Path<i64>,
 ) -> Response {
     let pool = pool_of(&state);
-    match crate::db::revoke_credential(pool, &account, id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => problem(StatusCode::NOT_FOUND, "No such credential", None),
-        Err(e) => {
-            eprintln!("http: credential revoke failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
-    }
+    owner_scoped_delete_response(
+        crate::db::revoke_credential(pool, &account, id).await,
+        "No such credential",
+        "credential revoke",
+    )
 }

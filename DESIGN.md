@@ -219,6 +219,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     page size. Stable `id < before_id` pagination replaces the former
     unbounded name dump, while an exact lookup enters storage only through the
     same RFC1459-folded key used by authentication.
+  - `RegisteredChannelDirectoryRow`/`ServerBanDirectoryRow` and their bounded
+    page-size types — persistent administrator policy inventories are typed
+    projections with stable `id < before_id` pagination. Exact channel,
+    founder, and mask lookup reuses the RFC1459-folded storage keys; ban kind
+    enters the query only after validation against its closed K/D/X-line set.
   - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
     `&str`, so two fields cannot be transposed at a call site.
   - `HistoryDbRow` — the history read binds columns by **name**
@@ -852,6 +857,16 @@ browser sessions and personal access tokens are not counted; credential
 hashes, bearer/session hashes, OpenID Connect subjects, and sealed upstream
 secrets are not selected at all.
 
+Administrator registered-channel and server-ban reads are independent of the
+unbounded boot preload required by the live core. They project newest-first
+policy pages with immutable IDs, exact folded filters, and one extra row for
+cursor detection. Channel posture includes the founder, registration time,
+KEEP policy, retained-topic presence, canonical mode lock, and access-grant
+count. `(founder_account_id, id DESC)` supports founder-filtered channel pages.
+Ban posture preserves display casing while filtering by the enforcement key;
+`(kind, id DESC)` supports kind-filtered pages. The overview asks each directory
+for only its newest ten rows.
+
 Write path for messages: producers push to an in-process MPSC; a writer pool
 batches into multi-row `INSERT ... UNNEST` (or COPY for bulk) with group
 commit — one connection cannot stall the chat path on Postgres latency. The
@@ -1197,9 +1212,9 @@ Surface (initial):
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
   canonical MLOCK, access flags, founder transfer, unregister)
 - `history`: paged queries per §11.2
-- `admin`: bounded, exact-filtered/stable-cursor account posture; global bans
-  (kline-equivalents); server stats; exact-filtered/stable-cursor audit-log
-  query; live/historical observability; Prometheus exposition. Personalized
+- `admin`: bounded, exact-filtered/stable-cursor account posture, registered
+  channel policy, global K/D/X-line policy, and audit log; server stats;
+  live/historical observability; Prometheus exposition. Personalized
   administrator JSON and metrics responses carry `Cache-Control: no-store`.
 - `healthz` (liveness; no auth)
 - `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
@@ -1230,7 +1245,11 @@ protected. `/console/accounts` gives administrators a newest-first,
 case-insensitive exact-search directory of account age, login-method posture,
 active access, networks, and founded channels. It deliberately shares the
 secret-free projection and stable cursor with `GET /api/v1/admin/accounts`;
-the overview requests only its newest ten rows. The **live chat
+the overview requests only its newest ten rows. `/console/admin/channels` and
+`/console/bans` likewise own bounded exact-search policy directories and their
+destructive controls; channel unregister and ban add/remove still cross the
+live core and redirect back to the page that owns the mutation. The overview
+contains only ten-row previews instead of unbounded policy tables. The **live chat
 client** is a small hand-written vanilla-JS IRC client (`web/src`,
 bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list

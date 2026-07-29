@@ -1,0 +1,107 @@
+{% extends "console_base.html" %}
+{% block main %}
+  {% if let Some(err) = error %}
+    <p class="banner-error" role="alert">{{ err }}</p>
+  {% endif %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">Channel policy</p>
+      <h1>Registered-channel directory</h1>
+      <p class="lede">Inspect retained policy and unregister channels through the live core so storage and runtime remain one confirmed state.</p>
+    </div>
+    <a class="button-link" href="/api/v1/admin/channels">Open JSON API</a>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Exact lookup</h2>
+        <p>Channel and founder matching follows the server's RFC1459 case-folding rules.</p>
+      </div>
+      {% if has_filters || has_cursor %}
+        <a class="secondary-link" href="/console/admin/channels">Clear filters and cursor</a>
+      {% endif %}
+    </div>
+    <form class="field-grid" method="get" action="/console/admin/channels">
+      <label class="field">
+        <span>Channel name</span>
+        <input name="name" value="{{ name }}" maxlength="50" autocomplete="off"
+               placeholder="#operations" />
+      </label>
+      <label class="field">
+        <span>Founder account</span>
+        <input name="founder" value="{{ founder }}" maxlength="64" autocomplete="off"
+               placeholder="alice" />
+      </label>
+      <label class="field">
+        <span>Rows per page</span>
+        <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"
+               inputmode="numeric" required />
+      </label>
+      <div class="form-actions field-wide">
+        <button class="primary" type="submit">Apply lookup</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head list-head">
+      <div>
+        <h2>Registered channels</h2>
+        <p>Newest registrations first. Unregistering removes retained topic, access, and mode-lock policy.</p>
+      </div>
+      <span class="count">{{ entries.len() }}</span>
+    </div>
+    {% if entries.is_empty() %}
+      <p class="empty">{% if has_filters %}No channel matches these exact filters.{% else %}No registered channels exist yet.{% endif %}</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Channel</th><th>Founder</th><th>Registered (UTC)</th>
+              <th>Retained policy</th><th>Access</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for entry in entries %}
+              <tr>
+                <td class="meta">{{ entry.id }}</td>
+                <td><strong><code>{{ entry.name }}</code></strong></td>
+                <td><code>{{ entry.founder }}</code></td>
+                <td class="meta"><time datetime="{{ entry.created_at }}">{{ entry.created_at }}</time></td>
+                <td class="account-posture">
+                  <span class="tag">KEEP{% if entry.keeptopic %} on{% else %} off{% endif %}</span>
+                  {% if entry.topic_retained %}<span class="tag">topic retained</span>{% endif %}
+                  {% if let Some(mlock) = entry.mlock %}<span class="tag">MLOCK <code>{{ mlock }}</code></span>{% endif %}
+                </td>
+                <td>{{ entry.access_entries }} grants</td>
+                <td>
+                  <form class="cell-form" method="post" action="/console/admin/channels/drop"
+                        data-confirm="Unregister {{ entry.name }} and delete its retained policy?">
+                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <input type="hidden" name="channel" value="{{ entry.name }}" />
+                    <button class="danger" type="submit">Unregister</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+
+    <div class="pager">
+      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching registrations.{% endif %}</span>
+      {% if let Some(before_id) = next_before_id %}
+        <form method="get" action="/console/admin/channels">
+          <input type="hidden" name="name" value="{{ name }}" />
+          <input type="hidden" name="founder" value="{{ founder }}" />
+          <input type="hidden" name="limit" value="{{ limit }}" />
+          <input type="hidden" name="before_id" value="{{ before_id }}" />
+          <button type="submit">Older registrations</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}
