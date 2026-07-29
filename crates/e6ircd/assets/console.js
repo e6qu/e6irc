@@ -24,6 +24,36 @@
     });
   }
 
+  for (const form of document.querySelectorAll("[data-network-form]")) {
+    const preset = form.querySelector("[data-network-preset]");
+    const name = form.querySelector("[data-network-name]");
+    const addr = form.querySelector("[data-network-addr]");
+    const tls = form.querySelector("[data-network-tls]");
+    if (
+      !(preset instanceof HTMLSelectElement) ||
+      !(name instanceof HTMLInputElement) ||
+      !(addr instanceof HTMLInputElement) ||
+      !(tls instanceof HTMLInputElement)
+    ) {
+      continue;
+    }
+
+    preset.addEventListener("change", () => {
+      const option = preset.selectedOptions[0];
+      if (!option || option.value === "custom") return;
+      name.value = option.dataset.name || "";
+      addr.value = option.dataset.addr || "";
+      tls.checked = option.dataset.tls === "true";
+    });
+
+    const markCustom = () => {
+      if (preset.value !== "custom") preset.value = "custom";
+    };
+    name.addEventListener("input", markCustom);
+    addr.addEventListener("input", markCustom);
+    tls.addEventListener("change", markCustom);
+  }
+
   const refresh = async (panel) => {
     const status = document.getElementById(panel.dataset.refreshStatus);
     panel.setAttribute("aria-busy", "true");

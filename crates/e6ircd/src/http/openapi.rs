@@ -500,7 +500,7 @@ pub(super) async fn openapi() -> Response {
             },
             "/api/v1/me/networks": {
                 "get": { "summary": "List the account's BNC networks with live upstream status",
-                    "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
+                    "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": bearer, "responses": ok_json },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "security": bearer,

@@ -23,47 +23,67 @@
           </div>
         {% endif %}
 
+        {% if let Some(err) = error %}
+          <p class="banner-error" role="alert">{{ err }}</p>
+        {% endif %}
+
         <section class="panel">
           <div class="panel-head">
             <div>
               <h2>Add an IRC network</h2>
-              <p>Credentials are encrypted before they are stored. The connection starts immediately.</p>
+              <p>Choose a known network or enter a custom endpoint. The connection starts immediately.</p>
             </div>
           </div>
-        <form class="network-form" method="post" action="/console/networks">
+        <form class="network-form" method="post" action="/console/networks" data-network-form>
           <input type="hidden" name="csrf" value="{{ csrf }}" />
+          <label class="field field-wide">
+            <span>IRC network</span>
+            <select name="preset" data-network-preset>
+              {% for preset in presets %}
+                <option value="{{ preset.id }}" data-name="{{ preset.name }}" data-addr="{{ preset.addr }}" data-tls="{% if preset.tls %}true{% else %}false{% endif %}" {% if form.preset == preset.id %}selected{% endif %}>{{ preset.label }}</option>
+              {% endfor %}
+              <option value="custom" {% if form.preset == "custom" || form.preset == "" %}selected{% endif %}>Custom server</option>
+            </select>
+            <small>Popular-network endpoints come from each network’s published connection guide.</small>
+          </label>
           <label class="field">
-            <span>Network name</span>
-            <input name="name" autocomplete="off" placeholder="Libera Chat" required />
-            <small>The short name used when attaching a client.</small>
+            <span>Network ID</span>
+            <input name="name" autocomplete="off" value="{{ form.name }}" maxlength="64" pattern="[A-Za-z0-9._-]+" data-network-name required />
+            <small>Stable client selector; letters, digits, dot, underscore, and hyphen only.</small>
           </label>
           <label class="field">
             <span>Server and port</span>
-            <input name="addr" autocomplete="off" placeholder="irc.libera.chat:6697" required />
+            <input name="addr" autocomplete="off" value="{{ form.addr }}" maxlength="255" data-network-addr required />
           </label>
           <label class="field">
             <span>Nickname</span>
-            <input name="nick" autocomplete="nickname" placeholder="{{ account }}" required />
+            <input name="nick" autocomplete="nickname" value="{{ form.nick }}" maxlength="64" required />
           </label>
           <label class="field">
             <span>Real name <em>optional</em></span>
-            <input name="realname" autocomplete="name" />
+            <input name="realname" autocomplete="name" value="{{ form.realname }}" maxlength="128" />
           </label>
           <label class="field field-wide">
             <span>Channels to join <em>optional</em></span>
-            <input name="autojoin" autocomplete="off" placeholder="#e6irc, #rust" />
+            <input name="autojoin" autocomplete="off" value="{{ form.autojoin }}" placeholder="#e6irc, #rust" />
             <small>Comma-separated channel names.</small>
           </label>
           <label class="field">
             <span>Upstream SASL account <em>optional</em></span>
-            <input name="sasl_account" autocomplete="username" />
+            <input name="sasl_account" autocomplete="username" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
           </label>
           <label class="field">
             <span>Upstream SASL password <em>optional</em></span>
-            <input type="password" name="sasl_password" autocomplete="new-password" />
+            <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" {% if !can_store_secrets %}disabled{% endif %} />
           </label>
+          {% if !can_store_secrets %}
+            <div class="banner-info field-wide">
+              <div><strong>Upstream credentials are unavailable.</strong> This deployment has no master key, so e6irc refuses to store passwords in plaintext. Networks that do not require SASL can still be added.</div>
+              {% if is_admin %}<a class="button-link" href="/console/configuration">View configuration</a>{% endif %}
+            </div>
+          {% endif %}
           <label class="check field-wide">
-            <input type="checkbox" name="tls" checked />
+            <input type="checkbox" name="tls" data-network-tls {% if form.tls %}checked{% endif %} />
             <span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span>
           </label>
           <div class="form-actions field-wide">

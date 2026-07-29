@@ -1151,6 +1151,8 @@ mod pages {
     #[derive(Deserialize)]
     pub struct NetworkFormFields {
         csrf: String,
+        #[serde(default)]
+        preset: String,
         name: String,
         addr: String,
         nick: String,
@@ -1167,20 +1169,40 @@ mod pages {
     }
 
     impl NetworkFormFields {
-        /// Build the `CreateNetwork` for an IRC upstream from the submitted form,
-        /// treating a blank optional text input as absent. Shared by the account
-        /// page.
-        fn into_create(self) -> CreateNetwork {
+        /// Resolve a selected catalog entry into the submitted fields. Doing
+        /// this server-side makes presets work without JavaScript; mutating the
+        /// fields also ensures a later validation error re-renders the values
+        /// that will actually be submitted, not stale values from the previous
+        /// selection.
+        fn apply_preset(&mut self) -> Result<(), NetworkMutationError> {
+            if !self.preset.is_empty() && self.preset != "custom" {
+                let Some(preset) = irc_network_preset(&self.preset) else {
+                    return Err(NetworkMutationError::new(
+                        StatusCode::BAD_REQUEST,
+                        "Unknown IRC network preset",
+                        Some("select one of the listed networks or Custom"),
+                    ));
+                };
+                self.name = preset.name.to_string();
+                self.addr = preset.addr.to_string();
+                self.tls = preset.tls.then(|| "on".to_string());
+            }
+            Ok(())
+        }
+
+        /// Build the `CreateNetwork` for an IRC upstream from already-resolved
+        /// form fields, treating a blank optional text input as absent.
+        fn into_resolved_create(self) -> CreateNetwork {
             let opt = |s: String| {
                 let s = s.trim().to_string();
                 (!s.is_empty()).then_some(s)
             };
             CreateNetwork {
                 kind: crate::config::NetworkKind::Irc,
-                name: self.name,
-                addr: self.addr,
+                name: self.name.trim().to_string(),
+                addr: self.addr.trim().to_string(),
                 tls: self.tls.as_deref() == Some("on"),
-                nick: self.nick,
+                nick: self.nick.trim().to_string(),
                 realname: opt(self.realname),
                 autojoin: self
                     .autojoin
@@ -1191,6 +1213,48 @@ mod pages {
                     .collect(),
                 sasl_account: opt(self.sasl_account),
                 sasl_password: opt(self.sasl_password),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct NetworkFormView {
+        preset: String,
+        name: String,
+        addr: String,
+        nick: String,
+        realname: String,
+        autojoin: String,
+        sasl_account: String,
+        tls: bool,
+    }
+
+    impl NetworkFormView {
+        fn libera(account: &str) -> Self {
+            let preset =
+                irc_network_preset("libera").expect("Libera preset is part of the catalog");
+            Self {
+                preset: preset.id.into(),
+                name: preset.name.into(),
+                addr: preset.addr.into(),
+                nick: account.into(),
+                realname: String::new(),
+                autojoin: String::new(),
+                sasl_account: String::new(),
+                tls: preset.tls,
+            }
+        }
+
+        fn submitted(fields: &NetworkFormFields) -> Self {
+            Self {
+                preset: fields.preset.clone(),
+                name: fields.name.clone(),
+                addr: fields.addr.clone(),
+                nick: fields.nick.clone(),
+                realname: fields.realname.clone(),
+                autojoin: fields.autojoin.clone(),
+                sasl_account: fields.sasl_account.clone(),
+                tls: fields.tls.as_deref() == Some("on"),
             }
         }
     }
@@ -4117,6 +4181,10 @@ mod pages {
         active: &'static str,
         networks: Vec<ConsoleNetView>,
         attach_addr: Option<std::net::SocketAddr>,
+        presets: &'static [IrcNetworkPreset],
+        form: NetworkFormView,
+        error: Option<String>,
+        can_store_secrets: bool,
     }
 
     #[derive(Template)]
@@ -4143,6 +4211,7 @@ mod pages {
         last_input: String,
         last_output: String,
         last_error: String,
+        last_error_reason: String,
         connect_latency: String,
         connection_attempts: u64,
         errors: u64,
@@ -4355,6 +4424,11 @@ mod pages {
             last_input: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_input_at)),
             last_output: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_output_at)),
             last_error: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_error_at)),
+            last_error_reason: runtime
+                .as_ref()
+                .and_then(|runtime| runtime.last_error)
+                .map(|failure| failure.summary().to_string())
+                .unwrap_or_else(|| "No classified runtime failure.".into()),
             connect_latency: runtime
                 .as_ref()
                 .and_then(|runtime| runtime.connect_latency_ms)
@@ -4448,24 +4522,17 @@ mod pages {
         }
     }
 
-    /// Console → BNC networks: the caller's own always-on upstreams with live
-    /// connection status, plus add/remove. Any authenticated user manages their
-    /// own networks (not admin-gated); an anonymous visitor goes to `/login`.
-    pub async fn console_networks(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
+    /// Render the network list and create form. Failed submissions use this same
+    /// path so their exact error and all non-secret fields remain in context.
+    async fn console_networks_page(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        form: NetworkFormView,
+        error: Option<String>,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
-        };
-        // The view lists networks straight from the database (like the account
-        // page), so it works even where the bouncer is disabled — status simply
-        // reads not-connected. Add/remove do require the live registry.
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        let is_admin = is_admin_account(&state, &account);
-        let networks = match console_network_views(&state, &account).await {
+        let is_admin = is_admin_account(state, &account);
+        let networks = match console_network_views(state, &account).await {
             Ok(n) => n,
             Err(r) => return r,
         };
@@ -4480,21 +4547,28 @@ mod pages {
             active: "networks",
             networks,
             attach_addr,
+            presets: IRC_NETWORK_PRESETS,
+            form,
+            error,
+            can_store_secrets: state.secret_key.is_some(),
         })
     }
 
-    /// Validate an add-network form and run the same creation core as the REST
-    /// endpoint.
-    async fn add_network_from_form(
-        state: &AppState,
-        account: &str,
-        fields: NetworkFormFields,
-    ) -> Result<(), Response> {
-        let Some(registry) = &state.bnc_registry else {
-            return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
+    /// Console → BNC networks: the caller's own always-on upstreams with live
+    /// connection status, plus add/remove. Any authenticated user manages their
+    /// own networks (not admin-gated); an anonymous visitor goes to `/login`.
+    pub async fn console_networks(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
         };
-        let req = fields.into_create();
-        create_network_core(state, registry, account, &req).await
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        let form = NetworkFormView::libera(&account);
+        console_networks_page(&state, account, csrf, form, None).await
     }
 
     /// Add a network from the console and return to the canonical list.
@@ -4511,8 +4585,38 @@ mod pages {
             Ok(account) => account,
             Err(response) => return response,
         };
-        if let Err(response) = add_network_from_form(&state, &account, fields).await {
-            return response;
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        let mut fields = fields;
+        let preset_result = fields.apply_preset();
+        let form_view = NetworkFormView::submitted(&fields);
+        let Some(registry) = &state.bnc_registry else {
+            return console_networks_page(
+                &state,
+                account,
+                csrf,
+                form_view,
+                Some("The network registry is not available on this server.".into()),
+            )
+            .await;
+        };
+        let req = match preset_result {
+            Ok(()) => fields.into_resolved_create(),
+            Err(error) => {
+                return console_networks_page(
+                    &state,
+                    account,
+                    csrf,
+                    form_view,
+                    Some(error.message()),
+                )
+                .await;
+            }
+        };
+        if let Err(error) = create_network_core(&state, registry, &account, &req).await {
+            return console_networks_page(&state, account, csrf, form_view, Some(error.message()))
+                .await;
         }
         Redirect::to("/console/networks").into_response()
     }
@@ -4616,8 +4720,10 @@ mod pages {
         let Some(enabled) = toggle_target(&f.enabled) else {
             return invalid_toggle_response();
         };
-        if let Err(r) = set_network_enabled_core(&state, registry, &account, &name, enabled).await {
-            return r;
+        if let Err(error) =
+            set_network_enabled_core(&state, registry, &account, &name, enabled).await
+        {
+            return error.into_response();
         }
         Redirect::to("/console/networks").into_response()
     }
@@ -4740,16 +4846,14 @@ mod pages {
             &autojoin,
         )
         .await;
-        if result.is_ok() {
-            return Redirect::to("/console/networks").into_response();
-        }
+        let error = match result {
+            Ok(()) => return Redirect::to("/console/networks").into_response(),
+            Err(error) => error.message(),
+        };
         // Re-render the form with a banner, keeping what the user typed.
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let err = "Could not save — check the address (host:port, not an internal \
-                   IP), nick, and field lengths."
-            .to_string();
         console_network_edit_page(
             &state,
             account,
@@ -4760,7 +4864,7 @@ mod pages {
             f.nick,
             f.realname,
             f.autojoin,
-            Some(err),
+            Some(error),
         )
     }
 
@@ -5561,9 +5665,7 @@ mod pages {
             let msg = format!("'{}' is not a bridge platform.", f.kind);
             return console_integrations_error(&state, &headers, account, msg).await;
         };
-        // Pre-check the build feature so the banner names it specifically (rather
-        // than the generic create-failure message) — create_network_core also
-        // enforces it, but its problem+json detail is lost to the plain form.
+        // Pre-check the build feature so the banner names it specifically.
         if !kind_feature_available(kind) {
             let msg = format!(
                 "This server was not built with the {} feature — rebuild with --features {}.",
@@ -5589,17 +5691,8 @@ mod pages {
             sasl_account: opt(f.sasl_account),
             sasl_password: opt(f.sasl_password),
         };
-        // create_network_core answers a problem+json Response; for the console
-        // (a plain form) re-render the page with a banner instead of navigating
-        // the admin to a bare JSON body. The specific reason is on the REST path.
-        if create_network_core(&state, registry, &account, &req)
-            .await
-            .is_err()
-        {
-            let msg = "Could not add the bridge — check the name and required \
-                       fields (and the server's master key for sealed tokens)."
-                .to_string();
-            return console_integrations_error(&state, &headers, account, msg).await;
+        if let Err(error) = create_network_core(&state, registry, &account, &req).await {
+            return console_integrations_error(&state, &headers, account, error.message()).await;
         }
         Redirect::to("/console/integrations").into_response()
     }
@@ -5658,16 +5751,10 @@ mod pages {
         let Some(enabled) = toggle_target(&form.enabled) else {
             return invalid_toggle_response();
         };
-        if set_network_enabled_core(&state, registry, &account, &form.name, enabled)
-            .await
-            .is_err()
+        if let Err(error) =
+            set_network_enabled_core(&state, registry, &account, &form.name, enabled).await
         {
-            let message = format!(
-                "Could not {} bridge '{}'.",
-                if enabled { "enable" } else { "disable" },
-                form.name
-            );
-            return console_integrations_error(&state, &headers, account, message).await;
+            return console_integrations_error(&state, &headers, account, error.message()).await;
         }
         Redirect::to("/console/integrations").into_response()
     }
@@ -5818,6 +5905,56 @@ mod pages {
             );
         }
         response
+    }
+
+    #[cfg(test)]
+    mod network_form_tests {
+        use super::*;
+
+        fn fields(preset: &str) -> NetworkFormFields {
+            NetworkFormFields {
+                csrf: "token".into(),
+                preset: preset.into(),
+                name: "stale name".into(),
+                addr: "stale.example:6667".into(),
+                nick: "alice".into(),
+                tls: None,
+                autojoin: "#rust, #e6irc".into(),
+                realname: String::new(),
+                sasl_account: String::new(),
+                sasl_password: String::new(),
+            }
+        }
+
+        #[test]
+        fn preset_owns_safe_id_endpoint_and_tls_defaults() {
+            let mut submitted = fields("libera");
+            submitted.apply_preset().expect("known preset");
+            let request = submitted.into_resolved_create();
+            assert_eq!(request.name, "libera");
+            assert_eq!(request.addr, "irc.libera.chat:6697");
+            assert!(request.tls);
+            assert_eq!(request.autojoin, ["#rust", "#e6irc"]);
+        }
+
+        #[test]
+        fn resolved_preset_values_are_the_values_rerendered_after_an_error() {
+            let mut submitted = fields("oftc");
+            submitted.apply_preset().expect("known preset");
+            let view = NetworkFormView::submitted(&submitted);
+            assert_eq!(view.preset, "oftc");
+            assert_eq!(view.name, "oftc");
+            assert_eq!(view.addr, "irc.oftc.net:6697");
+            assert!(view.tls);
+        }
+
+        #[test]
+        fn unknown_preset_is_not_silently_treated_as_custom() {
+            let error = fields("invented")
+                .apply_preset()
+                .expect_err("unknown preset must fail");
+            assert!(error.message().contains("Unknown IRC network preset"));
+        }
     }
 }
 

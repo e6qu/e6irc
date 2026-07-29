@@ -998,6 +998,20 @@ async fn console_add_and_delete_network_via_the_console() {
         page.contains("Raw IRC attachment is currently off"),
         "{page}"
     );
+    for needle in [
+        "Libera Chat",
+        "OFTC",
+        "EFnet",
+        "Snoonet",
+        "value=\"libera\"",
+        "value=\"irc.libera.chat:6697\"",
+        "value=\"alice\"",
+    ] {
+        assert!(
+            page.contains(needle),
+            "missing preset/form value {needle}: {page}"
+        );
+    }
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
@@ -1070,8 +1084,14 @@ async fn console_add_and_delete_network_via_the_console() {
          Connection: close\r\n\r\n{bad}",
         bad.len()
     );
-    let (status, _, _) = request(http, &add_bad).await;
-    assert_eq!(status, 400);
+    let (status, _, error_page) = request(http, &add_bad).await;
+    assert_eq!(status, 200);
+    assert!(error_page.contains("Invalid network name"), "{error_page}");
+    assert!(error_page.contains("value=\"bad?name\""), "{error_page}");
+    assert!(
+        error_page.contains("letters, digits, &#39;-&#39;, &#39;_&#39; or &#39;.&#39;"),
+        "{error_page}"
+    );
 
     // A forged body token is rejected.
     let forged = body.replace(&format!("csrf={csrf}"), "csrf=wrong");
@@ -1466,7 +1486,9 @@ async fn console_edit_network_updates_fields() {
     let (status, _, body) = request(http, &bad_post).await;
     assert_eq!(status, 200, "{body}");
     assert!(
-        body.contains("banner-error") && body.contains("Could not save"),
+        body.contains("banner-error")
+            && body.contains("Disallowed upstream address")
+            && body.contains("link-local"),
         "{body}"
     );
 
@@ -3667,7 +3689,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
             secure_cookies: false,
             admin_accounts: vec!["alice".into()],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig { url: url.clone() }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
@@ -3701,6 +3723,33 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
             .contains("location: /console/integrations"),
         "{headers}"
     );
+
+    // Enabling requires constructing the prospective driver before the durable
+    // flag changes. This row cannot be built (missing feature or master key), so
+    // the exact failure is rendered and storage remains disabled—no compensating
+    // rollback window can leave it marked enabled without a driver.
+    let enable = format!("csrf={csrf}&name=paused&enabled=true");
+    let enable_post = format!(
+        "POST /console/integrations/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{enable}",
+        enable.len()
+    );
+    let (status, _, body) = request(http, &enable_post).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("Cannot start network"), "{body}");
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("reconnect");
+    let paused = e6ircd::db::get_bnc_network(&pool, "alice", "paused")
+        .await
+        .expect("read paused bridge")
+        .expect("paused bridge still exists");
+    assert!(
+        !paused.enabled,
+        "failed enable must not change durable state"
+    );
+    drop(pool);
 
     let form = format!(
         "csrf={csrf}&kind=matrix&name=hq&addr=https://matrix.example&nick=e6bot&sasl_password=secret"

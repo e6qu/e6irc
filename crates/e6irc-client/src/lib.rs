@@ -113,6 +113,13 @@ impl Connection {
     /// Connect (plaintext) to `host:port`.
     pub async fn connect(addr: &str) -> io::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        Self::from_tcp(stream)
+    }
+
+    /// Build a plaintext IRC connection from an already-connected TCP stream.
+    /// Dialers that must resolve, vet, and try concrete addresses themselves use
+    /// this entry point without re-resolving the hostname after validation.
+    pub fn from_tcp(stream: TcpStream) -> io::Result<Self> {
         stream.set_nodelay(true)?;
         let (reader, writer) = stream.into_split();
         Ok(Self::from_halves(Box::new(reader), Box::new(writer)))
@@ -126,8 +133,19 @@ impl Connection {
         server_name: &str,
         roots: rustls::RootCertStore,
     ) -> io::Result<Self> {
-        install_crypto_provider();
         let stream = TcpStream::connect(addr).await?;
+        Self::from_tcp_tls(stream, server_name, roots).await
+    }
+
+    /// Establish TLS on an already-connected TCP stream, validating the
+    /// certificate against `server_name`. This is the TLS counterpart to
+    /// [`Connection::from_tcp`] for vetted custom dialers.
+    pub async fn from_tcp_tls(
+        stream: TcpStream,
+        server_name: &str,
+        roots: rustls::RootCertStore,
+    ) -> io::Result<Self> {
+        install_crypto_provider();
         stream.set_nodelay(true)?;
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)

@@ -1052,6 +1052,12 @@ impl Config {
                         n.name
                     )));
                 }
+                NetworkKind::Irc if !crate::bouncer::validate_irc_upstream_addr(&n.addr) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind=irc) addr must be host:port with a nonzero numeric port",
+                        n.name
+                    )));
+                }
                 NetworkKind::Matrix if n.addr.is_empty() => {
                     return Err(ConfigError::Invalid(format!(
                         "network '{}' (kind=matrix) requires addr (homeserver URL)",
@@ -1409,6 +1415,47 @@ mod tests {
         Some(DatabaseConfig {
             url: "postgres://localhost/x".into(),
         })
+    }
+
+    #[test]
+    fn irc_network_address_requires_host_and_nonzero_numeric_port() {
+        for addr in [
+            "irc.example",
+            "irc.example:not-a-port",
+            "irc.example:0",
+            "2001:db8::1:6697",
+        ] {
+            let mut network = net("custom", None);
+            network.addr = addr.into();
+            let cfg = Config {
+                listeners: vec![ListenerConfig {
+                    addr: "127.0.0.1:0".parse().unwrap(),
+                    tls: None,
+                    websocket: false,
+                }],
+                networks: vec![network],
+                bnc: bnc(),
+                database: db(),
+                ..Config::default()
+            };
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("host:port"), "{addr:?}: {error}");
+        }
+
+        let mut network = net("ipv6", None);
+        network.addr = "[2001:db8::1]:6697".into();
+        let cfg = Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+                websocket: false,
+            }],
+            networks: vec![network],
+            bnc: bnc(),
+            database: db(),
+            ..Config::default()
+        };
+        cfg.validate().expect("bracketed IPv6 address is valid");
     }
 
     #[test]
