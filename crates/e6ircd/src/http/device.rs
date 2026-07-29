@@ -158,6 +158,58 @@ pub(super) async fn require_admin(
     }
 }
 
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+fn bounded_admin_page_size<T>(
+    requested: Option<usize>,
+    default_limit: usize,
+    make: impl FnOnce(usize) -> Option<T>,
+    invalid_title: &'static str,
+    detail: &'static str,
+) -> Result<T, Response> {
+    make(requested.unwrap_or(default_limit))
+        .ok_or_else(|| problem(StatusCode::BAD_REQUEST, invalid_title, Some(detail)))
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+fn positive_admin_cursor(
+    before_id: Option<i64>,
+    invalid_title: &'static str,
+    detail: &'static str,
+) -> Result<Option<i64>, Response> {
+    if before_id.is_some_and(|id| id <= 0) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            invalid_title,
+            Some(detail),
+        ));
+    }
+    Ok(before_id)
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+fn printable_exact_filter(
+    value: Option<String>,
+    maximum_bytes: usize,
+    invalid_title: &'static str,
+    detail: &'static str,
+) -> Result<Option<String>, Response> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > maximum_bytes || value.chars().any(char::is_control) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            invalid_title,
+            Some(detail),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 #[derive(Default, serde::Deserialize)]
 pub(super) struct AccountDirectoryQuery {
     pub(super) limit: Option<usize>,
@@ -186,36 +238,27 @@ pub(super) fn validate_account_directory_query(
     params: AccountDirectoryQuery,
     default_limit: usize,
 ) -> Result<ValidatedAccountDirectoryQuery, Response> {
-    let requested_limit = params.limit.unwrap_or(default_limit);
-    let Some(page_size) = crate::db::AccountDirectoryPageSize::new(requested_limit) else {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid account-directory limit",
-            Some("The account-directory limit must be between 1 and 1,000."),
-        ));
-    };
-    if params.before_id.is_some_and(|id| id <= 0) {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid account-directory cursor",
-            Some("The before_id cursor must be a positive account id."),
-        ));
-    }
-    let name = params.name.map(|name| name.trim().to_owned());
-    let name = match name {
-        Some(name) if name.is_empty() => None,
-        Some(name) if name.len() > MAX_ACCOUNT_LEN || name.chars().any(char::is_control) => {
-            return Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid account filter",
-                Some("The exact account name must contain 1–64 printable bytes."),
-            ));
-        }
-        name => name,
-    };
+    let page_size = bounded_admin_page_size(
+        params.limit,
+        default_limit,
+        crate::db::AccountDirectoryPageSize::new,
+        "Invalid account-directory limit",
+        "The account-directory limit must be between 1 and 1,000.",
+    )?;
+    let before_id = positive_admin_cursor(
+        params.before_id,
+        "Invalid account-directory cursor",
+        "The before_id cursor must be a positive account id.",
+    )?;
+    let name = printable_exact_filter(
+        params.name,
+        MAX_ACCOUNT_LEN,
+        "Invalid account filter",
+        "The exact account name must contain 1–64 printable bytes.",
+    )?;
     Ok(ValidatedAccountDirectoryQuery {
         page_size,
-        before_id: params.before_id,
+        before_id,
         name,
     })
 }
@@ -295,41 +338,200 @@ pub(super) async fn admin_stats(
     }
 }
 
-/// List every registered channel with its founder (admin only).
-pub(super) async fn admin_channels(
-    State(state): State<Arc<AppState>>,
-    _admin: AdminAccount,
-) -> Response {
-    let pool = pool_of(&state);
-    match crate::db::list_registered_channels(pool).await {
-        Ok(rows) => admin_json(serde_json::json!({
-            "channels": rows
-                .into_iter()
-                .map(|(name, founder)| serde_json::json!({ "name": name, "founder": founder }))
-                .collect::<Vec<_>>(),
-        })),
-        Err(e) => admin_db_error("channel list", e),
+#[derive(Default, serde::Deserialize)]
+pub(super) struct RegisteredChannelDirectoryQuery {
+    pub(super) limit: Option<usize>,
+    pub(super) before_id: Option<i64>,
+    pub(super) name: Option<String>,
+    pub(super) founder: Option<String>,
+}
+
+pub(super) struct ValidatedRegisteredChannelDirectoryQuery {
+    pub(super) page_size: crate::db::RegisteredChannelDirectoryPageSize,
+    pub(super) before_id: Option<i64>,
+    pub(super) name: Option<String>,
+    pub(super) founder: Option<String>,
+}
+
+impl ValidatedRegisteredChannelDirectoryQuery {
+    pub(super) fn database_filter(&self) -> crate::db::RegisteredChannelDirectoryFilter<'_> {
+        crate::db::RegisteredChannelDirectoryFilter {
+            before_id: self.before_id,
+            exact_name: self.name.as_deref(),
+            exact_founder: self.founder.as_deref(),
+            page_size: self.page_size,
+        }
     }
 }
 
-/// List every server ban / K-line (admin only).
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+pub(super) fn validate_registered_channel_directory_query(
+    params: RegisteredChannelDirectoryQuery,
+    default_limit: usize,
+) -> Result<ValidatedRegisteredChannelDirectoryQuery, Response> {
+    let page_size = bounded_admin_page_size(
+        params.limit,
+        default_limit,
+        crate::db::RegisteredChannelDirectoryPageSize::new,
+        "Invalid registered-channel limit",
+        "The registered-channel limit must be between 1 and 1,000.",
+    )?;
+    let before_id = positive_admin_cursor(
+        params.before_id,
+        "Invalid registered-channel cursor",
+        "The before_id cursor must be a positive registered-channel id.",
+    )?;
+    let name = printable_exact_filter(
+        params.name,
+        crate::sanitize::CHANNELLEN,
+        "Invalid registered-channel filter",
+        "The exact channel name must contain 1–50 printable bytes.",
+    )?;
+    let founder = printable_exact_filter(
+        params.founder,
+        MAX_ACCOUNT_LEN,
+        "Invalid registered-channel filter",
+        "The exact founder name must contain 1–64 printable bytes.",
+    )?;
+    Ok(ValidatedRegisteredChannelDirectoryQuery {
+        page_size,
+        before_id,
+        name,
+        founder,
+    })
+}
+
+/// Filter and page registered-channel policy with its founder (admin only).
+pub(super) async fn admin_channels(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAccount,
+    axum::extract::Query(params): axum::extract::Query<RegisteredChannelDirectoryQuery>,
+) -> Response {
+    let pool = pool_of(&state);
+    let query = match validate_registered_channel_directory_query(params, 100) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    match crate::db::query_registered_channel_directory(pool, query.database_filter()).await {
+        Ok(page) => admin_json(serde_json::json!({
+            "channels": page.entries
+                .into_iter()
+                .map(|entry| serde_json::json!({
+                    "id": entry.id,
+                    "name": entry.name,
+                    "founder": entry.founder,
+                    "created_at": entry.created_at,
+                    "policy": {
+                        "keeptopic": entry.keeptopic,
+                        "topic_retained": entry.topic_retained,
+                        "mlock": entry.mlock,
+                        "access_entries": entry.access_entries,
+                    },
+                }))
+                .collect::<Vec<_>>(),
+            "next_before_id": page.next_before_id,
+        })),
+        Err(e) => admin_db_error("registered-channel directory", e),
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+pub(super) struct ServerBanDirectoryQuery {
+    pub(super) limit: Option<usize>,
+    pub(super) before_id: Option<i64>,
+    pub(super) kind: Option<String>,
+    pub(super) mask: Option<String>,
+}
+
+pub(super) struct ValidatedServerBanDirectoryQuery {
+    pub(super) page_size: crate::db::ServerBanDirectoryPageSize,
+    pub(super) before_id: Option<i64>,
+    pub(super) kind: Option<String>,
+    pub(super) mask: Option<String>,
+}
+
+impl ValidatedServerBanDirectoryQuery {
+    pub(super) fn database_filter(&self) -> crate::db::ServerBanDirectoryFilter<'_> {
+        crate::db::ServerBanDirectoryFilter {
+            before_id: self.before_id,
+            exact_kind: self.kind.as_deref(),
+            exact_mask: self.mask.as_deref(),
+            page_size: self.page_size,
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+pub(super) fn validate_server_ban_directory_query(
+    params: ServerBanDirectoryQuery,
+    default_limit: usize,
+) -> Result<ValidatedServerBanDirectoryQuery, Response> {
+    let page_size = bounded_admin_page_size(
+        params.limit,
+        default_limit,
+        crate::db::ServerBanDirectoryPageSize::new,
+        "Invalid server-ban limit",
+        "The server-ban limit must be between 1 and 1,000.",
+    )?;
+    let before_id = positive_admin_cursor(
+        params.before_id,
+        "Invalid server-ban cursor",
+        "The before_id cursor must be a positive server-ban id.",
+    )?;
+    let kind = match params.kind.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(kind @ ("kline" | "dline" | "xline")) => Some(kind.to_owned()),
+        Some(_) => {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid server-ban filter",
+                Some("The kind filter must be kline, dline, or xline."),
+            ));
+        }
+    };
+    let mask = printable_exact_filter(
+        params.mask,
+        e6irc_proto::message::MAX_LINE_LEN,
+        "Invalid server-ban filter",
+        "The exact mask must contain 1–512 printable bytes.",
+    )?;
+    Ok(ValidatedServerBanDirectoryQuery {
+        page_size,
+        before_id,
+        kind,
+        mask,
+    })
+}
+
+/// Filter and page persisted K/D/X-line policy (admin only).
 pub(super) async fn admin_server_bans(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
+    axum::extract::Query(params): axum::extract::Query<ServerBanDirectoryQuery>,
 ) -> Response {
     let pool = pool_of(&state);
-    match crate::db::list_server_bans(pool).await {
-        Ok(rows) => admin_json(serde_json::json!({
-            "bans": rows
+    let query = match validate_server_ban_directory_query(params, 100) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    match crate::db::query_server_ban_directory(pool, query.database_filter()).await {
+        Ok(page) => admin_json(serde_json::json!({
+            "bans": page.entries
                 .into_iter()
-                .map(|(mask, reason, set_by, kind)| {
+                .map(|entry| {
                     serde_json::json!({
-                        "mask": mask, "reason": reason, "set_by": set_by, "kind": kind,
+                        "id": entry.id,
+                        "mask": entry.mask,
+                        "reason": entry.reason,
+                        "set_by": entry.set_by,
+                        "kind": entry.kind,
+                        "created_at": entry.created_at,
                     })
                 })
                 .collect::<Vec<_>>(),
+            "next_before_id": page.next_before_id,
         })),
-        Err(e) => admin_db_error("server-ban list", e),
+        Err(e) => admin_db_error("server-ban directory", e),
     }
 }
 
@@ -392,24 +594,21 @@ pub(super) fn validate_audit_query(
     params: AuditQuery,
     default_limit: usize,
 ) -> Result<ValidatedAuditQuery, Response> {
-    let requested_limit = params.limit.unwrap_or(default_limit);
-    let Some(page_size) = crate::db::AuditLogPageSize::new(requested_limit) else {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid audit limit",
-            Some("The audit limit must be between 1 and 1,000."),
-        ));
-    };
-    if params.before_id.is_some_and(|id| id <= 0) {
-        return Err(problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid audit cursor",
-            Some("The before_id cursor must be a positive audit entry id."),
-        ));
-    }
+    let page_size = bounded_admin_page_size(
+        params.limit,
+        default_limit,
+        crate::db::AuditLogPageSize::new,
+        "Invalid audit limit",
+        "The audit limit must be between 1 and 1,000.",
+    )?;
+    let before_id = positive_admin_cursor(
+        params.before_id,
+        "Invalid audit cursor",
+        "The before_id cursor must be a positive audit entry id.",
+    )?;
     Ok(ValidatedAuditQuery {
         page_size,
-        before_id: params.before_id,
+        before_id,
         actor: audit_filter(params.actor, "actor", 128)?,
         action: audit_filter(params.action, "action", 64)?,
         target: audit_filter(params.target, "target", 512)?,
@@ -490,6 +689,90 @@ mod admin_query_tests {
             },
         ] {
             assert!(validate_account_directory_query(params, 100).is_err());
+        }
+    }
+
+    #[test]
+    fn registered_channel_query_validation_preserves_exact_bounded_values() {
+        let query = validate_registered_channel_directory_query(
+            RegisteredChannelDirectoryQuery {
+                limit: Some(25),
+                before_id: Some(42),
+                name: Some(" #Ops ".into()),
+                founder: Some(" Alice ".into()),
+            },
+            100,
+        )
+        .expect("valid query");
+        assert_eq!(query.page_size.value(), 25);
+        assert_eq!(query.before_id, Some(42));
+        assert_eq!(query.name.as_deref(), Some("#Ops"));
+        assert_eq!(query.founder.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn registered_channel_query_validation_rejects_invalid_values() {
+        for params in [
+            RegisteredChannelDirectoryQuery {
+                limit: Some(0),
+                ..RegisteredChannelDirectoryQuery::default()
+            },
+            RegisteredChannelDirectoryQuery {
+                before_id: Some(0),
+                ..RegisteredChannelDirectoryQuery::default()
+            },
+            RegisteredChannelDirectoryQuery {
+                name: Some("x".repeat(crate::sanitize::CHANNELLEN + 1)),
+                ..RegisteredChannelDirectoryQuery::default()
+            },
+            RegisteredChannelDirectoryQuery {
+                founder: Some("bad\nfounder".into()),
+                ..RegisteredChannelDirectoryQuery::default()
+            },
+        ] {
+            assert!(validate_registered_channel_directory_query(params, 100).is_err());
+        }
+    }
+
+    #[test]
+    fn server_ban_query_validation_preserves_exact_bounded_values() {
+        let query = validate_server_ban_directory_query(
+            ServerBanDirectoryQuery {
+                limit: Some(25),
+                before_id: Some(42),
+                kind: Some("kline".into()),
+                mask: Some(" Baddie@Host ".into()),
+            },
+            100,
+        )
+        .expect("valid query");
+        assert_eq!(query.page_size.value(), 25);
+        assert_eq!(query.before_id, Some(42));
+        assert_eq!(query.kind.as_deref(), Some("kline"));
+        assert_eq!(query.mask.as_deref(), Some("Baddie@Host"));
+    }
+
+    #[test]
+    fn server_ban_query_validation_rejects_invalid_values() {
+        for params in [
+            ServerBanDirectoryQuery {
+                limit: Some(1_001),
+                ..ServerBanDirectoryQuery::default()
+            },
+            ServerBanDirectoryQuery {
+                before_id: Some(-1),
+                ..ServerBanDirectoryQuery::default()
+            },
+            ServerBanDirectoryQuery {
+                kind: Some("gline".into()),
+                ..ServerBanDirectoryQuery::default()
+            },
+            ServerBanDirectoryQuery {
+                mask: Some("bad\rmask".into()),
+                ..ServerBanDirectoryQuery::default()
+            },
+        ] {
+            assert!(validate_server_ban_directory_query(params, 100).is_err());
         }
     }
 

@@ -494,6 +494,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
         .route("/console/accounts", get(pages::console_accounts))
+        .route(
+            "/console/admin/channels",
+            get(pages::console_admin_channels),
+        )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
         .route("/console/channels", get(pages::console_channels))
@@ -616,7 +620,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/integrations/toggle",
             post(pages::console_toggle_bridge),
         )
-        .route("/console/bans", post(pages::console_add_ban))
+        .route(
+            "/console/bans",
+            get(pages::console_server_bans).post(pages::console_add_ban),
+        )
         .route("/console/bans/delete", post(pages::console_remove_ban))
         .route(
             "/console/admin/channels/drop",
@@ -2168,16 +2175,6 @@ mod pages {
         .await
     }
 
-    struct ChannelRow {
-        name: String,
-        founder: String,
-    }
-    struct BanRow {
-        kind: String,
-        mask: String,
-        reason: String,
-        set_by: String,
-    }
     struct AuditRow {
         id: i64,
         at: String,
@@ -2206,12 +2203,9 @@ mod pages {
         live_traffic: String,
         live_errors: u64,
         accounts: Vec<crate::db::AccountDirectoryRow>,
-        channels: Vec<ChannelRow>,
-        bans: Vec<BanRow>,
+        channels: Vec<crate::db::RegisteredChannelDirectoryRow>,
+        bans: Vec<crate::db::ServerBanDirectoryRow>,
         audit: Vec<AuditRow>,
-        /// An error banner shown at the top when a management action failed
-        /// (e.g. an invalid ban mask). `None` on the plain GET.
-        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -2227,6 +2221,40 @@ mod pages {
         has_filter: bool,
         has_cursor: bool,
         next_before_id: Option<i64>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_admin_channels.html")]
+    struct ConsoleAdminChannels {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        entries: Vec<crate::db::RegisteredChannelDirectoryRow>,
+        name: String,
+        founder: String,
+        limit: usize,
+        has_filters: bool,
+        has_cursor: bool,
+        next_before_id: Option<i64>,
+        error: Option<String>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_bans.html")]
+    struct ConsoleServerBans {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        entries: Vec<crate::db::ServerBanDirectoryRow>,
+        kind: String,
+        mask: String,
+        limit: usize,
+        has_filters: bool,
+        has_cursor: bool,
+        next_before_id: Option<i64>,
+        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -2246,14 +2274,12 @@ mod pages {
         next_before_id: Option<i64>,
     }
 
-    /// Assemble the admin console view (all server-wide read data). `error` is a
-    /// banner to show when re-rendering after a failed management action. Callers
-    /// have already admin-gated the request.
+    /// Assemble the bounded admin overview. Callers have already admin-gated
+    /// the request.
     async fn console_build(
         state: &AppState,
         account: String,
         csrf: String,
-        error: Option<String>,
     ) -> Result<Console, Response> {
         let pool = pool_of(state);
         let (stat_accounts, stat_channels, stat_server_bans) = crate::db::server_stats(pool)
@@ -2271,23 +2297,32 @@ mod pages {
         .await
         .map_err(|e| super::device::admin_db_error("account directory", e))?
         .entries;
-        let channels = crate::db::list_registered_channels(pool)
-            .await
-            .map_err(|e| super::device::admin_db_error("channel list", e))?
-            .into_iter()
-            .map(|(name, founder)| ChannelRow { name, founder })
-            .collect();
-        let bans = crate::db::list_server_bans(pool)
-            .await
-            .map_err(|e| super::device::admin_db_error("server-ban list", e))?
-            .into_iter()
-            .map(|(mask, reason, set_by, kind)| BanRow {
-                kind,
-                mask,
-                reason,
-                set_by,
-            })
-            .collect();
+        let channels = crate::db::query_registered_channel_directory(
+            pool,
+            crate::db::RegisteredChannelDirectoryFilter {
+                before_id: None,
+                exact_name: None,
+                exact_founder: None,
+                page_size: crate::db::RegisteredChannelDirectoryPageSize::new(10)
+                    .expect("ten is a valid registered-channel preview size"),
+            },
+        )
+        .await
+        .map_err(|e| super::device::admin_db_error("registered-channel directory", e))?
+        .entries;
+        let bans = crate::db::query_server_ban_directory(
+            pool,
+            crate::db::ServerBanDirectoryFilter {
+                before_id: None,
+                exact_kind: None,
+                exact_mask: None,
+                page_size: crate::db::ServerBanDirectoryPageSize::new(10)
+                    .expect("ten is a valid server-ban preview size"),
+            },
+        )
+        .await
+        .map_err(|e| super::device::admin_db_error("server-ban directory", e))?
+        .entries;
         let audit = crate::db::list_audit_log(
             pool,
             crate::db::AuditLogPageSize::new(10).expect("ten is a valid audit preview size"),
@@ -2330,7 +2365,6 @@ mod pages {
             channels,
             bans,
             audit,
-            error,
         })
     }
 
@@ -2890,6 +2924,95 @@ mod pages {
             limit: query.page_size.value(),
             next_before_id: page.next_before_id,
         })
+    }
+
+    async fn console_admin_channels_build(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        query: super::device::ValidatedRegisteredChannelDirectoryQuery,
+        error: Option<String>,
+    ) -> Result<ConsoleAdminChannels, Response> {
+        let page =
+            crate::db::query_registered_channel_directory(pool_of(state), query.database_filter())
+                .await
+                .map_err(|error| {
+                    super::device::admin_db_error("registered-channel directory", error)
+                })?;
+        let name = query.name.unwrap_or_default();
+        let founder = query.founder.unwrap_or_default();
+        Ok(ConsoleAdminChannels {
+            account,
+            csrf,
+            is_admin: true,
+            active: "admin-channels",
+            entries: page.entries,
+            has_filters: !name.is_empty() || !founder.is_empty(),
+            has_cursor: query.before_id.is_some(),
+            name,
+            founder,
+            limit: query.page_size.value(),
+            next_before_id: page.next_before_id,
+            error,
+        })
+    }
+
+    pub async fn console_admin_channels(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+        Query(params): Query<super::device::RegisteredChannelDirectoryQuery>,
+    ) -> Response {
+        let query = match super::device::validate_registered_channel_directory_query(params, 50) {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        match console_admin_channels_build(&state, account, csrf, query, None).await {
+            Ok(view) => render_private(view),
+            Err(response) => response,
+        }
+    }
+
+    async fn console_server_bans_build(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        query: super::device::ValidatedServerBanDirectoryQuery,
+        error: Option<String>,
+    ) -> Result<ConsoleServerBans, Response> {
+        let page = crate::db::query_server_ban_directory(pool_of(state), query.database_filter())
+            .await
+            .map_err(|error| super::device::admin_db_error("server-ban directory", error))?;
+        let kind = query.kind.unwrap_or_default();
+        let mask = query.mask.unwrap_or_default();
+        Ok(ConsoleServerBans {
+            account,
+            csrf,
+            is_admin: true,
+            active: "bans",
+            entries: page.entries,
+            has_filters: !kind.is_empty() || !mask.is_empty(),
+            has_cursor: query.before_id.is_some(),
+            kind,
+            mask,
+            limit: query.page_size.value(),
+            next_before_id: page.next_before_id,
+            error,
+        })
+    }
+
+    pub async fn console_server_bans(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+        Query(params): Query<super::device::ServerBanDirectoryQuery>,
+    ) -> Response {
+        let query = match super::device::validate_server_ban_directory_query(params, 50) {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        match console_server_bans_build(&state, account, csrf, query, None).await {
+            Ok(view) => render_private(view),
+            Err(response) => response,
+        }
     }
 
     pub async fn console_audit(
@@ -4067,7 +4190,7 @@ mod pages {
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        match console_build(&state, account, csrf, None).await {
+        match console_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(resp) => resp,
         }
@@ -4896,19 +5019,52 @@ mod pages {
         }
     }
 
-    /// Re-render the admin console with an error banner after a failed action.
-    async fn console_error_page(
+    enum AdminPolicyPage {
+        RegisteredChannels,
+        ServerBans,
+    }
+
+    /// Re-render the policy page that owns a failed mutation. Successful
+    /// actions use Post/Redirect/Get; failures stay visible beside the exact
+    /// controls that produced them.
+    async fn admin_policy_error_page(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         account: String,
         message: String,
+        page: AdminPolicyPage,
     ) -> Response {
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        match console_build(state, account, csrf, Some(message)).await {
-            Ok(view) => render_private(view),
-            Err(resp) => resp,
+        match page {
+            AdminPolicyPage::RegisteredChannels => {
+                let query = match super::device::validate_registered_channel_directory_query(
+                    super::device::RegisteredChannelDirectoryQuery::default(),
+                    50,
+                ) {
+                    Ok(query) => query,
+                    Err(response) => return response,
+                };
+                match console_admin_channels_build(state, account, csrf, query, Some(message)).await
+                {
+                    Ok(view) => render_private(view),
+                    Err(response) => response,
+                }
+            }
+            AdminPolicyPage::ServerBans => {
+                let query = match super::device::validate_server_ban_directory_query(
+                    super::device::ServerBanDirectoryQuery::default(),
+                    50,
+                ) {
+                    Ok(query) => query,
+                    Err(response) => return response,
+                };
+                match console_server_bans_build(state, account, csrf, query, Some(message)).await {
+                    Ok(view) => render_private(view),
+                    Err(response) => response,
+                }
+            }
         }
     }
 
@@ -4975,9 +5131,12 @@ mod pages {
             reason: f.reason,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+        match run_admin_form(&state, &headers, &f.csrf, "/console/bans", make).await {
             Ok(resp) => resp,
-            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+            Err((account, msg)) => {
+                admin_policy_error_page(&state, &headers, account, msg, AdminPolicyPage::ServerBans)
+                    .await
+            }
         }
     }
 
@@ -4996,9 +5155,12 @@ mod pages {
             kind: f.kind,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+        match run_admin_form(&state, &headers, &f.csrf, "/console/bans", make).await {
             Ok(resp) => resp,
-            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+            Err((account, msg)) => {
+                admin_policy_error_page(&state, &headers, account, msg, AdminPolicyPage::ServerBans)
+                    .await
+            }
         }
     }
 
@@ -5016,9 +5178,18 @@ mod pages {
             channel: f.channel,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console", make).await {
+        match run_admin_form(&state, &headers, &f.csrf, "/console/admin/channels", make).await {
             Ok(resp) => resp,
-            Err((account, msg)) => console_error_page(&state, &headers, account, msg).await,
+            Err((account, msg)) => {
+                admin_policy_error_page(
+                    &state,
+                    &headers,
+                    account,
+                    msg,
+                    AdminPolicyPage::RegisteredChannels,
+                )
+                .await
+            }
         }
     }
 

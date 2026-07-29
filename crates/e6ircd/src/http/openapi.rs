@@ -33,6 +33,20 @@ pub(super) async fn openapi() -> Response {
         "name": "name", "in": "query",
         "schema": { "type": "string", "maxLength": 64 }
     }));
+    let mut registered_channel_parameters = admin_cursor_parameters();
+    registered_channel_parameters.extend([
+        serde_json::json!({ "name": "name", "in": "query",
+            "schema": { "type": "string", "maxLength": 50 } }),
+        serde_json::json!({ "name": "founder", "in": "query",
+            "schema": { "type": "string", "maxLength": 64 } }),
+    ]);
+    let mut server_ban_parameters = admin_cursor_parameters();
+    server_ban_parameters.extend([
+        serde_json::json!({ "name": "kind", "in": "query",
+            "schema": { "type": "string", "enum": ["kline", "dline", "xline"] } }),
+        serde_json::json!({ "name": "mask", "in": "query",
+            "schema": { "type": "string", "maxLength": 512 } }),
+    ]);
     let mut audit_parameters = admin_cursor_parameters();
     audit_parameters.extend([
         serde_json::json!({ "name": "actor", "in": "query",
@@ -494,15 +508,21 @@ pub(super) async fn openapi() -> Response {
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/channels": {
-                "get": { "summary": "List registered channels + founders (admin only)",
+                "get": { "summary": "Filter and page registered-channel policy (admin only)",
+                    "description": "Returns stable registration IDs newest-first. before_id selects strictly older rows, so concurrent registration cannot duplicate or skip entries. Optional channel and founder filters are exact under RFC1459 case-folding.",
                     "security": bearer,
-                    "responses": { "200": { "description": "channels" },
+                    "parameters": registered_channel_parameters,
+                    "responses": { "200": { "description": "registered-channel posture and next_before_id cursor" },
+                        "400": { "description": "invalid limit, cursor, channel, or founder filter" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/bans": {
-                "get": { "summary": "List server bans — K/D/X-lines with kind (admin only)",
+                "get": { "summary": "Filter and page persisted K/D/X-line policy (admin only)",
+                    "description": "Returns stable policy IDs newest-first. before_id selects strictly older rows, so concurrent policy additions cannot duplicate or skip entries. Kind is a closed exact filter; mask matching is exact under RFC1459 case-folding while display casing is preserved.",
                     "security": bearer,
-                    "responses": { "200": { "description": "server bans" },
+                    "parameters": server_ban_parameters,
+                    "responses": { "200": { "description": "server-ban policy and next_before_id cursor" },
+                        "400": { "description": "invalid limit, cursor, kind, or mask filter" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/audit": {

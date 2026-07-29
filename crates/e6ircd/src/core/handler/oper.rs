@@ -526,6 +526,30 @@ pub(crate) fn remove_server_ban_hot(
     state.server_bans.len() < before
 }
 
+fn acknowledge_server_ban_oper(
+    state: &mut ServerState,
+    conn: ConnId,
+    response_label: Option<String>,
+    action: &str,
+    kind_label: &str,
+    mask: &crate::core::state::MaskKey,
+) {
+    if !state.sessions.contains_key(&conn) {
+        return;
+    }
+    let server = state.config.server_name.clone();
+    let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
+    state.emit_deferred_labeled(conn, response_label, |state| {
+        state.send(
+            conn,
+            &format!(
+                ":{server} NOTICE {nick} :{action} {kind_label} for {}",
+                mask.as_str()
+            ),
+        );
+    });
+}
+
 pub(crate) fn server_ban_result(
     state: &mut ServerState,
     mutation: crate::core::ServerBanMutation,
@@ -560,19 +584,7 @@ pub(crate) fn server_ban_result(
                     conn,
                     label: response_label,
                 } => {
-                    if state.sessions.contains_key(&conn) {
-                        let server = state.config.server_name.clone();
-                        let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
-                        state.emit_deferred_labeled(conn, response_label, |state| {
-                            state.send(
-                                conn,
-                                &format!(
-                                    ":{server} NOTICE {nick} :Added {label} for {}",
-                                    mask.as_str()
-                                ),
-                            );
-                        });
-                    }
+                    acknowledge_server_ban_oper(state, conn, response_label, "Added", label, &mask);
                     notify_opers(
                         state,
                         None,
@@ -615,19 +627,14 @@ pub(crate) fn server_ban_result(
                     conn,
                     label: response_label,
                 } => {
-                    if state.sessions.contains_key(&conn) {
-                        let server = state.config.server_name.clone();
-                        let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
-                        state.emit_deferred_labeled(conn, response_label, |state| {
-                            state.send(
-                                conn,
-                                &format!(
-                                    ":{server} NOTICE {nick} :Removed {label} for {}",
-                                    mask.as_str()
-                                ),
-                            );
-                        });
-                    }
+                    acknowledge_server_ban_oper(
+                        state,
+                        conn,
+                        response_label,
+                        "Removed",
+                        label,
+                        &mask,
+                    );
                 }
                 crate::core::ServerBanRequester::Admin { request_id, .. } => {
                     finish_admin_server_ban(

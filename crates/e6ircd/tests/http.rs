@@ -550,6 +550,28 @@ async fn openapi_spec_is_served() {
             "OpenAPI account-directory query is missing {name}"
         );
     }
+    let channel_parameters = v["paths"]["/api/v1/admin/channels"]["get"]["parameters"]
+        .as_array()
+        .expect("registered-channel query parameters");
+    for name in ["limit", "before_id", "name", "founder"] {
+        assert!(
+            channel_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI registered-channel query is missing {name}"
+        );
+    }
+    let ban_parameters = v["paths"]["/api/v1/admin/bans"]["get"]["parameters"]
+        .as_array()
+        .expect("server-ban query parameters");
+    for name in ["limit", "before_id", "kind", "mask"] {
+        assert!(
+            ban_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI server-ban query is missing {name}"
+        );
+    }
     let audit_parameters = v["paths"]["/api/v1/admin/audit"]["get"]["parameters"]
         .as_array()
         .expect("audit query parameters");
@@ -1960,6 +1982,8 @@ async fn admin_accounts_endpoint_is_gated() {
     // fail rather than being silently clamped to a different query.
     for (path, title) in [
         ("/api/v1/admin/accounts", "Invalid account-directory limit"),
+        ("/api/v1/admin/channels", "Invalid registered-channel limit"),
+        ("/api/v1/admin/bans", "Invalid server-ban limit"),
         ("/api/v1/admin/audit", "Invalid audit limit"),
     ] {
         for limit in [0, 1001] {
@@ -2278,6 +2302,262 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn policy_directories_filter_page_and_escape_for_admins_only() {
+    let url = support::test_db("policy_directories_filter_page_and_escape_for_admins_only").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    for name in ["Alice", "Bob"] {
+        e6ircd::db::create_account(&pool, name, "pw")
+            .await
+            .unwrap_or_else(|error| panic!("create {name}: {error}"));
+    }
+    let alice_session = e6ircd::db::create_web_session(&pool, "Alice", None)
+        .await
+        .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(&pool, "Bob", None)
+        .await
+        .expect("bob session");
+    for (channel, founder) in [
+        ("#Alpha", "alice"),
+        ("#Bravo", "bob"),
+        ("#Charlie", "alice"),
+        ("#Eve<script>", "bob"),
+    ] {
+        sqlx::query(
+            "INSERT INTO channels (name, name_folded, founder_account_id)
+             SELECT $1, $2, id FROM accounts WHERE name_folded = $3",
+        )
+        .bind(channel)
+        .bind(channel.to_ascii_lowercase())
+        .bind(founder)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|error| panic!("insert {channel}: {error}"));
+    }
+    sqlx::query(
+        "UPDATE channels
+         SET keeptopic = FALSE, topic = 'retained', topic_setter = 'Alice',
+             topic_set_at = now(), mlock = '+nt'
+         WHERE name_folded = '#alpha'",
+    )
+    .execute(&pool)
+    .await
+    .expect("retained channel policy");
+    sqlx::query(
+        "INSERT INTO channel_access (channel_id, account_id, flags)
+         SELECT c.id, a.id, 'ov'
+         FROM channels c, accounts a
+         WHERE c.name_folded = '#alpha' AND a.name_folded = 'bob'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel access");
+    for (mask, display, reason, setter, kind) in [
+        ("bad@host", "Bad@Host", "spam", "Alice", "kline"),
+        ("192.0.2.*", "192.0.2.*", "proxy", "Bob", "dline"),
+        ("*bot*", "*Bot*", "automation", "Alice", "xline"),
+        (
+            "evil@host",
+            "Evil@Host",
+            "<script>alert(1)</script>",
+            "Bob",
+            "kline",
+        ),
+    ] {
+        e6ircd::db::add_server_ban(&pool, mask, display, reason, setter, kind)
+            .await
+            .unwrap_or_else(|error| panic!("add {kind} {display}: {error}"));
+    }
+
+    let config = Config {
+        server_name: "irc.policy.example".into(),
+        network_name: "PolicyNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let cookie_get = |path: &str, session: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    let (status, headers, body) = request(
+        http,
+        &cookie_get("/api/v1/admin/channels?limit=2", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
+    let channels: serde_json::Value = serde_json::from_str(&body).expect("channel JSON");
+    assert_eq!(
+        channels["channels"].as_array().expect("channel rows").len(),
+        2
+    );
+    let channel_cursor = channels["next_before_id"].as_i64().expect("channel cursor");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#Delta', '#delta', id FROM accounts WHERE name_folded = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .expect("concurrent channel");
+    let channel_older_path = format!("/api/v1/admin/channels?limit=2&before_id={channel_cursor}");
+    let (status, _, older_body) =
+        request(http, &cookie_get(&channel_older_path, &alice_session)).await;
+    assert_eq!(status, 200, "{older_body}");
+    let older: serde_json::Value = serde_json::from_str(&older_body).expect("older channels");
+    assert!(
+        older["channels"]
+            .as_array()
+            .expect("older channel rows")
+            .iter()
+            .all(|entry| entry["id"].as_i64().is_some_and(|id| id < channel_cursor)),
+        "channel cursor admitted a newer or duplicate row: {older_body}"
+    );
+    let exact_channel = "/api/v1/admin/channels?name=%23aLpHa&founder=aLiCe";
+    let (status, _, exact_body) = request(http, &cookie_get(exact_channel, &alice_session)).await;
+    assert_eq!(status, 200, "{exact_body}");
+    let exact: serde_json::Value = serde_json::from_str(&exact_body).expect("exact channel");
+    assert_eq!(exact["channels"].as_array().expect("exact rows").len(), 1);
+    assert_eq!(exact["channels"][0]["name"], "#Alpha");
+    assert_eq!(exact["channels"][0]["founder"], "Alice");
+    assert_eq!(exact["channels"][0]["policy"]["keeptopic"], false);
+    assert_eq!(exact["channels"][0]["policy"]["topic_retained"], true);
+    assert_eq!(exact["channels"][0]["policy"]["mlock"], "+nt");
+    assert_eq!(exact["channels"][0]["policy"]["access_entries"], 1);
+
+    let (status, headers, body) = request(
+        http,
+        &cookie_get("/api/v1/admin/bans?limit=2", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
+    let bans: serde_json::Value = serde_json::from_str(&body).expect("ban JSON");
+    assert_eq!(bans["bans"].as_array().expect("ban rows").len(), 2);
+    let ban_cursor = bans["next_before_id"].as_i64().expect("ban cursor");
+    e6ircd::db::add_server_ban(
+        &pool,
+        "new@host",
+        "New@Host",
+        "concurrent",
+        "Alice",
+        "kline",
+    )
+    .await
+    .expect("concurrent ban");
+    let ban_older_path = format!("/api/v1/admin/bans?limit=2&before_id={ban_cursor}");
+    let (status, _, older_body) = request(http, &cookie_get(&ban_older_path, &alice_session)).await;
+    assert_eq!(status, 200, "{older_body}");
+    let older: serde_json::Value = serde_json::from_str(&older_body).expect("older bans");
+    assert!(
+        older["bans"]
+            .as_array()
+            .expect("older ban rows")
+            .iter()
+            .all(|entry| entry["id"].as_i64().is_some_and(|id| id < ban_cursor)),
+        "server-ban cursor admitted a newer or duplicate row: {older_body}"
+    );
+    let exact_ban = "/api/v1/admin/bans?kind=kline&mask=BAD%40HOST";
+    let (status, _, exact_body) = request(http, &cookie_get(exact_ban, &alice_session)).await;
+    assert_eq!(status, 200, "{exact_body}");
+    let exact: serde_json::Value = serde_json::from_str(&exact_body).expect("exact ban");
+    assert_eq!(exact["bans"].as_array().expect("exact rows").len(), 1);
+    assert_eq!(exact["bans"][0]["mask"], "Bad@Host");
+    assert_eq!(exact["bans"][0]["reason"], "spam");
+    assert_eq!(exact["bans"][0]["set_by"], "Alice");
+
+    let (status, _, channel_page) =
+        request(http, &cookie_get("/console/admin/channels", &alice_session)).await;
+    assert_eq!(status, 200, "{channel_page}");
+    assert!(
+        channel_page.contains("<h1>Registered-channel directory</h1>"),
+        "{channel_page}"
+    );
+    assert!(
+        channel_page.contains("#Eve&#60;script&#62;"),
+        "{channel_page}"
+    );
+    assert!(!channel_page.contains("#Eve<script>"), "{channel_page}");
+    let (status, _, channel_short_page) = request(
+        http,
+        &cookie_get("/console/admin/channels?limit=2", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{channel_short_page}");
+    assert!(
+        channel_short_page.contains("Older registrations"),
+        "{channel_short_page}"
+    );
+
+    let (status, _, ban_page) = request(http, &cookie_get("/console/bans", &alice_session)).await;
+    assert_eq!(status, 200, "{ban_page}");
+    assert!(ban_page.contains("<h1>Server bans</h1>"), "{ban_page}");
+    assert!(
+        ban_page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
+        "{ban_page}"
+    );
+    assert!(
+        !ban_page.contains("<script>alert(1)</script>"),
+        "{ban_page}"
+    );
+    let (status, _, ban_short_page) =
+        request(http, &cookie_get("/console/bans?limit=2", &alice_session)).await;
+    assert_eq!(status, 200, "{ban_short_page}");
+    assert!(ban_short_page.contains("Older rules"), "{ban_short_page}");
+
+    for path in ["/console/admin/channels", "/console/bans"] {
+        let (status, headers, _) = request(http, &get(path)).await;
+        assert_eq!(status, 303, "{path}: {headers}");
+        assert!(
+            headers.to_ascii_lowercase().contains("location: /login"),
+            "{path}: {headers}"
+        );
+        let (status, _, _) = request(http, &cookie_get(path, &bob_session)).await;
+        assert_eq!(status, 403, "{path}");
+    }
+    for (path, title) in [
+        (
+            "/api/v1/admin/channels?before_id=0",
+            "Invalid registered-channel cursor",
+        ),
+        ("/api/v1/admin/bans?kind=gline", "Invalid server-ban filter"),
+    ] {
+        let (status, _, invalid) = request(http, &cookie_get(path, &alice_session)).await;
+        assert_eq!(status, 400, "{invalid}");
+        assert!(invalid.contains(title), "{invalid}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     let url = support::test_db("audit_explorer_filters_pages_and_escapes_for_admins_only").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
@@ -2467,26 +2747,29 @@ async fn admin_console_ban_and_channel_actions() {
         .http_addr
         .expect("http");
 
-    // Load the console and extract the session-bound CSRF token.
-    let page_req = format!(
-        "GET /console HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    // Load the server-ban page and extract the session-bound CSRF token.
+    let ban_page_req = format!(
+        "GET /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let (status, _, page) = request(http, &page_req).await;
+    let (status, _, page) = request(http, &ban_page_req).await;
     assert_eq!(status, 200, "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
         .nth(1)
         .and_then(|s| s.split('"').next())
-        .expect("csrf token in console")
+        .expect("csrf token in server-ban page")
         .to_string();
     assert!(!csrf.is_empty());
 
-    // Fetch /console and test for a needle, retrying while the redirect's
-    // committed core action becomes visible to the independent list query.
-    let console_has = |needle: &'static str, want: bool| {
-        let req = page_req.clone();
+    // Fetch a policy page and test for a needle, retrying while the redirect's
+    // committed core action becomes visible to the independent directory query.
+    let policy_page_has = |path: &'static str, needle: &'static str, want: bool| {
+        let session = session.clone();
         async move {
             for _ in 0..40 {
+                let req = format!(
+                    "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+                );
                 let (_, _, body) = request(http, &req).await;
                 if body.contains(needle) == want {
                     return true;
@@ -2497,7 +2780,7 @@ async fn admin_console_ban_and_channel_actions() {
         }
     };
 
-    // Add a K-line via the console -> 303 back to /console; the ban appears.
+    // Add a K-line via the console -> 303 back to its owning page; the ban appears.
     let body = "csrf=CSRF&kind=kline&mask=*@bad.example&reason=spam";
     let body = body.replace("CSRF", &csrf);
     let add = format!(
@@ -2508,15 +2791,17 @@ async fn admin_console_ban_and_channel_actions() {
     );
     let (status, head, _) = request(http, &add).await;
     assert_eq!(status, 303, "{head}");
-    // Discriminate on the bans-table empty-state text, not the mask itself: the
-    // mask also appears in the audit-log rows (KLINE/UNKLINE target), so a bare
-    // substring check would false-match after removal.
     assert!(
-        console_has("No server bans.", false).await,
+        head.to_ascii_lowercase()
+            .contains("location: /console/bans"),
+        "{head}"
+    );
+    assert!(
+        policy_page_has("/console/bans", "No server bans are active.", false).await,
         "ban not listed after add"
     );
 
-    // Remove it -> 303; the bans table is empty again.
+    // Remove it -> 303; the server-ban directory is empty again.
     let del = "csrf=CSRF&kind=kline&mask=*@bad.example".replace("CSRF", &csrf);
     let del_req = format!(
         "POST /console/bans/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -2527,18 +2812,23 @@ async fn admin_console_ban_and_channel_actions() {
     let (status, _, _) = request(http, &del_req).await;
     assert_eq!(status, 303);
     assert!(
-        console_has("No server bans.", true).await,
+        policy_page_has("/console/bans", "No server bans are active.", true).await,
         "ban still listed after remove"
     );
 
-    // Drop the registered channel -> 303; the channel list becomes empty.
+    // Drop the registered channel -> 303; the channel registry becomes empty.
     assert!(
-        console_has("No registered channels.", false).await,
+        policy_page_has(
+            "/console/admin/channels",
+            "No registered channels exist yet.",
+            false
+        )
+        .await,
         "channel not listed to begin with"
     );
     let drop_body = "csrf=CSRF&channel=%23dropme".replace("CSRF", &csrf);
     let drop_req = format!(
-        "POST /console/channels/drop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+        "POST /console/admin/channels/drop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{drop_body}",
         drop_body.len()
@@ -2546,7 +2836,12 @@ async fn admin_console_ban_and_channel_actions() {
     let (status, _, _) = request(http, &drop_req).await;
     assert_eq!(status, 303);
     assert!(
-        console_has("No registered channels.", true).await,
+        policy_page_has(
+            "/console/admin/channels",
+            "No registered channels exist yet.",
+            true
+        )
+        .await,
         "channel still listed after drop"
     );
 
