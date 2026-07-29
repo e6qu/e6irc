@@ -691,6 +691,38 @@ async fn handle_request(
             }
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
+        DbRequest::RegisterOwnedChannel {
+            request_id,
+            channel,
+            founder_account,
+            topic,
+        } => {
+            let result = match persist_channel_registration(
+                pool,
+                &channel,
+                &founder_account,
+                &topic,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    record_database_error(telemetry);
+                    eprintln!("db: owner channel registration failed: {error}");
+                    crate::core::ChannelRegistrationResult::Unavailable
+                }
+            };
+            core_tx
+                .push(Input::OwnedChannelRegistrationResult {
+                    request_id,
+                    channel,
+                    founder_account,
+                    topic,
+                    result,
+                })
+                .await
+                .is_ok()
+        }
         DbRequest::DropChannel { channel, requester } => {
             let dropped = match &requester {
                 crate::core::ChannelDropRequester::Admin { actor, .. } => {
@@ -938,6 +970,31 @@ async fn handle_request(
                 }
             };
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+        }
+        DbRequest::MutateOwnedChannel {
+            request_id,
+            channel,
+            actor,
+            mutation,
+        } => {
+            let result =
+                match persist_owned_channel_mutation(pool, &channel, &actor, &mutation).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        record_database_error(telemetry);
+                        eprintln!("db: owner channel mutation failed: {e}");
+                        crate::core::ChannelControlResult::Unavailable
+                    }
+                };
+            core_tx
+                .push(Input::ChannelControlResult {
+                    request_id,
+                    channel,
+                    mutation,
+                    result,
+                })
+                .await
+                .is_ok()
         }
         DbRequest::MutateServerBan {
             mutation,
@@ -1702,6 +1759,215 @@ pub async fn set_channel_access(
     }
 }
 
+/// Persist and audit one founder-owned channel mutation in a transaction.
+/// Locking the channel row makes ownership authorization, the write, and its
+/// audit record one indivisible transition.
+pub async fn persist_owned_channel_mutation(
+    pool: &PgPool,
+    channel: &str,
+    actor: &str,
+    mutation: &crate::core::PersistedChannelMutation,
+) -> Result<crate::core::ChannelControlResult, DbError> {
+    use crate::core::{ChannelControlResult, PersistedChannelMutation};
+
+    let channel_folded = CaseMapping::Rfc1459.casefold(channel);
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let row: Option<(i64, String, bool)> = sqlx::query_as(
+        "SELECT c.id, a.name_folded, c.keeptopic
+         FROM channels c JOIN accounts a ON a.id = c.founder_account_id
+         WHERE c.name_folded = $1
+         FOR UPDATE OF c",
+    )
+    .bind(&channel_folded)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((channel_id, founder, keeptopic)) = row else {
+        return Ok(ChannelControlResult::MissingOrNotOwner);
+    };
+    if founder != actor_folded {
+        return Ok(ChannelControlResult::MissingOrNotOwner);
+    }
+
+    let (action, detail) = match mutation {
+        PersistedChannelMutation::SetTopic { topic } => {
+            if !keeptopic {
+                return Ok(ChannelControlResult::KeeptopicDisabled);
+            }
+            let (text, setter, set_at) = match topic {
+                Some((text, setter, set_at)) => (Some(text), Some(setter), Some(*set_at as f64)),
+                None => (None, None, None),
+            };
+            sqlx::query(
+                "UPDATE channels
+                 SET topic = $2,
+                     topic_setter = $3,
+                     topic_set_at = CASE
+                         WHEN $4::double precision IS NULL THEN NULL
+                         ELSE to_timestamp($4::double precision)
+                     END
+                 WHERE id = $1",
+            )
+            .bind(channel_id)
+            .bind(text)
+            .bind(setter)
+            .bind(set_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+            (
+                "CHANNEL_TOPIC",
+                if topic.is_some() { "set" } else { "cleared" }.to_string(),
+            )
+        }
+        PersistedChannelMutation::SetKeeptopic { enabled, topic } => {
+            let (text, setter, set_at) = match topic {
+                Some((text, setter, set_at)) if *enabled => {
+                    (Some(text), Some(setter), Some(*set_at as f64))
+                }
+                _ => (None, None, None),
+            };
+            sqlx::query(
+                "UPDATE channels
+                 SET keeptopic = $2,
+                     topic = $3,
+                     topic_setter = $4,
+                     topic_set_at = CASE
+                         WHEN $5::double precision IS NULL THEN NULL
+                         ELSE to_timestamp($5::double precision)
+                     END
+                 WHERE id = $1",
+            )
+            .bind(channel_id)
+            .bind(enabled)
+            .bind(text)
+            .bind(setter)
+            .bind(set_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+            (
+                "CHANNEL_KEEPTOPIC",
+                if *enabled { "on" } else { "off" }.to_string(),
+            )
+        }
+        PersistedChannelMutation::SetMlock { mlock } => {
+            sqlx::query("UPDATE channels SET mlock = $2 WHERE id = $1")
+                .bind(channel_id)
+                .bind(mlock)
+                .execute(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+            (
+                "CHANNEL_MLOCK",
+                mlock.as_deref().unwrap_or("cleared").to_string(),
+            )
+        }
+        PersistedChannelMutation::SetAccess { account, flags } => {
+            let account_folded = CaseMapping::Rfc1459.casefold(account);
+            if let Some(flags) = flags {
+                let account_id: Option<i64> =
+                    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
+                        .bind(&account_folded)
+                        .fetch_optional(&mut *transaction)
+                        .await
+                        .map_err(DbError::Query)?;
+                let Some(account_id) = account_id else {
+                    return Ok(ChannelControlResult::AccountMissing);
+                };
+                let already: Option<i64> = sqlx::query_scalar(
+                    "SELECT account_id FROM channel_access
+                     WHERE channel_id = $1 AND account_id = $2",
+                )
+                .bind(channel_id)
+                .bind(account_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+                if already.is_none() {
+                    let count: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM channel_access WHERE channel_id = $1",
+                    )
+                    .bind(channel_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(DbError::Query)?;
+                    if count >= MAX_ACCESS_ENTRIES_PER_CHANNEL {
+                        return Ok(ChannelControlResult::AccessLimitReached);
+                    }
+                }
+                sqlx::query(
+                    "INSERT INTO channel_access (channel_id, account_id, flags)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (channel_id, account_id)
+                     DO UPDATE SET flags = EXCLUDED.flags",
+                )
+                .bind(channel_id)
+                .bind(account_id)
+                .bind(flags)
+                .execute(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+            } else {
+                sqlx::query(
+                    "DELETE FROM channel_access ca USING accounts a
+                     WHERE ca.channel_id = $1 AND ca.account_id = a.id
+                       AND a.name_folded = $2",
+                )
+                .bind(channel_id)
+                .bind(&account_folded)
+                .execute(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+            }
+            (
+                "CHANNEL_ACCESS",
+                format!(
+                    "account={account_folded} flags={}",
+                    flags.as_deref().unwrap_or("-")
+                ),
+            )
+        }
+        PersistedChannelMutation::TransferFounder { account } => {
+            let account_id: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
+                    .bind(account)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(DbError::Query)?;
+            let Some(account_id) = account_id else {
+                return Ok(ChannelControlResult::AccountMissing);
+            };
+            sqlx::query("UPDATE channels SET founder_account_id = $2 WHERE id = $1")
+                .bind(channel_id)
+                .bind(account_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+            ("CHANNEL_FOUNDER", account.clone())
+        }
+        PersistedChannelMutation::Drop => {
+            sqlx::query("DELETE FROM channels WHERE id = $1")
+                .bind(channel_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+            ("CHANNEL_DROP", String::new())
+        }
+    };
+    insert_audit_log_with(
+        &mut *transaction,
+        &actor_folded,
+        action,
+        &channel_folded,
+        &detail,
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(ChannelControlResult::Applied)
+}
+
 /// Whether `account` holds a registered relationship with `channel` — its
 /// founder, or an access-flag entry. Used to authorize the REST history read,
 /// which (unlike IRC `CHATHISTORY`) has no view of live channel membership, so
@@ -1962,9 +2228,54 @@ async fn handle_register_channel(
     topic: Option<(String, String, u64)>,
     label: Option<String>,
 ) -> DbReply {
+    use crate::core::ChannelRegistrationResult;
+
+    match persist_channel_registration(pool, channel, founder, &topic).await {
+        Ok(ChannelRegistrationResult::Registered) => DbReply::ChannelRegistered {
+            channel: channel.to_string(),
+            founder_account: founder.to_string(),
+            topic,
+            label,
+        },
+        Ok(ChannelRegistrationResult::Exists) => DbReply::ChannelExists {
+            channel: channel.to_string(),
+            label,
+        },
+        Ok(ChannelRegistrationResult::AccountMissing) => {
+            eprintln!("db: founder account {founder} missing during channel registration");
+            DbReply::ChannelRegisterUnavailable {
+                channel: channel.to_string(),
+                label,
+            }
+        }
+        Ok(ChannelRegistrationResult::Unavailable) => DbReply::ChannelRegisterUnavailable {
+            channel: channel.to_string(),
+            label,
+        },
+        Err(error) => {
+            eprintln!("db: channel registration failed: {error}");
+            DbReply::ChannelRegisterUnavailable {
+                channel: channel.to_string(),
+                label,
+            }
+        }
+    }
+}
+
+/// Insert one registered channel with its initial retained topic and audit
+/// record as one transition. Both ChanServ and the owner HTTP control plane use
+/// this function; only their authorization and response transports differ.
+async fn persist_channel_registration(
+    pool: &PgPool,
+    channel: &str,
+    founder: &str,
+    topic: &Option<(String, String, u64)>,
+) -> Result<crate::core::ChannelRegistrationResult, DbError> {
+    use crate::core::ChannelRegistrationResult;
+
     let chan_folded = CaseMapping::Rfc1459.casefold(channel);
     let founder_folded = CaseMapping::Rfc1459.casefold(founder);
-    let (topic_text, topic_setter, topic_set_at) = match &topic {
+    let (topic_text, topic_setter, topic_set_at) = match topic {
         Some((text, setter, set_at)) => (
             Some(text.as_str()),
             Some(setter.as_str()),
@@ -1972,7 +2283,8 @@ async fn handle_register_channel(
         ),
         None => (None, None, None),
     };
-    let inserted: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let inserted: Option<i64> = sqlx::query_scalar(
         "INSERT INTO channels (
              name, name_folded, founder_account_id,
              topic, topic_setter, topic_set_at
@@ -1991,55 +2303,34 @@ async fn handle_register_channel(
     .bind(topic_text)
     .bind(topic_setter)
     .bind(topic_set_at)
-    .fetch_optional(pool)
-    .await;
-    match inserted {
-        Ok(Some(_)) => DbReply::ChannelRegistered {
-            channel: channel.to_string(),
-            // Echo the founder the row was actually written with, so the hot
-            // map is seeded from the persisted value rather than the session's
-            // possibly-since-changed account.
-            founder_account: founder.to_string(),
-            topic,
-            label,
-        },
-        // No row: either the channel exists or the founder account
-        // vanished; both leave nothing registered. Distinguish them.
-        Ok(None) => {
-            let exists: Result<Option<i64>, _> =
-                sqlx::query_scalar("SELECT id FROM channels WHERE name_folded = $1")
-                    .bind(&chan_folded)
-                    .fetch_optional(pool)
-                    .await;
-            match exists {
-                Ok(Some(_)) => DbReply::ChannelExists {
-                    channel: channel.to_string(),
-                    label,
-                },
-                Ok(None) => {
-                    eprintln!("db: founder account {founder} missing during channel registration");
-                    DbReply::ChannelRegisterUnavailable {
-                        channel: channel.to_string(),
-                        label,
-                    }
-                }
-                Err(e) => {
-                    eprintln!("db: channel existence check failed: {e}");
-                    DbReply::ChannelRegisterUnavailable {
-                        channel: channel.to_string(),
-                        label,
-                    }
-                }
-            }
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    let result = if inserted.is_some() {
+        insert_audit_log_with(
+            &mut *transaction,
+            &founder_folded,
+            "CHANNEL_REGISTER",
+            &chan_folded,
+            "",
+        )
+        .await?;
+        ChannelRegistrationResult::Registered
+    } else {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM channels WHERE name_folded = $1)")
+                .bind(&chan_folded)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
+        if exists {
+            ChannelRegistrationResult::Exists
+        } else {
+            ChannelRegistrationResult::AccountMissing
         }
-        Err(e) => {
-            eprintln!("db: channel registration failed: {e}");
-            DbReply::ChannelRegisterUnavailable {
-                channel: channel.to_string(),
-                label,
-            }
-        }
-    }
+    };
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(result)
 }
 
 /// The three outcomes of a credential check, before an origin is attached.
@@ -2619,6 +2910,103 @@ pub async fn list_registered_channels(pool: &PgPool) -> Result<Vec<(String, Stri
     .await
     .map_err(DbError::Query)?;
     Ok(rows)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelAccessEntry {
+    pub account: String,
+    pub flags: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedChannel {
+    pub name: String,
+    pub founder: String,
+    pub keeptopic: bool,
+    pub topic: Option<String>,
+    pub topic_setter: Option<String>,
+    pub topic_set_at_millis: Option<i64>,
+    pub mlock: Option<String>,
+    pub access: Vec<ChannelAccessEntry>,
+}
+
+#[derive(sqlx::FromRow)]
+struct OwnedChannelRow {
+    name: String,
+    founder: String,
+    keeptopic: bool,
+    topic: Option<String>,
+    topic_setter: Option<String>,
+    topic_set_at_millis: Option<i64>,
+    mlock: Option<String>,
+    access_account: Option<String>,
+    access_flags: Option<String>,
+}
+
+/// Every registered channel founded by `account`, including its complete
+/// persisted control-plane configuration. One ordered join produces a
+/// statement-consistent view; callers never need to stitch channel rows and
+/// access grants from independently changing queries.
+pub async fn list_owned_channels(
+    pool: &PgPool,
+    account: &str,
+) -> Result<Vec<OwnedChannel>, DbError> {
+    let account_folded = CaseMapping::Rfc1459.casefold(account);
+    let rows: Vec<OwnedChannelRow> = sqlx::query_as(
+        "SELECT c.name,
+                founder.name AS founder,
+                c.keeptopic,
+                c.topic,
+                c.topic_setter,
+                (EXTRACT(EPOCH FROM c.topic_set_at) * 1000)::bigint
+                    AS topic_set_at_millis,
+                c.mlock,
+                access_account.name AS access_account,
+                ca.flags AS access_flags
+         FROM channels c
+         JOIN accounts founder ON founder.id = c.founder_account_id
+         LEFT JOIN channel_access ca ON ca.channel_id = c.id
+         LEFT JOIN accounts access_account ON access_account.id = ca.account_id
+         WHERE founder.name_folded = $1
+         ORDER BY c.name_folded, access_account.name_folded",
+    )
+    .bind(account_folded)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+
+    let mut channels: Vec<OwnedChannel> = Vec::new();
+    for row in rows {
+        let is_new = channels
+            .last()
+            .is_none_or(|channel| channel.name != row.name);
+        if is_new {
+            channels.push(OwnedChannel {
+                name: row.name.clone(),
+                founder: row.founder,
+                keeptopic: row.keeptopic,
+                topic: row.topic,
+                topic_setter: row.topic_setter,
+                topic_set_at_millis: row.topic_set_at_millis,
+                mlock: row.mlock,
+                access: Vec::new(),
+            });
+        }
+        match (row.access_account, row.access_flags) {
+            (Some(account), Some(flags)) => channels
+                .last_mut()
+                .expect("channel row inserted")
+                .access
+                .push(ChannelAccessEntry { account, flags }),
+            (None, None) => {}
+            _ => {
+                return Err(DbError::Query(sqlx::Error::Protocol(
+                    "channel access row has only one nullable field".into(),
+                )));
+            }
+        }
+    }
+    Ok(channels)
 }
 
 /// Every registered channel that has a retained topic, as `(name_folded,

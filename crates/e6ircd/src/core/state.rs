@@ -548,6 +548,17 @@ impl MlockModes {
                 other => return Err(other),
             }
         }
+        // Render equal policies identically regardless of input order.
+        m.on = Self::LOCKABLE
+            .iter()
+            .copied()
+            .filter(|mode| m.on.contains(*mode))
+            .collect();
+        m.off = Self::LOCKABLE
+            .iter()
+            .copied()
+            .filter(|mode| m.off.contains(*mode))
+            .collect();
         Ok(m)
     }
 
@@ -935,6 +946,10 @@ pub(crate) struct ServerState {
     pub pending_admin_server_bans: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
     /// Monotonic request ID source for `pending_admin_server_bans`.
     pub admin_server_ban_id: u64,
+    /// Founder-owned HTTP channel mutations awaiting a database verdict.
+    pub pending_channel_controls: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
+    /// Monotonic request ID source for `pending_channel_controls`.
+    pub channel_control_id: u64,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -1018,6 +1033,8 @@ impl ServerState {
             admin_channel_drop_id: 0,
             pending_admin_server_bans: HashMap::new(),
             admin_server_ban_id: 0,
+            pending_channel_controls: HashMap::new(),
+            channel_control_id: 0,
         }
     }
 
@@ -1289,21 +1306,26 @@ impl ServerState {
         self.keeptopic_off = names.into_iter().map(ChanKey).collect();
     }
 
-    /// Load persisted mode locks as `(name_folded, spec)`. A row whose spec
-    /// won't parse (unlockable char) is dropped loudly rather than silently
-    /// enforcing a partial lock.
-    pub fn preload_mlock(&mut self, rows: Vec<(String, String)>) {
-        self.channel_mlock = rows
-            .into_iter()
-            .filter_map(|(name, spec)| match MlockModes::parse(&spec) {
-                Ok(m) if !m.is_empty() => Some((ChanKey(name), m)),
-                Ok(_) => None,
-                Err(bad) => {
-                    eprintln!("mlock: dropping {name:?} with unlockable char {bad:?}");
-                    None
-                }
-            })
-            .collect();
+    /// Load persisted mode locks as `(name_folded, spec)`. Corrupt storage
+    /// aborts startup instead of silently running without the promised lock.
+    pub fn preload_mlock(&mut self, rows: Vec<(String, String)>) -> Result<(), String> {
+        let mut locks = HashMap::with_capacity(rows.len());
+        for (name, spec) in rows {
+            let modes = MlockModes::parse(&spec)
+                .map_err(|bad| format!("invalid persisted MLOCK for {name:?}: {bad:?}"))?;
+            if modes.is_empty() {
+                return Err(format!("empty persisted MLOCK for {name:?}"));
+            }
+            let canonical = modes.render();
+            if canonical != spec {
+                return Err(format!(
+                    "non-canonical persisted MLOCK for {name:?}: {spec:?}"
+                ));
+            }
+            locks.insert(ChanKey(name), modes);
+        }
+        self.channel_mlock = locks;
+        Ok(())
     }
 
     /// Whether setting boolean mode `c` to `adding` would violate `key`'s
@@ -2193,6 +2215,18 @@ fn wire_line_violation(line: &[u8], multiline_capable: bool) -> Option<String> {
     // unconditional guarantee of `WireLine::sanitized` at the delivery funnel;
     // asserting "no line ever carries one" would fire on that legitimate data.
     None
+}
+
+#[cfg(test)]
+mod mlock_tests {
+    use super::MlockModes;
+
+    #[test]
+    fn equivalent_mode_locks_have_one_canonical_spelling() {
+        assert_eq!(MlockModes::parse("+tn-i").unwrap().render(), "+nt-i");
+        assert_eq!(MlockModes::parse("-i+tn").unwrap().render(), "+nt-i");
+        assert_eq!(MlockModes::parse("+n+t-i").unwrap().render(), "+nt-i");
+    }
 }
 
 #[cfg(test)]

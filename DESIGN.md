@@ -163,6 +163,23 @@ These are project-wide rules, enforced in review and (where possible) CI:
     only after it commits. The IRC and HTTP origins are typed requesters, so a
     global committed result does not depend on a still-live `ConnId`, and no
     sentinel connection can accidentally stand in for an admin request.
+  - `PersistedChannelMutation` — the founder web console and REST API do not
+    write channel rows beside the live core. They submit one typed mutation to
+    the core, which validates and canonicalizes it, while the serial database
+    worker locks and re-checks founder ownership, writes the mutation and audit
+    row in one transaction, and returns a typed verdict. Only an applied verdict
+    changes the hot founder/topic/KEEPTOPIC/MLOCK/access maps.
+    Registration from ChanServ and the owner control plane shares one audited
+    insert; the HTTP origin is admitted only when an identified session for the
+    actor currently operates the live channel, and its typed verdict seeds the
+    same founder/topic mirrors.
+    The API and ChanServ therefore cannot write independently committed
+    versions of one setting, and restart preload reads the same rows that
+    produced the live verdict. MLOCK parsing
+    orders modes by the closed lockable-mode set, so equivalent policies have
+    one stored and returned spelling; migration 0038 normalizes historical
+    rows and constrains future storage. A corrupt/non-canonical preload is a
+    startup error, never a silently missing lock.
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the CR/LF sanitizer and
     the detached-buffer append; the bypass is a compile error, not a lint.
@@ -207,6 +224,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     submitted session-bound CSRF token before returning an actor. Forms carry
     the token in their body, so standard browser submissions work without a
     feature-gated client runtime.
+  - `FormBody<T>` — URL-encoded form rejection is an extractor contract, not
+    handler boilerplate. A server-rendered mutation that asks for a form gets
+    the same problem response for malformed input before its body runs, so a
+    new handler cannot forget or invent a different parse-failure path.
   - `RateLimited` — a request that has spent one token from the per-IP
     auth-rate budget, as a `FromRequestParts` extractor. Every unauthenticated,
     work-inducing route declares the throttle by asking for `_: RateLimited`
@@ -1122,7 +1143,9 @@ Surface (initial):
   API tokens CRUD, OIDC identity link/list/unlink
 - `networks`: BNC network CRUD (+ enable/disable, status), buffers list,
   read-marker get/set
-- `channels`: registered-channel management (access flags, topic, mlock)
+- `channels`: owner-scoped registered-channel inventory and management at
+  `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
+  canonical MLOCK, access flags, founder transfer, unregister)
 - `history`: paged queries per §11.2
 - `admin`: accounts, global bans (kline-equivalents), server stats,
   audit-log query, live/historical observability, Prometheus exposition
@@ -1145,7 +1168,13 @@ Post/Redirect/Get. An always-served, same-origin `/console.js` handles only
 progressive enhancements: destructive-action confirmation, one-time-secret
 copying, and monitoring refresh with explicit failure state. The console
 therefore works in the default build as well as `embed-web`, and its private
-pages use a CSP that permits only that same-origin script. The **live chat
+pages use a CSP that permits only that same-origin script.
+`/console/channels` lets an identified live channel operator register it, then
+manage the retained topic, KEEPTOPIC, canonical mode lock,
+auto-op/auto-voice grants, ownership transfer, and unregister lifecycle
+through storage-confirmed core mutations. Empty and unauthorized inventories
+remain distinct from storage failures, and every form is session-CSRF
+protected. The **live chat
 client** is a small hand-written vanilla-JS IRC client (`web/src`,
 bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list

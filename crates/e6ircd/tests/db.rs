@@ -2788,6 +2788,17 @@ async fn channel_registration_stores_initial_topic_in_its_insert() {
             1000
         )]
     );
+    let audit = db::list_audit_log(&pool, 1).await.expect("audit");
+    let (actor, action, target, detail, _) = &audit[0];
+    assert_eq!(
+        (
+            actor.as_str(),
+            action.as_str(),
+            target.as_str(),
+            detail.as_str()
+        ),
+        ("boss", "CHANNEL_REGISTER", "#c", "")
+    );
 }
 
 #[tokio::test]
@@ -2956,7 +2967,23 @@ async fn channel_mlock_persist_and_load() {
             .is_empty()
     );
 
-    // Set → loads back with the same spec.
+    // The database boundary rejects a semantically valid but non-canonical
+    // spelling; every shipped writer canonicalizes before it reaches storage.
+    assert!(
+        db::set_channel_mlock(&pool, "#c", Some("+tn-i".into()))
+            .await
+            .is_err()
+    );
+    for noncanonical in ["+-i", "+i-i"] {
+        assert!(
+            db::set_channel_mlock(&pool, "#c", Some(noncanonical.into()))
+                .await
+                .is_err(),
+            "database accepted non-canonical MLOCK {noncanonical}"
+        );
+    }
+
+    // Canonical set → loads back with the same spec.
     assert!(
         db::set_channel_mlock(&pool, "#c", Some("+nt-i".into()))
             .await
@@ -2983,6 +3010,52 @@ async fn channel_mlock_persist_and_load() {
         !db::set_channel_mlock(&pool, "#missing", Some("+m".into()))
             .await
             .expect("missing row")
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn channel_mlock_migration_normalizes_historical_rows() {
+    static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+    let url = support::test_db("channel_mlock_migration_normalizes_historical_rows").await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("connect");
+    MIGRATIONS
+        .run_to(37, &pool)
+        .await
+        .expect("migrate through 0037");
+    sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('boss', 'boss')")
+        .execute(&pool)
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id, mlock)
+         SELECT spelling, spelling, id, mlock
+         FROM accounts
+         CROSS JOIN (VALUES
+             ('#reordered', '+tn-i'),
+             ('#contradictory', '+i-i'),
+             ('#empty', '+-')
+         ) historical(spelling, mlock)
+         WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("historical locks");
+
+    MIGRATIONS.run(&pool).await.expect("migrate through 0038");
+    let locks: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, mlock FROM channels ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .expect("normalized locks");
+    assert_eq!(
+        locks,
+        vec![
+            ("#contradictory".into(), Some("-i".into())),
+            ("#empty".into(), None),
+            ("#reordered".into(), Some("+nt-i".into())),
+        ]
     );
 }
 
@@ -3035,6 +3108,148 @@ async fn channel_access_persist_and_load() {
             .expect("list")
             .is_empty()
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn owned_channel_control_is_scoped_and_complete() {
+    use e6ircd::core::{ChannelControlResult, PersistedChannelMutation};
+
+    let pool = db::connect_and_migrate(
+        &support::test_db("owned_channel_control_is_scoped_and_complete").await,
+    )
+    .await
+    .expect("connect");
+    for account in ["boss", "alice", "mallory"] {
+        db::create_account(&pool, account, "pw")
+            .await
+            .expect("account");
+    }
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#Control', '#control', id FROM accounts WHERE name_folded = 'boss'",
+    )
+    .execute(&pool)
+    .await
+    .expect("channel");
+
+    let topic = PersistedChannelMutation::SetTopic {
+        topic: Some(("Welcome".into(), "boss".into(), 123)),
+    };
+    assert_eq!(
+        db::persist_owned_channel_mutation(&pool, "#control", "mallory", &topic)
+            .await
+            .expect("scope verdict"),
+        ChannelControlResult::MissingOrNotOwner
+    );
+    assert_eq!(
+        db::persist_owned_channel_mutation(&pool, "#control", "boss", &topic)
+            .await
+            .expect("topic"),
+        ChannelControlResult::Applied
+    );
+    for mutation in [
+        PersistedChannelMutation::SetMlock {
+            mlock: Some("+nt-i".into()),
+        },
+        PersistedChannelMutation::SetAccess {
+            account: "alice".into(),
+            flags: Some("ov".into()),
+        },
+    ] {
+        assert_eq!(
+            db::persist_owned_channel_mutation(&pool, "#control", "boss", &mutation)
+                .await
+                .expect("mutation"),
+            ChannelControlResult::Applied
+        );
+    }
+
+    assert!(
+        db::list_owned_channels(&pool, "mallory")
+            .await
+            .expect("mallory inventory")
+            .is_empty()
+    );
+    let channels = db::list_owned_channels(&pool, "BOSS")
+        .await
+        .expect("owner inventory");
+    assert_eq!(channels.len(), 1);
+    let channel = &channels[0];
+    assert_eq!(channel.name, "#Control");
+    assert_eq!(channel.founder, "boss");
+    assert!(channel.keeptopic);
+    assert_eq!(channel.topic.as_deref(), Some("Welcome"));
+    assert_eq!(channel.topic_setter.as_deref(), Some("boss"));
+    assert_eq!(channel.topic_set_at_millis, Some(123_000));
+    assert_eq!(channel.mlock.as_deref(), Some("+nt-i"));
+    assert_eq!(
+        channel.access,
+        vec![db::ChannelAccessEntry {
+            account: "alice".into(),
+            flags: "ov".into(),
+        }]
+    );
+
+    assert_eq!(
+        db::persist_owned_channel_mutation(
+            &pool,
+            "#control",
+            "boss",
+            &PersistedChannelMutation::SetKeeptopic {
+                enabled: false,
+                topic: None,
+            },
+        )
+        .await
+        .expect("disable retention"),
+        ChannelControlResult::Applied
+    );
+    assert_eq!(
+        db::persist_owned_channel_mutation(&pool, "#control", "boss", &topic)
+            .await
+            .expect("topic while disabled"),
+        ChannelControlResult::KeeptopicDisabled
+    );
+    assert_eq!(
+        db::persist_owned_channel_mutation(
+            &pool,
+            "#control",
+            "boss",
+            &PersistedChannelMutation::TransferFounder {
+                account: "alice".into(),
+            },
+        )
+        .await
+        .expect("transfer"),
+        ChannelControlResult::Applied
+    );
+    assert!(
+        db::list_owned_channels(&pool, "boss")
+            .await
+            .expect("old owner")
+            .is_empty()
+    );
+    assert_eq!(
+        db::list_owned_channels(&pool, "alice")
+            .await
+            .expect("new owner")
+            .len(),
+        1
+    );
+    let audit = db::list_audit_log(&pool, 20).await.expect("audit");
+    for action in [
+        "CHANNEL_TOPIC",
+        "CHANNEL_MLOCK",
+        "CHANNEL_ACCESS",
+        "CHANNEL_KEEPTOPIC",
+        "CHANNEL_FOUNDER",
+    ] {
+        assert!(
+            audit.iter().any(|entry| entry.1 == action),
+            "missing atomic owner-channel audit action {action}: {audit:#?}"
+        );
+    }
 }
 
 #[tokio::test]

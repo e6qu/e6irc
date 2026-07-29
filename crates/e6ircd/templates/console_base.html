@@ -261,6 +261,28 @@
         white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.76rem; line-height: 1.45; }
       .backlog code:last-child { border-bottom: 0; }
       .page-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; }
+      .channel-list { display: grid; gap: 1.25rem; }
+      .channel-control { margin: 0; }
+      .channel-control h3, .danger-zone h3 { font-size: 0.95rem; margin: 0; }
+      .channel-control-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px; background: var(--border); border: 1px solid var(--border);
+        border-radius: 0.65rem; overflow: hidden; margin-top: 1rem; }
+      .control-block { background: var(--panel-subtle); padding: 1rem; }
+      .control-block form { display: grid; gap: 0.7rem; margin-top: 0.85rem; }
+      .control-block form button { justify-self: start; }
+      .inline-control { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+      .access-control { border: 1px solid var(--border); border-radius: 0.65rem; margin-top: 1rem; }
+      .access-create { grid-template-columns: minmax(12rem, 1fr) auto auto auto;
+        align-items: end; border-top: 1px solid var(--border); padding-top: 1rem; }
+      .danger-zone { display: grid; grid-template-columns: minmax(0, 1fr) minmax(18rem, 0.8fr);
+        gap: 1rem; align-items: center; margin-top: 1rem; padding: 1rem;
+        background: color-mix(in srgb, var(--off) 7%, var(--panel));
+        border: 1px solid color-mix(in srgb, var(--off) 30%, var(--border));
+        border-radius: 0.65rem; }
+      .danger-zone p { color: var(--muted); margin: 0.25rem 0 0; font-size: 0.82rem; }
+      .danger-actions { display: flex; align-items: end; justify-content: flex-end; flex-wrap: wrap;
+        gap: 0.65rem; }
+      .danger-actions form { display: flex; align-items: end; gap: 0.55rem; margin: 0; }
       @media (max-width: 40rem) {
         .layout { flex-direction: column; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
@@ -272,12 +294,14 @@
         .network-form, .field-grid, .settings-section, .connection-card,
         .inline-config-form, .oidc-form { grid-template-columns: 1fr; }
         .bootstrap-card, .health-strip, .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .monitoring-history-grid, .access-grid, .secret-reveal { grid-template-columns: 1fr; }
+        .monitoring-history-grid, .access-grid, .secret-reveal, .channel-control-grid,
+        .access-create, .danger-zone { grid-template-columns: 1fr; }
         .monitoring-toolbar { align-items: stretch; flex-direction: column; }
         .error-grid { grid-template-columns: 1fr; }
         .inline-create, .marker-grid { grid-template-columns: 1fr; }
         .network-summary { grid-template-columns: 1fr; }
         .identity-list article, .secret-value { align-items: stretch; flex-direction: column; }
+        .danger-actions, .danger-actions form { align-items: stretch; flex-direction: column; }
         .field-wide { grid-column: auto; }
       }
     </style>
@@ -303,6 +327,7 @@
         {% endif %}
         <div class="section">You</div>
         <a href="/console/networks"{% if active == "networks" %} class="active"{% endif %}>BNC networks</a>
+        <a href="/console/channels"{% if active == "channels" %} class="active"{% endif %}>Registered channels</a>
         <a href="/console/my-sessions"{% if active == "my-sessions" %} class="active"{% endif %}>Your sessions</a>
         <a href="/console/account"{% if active == "account" %} class="active"{% endif %}>Account &amp; access</a>
       </nav>

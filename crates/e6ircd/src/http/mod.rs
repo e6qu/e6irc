@@ -16,6 +16,7 @@ use sqlx::PgPool;
 
 use crate::config::OidcProviderConfig;
 
+mod channels;
 mod credentials;
 mod device;
 mod history;
@@ -24,6 +25,7 @@ mod oidc;
 mod openapi;
 mod ws;
 
+use channels::*;
 use credentials::*;
 use device::*;
 use history::*;
@@ -31,6 +33,30 @@ use networks::*;
 use oidc::*;
 use openapi::*;
 use ws::*;
+
+/// A URL-encoded form body whose extraction failures use the API's problem
+/// response contract instead of Axum's default text rejection.
+pub(crate) struct FormBody<T>(pub(crate) T);
+
+impl<T, S> axum::extract::FromRequest<S> for FormBody<T>
+where
+    axum::Form<T>:
+        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::FormRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::Form::<T>::from_request(req, state).await {
+            Ok(axum::Form(value)) => Ok(Self(value)),
+            Err(error) => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid form",
+                Some(&error.to_string()),
+            )),
+        }
+    }
+}
 
 /// One in-flight OIDC authorization (state → verifier/nonce), expiring
 /// after ten minutes.
@@ -210,6 +236,37 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// Run one HTTP control-plane mutation on the core and await its typed outcome.
+/// The core owns live-state ordering and the database verdict; HTTP handlers do
+/// not write durable/live state along a second path.
+async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result<String, String> {
+    match core_reply(state, req).await? {
+        crate::core::AdminReply::Ok(message) => Ok(message),
+        crate::core::AdminReply::Err(message)
+        | crate::core::AdminReply::ChannelErr { message, .. } => Err(message),
+        crate::core::AdminReply::Sessions(_) => {
+            Err("unexpected sessions reply for a mutation".into())
+        }
+    }
+}
+
+async fn core_reply(
+    state: &AppState,
+    req: crate::core::AdminRequest,
+) -> Result<crate::core::AdminReply, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state
+        .core_tx
+        .push(crate::core::Input::Admin { req, reply: tx })
+        .await
+        .is_err()
+    {
+        return Err("core worker unavailable".into());
+    }
+    rx.await
+        .map_err(|_| "core worker dropped the request".into())
 }
 
 #[cfg(test)]
@@ -410,6 +467,36 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
         .route("/console/account", get(pages::console_account))
+        .route("/console/channels", get(pages::console_channels))
+        .route(
+            "/console/channels/topic",
+            post(pages::console_channel_topic),
+        )
+        .route(
+            "/console/channels/register",
+            post(pages::console_channel_register),
+        )
+        .route(
+            "/console/channels/keeptopic",
+            post(pages::console_channel_keeptopic),
+        )
+        .route(
+            "/console/channels/mlock",
+            post(pages::console_channel_mlock),
+        )
+        .route(
+            "/console/channels/access",
+            post(pages::console_channel_access),
+        )
+        .route(
+            "/console/channels/access/delete",
+            post(pages::console_channel_access_delete),
+        )
+        .route(
+            "/console/channels/founder",
+            post(pages::console_channel_founder),
+        )
+        .route("/console/channels/drop", post(pages::console_channel_drop))
         .route(
             "/console/account/app-passwords",
             post(pages::console_create_app_password),
@@ -498,7 +585,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/console/bans", post(pages::console_add_ban))
         .route("/console/bans/delete", post(pages::console_remove_ban))
-        .route("/console/channels/drop", post(pages::console_drop_channel))
+        .route(
+            "/console/admin/channels/drop",
+            post(pages::console_drop_channel),
+        )
         .route("/console/sessions", get(pages::console_sessions))
         .route("/console/sessions/kill", post(pages::console_kill_session))
         .route("/console/my-sessions", get(pages::console_my_sessions))
@@ -544,6 +634,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(me_tokens_revoke),
         )
         .route("/api/v1/me/read-markers", get(me_read_markers))
+        .route(
+            "/api/v1/me/channels",
+            get(list_owned_channels).post(register_owned_channel),
+        )
+        .route(
+            "/api/v1/me/channels/{name}",
+            get(get_owned_channel)
+                .patch(patch_owned_channel)
+                .delete(delete_owned_channel),
+        )
+        .route(
+            "/api/v1/me/channels/{name}/access/{account}",
+            axum::routing::put(put_channel_access).delete(delete_channel_access),
+        )
         .route("/api/v1/me/credentials", get(list_credentials))
         .route(
             "/api/v1/me/credentials/{id}",
@@ -1374,6 +1478,334 @@ mod pages {
             }
             Err(error) => super::device::admin_db_error("identity unlink", error),
         }
+    }
+
+    struct ChannelAccessView {
+        account: String,
+        flags: String,
+        auto_op: bool,
+        auto_voice: bool,
+    }
+
+    struct OwnedChannelView {
+        name: String,
+        founder: String,
+        keeptopic: bool,
+        topic: String,
+        topic_setter: String,
+        mlock: String,
+        access: Vec<ChannelAccessView>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_channels.html")]
+    struct ConsoleChannels {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        channels: Vec<OwnedChannelView>,
+        error: Option<String>,
+    }
+
+    async fn console_channels_build(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        error: Option<String>,
+    ) -> Result<ConsoleChannels, Response> {
+        let channels = crate::db::list_owned_channels(pool_of(state), &account)
+            .await
+            .map_err(|error| super::device::admin_db_error("owned channel list", error))?
+            .into_iter()
+            .map(|channel| OwnedChannelView {
+                name: channel.name,
+                founder: channel.founder,
+                keeptopic: channel.keeptopic,
+                topic: channel.topic.unwrap_or_default(),
+                topic_setter: channel
+                    .topic_setter
+                    .unwrap_or_else(|| "No retained topic".into()),
+                mlock: channel.mlock.unwrap_or_default(),
+                access: channel
+                    .access
+                    .into_iter()
+                    .map(|entry| ChannelAccessView {
+                        auto_op: entry.flags.contains('o'),
+                        auto_voice: entry.flags.contains('v'),
+                        account: entry.account,
+                        flags: entry.flags,
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(ConsoleChannels {
+            is_admin: is_admin_account(state, &account),
+            account,
+            csrf,
+            active: "channels",
+            channels,
+            error,
+        })
+    }
+
+    pub async fn console_channels(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        match console_channels_build(&state, account, csrf, None).await {
+            Ok(view) => render_private(view),
+            Err(response) => response,
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelTopicForm {
+        csrf: String,
+        channel: String,
+        #[serde(default)]
+        topic: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelRegisterForm {
+        csrf: String,
+        channel: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelKeeptopicForm {
+        csrf: String,
+        channel: String,
+        enabled: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelMlockForm {
+        csrf: String,
+        channel: String,
+        #[serde(default)]
+        mlock: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelAccessForm {
+        csrf: String,
+        channel: String,
+        account: String,
+        #[serde(default)]
+        auto_op: Option<String>,
+        #[serde(default)]
+        auto_voice: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelAccessDeleteForm {
+        csrf: String,
+        channel: String,
+        account: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct ChannelFounderForm {
+        csrf: String,
+        channel: String,
+        account: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct OwnedChannelDropForm {
+        csrf: String,
+        channel: String,
+    }
+
+    async fn run_owned_channel_form(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        csrf: &str,
+        channel: String,
+        mutation: crate::core::ChannelMutation,
+    ) -> Response {
+        let account = match require_form_actor(state, headers, csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let request = crate::core::AdminRequest::MutateOwnedChannel {
+            channel,
+            actor: account.clone(),
+            mutation,
+        };
+        match core_action(state, request).await {
+            Ok(_) => Redirect::to("/console/channels").into_response(),
+            Err(message) => {
+                let csrf = session_token(headers, state.secure_cookies)
+                    .map(|session| state.csrf_token(&session))
+                    .unwrap_or_default();
+                match console_channels_build(state, account, csrf, Some(message)).await {
+                    Ok(view) => render_private(view),
+                    Err(response) => response,
+                }
+            }
+        }
+    }
+
+    pub async fn console_channel_topic(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelTopicForm>,
+    ) -> Response {
+        let topic = (!form.topic.trim().is_empty()).then_some(form.topic);
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::SetTopic { topic },
+        )
+        .await
+    }
+
+    pub async fn console_channel_register(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelRegisterForm>,
+    ) -> Response {
+        let account = match require_form_actor(&state, &headers, &form.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let request = crate::core::AdminRequest::RegisterOwnedChannel {
+            channel: form.channel,
+            actor: account.clone(),
+        };
+        match core_action(&state, request).await {
+            Ok(_) => Redirect::to("/console/channels").into_response(),
+            Err(message) => {
+                match console_channels_build(&state, account, form.csrf, Some(message)).await {
+                    Ok(view) => render_private(view),
+                    Err(response) => response,
+                }
+            }
+        }
+    }
+
+    pub async fn console_channel_keeptopic(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelKeeptopicForm>,
+    ) -> Response {
+        let enabled = match form.enabled.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => {
+                return problem(StatusCode::BAD_REQUEST, "Invalid KEEPTOPIC value", None);
+            }
+        };
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::SetKeeptopic { enabled },
+        )
+        .await
+    }
+
+    pub async fn console_channel_mlock(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelMlockForm>,
+    ) -> Response {
+        let mlock = (!form.mlock.trim().is_empty()).then_some(form.mlock);
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::SetMlock { mlock },
+        )
+        .await
+    }
+
+    pub async fn console_channel_access(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelAccessForm>,
+    ) -> Response {
+        let mut flags = String::new();
+        if form.auto_op.is_some() {
+            flags.push('o');
+        }
+        if form.auto_voice.is_some() {
+            flags.push('v');
+        }
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::SetAccess {
+                account: form.account,
+                flags: Some(flags),
+            },
+        )
+        .await
+    }
+
+    pub async fn console_channel_access_delete(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelAccessDeleteForm>,
+    ) -> Response {
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::SetAccess {
+                account: form.account,
+                flags: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn console_channel_founder(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<ChannelFounderForm>,
+    ) -> Response {
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::TransferFounder {
+                account: form.account,
+            },
+        )
+        .await
+    }
+
+    pub async fn console_channel_drop(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        FormBody(form): FormBody<OwnedChannelDropForm>,
+    ) -> Response {
+        run_owned_channel_form(
+            &state,
+            &headers,
+            &form.csrf,
+            form.channel,
+            crate::core::ChannelMutation::Drop,
+        )
+        .await
     }
 
     struct ChannelRow {
@@ -3954,32 +4386,6 @@ mod pages {
         Ok(account)
     }
 
-    /// Run one admin console action on the core worker and await its outcome.
-    /// The action mutates live state (hot ban list, registered-channel maps) and
-    /// persists, exactly like the equivalent oper/services IRC command.
-    async fn admin_action(
-        state: &AppState,
-        req: crate::core::AdminRequest,
-    ) -> Result<String, String> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if state
-            .core_tx
-            .push(crate::core::Input::Admin { req, reply: tx })
-            .await
-            .is_err()
-        {
-            return Err("core worker unavailable".into());
-        }
-        match rx.await {
-            Ok(crate::core::AdminReply::Ok(m)) => Ok(m),
-            Ok(crate::core::AdminReply::Err(m)) => Err(m),
-            Ok(crate::core::AdminReply::Sessions(_)) => {
-                Err("unexpected sessions reply for a mutation".into())
-            }
-            Err(_) => Err("core worker dropped the request".into()),
-        }
-    }
-
     /// Snapshot live client sessions from the core worker. With `own`, restrict
     /// to sessions authenticated as that account (the caller's own clients).
     async fn admin_list_sessions(
@@ -4062,7 +4468,7 @@ mod pages {
             Err(gate) => return Ok(gate),
         };
         let req = make_req(account.clone());
-        match admin_action(state, req).await {
+        match core_action(state, req).await {
             Ok(_) => Ok(Redirect::to(redirect).into_response()),
             Err(msg) => Err((account, msg)),
         }
@@ -4271,7 +4677,7 @@ mod pages {
             reason: f.reason,
             account: account.clone(),
         };
-        match admin_action(&state, req).await {
+        match core_action(&state, req).await {
             Ok(_) => Redirect::to("/console/my-sessions").into_response(),
             Err(msg) => render_sessions_page(&state, &headers, account, true, Some(msg)).await,
         }
