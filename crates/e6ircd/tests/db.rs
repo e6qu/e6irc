@@ -636,7 +636,7 @@ async fn credential_list_and_revoke() {
     db::issue_app_password(&pool, "creduser", "pw", "phone")
         .await
         .expect("ap2");
-    let session = db::create_web_session(&pool, "creduser")
+    let session = db::create_web_session(&pool, "creduser", None)
         .await
         .expect("session");
     drop(pool);
@@ -1165,12 +1165,14 @@ async fn history_rest_endpoint() {
     .execute(&pool)
     .await
     .expect("register #web");
-    let session = db::create_web_session(&pool, "web").await.expect("session");
+    let session = db::create_web_session(&pool, "web", None)
+        .await
+        .expect("session");
     // A second account with no relationship to #web must be refused (IDOR).
     db::create_account(&pool, "other", "pw")
         .await
         .expect("create other");
-    let other_session = db::create_web_session(&pool, "other")
+    let other_session = db::create_web_session(&pool, "other", None)
         .await
         .expect("other session");
     let pool2 = pool.clone();
@@ -1392,7 +1394,7 @@ PING x
     db::create_account(&pool2, "snoop", "pw")
         .await
         .expect("snoop");
-    let snoop_session = db::create_web_session(&pool2, "snoop")
+    let snoop_session = db::create_web_session(&pool2, "snoop", None)
         .await
         .expect("snoop session");
     for probe in ["web", "other", "other!web", "web!other"] {
@@ -3704,7 +3706,7 @@ async fn oidc_identity_link_list_and_conflict() {
 
     // Removing an identity also revokes only the sessions asserted by that
     // identity. A local session and the other identity's session survive.
-    let removed_session = db::create_oidc_web_session(
+    let removed_session = db::create_web_session_with_identity(
         &pool,
         "alice",
         db::OidcSessionIdentity {
@@ -3712,10 +3714,11 @@ async fn oidc_identity_link_list_and_conflict() {
             subject: Some("sub-0"),
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("removed identity session");
-    let retained_session = db::create_oidc_web_session(
+    let retained_session = db::create_web_session_with_identity(
         &pool,
         "alice",
         db::OidcSessionIdentity {
@@ -3723,10 +3726,11 @@ async fn oidc_identity_link_list_and_conflict() {
             subject: Some("sub-1"),
             ..Default::default()
         },
+        None,
     )
     .await
     .expect("retained identity session");
-    let local_session = db::create_web_session(&pool, "alice")
+    let local_session = db::create_web_session(&pool, "alice", None)
         .await
         .expect("local session");
     assert_eq!(
@@ -3823,14 +3827,16 @@ async fn oidc_web_session_records_logout_hint() {
         .expect("acct");
 
     // A plain session carries no logout hint.
-    let plain = db::create_web_session(&pool, "alice").await.expect("plain");
+    let plain = db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("plain");
     assert_eq!(
         db::session_logout_hint(&pool, &plain).await.expect("hint"),
         (None, None)
     );
 
     // An OIDC session records the id token + provider for RP-initiated logout.
-    let sso = db::create_oidc_web_session(
+    let sso = db::create_web_session_with_identity(
         &pool,
         "alice",
         db::OidcSessionIdentity {
@@ -3842,6 +3848,7 @@ async fn oidc_web_session_records_logout_hint() {
             email: Some("alice@example.test"),
             role: Some("developer"),
         },
+        None,
     )
     .await
     .expect("sso");
@@ -3876,7 +3883,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
     db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let first = db::create_oidc_web_session(
+    let first = db::create_web_session_with_identity(
         &pool,
         "alice",
         db::OidcSessionIdentity {
@@ -3888,10 +3895,11 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
             email: Some("alice@example.test"),
             role: Some("developer"),
         },
+        None,
     )
     .await
     .expect("first session");
-    let second = db::create_oidc_web_session(
+    let second = db::create_web_session_with_identity(
         &pool,
         "alice",
         db::OidcSessionIdentity {
@@ -3903,6 +3911,7 @@ async fn oidc_logout_revokes_correlated_sessions_and_rejects_replay() {
             email: Some("alice@example.test"),
             role: Some("developer"),
         },
+        None,
     )
     .await
     .expect("second session");
@@ -4153,4 +4162,77 @@ async fn bnc_buffer_trim_is_scoped_to_one_network() {
         .await
         .expect("read");
     assert_eq!(kept, vec!["line 5999"]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn web_session_inventory_and_revocation_are_owner_scoped() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("web_session_inventory_and_revocation_are_owner_scoped").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    db::create_account(&pool, "bob", "pw").await.expect("bob");
+
+    let desktop_agent = db::SessionUserAgent::from_header(" Desktop\tBrowser ")
+        .expect("normalized desktop user agent");
+    let first = db::create_web_session(&pool, "alice", Some(&desktop_agent))
+        .await
+        .expect("first session");
+    let second = db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("second session");
+    let bob = db::create_web_session(&pool, "bob", None)
+        .await
+        .expect("bob session");
+
+    let sessions = db::list_web_sessions(&pool, "alice", Some(&second))
+        .await
+        .expect("list alice sessions");
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions[0].current, "current session sorts first");
+    assert_eq!(sessions[0].user_agent, None);
+    assert!(!sessions[1].current);
+    assert_eq!(sessions[1].user_agent.as_deref(), Some("Desktop�Browser"));
+
+    let bob_id = db::list_web_sessions(&pool, "bob", Some(&bob))
+        .await
+        .expect("list bob sessions")[0]
+        .id;
+    assert_eq!(
+        db::delete_web_session_by_id(&pool, "alice", bob_id, Some(&second))
+            .await
+            .expect("cross-account delete"),
+        None,
+        "an owner-scoped delete cannot revoke another account's session"
+    );
+
+    let first_id = sessions[1].id;
+    assert_eq!(
+        db::delete_web_session_by_id(&pool, "alice", first_id, Some(&second))
+            .await
+            .expect("delete first"),
+        Some(false)
+    );
+    assert_eq!(
+        db::session_account(&pool, &first)
+            .await
+            .expect("resolve deleted session"),
+        None
+    );
+    assert_eq!(
+        db::delete_other_web_sessions(&pool, "alice", &second)
+            .await
+            .expect("delete others"),
+        0
+    );
+    assert_eq!(
+        db::session_account(&pool, &second)
+            .await
+            .expect("current session survives"),
+        Some("alice".into())
+    );
 }

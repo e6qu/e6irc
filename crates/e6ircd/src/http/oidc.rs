@@ -488,7 +488,8 @@ pub(super) async fn oidc_callback(
     // Record the id token + provider so logout can end the provider's SSO
     // session (RP-initiated logout), not just the local e6irc session.
     let id_token_raw = id_token.to_string();
-    let token = match crate::db::create_oidc_web_session(
+    let user_agent = session_user_agent(&headers);
+    let token = match crate::db::create_web_session_with_identity(
         &pool,
         &account,
         crate::db::OidcSessionIdentity {
@@ -500,6 +501,7 @@ pub(super) async fn oidc_callback(
             email: email.as_deref(),
             role: role.map(Role::as_str),
         },
+        user_agent.as_ref(),
     )
     .await
     {
@@ -1226,4 +1228,13 @@ pub(super) fn clear_session_cookie(secure: bool) -> String {
 
 pub(super) fn session_token(headers: &axum::http::HeaderMap, secure: bool) -> Option<String> {
     cookie_value(headers, session_cookie_name(secure))
+}
+
+pub(super) fn session_user_agent(
+    headers: &axum::http::HeaderMap,
+) -> Option<crate::db::SessionUserAgent> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::db::SessionUserAgent::from_header)
 }

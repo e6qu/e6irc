@@ -639,6 +639,7 @@ async fn local_login_is_browser_bound_and_accepts_only_the_primary_password() {
     let valid = format!("login_state={state}&account=aLiCe&password=primary");
     let req = format!(
         "POST /login HTTP/1.1\r\nHost: t\r\nCookie: e6irc_login_state={state}\r\n\
+         User-Agent: e6irc test browser\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{valid}",
         valid.len()
@@ -648,6 +649,20 @@ async fn local_login_is_browser_bound_and_accepts_only_the_primary_password() {
     assert!(headers.contains("location: /"), "{headers}");
     assert!(headers.contains("e6irc_session="), "{headers}");
     assert!(headers.contains("e6irc_login_state=;"), "{headers}");
+    let session_token = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: e6irc_session="))
+        .and_then(|value| value.split(';').next())
+        .expect("session cookie");
+    let sessions = e6ircd::db::list_web_sessions(&pool, "Alice", Some(session_token))
+        .await
+        .expect("browser session inventory");
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions[0].current);
+    assert_eq!(
+        sessions[0].user_agent.as_deref(),
+        Some("e6irc test browser")
+    );
 }
 
 #[tokio::test]
@@ -669,7 +684,7 @@ async fn account_url_redirects_to_the_complete_account_console() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -763,7 +778,7 @@ async fn console_networks_page_lists_the_callers_networks() {
     )
     .await
     .expect("seed hostile backlog line");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -851,7 +866,7 @@ async fn console_add_and_delete_network_via_the_console() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -995,7 +1010,7 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("account");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -1236,7 +1251,7 @@ async fn console_edit_network_updates_fields() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     // A bridge network (kind=matrix), inserted directly (creating one needs the
@@ -1625,10 +1640,10 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
             .await
             .expect("account");
     }
-    let boss_session = e6ircd::db::create_web_session(&pool, "boss")
+    let boss_session = e6ircd::db::create_web_session(&pool, "boss", None)
         .await
         .expect("boss session");
-    let mallory_session = e6ircd::db::create_web_session(&pool, "mallory")
+    let mallory_session = e6ircd::db::create_web_session(&pool, "mallory", None)
         .await
         .expect("mallory session");
     sqlx::query(
@@ -2028,7 +2043,7 @@ async fn admin_console_ban_and_channel_actions() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     sqlx::query(
@@ -2179,7 +2194,7 @@ async fn admin_console_lists_and_kills_sessions() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -2289,7 +2304,7 @@ async fn my_sessions_are_scoped_to_the_caller() {
     e6ircd::db::create_account(&pool, "bob", "s3cr3t")
         .await
         .expect("bob");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -2412,6 +2427,170 @@ async fn my_sessions_are_scoped_to_the_caller() {
     assert!(killed, "alice's own session was not disconnected");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() {
+    let url =
+        support::test_db("browser_sessions_are_visible_and_owner_scoped_across_api_and_console")
+            .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let current_agent =
+        e6ircd::db::SessionUserAgent::from_header("Current Browser").expect("agent");
+    let other_agent = e6ircd::db::SessionUserAgent::from_header("Browser <other>").expect("agent");
+    let current = e6ircd::db::create_web_session(&pool, "alice", Some(&current_agent))
+        .await
+        .expect("current session");
+    let other = e6ircd::db::create_web_session(&pool, "alice", Some(&other_agent))
+        .await
+        .expect("other session");
+    let bob = e6ircd::db::create_web_session(&pool, "bob", None)
+        .await
+        .expect("bob session");
+
+    let config = Config {
+        server_name: "irc.browser-sessions.example".into(),
+        network_name: "BrowserSessionsNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let api_list = format!(
+        "GET /api/v1/me/sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, body) = request(http, &api_list).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(headers.contains("cache-control: no-store"), "{headers}");
+    assert!(!body.contains("token_hash"), "{body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("session JSON");
+    let sessions = payload["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 2, "{payload}");
+    assert_eq!(
+        sessions.iter().filter(|row| row["current"] == true).count(),
+        1
+    );
+    let current_id = sessions
+        .iter()
+        .find(|row| row["current"] == true)
+        .and_then(|row| row["id"].as_i64())
+        .expect("current id");
+    let other_id = sessions
+        .iter()
+        .find(|row| row["current"] == false)
+        .and_then(|row| row["id"].as_i64())
+        .expect("other id");
+
+    let page = format!(
+        "GET /console/my-sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page_body) = request(http, &page).await;
+    assert_eq!(status, 200, "{page_body}");
+    assert!(
+        page_body.contains("<h2>Browser sessions</h2>"),
+        "{page_body}"
+    );
+    assert!(page_body.contains("Current Browser"), "{page_body}");
+    assert!(page_body.contains("Browser &#60;other&#62;"), "{page_body}");
+    assert!(!page_body.contains("Browser <other>"), "{page_body}");
+    assert!(page_body.contains("Current session"), "{page_body}");
+    assert!(
+        page_body.contains("Sign out others"),
+        "bulk revocation missing: {page_body}"
+    );
+    let csrf = csrf_from_html(&page_body).to_string();
+
+    let bob_id = e6ircd::db::list_web_sessions(&pool, "bob", Some(&bob))
+        .await
+        .expect("list bob")[0]
+        .id;
+    let cross_account = format!(
+        "DELETE /api/v1/me/sessions/{bob_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, _) = request(http, &cross_account).await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &bob)
+            .await
+            .expect("bob session"),
+        Some("bob".into())
+    );
+
+    let revoke_other = format!(
+        "DELETE /api/v1/me/sessions/{other_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, _) = request(http, &revoke_other).await;
+    assert_eq!(status, 204, "{headers}");
+    assert!(!headers.contains("set-cookie:"), "{headers}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &other)
+            .await
+            .expect("other session"),
+        None
+    );
+
+    let third = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("third session");
+    let revoke_others_body = format!("csrf={csrf}");
+    let revoke_others = format!(
+        "POST /console/my-sessions/browser/others/delete HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={current}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{revoke_others_body}",
+        revoke_others_body.len()
+    );
+    let (status, headers, _) = request(http, &revoke_others).await;
+    assert_eq!(status, 303, "{headers}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &current)
+            .await
+            .expect("current session"),
+        Some("alice".into())
+    );
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &third)
+            .await
+            .expect("third session"),
+        None
+    );
+
+    let revoke_current = format!(
+        "DELETE /api/v1/me/sessions/{current_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, _) = request(http, &revoke_current).await;
+    assert_eq!(status, 204, "{headers}");
+    assert!(headers.contains("e6irc_session=;"), "{headers}");
+    assert!(headers.contains("Max-Age=0"), "{headers}");
+    assert_eq!(
+        e6ircd::db::session_account(&pool, &current)
+            .await
+            .expect("current revoked"),
+        None
+    );
+}
+
 /// The console Integrations page is admin-gated and lists every chat-platform
 /// bridge with build availability matching the exact feature configuration.
 #[tokio::test(flavor = "multi_thread")]
@@ -2530,7 +2709,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     e6ircd::db::create_bnc_network(
@@ -2650,7 +2829,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     e6ircd::db::link_oidc_identity(&pool, "alice", "https://idp.example", "alice-secondary")
         .await
         .expect("secondary identity");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
 
@@ -2872,7 +3051,7 @@ async fn device_authorization_grant_flow() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -3304,7 +3483,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_oidc_web_session(
+    let session = e6ircd::db::create_web_session_with_identity(
         &pool,
         "alice",
         e6ircd::db::OidcSessionIdentity {
@@ -3316,10 +3495,11 @@ async fn rp_initiated_logout_redirects_to_provider() {
             email: Some("alice@example.test"),
             role: Some("developer"),
         },
+        None,
     )
     .await
     .expect("sso session");
-    let local_session = e6ircd::db::create_web_session(&pool, "alice")
+    let local_session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("local session");
     drop(pool);
@@ -3550,7 +3730,7 @@ async fn application_entry_is_fail_closed_and_starts_provider_authorization() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice")
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
     drop(pool);
@@ -3620,7 +3800,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("acct");
-    let session = e6ircd::db::create_oidc_web_session(
+    let session = e6ircd::db::create_web_session_with_identity(
         &pool,
         "alice",
         e6ircd::db::OidcSessionIdentity {
@@ -3632,6 +3812,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
             email: Some("alice@example.test"),
             role: Some("developer"),
         },
+        None,
     )
     .await
     .expect("session");

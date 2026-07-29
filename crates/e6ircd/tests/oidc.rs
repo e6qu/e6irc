@@ -151,7 +151,7 @@ async fn pat_bearer_auth_works() {
     e6ircd::db::create_account(&pool, "patuser", "pw")
         .await
         .expect("create");
-    let session = e6ircd::db::create_web_session(&pool, "patuser")
+    let session = e6ircd::db::create_web_session(&pool, "patuser", None)
         .await
         .expect("session");
     drop(pool);
@@ -230,10 +230,10 @@ async fn oidc_identity_link_flow_and_conflict() {
     e6ircd::db::create_account(&pool, "bob", "pw")
         .await
         .expect("bob");
-    let alice_session = e6ircd::db::create_web_session(&pool, "alice")
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("s1");
-    let bob_session = e6ircd::db::create_web_session(&pool, "bob")
+    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
         .await
         .expect("s2");
     drop(pool);

@@ -1,40 +1,107 @@
 {% extends "console_base.html" %}
 {% block main %}
-        {% if let Some(err) = error %}
-          <p class="banner-error" role="alert">{{ err }}</p>
-        {% endif %}
-        <h1>{{ title }} <span class="tag">{{ sessions.len() }}</span></h1>
-        <p class="meta">{{ hint }}</p>
-        {% if sessions.is_empty() %}
-          <p class="empty">No client sessions.</p>
-        {% else %}
-          <div class="scroll">
-            <table>
-              <thead>
-                <tr><th>Nick</th><th>User@Host</th><th>Account</th><th>Channels</th><th></th></tr>
-              </thead>
-              <tbody>
-                {% for s in sessions %}
-                  <tr>
-                    <td><code>{{ s.nick }}</code>{% if s.oper %} <span class="tag">oper</span>{% endif %}</td>
-                    <td><code>{{ s.user }}@{{ s.host }}</code></td>
-                    <td>{% if let Some(a) = s.account %}<code>{{ a }}</code>{% else %}<span class="meta">—</span>{% endif %}</td>
-                    <td>{% if s.channels.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ s.channels }}</code>{% endif %}</td>
-                    <td>
-                      {# nick read from the data-attribute at runtime, never
-                         concatenated into JS source. #}
-                      <form class="cell-form" method="post" action="{{ kill_action }}"
-                            data-confirm="Disconnect {{ s.nick }}?">
+  {% if let Some(err) = error %}
+    <p class="banner-error" role="alert">{{ err }}</p>
+  {% endif %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">Access &amp; connections</p>
+      <h1>{{ title }}</h1>
+      <p class="lede">{{ hint }}</p>
+    </div>
+  </div>
+
+  {% if show_browser_sessions %}
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Browser sessions</h2>
+          <p>Durable web logins for this account. Session tokens remain hash-only and are never displayed.</p>
+        </div>
+        <div class="row-actions">
+          <span class="count">{{ browser_sessions.len() }}</span>
+          {% if browser_sessions.len() > 1 %}
+            <form method="post" action="/console/my-sessions/browser/others/delete"
+                  data-confirm="Sign out every other browser session?">
+              <input type="hidden" name="csrf" value="{{ csrf }}" />
+              <button class="danger" type="submit">Sign out others</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+      {% if browser_sessions.is_empty() %}
+        <p class="empty">No active browser sessions.</p>
+      {% else %}
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr><th>Browser</th><th>Sign-in method</th><th>Created</th><th>Expires</th><th></th></tr>
+            </thead>
+            <tbody>
+              {% for session in browser_sessions %}
+                <tr>
+                  <td class="session-agent">{{ session.user_agent }}</td>
+                  <td>{{ session.method }}</td>
+                  <td><time datetime="{{ session.created }}">{{ session.created }}</time></td>
+                  <td><time datetime="{{ session.expires }}">{{ session.expires }}</time></td>
+                  <td>
+                    {% if session.current %}
+                      <span class="tag">Current session</span>
+                    {% else %}
+                      <form class="cell-form" method="post"
+                            action="/console/my-sessions/browser/{{ session.id }}/delete"
+                            data-confirm="Sign out this browser session?">
                         <input type="hidden" name="csrf" value="{{ csrf }}" />
-                        <input type="hidden" name="nick" value="{{ s.nick }}" />
-                        <input type="text" name="reason" placeholder="reason" />
-                        <button class="danger" type="submit">Kill</button>
+                        <button class="danger" type="submit">Sign out</button>
                       </form>
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        {% endif %}
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+    </section>
+  {% endif %}
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>{% if show_browser_sessions %}Connected IRC clients{% else %}Live client connections{% endif %}</h2>
+        <p>Raw IRC, IRC-over-WebSocket, and authenticated bouncer attachments currently held by the core.</p>
+      </div>
+      <span class="count">{{ sessions.len() }}</span>
+    </div>
+    {% if sessions.is_empty() %}
+      <p class="empty">No connected IRC clients.</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>Nick</th><th>User@Host</th><th>Account</th><th>Channels</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for s in sessions %}
+              <tr>
+                <td><code>{{ s.nick }}</code>{% if s.oper %} <span class="tag">oper</span>{% endif %}</td>
+                <td><code>{{ s.user }}@{{ s.host }}</code></td>
+                <td>{% if let Some(a) = s.account %}<code>{{ a }}</code>{% else %}<span class="meta">—</span>{% endif %}</td>
+                <td>{% if s.channels.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ s.channels }}</code>{% endif %}</td>
+                <td>
+                  <form class="cell-form" method="post" action="{{ kill_action }}"
+                        data-confirm="Disconnect {{ s.nick }}?">
+                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <input type="hidden" name="nick" value="{{ s.nick }}" />
+                    <input type="text" name="reason" placeholder="reason" />
+                    <button class="danger" type="submit">Kill</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </section>
 {% endblock %}
