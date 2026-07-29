@@ -83,7 +83,7 @@ async fn run(session: LocalSession, mut ends: DriverEnds) {
 }
 
 async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::SessionOutcome {
-    use super::SessionOutcome::{Dropped, Stopped};
+    use super::SessionOutcome::Stopped;
     let conn = match session.core.next_conn.allocate() {
         Ok(conn) => conn,
         Err(error) => {
@@ -181,7 +181,9 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
                 }
                 // Core closed our session: reconnect with a fresh ConnId (and
                 // emit Disconnected via run_with_backoff) rather than die.
-                None => return Dropped,
+                None => {
+                    return super::SessionOutcome::Dropped(super::NetworkFailure::ConnectionLost);
+                }
             },
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {

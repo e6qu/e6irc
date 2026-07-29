@@ -85,6 +85,7 @@ async fn run(config: DiscordConfig, mut ends: DriverEnds) {
 }
 
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+    use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
     // Bound REST calls so a hung request can't stall the gateway loop; vet every
     // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
@@ -92,7 +93,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         Ok(c) => c,
         Err(e) => {
             eprintln!("discord: http client build failed: {e}");
-            return Dropped;
+            return Dropped(NetworkFailure::UpstreamRequestFailed);
         }
     };
     let base = api_base(config);
@@ -112,7 +113,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     eprintln!(
                         "discord: channel {id} has an unsafe name {name:?}; refusing to bridge it"
                     );
-                    return Dropped;
+                    return Dropped(NetworkFailure::ChannelMappingFailed);
                 }
                 // Two Discord channels whose IRC names collide *under the
                 // casemapping* derive one IRC channel and would silently
@@ -124,14 +125,14 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         "discord: channel {id} name {name:?} collides with an already-bridged \
                          channel {channel:?}; refusing to bridge it"
                     );
-                    return Dropped;
+                    return Dropped(NetworkFailure::ChannelMappingFailed);
                 }
                 id_to_channel.insert(id.clone(), channel.clone());
                 channel_to_id.insert(folded, id.clone());
             }
             Err(e) => {
                 eprintln!("discord: channel {id} lookup failed: {e}");
-                return Dropped;
+                return Dropped(NetworkFailure::UpstreamRequestFailed);
             }
         }
     }
@@ -140,7 +141,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         Ok(u) => u,
         Err(e) => {
             eprintln!("discord: gateway discovery failed: {e}");
-            return Dropped;
+            return Dropped(NetworkFailure::UpstreamRequestFailed);
         }
     };
     let url = format!("{}/?v=10&encoding=json", gateway.trim_end_matches('/'));
@@ -156,11 +157,11 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
             eprintln!("discord: gateway connect failed: {e}");
-            return Dropped;
+            return Dropped(NetworkFailure::ConnectionFailed);
         }
         Err(_) => {
             eprintln!("discord: gateway connect timed out");
-            return Dropped;
+            return Dropped(NetworkFailure::ConnectionTimedOut);
         }
     };
     let (mut write, mut read) = ws.split();
@@ -174,16 +175,28 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             }) => ms,
             Ok(_) => {
                 eprintln!("discord: first gateway frame was not HELLO");
-                return Dropped;
+                return Dropped(NetworkFailure::UpstreamProtocolFailed);
             }
             Err(e) => {
                 eprintln!("discord: malformed HELLO frame: {e}");
-                return Dropped;
+                return Dropped(NetworkFailure::UpstreamProtocolFailed);
             }
         },
-        _ => {
+        Err(_) => {
+            eprintln!("discord: HELLO timed out");
+            return Dropped(NetworkFailure::ConnectionTimedOut);
+        }
+        Ok(Some(Err(e))) => {
+            eprintln!("discord: gateway read error before HELLO: {e}");
+            return Dropped(NetworkFailure::ConnectionLost);
+        }
+        Ok(None) => {
+            eprintln!("discord: gateway closed before HELLO");
+            return Dropped(NetworkFailure::ConnectionLost);
+        }
+        Ok(Some(Ok(_))) => {
             eprintln!("discord: no HELLO from gateway");
-            return Dropped;
+            return Dropped(NetworkFailure::UpstreamProtocolFailed);
         }
     };
 
@@ -196,7 +209,7 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
         }
     });
     if write.send(Ws::text(identify.to_string())).await.is_err() {
-        return Dropped;
+        return Dropped(NetworkFailure::UpstreamWriteFailed);
     }
     ends.emit(ConnectionEvent::Connected);
 
@@ -213,19 +226,19 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             _ = heartbeat.tick() => {
                 let hb = serde_json::json!({ "op": 1, "d": last_seq });
                 if write.send(Ws::text(hb.to_string())).await.is_err() {
-                    return Dropped;
+                    return Dropped(NetworkFailure::UpstreamWriteFailed);
                 }
             }
             frame = tokio::time::timeout(read_timeout, read.next()) => {
                 let Ok(frame) = frame else {
                     eprintln!("discord: gateway idle past timeout; reconnecting");
-                    return Dropped;
+                    return Dropped(NetworkFailure::KeepaliveTimedOut);
                 };
                 let text = match frame {
                     Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
                     Some(Ok(Ws::Ping(p))) => {
                         if write.send(Ws::Pong(p)).await.is_err() {
-                            return Dropped;
+                            return Dropped(NetworkFailure::UpstreamWriteFailed);
                         }
                         continue;
                     }
@@ -243,20 +256,20 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                             );
                             return super::SessionOutcome::AuthRejected;
                         }
-                        return Dropped;
+                        return Dropped(NetworkFailure::ConnectionLost);
                     }
-                    None => return Dropped,
+                    None => return Dropped(NetworkFailure::ConnectionLost),
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => {
                         eprintln!("discord: gateway read error: {e}");
-                        return Dropped;
+                        return Dropped(NetworkFailure::ConnectionLost);
                     }
                 };
                 let frame = match parse_frame(&text) {
                     Ok(frame) => frame,
                     Err(e) => {
                         eprintln!("discord: malformed gateway frame: {e}");
-                        return Dropped;
+                        return Dropped(NetworkFailure::UpstreamProtocolFailed);
                     }
                 };
                 if let Some(s) = frame.seq {
@@ -270,14 +283,14 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                         // than run with echo suppression silently disabled.
                         if id.is_empty() {
                             eprintln!("discord: READY without user id");
-                            return Dropped;
+                            return Dropped(NetworkFailure::UpstreamProtocolFailed);
                         }
                         our_id = id;
                     }
                     Event::HeartbeatRequest => {
                         let hb = serde_json::json!({ "op": 1, "d": last_seq });
                         if write.send(Ws::text(hb.to_string())).await.is_err() {
-                            return Dropped;
+                            return Dropped(NetworkFailure::UpstreamWriteFailed);
                         }
                     }
                     Event::Message { channel_id, author_id, author, content, attachments } => {

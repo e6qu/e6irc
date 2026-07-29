@@ -1062,7 +1062,13 @@ the same counters and timestamps plus the last error as a closed,
 credential-safe code and summary—never raw provider text or credentials. The
 runtime snapshot is held once on `NetworkHandle`, so IRC and every bridge
 driver enter the same measurement path; both raw-IRC and web attachments use
-the counted `send` funnel.
+the counted `send` funnel. A reconnecting session must return a
+`SessionOutcome::Dropped(NetworkFailure)`, making an unclassified transient
+failure a type error across IRC, local, Matrix, Discord, and Slack. Recoverable
+message-delivery and detached-backlog storage failures use the same closed
+classification-and-accounting choke point, so an error counter or timestamp
+cannot advance without a safe reason. Backlog restore failures are loud and
+observable rather than silently starting with missing history.
 
 `/console/integrations` (admin) manages the chat-platform bridges:
 per-platform build availability, the complete stored inventory (including

@@ -82,6 +82,7 @@ async fn run(config: SlackConfig, mut ends: DriverEnds) {
 }
 
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+    use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
     // Bound REST calls so a hung request can't stall the socket loop; vet every
     // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
@@ -89,7 +90,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         Ok(c) => c,
         Err(e) => {
             eprintln!("slack: http client build failed: {e}");
-            return Dropped;
+            return Dropped(NetworkFailure::UpstreamRequestFailed);
         }
     };
     let base = api_base(config);
@@ -109,7 +110,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                     eprintln!(
                         "slack: channel {id} has an unsafe name {name:?}; refusing to bridge it"
                     );
-                    return Dropped;
+                    return Dropped(NetworkFailure::ChannelMappingFailed);
                 }
                 // Two Slack channels whose IRC names collide *under the
                 // casemapping* derive one IRC channel and would silently
@@ -121,7 +122,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                         "slack: channel {id} name {name:?} collides with an already-bridged \
                          channel {channel:?}; refusing to bridge it"
                     );
-                    return Dropped;
+                    return Dropped(NetworkFailure::ChannelMappingFailed);
                 }
                 id_to_channel.insert(id.clone(), channel.clone());
                 channel_to_id.insert(folded, id.clone());
@@ -148,11 +149,11 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
             eprintln!("slack: socket connect failed: {e}");
-            return Dropped;
+            return Dropped(NetworkFailure::ConnectionFailed);
         }
         Err(_) => {
             eprintln!("slack: socket connect timed out");
-            return Dropped;
+            return Dropped(NetworkFailure::ConnectionTimedOut);
         }
     };
     let (mut write, mut read) = ws.split();
@@ -169,39 +170,41 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             frame = tokio::time::timeout(read_timeout, read.next()) => {
                 let Ok(frame) = frame else {
                     eprintln!("slack: socket idle past timeout; reconnecting");
-                    return Dropped;
+                    return Dropped(NetworkFailure::KeepaliveTimedOut);
                 };
                 let text = match frame {
                     Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
                     Some(Ok(Ws::Ping(p))) => {
                         if write.send(Ws::Pong(p)).await.is_err() {
-                            return Dropped;
+                            return Dropped(NetworkFailure::UpstreamWriteFailed);
                         }
                         continue;
                     }
-                    Some(Ok(Ws::Close(_))) | None => return Dropped,
+                    Some(Ok(Ws::Close(_))) | None => {
+                        return Dropped(NetworkFailure::ConnectionLost);
+                    }
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => {
                         eprintln!("slack: socket read error: {e}");
-                        return Dropped;
+                        return Dropped(NetworkFailure::ConnectionLost);
                     }
                 };
                 let envelope = match parse_envelope(&text) {
                     Ok(envelope) => envelope,
                     Err(e) => {
                         eprintln!("slack: malformed Socket Mode frame: {e}");
-                        return Dropped;
+                        return Dropped(NetworkFailure::UpstreamProtocolFailed);
                     }
                 };
                 // Socket Mode requires acknowledging each envelope by id.
                 if let Some(ack_id) = &envelope.ack {
                     let ack = serde_json::json!({ "envelope_id": ack_id });
                     if write.send(Ws::text(ack.to_string())).await.is_err() {
-                        return Dropped;
+                        return Dropped(NetworkFailure::UpstreamWriteFailed);
                     }
                 }
                 if envelope.disconnect {
-                    return Dropped; // Slack asked us to reconnect.
+                    return Dropped(NetworkFailure::ConnectionLost);
                 }
                 if let Some(m) = envelope.message
                     && let Some(channel) = id_to_channel.get(&m.channel).cloned()
@@ -218,6 +221,7 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
                                     Ok(name) => name,
                                     Err(e) => {
                                         eprintln!("slack: users.info for {} failed: {e}", m.user);
+                                        ends.record_error(NetworkFailure::UpstreamRequestFailed);
                                         m.user.clone()
                                     }
                                 };
@@ -370,7 +374,7 @@ fn slack_failure(context: &str, err: &str) -> super::SessionOutcome {
         super::SessionOutcome::AuthRejected
     } else {
         eprintln!("slack: {context}: {err}");
-        super::SessionOutcome::Dropped
+        super::SessionOutcome::Dropped(super::NetworkFailure::UpstreamRequestFailed)
     }
 }
 
