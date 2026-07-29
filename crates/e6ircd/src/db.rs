@@ -36,6 +36,9 @@ pub enum DbError {
     StaleServerSettings,
     /// Unknown account or wrong password (indistinguishable on purpose).
     BadCredentials,
+    /// An authenticated caller tried to create a primary password where one
+    /// already exists and therefore must be rotated with the current password.
+    LocalPasswordExists,
     /// A write resolved to no account row for the given name.
     UnknownAccount(String),
     ReplayedLogoutToken,
@@ -64,6 +67,7 @@ impl std::fmt::Display for DbError {
             }
             Self::StaleServerSettings => write!(f, "server settings changed concurrently"),
             Self::BadCredentials => write!(f, "invalid account or password"),
+            Self::LocalPasswordExists => write!(f, "account already has a primary password"),
             Self::UnknownAccount(n) => write!(f, "no such account: {n}"),
             Self::ReplayedLogoutToken => write!(f, "OpenID Connect logout token was replayed"),
             Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
@@ -322,6 +326,46 @@ async fn hash_password(password: String) -> Result<String, DbError> {
     .expect("hashing task panicked")
 }
 
+/// Verify one password against every supplied credential without
+/// short-circuiting. Keeping the Argon2 gate and comparison loop here means
+/// primary-password-only web authentication cannot drift from SASL's
+/// all-credentials verification.
+async fn matching_credential_id(credentials: Vec<(i64, String)>, password: String) -> Option<i64> {
+    let _permit = ARGON2_PERMITS
+        .acquire()
+        .await
+        .expect("argon2 semaphore never closed");
+    tokio::task::spawn_blocking(move || {
+        let mut matched_id = None;
+        for (id, hash) in &credentials {
+            let matches = PasswordHash::new(hash).is_ok_and(|parsed| {
+                hasher()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            });
+            if matches {
+                matched_id = Some(*id);
+            }
+        }
+        matched_id
+    })
+    .await
+    .expect("verification task panicked")
+}
+
+async fn spend_dummy_verification(password: String) {
+    let _permit = ARGON2_PERMITS
+        .acquire()
+        .await
+        .expect("argon2 semaphore never closed");
+    tokio::task::spawn_blocking(move || {
+        let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
+        let _ = hasher().verify_password(password.as_bytes(), &parsed);
+    })
+    .await
+    .expect("verification task panicked");
+}
+
 /// Most app passwords one account may hold, matching the REST layer's
 /// `MAX_CREDENTIALS_PER_ACCOUNT`. Bounds authenticated storage growth.
 const MAX_APP_PASSWORDS_PER_ACCOUNT: i64 = 32;
@@ -334,10 +378,11 @@ pub async fn issue_app_password(
     password: &str,
     label: &str,
 ) -> Result<String, DbError> {
-    match handle_verify(pool, account, password).await {
-        VerifyOutcome::Verified(_) => {}
-        VerifyOutcome::Rejected => return Err(DbError::BadCredentials),
-        VerifyOutcome::Unavailable => return Err(DbError::Query(sqlx::Error::PoolClosed)),
+    if verify_local_password(pool, account, password)
+        .await?
+        .is_none()
+    {
+        return Err(DbError::BadCredentials);
     }
     issue_app_password_for_account(pool, account, label).await
 }
@@ -1131,7 +1176,7 @@ pub async fn list_oidc_identities(
 #[derive(Debug, PartialEq, Eq)]
 pub enum UnlinkIdentityOutcome {
     Unlinked,
-    LastIdentity,
+    LastLoginMethod,
     NotFound,
 }
 
@@ -1168,14 +1213,20 @@ pub async fn unlink_oidc_identity(
     let Some((issuer, subject)) = identity else {
         return Ok(UnlinkIdentityOutcome::NotFound);
     };
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM oidc_identities WHERE account_id = $1")
-            .bind(account_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(DbError::Query)?;
-    if count <= 1 {
-        return Ok(UnlinkIdentityOutcome::LastIdentity);
+    let (identity_count, has_local_password): (i64, bool) = sqlx::query_as(
+        "SELECT
+             (SELECT count(*) FROM oidc_identities WHERE account_id = $1),
+             EXISTS(
+                 SELECT 1 FROM account_credentials
+                 WHERE account_id = $1 AND kind = 'local_password'
+             )",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    if identity_count <= 1 && !has_local_password {
+        return Ok(UnlinkIdentityOutcome::LastLoginMethod);
     }
     sqlx::query("DELETE FROM oidc_identities WHERE id = $1 AND account_id = $2")
         .bind(identity_id)
@@ -2576,55 +2627,12 @@ pub async fn verify_credentials(
     .await
     .map_err(DbError::Query)?;
     if rows.is_empty() {
-        // No such account. Still spend one argon2 verification against a fixed
-        // throwaway hash, so a non-existent account is indistinguishable from a
-        // single-credential account being rejected. (An account with extra app
-        // passwords costs proportionally more argon2 to reject — an accepted,
-        // minor timing signal of "has app passwords", inherent to checking each
-        // stored credential; it never reveals the password itself.)
-        let password = password.to_string();
-        let _permit = ARGON2_PERMITS
-            .acquire()
-            .await
-            .expect("argon2 semaphore never closed");
-        tokio::task::spawn_blocking(move || {
-            let parsed = PasswordHash::new(dummy_verify_hash()).expect("dummy hash parses");
-            // Always fails (the password never matches); we run it only to
-            // spend the argon2 time, so the result is deliberately discarded.
-            let _ = hasher().verify_password(password.as_bytes(), &parsed);
-        })
-        .await
-        .expect("verification task panicked");
+        spend_dummy_verification(password.to_string()).await;
         return Ok(None);
     }
     let display_name = rows[0].0.clone();
     let creds: Vec<(i64, String)> = rows.into_iter().map(|(_, h, id)| (id, h)).collect();
-    let password = password.to_string();
-    // Returns the id of the credential that matched, if any — evaluated over
-    // every credential so the reject time is uniform (the id is only recorded,
-    // never short-circuited on).
-    let _permit = ARGON2_PERMITS
-        .acquire()
-        .await
-        .expect("argon2 semaphore never closed");
-    let matched_id = tokio::task::spawn_blocking(move || {
-        // Evaluate every credential (not a short-circuiting any()) so the reject
-        // time doesn't reveal which credential matched or how early.
-        let mut matched_id: Option<i64> = None;
-        for (id, hash) in &creds {
-            let ok = PasswordHash::new(hash).is_ok_and(|parsed| {
-                hasher()
-                    .verify_password(password.as_bytes(), &parsed)
-                    .is_ok()
-            });
-            if ok {
-                matched_id = Some(*id);
-            }
-        }
-        matched_id
-    })
-    .await
-    .expect("verification task panicked");
+    let matched_id = matching_credential_id(creds, password.to_string()).await;
     if let Some(id) = matched_id {
         // Record the use so the credential list can show it. Best-effort: a
         // failure here must not fail an otherwise-successful authentication, so
@@ -2639,6 +2647,146 @@ pub async fn verify_credentials(
         }
     }
     Ok(matched_id.map(|_| display_name))
+}
+
+/// Verify only the account's primary password. Browser login and password
+/// rotation deliberately do not accept app passwords, whose authority is
+/// limited to IRC client attachment.
+pub async fn verify_local_password(
+    pool: &PgPool,
+    account: &str,
+    password: &str,
+) -> Result<Option<String>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let row: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT a.name, c.argon2_hash, c.id FROM accounts a
+         JOIN account_credentials c ON c.account_id = a.id
+         WHERE a.name_folded = $1 AND c.kind = 'local_password'",
+    )
+    .bind(&folded)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((display_name, hash, id)) = row else {
+        spend_dummy_verification(password.to_string()).await;
+        return Ok(None);
+    };
+    let matched = matching_credential_id(vec![(id, hash)], password.to_string()).await;
+    if matched.is_some() {
+        sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(DbError::Query)?;
+        Ok(Some(display_name))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn lock_account_id(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    folded_account: &str,
+) -> Result<Option<i64>, DbError> {
+    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+        .bind(folded_account)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(DbError::Query)
+}
+
+/// Replace an account's primary password after verifying the current primary
+/// credential. The credential row is locked across verify-and-update so two
+/// concurrent rotations cannot both authorize against the same old password.
+pub async fn change_local_password(
+    pool: &PgPool,
+    account: &str,
+    current_password: &str,
+    new_password: &str,
+) -> Result<(), DbError> {
+    let new_hash = hash_password(new_password.to_string()).await?;
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id = lock_account_id(&mut tx, &folded).await?;
+    let Some(account_id) = account_id else {
+        spend_dummy_verification(current_password.to_string()).await;
+        return Err(DbError::BadCredentials);
+    };
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT c.id, c.argon2_hash FROM account_credentials c
+         WHERE c.account_id = $1 AND c.kind = 'local_password'
+         FOR UPDATE OF c",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((credential_id, current_hash)) = row else {
+        spend_dummy_verification(current_password.to_string()).await;
+        return Err(DbError::BadCredentials);
+    };
+    if matching_credential_id(
+        vec![(credential_id, current_hash)],
+        current_password.to_string(),
+    )
+    .await
+    .is_none()
+    {
+        return Err(DbError::BadCredentials);
+    }
+    sqlx::query(
+        "UPDATE account_credentials
+         SET argon2_hash = $1, last_used_at = now()
+         WHERE id = $2",
+    )
+    .bind(new_hash)
+    .bind(credential_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// Add the first primary password to an authenticated account provisioned by
+/// OIDC. The account-row lock plus the partial unique index serialize and
+/// enforce the absent-to-present transition.
+pub async fn set_local_password(
+    pool: &PgPool,
+    account: &str,
+    new_password: &str,
+) -> Result<(), DbError> {
+    let new_hash = hash_password(new_password.to_string()).await?;
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id = lock_account_id(&mut tx, &folded).await?;
+    let Some(account_id) = account_id else {
+        return Err(DbError::BadCredentials);
+    };
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM account_credentials
+             WHERE account_id = $1 AND kind = 'local_password'
+         )",
+    )
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    if exists {
+        return Err(DbError::LocalPasswordExists);
+    }
+    sqlx::query(
+        "INSERT INTO account_credentials (account_id, kind, argon2_hash)
+         VALUES ($1, 'local_password', $2)",
+    )
+    .bind(account_id)
+    .bind(new_hash)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    tx.commit().await.map_err(DbError::Query)?;
+    Ok(())
 }
 
 // ---- per-account BNC networks (DESIGN §10.3) ----------------------------

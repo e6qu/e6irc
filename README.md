@@ -34,9 +34,10 @@ written against Libera should work unchanged against e6ircd.
   setname, away-notify, bot mode, and the common channel modes —
   conformance-tested against the [irctest](https://github.com/progval/irctest)
   suite in CI and live-verified against Libera/OFTC/Ergo.
-- **HTTP layer**: OIDC code+PKCE multi-provider login, opaque web
-  sessions, personal access tokens, an OpenAPI 3.1 spec, and
-  IRCv3-over-WebSocket — all in-process on an optional listener.
+- **HTTP layer**: local-account and OIDC code+PKCE multi-provider login,
+  opaque web sessions, primary-password rotation, personal access tokens, an
+  OpenAPI 3.1 spec, and IRCv3-over-WebSocket — all in-process on an optional
+  listener.
 - **BNC**: per-account always-on networks with backlog persistence and
   replay, SASL to upstreams, encrypted credential storage, and a pluggable
   driver SPI. Each network exposes owner-scoped lifecycle, connection latency,

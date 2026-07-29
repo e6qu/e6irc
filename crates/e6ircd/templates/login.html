@@ -11,18 +11,39 @@
     <main class="auth-shell" id="main-content">
       <section class="auth-card" aria-labelledby="sign-in-title">
       <span class="brand" aria-label="e6irc">e6irc</span>
-      <p class="eyebrow">Single sign-on</p>
+      <p class="eyebrow">Welcome back</p>
       <h1 id="sign-in-title">Sign in to e6irc</h1>
       <p class="lede">Connect to your networks and conversations.</p>
-      <div class="actions">
-      {% if providers.is_empty() %}
-        <p class="none">No login providers are configured on this server.</p>
-      {% else %}
+      {% if let Some(message) = error %}
+        <div class="auth-error" role="alert">{{ message }}</div>
+      {% endif %}
+      {% if local_enabled %}
+        <form class="login-form" method="post" action="/login">
+          <input type="hidden" name="login_state" value="{{ login_state }}" />
+          <label>
+            <span>Account</span>
+            <input name="account" value="{{ account }}" maxlength="64" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus />
+          </label>
+          <label>
+            <span>Password</span>
+            <input type="password" name="password" maxlength="512" autocomplete="current-password" required />
+          </label>
+          <button class="primary-action" type="submit">Sign in</button>
+        </form>
+      {% endif %}
+      {% if !providers.is_empty() %}
+        {% if local_enabled %}
+          <div class="auth-divider"><span>or use single sign-on</span></div>
+        {% endif %}
+        <div class="actions">
         {% for p in providers %}
           <a class="primary-action" href="/api/v1/auth/oidc/{{ p }}/start">Continue with {{ p }}</a>
         {% endfor %}
+        </div>
       {% endif %}
-      </div>
+      {% if !local_enabled && providers.is_empty() %}
+        <p class="none unavailable">No login methods are configured on this server.</p>
+      {% endif %}
       </section>
     </main>
   </body>

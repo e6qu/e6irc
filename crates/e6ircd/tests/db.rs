@@ -831,6 +831,98 @@ async fn revoke_credential_cannot_delete_the_primary_password() {
     );
 }
 
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn primary_password_rotation_is_single_and_rejects_app_passwords() {
+    let url =
+        support::test_db("primary_password_rotation_is_single_and_rejects_app_passwords").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "rotate", "old")
+        .await
+        .expect("create");
+    let app = db::issue_app_password(&pool, "rotate", "old", "client")
+        .await
+        .expect("app password");
+
+    assert_eq!(
+        db::verify_local_password(&pool, "rotate", &app)
+            .await
+            .expect("local verify"),
+        None,
+        "an IRC app password must not become a browser or rotation credential"
+    );
+    assert!(matches!(
+        db::issue_app_password(&pool, "rotate", &app, "chained").await,
+        Err(db::DbError::BadCredentials)
+    ));
+    assert!(matches!(
+        db::change_local_password(&pool, "rotate", &app, "attacker-choice").await,
+        Err(db::DbError::BadCredentials)
+    ));
+
+    db::change_local_password(&pool, "ROTATE", "old", "new")
+        .await
+        .expect("rotate");
+    assert_eq!(
+        db::verify_local_password(&pool, "rotate", "old")
+            .await
+            .expect("old verify"),
+        None
+    );
+    assert_eq!(
+        db::verify_local_password(&pool, "rotate", "new")
+            .await
+            .expect("new verify"),
+        Some("rotate".into())
+    );
+    assert_eq!(
+        db::verify_credentials(&pool, "rotate", &app)
+            .await
+            .expect("app verify"),
+        Some("rotate".into()),
+        "rotating the primary must not silently revoke independent app passwords"
+    );
+
+    let account_id: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = 'rotate'")
+            .fetch_one(&pool)
+            .await
+            .expect("account id");
+    let duplicate = sqlx::query(
+        "INSERT INTO account_credentials (account_id, kind, argon2_hash)
+         VALUES ($1, 'local_password', 'not-a-real-hash')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "storage must reject a second primary password"
+    );
+
+    let oidc_account = db::find_or_create_oidc_account(
+        &pool,
+        "https://idp.example",
+        "password-bootstrap",
+        "oidc-only",
+    )
+    .await
+    .expect("OIDC account");
+    db::set_local_password(&pool, &oidc_account, "first-local")
+        .await
+        .expect("set first password");
+    assert_eq!(
+        db::verify_local_password(&pool, &oidc_account, "first-local")
+            .await
+            .expect("verify first password"),
+        Some(oidc_account.clone())
+    );
+    assert!(matches!(
+        db::set_local_password(&pool, &oidc_account, "second-local").await,
+        Err(db::DbError::LocalPasswordExists)
+    ));
+}
+
 /// Per-account app passwords are capped, so an authenticated account can't flood
 /// the credential table.
 #[tokio::test]
@@ -3661,7 +3753,14 @@ async fn oidc_identity_link_list_and_conflict() {
         db::unlink_oidc_identity(&pool, "alice", identities[1].0)
             .await
             .expect("last identity"),
-        db::UnlinkIdentityOutcome::LastIdentity
+        db::UnlinkIdentityOutcome::Unlinked,
+        "the local password remains a login method"
+    );
+    assert_eq!(
+        db::session_account(&pool, &retained_session)
+            .await
+            .expect("final identity session"),
+        None
     );
     assert_eq!(
         db::unlink_oidc_identity(&pool, "alice", i64::MAX)
@@ -3670,20 +3769,21 @@ async fn oidc_identity_link_list_and_conflict() {
         db::UnlinkIdentityOutcome::NotFound
     );
 
-    // The account-row lock makes the last-identity rule hold under concurrent
-    // requests too: exactly one of two removals succeeds.
-    db::link_oidc_identity(&pool, "bob", "https://idp.example", "bob-0")
+    // For an OIDC-only account, the account-row lock makes the last-login-method
+    // rule hold under concurrent requests: exactly one of two removals succeeds.
+    let oidc_only =
+        db::find_or_create_oidc_account(&pool, "https://idp.example", "oidc-only-0", "oidc-only")
+            .await
+            .expect("OIDC-only account");
+    db::link_oidc_identity(&pool, &oidc_only, "https://idp.example", "oidc-only-1")
         .await
-        .expect("bob identity 0");
-    db::link_oidc_identity(&pool, "bob", "https://idp.example", "bob-1")
+        .expect("second OIDC-only identity");
+    let oidc_identities = db::list_oidc_identities(&pool, &oidc_only)
         .await
-        .expect("bob identity 1");
-    let bob = db::list_oidc_identities(&pool, "bob")
-        .await
-        .expect("bob identities");
+        .expect("OIDC-only identities");
     let (first, second) = tokio::join!(
-        db::unlink_oidc_identity(&pool, "bob", bob[0].0),
-        db::unlink_oidc_identity(&pool, "bob", bob[1].0),
+        db::unlink_oidc_identity(&pool, &oidc_only, oidc_identities[0].0),
+        db::unlink_oidc_identity(&pool, &oidc_only, oidc_identities[1].0),
     );
     let outcomes = [first.expect("first unlink"), second.expect("second unlink")];
     assert_eq!(
@@ -3697,13 +3797,13 @@ async fn oidc_identity_link_list_and_conflict() {
     assert_eq!(
         outcomes
             .iter()
-            .filter(|outcome| **outcome == db::UnlinkIdentityOutcome::LastIdentity)
+            .filter(|outcome| **outcome == db::UnlinkIdentityOutcome::LastLoginMethod)
             .count(),
         1,
         "{outcomes:?}"
     );
     assert_eq!(
-        db::list_oidc_identities(&pool, "bob")
+        db::list_oidc_identities(&pool, &oidc_only)
             .await
             .expect("bob remaining")
             .len(),

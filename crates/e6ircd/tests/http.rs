@@ -57,6 +57,25 @@ fn csrf_from_html(html: &str) -> &str {
         .expect("csrf token in page")
 }
 
+fn login_state_from_html(html: &str) -> &str {
+    html.split("name=\"login_state\" value=\"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .expect("login state in page")
+}
+
+fn form_value(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn healthz_is_public_and_ok() {
     let running = net::start(test_config()).await.expect("start");
@@ -521,6 +540,7 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
     assert!(v["paths"]["/api/v1/me/identities/{id}"]["delete"].is_object());
+    assert!(v["paths"]["/api/v1/me/password"]["put"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/frontchannel-logout"]["get"].is_object());
     assert!(v["components"]["securitySchemes"]["bearer"].is_object());
@@ -536,8 +556,98 @@ async fn login_page_renders() {
     assert_eq!(status, 200);
     assert!(head.to_lowercase().contains("text/html"), "{head}");
     assert!(body.contains("<title>e6irc — sign in</title>"), "{body}");
-    // No providers configured in the bare test config.
-    assert!(body.contains("No login providers"), "{body}");
+    // Neither PostgreSQL nor an OIDC provider is configured in the bare test
+    // config, so the page says explicitly that authentication is unavailable.
+    assert!(body.contains("No login methods"), "{body}");
+    assert!(!body.contains("name=\"password\""), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn local_login_is_browser_bound_and_accepts_only_the_primary_password() {
+    let url =
+        support::test_db("local_login_is_browser_bound_and_accepts_only_the_primary_password")
+            .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "Alice", "primary")
+        .await
+        .expect("account");
+    let app_password = e6ircd::db::issue_app_password(&pool, "Alice", "primary", "client")
+        .await
+        .expect("app password");
+
+    let config = Config {
+        server_name: "irc.login.example".into(),
+        network_name: "LoginNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let (status, headers, body) = request(http, &get("/login")).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(body.contains("action=\"/login\""), "{body}");
+    assert!(headers.contains("e6irc_login_state="), "{headers}");
+    assert!(headers.contains("SameSite=Strict"), "{headers}");
+    let state = login_state_from_html(&body).to_string();
+
+    let unbound = format!("login_state={state}&account=Alice&password=primary");
+    let req = format!(
+        "POST /login HTTP/1.1\r\nHost: t\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{unbound}",
+        unbound.len()
+    );
+    let (status, _, body) = request(http, &req).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("form expired"), "{body}");
+
+    let (_, _, body) = request(http, &get("/login")).await;
+    let state = login_state_from_html(&body);
+    let app_attempt = format!(
+        "login_state={state}&account=Alice&password={}",
+        form_value(&app_password)
+    );
+    let req = format!(
+        "POST /login HTTP/1.1\r\nHost: t\r\nCookie: e6irc_login_state={state}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{app_attempt}",
+        app_attempt.len()
+    );
+    let (status, _, body) = request(http, &req).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(body.contains("Invalid account or password"), "{body}");
+
+    let (_, _, body) = request(http, &get("/login")).await;
+    let state = login_state_from_html(&body);
+    let valid = format!("login_state={state}&account=aLiCe&password=primary");
+    let req = format!(
+        "POST /login HTTP/1.1\r\nHost: t\r\nCookie: e6irc_login_state={state}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{valid}",
+        valid.len()
+    );
+    let (status, headers, _) = request(http, &req).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(headers.contains("location: /"), "{headers}");
+    assert!(headers.contains("e6irc_session="), "{headers}");
+    assert!(headers.contains("e6irc_login_state=;"), "{headers}");
 }
 
 #[tokio::test]
@@ -2582,6 +2692,46 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
+    let password_form =
+        format!("csrf={csrf}&current_password=pw&new_password=new-pw&confirm_password=new-pw");
+    let change_password = format!(
+        "POST /console/account/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{password_form}",
+        password_form.len()
+    );
+    let (status, _, body) = request(http, &change_password).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("Primary password changed"), "{body}");
+    assert_eq!(
+        e6ircd::db::verify_local_password(&pool, "alice", "pw")
+            .await
+            .expect("old password verify"),
+        None
+    );
+    assert_eq!(
+        e6ircd::db::verify_local_password(&pool, "alice", "new-pw")
+            .await
+            .expect("new password verify"),
+        Some("alice".into())
+    );
+
+    let api_password = r#"{"current_password":"new-pw","new_password":"api-pw"}"#;
+    let api_change = format!(
+        "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{api_password}",
+        api_password.len()
+    );
+    let (status, _, body) = request(http, &api_change).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        e6ircd::db::verify_local_password(&pool, "alice", "api-pw")
+            .await
+            .expect("API password verify"),
+        Some("alice".into())
+    );
+
     let app_form = format!("csrf={csrf}&label=Laptop");
     let create_app = format!(
         "POST /console/account/app-passwords HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -2685,13 +2835,13 @@ async fn account_console_manages_credentials_tokens_and_identities() {
          Content-Length: {}\r\nConnection: close\r\n\r\n{unlink_form}",
         unlink_form.len()
     );
-    let (status, headers, _) = request(http, &unlink).await;
-    assert_eq!(status, 303, "{headers}");
+    let (status, headers, body) = request(http, &unlink).await;
+    assert_eq!(status, 200, "{headers}");
+    assert!(body.contains("Login identity unlinked"), "{body}");
     assert!(
-        headers.to_ascii_lowercase().contains("location: /login"),
-        "{headers}"
+        !headers.contains("Max-Age=0"),
+        "a valid local session must not be cleared: {headers}"
     );
-    assert!(headers.contains("Max-Age=0"), "{headers}");
 
     let remaining = e6ircd::db::list_oidc_identities(&pool, "alice")
         .await
@@ -2703,8 +2853,13 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         remaining[0].0
     );
     let (status, _, body) = request(http, &last_delete).await;
-    assert_eq!(status, 409, "{body}");
-    assert!(body.contains("Last login identity"), "{body}");
+    assert_eq!(status, 204, "{body}");
+    assert!(
+        e6ircd::db::list_oidc_identities(&pool, "alice")
+            .await
+            .expect("identities after final unlink")
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
