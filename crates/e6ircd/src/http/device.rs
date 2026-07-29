@@ -158,22 +158,103 @@ pub(super) async fn require_admin(
     }
 }
 
-/// List every account (admin only).
+#[derive(Default, serde::Deserialize)]
+pub(super) struct AccountDirectoryQuery {
+    pub(super) limit: Option<usize>,
+    pub(super) before_id: Option<i64>,
+    pub(super) name: Option<String>,
+}
+
+pub(super) struct ValidatedAccountDirectoryQuery {
+    pub(super) page_size: crate::db::AccountDirectoryPageSize,
+    pub(super) before_id: Option<i64>,
+    pub(super) name: Option<String>,
+}
+
+impl ValidatedAccountDirectoryQuery {
+    pub(super) fn database_filter(&self) -> crate::db::AccountDirectoryFilter<'_> {
+        crate::db::AccountDirectoryFilter {
+            before_id: self.before_id,
+            exact_name: self.name.as_deref(),
+            page_size: self.page_size,
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+pub(super) fn validate_account_directory_query(
+    params: AccountDirectoryQuery,
+    default_limit: usize,
+) -> Result<ValidatedAccountDirectoryQuery, Response> {
+    let requested_limit = params.limit.unwrap_or(default_limit);
+    let Some(page_size) = crate::db::AccountDirectoryPageSize::new(requested_limit) else {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid account-directory limit",
+            Some("The account-directory limit must be between 1 and 1,000."),
+        ));
+    };
+    if params.before_id.is_some_and(|id| id <= 0) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid account-directory cursor",
+            Some("The before_id cursor must be a positive account id."),
+        ));
+    }
+    let name = params.name.map(|name| name.trim().to_owned());
+    let name = match name {
+        Some(name) if name.is_empty() => None,
+        Some(name) if name.len() > MAX_ACCOUNT_LEN || name.chars().any(char::is_control) => {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid account filter",
+                Some("The exact account name must contain 1–64 printable bytes."),
+            ));
+        }
+        name => name,
+    };
+    Ok(ValidatedAccountDirectoryQuery {
+        page_size,
+        before_id: params.before_id,
+        name,
+    })
+}
+
+/// Page administrator-safe account posture (admin only).
 pub(super) async fn admin_accounts(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,
+    axum::extract::Query(params): axum::extract::Query<AccountDirectoryQuery>,
 ) -> Response {
     let pool = pool_of(&state);
-    match crate::db::list_accounts(pool).await {
-        Ok(names) => admin_json(serde_json::json!({ "accounts": names })),
-        Err(e) => {
-            eprintln!("http: admin account list failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+    let query = match validate_account_directory_query(params, 100) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    match crate::db::query_account_directory(pool, query.database_filter()).await {
+        Ok(page) => admin_json(serde_json::json!({
+            "accounts": page.entries
+                .into_iter()
+                .map(|entry| serde_json::json!({
+                    "id": entry.id,
+                    "name": entry.name,
+                    "created_at": entry.created_at,
+                    "authentication": {
+                        "local_password": entry.has_local_password,
+                        "app_passwords": entry.app_passwords,
+                        "api_tokens": entry.api_tokens,
+                        "oidc_identities": entry.oidc_identities,
+                        "browser_sessions": entry.browser_sessions,
+                    },
+                    "resources": {
+                        "networks": entry.networks,
+                        "founded_channels": entry.founded_channels,
+                    },
+                }))
+                .collect::<Vec<_>>(),
+            "next_before_id": page.next_before_id,
+        })),
+        Err(e) => admin_db_error("account directory", e),
     }
 }
 
@@ -365,8 +446,52 @@ pub(super) async fn admin_audit(
 }
 
 #[cfg(test)]
-mod audit_query_tests {
+mod admin_query_tests {
     use super::*;
+
+    #[test]
+    fn account_directory_query_validation_preserves_exact_bounded_values() {
+        let query = validate_account_directory_query(
+            AccountDirectoryQuery {
+                limit: Some(25),
+                before_id: Some(42),
+                name: Some(" Alice ".into()),
+            },
+            100,
+        )
+        .expect("valid query");
+        assert_eq!(query.page_size.value(), 25);
+        assert_eq!(query.before_id, Some(42));
+        assert_eq!(query.name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn account_directory_query_validation_rejects_invalid_values() {
+        for params in [
+            AccountDirectoryQuery {
+                limit: Some(0),
+                ..AccountDirectoryQuery::default()
+            },
+            AccountDirectoryQuery {
+                limit: Some(1_001),
+                ..AccountDirectoryQuery::default()
+            },
+            AccountDirectoryQuery {
+                before_id: Some(0),
+                ..AccountDirectoryQuery::default()
+            },
+            AccountDirectoryQuery {
+                name: Some("bad\naccount".into()),
+                ..AccountDirectoryQuery::default()
+            },
+            AccountDirectoryQuery {
+                name: Some("x".repeat(MAX_ACCOUNT_LEN + 1)),
+                ..AccountDirectoryQuery::default()
+            },
+        ] {
+            assert!(validate_account_directory_query(params, 100).is_err());
+        }
+    }
 
     #[test]
     fn audit_query_validation_preserves_exact_bounded_values() {

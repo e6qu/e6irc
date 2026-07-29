@@ -539,6 +539,17 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
+    let account_parameters = v["paths"]["/api/v1/admin/accounts"]["get"]["parameters"]
+        .as_array()
+        .expect("account-directory query parameters");
+    for name in ["limit", "before_id", "name"] {
+        assert!(
+            account_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI account-directory query is missing {name}"
+        );
+    }
     let audit_parameters = v["paths"]["/api/v1/admin/audit"]["get"]["parameters"]
         .as_array()
         .expect("audit query parameters");
@@ -1904,7 +1915,7 @@ async fn admin_accounts_endpoint_is_gated() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|x| x.as_str().unwrap())
+        .map(|entry| entry["name"].as_str().unwrap())
         .collect();
     assert!(
         names.contains(&"alice") && names.contains(&"bob"),
@@ -1945,21 +1956,26 @@ async fn admin_accounts_endpoint_is_gated() {
         );
     }
 
-    // Collection limits are a contract, not a suggestion: out-of-range audit
-    // windows fail rather than being silently clamped to a different query.
-    for limit in [0, 1001] {
-        let req = format!(
-            "GET /api/v1/admin/audit?limit={limit} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
-        );
-        let (status, headers, body) = request(http, &req).await;
-        assert_eq!(status, 400, "{body}");
-        assert!(
-            headers
-                .to_ascii_lowercase()
-                .contains("content-type: application/problem+json"),
-            "{headers}"
-        );
-        assert!(body.contains("Invalid audit limit"), "{body}");
+    // Collection limits are contracts, not suggestions: out-of-range windows
+    // fail rather than being silently clamped to a different query.
+    for (path, title) in [
+        ("/api/v1/admin/accounts", "Invalid account-directory limit"),
+        ("/api/v1/admin/audit", "Invalid audit limit"),
+    ] {
+        for limit in [0, 1001] {
+            let req = format!(
+                "GET {path}?limit={limit} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+            );
+            let (status, headers, body) = request(http, &req).await;
+            assert_eq!(status, 400, "{body}");
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("content-type: application/problem+json"),
+                "{headers}"
+            );
+            assert!(body.contains(title), "{body}");
+        }
     }
 
     // Stats reflects the seeded data (2 accounts, 1 channel, 1 server ban).
@@ -2063,6 +2079,201 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
     ] {
         assert!(body.contains(needle), "console missing {needle:?}: {body}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
+    let url =
+        support::test_db("account_directory_filters_pages_counts_and_escapes_for_admins_only")
+            .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    for name in ["Alice", "Bob", "Carol"] {
+        e6ircd::db::create_account(&pool, name, "pw")
+            .await
+            .unwrap_or_else(|error| panic!("create {name}: {error}"));
+    }
+    sqlx::query(
+        "INSERT INTO accounts (name, name_folded)
+         VALUES ('Eve<script>alert(1)</script>', 'eve<script>alert(1)</script>')",
+    )
+    .execute(&pool)
+    .await
+    .expect("hostile display account");
+    let alice_session = e6ircd::db::create_web_session(&pool, "Alice", None)
+        .await
+        .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(&pool, "Bob", None)
+        .await
+        .expect("bob session");
+    e6ircd::db::issue_app_password_for_account(&pool, "Alice", "desktop")
+        .await
+        .expect("app password");
+    let api_secret = e6ircd::db::issue_api_token(&pool, "Alice", "automation")
+        .await
+        .expect("API token");
+    assert_eq!(
+        e6ircd::db::link_oidc_identity(
+            &pool,
+            "Alice",
+            "https://issuer.example",
+            "sensitive-subject",
+        )
+        .await
+        .expect("OIDC identity"),
+        e6ircd::db::LinkOutcome::Linked
+    );
+    sqlx::query(
+        "WITH account AS (
+             SELECT id FROM accounts WHERE name_folded = 'alice'
+         ), network AS (
+             INSERT INTO bnc_networks (account_id, name, addr, nick, kind)
+             SELECT id, 'local', '', 'Alice', 'irc' FROM account
+         )
+         INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#alice', '#alice', id FROM account",
+    )
+    .execute(&pool)
+    .await
+    .expect("resource posture");
+
+    let config = Config {
+        server_name: "irc.accounts.example".into(),
+        network_name: "AccountsNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let cookie_get = |path: &str, session: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    let (status, headers, body) = request(
+        http,
+        &cookie_get("/api/v1/admin/accounts?limit=2", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
+    let first: serde_json::Value = serde_json::from_str(&body).expect("first page JSON");
+    assert_eq!(first["accounts"].as_array().expect("account rows").len(), 2);
+    let cursor = first["next_before_id"].as_i64().expect("next page cursor");
+    assert!(first["accounts"][0]["id"].as_i64().is_some(), "{body}");
+
+    e6ircd::db::create_account(&pool, "Dave", "pw")
+        .await
+        .expect("concurrent account");
+    let older_path = format!("/api/v1/admin/accounts?limit=2&before_id={cursor}");
+    let (status, _, older_body) = request(http, &cookie_get(&older_path, &alice_session)).await;
+    assert_eq!(status, 200, "{older_body}");
+    let older: serde_json::Value = serde_json::from_str(&older_body).expect("older page JSON");
+    assert!(
+        older["accounts"]
+            .as_array()
+            .expect("older rows")
+            .iter()
+            .all(|entry| entry["id"].as_i64().is_some_and(|id| id < cursor)),
+        "cursor admitted a newer or duplicate account: {older_body}"
+    );
+
+    let (status, _, exact_body) = request(
+        http,
+        &cookie_get("/api/v1/admin/accounts?name=aLiCe", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{exact_body}");
+    let exact: serde_json::Value = serde_json::from_str(&exact_body).expect("exact JSON");
+    assert_eq!(
+        exact["accounts"].as_array().expect("exact rows").len(),
+        1,
+        "{exact_body}"
+    );
+    let alice = &exact["accounts"][0];
+    assert_eq!(alice["name"], "Alice");
+    assert_eq!(alice["authentication"]["local_password"], true);
+    assert_eq!(alice["authentication"]["app_passwords"], 1);
+    assert_eq!(alice["authentication"]["api_tokens"], 1);
+    assert_eq!(alice["authentication"]["oidc_identities"], 1);
+    assert_eq!(alice["authentication"]["browser_sessions"], 1);
+    assert_eq!(alice["resources"]["networks"], 1);
+    assert_eq!(alice["resources"]["founded_channels"], 1);
+    assert!(
+        !exact_body.contains(&api_secret),
+        "API secret leaked: {exact_body}"
+    );
+    assert!(
+        !exact_body.contains("sensitive-subject"),
+        "OIDC subject leaked: {exact_body}"
+    );
+
+    let hostile_path = "/console/accounts?name=Eve%3Cscript%3Ealert%281%29%3C%2Fscript%3E";
+    let (status, _, page) = request(http, &cookie_get(hostile_path, &alice_session)).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("<h1>Account directory</h1>"), "{page}");
+    assert!(
+        page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
+        "{page}"
+    );
+    assert!(!page.contains("<script>alert(1)</script>"), "{page}");
+    let (status, _, alice_page) = request(
+        http,
+        &cookie_get("/console/accounts?name=aLiCe", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{alice_page}");
+    assert!(alice_page.contains("local password"), "{alice_page}");
+    assert!(alice_page.contains("1 OIDC"), "{alice_page}");
+
+    let (status, _, short_page) = request(
+        http,
+        &cookie_get("/console/accounts?limit=2", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{short_page}");
+    assert!(short_page.contains("Older accounts"), "{short_page}");
+
+    let (status, headers, _) = request(http, &get("/console/accounts")).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(
+        headers.to_ascii_lowercase().contains("location: /login"),
+        "{headers}"
+    );
+    let (status, _, _) = request(http, &cookie_get("/console/accounts", &bob_session)).await;
+    assert_eq!(status, 403);
+    let (status, _, invalid) = request(
+        http,
+        &cookie_get("/api/v1/admin/accounts?before_id=0", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 400, "{invalid}");
+    assert!(
+        invalid.contains("Invalid account-directory cursor"),
+        "{invalid}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

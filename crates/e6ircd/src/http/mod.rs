@@ -493,6 +493,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console.js", get(pages::console_script))
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
+        .route("/console/accounts", get(pages::console_accounts))
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
         .route("/console/channels", get(pages::console_channels))
@@ -1317,6 +1318,26 @@ mod pages {
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         Ok((account, csrf))
+    }
+
+    /// An administrator-authenticated server-rendered page actor. Declaring
+    /// this extractor in a handler signature makes the login redirect, admin
+    /// gate, and session-bound CSRF derivation preconditions of calling it.
+    pub(super) struct AdminPageActor {
+        account: String,
+        csrf: String,
+    }
+
+    impl axum::extract::FromRequestParts<Arc<AppState>> for AdminPageActor {
+        type Rejection = Response;
+
+        async fn from_request_parts(
+            parts: &mut axum::http::request::Parts,
+            state: &Arc<AppState>,
+        ) -> Result<Self, Self::Rejection> {
+            let (account, csrf) = page_actor(state, &parts.headers, true).await?;
+            Ok(Self { account, csrf })
+        }
     }
 
     /// Preserve the old account-page URL while keeping one canonical
@@ -2184,13 +2205,28 @@ mod pages {
         live_upstreams: String,
         live_traffic: String,
         live_errors: u64,
-        accounts: Vec<String>,
+        accounts: Vec<crate::db::AccountDirectoryRow>,
         channels: Vec<ChannelRow>,
         bans: Vec<BanRow>,
         audit: Vec<AuditRow>,
         /// An error banner shown at the top when a management action failed
         /// (e.g. an invalid ban mask). `None` on the plain GET.
         error: Option<String>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_accounts.html")]
+    struct ConsoleAccounts {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        entries: Vec<crate::db::AccountDirectoryRow>,
+        name: String,
+        limit: usize,
+        has_filter: bool,
+        has_cursor: bool,
+        next_before_id: Option<i64>,
     }
 
     #[derive(Template)]
@@ -2223,9 +2259,18 @@ mod pages {
         let (stat_accounts, stat_channels, stat_server_bans) = crate::db::server_stats(pool)
             .await
             .map_err(|e| super::device::admin_db_error("server stats", e))?;
-        let accounts = crate::db::list_accounts(pool)
-            .await
-            .map_err(|e| super::device::admin_db_error("account list", e))?;
+        let accounts = crate::db::query_account_directory(
+            pool,
+            crate::db::AccountDirectoryFilter {
+                before_id: None,
+                exact_name: None,
+                page_size: crate::db::AccountDirectoryPageSize::new(10)
+                    .expect("ten is a valid account preview size"),
+            },
+        )
+        .await
+        .map_err(|e| super::device::admin_db_error("account directory", e))?
+        .entries;
         let channels = crate::db::list_registered_channels(pool)
             .await
             .map_err(|e| super::device::admin_db_error("channel list", e))?
@@ -2794,13 +2839,9 @@ mod pages {
 
     pub async fn console_monitoring(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
+        AdminPageActor { account, csrf }: AdminPageActor,
         Query(query): Query<ConsoleMonitoringQuery>,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, true).await {
-            Ok(actor) => actor,
-            Err(response) => return response,
-        };
         let window = match MonitoringWindow::from_query(query.minutes) {
             Ok(window) => window,
             Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
@@ -2815,15 +2856,47 @@ mod pages {
         })
     }
 
-    pub async fn console_audit(
+    pub async fn console_accounts(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Query(params): Query<super::device::AuditQuery>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+        Query(params): Query<super::device::AccountDirectoryQuery>,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, true).await {
-            Ok(actor) => actor,
+        let query = match super::device::validate_account_directory_query(params, 50) {
+            Ok(query) => query,
             Err(response) => return response,
         };
+        let page = match crate::db::query_account_directory(
+            pool_of(&state),
+            query.database_filter(),
+        )
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                return super::device::admin_db_error("account directory", error);
+            }
+        };
+        let name = query.name.unwrap_or_default();
+        let has_cursor = query.before_id.is_some();
+        render_private(ConsoleAccounts {
+            account,
+            csrf,
+            is_admin: true,
+            active: "accounts",
+            entries: page.entries,
+            has_filter: !name.is_empty(),
+            has_cursor,
+            name,
+            limit: query.page_size.value(),
+            next_before_id: page.next_before_id,
+        })
+    }
+
+    pub async fn console_audit(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+        Query(params): Query<super::device::AuditQuery>,
+    ) -> Response {
         let query = match super::device::validate_audit_query(params, 50) {
             Ok(query) => query,
             Err(response) => return response,
@@ -2867,12 +2940,9 @@ mod pages {
 
     pub async fn console_monitoring_panel(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
+        _admin: AdminPageActor,
         Query(query): Query<ConsoleMonitoringQuery>,
     ) -> Response {
-        if let Err(response) = page_actor(&state, &headers, true).await {
-            return response;
-        }
         let window = match MonitoringWindow::from_query(query.minutes) {
             Ok(window) => window,
             Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
@@ -3259,12 +3329,8 @@ mod pages {
 
     pub async fn console_configuration(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
+        AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, true).await {
-            Ok(actor) => actor,
-            Err(response) => return response,
-        };
         let Some(config) = &state.managed_config else {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -4698,12 +4764,8 @@ mod pages {
     /// Console → Integrations (admin) GET.
     pub async fn console_integrations(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
+        AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, true).await {
-            Ok(x) => x,
-            Err(r) => return r,
-        };
         match console_integrations_build(&state, account, csrf, None).await {
             Ok(view) => render_private(view),
             Err(response) => response,

@@ -56,6 +56,23 @@ bounded page-size type makes invalid SQL limits and cursor indexing
 unrepresentable. All personalized administrator JSON, observability, and
 Prometheus responses now carry `Cache-Control: no-store`.
 
+Administrator account directory (2026-07-29): the unbounded bare-name account
+dump is replaced by a dedicated `/console/accounts` identity-operations page
+and the matching paginated `GET /api/v1/admin/accounts` contract. Stable
+account-id cursors remain non-overlapping while registration continues, and
+exact account lookup uses RFC1459 case-folding. Each row exposes creation time,
+login-method counts, active browser sessions and personal access tokens,
+networks, and founded channels without selecting credential hashes, bearer or
+session hashes, OpenID Connect subjects, or sealed upstream secrets. Expired
+access is excluded. Typed rows and bounded page sizes make transposed posture
+fields and invalid SQL limits unrepresentable; owner indexes on OpenID Connect
+identities and founded channels keep the aggregate query bounded. The overview
+now requests only the newest ten accounts instead of materializing the entire
+table. The same pass made administrator server-rendered authentication a typed
+handler extractor, so monitoring, audit, configuration, integrations, and the
+directory cannot compile without their login redirect, administrator gate, and
+session-bound CSRF derivation.
+
 Conformance harness reliability (2026-07-29): the e6ircd irctest controller
 now gives commands crossing independent raw-TCP and WebSocket reader tasks a
 bounded settling window before inserting its recipient-side PING barrier.
