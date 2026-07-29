@@ -33,6 +33,17 @@ first local password for an OIDC-only account or rotate an existing primary
 after verifying it. Rotation is serialized under the account row, and
 migration 0039 enforces at most one `local_password` credential per account.
 
+Browser session control (2026-07-29): `/console/my-sessions` now presents both
+durable browser logins and live authenticated IRC clients instead of using
+"sessions" for only the latter. Browser rows expose creation/expiry, a bounded
+display-safe user agent, local/OpenID Connect provenance, and the current
+session without ever exposing the opaque token or its hash. Users can sign out
+one other browser or all others; `GET /api/v1/me/sessions` and owner-scoped
+`DELETE /api/v1/me/sessions/{id}` provide the same inventory and individual
+revocation. Deleting the current session also clears its cookie. Migration
+0040 adds stable resource ids and bounded user-agent storage, while database
+and HTTP tests prove cross-account ids cannot revoke or disclose a session.
+
 Conformance harness reliability (2026-07-29): the e6ircd irctest controller
 now gives commands crossing independent raw-TCP and WebSocket reader tasks a
 bounded settling window before inserting its recipient-side PING barrier.

@@ -3539,27 +3539,53 @@ pub struct OidcSessionIdentity<'a> {
     pub role: Option<&'a str>,
 }
 
-/// Mint a web session for an account: opaque 32-byte token returned to
-/// the caller; only its SHA-256 is stored. 14-day expiry.
-pub async fn create_web_session(pool: &PgPool, account: &str) -> Result<String, DbError> {
-    create_web_session_full(pool, account, OidcSessionIdentity::default()).await
+/// A bounded, display-safe HTTP User-Agent value recorded as browser-session
+/// provenance. Constructing it once at ingress prevents raw control characters
+/// or an unbounded header from reaching storage, JSON, or the console.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUserAgent(String);
+
+impl SessionUserAgent {
+    pub fn from_header(value: &str) -> Option<Self> {
+        let normalized: String = value
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    '\u{fffd}'
+                } else {
+                    character
+                }
+            })
+            .take(512)
+            .collect();
+        let normalized = normalized.trim();
+        (!normalized.is_empty()).then(|| Self(normalized.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Mint a web session for an account: opaque 32-byte token returned to the
+/// caller; only its SHA-256 is stored. The session expires after 14 days.
+pub async fn create_web_session(
+    pool: &PgPool,
+    account: &str,
+    user_agent: Option<&SessionUserAgent>,
+) -> Result<String, DbError> {
+    create_web_session_with_identity(pool, account, OidcSessionIdentity::default(), user_agent)
+        .await
 }
 
 /// Like [`create_web_session`], but records the upstream identity so logout can
 /// end the provider's SSO session and the account page can show who is signed
 /// in.
-pub async fn create_oidc_web_session(
+pub async fn create_web_session_with_identity(
     pool: &PgPool,
     account: &str,
     identity: OidcSessionIdentity<'_>,
-) -> Result<String, DbError> {
-    create_web_session_full(pool, account, identity).await
-}
-
-async fn create_web_session_full(
-    pool: &PgPool,
-    account: &str,
-    identity: OidcSessionIdentity<'_>,
+    user_agent: Option<&SessionUserAgent>,
 ) -> Result<String, DbError> {
     let OidcSessionIdentity {
         id_token,
@@ -3583,8 +3609,9 @@ async fn create_web_session_full(
         .map_err(DbError::Query)?;
     let inserted = sqlx::query(
         "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider,
-                                   oidc_issuer, oidc_subject, oidc_sid, oidc_email, oidc_role)
-         SELECT $1, a.id, now() + interval '14 days', $3, $4, $5, $6, $7, $8, $9
+                                   oidc_issuer, oidc_subject, oidc_sid, oidc_email, oidc_role,
+                                   user_agent)
+         SELECT $1, a.id, now() + interval '14 days', $3, $4, $5, $6, $7, $8, $9, $10
          FROM accounts a WHERE a.name_folded = $2",
     )
     .bind(token_hash(&token))
@@ -3596,6 +3623,7 @@ async fn create_web_session_full(
     .bind(sid)
     .bind(email)
     .bind(role)
+    .bind(user_agent.map(SessionUserAgent::as_str))
     .execute(pool)
     .await
     .map_err(DbError::Query)?;
@@ -3748,6 +3776,93 @@ pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbErro
         .await
         .map_err(DbError::Query)?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct WebSessionRow {
+    pub id: i64,
+    pub created_at: String,
+    pub expires_at: String,
+    pub provider: Option<String>,
+    pub user_agent: Option<String>,
+    pub current: bool,
+}
+
+/// List one account's unexpired browser sessions without exposing their token
+/// hashes. `current_token` only marks the matching row; it never changes the
+/// owner predicate.
+pub async fn list_web_sessions(
+    pool: &PgPool,
+    account: &str,
+    current_token: Option<&str>,
+) -> Result<Vec<WebSessionRow>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let current_hash = current_token.map(token_hash);
+    sqlx::query_as(
+        "SELECT s.id,
+                to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    AS created_at,
+                to_char(s.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    AS expires_at,
+                s.oidc_provider AS provider,
+                s.user_agent,
+                CASE WHEN $2::bytea IS NULL THEN FALSE ELSE s.token_hash = $2 END AS current
+         FROM web_sessions s
+         JOIN accounts a ON a.id = s.account_id
+         WHERE a.name_folded = $1 AND s.expires_at > now()
+         ORDER BY current DESC, s.created_at DESC, s.id DESC",
+    )
+    .bind(folded)
+    .bind(current_hash)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Revoke one owner-scoped browser session. The returned boolean says whether
+/// the deleted row was the request's current cookie session.
+pub async fn delete_web_session_by_id(
+    pool: &PgPool,
+    account: &str,
+    id: i64,
+    current_token: Option<&str>,
+) -> Result<Option<bool>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let current_hash = current_token.map(token_hash);
+    sqlx::query_scalar(
+        "DELETE FROM web_sessions s USING accounts a
+         WHERE s.account_id = a.id AND a.name_folded = $1 AND s.id = $2
+         RETURNING CASE
+             WHEN $3::bytea IS NULL THEN FALSE
+             ELSE s.token_hash = $3
+         END",
+    )
+    .bind(folded)
+    .bind(id)
+    .bind(current_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Revoke every other browser session owned by `account`, preserving the
+/// supplied current cookie session.
+pub async fn delete_other_web_sessions(
+    pool: &PgPool,
+    account: &str,
+    current_token: &str,
+) -> Result<u64, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let deleted = sqlx::query(
+        "DELETE FROM web_sessions s USING accounts a
+         WHERE s.account_id = a.id AND a.name_folded = $1 AND s.token_hash <> $2",
+    )
+    .bind(folded)
+    .bind(token_hash(current_token))
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(deleted.rows_affected())
 }
 
 // ---- personal access tokens ---------------------------------------------

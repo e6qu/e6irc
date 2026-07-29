@@ -23,6 +23,7 @@ mod history;
 pub(crate) mod networks;
 mod oidc;
 mod openapi;
+mod sessions;
 mod ws;
 
 use channels::*;
@@ -32,6 +33,7 @@ use history::*;
 use networks::*;
 use oidc::*;
 use openapi::*;
+use sessions::*;
 use ws::*;
 
 /// A URL-encoded form body whose extraction failures use the API's problem
@@ -621,6 +623,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(pages::console_kill_own_session),
         )
         .route(
+            "/console/my-sessions/browser/{id}/delete",
+            post(pages::console_revoke_browser_session),
+        )
+        .route(
+            "/console/my-sessions/browser/others/delete",
+            post(pages::console_revoke_other_browser_sessions),
+        )
+        .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         )
@@ -649,6 +659,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/auth/device/token", post(device_token))
         .route("/api/v1/auth/device/approve", post(device_approve))
         .route("/api/v1/me", get(me))
+        .route("/api/v1/me/sessions", get(list_browser_sessions))
+        .route(
+            "/api/v1/me/sessions/{id}",
+            axum::routing::delete(revoke_browser_session),
+        )
         .route(
             "/api/v1/me/tokens",
             get(me_tokens_list).post(create_api_token),
@@ -974,7 +989,8 @@ mod pages {
                     );
                 }
             };
-        let token = match crate::db::create_web_session(pool, &account).await {
+        let user_agent = super::session_user_agent(&headers);
+        let token = match crate::db::create_web_session(pool, &account, user_agent.as_ref()).await {
             Ok(token) => token,
             Err(error) => {
                 eprintln!("local login: session creation failed: {error}");
@@ -3773,6 +3789,15 @@ mod pages {
         channels: String,
     }
 
+    struct BrowserSessionRow {
+        id: i64,
+        method: String,
+        user_agent: String,
+        created: String,
+        expires: String,
+        current: bool,
+    }
+
     #[derive(Template)]
     #[template(path = "console_sessions.html")]
     struct ConsoleSessions {
@@ -3784,6 +3809,8 @@ mod pages {
         hint: &'static str,
         kill_action: &'static str,
         sessions: Vec<SessionRow>,
+        show_browser_sessions: bool,
+        browser_sessions: Vec<BrowserSessionRow>,
         error: Option<String>,
     }
 
@@ -4879,7 +4906,7 @@ mod pages {
             .unwrap_or_default();
         let is_admin = is_admin_account(state, &account);
         let filter = own.then(|| account.clone());
-        let (sessions, error): (Vec<SessionRow>, Option<String>) =
+        let (sessions, mut error): (Vec<SessionRow>, Option<String>) =
             match admin_list_sessions(state, filter).await {
                 Ok(list) => (
                     list.into_iter()
@@ -4897,6 +4924,34 @@ mod pages {
                 // Surface a snapshot failure as the banner rather than a blank page.
                 Err(msg) => (Vec::new(), Some(error.unwrap_or(msg))),
             };
+        let browser_sessions = if own {
+            let current = session_token(headers, state.secure_cookies);
+            match crate::db::list_web_sessions(pool_of(state), &account, current.as_deref()).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| BrowserSessionRow {
+                        id: row.id,
+                        method: row.provider.map_or_else(
+                            || "Local password".into(),
+                            |provider| format!("OpenID Connect · {provider}"),
+                        ),
+                        user_agent: row.user_agent.unwrap_or_else(|| "Unknown browser".into()),
+                        created: row.created_at,
+                        expires: row.expires_at,
+                        current: row.current,
+                    })
+                    .collect(),
+                Err(database_error) => {
+                    eprintln!("console: browser session list failed: {database_error}");
+                    if error.is_none() {
+                        error = Some("Browser session storage is unavailable.".into());
+                    }
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let (active, title, hint, kill_action) = if own {
             (
                 "my-sessions",
@@ -4921,6 +4976,8 @@ mod pages {
             hint,
             kill_action,
             sessions,
+            show_browser_sessions: own,
+            browser_sessions,
             error,
         })
     }
@@ -4997,6 +5054,85 @@ mod pages {
         match core_action(&state, req).await {
             Ok(_) => Redirect::to("/console/my-sessions").into_response(),
             Err(msg) => render_sessions_page(&state, &headers, account, true, Some(msg)).await,
+        }
+    }
+
+    async fn browser_session_error(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        message: &'static str,
+    ) -> Response {
+        render_sessions_page(state, headers, account, true, Some(message.to_owned())).await
+    }
+
+    /// Console → revoke one durable browser session owned by the caller.
+    pub async fn console_revoke_browser_session(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(id): Path<i64>,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, _) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        let current = session_token(&headers, state.secure_cookies);
+        match crate::db::delete_web_session_by_id(pool_of(&state), &account, id, current.as_deref())
+            .await
+        {
+            Ok(Some(false)) => Redirect::to("/console/my-sessions").into_response(),
+            Ok(Some(true)) => {
+                let mut response = Redirect::to("/login").into_response();
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    clear_session_cookie(state.secure_cookies)
+                        .parse()
+                        .expect("session clear cookie is valid"),
+                );
+                response
+            }
+            Ok(None) => {
+                browser_session_error(&state, &headers, account, "No such browser session.").await
+            }
+            Err(error) => {
+                eprintln!("console: browser session revoke failed: {error}");
+                browser_session_error(
+                    &state,
+                    &headers,
+                    account,
+                    "Browser session storage is unavailable.",
+                )
+                .await
+            }
+        }
+    }
+
+    /// Console → revoke every other browser login while preserving the session
+    /// whose CSRF token authorized the form.
+    pub async fn console_revoke_other_browser_sessions(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, _) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        let current = session_token(&headers, state.secure_cookies)
+            .expect("form actor requires a cookie session");
+        match crate::db::delete_other_web_sessions(pool_of(&state), &account, &current).await {
+            Ok(_) => Redirect::to("/console/my-sessions").into_response(),
+            Err(error) => {
+                eprintln!("console: other browser session revoke failed: {error}");
+                browser_session_error(
+                    &state,
+                    &headers,
+                    account,
+                    "Browser session storage is unavailable.",
+                )
+                .await
+            }
         }
     }
 

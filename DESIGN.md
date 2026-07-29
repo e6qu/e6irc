@@ -201,6 +201,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
     runs the check as a precondition of being called. An admin route cannot
     forget the gate: the ungated handler fails to compile for want of the
     argument, rather than relying on every handler to open with the same line.
+  - `SessionUserAgent` and owner-scoped browser-session queries — login
+    provenance is bounded and neutralized exactly once before storage, while
+    inventory and revocation always bind both the folded account and the
+    resource id. A guessed id cannot disclose or revoke another account's
+    session, and the opaque authentication token and its hash never enter an
+    inventory row.
   - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
     `&str`, so two fields cannot be transposed at a call site.
   - `HistoryDbRow` — the history read binds columns by **name**
@@ -781,7 +787,8 @@ Principal tables (columns abridged):
   argon2id hash, label, last_used_at) — app passwords are per-client,
   revocable, shown once at creation
 - `oidc_identities` (issuer, subject) → account_id, UNIQUE(issuer, subject)
-- `web_sessions` (opaque id hash, account_id, expiry, ua)
+- `web_sessions` (owner-scoped resource id, opaque token hash, account_id,
+  creation/expiry, bounded user agent, optional OIDC identity/session metadata)
 - `api_tokens` (hashed PATs, scopes, expiry)
 - `channels` (registered channels: founder, flags, topic retention, mlock)
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS
@@ -867,7 +874,9 @@ supplied.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
   `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
   server-rendered forms carry a per-session HMAC token in the request body and
-  reject a missing or invalid token before mutation.
+  reject a missing or invalid token before mutation. Each login records a
+  bounded, display-safe user agent and a separate stable resource id; neither
+  the opaque token nor its hash is exposed by session inventory.
 - The embedded application entry point was an authentication boundary. A
   valid local session rendered the client; otherwise a single configured
   provider's ordinary authorization flow began immediately. An existing
@@ -927,7 +936,13 @@ success redirects (PRG), failure re-renders with an error banner. A non-admin
 counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
 *their own* connected clients: the core scopes the snapshot to the caller's
 account and refuses a self-service kill of a session not authenticated as the
-caller, so it can never touch anyone else's. The console shell (`console_base.html`) is
+caller, so it can never touch anyone else's. The same page lists the account's
+durable browser logins with creation/expiry, sign-in method, provider, bounded
+user-agent provenance, and a current-session marker. Individual and bulk
+other-session revocation are owner-scoped in PostgreSQL; deleting the current
+session also clears its browser cookie. The equivalent REST surface is
+`GET /api/v1/me/sessions` and `DELETE /api/v1/me/sessions/{id}`.
+The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and
 personal access tokens, linking and safely unlinking login identities, and

@@ -68,6 +68,31 @@ pub(super) async fn openapi() -> Response {
                 "get": { "summary": "The authenticated account", "security": bearer,
                     "responses": ok_json }
             },
+            "/api/v1/me/sessions": {
+                "get": {
+                    "summary": "List your active browser sessions",
+                    "description": "Returns owner-scoped stable IDs, creation/expiry times, login method, provider, bounded User-Agent provenance, and whether a row is the request's current cookie session. Session tokens and hashes are never returned.",
+                    "security": bearer,
+                    "responses": {
+                        "200": { "description": "unexpired browser sessions, current first" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/sessions/{id}": {
+                "delete": {
+                    "summary": "Revoke one of your browser sessions",
+                    "description": "The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
+                    "security": bearer,
+                    "parameters": [{ "name": "id", "in": "path", "required": true,
+                        "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": {
+                        "204": { "description": "session revoked" },
+                        "404": { "description": "session does not exist or belongs to another account" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
             "/api/v1/auth/oidc/{provider}/start": {
                 "get": { "summary": "Begin interactive OIDC login (redirects to the provider)",
                     "description": "Redirects the browser to the provider's authorization endpoint (code flow + PKCE) and sets a state-binding cookie the callback requires.",
