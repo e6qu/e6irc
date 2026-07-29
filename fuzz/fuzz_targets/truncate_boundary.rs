@@ -22,7 +22,10 @@ fuzz_target!(|data: &[u8]| {
     let budget = data.first().copied().unwrap_or(0) as usize % (s.len() + 2);
 
     let floor = floor_char_boundary(s, budget);
-    assert!(floor <= budget || floor == s.len(), "floor exceeded its budget");
+    assert!(
+        floor <= budget || floor == s.len(),
+        "floor exceeded its budget"
+    );
     assert!(floor <= s.len(), "floor past the end");
     assert!(s.is_char_boundary(floor), "floor not on a boundary");
 

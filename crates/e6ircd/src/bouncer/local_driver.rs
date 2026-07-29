@@ -4,12 +4,11 @@
 //! an external one — but over the core queue instead of a socket.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
 
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
-use crate::core::{ConnId, Input, Output};
+use crate::core::{ConnectionIdAllocator, Input, Output};
 
 /// The in-process network's name — the driver `kind`, the session host, and the
 /// network a slash-less BNC attach defaults to (DESIGN §10.4: bare = `local`).
@@ -19,7 +18,7 @@ pub(crate) const LOCAL_NETWORK: &str = "local";
 #[derive(Clone)]
 pub struct CoreHandles {
     pub core_tx: Sender<Input>,
-    pub next_conn: Arc<AtomicU64>,
+    pub next_conn: Arc<ConnectionIdAllocator>,
     pub sendq: usize,
 }
 
@@ -85,7 +84,13 @@ async fn run(session: LocalSession, mut ends: DriverEnds) {
 
 async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::SessionOutcome::{Dropped, Stopped};
-    let conn = ConnId(session.core.next_conn.fetch_add(1, Ordering::Relaxed));
+    let conn = match session.core.next_conn.allocate() {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("local bouncer connection stopped: {error}");
+            return Stopped;
+        }
+    };
     let (out_tx, mut out_rx) = queue::<Output>(QueueConfig {
         name: "local-sendq",
         capacity: session.core.sendq,
@@ -98,6 +103,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             conn,
             tx: out_tx,
             host: "local".into(),
+            transport: crate::core::ConnectionTransport::Local,
         })
         .await
         .is_err()
@@ -238,7 +244,7 @@ mod tests {
         let session = LocalSession {
             core: CoreHandles {
                 core_tx,
-                next_conn: Arc::new(AtomicU64::new(1)),
+                next_conn: Arc::new(ConnectionIdAllocator::new(std::num::NonZeroU64::MIN)),
                 sendq: 8,
             },
             nick: "alice".into(),

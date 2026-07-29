@@ -38,18 +38,17 @@ pub(crate) fn handle(
         AdminRequest::DropChannel { channel, actor } => {
             return begin_drop_channel(state, &channel, actor, reply);
         }
-        AdminRequest::ListSessions => list_sessions(state, None),
-        AdminRequest::Kill {
-            nick,
+        AdminRequest::ListConnections { query } => list_connections(state, query),
+        AdminRequest::DisconnectConnection {
+            connection_id,
             reason,
             actor,
-        } => kill(state, &nick, &reason, &actor),
-        AdminRequest::ListOwnSessions { account } => list_sessions(state, Some(&account)),
-        AdminRequest::KillOwn {
-            nick,
+        } => disconnect_connection(state, connection_id, &reason, &actor),
+        AdminRequest::DisconnectOwnConnection {
+            connection_id,
             reason,
             account,
-        } => kill_own(state, &nick, &reason, &account),
+        } => disconnect_own_connection(state, connection_id, &reason, &account),
         AdminRequest::MutateOwnedChannel {
             channel,
             actor,
@@ -334,86 +333,196 @@ fn normalize_channel_mutation(
     }
 }
 
-/// Whether session `conn`'s authenticated account casefolds to `account`.
-fn session_owned_by(state: &ServerState, conn: crate::core::ConnId, account: &str) -> bool {
+/// Return the registered session's nick only when its authenticated account
+/// casefolds to `account`.
+fn owned_session_nick(
+    state: &ServerState,
+    conn: crate::core::ConnId,
+    account: &str,
+) -> Option<String> {
     let want = state.casemap.casefold(account);
     state
         .sessions
         .get(&conn)
-        .and_then(|s| s.account.as_deref())
-        .is_some_and(|a| state.casemap.casefold(a) == want)
-}
-
-/// Snapshot registered sessions. With `only_account`, restrict to sessions
-/// authenticated as that account (the caller's own connected clients).
-fn list_sessions(state: &ServerState, only_account: Option<&str>) -> AdminReply {
-    let want = only_account.map(|a| state.casemap.casefold(a));
-    let mut sessions: Vec<crate::core::SessionInfo> = state
-        .sessions
-        .values()
-        .filter(|s| s.is_registered())
-        .filter(|s| match &want {
-            None => true,
-            Some(w) => s
+        .filter(|session| session.is_registered())
+        .filter(|session| {
+            session
                 .account
                 .as_deref()
-                .is_some_and(|a| &state.casemap.casefold(a) == w),
+                .is_some_and(|session_account| state.casemap.casefold(session_account) == want)
         })
-        .map(|s| {
-            let mut channels: Vec<String> =
-                s.channels.iter().map(|k| k.as_str().to_string()).collect();
+        .and_then(|session| session.nick())
+        .map(str::to_owned)
+}
+
+struct FoldedLiveConnectionFilter {
+    nick: Option<String>,
+    account: Option<String>,
+    transport: Option<crate::core::ConnectionTransport>,
+    oper: Option<bool>,
+}
+
+fn live_connection_matches(
+    state: &ServerState,
+    session: &crate::core::state::Session,
+    filter: &FoldedLiveConnectionFilter,
+) -> bool {
+    if !session.is_registered() {
+        return false;
+    }
+    if let Some(want) = filter.nick.as_deref()
+        && !session
+            .nick()
+            .is_some_and(|nick| state.casemap.casefold(nick) == want)
+    {
+        return false;
+    }
+    if let Some(want) = filter.account.as_deref()
+        && !session
+            .account
+            .as_deref()
+            .is_some_and(|account| state.casemap.casefold(account) == want)
+    {
+        return false;
+    }
+    if filter
+        .transport
+        .is_some_and(|transport| session.transport != transport)
+    {
+        return false;
+    }
+    if filter.oper.is_some_and(|oper| session.oper != oper) {
+        return false;
+    }
+    true
+}
+
+/// Build a newest-first live-connection page while retaining at most one page
+/// plus its cursor sentinel. The core still examines live state once, but a
+/// request can never allocate a vector proportional to the whole server.
+fn list_connections(state: &ServerState, query: crate::core::LiveConnectionQuery) -> AdminReply {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let page_size = query.page_size.value();
+    let fetch_limit = page_size + 1;
+    let filter = FoldedLiveConnectionFilter {
+        nick: query
+            .exact_nick
+            .as_deref()
+            .map(|nick| state.casemap.casefold(nick)),
+        account: query
+            .exact_account
+            .as_deref()
+            .map(|account| state.casemap.casefold(account)),
+        transport: query.transport,
+        oper: query.oper,
+    };
+    let mut newest = BinaryHeap::with_capacity(fetch_limit + 1);
+    for (&connection_id, session) in &state.sessions {
+        if query
+            .before_id
+            .is_some_and(|before_id| connection_id.0 >= before_id)
+            || !live_connection_matches(state, session, &filter)
+        {
+            continue;
+        }
+        newest.push(Reverse(connection_id.0));
+        if newest.len() > fetch_limit {
+            newest.pop();
+        }
+    }
+    let now = (state.config.mono_clock)();
+    let mut connection_ids: Vec<u64> = newest
+        .into_iter()
+        .map(|Reverse(connection_id)| connection_id)
+        .collect();
+    connection_ids.sort_unstable_by(|left, right| right.cmp(left));
+    let next_before_id = (connection_ids.len() > page_size).then(|| connection_ids[page_size - 1]);
+    connection_ids.truncate(page_size);
+    let entries = connection_ids
+        .into_iter()
+        .map(|connection_id| {
+            let session = &state.sessions[&crate::core::ConnId(connection_id)];
+            let mut channels: Vec<String> = session
+                .channels
+                .iter()
+                .map(|channel| channel.as_str().to_string())
+                .collect();
             channels.sort();
-            crate::core::SessionInfo {
-                nick: s.nick().unwrap_or("*").to_string(),
-                user: s.user().unwrap_or("*").to_string(),
-                host: s.host.clone(),
-                account: s.account.clone(),
-                oper: s.oper,
+            crate::core::LiveConnectionInfo {
+                id: connection_id,
+                nick: session.nick().unwrap_or("*").to_string(),
+                user: session.user().unwrap_or("*").to_string(),
+                host: session.host.clone(),
+                account: session.account.clone(),
+                oper: session.oper,
+                transport: session.transport,
+                connected_at: session.signon,
+                idle_seconds: now.saturating_sub(session.last_active).as_secs(),
                 channels,
             }
         })
         .collect();
-    sessions.sort_by_key(|s| s.nick.to_lowercase());
-    AdminReply::Sessions(sessions)
+    AdminReply::Connections(crate::core::LiveConnectionPage {
+        entries,
+        next_before_id,
+    })
 }
 
-fn kill(state: &mut ServerState, nick_in: &str, reason_in: &str, actor: &str) -> AdminReply {
+fn disconnect_connection(
+    state: &mut ServerState,
+    connection_id: u64,
+    reason_in: &str,
+    actor: &str,
+) -> AdminReply {
     let comment = e6irc_proto::message::truncate_on_char_boundary(reason_in.trim(), 300);
     let comment = if comment.is_empty() {
-        "Killed via admin console"
+        "Administrative disconnect"
     } else {
         comment
     };
-    if super::oper::kill_by_nick(state, nick_in, comment, actor) {
-        AdminReply::Ok(format!("Killed {nick_in}"))
+    let connection = crate::core::ConnId(connection_id);
+    let nick = state
+        .sessions
+        .get(&connection)
+        .and_then(|session| session.nick())
+        .map(str::to_owned);
+    if super::oper::kill_connection(state, connection, comment, actor) {
+        AdminReply::Ok(format!(
+            "Disconnected {}",
+            nick.as_deref().unwrap_or("connection")
+        ))
     } else {
-        AdminReply::Err(format!("no such nick '{nick_in}'"))
+        AdminReply::ConnectionMissing
     }
 }
 
-/// Self-service kill: disconnect `nick` only if that session is authenticated as
-/// `account` (the caller). Refuses to touch a session that isn't the caller's,
-/// so a non-admin cannot kill anyone else by guessing a nick.
-fn kill_own(state: &mut ServerState, nick_in: &str, reason_in: &str, account: &str) -> AdminReply {
-    let key = state.nick_key(nick_in);
-    let Some(&conn) = state.nicks.get(&key) else {
-        return AdminReply::Err(format!("no such session '{nick_in}'"));
-    };
-    if !session_owned_by(state, conn, account) {
+/// Self-service disconnect: the immutable id must still name a registered
+/// connection authenticated as the caller. A stale id can never resolve to a
+/// later connection, unlike a nick that may have been released and reused.
+fn disconnect_own_connection(
+    state: &mut ServerState,
+    connection_id: u64,
+    reason_in: &str,
+    account: &str,
+) -> AdminReply {
+    let connection = crate::core::ConnId(connection_id);
+    let Some(nick) = owned_session_nick(state, connection, account) else {
         // Report as not-found rather than forbidden, so this can't be used to
-        // probe which nicks exist / are signed in as other accounts.
-        return AdminReply::Err(format!("no such session '{nick_in}'"));
-    }
+        // probe which connections exist or belong to other accounts.
+        return AdminReply::ConnectionMissing;
+    };
     let comment = e6irc_proto::message::truncate_on_char_boundary(reason_in.trim(), 300);
     let comment = if comment.is_empty() {
-        "Disconnected from your account console"
+        "Disconnected by account owner"
     } else {
         comment
     };
-    if super::oper::kill_by_nick(state, nick_in, comment, account) {
-        AdminReply::Ok(format!("Disconnected {nick_in}"))
+    if super::oper::kill_connection(state, connection, comment, account) {
+        AdminReply::Ok(format!("Disconnected {nick}"))
     } else {
-        AdminReply::Err(format!("no such session '{nick_in}'"))
+        AdminReply::ConnectionMissing
     }
 }
 

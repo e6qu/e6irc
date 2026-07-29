@@ -13,7 +13,9 @@ mod state;
 
 pub use state::{ConnId, CoreConfig, dm_conversation_key};
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -21,6 +23,47 @@ use e6irc_queue::{PushError, Sender};
 use state::ServerState;
 
 use crate::observability::{LatencyKind, Telemetry};
+
+/// One process-wide source of live connection identifiers.
+///
+/// Production seeds this counter from the operating system's cryptographically
+/// secure random number generator on every boot. All ingress paths share the
+/// allocator, so identifiers remain ordered for keyset pagination, cannot
+/// collide within a process, and do not predictably name a different
+/// connection after a restart. Exhaustion is an explicit error instead of
+/// wrapping onto an existing identifier.
+#[derive(Debug)]
+pub struct ConnectionIdAllocator {
+    next: AtomicU64,
+}
+
+impl ConnectionIdAllocator {
+    pub fn new(first: NonZeroU64) -> Self {
+        Self {
+            next: AtomicU64::new(first.get()),
+        }
+    }
+
+    pub fn allocate(&self) -> Result<ConnId, ConnectionIdExhausted> {
+        self.next
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(ConnId)
+            .map_err(|_| ConnectionIdExhausted)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionIdExhausted;
+
+impl std::fmt::Display for ConnectionIdExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("live connection identifier space exhausted")
+    }
+}
+
+impl std::error::Error for ConnectionIdExhausted {}
 
 /// Events into the core worker.
 #[derive(Debug)]
@@ -30,6 +73,7 @@ pub enum Input {
         conn: ConnId,
         tx: Sender<Output>,
         host: String,
+        transport: ConnectionTransport,
     },
     /// One complete line from the connection (terminator stripped).
     Line { conn: ConnId, line: Vec<u8> },
@@ -142,22 +186,19 @@ pub enum AdminRequest {
     },
     /// Unregister a registered channel (like ChanServ DROP, founder-agnostic).
     DropChannel { channel: String, actor: String },
-    /// Snapshot every live (registered) client session for the console.
-    ListSessions,
-    /// Disconnect the session holding `nick` (like oper KILL).
-    Kill {
-        nick: String,
+    /// Query a bounded, stable page of live registered connections.
+    ListConnections { query: LiveConnectionQuery },
+    /// Disconnect the exact live connection identified by its immutable
+    /// resource id.
+    DisconnectConnection {
+        connection_id: u64,
         reason: String,
         actor: String,
     },
-    /// Snapshot only the sessions authenticated as `account` — the caller's own
-    /// connected clients (self-service, not admin).
-    ListOwnSessions { account: String },
-    /// Disconnect the session holding `nick`, but only if it is authenticated as
-    /// `account` (the caller) — a self-service kill that cannot touch anyone
-    /// else's session.
-    KillOwn {
-        nick: String,
+    /// Disconnect an immutable live connection id only when it is currently
+    /// authenticated as `account`.
+    DisconnectOwnConnection {
+        connection_id: u64,
         reason: String,
         account: String,
     },
@@ -241,15 +282,74 @@ pub enum ChannelRegistrationResult {
     Unavailable,
 }
 
-/// A snapshot of one live client session, for the admin console's sessions view.
-#[derive(Debug)]
-pub struct SessionInfo {
+/// The ingress path that owns one live core connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTransport {
+    Tcp,
+    Tls,
+    WebSocket,
+    Local,
+}
+
+impl ConnectionTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Tls => "tls",
+            Self::WebSocket => "websocket",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// A non-zero connection-directory page size capped at the public API maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveConnectionPageSize(usize);
+
+impl LiveConnectionPageSize {
+    pub const MAX: usize = 1_000;
+
+    pub fn new(value: usize) -> Option<Self> {
+        (1..=Self::MAX).contains(&value).then_some(Self(value))
+    }
+
+    pub const fn value(self) -> usize {
+        self.0
+    }
+}
+
+/// Validated filters for a bounded live-connection snapshot. Connection ids
+/// increase for the process lifetime, so `before_id` gives newest-first
+/// keyset pagination that concurrent accepts cannot disturb.
+#[derive(Debug, Clone)]
+pub struct LiveConnectionQuery {
+    pub before_id: Option<u64>,
+    pub exact_nick: Option<String>,
+    pub exact_account: Option<String>,
+    pub transport: Option<ConnectionTransport>,
+    pub oper: Option<bool>,
+    pub page_size: LiveConnectionPageSize,
+}
+
+/// A snapshot of one live registered client connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveConnectionInfo {
+    pub id: u64,
     pub nick: String,
     pub user: String,
     pub host: String,
     pub account: Option<String>,
     pub oper: bool,
+    pub transport: ConnectionTransport,
+    pub connected_at: e6irc_proto::time::Millis,
+    pub idle_seconds: u64,
     pub channels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveConnectionPage {
+    pub entries: Vec<LiveConnectionInfo>,
+    pub next_before_id: Option<u64>,
 }
 
 /// The outcome of an [`AdminRequest`], returned over its oneshot reply.
@@ -265,8 +365,10 @@ pub enum AdminReply {
         kind: ChannelControlError,
         message: String,
     },
-    /// A live-sessions snapshot (answer to [`AdminRequest::ListSessions`]).
-    Sessions(Vec<SessionInfo>),
+    /// A bounded live-connection page.
+    Connections(LiveConnectionPage),
+    /// An exact connection-id mutation found no eligible live connection.
+    ConnectionMissing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -992,7 +1094,12 @@ impl Core {
             self.state.telemetry.record_connection_opened();
         }
         match input {
-            Input::Open { conn, tx, host } => self.state.open(conn, tx, host),
+            Input::Open {
+                conn,
+                tx,
+                host,
+                transport,
+            } => self.state.open(conn, tx, host, transport),
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
@@ -1153,5 +1260,28 @@ mod wire_line_tests {
         // A clean line is returned unchanged (fast path).
         let clean = Bytes::from(&b"PING :token\r\n"[..]);
         assert_eq!(WireLine::sanitized(clean.clone()).0, clean);
+    }
+}
+
+#[cfg(test)]
+mod connection_id_allocator_tests {
+    use std::num::NonZeroU64;
+
+    use super::ConnectionIdAllocator;
+
+    #[test]
+    fn allocation_is_ordered_and_refuses_to_wrap() {
+        let allocator =
+            ConnectionIdAllocator::new(NonZeroU64::new(7).expect("non-zero test start"));
+        assert_eq!(allocator.allocate().expect("first identifier").0, 7);
+        assert_eq!(allocator.allocate().expect("second identifier").0, 8);
+
+        let exhausted =
+            ConnectionIdAllocator::new(NonZeroU64::new(u64::MAX - 1).expect("non-zero"));
+        assert_eq!(
+            exhausted.allocate().expect("last identifier").0,
+            u64::MAX - 1
+        );
+        assert!(exhausted.allocate().is_err());
     }
 }

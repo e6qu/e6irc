@@ -4657,3 +4657,64 @@ async fn web_session_inventory_and_revocation_are_owner_scoped() {
         Some("alice".into())
     );
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn concurrent_browser_session_issuance_enforces_the_active_cap() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("concurrent_browser_session_issuance_enforces_the_active_cap").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+
+    let mut issuers = tokio::task::JoinSet::new();
+    for _ in 0..(db::MAX_BROWSER_SESSIONS_PER_ACCOUNT + 8) {
+        let pool = pool.clone();
+        issuers.spawn(async move {
+            db::create_web_session(&pool, "alice", None)
+                .await
+                .expect("concurrent session issuance")
+        });
+    }
+    let mut tokens = Vec::new();
+    while let Some(result) = issuers.join_next().await {
+        tokens.push(result.expect("issuer task"));
+    }
+
+    let sessions = db::list_web_sessions(&pool, "alice", None)
+        .await
+        .expect("bounded inventory");
+    assert_eq!(
+        sessions.len(),
+        db::MAX_BROWSER_SESSIONS_PER_ACCOUNT,
+        "the owner inventory is bounded at the issuance invariant"
+    );
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM web_sessions s
+         JOIN accounts a ON a.id = s.account_id
+         WHERE a.name_folded = 'alice' AND s.expires_at > now()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("active session count");
+    assert_eq!(
+        active as usize,
+        db::MAX_BROWSER_SESSIONS_PER_ACCOUNT,
+        "serialized issuance must keep storage itself at the cap"
+    );
+
+    let mut retained = 0;
+    for token in tokens {
+        if db::session_account(&pool, &token)
+            .await
+            .expect("token lookup")
+            .is_some()
+        {
+            retained += 1;
+        }
+    }
+    assert_eq!(retained, db::MAX_BROWSER_SESSIONS_PER_ACCOUNT);
+}

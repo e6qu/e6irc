@@ -210,6 +210,12 @@ These are project-wide rules, enforced in review and (where possible) CI:
     resource id. A guessed id cannot disclose or revoke another account's
     session, and the opaque authentication token and its hash never enter an
     inventory row.
+  - `ConnectionIdAllocator`/`LiveConnectionPageSize` — every production
+    ingress transport draws from one randomly boot-seeded, non-wrapping ID
+    source, and live-state queries can retain only a typed bounded page plus
+    one cursor sentinel. Disconnect mutations carry the selected ID to the
+    shared teardown path and owner mutations recheck its authenticated account;
+    mutable nick reuse cannot redirect a stale control to another client.
   - `AuditLogRow`/`AuditLogPageSize` — the audit read binds named columns into
     a typed row instead of returning five transposition-prone strings, and an
     invalid zero/oversized page cannot reach SQL or cursor arithmetic. Stable
@@ -964,24 +970,40 @@ cursor-paginated security-operations view at `/console/audit`; it shares the
 `/api/v1/admin/*` JSON endpoints use, so it can never surface server-wide data
 to a non-admin. Beyond the read
 views, the console can **act**: add/remove a K/D/X-line, unregister a registered
-channel, and — from a live client-sessions view at `/console/sessions` — KILL a
-session by nick. These run on the core worker via `Input::Admin { req, reply }`
-(a oneshot-reply), reusing the exact live-state + persistence path of the
-equivalent oper/services command — a console ban updates the hot ban list,
-persists, disconnects matching sessions, and audit-logs identically to oper
-KLINE; a console KILL is the same teardown as oper KILL; the sessions view is a
-live snapshot of the core's session table (the shared logic is extracted so
-there is one implementation, not two). Actions are admin-gated + CSRF-protected;
-success redirects (PRG), failure re-renders with an error banner. A non-admin
-counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
-*their own* connected clients: the core scopes the snapshot to the caller's
-account and refuses a self-service kill of a session not authenticated as the
-caller, so it can never touch anyone else's. The same page lists the account's
-durable browser logins with creation/expiry, sign-in method, provider, bounded
-user-agent provenance, and a current-session marker. Individual and bulk
-other-session revocation are owner-scoped in PostgreSQL; deleting the current
-session also clears its browser cookie. The equivalent REST surface is
-`GET /api/v1/me/sessions` and `DELETE /api/v1/me/sessions/{id}`.
+channel, and disconnect an exact live connection from the bounded,
+cursor-paginated directory at `/console/sessions`. The directory projects only
+registered clients and supports exact RFC1459-folded nick/account filters plus
+closed transport and operator filters. It retains at most one requested page
+and its cursor sentinel while scanning hot state, so response allocation is
+independent of total connections.
+
+Every ingress path shares one non-wrapping connection-ID allocator seeded from
+the operating system's cryptographically secure random number generator at
+boot. Disconnect requests carry the immutable ID
+resolved by the directory instead of a mutable nick, closing both nick-reuse
+and predictable post-restart stale-form targeting. JSON renders IDs and cursors
+as decimal strings so JavaScript cannot round a 64-bit resource identifier.
+The core owns the disconnect choke point: IRC `KILL`, console forms, and REST
+mutations share the same audit, operator-notice, terminal `ERROR`, and close
+path. Actions are admin-gated + CSRF-protected; success redirects (PRG), failure
+re-renders with an error banner. The equivalent administrator REST surface is
+`GET /api/v1/admin/connections` and
+`DELETE /api/v1/admin/connections/{id}`.
+
+A non-admin counterpart at `/console/my-sessions` lets any signed-in user see
+and disconnect *their own* authenticated clients. The core forces the account
+filter and rechecks ownership of the immutable ID at mutation time, so a stale
+or guessed identifier cannot touch another account. The matching REST surface
+is `GET /api/v1/me/connections` and
+`DELETE /api/v1/me/connections/{id}`. The same console page lists durable
+browser logins with creation/expiry, sign-in method, provider, bounded
+user-agent provenance, and a current-session marker. Issuance is serialized on
+the account row and capped at 32 active browser sessions; a new login
+atomically revokes the oldest instead of exceeding the cap or locking the
+account out. Individual and bulk other-session revocation remain owner-scoped
+in PostgreSQL, and deleting the current session also clears its browser cookie.
+Their REST surface is `GET /api/v1/me/sessions` and
+`DELETE /api/v1/me/sessions/{id}`.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and

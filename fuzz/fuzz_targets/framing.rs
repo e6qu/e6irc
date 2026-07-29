@@ -46,8 +46,15 @@ fuzz_target!(|data: &[u8]| {
     // Property 1: every completed line fits the limit and holds no newline.
     let whole = lines(stream, limit, stream.len().max(1));
     for line in &whole {
-        assert!(line.len() <= limit, "framed line of {} bytes over limit {limit}", line.len());
-        assert!(!line.contains(&b'\n'), "framed line contains a bare newline");
+        assert!(
+            line.len() <= limit,
+            "framed line of {} bytes over limit {limit}",
+            line.len()
+        );
+        assert!(
+            !line.contains(&b'\n'),
+            "framed line contains a bare newline"
+        );
         // A line may legitimately end in CR: the framer strips only the single
         // CR of the CRLF terminator, leaving any *embedded* CR for
         // `Message::parse` to reject (its documented single rejection point).
@@ -57,5 +64,8 @@ fuzz_target!(|data: &[u8]| {
     // picks the chunk width; feeding the same stream that way must agree.
     let chunk = (data.get(1).copied().unwrap_or(1) as usize % 17) + 1;
     let chunked = lines(stream, limit, chunk);
-    assert_eq!(whole, chunked, "framing depends on chunk boundaries (chunk={chunk})");
+    assert_eq!(
+        whole, chunked,
+        "framing depends on chunk boundaries (chunk={chunk})"
+    );
 });

@@ -90,8 +90,8 @@ pub struct AppState {
     pub pending_auth: Mutex<HashMap<String, PendingAuth>>,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
     pub core_tx: e6irc_queue::Sender<crate::core::Input>,
-    /// Shared connection-id allocator (with the TCP listeners).
-    pub next_conn: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Shared connection-id allocator (with every other ingress transport).
+    pub next_conn: std::sync::Arc<crate::core::ConnectionIdAllocator>,
     /// Per-connection SendQ capacity.
     pub sendq: usize,
     /// The always-on network registry shared by web chat, management, and the
@@ -268,9 +268,10 @@ async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result
         crate::core::AdminReply::Ok(message) => Ok(message),
         crate::core::AdminReply::Err(message)
         | crate::core::AdminReply::ChannelErr { message, .. } => Err(message),
-        crate::core::AdminReply::Sessions(_) => {
-            Err("unexpected sessions reply for a mutation".into())
+        crate::core::AdminReply::Connections(_) => {
+            Err("unexpected live-connection reply for a mutation".into())
         }
+        crate::core::AdminReply::ConnectionMissing => Err("no such live connection".into()),
     }
 }
 
@@ -630,11 +631,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(pages::console_drop_channel),
         )
         .route("/console/sessions", get(pages::console_sessions))
-        .route("/console/sessions/kill", post(pages::console_kill_session))
+        .route(
+            "/console/sessions/{id}/disconnect",
+            post(pages::console_disconnect_session),
+        )
         .route("/console/my-sessions", get(pages::console_my_sessions))
         .route(
-            "/console/my-sessions/kill",
-            post(pages::console_kill_own_session),
+            "/console/my-sessions/{id}/disconnect",
+            post(pages::console_disconnect_own_session),
         )
         .route(
             "/console/my-sessions/browser/{id}/delete",
@@ -678,6 +682,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v1/me/sessions/{id}",
             axum::routing::delete(revoke_browser_session),
         )
+        .route("/api/v1/me/connections", get(me_connections))
+        .route(
+            "/api/v1/me/connections/{id}",
+            axum::routing::delete(me_disconnect_connection),
+        )
         .route(
             "/api/v1/me/tokens",
             get(me_tokens_list).post(create_api_token),
@@ -718,6 +727,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/me/networks/{name}/buffer", get(network_buffer))
         .route("/api/v1/history", get(history))
         .route("/api/v1/admin/accounts", get(admin_accounts))
+        .route("/api/v1/admin/connections", get(admin_connections))
+        .route(
+            "/api/v1/admin/connections/{id}",
+            axum::routing::delete(admin_disconnect_connection),
+        )
         .route("/api/v1/admin/channels", get(admin_channels))
         .route("/api/v1/admin/bans", get(admin_server_bans))
         .route("/api/v1/admin/audit", get(admin_audit))
@@ -4047,11 +4061,15 @@ mod pages {
     }
 
     struct SessionRow {
+        id: u64,
         nick: String,
         user: String,
         host: String,
         account: Option<String>,
         oper: bool,
+        transport: &'static str,
+        connected_at: String,
+        idle_seconds: u64,
         /// Channels the session is in, pre-joined for display.
         channels: String,
     }
@@ -4074,9 +4092,18 @@ mod pages {
         active: &'static str,
         title: &'static str,
         hint: &'static str,
-        kill_action: &'static str,
+        disconnect_action: &'static str,
         sessions: Vec<SessionRow>,
+        nick_filter: String,
+        account_filter: String,
+        transport_filter: String,
+        oper_filter: String,
+        limit: usize,
+        has_filters: bool,
+        has_cursor: bool,
+        next_before_id: Option<u64>,
         show_browser_sessions: bool,
+        show_account_filter: bool,
         browser_sessions: Vec<BrowserSessionRow>,
         error: Option<String>,
     }
@@ -4993,29 +5020,15 @@ mod pages {
         Ok(account)
     }
 
-    /// Snapshot live client sessions from the core worker. With `own`, restrict
-    /// to sessions authenticated as that account (the caller's own clients).
-    async fn admin_list_sessions(
+    /// Ask the core for one already-validated bounded connection page.
+    async fn list_live_connections(
         state: &AppState,
-        own: Option<String>,
-    ) -> Result<Vec<crate::core::SessionInfo>, String> {
-        let req = match own {
-            Some(account) => crate::core::AdminRequest::ListOwnSessions { account },
-            None => crate::core::AdminRequest::ListSessions,
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if state
-            .core_tx
-            .push(crate::core::Input::Admin { req, reply: tx })
-            .await
-            .is_err()
-        {
-            return Err("core worker unavailable".into());
-        }
-        match rx.await {
-            Ok(crate::core::AdminReply::Sessions(s)) => Ok(s),
+        query: crate::core::LiveConnectionQuery,
+    ) -> Result<crate::core::LiveConnectionPage, String> {
+        match core_reply(state, crate::core::AdminRequest::ListConnections { query }).await {
+            Ok(crate::core::AdminReply::Connections(page)) => Ok(page),
             Ok(_) => Err("unexpected reply".into()),
-            Err(_) => Err("core worker dropped the request".into()),
+            Err(error) => Err(error),
         }
     }
 
@@ -5194,47 +5207,52 @@ mod pages {
     }
 
     #[derive(Deserialize)]
-    pub struct KillForm {
+    pub struct DisconnectForm {
         csrf: String,
-        nick: String,
         #[serde(default)]
         reason: String,
     }
 
-    /// Render the client-sessions view. `own = false` is the admin view of every
-    /// session (`/console/sessions`); `own = true` is the caller's self-service
-    /// view of their own connected clients (`/console/my-sessions`). `error`
-    /// shows a banner after a failed disconnect.
+    /// Render one bounded live-connection page. `own` forces the account filter
+    /// for self-service and also includes the caller's capped durable browser
+    /// logins.
     async fn render_sessions_page(
         state: &AppState,
         headers: &axum::http::HeaderMap,
         account: String,
         own: bool,
+        query: ValidatedLiveConnectionQuery,
         error: Option<String>,
     ) -> Response {
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
         let is_admin = is_admin_account(state, &account);
-        let filter = own.then(|| account.clone());
-        let (sessions, mut error): (Vec<SessionRow>, Option<String>) =
-            match admin_list_sessions(state, filter).await {
-                Ok(list) => (
-                    list.into_iter()
-                        .map(|s| SessionRow {
-                            nick: s.nick,
-                            user: s.user,
-                            host: s.host,
-                            account: s.account,
-                            oper: s.oper,
-                            channels: s.channels.join(", "),
-                        })
-                        .collect(),
-                    error,
-                ),
-                // Surface a snapshot failure as the banner rather than a blank page.
-                Err(msg) => (Vec::new(), Some(error.unwrap_or(msg))),
-            };
+        let page =
+            list_live_connections(state, query.core_query(own.then_some(account.as_str()))).await;
+        let (sessions, next_before_id, mut error) = match page {
+            Ok(page) => (
+                page.entries
+                    .into_iter()
+                    .map(|connection| SessionRow {
+                        id: connection.id,
+                        nick: connection.nick,
+                        user: connection.user,
+                        host: connection.host,
+                        account: connection.account,
+                        oper: connection.oper,
+                        transport: connection.transport.as_str(),
+                        connected_at: e6irc_proto::time::server_time(connection.connected_at),
+                        idle_seconds: connection.idle_seconds,
+                        channels: connection.channels.join(", "),
+                    })
+                    .collect(),
+                page.next_before_id,
+                error,
+            ),
+            // Surface a snapshot failure as the banner rather than a blank page.
+            Err(message) => (Vec::new(), None, Some(error.unwrap_or(message))),
+        };
         let browser_sessions = if own {
             let current = session_token(headers, state.secure_cookies);
             match crate::db::list_web_sessions(pool_of(state), &account, current.as_deref()).await {
@@ -5263,21 +5281,29 @@ mod pages {
         } else {
             Vec::new()
         };
-        let (active, title, hint, kill_action) = if own {
+        let (active, title, hint, disconnect_action) = if own {
             (
                 "my-sessions",
                 "Your sessions",
-                "Clients currently signed in to your account (raw IRC, WebSocket, BNC). Disconnecting one signs it out immediately.",
-                "/console/my-sessions/kill",
+                "Durable browser logins and live IRC connections authenticated to your account. Disconnecting a live connection targets its immutable connection ID.",
+                "/console/my-sessions",
             )
         } else {
             (
                 "sessions",
-                "Client sessions",
-                "Live registered client connections (raw IRC, WebSocket, and BNC attach). Disconnecting one removes it immediately, like the oper KILL.",
-                "/console/sessions/kill",
+                "Live connections",
+                "Bounded, newest-first registered IRC connections across TCP, TLS, WebSocket, and the local in-process network.",
+                "/console/sessions",
             )
         };
+        let nick_filter = query.nick.unwrap_or_default();
+        let account_filter = query.account.unwrap_or_default();
+        let transport_filter = query
+            .transport
+            .map(crate::core::ConnectionTransport::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let oper_filter = query.oper.map(|oper| oper.to_string()).unwrap_or_default();
         render_private(ConsoleSessions {
             account,
             csrf,
@@ -5285,86 +5311,135 @@ mod pages {
             active,
             title,
             hint,
-            kill_action,
+            disconnect_action,
             sessions,
+            has_filters: !nick_filter.is_empty()
+                || !account_filter.is_empty()
+                || !transport_filter.is_empty()
+                || !oper_filter.is_empty(),
+            has_cursor: query.before_id.is_some(),
+            nick_filter,
+            account_filter,
+            transport_filter,
+            oper_filter,
+            limit: query.page_size.value(),
+            next_before_id,
             show_browser_sessions: own,
+            show_account_filter: !own,
             browser_sessions,
             error,
         })
     }
 
-    /// Console → live client sessions (admin-gated, like `/console`).
+    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
+    fn default_live_connection_query() -> Result<ValidatedLiveConnectionQuery, Response> {
+        validate_live_connection_query(LiveConnectionQueryParams::default(), 50)
+    }
+
+    /// Console → bounded live connection directory (admin-gated).
     pub async fn console_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
+        AdminPageActor { account, .. }: AdminPageActor,
+        Query(params): Query<LiveConnectionQueryParams>,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let query = match validate_live_connection_query(params, 50) {
+            Ok(query) => query,
+            Err(response) => return response,
         };
-        if !is_admin_account(&state, &account) {
-            return problem(StatusCode::FORBIDDEN, "Admin only", None);
-        }
-        render_sessions_page(&state, &headers, account, false, None).await
+        render_sessions_page(&state, &headers, account, false, query, None).await
     }
 
-    /// Console → KILL a client session by nick (admin), like oper KILL.
-    pub async fn console_kill_session(
+    /// Console → disconnect an exact live connection (admin), like oper KILL
+    /// after its nick has resolved to one immutable connection.
+    pub async fn console_disconnect_session(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        form: Result<axum::Form<KillForm>, axum::extract::rejection::FormRejection>,
+        Path(connection_id): Path<u64>,
+        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
+        if connection_id == 0 {
+            return problem(StatusCode::BAD_REQUEST, "Invalid live-connection id", None);
+        }
         let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
+            Ok(form) => form,
+            Err(response) => return response,
         };
-        let make = |actor| crate::core::AdminRequest::Kill {
-            nick: f.nick,
-            reason: f.reason,
+        let reason = match validate_disconnect_reason(f.reason) {
+            Ok(reason) => reason,
+            Err(response) => return response,
+        };
+        let make = |actor| crate::core::AdminRequest::DisconnectConnection {
+            connection_id,
+            reason,
             actor,
         };
         match run_admin_form(&state, &headers, &f.csrf, "/console/sessions", make).await {
-            Ok(resp) => resp,
-            Err((account, msg)) => {
-                render_sessions_page(&state, &headers, account, false, Some(msg)).await
+            Ok(response) => response,
+            Err((account, message)) => {
+                let query = match default_live_connection_query() {
+                    Ok(query) => query,
+                    Err(response) => return response,
+                };
+                render_sessions_page(&state, &headers, account, false, query, Some(message)).await
             }
         }
     }
 
-    /// Console → your own sessions (any authenticated user; not admin-gated).
+    /// Console → the caller's capped browser sessions and bounded live
+    /// connections.
     pub async fn console_my_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
+        Query(params): Query<OwnLiveConnectionQueryParams>,
     ) -> Response {
         let Ok(account) = authenticate(&state, &headers).await else {
             return Redirect::to("/login").into_response();
         };
-        render_sessions_page(&state, &headers, account, true, None).await
+        let query = match validate_live_connection_query(params.into(), 50) {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        render_sessions_page(&state, &headers, account, true, query, None).await
     }
 
-    /// Console → disconnect one of *your own* sessions by nick. The core refuses
-    /// to touch a session not authenticated as the caller, so this cannot kill
-    /// anyone else even though it is not admin-gated.
-    pub async fn console_kill_own_session(
+    /// Console → disconnect one exact live connection only if it remains owned
+    /// by the caller.
+    pub async fn console_disconnect_own_session(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        form: Result<axum::Form<KillForm>, axum::extract::rejection::FormRejection>,
+        Path(connection_id): Path<u64>,
+        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
+        if connection_id == 0 {
+            return problem(StatusCode::BAD_REQUEST, "Invalid live-connection id", None);
+        }
         let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let reason = match validate_disconnect_reason(f.reason) {
+            Ok(reason) => reason,
+            Err(response) => return response,
         };
         let account = match require_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
+            Ok(account) => account,
+            Err(response) => return response,
         };
-        let req = crate::core::AdminRequest::KillOwn {
-            nick: f.nick,
-            reason: f.reason,
+        let request = crate::core::AdminRequest::DisconnectOwnConnection {
+            connection_id,
+            reason,
             account: account.clone(),
         };
-        match core_action(&state, req).await {
+        match core_action(&state, request).await {
             Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(msg) => render_sessions_page(&state, &headers, account, true, Some(msg)).await,
+            Err(message) => {
+                let query = match default_live_connection_query() {
+                    Ok(query) => query,
+                    Err(response) => return response,
+                };
+                render_sessions_page(&state, &headers, account, true, query, Some(message)).await
+            }
         }
     }
 
@@ -5374,7 +5449,19 @@ mod pages {
         account: String,
         message: &'static str,
     ) -> Response {
-        render_sessions_page(state, headers, account, true, Some(message.to_owned())).await
+        let query = match default_live_connection_query() {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        render_sessions_page(
+            state,
+            headers,
+            account,
+            true,
+            query,
+            Some(message.to_owned()),
+        )
+        .await
     }
 
     /// Console → revoke one durable browser session owned by the caller.

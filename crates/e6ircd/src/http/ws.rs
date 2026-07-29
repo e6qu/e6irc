@@ -75,7 +75,21 @@ pub(super) async fn ws_irc(
     if let Some(proto) = chosen {
         upgrade = upgrade.protocols([proto]);
     }
-    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode))
+    let conn = match state.next_conn.allocate() {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("ws-irc connection refused: {error}");
+            state
+                .telemetry
+                .record_error(crate::observability::ErrorKind::ConnectionSetup);
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Connection service unavailable",
+                None,
+            );
+        }
+    };
+    upgrade.on_upgrade(move |socket| ws_irc_conn(state, socket, guard, ip, mode, conn))
 }
 
 /// Bridge one WebSocket to the IRC core: each inbound text frame is one
@@ -89,13 +103,12 @@ pub(super) async fn ws_irc_conn(
     _conn_guard: crate::net::ConnGuard,
     ip: std::net::IpAddr,
     mode: WsFrameMode,
+    conn: crate::core::ConnId,
 ) {
-    use crate::core::{ConnId, Input, Output};
+    use crate::core::{Input, Output};
     use e6irc_proto::framing::{LineBuffer, LineEvent};
-    use std::sync::atomic::Ordering;
 
     // Held for the whole connection; its Drop releases the per-IP slot.
-    let conn = ConnId(state.next_conn.fetch_add(1, Ordering::Relaxed));
     let (out_tx, mut out_rx) = e6irc_queue::queue::<Output>(e6irc_queue::Config {
         name: "ws-sendq",
         capacity: state.sendq,
@@ -111,6 +124,7 @@ pub(super) async fn ws_irc_conn(
             // give every WS user the same hostmask, letting a banned user evade
             // KLINE/DLINE through /ws/irc and making per-user host bans impossible.
             host: ip.to_string(),
+            transport: crate::core::ConnectionTransport::WebSocket,
         })
         .await
         .is_err()

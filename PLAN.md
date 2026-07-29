@@ -44,6 +44,21 @@ revocation. Deleting the current session also clears its cookie. Migration
 0040 adds stable resource ids and bounded user-agent storage, while database
 and HTTP tests prove cross-account ids cannot revoke or disclose a session.
 
+Live connection directory and browser-session bounds (2026-07-29): the
+administrator and owner connection views now use a bounded, stable,
+newest-first core query instead of materializing the entire session table.
+Exact RFC1459-folded nick/account, transport, and operator filters are shared by
+the console and the new `/api/v1/admin/connections` and
+`/api/v1/me/connections` resources. Disconnects target the listed immutable
+connection ID and recheck owner scope in the core; they no longer resolve a
+mutable nick that could be reused between rendering and submission. All
+ingress transports share a non-wrapping, randomly boot-seeded allocator, and
+JSON represents IDs/cursors as exact decimal strings. Browser-session issuance
+is serialized per account and retains at most 32 active rows, rolling out the
+oldest on a new login; migration 0044 cleans historical excess/expired rows and
+installs the owner/newest index. Core, HTTP, migration, concurrency, ownership,
+cursor, filter, and stale-resource tests cover the contract.
+
 Audit-log explorer (2026-07-29): privileged actions now have a dedicated
 administrator security-operations page at `/console/audit` instead of an
 unsearchable 100-row dump on the overview. Exact actor/action/target filters
@@ -1871,7 +1886,7 @@ the original vision.
 
 Web-UI sweep 5 — client UX polish + audit-fix (2026-07-27): an adversarial
 audit over the large new console/session/network-edit surface came back with
-**no security defect** (KillOwn ownership scoping, create↔edit validation
+**no security defect** (owner-scoped disconnect authorization, create↔edit validation
 equivalence incl. SSRF-on-edit, CSRF on every mutation, no IDOR/injection/
 panic — all verified). It surfaced one **LOW correctness bug this sweep-series
 introduced**: the IRC-only network edit form was reachable for *bridge*
@@ -1889,18 +1904,18 @@ clippy ×5; all gates.
 Web-UI sweep 4 — per-user session management (2026-07-27): closes the "manage
 your own client connections" gap from the original vision. A new non-admin
 `/console/my-sessions` lists the caller's own SASL-authenticated clients (raw
-IRC / WebSocket / BNC) and can disconnect one. It runs through the core via two
-new `Input::Admin` variants: `ListOwnSessions { account }` (the session snapshot
-filtered to that account) and `KillOwn { nick, account }` — which **refuses to
-kill a session not authenticated as the caller**, so a non-admin cannot touch
-anyone else's session even by guessing a nick. The admin `/console/sessions`
-view and this one share one parameterized template + `render_sessions_page(own)`
+IRC / WebSocket / BNC) and can disconnect one. It runs through the core via the
+same bounded `ListConnections` query and exact `DisconnectOwnConnection`
+mutation used by the REST API; the latter **refuses to disconnect a connection
+not authenticated as the caller**, so a non-admin cannot touch anyone else's
+resource even by guessing an ID. The admin `/console/sessions` view and this
+one share one parameterized template + `render_sessions_page(own)`
 builder. Boy-scout dedup to keep the ratchet green: extracted `parse_form` /
 `parse_json` body-parse helpers (used across the console/JSON POST handlers,
 including a pre-existing credentials↔device clone). Covered by a PG-gated http
 test (`my_sessions_are_scoped_to_the_caller`) that connects two SASL clients
-(alice, bob) and asserts alice sees only her own, cannot kill bob's, and can
-kill her own. Verified locally (Docker back up): full http PG suite 21/21;
+(alice, bob) and asserts alice sees only her own, cannot disconnect bob's, and
+can disconnect her own. Verified locally (Docker back up): full http PG suite 21/21;
 clippy ×5; all gates.
 
 Web-UI sweep 3 — client settings + notifications (2026-07-27, client-only):
@@ -2031,15 +2046,18 @@ back to `/console` (PRG), failures re-render with an error banner. Covered by a
 PG-gated http test (`admin_console_ban_and_channel_actions`) exercising
 add → remove → drop plus the CSRF/anonymous gates.
 
-Phase 3 — live client-sessions view + KILL. A new admin `/console/sessions`
-page lists every live registered client (nick, user@host, account, oper flag,
-channels) as a snapshot of the core's session table, with a KILL button per
-row. Both the snapshot (`AdminRequest::ListSessions` → `AdminReply::Sessions`)
-and the KILL (`AdminRequest::Kill`, reusing the extracted `oper::kill_by_nick`)
-run through the same core `Input::Admin` path, so a console KILL is the exact
-teardown oper KILL performs (audit + snotice + close `ERROR`). Covered by a
-PG-gated http test (`admin_console_lists_and_kills_sessions`) that connects a
-real IRC client, sees it listed, kills it, and confirms the disconnect. The
+Phase 3 — live client-sessions view + disconnect. The admin
+`/console/sessions` page lists bounded pages of live registered clients (ID,
+nick, user@host, account, oper flag, transport, connected/idle posture, and
+channels), with an exact-ID disconnect control per row. Both the snapshot
+(`AdminRequest::ListConnections` → `AdminReply::Connections`) and the
+disconnect (`AdminRequest::DisconnectConnection`, sharing
+`oper::kill_connection`) run through the same core `Input::Admin` path, so a
+console mutation is the exact teardown IRC `KILL` performs (audit + snotice +
+close `ERROR`). Covered by a PG-gated HTTP test
+(`admin_connection_directory_and_disconnect_controls`) that connects real IRC
+clients, filters the JSON directory, disconnects through console and REST, and
+confirms stale identifiers return 404. The
 four console mutation handlers share a `run_admin_form` gate/dispatch helper
 (keeping the copy-paste ratchet green).
 

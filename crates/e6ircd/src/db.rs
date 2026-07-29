@@ -3889,6 +3889,9 @@ impl SessionUserAgent {
     }
 }
 
+/// Maximum unexpired durable browser logins retained for one account.
+pub const MAX_BROWSER_SESSIONS_PER_ACCOUNT: usize = 32;
+
 /// Mint a web session for an account: opaque 32-byte token returned to the
 /// caller; only its SHA-256 is stored. The session expires after 14 days.
 pub async fn create_web_session(
@@ -3923,21 +3926,48 @@ pub async fn create_web_session_with_identity(
     argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
     let token = e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-");
     let folded = CaseMapping::Rfc1459.casefold(account);
-    // Prune expired sessions on write: lookups already filter on `expires_at`,
-    // but nothing else deletes them, so every login otherwise leaks a dead row.
-    sqlx::query("DELETE FROM web_sessions WHERE expires_at <= now()")
-        .execute(pool)
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    // Serialize issuance per account, then retain only the newest cap-1 active
+    // rows before inserting. A count followed by an insert without this lock
+    // lets concurrent logins exceed the cap. Rolling out the oldest login keeps
+    // a credential-owning user able to sign in and recover the account instead
+    // of letting a filled session set permanently lock out the login surface.
+    let account_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
+            .bind(&folded)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(DbError::Query)?;
+    let Some(account_id) = account_id else {
+        return Err(DbError::BadCredentials);
+    };
+    sqlx::query("DELETE FROM web_sessions WHERE account_id = $1 AND expires_at <= now()")
+        .bind(account_id)
+        .execute(&mut *tx)
         .await
         .map_err(DbError::Query)?;
-    let inserted = sqlx::query(
+    sqlx::query(
+        "DELETE FROM web_sessions
+         WHERE account_id = $1 AND id IN (
+             SELECT id FROM web_sessions
+             WHERE account_id = $1 AND expires_at > now()
+             ORDER BY created_at DESC, id DESC
+             OFFSET $2
+         )",
+    )
+    .bind(account_id)
+    .bind((MAX_BROWSER_SESSIONS_PER_ACCOUNT - 1) as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
         "INSERT INTO web_sessions (token_hash, account_id, expires_at, id_token, oidc_provider,
                                    oidc_issuer, oidc_subject, oidc_sid, oidc_email, oidc_role,
                                    user_agent)
-         SELECT $1, a.id, now() + interval '14 days', $3, $4, $5, $6, $7, $8, $9, $10
-         FROM accounts a WHERE a.name_folded = $2",
+         VALUES ($1, $2, now() + interval '14 days', $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(token_hash(&token))
-    .bind(&folded)
+    .bind(account_id)
     .bind(id_token)
     .bind(provider)
     .bind(issuer)
@@ -3946,12 +3976,10 @@ pub async fn create_web_session_with_identity(
     .bind(email)
     .bind(role)
     .bind(user_agent.map(SessionUserAgent::as_str))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
-    if inserted.rows_affected() == 0 {
-        return Err(DbError::BadCredentials);
-    }
+    tx.commit().await.map_err(DbError::Query)?;
     Ok(token)
 }
 
@@ -4132,10 +4160,12 @@ pub async fn list_web_sessions(
          FROM web_sessions s
          JOIN accounts a ON a.id = s.account_id
          WHERE a.name_folded = $1 AND s.expires_at > now()
-         ORDER BY current DESC, s.created_at DESC, s.id DESC",
+         ORDER BY current DESC, s.created_at DESC, s.id DESC
+         LIMIT $3",
     )
     .bind(folded)
     .bind(current_hash)
+    .bind(MAX_BROWSER_SESSIONS_PER_ACCOUNT as i64)
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)

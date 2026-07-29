@@ -110,12 +110,34 @@ pub(crate) fn kill_by_nick(
     let Some(&victim) = state.nicks.get(&key) else {
         return false;
     };
+    kill_connection(state, victim, comment, killer)
+}
+
+/// Disconnect one exact registered connection. HTTP control-plane rows carry
+/// this immutable id, so a delayed form or API request cannot follow a released
+/// nick onto a different client. IRC KILL resolves its nick once and then uses
+/// this same close/audit path.
+pub(crate) fn kill_connection(
+    state: &mut ServerState,
+    victim: ConnId,
+    comment: &str,
+    killer: &str,
+) -> bool {
+    let Some(target) = state
+        .sessions
+        .get(&victim)
+        .filter(|session| session.is_registered())
+        .and_then(|session| session.nick())
+        .map(str::to_owned)
+    else {
+        return false;
+    };
     let reason = format!("Killed ({killer} ({comment}))");
     let server = state.config.server_name.clone();
     // Audit before the close: a self-kill removes the actor's own session, and
     // recording afterwards would resolve the actor to an empty string — an
     // unattributed row in the log whose whole purpose is attribution.
-    record_audit_by(state, killer, "KILL", target, comment);
+    record_audit_by(state, killer, "KILL", &target, comment);
     // Snotice every other oper (the victim, if an oper, is about to be closed).
     notify_opers(
         state,

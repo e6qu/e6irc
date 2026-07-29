@@ -250,6 +250,7 @@ pub(crate) enum Registration {
 pub(crate) struct Session {
     pub tx: Sender<Output>,
     pub host: String,
+    pub transport: crate::core::ConnectionTransport,
     /// Registration state and the identity fields, as one sum type (see
     /// [`Registration`]): a registered connection *has* a nick/user/realname.
     pub reg: Registration,
@@ -1526,13 +1527,20 @@ impl ServerState {
             .filter(|c| self.sessions.get(c).is_some_and(|s| s.is_registered()))
     }
 
-    pub fn open(&mut self, conn: ConnId, tx: Sender<Output>, host: String) {
+    pub fn open(
+        &mut self,
+        conn: ConnId,
+        tx: Sender<Output>,
+        host: String,
+        transport: crate::core::ConnectionTransport,
+    ) {
         let opened_at = (self.config.mono_clock)();
         let prev = self.sessions.insert(
             conn,
             Session {
                 tx,
                 host,
+                transport,
                 reg: Registration::Registering {
                     nick: None,
                     user: None,

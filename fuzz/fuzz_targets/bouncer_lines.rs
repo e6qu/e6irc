@@ -35,7 +35,10 @@ fuzz_target!(|data: &[u8]| {
     // The real pipeline: a stored upstream line is sanitized on the way in and
     // tag-filtered on the way out to a client.
     let sanitized = upstream_line(raw.clone());
-    assert!(!injects(&sanitized), "sanitize left an injectable byte: {sanitized:?}");
+    assert!(
+        !injects(&sanitized),
+        "sanitize left an injectable byte: {sanitized:?}"
+    );
 
     let delivered = filter_tags(&sanitized, caps);
     assert!(

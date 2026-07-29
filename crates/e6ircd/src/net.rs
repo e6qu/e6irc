@@ -11,15 +11,15 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, TlsConfig};
-use crate::core::{ConnId, Core, CoreConfig, Input, Output};
+use crate::core::{ConnId, ConnectionIdAllocator, Core, CoreConfig, Input, Output};
 use crate::observability::{ErrorKind, Telemetry};
 use e6irc_proto::framing::{LineBuffer, LineEvent};
 use e6irc_queue::{Policy, Receiver, Sender, queue};
@@ -32,6 +32,21 @@ const READ_BUF: usize = 4096;
 /// How often the liveness reaper tick fires (seconds); the reaper's own
 /// deadlines are coarse minutes, so a fine tick isn't needed.
 const REAP_TICK_SECS: u64 = 15;
+
+fn random_connection_id_start() -> io::Result<NonZeroU64> {
+    use aws_lc_rs::rand::SecureRandom;
+
+    let mut bytes = [0u8; 8];
+    aws_lc_rs::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| io::Error::other("system RNG failed while seeding connection identifiers"))?;
+    // Keep the top two bits clear: cursor input is parsed as signed SQL-style
+    // int64 at the HTTP boundary, while the remaining 62 random/counter bits
+    // still leave more connection identifiers than one process can consume.
+    let value = (u64::from_le_bytes(bytes) & (u64::MAX >> 2)) | 1;
+    NonZeroU64::new(value)
+        .ok_or_else(|| io::Error::other("connection identifier seed was unexpectedly zero"))
+}
 
 /// Cap on the TLS handshake. `Input::Open` only reaches the core — and thus the
 /// liveness reaper — *after* the handshake completes, so a peer that finishes
@@ -388,7 +403,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // Accept-loop tasks, collected so shutdown can stop admitting connections.
     let mut listeners: Vec<tokio::task::AbortHandle> = Vec::new();
 
-    let next_conn = Arc::new(AtomicU64::new(1));
+    let next_conn = Arc::new(ConnectionIdAllocator::new(random_connection_id_start()?));
 
     // The BNC registry is shared between the HTTP management API (which
     // adds/removes networks) and the BNC listener (which attaches to
@@ -801,7 +816,7 @@ async fn accept_loop(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
     core_tx: Sender<Input>,
-    next_conn: Arc<AtomicU64>,
+    next_conn: Arc<ConnectionIdAllocator>,
     sendq: usize,
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
@@ -827,7 +842,15 @@ async fn accept_loop(
             drop(stream); // closes the socket; the client sees EOF
             continue;
         };
-        let conn = ConnId(next_conn.fetch_add(1, Ordering::Relaxed));
+        let conn = match next_conn.allocate() {
+            Ok(conn) => conn,
+            Err(error) => {
+                eprintln!("refused {peer}: {error}");
+                telemetry.record_error(ErrorKind::ConnectionSetup);
+                drop(stream);
+                continue;
+            }
+        };
         let core_tx = core_tx.clone();
         let tls = tls.clone();
         let telemetry = telemetry.clone();
@@ -849,7 +872,16 @@ async fn accept_loop(
                     .await;
                     match handshake {
                         Ok(Ok(tls_stream)) => {
-                            serve_conn(tls_stream, conn, peer, core_tx, sendq, telemetry).await
+                            serve_conn(
+                                tls_stream,
+                                conn,
+                                peer,
+                                crate::core::ConnectionTransport::Tls,
+                                core_tx,
+                                sendq,
+                                telemetry,
+                            )
+                            .await
                         }
                         Ok(Err(e)) => {
                             telemetry.record_error(ErrorKind::TlsHandshake);
@@ -861,7 +893,18 @@ async fn accept_loop(
                         }
                     }
                 }
-                None => serve_conn(stream, conn, peer, core_tx, sendq, telemetry).await,
+                None => {
+                    serve_conn(
+                        stream,
+                        conn,
+                        peer,
+                        crate::core::ConnectionTransport::Tcp,
+                        core_tx,
+                        sendq,
+                        telemetry,
+                    )
+                    .await
+                }
             }
         });
     }
@@ -871,6 +914,7 @@ async fn serve_conn<S>(
     stream: S,
     conn: ConnId,
     peer: SocketAddr,
+    transport: crate::core::ConnectionTransport,
     core_tx: Sender<Input>,
     sendq: usize,
     telemetry: Arc<Telemetry>,
@@ -895,6 +939,7 @@ async fn serve_conn<S>(
             // tests — a silent ban evasion — and WHOIS would show the mapped
             // spelling. Mirrors the outbound SSRF canonicalization in `networks`.
             host: peer.ip().to_canonical().to_string(),
+            transport,
         })
         .await
         .is_err()
@@ -1097,6 +1142,7 @@ mod tests {
             DeadPeer,
             ConnId(1),
             peer,
+            crate::core::ConnectionTransport::Tcp,
             core_tx,
             8,
             Arc::new(Telemetry::new()),
@@ -1130,6 +1176,7 @@ mod tests {
             DeadPeer,
             ConnId(1),
             peer,
+            crate::core::ConnectionTransport::Tcp,
             core_tx,
             8,
             Arc::new(Telemetry::new()),
@@ -1202,6 +1249,7 @@ mod tests {
                 conn: ConnId(1),
                 tx: out_tx,
                 host: "host.test".into(),
+                transport: crate::core::ConnectionTransport::Tcp,
             })
             .await
             .expect("open");
