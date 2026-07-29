@@ -48,9 +48,9 @@ written against Libera should work unchanged against e6ircd.
   console pages plus a vanilla-JavaScript chat client over `/ws/ui`.
   Account access, registered channels (topics, mode locks, access and
   ownership), BNC networks, integrations, configuration, sessions, traffic,
-  connections, latency, errors, and the filterable privileged-action audit
-  trail are managed and inspected in the UI. The Vite production bundle has no
-  runtime package dependencies.
+  connections, latency, errors, a secret-free account posture directory, and
+  the filterable privileged-action audit trail are managed and inspected in
+  the UI. The Vite production bundle has no runtime package dependencies.
   Static assets deploy either from a CDN or embedded into the binary
   behind the `embed-web` feature.
 - **Cross-platform**: Linux, macOS, and Windows on both x86_64 and

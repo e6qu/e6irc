@@ -196,11 +196,14 @@ These are project-wide rules, enforced in review and (where possible) CI:
     nick/channel validators), each documented with the position it protects
     (prefix / middle / tag / trailing). A new field gets the right rule by
     reaching for the module rather than re-deriving a one-off filter.
-  - `Authenticated`/`AdminAccount` — an HTTP handler is authenticated (or
-    admin-gated) because it *asks for* the extractor in its signature, which
-    runs the check as a precondition of being called. An admin route cannot
-    forget the gate: the ungated handler fails to compile for want of the
-    argument, rather than relying on every handler to open with the same line.
+  - `Authenticated`/`AdminAccount`/`AdminPageActor` — an HTTP handler is
+    authenticated (or admin-gated) because it *asks for* the extractor in its
+    signature, which runs the check as a precondition of being called. JSON
+    routes use API rejection semantics; server-rendered administrator pages use
+    the login redirect plus session-bound CSRF derivation. An admin route or
+    page cannot forget the gate: the ungated handler fails to compile for want
+    of the argument, rather than relying on every handler to open with the same
+    line.
   - `SessionUserAgent` and owner-scoped browser-session queries — login
     provenance is bounded and neutralized exactly once before storage, while
     inventory and revocation always bind both the folded account and the
@@ -211,6 +214,11 @@ These are project-wide rules, enforced in review and (where possible) CI:
     a typed row instead of returning five transposition-prone strings, and an
     invalid zero/oversized page cannot reach SQL or cursor arithmetic. Stable
     `id < before_id` pagination excludes concurrent appends by construction.
+  - `AccountDirectoryRow`/`AccountDirectoryPageSize` — the administrator
+    account read has a typed, secret-free posture projection and a bounded
+    page size. Stable `id < before_id` pagination replaces the former
+    unbounded name dump, while an exact lookup enters storage only through the
+    same RFC1459-folded key used by authentication.
   - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
     `&str`, so two fields cannot be transposed at a call site.
   - `HistoryDbRow` — the history read binds columns by **name**
@@ -836,6 +844,14 @@ Principal tables (columns abridged):
   `(filter, id DESC)` indexes and paginate with `id < before_id`; a concurrently
   appended action is therefore never duplicated into an older page.
 
+Administrator account-directory reads project account age and aggregate login/
+resource counts only. Correlated reads use the child tables' account-owner
+indexes (including `oidc_identities.account_id` and
+`channels.founder_account_id`) and paginate accounts by immutable id. Expired
+browser sessions and personal access tokens are not counted; credential
+hashes, bearer/session hashes, OpenID Connect subjects, and sealed upstream
+secrets are not selected at all.
+
 Write path for messages: producers push to an in-process MPSC; a writer pool
 batches into multi-row `INSERT ... UNNEST` (or COPY for bulk) with group
 commit — one connection cannot stall the chat path on Postgres latency. The
@@ -1181,10 +1197,10 @@ Surface (initial):
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
   canonical MLOCK, access flags, founder transfer, unregister)
 - `history`: paged queries per §11.2
-- `admin`: accounts, global bans (kline-equivalents), server stats,
-  exact-filtered/stable-cursor audit-log query, live/historical observability,
-  Prometheus exposition. Personalized administrator JSON and metrics responses
-  carry `Cache-Control: no-store`.
+- `admin`: bounded, exact-filtered/stable-cursor account posture; global bans
+  (kline-equivalents); server stats; exact-filtered/stable-cursor audit-log
+  query; live/historical observability; Prometheus exposition. Personalized
+  administrator JSON and metrics responses carry `Cache-Control: no-store`.
 - `healthz` (liveness; no auth)
 - `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
 
@@ -1210,7 +1226,11 @@ manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle
 through storage-confirmed core mutations. Empty and unauthorized inventories
 remain distinct from storage failures, and every form is session-CSRF
-protected. The **live chat
+protected. `/console/accounts` gives administrators a newest-first,
+case-insensitive exact-search directory of account age, login-method posture,
+active access, networks, and founded channels. It deliberately shares the
+secret-free projection and stable cursor with `GET /api/v1/admin/accounts`;
+the overview requests only its newest ten rows. The **live chat
 client** is a small hand-written vanilla-JS IRC client (`web/src`,
 bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list

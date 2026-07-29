@@ -249,6 +249,8 @@
       .session-agent { min-width: 14rem; max-width: 30rem; white-space: normal; overflow-wrap: anywhere; }
       .audit-target, .audit-detail { min-width: 10rem; max-width: 28rem; white-space: normal;
         overflow-wrap: anywhere; }
+      .account-posture { min-width: 10rem; white-space: normal; }
+      .account-posture .tag { margin: 0.12rem 0.15rem 0.12rem 0; }
       .pager { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
         margin-top: 1rem; }
       .pager form { margin: 0; }
@@ -326,6 +328,7 @@
         {% if is_admin %}
           <div class="section">Server</div>
           <a href="/console"{% if active == "overview" %} class="active"{% endif %}>Overview</a>
+          <a href="/console/accounts"{% if active == "accounts" %} class="active"{% endif %}>Accounts</a>
           <a href="/console/monitoring"{% if active == "monitoring" %} class="active"{% endif %}>Monitoring</a>
           <a href="/console/audit"{% if active == "audit" %} class="active"{% endif %}>Audit log</a>
           <a href="/console/configuration"{% if active == "configuration" %} class="active"{% endif %}>Configuration</a>

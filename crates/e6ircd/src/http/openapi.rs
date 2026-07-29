@@ -19,6 +19,29 @@ pub(super) async fn openapi() -> Response {
         { "name": "account", "in": "path", "required": true,
             "schema": { "type": "string" } }
     ]);
+    let admin_cursor_parameters = || {
+        vec![
+            serde_json::json!({ "name": "limit", "in": "query",
+                "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
+                    "default": 100 } }),
+            serde_json::json!({ "name": "before_id", "in": "query",
+                "schema": { "type": "integer", "format": "int64", "minimum": 1 } }),
+        ]
+    };
+    let mut account_directory_parameters = admin_cursor_parameters();
+    account_directory_parameters.push(serde_json::json!({
+        "name": "name", "in": "query",
+        "schema": { "type": "string", "maxLength": 64 }
+    }));
+    let mut audit_parameters = admin_cursor_parameters();
+    audit_parameters.extend([
+        serde_json::json!({ "name": "actor", "in": "query",
+            "schema": { "type": "string", "maxLength": 128 } }),
+        serde_json::json!({ "name": "action", "in": "query",
+            "schema": { "type": "string", "maxLength": 64 } }),
+        serde_json::json!({ "name": "target", "in": "query",
+            "schema": { "type": "string", "maxLength": 512 } }),
+    ]);
     let spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -462,8 +485,12 @@ pub(super) async fn openapi() -> Response {
                     "responses": ok_json }
             },
             "/api/v1/admin/accounts": {
-                "get": { "summary": "List all accounts (admin only)", "security": bearer,
-                    "responses": { "200": { "description": "account names" },
+                "get": { "summary": "Filter and page administrator-safe account posture (admin only)",
+                    "description": "Returns stable account IDs newest-first. before_id selects strictly older accounts, so concurrent registration cannot duplicate or skip rows. The optional name filter is exact under RFC1459 case-folding. Counts omit expired browser sessions and personal access tokens; no credential, token, session, identity-subject, or network-secret material is returned.",
+                    "security": bearer,
+                    "parameters": account_directory_parameters,
+                    "responses": { "200": { "description": "account posture entries and next_before_id cursor" },
+                        "400": { "description": "invalid limit, cursor, or exact account filter" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/channels": {
@@ -482,19 +509,7 @@ pub(super) async fn openapi() -> Response {
                 "get": { "summary": "Filter and page the privileged-action audit log (admin only)",
                     "description": "Returns stable audit entry IDs newest-first. before_id selects strictly older entries, so concurrent appends cannot duplicate or skip rows. Actor, action, and target filters are exact.",
                     "security": bearer,
-                    "parameters": [
-                        { "name": "limit", "in": "query",
-                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
-                                "default": 100 } },
-                        { "name": "before_id", "in": "query",
-                            "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
-                        { "name": "actor", "in": "query",
-                            "schema": { "type": "string", "maxLength": 128 } },
-                        { "name": "action", "in": "query",
-                            "schema": { "type": "string", "maxLength": 64 } },
-                        { "name": "target", "in": "query",
-                            "schema": { "type": "string", "maxLength": 512 } }
-                    ],
+                    "parameters": audit_parameters,
                     "responses": { "200": { "description": "audit entries and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, or exact filter" },
                         "403": { "description": "not an admin account" } } }

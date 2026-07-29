@@ -17,6 +17,10 @@ fn audit_page_size(value: usize) -> db::AuditLogPageSize {
     db::AuditLogPageSize::new(value).expect("test audit page size is in range")
 }
 
+fn account_page_size(value: usize) -> db::AccountDirectoryPageSize {
+    db::AccountDirectoryPageSize::new(value).expect("test account page size is in range")
+}
+
 /// `query_history` now returns `Result` (a DB fault is surfaced, not folded
 /// into an empty page); these tests exercise the happy path, so a query error
 /// is a test failure — unwrap it here rather than at every call site.
@@ -3612,6 +3616,122 @@ async fn audit_log_records_and_lists() {
         (&"KLINE".to_string(), &"baddie@*".to_string())
     );
     assert_eq!(&list[1].action, &"OPER".to_string());
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("account_directory_posture_filters_and_cursor_pages_are_stable").await,
+    )
+    .await
+    .expect("connect");
+    for name in ["Alice", "Bob", "Carol"] {
+        db::create_account(&pool, name, "pw")
+            .await
+            .unwrap_or_else(|error| panic!("create {name}: {error}"));
+    }
+    db::issue_app_password_for_account(&pool, "Alice", "desktop")
+        .await
+        .expect("app password");
+    db::issue_api_token(&pool, "Alice", "active")
+        .await
+        .expect("API token");
+    db::create_web_session(&pool, "Alice", None)
+        .await
+        .expect("browser session");
+    assert_eq!(
+        db::link_oidc_identity(&pool, "Alice", "https://issuer.example", "alice-subject")
+            .await
+            .expect("OIDC link"),
+        db::LinkOutcome::Linked
+    );
+    sqlx::query(
+        "WITH account AS (
+             SELECT id FROM accounts WHERE name_folded = 'alice'
+         ), expired_token AS (
+             INSERT INTO api_tokens (token_hash, account_id, label, expires_at)
+             SELECT decode(repeat('ab', 32), 'hex'), id, 'expired',
+                    now() - interval '1 hour' FROM account
+         ), expired_session AS (
+             INSERT INTO web_sessions (token_hash, account_id, expires_at)
+             SELECT decode(repeat('cd', 32), 'hex'), id,
+                    now() - interval '1 hour' FROM account
+         ), network AS (
+             INSERT INTO bnc_networks (account_id, name, addr, nick, kind)
+             SELECT id, 'local', '', 'Alice', 'irc' FROM account
+         )
+         INSERT INTO channels (name, name_folded, founder_account_id)
+         SELECT '#alice', '#alice', id FROM account",
+    )
+    .execute(&pool)
+    .await
+    .expect("posture fixtures");
+
+    let first = db::query_account_directory(
+        &pool,
+        db::AccountDirectoryFilter {
+            before_id: None,
+            exact_name: None,
+            page_size: account_page_size(2),
+        },
+    )
+    .await
+    .expect("first page");
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Carol", "Bob"]
+    );
+    let cursor = first.next_before_id.expect("older page cursor");
+    assert_eq!(cursor, first.entries[1].id);
+
+    db::create_account(&pool, "Dave", "pw")
+        .await
+        .expect("concurrent account");
+    let second = db::query_account_directory(
+        &pool,
+        db::AccountDirectoryFilter {
+            before_id: Some(cursor),
+            exact_name: None,
+            page_size: account_page_size(2),
+        },
+    )
+    .await
+    .expect("second page");
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].name, "Alice");
+    assert!(
+        second.entries.iter().all(|entry| entry.id < cursor),
+        "cursor admitted a newer or duplicate row: {second:#?}"
+    );
+
+    let exact = db::query_account_directory(
+        &pool,
+        db::AccountDirectoryFilter {
+            before_id: None,
+            exact_name: Some("aLiCe"),
+            page_size: account_page_size(10),
+        },
+    )
+    .await
+    .expect("exact account");
+    assert_eq!(exact.entries.len(), 1);
+    let alice = &exact.entries[0];
+    assert!(alice.has_local_password);
+    assert_eq!(alice.app_passwords, 1);
+    assert_eq!(alice.api_tokens, 1, "expired token must not count");
+    assert_eq!(alice.oidc_identities, 1);
+    assert_eq!(
+        alice.browser_sessions, 1,
+        "expired browser session must not count"
+    );
+    assert_eq!(alice.networks, 1);
+    assert_eq!(alice.founded_channels, 1);
+    assert_eq!(exact.next_before_id, None);
 }
 
 #[tokio::test]

@@ -23,7 +23,10 @@
           <div class="card"><div class="n">{{ stat_server_bans }}</div><div class="l">Server bans</div></div>
         </div>
 
-        <h2 id="accounts">Accounts <span class="tag">{{ accounts.len() }}</span></h2>
+        <div class="panel-head list-head">
+          <h2 id="accounts">Newest accounts <span class="tag">latest {{ accounts.len() }}</span></h2>
+          <a class="secondary-link" href="/console/accounts">Explore account directory</a>
+        </div>
         {% if accounts.is_empty() %}
           <p class="empty">No accounts.</p>
         {% else %}
@@ -31,7 +34,7 @@
             <table>
               <thead><tr><th>Name</th></tr></thead>
               <tbody>
-                {% for a in accounts %}<tr><td><code>{{ a }}</code></td></tr>{% endfor %}
+                {% for a in accounts %}<tr><td><code>{{ a.name }}</code></td></tr>{% endfor %}
               </tbody>
             </table>
           </div>

@@ -2235,21 +2235,50 @@ pub struct AuditLogPage {
     pub next_before_id: Option<i64>,
 }
 
-/// A non-zero audit page size capped at the public API's fixed maximum.
-/// Invalid sizes cannot reach SQL or the cursor calculation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuditLogPageSize(usize);
+macro_rules! bounded_page_size {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name(usize);
 
-impl AuditLogPageSize {
-    pub const MAX: usize = 1_000;
+        impl $name {
+            pub const MAX: usize = 1_000;
 
-    pub fn new(value: usize) -> Option<Self> {
-        (1..=Self::MAX).contains(&value).then_some(Self(value))
-    }
+            pub fn new(value: usize) -> Option<Self> {
+                (1..=Self::MAX).contains(&value).then_some(Self(value))
+            }
 
-    pub fn value(self) -> usize {
-        self.0
-    }
+            pub fn value(self) -> usize {
+                self.0
+            }
+        }
+    };
+}
+
+bounded_page_size!(
+    AuditLogPageSize,
+    "A non-zero audit page size capped at the public API maximum."
+);
+
+fn keyset_page<T>(
+    mut entries: Vec<T>,
+    page_size: usize,
+    stable_id: impl Fn(&T) -> i64,
+) -> (Vec<T>, Option<i64>) {
+    let next_before_id = (entries.len() > page_size).then(|| stable_id(&entries[page_size - 1]));
+    entries.truncate(page_size);
+    (entries, next_before_id)
+}
+
+macro_rules! fetch_keyset_page {
+    ($pool:expr, $query:expr, $row:ty, $page_size:expr) => {{
+        let entries: Vec<$row> = $query
+            .build_query_as()
+            .fetch_all($pool)
+            .await
+            .map_err(DbError::Query)?;
+        keyset_page(entries, $page_size, |entry| entry.id)
+    }};
 }
 
 /// Query the privileged-action audit trail newest-first. Exact filters and the
@@ -2282,13 +2311,7 @@ pub async fn query_audit_log(
     query
         .push(" ORDER BY id DESC LIMIT ")
         .push_bind(fetch_limit as i64);
-    let mut entries: Vec<AuditLogRow> = query
-        .build_query_as()
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::Query)?;
-    let next_before_id = (entries.len() > page_size).then(|| entries[page_size - 1].id);
-    entries.truncate(page_size);
+    let (entries, next_before_id) = fetch_keyset_page!(pool, query, AuditLogRow, page_size);
     Ok(AuditLogPage {
         entries,
         next_before_id,
@@ -2669,12 +2692,85 @@ pub async fn server_stats(pool: &PgPool) -> Result<(i64, i64, i64), DbError> {
     .map_err(DbError::Query)
 }
 
-/// Every account's display name, ordered — for the admin API.
-pub async fn list_accounts(pool: &PgPool) -> Result<Vec<String>, DbError> {
-    sqlx::query_scalar("SELECT name FROM accounts ORDER BY name")
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::Query)
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AccountDirectoryRow {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub has_local_password: bool,
+    pub app_passwords: i64,
+    pub api_tokens: i64,
+    pub oidc_identities: i64,
+    pub browser_sessions: i64,
+    pub networks: i64,
+    pub founded_channels: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AccountDirectoryFilter<'a> {
+    pub before_id: Option<i64>,
+    pub exact_name: Option<&'a str>,
+    pub page_size: AccountDirectoryPageSize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AccountDirectoryPage {
+    pub entries: Vec<AccountDirectoryRow>,
+    pub next_before_id: Option<i64>,
+}
+
+bounded_page_size!(
+    AccountDirectoryPageSize,
+    "A non-zero account-directory page size capped at the public API maximum."
+);
+
+/// Query administrator-safe account posture newest-first. No credential hash,
+/// bearer token, session hash, OIDC subject, or sealed network secret crosses
+/// this boundary.
+pub async fn query_account_directory(
+    pool: &PgPool,
+    filter: AccountDirectoryFilter<'_>,
+) -> Result<AccountDirectoryPage, DbError> {
+    let page_size = filter.page_size.value();
+    let fetch_limit = page_size + 1;
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT a.id, a.name,
+                to_char(a.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                EXISTS (
+                    SELECT 1 FROM account_credentials c
+                    WHERE c.account_id = a.id AND c.kind = 'local_password'
+                ) AS has_local_password,
+                (SELECT count(*) FROM account_credentials c
+                 WHERE c.account_id = a.id AND c.kind = 'app_password') AS app_passwords,
+                (SELECT count(*) FROM api_tokens t
+                 WHERE t.account_id = a.id
+                   AND (t.expires_at IS NULL OR t.expires_at > now())) AS api_tokens,
+                (SELECT count(*) FROM oidc_identities i
+                 WHERE i.account_id = a.id) AS oidc_identities,
+                (SELECT count(*) FROM web_sessions s
+                 WHERE s.account_id = a.id AND s.expires_at > now()) AS browser_sessions,
+                (SELECT count(*) FROM bnc_networks n
+                 WHERE n.account_id = a.id) AS networks,
+                (SELECT count(*) FROM channels ch
+                 WHERE ch.founder_account_id = a.id) AS founded_channels
+         FROM accounts a WHERE TRUE",
+    );
+    if let Some(before_id) = filter.before_id {
+        query.push(" AND a.id < ").push_bind(before_id);
+    }
+    if let Some(exact_name) = filter.exact_name {
+        let folded = CaseMapping::Rfc1459.casefold(exact_name);
+        query.push(" AND a.name_folded = ").push_bind(folded);
+    }
+    query
+        .push(" ORDER BY a.id DESC LIMIT ")
+        .push_bind(fetch_limit as i64);
+    let (entries, next_before_id) = fetch_keyset_page!(pool, query, AccountDirectoryRow, page_size);
+    Ok(AccountDirectoryPage {
+        entries,
+        next_before_id,
+    })
 }
 
 /// A fixed argon2id hash used only to spend a verification's worth of CPU on
