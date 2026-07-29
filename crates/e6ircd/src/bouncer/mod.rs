@@ -24,6 +24,7 @@ mod slack;
 
 #[cfg(feature = "discord")]
 pub use discord::{DiscordConfig, DiscordDriver};
+pub(crate) use irc_driver::validate_irc_upstream_addr;
 pub use irc_driver::{IrcNetwork, NetworkConfig};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
@@ -238,11 +239,16 @@ pub(crate) enum SessionOutcome {
     /// in a row, so a mistyped or revoked upstream password can't hammer the
     /// upstream forever every ~30s.
     AuthRejected,
+    /// The upstream rejected IRC registration itself (for example, an invalid
+    /// or occupied nickname or a network ban). Retrying unchanged settings has
+    /// the same hammering problem as bad credentials, but it must not be
+    /// mislabeled as an authentication failure in owner diagnostics.
+    RegistrationRejected,
 }
 
-/// Consecutive upstream auth rejections before a driver stops re-dialing and
-/// parks until the network is reconfigured (which drops the handle and ends it).
-pub(crate) const MAX_CONSECUTIVE_AUTH_FAILURES: u32 = 5;
+/// Consecutive upstream credential or registration rejections before a driver
+/// stops re-dialing and parks until the network is reconfigured.
+pub(crate) const MAX_CONSECUTIVE_REGISTRATION_REJECTIONS: u32 = 5;
 
 /// Depth of the bounded client→upstream command queue per network (shared by all
 /// attached clients). Past this a send is refused (`SendOutcome::Full`) and the
@@ -354,7 +360,7 @@ pub(crate) async fn run_with_backoff<C>(
     session: DriverSession<C>,
 ) {
     let mut backoff = Backoff::new(ends.reconnect_seed);
-    let mut consecutive_auth_failures: u32 = 0;
+    let mut consecutive_rejections: u32 = 0;
     loop {
         // A stop signalled while a session runs is observed inside it (via
         // `next_command`); one signalled while we wait to reconnect is caught
@@ -366,16 +372,27 @@ pub(crate) async fn run_with_backoff<C>(
         let started = tokio::time::Instant::now();
         match session(&config, ends).await {
             SessionOutcome::Stopped => return,
-            SessionOutcome::AuthRejected => {
-                consecutive_auth_failures += 1;
-                if consecutive_auth_failures >= MAX_CONSECUTIVE_AUTH_FAILURES {
-                    ends.emit(ConnectionEvent::AuthenticationFailed);
-                    // Stop hammering an upstream that keeps rejecting the
-                    // credentials; a bad/revoked password won't fix itself on
-                    // retry. Park until the network is reconfigured (which drops
-                    // the handle and returns from `shutdown_signalled`).
+            outcome @ (SessionOutcome::AuthRejected | SessionOutcome::RegistrationRejected) => {
+                let (failure, event) = match outcome {
+                    SessionOutcome::AuthRejected => (
+                        NetworkFailure::AuthenticationRejected,
+                        ConnectionEvent::AuthenticationFailed,
+                    ),
+                    SessionOutcome::RegistrationRejected => (
+                        NetworkFailure::RegistrationRejected,
+                        ConnectionEvent::RegistrationFailed,
+                    ),
+                    _ => unreachable!("matched only terminal rejections"),
+                };
+                ends.classify_error(failure);
+                consecutive_rejections += 1;
+                if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS {
+                    ends.emit(event);
+                    // Stop hammering an upstream that keeps rejecting unchanged
+                    // credentials or registration settings. Park until the
+                    // network is reconfigured (which drops the handle).
                     ends.emit_line(
-                        ":*bnc* NOTICE * :upstream rejected authentication repeatedly; \
+                        ":*bnc* NOTICE * :upstream rejected registration repeatedly; \
                          not reconnecting until this network is reconfigured"
                             .to_string(),
                     );
@@ -389,7 +406,7 @@ pub(crate) async fn run_with_backoff<C>(
             SessionOutcome::Dropped => {
                 // A transient (non-auth) drop: a connection-level failure that
                 // may well recover, so keep retrying and reset the auth counter.
-                consecutive_auth_failures = 0;
+                consecutive_rejections = 0;
                 if !wait_for_reconnect(ends, &mut backoff, started.elapsed()).await {
                     return;
                 }
@@ -715,6 +732,8 @@ pub enum ConnectionEvent {
     Reconnecting,
     /// Repeated credential rejection parked the driver until it is reconfigured.
     AuthenticationFailed,
+    /// Repeated IRC registration rejection parked the driver until reconfigured.
+    RegistrationFailed,
 }
 
 /// A handle to a running, always-on network driver. Events are
@@ -750,6 +769,7 @@ pub enum NetworkLifecycle {
     Connected,
     Reconnecting,
     AuthenticationFailed,
+    RegistrationFailed,
 }
 
 impl NetworkLifecycle {
@@ -759,13 +779,76 @@ impl NetworkLifecycle {
             Self::Connected => "connected",
             Self::Reconnecting => "reconnecting",
             Self::AuthenticationFailed => "authentication_failed",
+            Self::RegistrationFailed => "registration_failed",
+        }
+    }
+}
+
+/// Credential-safe classification of the latest operational failure. Raw
+/// upstream errors can contain provider text (and, for some bridges, request
+/// details), so monitoring exposes this closed vocabulary instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkFailure {
+    ConnectionTimedOut,
+    ConnectionFailed,
+    SecureConnectionFailed,
+    RegistrationTimedOut,
+    RegistrationFailed,
+    RegistrationRejected,
+    AuthenticationRejected,
+    AutojoinFailed,
+    ConnectionLost,
+    KeepaliveTimedOut,
+    UpstreamWriteFailed,
+    CommandQueueFull,
+    DriverStopped,
+}
+
+impl NetworkFailure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ConnectionTimedOut => "connection_timed_out",
+            Self::ConnectionFailed => "connection_failed",
+            Self::SecureConnectionFailed => "secure_connection_failed",
+            Self::RegistrationTimedOut => "registration_timed_out",
+            Self::RegistrationFailed => "registration_failed",
+            Self::RegistrationRejected => "registration_rejected",
+            Self::AuthenticationRejected => "authentication_rejected",
+            Self::AutojoinFailed => "autojoin_failed",
+            Self::ConnectionLost => "connection_lost",
+            Self::KeepaliveTimedOut => "keepalive_timed_out",
+            Self::UpstreamWriteFailed => "upstream_write_failed",
+            Self::CommandQueueFull => "command_queue_full",
+            Self::DriverStopped => "driver_stopped",
+        }
+    }
+
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::ConnectionTimedOut => "The upstream connection timed out.",
+            Self::ConnectionFailed => "The upstream address could not be reached.",
+            Self::SecureConnectionFailed => {
+                "The secure connection failed; check DNS, port, and TLS identity."
+            }
+            Self::RegistrationTimedOut => "The upstream did not finish IRC registration in time.",
+            Self::RegistrationFailed => "The upstream closed or rejected IRC registration.",
+            Self::RegistrationRejected => {
+                "The upstream rejected IRC registration; check the nickname and network policy."
+            }
+            Self::AuthenticationRejected => "The upstream rejected the configured credentials.",
+            Self::AutojoinFailed => "A configured JOIN could not be sent during startup.",
+            Self::ConnectionLost => "The established upstream connection was lost.",
+            Self::KeepaliveTimedOut => "The upstream stopped responding to keepalive checks.",
+            Self::UpstreamWriteFailed => "A line could not be written to the upstream.",
+            Self::CommandQueueFull => "The upstream command queue is full.",
+            Self::DriverStopped => "The network driver is no longer accepting commands.",
         }
     }
 }
 
 /// Owner-safe operational data for one network. It contains counters and
-/// timestamps only—never upstream credentials or raw errors that could echo a
-/// provider response containing secrets.
+/// timestamps plus a closed, credential-safe failure classification—never raw
+/// errors that could echo a provider response containing secrets.
 #[derive(Debug, Clone)]
 pub struct NetworkRuntimeSnapshot {
     pub lifecycle: NetworkLifecycle,
@@ -774,6 +857,7 @@ pub struct NetworkRuntimeSnapshot {
     pub last_input_at: Option<e6irc_proto::time::Millis>,
     pub last_output_at: Option<e6irc_proto::time::Millis>,
     pub last_error_at: Option<e6irc_proto::time::Millis>,
+    pub last_error: Option<NetworkFailure>,
     pub connect_latency_ms: Option<u64>,
     pub connection_attempts: u64,
     pub errors: u64,
@@ -806,6 +890,7 @@ struct NetworkRuntime {
     last_input_at: std::sync::atomic::AtomicU64,
     last_output_at: std::sync::atomic::AtomicU64,
     last_error_at: std::sync::atomic::AtomicU64,
+    last_error: std::sync::Mutex<Option<NetworkFailure>>,
 }
 
 impl NetworkRuntime {
@@ -828,6 +913,7 @@ impl NetworkRuntime {
             last_input_at: std::sync::atomic::AtomicU64::new(0),
             last_output_at: std::sync::atomic::AtomicU64::new(0),
             last_error_at: std::sync::atomic::AtomicU64::new(0),
+            last_error: std::sync::Mutex::new(None),
         }
     }
 
@@ -868,15 +954,11 @@ impl NetworkRuntime {
         );
     }
 
-    fn failed(&self, terminal_authentication_failure: bool) {
+    fn failed(&self, terminal: Option<NetworkLifecycle>) {
         self.operational_error();
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
-        state.lifecycle = if terminal_authentication_failure {
-            NetworkLifecycle::AuthenticationFailed
-        } else {
-            NetworkLifecycle::Reconnecting
-        };
+        state.lifecycle = terminal.unwrap_or(NetworkLifecycle::Reconnecting);
         state.state_changed_at = now;
         state.connected_at = None;
     }
@@ -887,6 +969,10 @@ impl NetworkRuntime {
         let now = epoch_millis();
         self.last_error_at
             .store(now.as_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn classify_error(&self, failure: NetworkFailure) {
+        *self.last_error.lock().expect("network runtime poisoned") = Some(failure);
     }
 
     fn record_input(&self, bytes: usize) {
@@ -1105,10 +1191,13 @@ impl NetworkHandle {
                 SendOutcome::Sent
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.runtime
+                    .classify_error(NetworkFailure::CommandQueueFull);
                 self.runtime.operational_error();
                 SendOutcome::Full
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.runtime.classify_error(NetworkFailure::DriverStopped);
                 self.runtime.operational_error();
                 SendOutcome::Closed
             }
@@ -1188,6 +1277,11 @@ impl NetworkHandle {
             last_input_at: atomic_millis(&self.runtime.last_input_at),
             last_output_at: atomic_millis(&self.runtime.last_output_at),
             last_error_at: atomic_millis(&self.runtime.last_error_at),
+            last_error: *self
+                .runtime
+                .last_error
+                .lock()
+                .expect("network runtime poisoned"),
             connect_latency_ms: state.connect_latency_ms,
             connection_attempts: self
                 .runtime
@@ -1314,6 +1408,13 @@ pub struct DriverEnds {
 }
 
 impl DriverEnds {
+    /// Record a credential-safe diagnostic before emitting a failure event.
+    /// The event owns counters and timestamps; this method owns only the closed
+    /// failure classification exposed by monitoring.
+    pub(crate) fn classify_error(&self, failure: NetworkFailure) {
+        self.runtime.classify_error(failure);
+    }
+
     /// Record a line to the detached buffer and broadcast it live. The line
     /// is neutralized first (see [`crate::sanitize::upstream_line`]) so a bridge that
     /// builds it from free-form remote text cannot inject a second IRC line
@@ -1350,11 +1451,21 @@ impl DriverEnds {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 DriverEvent::Connected
             }
-            ConnectionEvent::Reconnecting | ConnectionEvent::AuthenticationFailed => {
+            ConnectionEvent::Reconnecting
+            | ConnectionEvent::AuthenticationFailed
+            | ConnectionEvent::RegistrationFailed => {
                 self.connected
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                self.runtime
-                    .failed(event == ConnectionEvent::AuthenticationFailed);
+                let terminal = match event {
+                    ConnectionEvent::AuthenticationFailed => {
+                        Some(NetworkLifecycle::AuthenticationFailed)
+                    }
+                    ConnectionEvent::RegistrationFailed => {
+                        Some(NetworkLifecycle::RegistrationFailed)
+                    }
+                    _ => None,
+                };
+                self.runtime.failed(terminal);
                 if let Some(telemetry) = self
                     .telemetry
                     .lock()
@@ -1684,19 +1795,34 @@ mod tests {
         assert_eq!(connected.attached_clients, 1);
         assert!(connected.last_input_at.is_some());
         assert!(connected.last_output_at.is_some());
+        assert_eq!(connected.last_error, None);
         assert!(connected.connect_latency_ms.is_some());
 
         drop(attachment);
+        ends.classify_error(NetworkFailure::ConnectionLost);
         ends.emit(ConnectionEvent::Reconnecting);
         let reconnecting = handle.runtime_snapshot();
         assert_eq!(reconnecting.lifecycle, NetworkLifecycle::Reconnecting);
         assert_eq!(reconnecting.errors, 1);
         assert_eq!(reconnecting.attached_clients, 0);
         assert!(reconnecting.last_error_at.is_some());
+        assert_eq!(
+            reconnecting.last_error,
+            Some(NetworkFailure::ConnectionLost)
+        );
 
         ends.emit(ConnectionEvent::AuthenticationFailed);
         let failed = handle.runtime_snapshot();
         assert_eq!(failed.lifecycle, NetworkLifecycle::AuthenticationFailed);
+
+        ends.classify_error(NetworkFailure::RegistrationRejected);
+        ends.emit(ConnectionEvent::RegistrationFailed);
+        let rejected = handle.runtime_snapshot();
+        assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);
+        assert_eq!(
+            rejected.last_error,
+            Some(NetworkFailure::RegistrationRejected)
+        );
         assert_eq!(failed.errors, 2);
     }
 

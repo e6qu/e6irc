@@ -69,7 +69,15 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
     let connect_fut = connect(config);
     let mut conn = match tokio::time::timeout(Duration::from_secs(30), connect_fut).await {
         Ok(Ok(c)) => c,
-        Ok(Err(_)) | Err(_) => return super::SessionOutcome::Dropped,
+        Ok(Err(_)) => {
+            let failure = if config.tls {
+                super::NetworkFailure::SecureConnectionFailed
+            } else {
+                super::NetworkFailure::ConnectionFailed
+            };
+            return dropped(ends, failure);
+        }
+        Err(_) => return dropped(ends, super::NetworkFailure::ConnectionTimedOut),
     };
     let register_fut = async {
         match &config.sasl {
@@ -87,13 +95,26 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         // connection error, so the reconnect loop can stop re-dialing rather
         // than hammer the upstream with the same rejected credentials forever.
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            ends.classify_error(super::NetworkFailure::AuthenticationRejected);
             return super::SessionOutcome::AuthRejected;
         }
-        Ok(Err(_)) | Err(_) => return super::SessionOutcome::Dropped,
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::Other
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            ends.classify_error(super::NetworkFailure::RegistrationRejected);
+            return super::SessionOutcome::RegistrationRejected;
+        }
+        Ok(Err(_)) => return dropped(ends, super::NetworkFailure::RegistrationFailed),
+        Err(_) => return dropped(ends, super::NetworkFailure::RegistrationTimedOut),
     }
     for chan in &config.autojoin {
         if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
-            return super::SessionOutcome::Dropped;
+            return dropped(ends, super::NetworkFailure::AutojoinFailed);
         }
     }
     ends.emit(ConnectionEvent::Connected);
@@ -123,7 +144,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
                             if conn.send_line(&format!("PONG :{token}")).await.is_err() {
-                                return super::SessionOutcome::Dropped;
+                                return dropped(ends, super::NetworkFailure::UpstreamWriteFailed);
                             }
                             continue;
                         }
@@ -149,15 +170,17 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                 // Only a genuine EOF or a real I/O error ends the session — a
                 // recoverable per-line error is now `Ok(Some((None, _)))` above,
                 // never conflated with the stream ending.
-                Ok(Ok(None)) | Ok(Err(_)) => return super::SessionOutcome::Dropped,
+                Ok(Ok(None)) | Ok(Err(_)) => {
+                    return dropped(ends, super::NetworkFailure::ConnectionLost);
+                }
                 Err(_) => {
                     // Idle past the keepalive window.
                     if awaiting_keepalive {
-                        return super::SessionOutcome::Dropped; // our PING went unanswered → dead
+                        return dropped(ends, super::NetworkFailure::KeepaliveTimedOut);
                     }
                     awaiting_keepalive = true;
                     if conn.send_line("PING :e6bnc-keepalive").await.is_err() {
-                        return super::SessionOutcome::Dropped;
+                        return dropped(ends, super::NetworkFailure::UpstreamWriteFailed);
                     }
                 }
             },
@@ -165,13 +188,18 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
             cmd = ends.next_command() => match cmd {
                 Some(line) => {
                     if conn.send_line(&line).await.is_err() {
-                        return super::SessionOutcome::Dropped;
+                        return dropped(ends, super::NetworkFailure::UpstreamWriteFailed);
                     }
                 }
                 None => return super::SessionOutcome::Stopped, // handle dropped
             },
         }
     }
+}
+
+fn dropped(ends: &DriverEnds, failure: super::NetworkFailure) -> super::SessionOutcome {
+    ends.classify_error(failure);
+    super::SessionOutcome::Dropped
 }
 
 /// Idle gap before the driver sends a keepalive PING (and again before it
@@ -189,29 +217,212 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     // `169.254.169.254` (or a DNS rebind between creation and now) would reach an
     // internal target. Connecting to the specific vetted socket address closes
     // both: resolution can't differ between the check and the connect.
-    let resolved: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host(&config.addr).await?.collect();
-    let Some(vetted) = resolved
-        .into_iter()
-        .find(|sa| !crate::http::networks::is_blocked_upstream_ip(sa.ip()))
-    else {
+    let vetted = interleave_address_families(
+        tokio::net::lookup_host(&config.addr)
+            .await?
+            .filter(|address| !crate::http::networks::is_blocked_upstream_ip(address.ip()))
+            .collect(),
+    );
+    if vetted.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "upstream address resolves only to blocked/internal targets",
         ));
-    };
-    let vetted = vetted.to_string();
-    if config.tls {
-        // Dial the vetted IP but validate the certificate against the configured
-        // hostname (SNI + cert name), so IP-pinning the connection doesn't weaken
-        // TLS identity.
-        let name = config
-            .addr
-            .rsplit_once(':')
-            .map(|(h, _)| h.to_string())
-            .unwrap_or_else(|| config.addr.clone());
-        Connection::connect_tls(&vetted, &name, e6irc_client::webpki_root_store()).await
+    }
+
+    // Try every vetted result. Public round robins commonly return both IPv6
+    // and IPv4; selecting only the first made a host without working IPv6 retry
+    // the same unreachable address forever instead of reaching the IPv4 peer.
+    // Each concrete dial is bounded so one black-holed address cannot consume
+    // the entire outer connection deadline.
+    let server_name = upstream_host(&config.addr)?;
+    let mut last_error = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "upstream resolved addresses were exhausted",
+    );
+    for address in vetted {
+        let stream = match tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                last_error = error;
+                continue;
+            }
+            Err(_) => {
+                last_error = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "concrete upstream address timed out",
+                );
+                continue;
+            }
+        };
+        let connected = if config.tls {
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                Connection::from_tcp_tls(stream, server_name, e6irc_client::webpki_root_store()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TLS handshake to concrete upstream address timed out",
+                )),
+            }
+        } else {
+            Connection::from_tcp(stream)
+        };
+        match connected {
+            Ok(connection) => return Ok(connection),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn interleave_address_families(addresses: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let start_with_ipv6 = addresses.first().is_some_and(std::net::SocketAddr::is_ipv6);
+    let (ipv6, ipv4): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) = addresses
+        .into_iter()
+        .partition(std::net::SocketAddr::is_ipv6);
+    let (mut first, mut second) = if start_with_ipv6 {
+        (ipv6, ipv4)
     } else {
-        Connection::connect(&vetted).await
+        (ipv4, ipv6)
+    };
+    let mut ordered = Vec::with_capacity(first.len() + second.len());
+    while !first.is_empty() || !second.is_empty() {
+        if let Some(address) = first.pop_front() {
+            ordered.push(address);
+        }
+        if let Some(address) = second.pop_front() {
+            ordered.push(address);
+        }
+    }
+    ordered
+}
+
+fn upstream_host(addr: &str) -> std::io::Result<&str> {
+    let (host, port) = if let Some(bracketed) = addr.strip_prefix('[') {
+        let (host, suffix) = bracketed
+            .split_once(']')
+            .ok_or_else(invalid_upstream_addr)?;
+        let port = suffix
+            .strip_prefix(':')
+            .filter(|port| !port.is_empty())
+            .ok_or_else(invalid_upstream_addr)?;
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(invalid_upstream_addr());
+        }
+        (host, port)
+    } else {
+        let (host, port) = addr.rsplit_once(':').ok_or_else(invalid_upstream_addr)?;
+        if host.contains(':') {
+            return Err(invalid_upstream_addr());
+        }
+        (host, port)
+    };
+    if host.is_empty()
+        || host
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'[' | b']'))
+        || port.parse::<u16>().ok().filter(|port| *port != 0).is_none()
+    {
+        return Err(invalid_upstream_addr());
+    }
+    Ok(host)
+}
+
+fn invalid_upstream_addr() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "upstream address must be host:port with a nonzero numeric port",
+    )
+}
+
+/// Syntactic IRC upstream validation shared by configuration and HTTP mutation
+/// paths. DNS and SSRF checks remain dial-time concerns.
+pub(crate) fn validate_irc_upstream_addr(addr: &str) -> bool {
+    upstream_host(addr).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_tls_host_handles_dns_and_bracketed_ipv6() {
+        assert_eq!(
+            upstream_host("irc.libera.chat:6697").expect("DNS host"),
+            "irc.libera.chat"
+        );
+        assert_eq!(
+            upstream_host("[2001:db8::1]:6697").expect("IPv6"),
+            "2001:db8::1"
+        );
+        assert!(upstream_host("missing-port").is_err());
+        assert!(upstream_host("irc.example:not-a-port").is_err());
+        assert!(upstream_host("irc.example:0").is_err());
+        assert!(upstream_host("2001:db8::1:6697").is_err());
+        assert!(upstream_host("[irc.example]:6697").is_err());
+    }
+
+    #[test]
+    fn resolved_addresses_alternate_families_without_reordering_each_family() {
+        let v6a = "[2001:db8::1]:6697".parse().unwrap();
+        let v6b = "[2001:db8::2]:6697".parse().unwrap();
+        let v4a = "192.0.2.1:6697".parse().unwrap();
+        let v4b = "192.0.2.2:6697".parse().unwrap();
+        assert_eq!(
+            interleave_address_families(vec![v6a, v6b, v4a, v4b]),
+            [v6a, v4a, v6b, v4b]
+        );
+        assert_eq!(
+            interleave_address_families(vec![v4a, v4b, v6a, v6b]),
+            [v4a, v6a, v4b, v6b]
+        );
+    }
+
+    /// Exercises the actual always-on driver path (DNS vetting, pinned-IP TLS
+    /// with hostname verification, IRC registration, and lifecycle reporting),
+    /// not only the lower-level client probe in `tests/live_compat.rs`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live network: briefly connects the BNC driver to Libera.Chat"]
+    async fn live_driver_connects_to_libera() {
+        let nick = format!("e6b{:05}", std::process::id() % 100000);
+        let handle = IrcNetwork::start(NetworkConfig {
+            addr: "irc.libera.chat:6697".into(),
+            tls: true,
+            nick,
+            realname: "e6irc BNC interop probe".into(),
+            buffer_cap: 32,
+            ..NetworkConfig::default()
+        });
+
+        let connected = tokio::time::timeout(Duration::from_secs(35), async {
+            loop {
+                let runtime = handle.runtime_snapshot();
+                if runtime.lifecycle == super::super::NetworkLifecycle::Connected {
+                    break runtime;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "Libera driver did not connect: {:?}",
+                handle.runtime_snapshot()
+            )
+        });
+        assert!(connected.connect_latency_ms.is_some());
+        assert!(connected.lines_in > 0, "{connected:?}");
+        assert_eq!(connected.last_error, None, "{connected:?}");
+
+        handle.shutdown();
     }
 }

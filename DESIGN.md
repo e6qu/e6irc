@@ -1034,17 +1034,32 @@ plaintext bootstrap credentials remain authoritative until a master key is
 supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.
 
-The console is also the home of `/console/networks` — a per-user BNC network manager with
-add/remove/enable-disable, and **edit** of an IRC
+The console is also the home of `/console/networks` — a per-user BNC network
+manager with add/remove/enable-disable, and **edit** of an IRC
 network's connection/identity fields (addr, tls, nick, realname, autojoin; SASL
 credentials change via delete+recreate; a bridge is edited on the Integrations
 page, so the IRC edit form refuses non-IRC kinds), available to any
-authenticated user for their own networks. Each network has an owner-scoped
+authenticated user for their own networks. The create form defaults to a
+Libera Chat preset and offers a small, provenance-dated catalog of published
+TLS endpoints (Libera, OFTC, EFnet, Snoonet) plus Custom. A preset's human label
+is never its client/URL identifier: `Libera Chat` maps to the safe stable id
+`libera`. Presets are applied server-side so they work without JavaScript;
+the script only mirrors their fields for editing. Invalid submissions re-render
+the page with the precise shared validation problem and preserve non-secret
+input, including the resolved preset values. IRC addresses must be a syntactic
+`host:port` with a nonzero numeric port (and bracketed IPv6); configuration,
+REST, and console creation share that invariant so an invalid endpoint cannot
+be persisted into an endless reconnect loop. If no master key is configured,
+credential inputs are visibly
+unavailable rather than accepting a password the server must refuse to store.
+
+Each network has an owner-scoped
 operations page refreshed every ten seconds: lifecycle and state-transition
 time, connection age and latency, attempts and errors, attached raw/web
 clients, per-network line/byte traffic, in-memory buffer use, stored backlog
 bounds, and the newest 100 stored lines. `/api/v1/me/networks/{name}` exposes
-the same counters and timestamps without raw errors or credentials. The
+the same counters and timestamps plus the last error as a closed,
+credential-safe code and summary—never raw provider text or credentials. The
 runtime snapshot is held once on `NetworkHandle`, so IRC and every bridge
 driver enter the same measurement path; both raw-IRC and web attachments use
 the counted `send` funnel.
@@ -1060,6 +1075,9 @@ via the console or REST, persisted, and started by the one feature-gated
 startup, DB-network boot, runtime create, re-enable) shares. Per-kind secrecy:
 the password is always sealed; a kind whose *account* field is a secret (Slack's
 bot token) seals that too, while an IRC `sasl_account` login name stays plaintext.
+Create, edit, and enable construct the prospective driver before mutating
+PostgreSQL, so a missing key or factory rejection cannot leave durable state
+claiming a driver configuration that never entered the live registry.
 
 ---
 
@@ -1105,9 +1123,11 @@ one implementation shared with the external-network path.
 - Full IRCv3 *client* implementation reusing `e6irc-proto` + the same SASL
   machinery; requests `server-time`, `message-tags`, `away-notify`, etc.
   from upstream when available (Libera: yes).
-- Auto-reconnect with exponential backoff + jitter, bounded so a repeatedly
-  rejected upstream credential stops re-dialing rather than hammering the
-  upstream forever. On reconnect the driver re-registers and re-joins the
+- Auto-reconnect with exponential backoff + jitter, bounded so repeatedly
+  rejected credentials or IRC registration settings stop re-dialing rather
+  than hammering the upstream forever; authentication and registration
+  rejection have distinct terminal lifecycle states. On reconnect the driver
+  re-registers and re-joins the
   *configured* autojoin channels under the configured nick. A JOIN or NICK
   issued by an attached client changes only the current upstream session;
   persistent reconnect behavior is edited explicitly in the network's stored
@@ -1118,6 +1138,10 @@ one implementation shared with the external-network path.
   instead of retrying a permanently gone core. `Connected` is emitted only
   after registration and configured auto-joins have all reached their
   transport.
+- The dialer vets every DNS answer at connect time, alternates IPv6 and IPv4
+  results while preserving each family's resolver order, bounds each concrete
+  TCP/TLS attempt, and tries the remaining vetted addresses. TLS still validates
+  the certificate against the configured hostname rather than the pinned IP.
 - Primary interop target: Libera (tested against the §7.7 docker stack).
 
 ### 10.4 Attach addressing
@@ -1492,7 +1516,9 @@ Layers, bottom to top:
 4. **Compatibility** (§7.7): the vendored Libera-snapshot ISUPPORT
    differential (offline, in CI); opt-in light-touch live interop tests
    against Libera/OFTC/Ergo; and an optional pinned-Solanum differential
-   oracle under `vendor/tests/external-oracles/` (developer tool, not CI).
+   oracle under `vendor/tests/external-oracles/` (developer tool, not CI). A
+   second opt-in probe drives the actual BNC path through DNS vetting,
+   pinned-address TLS, registration, and lifecycle reporting against Libera.
 5. **Integration**: BNC `irc` driver against an e6ircd upstream
    (reconnect, SASL, playback); OIDC flows against a dockerized Keycloak
    (or dex).

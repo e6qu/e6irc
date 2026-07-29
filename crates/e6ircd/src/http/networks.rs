@@ -4,6 +4,129 @@ use super::*;
 
 // ---- per-account BNC networks -------------------------------------------
 
+/// A safe, user-facing failure from a network mutation. Keeping the problem
+/// fields typed until the HTTP edge lets the JSON API render problem+json while
+/// server-rendered forms show the same precise reason.
+#[derive(Debug)]
+pub(super) struct NetworkMutationError {
+    status: StatusCode,
+    title: &'static str,
+    detail: Option<String>,
+}
+
+impl NetworkMutationError {
+    pub(super) fn new(status: StatusCode, title: &'static str, detail: Option<&str>) -> Self {
+        Self {
+            status,
+            title,
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    pub(super) fn message(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}: {detail}", self.title),
+            None => self.title.to_string(),
+        }
+    }
+
+    pub(super) fn into_response(self) -> Response {
+        problem(self.status, self.title, self.detail.as_deref())
+    }
+}
+
+fn network_error(
+    status: StatusCode,
+    title: &'static str,
+    detail: Option<&str>,
+) -> NetworkMutationError {
+    NetworkMutationError::new(status, title, detail)
+}
+
+/// Normalize the shared result contract of owner-scoped network updates. This
+/// keeps "missing row" and database failure semantics identical across edit
+/// and enable/disable mutations.
+fn require_network_updated(
+    result: Result<bool, crate::db::DbError>,
+    operation: &str,
+) -> Result<(), NetworkMutationError> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(network_error(
+            StatusCode::NOT_FOUND,
+            "No such network",
+            None,
+        )),
+        Err(error) => {
+            eprintln!("http: network {operation}: {error}");
+            Err(network_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ))
+        }
+    }
+}
+
+/// A curated public IRC network whose connection defaults can be selected in
+/// the console. `name` is the stable e6irc selector, deliberately distinct from
+/// the human label so spaces cannot leak into URL/client addressing.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IrcNetworkPreset {
+    pub(super) id: &'static str,
+    pub(super) label: &'static str,
+    pub(super) name: &'static str,
+    pub(super) addr: &'static str,
+    pub(super) tls: bool,
+}
+
+/// Public connection endpoints from the networks' own documentation, verified
+/// 2026-07-29:
+/// - <https://libera.chat/guides/connect>
+/// - <https://www.oftc.net/>
+/// - <https://www.efnet.org/>
+/// - <https://snoonet.org/help/>
+///
+/// Keep this catalog small and authoritative: a stale preset is worse than
+/// making a custom endpoint explicit.
+pub(super) const IRC_NETWORK_PRESETS: &[IrcNetworkPreset] = &[
+    IrcNetworkPreset {
+        id: "libera",
+        label: "Libera Chat",
+        name: "libera",
+        addr: "irc.libera.chat:6697",
+        tls: true,
+    },
+    IrcNetworkPreset {
+        id: "oftc",
+        label: "OFTC",
+        name: "oftc",
+        addr: "irc.oftc.net:6697",
+        tls: true,
+    },
+    IrcNetworkPreset {
+        id: "efnet",
+        label: "EFnet",
+        name: "efnet",
+        addr: "irc.efnet.org:6697",
+        tls: true,
+    },
+    IrcNetworkPreset {
+        id: "snoonet",
+        label: "Snoonet",
+        name: "snoonet",
+        addr: "irc.snoonet.org:6697",
+        tls: true,
+    },
+];
+
+pub(super) fn irc_network_preset(id: &str) -> Option<IrcNetworkPreset> {
+    IRC_NETWORK_PRESETS
+        .iter()
+        .copied()
+        .find(|preset| preset.id == id)
+}
+
 #[derive(Deserialize)]
 pub(super) struct CreateNetwork {
     /// Driver kind; defaults to `irc`. A bridge kind requires its build feature.
@@ -36,6 +159,10 @@ fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json:
         "last_input_at": timestamp(runtime.last_input_at),
         "last_output_at": timestamp(runtime.last_output_at),
         "last_error_at": timestamp(runtime.last_error_at),
+        "last_error": runtime.last_error.map(|error| serde_json::json!({
+            "code": error.code(),
+            "summary": error.summary(),
+        })),
         "connect_latency_ms": runtime.connect_latency_ms,
         "connection_attempts": runtime.connection_attempts,
         "errors": runtime.errors,
@@ -178,7 +305,7 @@ pub(super) async fn create_network(
                 .to_string(),
         )
             .into_response(),
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
@@ -267,21 +394,19 @@ pub(super) fn network_name_ok(name: &str) -> bool {
 /// `autojoin`, rejects CR/LF/NUL in them (a line-injection primitive into the
 /// upstream NICK/USER/JOIN), and refuses an obviously-internal `addr` (SSRF).
 /// Does *not* check presence — a bridge kind legitimately has no addr/nick.
-// Err carries a full problem Response, as everywhere in this module's validators.
-#[allow(clippy::result_large_err)]
 pub(super) fn check_upstream_bounds(
     addr: &str,
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
-) -> Result<(), Response> {
+) -> Result<(), NetworkMutationError> {
     if addr.len() > 255
         || nick.len() > 64
         || realname.is_some_and(|r| r.len() > 128)
         || autojoin.len() > 64
         || autojoin.iter().any(|c| c.len() > 64)
     {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Field too long",
             Some("network fields exceed their length bounds"),
@@ -293,14 +418,14 @@ pub(super) fn check_upstream_bounds(
         || realname.is_some_and(has_control)
         || autojoin.iter().any(|c| has_control(c))
     {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Invalid character",
             Some("nick, realname and autojoin must not contain CR, LF or NUL"),
         ));
     }
     if upstream_addr_is_internal(addr) {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Disallowed upstream address",
             Some(
@@ -313,18 +438,24 @@ pub(super) fn check_upstream_bounds(
 
 /// Full validation for an IRC upstream's connection/identity fields (create and
 /// edit): `addr`/`nick` required, plus the shared [`check_upstream_bounds`].
-#[allow(clippy::result_large_err)]
 pub(super) fn validate_irc_upstream(
     addr: &str,
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
-) -> Result<(), Response> {
+) -> Result<(), NetworkMutationError> {
     if addr.is_empty() || nick.is_empty() {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Missing required fields",
             Some("addr and nick are required"),
+        ));
+    }
+    if !crate::bouncer::validate_irc_upstream_addr(addr) {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid upstream address",
+            Some("addr must be host:port with a nonzero numeric port; bracket IPv6 addresses"),
         ));
     }
     check_upstream_bounds(addr, nick, realname, autojoin)
@@ -345,49 +476,66 @@ pub(super) async fn update_network_core(
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
-) -> Result<(), Response> {
+) -> Result<(), NetworkMutationError> {
     validate_irc_upstream(addr, nick, realname, autojoin)?;
     let pool = pool_of(state);
     // This form edits IRC connection/identity fields; a bridge (matrix/discord/
     // slack) has no such fields and its credentials change via delete+recreate.
     // Refuse to overwrite a non-IRC row's addr/nick/etc. through it (a direct
     // POST to the edit URL, since the UI hides the link for bridges).
-    match crate::db::get_bnc_network(pool, account, name).await {
+    let mut row = match crate::db::get_bnc_network(pool, account, name).await {
         Ok(Some(row)) if row.kind != crate::config::NetworkKind::Irc => {
-            return Err(problem(
+            return Err(network_error(
                 StatusCode::BAD_REQUEST,
                 "Not an IRC network",
                 Some("bridges are managed on the Integrations page, not edited here"),
             ));
         }
-        Ok(Some(_)) => {}
-        Ok(None) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Err(network_error(
+                StatusCode::NOT_FOUND,
+                "No such network",
+                None,
+            ));
+        }
         Err(e) => {
             eprintln!("http: network update kind check: {e}");
-            return Err(problem(
+            return Err(network_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",
                 None,
             ));
         }
+    };
+
+    // Construct the prospective live driver before changing durable state.
+    // Missing/corrupt sealed credentials can therefore never leave the edited
+    // database row disagreeing with the still-running old driver.
+    row.addr = addr.to_string();
+    row.tls = tls;
+    row.nick = nick.to_string();
+    row.realname = realname.map(str::to_string);
+    row.autojoin = autojoin.to_vec();
+    let driver = if row.enabled {
+        Some(
+            crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account).map_err(
+                |error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)),
+            )?,
+        )
+    } else {
+        None
+    };
+
+    require_network_updated(
+        crate::db::update_bnc_network(pool, account, name, addr, tls, nick, realname, autojoin)
+            .await,
+        "update failed",
+    )?;
+    if let Some(driver) = driver {
+        registry.add(Some(account), name, driver);
     }
-    match crate::db::update_bnc_network(pool, account, name, addr, tls, nick, realname, autojoin)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
-        Err(e) => {
-            eprintln!("http: network update: {e}");
-            return Err(problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
-    }
-    // Rebuild the live driver from the now-updated row so the new settings take
-    // effect (replacing the running driver when enabled).
-    reconcile_network_driver(state, registry, account, name).await
+    Ok(())
 }
 
 pub(super) async fn create_network_core(
@@ -395,10 +543,10 @@ pub(super) async fn create_network_core(
     registry: &crate::bouncer::Registry,
     account: &str,
     req: &CreateNetwork,
-) -> Result<(), Response> {
+) -> Result<(), NetworkMutationError> {
     // The name is the client-facing /network selector; see network_name_ok.
     if !network_name_ok(&req.name) {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Invalid network name",
             Some(
@@ -412,7 +560,7 @@ pub(super) async fn create_network_core(
     // is not creatable as a bouncer network — reject up front (before any insert)
     // rather than persist a row whose driver could never start.
     if !kind_feature_available(kind) {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Unsupported network kind",
             Some(match kind {
@@ -433,7 +581,7 @@ pub(super) async fn create_network_core(
         NetworkKind::Local => true,
     };
     if missing {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Missing required fields for this network kind",
             Some(match kind {
@@ -452,7 +600,11 @@ pub(super) async fn create_network_core(
     // subset shared with the edit path). `addr`/`nick`/`realname`/`autojoin` are
     // interpolated into NICK/USER/JOIN lines, so a CR/LF/NUL there is a
     // line-injection primitive; `addr` is SSRF-vetted; all are length-bounded.
-    check_upstream_bounds(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
+    if kind == NetworkKind::Irc {
+        validate_irc_upstream(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
+    } else {
+        check_upstream_bounds(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
+    }
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
     // sealed-secret size cap) are checked here rather than in the shared helper.
@@ -461,7 +613,7 @@ pub(super) async fn create_network_core(
         || req.sasl_account.as_ref().is_some_and(|a| a.len() > 255)
         || req.sasl_password.as_ref().is_some_and(|p| p.len() > 512)
     {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Field too long",
             Some("network fields exceed their length bounds"),
@@ -470,7 +622,7 @@ pub(super) async fn create_network_core(
     if req.sasl_account.as_deref().is_some_and(has_control)
         || req.sasl_password.as_deref().is_some_and(has_control)
     {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Invalid character",
             Some("SASL fields must not contain CR, LF or NUL"),
@@ -480,7 +632,7 @@ pub(super) async fn create_network_core(
     // secret). Bridges don't follow that rule — their required fields are checked
     // above — so this only applies to IRC.
     if kind == NetworkKind::Irc && req.sasl_account.is_some() != req.sasl_password.is_some() {
-        return Err(problem(
+        return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Incomplete upstream SASL",
             Some("provide both sasl_account and sasl_password, or neither"),
@@ -497,7 +649,7 @@ pub(super) async fn create_network_core(
         (Some(k), _) => Some(k),
         (None, false) => None,
         (None, true) => {
-            return Err(problem(
+            return Err(network_error(
                 StatusCode::CONFLICT,
                 "No master key configured",
                 Some("the server cannot store upstream credentials without [secrets]"),
@@ -516,6 +668,21 @@ pub(super) async fn create_network_core(
         ),
         other => other.clone(),
     };
+
+    // Build before inserting. A factory rejection must not create durable state
+    // that then depends on a best-effort compensating delete.
+    let driver = crate::bouncer::build_driver(
+        kind,
+        req.addr.clone(),
+        req.tls,
+        req.nick.clone(),
+        req.realname.clone().unwrap_or_else(|| req.nick.clone()),
+        req.autojoin.clone(),
+        1000,
+        req.sasl_account.clone(),
+        req.sasl_password.clone(),
+    )
+    .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))?;
 
     let row = crate::db::BncNetworkRow {
         kind,
@@ -537,14 +704,14 @@ pub(super) async fn create_network_core(
     match crate::db::create_bnc_network(pool, account, &row).await {
         Ok(_) => {}
         Err(crate::db::DbError::TooManyNetworks) => {
-            return Err(problem(
+            return Err(network_error(
                 StatusCode::CONFLICT,
                 "Network limit reached",
                 Some("this account has reached its maximum number of networks"),
             ));
         }
         Err(crate::db::DbError::DuplicateNetwork(_)) => {
-            return Err(problem(
+            return Err(network_error(
                 StatusCode::CONFLICT,
                 "Network already exists",
                 None,
@@ -552,41 +719,13 @@ pub(super) async fn create_network_core(
         }
         Err(e) => {
             eprintln!("http: network create failed: {e}");
-            return Err(problem(
+            return Err(network_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",
                 None,
             ));
         }
     }
-
-    // Build the driver from the *plaintext* creds (the row stored the sealed
-    // forms) via the one feature-gated factory. Feature availability was checked
-    // up front, so an error here is unexpected — undo the insert rather than
-    // leave a row whose driver never started.
-    let driver = match crate::bouncer::build_driver(
-        kind,
-        req.addr.clone(),
-        req.tls,
-        req.nick.clone(),
-        req.realname.clone().unwrap_or_else(|| req.nick.clone()),
-        req.autojoin.clone(),
-        1000,
-        req.sasl_account.clone(),
-        req.sasl_password.clone(),
-    ) {
-        Ok(driver) => driver,
-        Err(e) => {
-            if let Err(re) = crate::db::delete_bnc_network(pool, account, &req.name).await {
-                eprintln!("http: rollback after driver-build failure failed: {re}");
-            }
-            return Err(problem(
-                StatusCode::CONFLICT,
-                "Cannot start network",
-                Some(&e),
-            ));
-        }
-    };
     registry.add(Some(account), &req.name, driver);
     Ok(())
 }
@@ -665,86 +804,54 @@ pub(super) struct PatchNetwork {
     pub(super) enabled: bool,
 }
 
-/// Persist a network's enabled flag and start (enable) or stop (disable) its
-/// always-on driver, rolling the flag back if a re-enabled driver can't be
-/// built. Config and buffers are untouched — a disabled network can be
-/// re-enabled later. Returns `Err(response)` (a problem+json) on any failure.
-/// Shared by the REST `PATCH` and the console toggle button.
-/// Load `account`'s network `name` from the DB and reconcile its live driver
-/// with the persisted state: (re)build and install the driver when the row is
-/// enabled — `registry.add` stops and replaces any running driver — or stop it
-/// when disabled. `Err(problem)` if the row is gone or the driver can't build.
-/// Shared by enable/disable and edit, both of which need the running driver to
-/// match the stored row.
-async fn reconcile_network_driver(
-    state: &AppState,
-    registry: &crate::bouncer::Registry,
-    account: &str,
-    name: &str,
-) -> Result<(), Response> {
-    let pool = pool_of(state);
-    let row = match crate::db::get_bnc_network(pool, account, name).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
-        Err(e) => {
-            eprintln!("http: network reload failed: {e}");
-            return Err(problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
-    };
-    if row.enabled {
-        match crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account) {
-            Ok(driver) => registry.add(Some(account), name, driver),
-            Err(e) => {
-                return Err(problem(
-                    StatusCode::CONFLICT,
-                    "Cannot start network",
-                    Some(&e),
-                ));
-            }
-        }
-    } else {
-        registry.remove(Some(account), name);
-    }
-    Ok(())
-}
-
+/// Persist a network's enabled flag and start or stop its always-on driver.
+/// Enabling builds from the stored row first, so a missing key/factory failure
+/// cannot require a compensating database rollback.
 pub(super) async fn set_network_enabled_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
     account: &str,
     name: &str,
     enabled: bool,
-) -> Result<(), Response> {
+) -> Result<(), NetworkMutationError> {
     let pool = pool_of(state);
 
-    // Persist the flag first; a miss means the caller owns no such network.
-    match crate::db::set_bnc_network_enabled(pool, account, name, enabled).await {
-        Ok(true) => {}
-        Ok(false) => return Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
-        Err(e) => {
-            eprintln!("http: network enable/disable failed: {e}");
-            return Err(problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
-    }
+    let driver = if enabled {
+        let row = match crate::db::get_bnc_network(pool, account, name).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                return Err(network_error(
+                    StatusCode::NOT_FOUND,
+                    "No such network",
+                    None,
+                ));
+            }
+            Err(error) => {
+                eprintln!("http: network enable lookup failed: {error}");
+                return Err(network_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ));
+            }
+        };
+        Some(
+            crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account).map_err(
+                |error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)),
+            )?,
+        )
+    } else {
+        None
+    };
 
-    if let Err(resp) = reconcile_network_driver(state, registry, account, name).await {
-        // A freshly-*enabled* network whose driver can't start leaves the flag
-        // disagreeing with reality — roll it back. (The disable path removes a
-        // driver and cannot fail to "start".)
-        if enabled
-            && let Err(re) = crate::db::set_bnc_network_enabled(pool, account, name, false).await
-        {
-            eprintln!("http: failed to roll back enable after start error: {re}");
-        }
-        return Err(resp);
+    require_network_updated(
+        crate::db::set_bnc_network_enabled(pool, account, name, enabled).await,
+        "enable/disable failed",
+    )?;
+    if let Some(driver) = driver {
+        registry.add(Some(account), name, driver);
+    } else {
+        registry.remove(Some(account), name);
     }
     Ok(())
 }
@@ -760,8 +867,10 @@ pub(super) async fn patch_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    if let Err(r) = set_network_enabled_core(&state, registry, &account, &name, req.enabled).await {
-        return r;
+    if let Err(error) =
+        set_network_enabled_core(&state, registry, &account, &name, req.enabled).await
+    {
+        return error.into_response();
     }
     (
         [(header::CONTENT_TYPE, "application/json")],
@@ -799,7 +908,59 @@ pub(super) async fn delete_network(
 
 #[cfg(test)]
 mod tests {
-    use super::{network_name_ok, upstream_addr_is_internal};
+    use super::{
+        IRC_NETWORK_PRESETS, network_name_ok, runtime_json, upstream_addr_is_internal,
+        validate_irc_upstream,
+    };
+
+    #[test]
+    fn runtime_json_exposes_only_the_safe_failure_classification() {
+        let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
+        ends.classify_error(crate::bouncer::NetworkFailure::SecureConnectionFailed);
+        ends.emit(crate::bouncer::ConnectionEvent::Reconnecting);
+        let json = runtime_json(&handle.runtime_snapshot());
+        assert_eq!(
+            json["last_error"]["code"], "secure_connection_failed",
+            "{json}"
+        );
+        assert_eq!(
+            json["last_error"]["summary"],
+            "The secure connection failed; check DNS, port, and TLS identity.",
+            "{json}"
+        );
+        assert!(
+            json.get("raw_error").is_none(),
+            "raw provider errors must never enter the owner API: {json}"
+        );
+    }
+
+    #[test]
+    fn public_irc_presets_are_safe_tls_endpoints() {
+        assert!(
+            IRC_NETWORK_PRESETS
+                .iter()
+                .any(|preset| preset.id == "libera"),
+            "Libera is the primary interop target"
+        );
+        for preset in IRC_NETWORK_PRESETS {
+            assert_eq!(preset.id, preset.name);
+            assert!(network_name_ok(preset.name), "{preset:?}");
+            assert!(preset.tls, "public preset must default to TLS: {preset:?}");
+            assert!(
+                preset.addr.ends_with(":6697"),
+                "preset must include its secure IRC port: {preset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_irc_upstream_is_rejected_before_it_can_be_persisted() {
+        for addr in ["irc.example", "irc.example:0", "irc.example:not-a-port"] {
+            let error = validate_irc_upstream(addr, "alice", None, &[])
+                .expect_err("malformed address must fail");
+            assert!(error.message().contains("host:port"), "{addr}: {error:?}");
+        }
+    }
 
     #[test]
     fn network_name_charset_is_restricted() {

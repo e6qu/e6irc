@@ -16,6 +16,36 @@ SET options) is now fully built and tested — the only open work is the two
 environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
 ⛔ blocked (reason).
 
+IRC network creation and post-merge audit (2026-07-29): the console no longer
+suggests the invalid selector `Libera Chat` and then returns a bare
+problem+json page for rejecting its space. The add form now defaults to the
+stable `libera` identifier and verified `irc.libera.chat:6697` TLS endpoint,
+offers server-enforced Libera/OFTC/EFnet/Snoonet presets plus Custom, pre-fills
+the caller's nick, preserves non-secret input on failure, and renders the exact
+shared validation reason. Configuration, REST, and UI creation now also reject
+malformed IRC addresses before persistence unless they are `host:port` with a
+nonzero numeric port (bracketed for IPv6). The form makes the absence of a
+credential-sealing master key explicit before accepting SASL input.
+
+The runtime audit fixed the second Libera failure class: the IRC dialer had
+vetted all DNS results but selected only the first, so an unreachable IPv6
+answer could prevent trying a working IPv4 answer forever. It now alternates
+address families, bounds each concrete TCP/TLS attempt, and tries every vetted
+result while retaining hostname certificate verification. A new opt-in live
+test drives the actual always-on BNC driver through Libera TLS registration.
+Owner diagnostics now include a closed, credential-safe failure code/summary
+for connection, TLS, registration, SASL, autojoin, keepalive, writes, and queue
+failures; raw provider errors remain excluded. Authentication and IRC
+registration rejection have distinct parked lifecycle states.
+
+Create/edit/enable now build the prospective driver before changing durable
+state. This removes best-effort compensating deletes/rollbacks and makes a
+missing key or driver-factory rejection unable to leave PostgreSQL and the live
+registry disagreeing. The JSON API and every server-rendered network/bridge form
+share a typed mutation error, so one path can no longer lose details the other
+keeps. Verified with unit/API serialization tests, the real Libera driver,
+database-backed console/storage lifecycle tests, and the full repository gates.
+
 OIDC provider interoperability (2026-07-28): back-channel logout now accepts
 the generic `typ: JWT` emitted by Hydra as well as the recommended
 `typ: logout+jwt` and an omitted type. Tokens explicitly typed for another
@@ -866,8 +896,9 @@ display-cased account name that the registry and the persistence task use —
 an ownerless (operator-configured) one, so another account's network is not
 reachable. The networks API returns `has_sasl_password` rather than the sealed
 credential. Disable and delete both stop the driver rather than leaving it
-running behind a flag, and a failed enable rolls the flag back so it cannot
-claim a state the server is not in.
+running behind a flag. Enable now constructs the prospective driver before
+persisting the flag, so a failed build cannot claim a state the server is not
+in and needs no compensating rollback.
 
 Twenty-third sweep — driver SPI and registry key made unmistakable
 (2026-07-22): sweep 22 hardened the buffer's *restore* path and closed by noting
@@ -2173,8 +2204,9 @@ kind** before building: the password is always sealed, and a kind whose *account
 field is a secret (Slack's `xoxb-` bot token) seals that too, while an IRC
 `sasl_account` login name stays plaintext. `create_network_core` grew per-kind
 required-field validation, an up-front feature-availability gate (so a row is
-never persisted for a driver that can't start), and matching per-kind sealing; on
-the rare post-insert driver-build failure it rolls the row back.
+never persisted for a driver that can't start), and matching per-kind sealing.
+Driver construction now precedes the insert, so a factory failure has no row to
+roll back.
 
 Because `CreateNetwork` gained a `kind` field, the REST create endpoint supports
 bridges immediately. The console `/console/integrations` page became a real
@@ -5271,8 +5303,8 @@ not built yet. Ranked by value:
    driver's handle, or null when no handle is live) and an `enabled` flag;
    **`PATCH /me/networks/{name}` `{enabled}`** pauses/resumes a network —
    persisting the flag (migration 0016), stopping or rebuilding its driver
-   (skipped at boot while disabled), rolling the flag back if a stored
-   secret can't be opened. Fixing this surfaced and repaired a latent bug:
+   (skipped at boot while disabled), and opening stored secrets before the
+   durable enable write so failure needs no rollback. Fixing this surfaced and repaired a latent bug:
    the buffer-persistence task held a strong driver handle, so `remove`
    never actually stopped a driver (delete leaked it too) — the registry
    now aborts that task on remove/replace. `me/tokens` list/delete are
