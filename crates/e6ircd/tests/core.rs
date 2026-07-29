@@ -107,6 +107,14 @@ impl TestServer {
     }
 
     fn connect(&mut self, id: u64) -> ConnId {
+        self.connect_with_transport(id, e6ircd::core::ConnectionTransport::Tcp)
+    }
+
+    fn connect_with_transport(
+        &mut self,
+        id: u64,
+        transport: e6ircd::core::ConnectionTransport,
+    ) -> ConnId {
         let conn = ConnId(id);
         let (tx, rx) = queue(Config {
             name: "test-sendq",
@@ -117,6 +125,7 @@ impl TestServer {
             conn,
             tx,
             host: format!("host{id}.example"),
+            transport,
         });
         self.conns.push((conn, rx));
         conn
@@ -168,6 +177,18 @@ fn identify(s: &mut TestServer, conn: ConnId, account: &str) {
         },
     });
     s.drain(conn);
+}
+
+fn core_admin(
+    server: &mut TestServer,
+    request: e6ircd::core::AdminRequest,
+) -> e6ircd::core::AdminReply {
+    let (reply, mut result) = tokio::sync::oneshot::channel();
+    server.core.handle(Input::Admin {
+        req: request,
+        reply,
+    });
+    result.try_recv().expect("synchronous admin reply")
 }
 
 fn commit_server_ban(s: &mut TestServer) -> e6ircd::core::ServerBanMutation {
@@ -5314,6 +5335,7 @@ fn fresh_session_flood_bucket_starts_full_regardless_of_uptime() {
         conn,
         tx,
         host: "h".into(),
+        transport: e6ircd::core::ConnectionTransport::Tcp,
     });
     for line in ["NICK alice", "USER a 0 * :A"] {
         core.handle(Input::Line {
@@ -5388,6 +5410,7 @@ fn account_creation_is_rate_limited_per_ip() {
         conn,
         tx,
         host: "shared-ip".into(),
+        transport: e6ircd::core::ConnectionTransport::Tcp,
     });
     for line in ["NICK alice", "USER a 0 * :A", "REGISTER * * pw"] {
         core.handle(Input::Line {
@@ -5463,6 +5486,7 @@ fn hot_history_ring_is_lru_evicted() {
         conn,
         tx,
         host: "h".into(),
+        transport: e6ircd::core::ConnectionTransport::Tcp,
     });
     for line in [
         "CAP LS 302",
@@ -7372,6 +7396,7 @@ fn history_logmessage_gated_on_database() {
             conn,
             tx,
             host: "h".into(),
+            transport: e6ircd::core::ConnectionTransport::Tcp,
         });
         for line in ["NICK a", "USER a 0 * :A", "JOIN #c", "PRIVMSG #c :hello"] {
             core.handle(Input::Line {
@@ -9970,4 +9995,148 @@ fn echo_message_covers_messages_to_services() {
         !s.drain(bob).iter().any(|l| l.contains("PRIVMSG NickServ")),
         "no echo without echo-message"
     );
+}
+
+#[test]
+fn live_connection_pages_are_bounded_filterable_and_stable() {
+    use e6ircd::core::{
+        AdminReply, ConnectionTransport, LiveConnectionPageSize, LiveConnectionQuery,
+    };
+
+    let mut server = TestServer::new();
+    let register = |server: &mut TestServer, id, nick, transport| {
+        let connection = server.connect_with_transport(id, transport);
+        server.line(connection, &format!("NICK {nick}"));
+        server.line(connection, &format!("USER {nick} 0 * :Real {nick}"));
+        server.drain(connection);
+        connection
+    };
+    let alice = register(&mut server, 10, "Alice", ConnectionTransport::Tcp);
+    identify(&mut server, alice, "AliceAccount");
+    let bob = register(&mut server, 20, "Bob", ConnectionTransport::WebSocket);
+    identify(&mut server, bob, "BobAccount");
+    let carol = register(&mut server, 30, "Carol", ConnectionTransport::Local);
+    server.line(carol, "OPER god letmein");
+    server.drain(carol);
+
+    let query = |before_id, page_size| LiveConnectionQuery {
+        before_id,
+        exact_nick: None,
+        exact_account: None,
+        transport: None,
+        oper: None,
+        page_size: LiveConnectionPageSize::new(page_size).expect("valid test page size"),
+    };
+    let AdminReply::Connections(first) = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::ListConnections {
+            query: query(None, 2),
+        },
+    ) else {
+        panic!("expected live-connection page");
+    };
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [30, 20]
+    );
+    assert_eq!(first.next_before_id, Some(20));
+    assert_eq!(first.entries[0].transport, ConnectionTransport::Local);
+    assert_eq!(first.entries[0].idle_seconds, 0);
+
+    // A new connection accepted after page one is newer than its cursor and
+    // therefore cannot duplicate into page two.
+    register(&mut server, 40, "Delta", ConnectionTransport::Tls);
+    let AdminReply::Connections(second) = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::ListConnections {
+            query: query(first.next_before_id, 2),
+        },
+    ) else {
+        panic!("expected second live-connection page");
+    };
+    assert_eq!(
+        second
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [10]
+    );
+    assert_eq!(second.next_before_id, None);
+
+    for filtered in [
+        LiveConnectionQuery {
+            exact_nick: Some("bOB".into()),
+            ..query(None, 10)
+        },
+        LiveConnectionQuery {
+            exact_account: Some("aliceaccount".into()),
+            ..query(None, 10)
+        },
+        LiveConnectionQuery {
+            transport: Some(ConnectionTransport::Tls),
+            ..query(None, 10)
+        },
+        LiveConnectionQuery {
+            oper: Some(true),
+            ..query(None, 10)
+        },
+    ] {
+        let AdminReply::Connections(page) = core_admin(
+            &mut server,
+            e6ircd::core::AdminRequest::ListConnections { query: filtered },
+        ) else {
+            panic!("expected filtered live-connection page");
+        };
+        assert_eq!(page.entries.len(), 1);
+    }
+}
+
+#[test]
+fn immutable_connection_disconnect_cannot_follow_a_reused_nick() {
+    use e6ircd::core::{AdminReply, ConnectionTransport};
+
+    let mut server = TestServer::new();
+    let old = server.register(10, "reused");
+    server.core.handle(Input::Closed {
+        conn: old,
+        reason: "gone".into(),
+    });
+    let replacement = server.connect_with_transport(20, ConnectionTransport::Tls);
+    server.line(replacement, "NICK reused");
+    server.line(replacement, "USER reused 0 * :Replacement");
+    server.drain(replacement);
+
+    let stale = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::DisconnectConnection {
+            connection_id: old.0,
+            reason: "stale form".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(matches!(stale, AdminReply::ConnectionMissing));
+
+    // The replacement still owns the nick and answers normally.
+    server.line(replacement, "PING :alive");
+    assert!(
+        server
+            .drain(replacement)
+            .iter()
+            .any(|line| line.contains(" PONG "))
+    );
+
+    let exact = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::DisconnectConnection {
+            connection_id: replacement.0,
+            reason: "exact resource".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(matches!(exact, AdminReply::Ok(_)));
 }

@@ -96,6 +96,7 @@ fn our_isupport() -> HashMap<String, String> {
         conn,
         tx,
         host: "h".into(),
+        transport: e6ircd::core::ConnectionTransport::Tcp,
     });
     core.handle(Input::Line {
         conn,

@@ -219,7 +219,9 @@ async fn control_response(
             "Channel change rejected",
             Some(&message),
         ),
-        Ok(crate::core::AdminReply::Sessions(_)) => problem(
+        Ok(
+            crate::core::AdminReply::Connections(_) | crate::core::AdminReply::ConnectionMissing,
+        ) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Unexpected core response",
             None,

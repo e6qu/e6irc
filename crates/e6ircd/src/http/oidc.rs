@@ -900,7 +900,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for Authenticated {
 /// omit. (Admin gating was a convention every `admin_*` handler had to open
 /// with; this makes the ungated admin handler fail to compile for want of an
 /// argument, the same way [`Authenticated`] did for authentication.)
-pub(crate) struct AdminAccount;
+pub(crate) struct AdminAccount(pub(crate) String);
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
     type Rejection = Response;
@@ -909,12 +909,10 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        // The gate is the point; the admin's name is discarded because no admin
-        // read endpoint needs it. A future audited admin *action* that wants the
-        // actor can carry it then.
-        require_admin(state, &parts.headers)
-            .await
-            .map(|_account| AdminAccount)
+        // Keep the resolved account in the typed gate: read handlers may ignore
+        // it, while audited mutations can attribute the actor without
+        // authenticating a second time along a divergent path.
+        require_admin(state, &parts.headers).await.map(AdminAccount)
     }
 }
 

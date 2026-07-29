@@ -57,6 +57,18 @@ fn csrf_from_html(html: &str) -> &str {
         .expect("csrf token in page")
 }
 
+fn body_connection_id(html: &str, prefix: &str) -> u64 {
+    html.match_indices(prefix)
+        .filter_map(|(offset, _)| {
+            html[offset + prefix.len()..]
+                .split('/')
+                .next()
+                .and_then(|segment| segment.parse().ok())
+        })
+        .next()
+        .expect("immutable connection id in page action")
+}
+
 fn login_state_from_html(html: &str) -> &str {
     html.split("name=\"login_state\" value=\"")
         .nth(1)
@@ -582,6 +594,48 @@ async fn openapi_spec_is_served() {
                 .any(|parameter| parameter["name"] == name),
             "OpenAPI audit query is missing {name}"
         );
+    }
+    let admin_connection_parameters = v["paths"]["/api/v1/admin/connections"]["get"]["parameters"]
+        .as_array()
+        .expect("admin live-connection query parameters");
+    for name in ["limit", "before_id", "nick", "account", "transport", "oper"] {
+        assert!(
+            admin_connection_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI admin live-connection query is missing {name}"
+        );
+    }
+    let own_connection_parameters = v["paths"]["/api/v1/me/connections"]["get"]["parameters"]
+        .as_array()
+        .expect("owner live-connection query parameters");
+    for name in ["limit", "before_id", "nick", "transport", "oper"] {
+        assert!(
+            own_connection_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI owner live-connection query is missing {name}"
+        );
+    }
+    assert!(
+        !own_connection_parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "account"),
+        "owner query must not advertise a cross-account filter"
+    );
+    for path in [
+        "/api/v1/admin/connections/{id}",
+        "/api/v1/me/connections/{id}",
+    ] {
+        let parameters = v["paths"][path]["delete"]["parameters"]
+            .as_array()
+            .expect("connection mutation parameters");
+        for name in ["id", "reason"] {
+            assert!(
+                parameters.iter().any(|parameter| parameter["name"] == name),
+                "OpenAPI {path} mutation is missing {name}"
+            );
+        }
     }
     assert!(v["paths"]["/api/v1/me/identities/{id}"]["delete"].is_object());
     assert!(v["paths"]["/api/v1/me/password"]["put"].is_object());
@@ -2866,21 +2920,27 @@ async fn admin_console_ban_and_channel_actions() {
     assert!(head.to_lowercase().contains("location: /login"), "{head}");
 }
 
-/// Admin console live-sessions view + KILL: a connected IRC client shows up in
-/// the sessions list and can be disconnected from the console.
+/// The administrator connection API and console expose immutable connection
+/// ids and the console disconnects that exact resource.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn admin_console_lists_and_kills_sessions() {
-    let url = support::test_db("admin_console_lists_and_kills_sessions").await;
+async fn admin_connection_directory_and_disconnect_controls() {
+    let url = support::test_db("admin_connection_directory_and_disconnect_controls").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
     e6ircd::db::create_account(&pool, "alice", "pw")
         .await
         .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
     let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
+    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
+        .await
+        .expect("bob session");
     drop(pool);
 
     let config = Config {
@@ -2903,12 +2963,31 @@ async fn admin_console_lists_and_kills_sessions() {
     let running = net::start(config).await.expect("start");
     let irc = running.addrs[0];
     let http = running.http_addr.expect("http");
+    let authenticated_get = |path: &str, cookie: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={cookie}\r\n\
+             Connection: close\r\n\r\n"
+        )
+    };
+
+    let (status, _, _) = request(http, &get("/api/v1/admin/connections")).await;
+    assert_eq!(status, 401);
+    let (status, _, _) = request(
+        http,
+        &authenticated_get("/api/v1/admin/connections", &bob_session),
+    )
+    .await;
+    assert_eq!(status, 403);
 
     // A client connects and registers, so it is a live session.
     let mut victim = e6irc_client::Connection::connect(&irc.to_string())
         .await
         .expect("tcp");
     victim.register("victim", "v").await.expect("register");
+    let mut peer = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("peer tcp");
+    peer.register("peer", "p").await.expect("register peer");
 
     let sessions_req = format!(
         "GET /console/sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -2933,11 +3012,66 @@ async fn admin_console_lists_and_kills_sessions() {
     }
     assert!(listed, "victim session not listed");
     assert!(!csrf.is_empty(), "no csrf on sessions page");
+    let api_req = format!(
+        "GET /api/v1/admin/connections?limit=1&nick=VICTIM&transport=tcp HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, api_head, api_body) = request(http, &api_req).await;
+    assert_eq!(status, 200, "{api_body}");
+    assert!(
+        api_head
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{api_head}"
+    );
+    let api: serde_json::Value = serde_json::from_str(&api_body).expect("connection JSON");
+    let connection_id = api["connections"][0]["id"]
+        .as_str()
+        .expect("exact decimal connection id")
+        .parse::<u64>()
+        .expect("connection id");
+    assert_eq!(api["connections"][0]["nick"], "victim");
+    assert_eq!(api["connections"][0]["transport"], "tcp");
+    assert!(api["connections"][0]["connected_at"].is_string());
+    assert!(api["connections"][0]["idle_seconds"].is_u64());
 
-    // KILL it from the console -> 303 back to the sessions view.
-    let body = "csrf=CSRF&nick=victim&reason=cleanup".replace("CSRF", &csrf);
+    let newest_page = authenticated_get("/api/v1/admin/connections?limit=1", &session);
+    let (status, _, body) = request(http, &newest_page).await;
+    assert_eq!(status, 200, "{body}");
+    let newest: serde_json::Value = serde_json::from_str(&body).expect("newest page");
+    assert_eq!(newest["connections"][0]["nick"], "peer");
+    let cursor = newest["next_before_id"]
+        .as_str()
+        .expect("exact decimal next-page cursor");
+    let older_page = authenticated_get(
+        &format!("/api/v1/admin/connections?limit=1&before_id={cursor}"),
+        &session,
+    );
+    let (status, _, body) = request(http, &older_page).await;
+    assert_eq!(status, 200, "{body}");
+    let older: serde_json::Value = serde_json::from_str(&body).expect("older page");
+    assert_eq!(older["connections"][0]["nick"], "victim");
+
+    for path in [
+        "/api/v1/admin/connections?limit=0",
+        "/api/v1/admin/connections?limit=1001",
+        "/api/v1/admin/connections?before_id=0",
+        "/api/v1/admin/connections?transport=udp",
+        "/api/v1/admin/connections?oper=yes",
+    ] {
+        let (status, head, body) = request(http, &authenticated_get(path, &session)).await;
+        assert_eq!(status, 400, "{path}: {body}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: application/problem+json"),
+            "{head}"
+        );
+    }
+
+    // Disconnect the exact immutable resource from the console -> 303.
+    let body = "csrf=CSRF&reason=cleanup".replace("CSRF", &csrf);
     let kill = format!(
-        "POST /console/sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+        "POST /console/sessions/{connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
@@ -2959,7 +3093,7 @@ async fn admin_console_lists_and_kills_sessions() {
     .expect("victim was not disconnected");
     assert!(killed);
 
-    // It no longer appears in the sessions list.
+    // It no longer appears in the live-connection list.
     let mut gone = false;
     for _ in 0..40 {
         let (_, _, body) = request(http, &sessions_req).await;
@@ -2969,7 +3103,48 @@ async fn admin_console_lists_and_kills_sessions() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(gone, "victim still listed after kill");
+    assert!(gone, "victim still listed after disconnect");
+
+    // The JSON mutation targets the same immutable resource and a repeated
+    // request reports the now-stale identifier instead of succeeding twice.
+    let mut api_victim = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("second tcp client");
+    api_victim
+        .register("api-victim", "v")
+        .await
+        .expect("register second client");
+    let api_lookup = format!(
+        "GET /api/v1/admin/connections?nick=api-victim HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let api_connection_id = loop {
+        let (status, _, body) = request(http, &api_lookup).await;
+        assert_eq!(status, 200, "{body}");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("connection page");
+        if let Some(id) = value["connections"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row["id"].as_str())
+            .and_then(|id| id.parse::<u64>().ok())
+        {
+            break id;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let delete = format!(
+        "DELETE /api/v1/admin/connections/{api_connection_id}?reason=api-cleanup HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &delete).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{head}"
+    );
+    let (status, _, body) = request(http, &delete).await;
+    assert_eq!(status, 404, "{body}");
 }
 
 /// The per-user sessions view lists only the caller's own SASL-authenticated
@@ -3056,12 +3231,36 @@ async fn my_sessions_are_scoped_to_the_caller() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(ok && !csrf.is_empty(), "alice's own session not listed");
+    let alice_connection_id =
+        body_connection_id(&request(http, &page_req).await.2, "/console/my-sessions/");
 
-    // Attempt to kill bob's session by nick -> refused (not the caller's); bob
-    // stays connected.
-    let kill_bob = format!("csrf={csrf}&nick=bobcli&reason=x");
+    // The next accepted IRC connection belongs to Bob. Guessing its immutable
+    // id is still refused because owner authorization is re-checked in core.
+    let bob_connection_id = alice_connection_id + 1;
+    let owner_api = format!(
+        "GET /api/v1/me/connections?nick=ALICECLI&transport=tcp HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &owner_api).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{head}"
+    );
+    let owner_page: serde_json::Value = serde_json::from_str(&body).expect("owner connection page");
+    assert_eq!(owner_page["connections"].as_array().map(Vec::len), Some(1));
+    assert_eq!(owner_page["connections"][0]["nick"], "alicecli");
+    let delete_bob_api = format!(
+        "DELETE /api/v1/me/connections/{bob_connection_id}?reason=nope HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &delete_bob_api).await;
+    assert_eq!(status, 404, "{body}");
+
+    let kill_bob = format!("csrf={csrf}&reason=x");
     let kb = format!(
-        "POST /console/my-sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+        "POST /console/my-sessions/{bob_connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{kill_bob}",
         kill_bob.len()
@@ -3087,10 +3286,48 @@ async fn my_sessions_are_scoped_to_the_caller() {
     .unwrap_or(false);
     assert!(bob_alive, "bob was wrongly disconnected by alice");
 
-    // Killing alice's own session works -> 303 and the client is disconnected.
-    let kill_me = format!("csrf={csrf}&nick=alicecli&reason=bye");
+    let mut alice_api_cli = e6irc_client::Connection::connect(&irc.to_string())
+        .await
+        .expect("alice API tcp");
+    alice_api_cli
+        .register_sasl("aliceapi", "A", "alice", "s3cr3t")
+        .await
+        .expect("alice API SASL");
+    let alice_api_lookup = format!(
+        "GET /api/v1/me/connections?nick=aliceapi HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let alice_api_connection_id = loop {
+        let (status, _, body) = request(http, &alice_api_lookup).await;
+        assert_eq!(status, 200, "{body}");
+        let page: serde_json::Value = serde_json::from_str(&body).expect("owner API page");
+        if let Some(id) = page["connections"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row["id"].as_str())
+        {
+            break id.to_owned();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let delete_alice_api = format!(
+        "DELETE /api/v1/me/connections/{alice_api_connection_id}?reason=owner-api HTTP/1.1\r\n\
+         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, head, body) = request(http, &delete_alice_api).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{head}"
+    );
+    let (status, _, body) = request(http, &delete_alice_api).await;
+    assert_eq!(status, 404, "{body}");
+
+    // Disconnecting alice's original session works -> 303.
+    let kill_me = format!("csrf={csrf}&reason=bye");
     let km = format!(
-        "POST /console/my-sessions/kill HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+        "POST /console/my-sessions/{alice_connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{kill_me}",
         kill_me.len()

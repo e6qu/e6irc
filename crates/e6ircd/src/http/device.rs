@@ -159,7 +159,7 @@ pub(super) async fn require_admin(
 }
 
 #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-fn bounded_admin_page_size<T>(
+pub(super) fn bounded_admin_page_size<T>(
     requested: Option<usize>,
     default_limit: usize,
     make: impl FnOnce(usize) -> Option<T>,
@@ -171,7 +171,7 @@ fn bounded_admin_page_size<T>(
 }
 
 #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-fn positive_admin_cursor(
+pub(super) fn positive_admin_cursor(
     before_id: Option<i64>,
     invalid_title: &'static str,
     detail: &'static str,
@@ -187,7 +187,7 @@ fn positive_admin_cursor(
 }
 
 #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-fn printable_exact_filter(
+pub(super) fn printable_exact_filter(
     value: Option<String>,
     maximum_bytes: usize,
     invalid_title: &'static str,

@@ -19,11 +19,14 @@ pub(super) async fn openapi() -> Response {
         { "name": "account", "in": "path", "required": true,
             "schema": { "type": "string" } }
     ]);
+    let page_limit_parameter = || {
+        serde_json::json!({ "name": "limit", "in": "query",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
+                "default": 100 } })
+    };
     let admin_cursor_parameters = || {
         vec![
-            serde_json::json!({ "name": "limit", "in": "query",
-                "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
-                    "default": 100 } }),
+            page_limit_parameter(),
             serde_json::json!({ "name": "before_id", "in": "query",
                 "schema": { "type": "integer", "format": "int64", "minimum": 1 } }),
         ]
@@ -56,12 +59,42 @@ pub(super) async fn openapi() -> Response {
         serde_json::json!({ "name": "target", "in": "query",
             "schema": { "type": "string", "maxLength": 512 } }),
     ]);
+    let connection_cursor_parameters = || {
+        vec![
+            page_limit_parameter(),
+            serde_json::json!({ "name": "before_id", "in": "query",
+                "schema": { "type": "string", "pattern": "^[1-9][0-9]*$" } }),
+        ]
+    };
+    let mut own_connection_parameters = connection_cursor_parameters();
+    own_connection_parameters.extend([
+        serde_json::json!({ "name": "nick", "in": "query",
+            "schema": { "type": "string", "maxLength": 64 } }),
+        serde_json::json!({ "name": "transport", "in": "query",
+            "schema": { "type": "string",
+                "enum": ["tcp", "tls", "websocket", "local"] } }),
+        serde_json::json!({ "name": "oper", "in": "query",
+            "schema": { "type": "boolean" } }),
+    ]);
+    let mut admin_connection_parameters = own_connection_parameters.clone();
+    admin_connection_parameters.push(serde_json::json!({
+        "name": "account", "in": "query",
+        "schema": { "type": "string", "maxLength": 64 }
+    }));
+    let connection_mutation_parameters = || {
+        vec![
+            serde_json::json!({ "name": "id", "in": "path", "required": true,
+                "schema": { "type": "string", "pattern": "^[1-9][0-9]*$" } }),
+            serde_json::json!({ "name": "reason", "in": "query",
+                "schema": { "type": "string", "maxLength": 300 } }),
+        ]
+    };
     let spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
             "title": "e6irc REST API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Account, credential, and BNC-network management for e6ircd.",
+            "description": "Account, connection, policy, monitoring, credential, and BNC-network management for e6ircd.",
         },
         "components": {
             "securitySchemes": {
@@ -108,7 +141,7 @@ pub(super) async fn openapi() -> Response {
             "/api/v1/me/sessions": {
                 "get": {
                     "summary": "List your active browser sessions",
-                    "description": "Returns owner-scoped stable IDs, creation/expiry times, login method, provider, bounded User-Agent provenance, and whether a row is the request's current cookie session. Session tokens and hashes are never returned.",
+                    "description": "Returns at most 32 owner-scoped stable IDs, creation/expiry times, login method, provider, bounded User-Agent provenance, and whether a row is the request's current cookie session. A new login atomically revokes the oldest active row at the cap. Session tokens and hashes are never returned.",
                     "security": bearer,
                     "responses": {
                         "200": { "description": "unexpired browser sessions, current first" },
@@ -127,6 +160,34 @@ pub(super) async fn openapi() -> Response {
                         "204": { "description": "session revoked" },
                         "404": { "description": "session does not exist or belongs to another account" },
                         "503": { "description": "database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/connections": {
+                "get": {
+                    "summary": "Filter and page your live IRC connections",
+                    "description": "Returns only registered connections currently authenticated to the caller. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. IDs identify exact live resources; before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
+                    "security": bearer,
+                    "parameters": own_connection_parameters,
+                    "responses": {
+                        "200": { "description": "owner-scoped connection posture and next_before_id cursor" },
+                        "400": { "description": "invalid limit, cursor, or exact filter" },
+                        "401": { "description": "authentication required" },
+                        "503": { "description": "live core unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/connections/{id}": {
+                "delete": {
+                    "summary": "Disconnect one of your exact live IRC connections",
+                    "description": "Core ownership is rechecked against the authenticated account at mutation time. Another account's or a stale ID is indistinguishable from a missing resource.",
+                    "security": bearer,
+                    "parameters": connection_mutation_parameters(),
+                    "responses": {
+                        "204": { "description": "connection disconnected" },
+                        "400": { "description": "invalid ID or reason" },
+                        "404": { "description": "connection is stale, missing, or belongs to another account" },
+                        "503": { "description": "live core unavailable" }
                     }
                 }
             },
@@ -506,6 +567,35 @@ pub(super) async fn openapi() -> Response {
                     "responses": { "200": { "description": "account posture entries and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, or exact account filter" },
                         "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/connections": {
+                "get": {
+                    "summary": "Filter and page all live IRC connections (admin only)",
+                    "description": "Returns a bounded newest-first projection of registered clients across TCP, TLS, WebSocket, and the local in-process transport. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. Nick and account filters use RFC1459 case-folding. before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
+                    "security": bearer,
+                    "parameters": admin_connection_parameters,
+                    "responses": {
+                        "200": { "description": "connection posture entries and next_before_id cursor" },
+                        "400": { "description": "invalid limit, cursor, or exact filter" },
+                        "403": { "description": "not an admin account" },
+                        "503": { "description": "live core unavailable" }
+                    }
+                }
+            },
+            "/api/v1/admin/connections/{id}": {
+                "delete": {
+                    "summary": "Disconnect one exact live IRC connection (admin only)",
+                    "description": "Targets the immutable connection resource rather than resolving a mutable nick. The shared core disconnect path emits the terminal ERROR, operator notice, and audit record.",
+                    "security": bearer,
+                    "parameters": connection_mutation_parameters(),
+                    "responses": {
+                        "204": { "description": "connection disconnected" },
+                        "400": { "description": "invalid ID or reason" },
+                        "403": { "description": "not an admin account" },
+                        "404": { "description": "stale or missing connection" },
+                        "503": { "description": "live core unavailable" }
+                    }
+                }
             },
             "/api/v1/admin/channels": {
                 "get": { "summary": "Filter and page registered-channel policy (admin only)",

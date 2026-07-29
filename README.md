@@ -35,9 +35,11 @@ written against Libera should work unchanged against e6ircd.
   conformance-tested against the [irctest](https://github.com/progval/irctest)
   suite in CI and live-verified against Libera/OFTC/Ergo.
 - **HTTP layer**: local-account and OIDC code+PKCE multi-provider login,
-  opaque and individually revocable browser sessions, primary-password
-  rotation, personal access tokens, an OpenAPI 3.1 spec, and
-  IRCv3-over-WebSocket — all in-process on an optional listener.
+  opaque and individually revocable browser sessions with a concurrent-safe
+  per-account cap, bounded administrator/owner live-connection directories
+  with exact-resource disconnects, primary-password rotation, personal access
+  tokens, an OpenAPI 3.1 spec, and IRCv3-over-WebSocket — all in-process on an
+  optional listener.
 - **BNC**: per-account always-on networks with backlog persistence and
   replay, SASL to upstreams, encrypted credential storage, and a pluggable
   driver SPI. Each network exposes owner-scoped lifecycle, connection latency,
@@ -47,11 +49,11 @@ written against Libera should work unchanged against e6ircd.
 - **Web client**: server-rendered login, self-service, and operational
   console pages plus a vanilla-JavaScript chat client over `/ws/ui`.
   Account access, registered channels (topics, mode locks, access and
-  ownership), BNC networks, integrations, configuration, sessions, traffic,
-  connections, latency, errors, secret-free account posture, registered-channel
-  policy, K/D/X-line policy, and the privileged-action audit trail are managed
-  and inspected through bounded, filterable UI workflows. The Vite production
-  bundle has no runtime package dependencies.
+  ownership), BNC networks, integrations, configuration, browser sessions,
+  live connections, traffic, latency, errors, secret-free account posture,
+  registered-channel policy, K/D/X-line policy, and the privileged-action audit
+  trail are managed and inspected through bounded, filterable UI workflows.
+  The Vite production bundle has no runtime package dependencies.
   Static assets deploy either from a CDN or embedded into the binary
   behind the `embed-web` feature.
 - **Cross-platform**: Linux, macOS, and Windows on both x86_64 and
