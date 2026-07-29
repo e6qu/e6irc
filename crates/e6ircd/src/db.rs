@@ -2210,21 +2210,108 @@ pub async fn insert_audit_log(
     insert_audit_log_with(pool, actor, action, target, detail).await
 }
 
-/// The most recent `limit` audit entries as `(actor, action, target,
-/// detail, created_at RFC3339)`, newest first — for the admin API.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AuditLogRow {
+    pub id: i64,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub detail: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AuditLogFilter<'a> {
+    pub before_id: Option<i64>,
+    pub actor: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub target: Option<&'a str>,
+    pub page_size: AuditLogPageSize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuditLogPage {
+    pub entries: Vec<AuditLogRow>,
+    pub next_before_id: Option<i64>,
+}
+
+/// A non-zero audit page size capped at the public API's fixed maximum.
+/// Invalid sizes cannot reach SQL or the cursor calculation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditLogPageSize(usize);
+
+impl AuditLogPageSize {
+    pub const MAX: usize = 1_000;
+
+    pub fn new(value: usize) -> Option<Self> {
+        (1..=Self::MAX).contains(&value).then_some(Self(value))
+    }
+
+    pub fn value(self) -> usize {
+        self.0
+    }
+}
+
+/// Query the privileged-action audit trail newest-first. Exact filters and the
+/// stable identity cursor are applied in PostgreSQL, so pagination neither
+/// duplicates nor skips rows when a concurrent action is appended.
+pub async fn query_audit_log(
+    pool: &PgPool,
+    filter: AuditLogFilter<'_>,
+) -> Result<AuditLogPage, DbError> {
+    let page_size = filter.page_size.value();
+    let fetch_limit = page_size + 1;
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT id, actor, action, target, detail,
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    AS created_at
+         FROM audit_log WHERE TRUE",
+    );
+    if let Some(before_id) = filter.before_id {
+        query.push(" AND id < ").push_bind(before_id);
+    }
+    if let Some(actor) = filter.actor {
+        query.push(" AND actor = ").push_bind(actor);
+    }
+    if let Some(action) = filter.action {
+        query.push(" AND action = ").push_bind(action);
+    }
+    if let Some(target) = filter.target {
+        query.push(" AND target = ").push_bind(target);
+    }
+    query
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind(fetch_limit as i64);
+    let mut entries: Vec<AuditLogRow> = query
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)?;
+    let next_before_id = (entries.len() > page_size).then(|| entries[page_size - 1].id);
+    entries.truncate(page_size);
+    Ok(AuditLogPage {
+        entries,
+        next_before_id,
+    })
+}
+
+/// The most recent `limit` audit entries, newest first.
 pub async fn list_audit_log(
     pool: &PgPool,
-    limit: i64,
-) -> Result<Vec<(String, String, String, String, String)>, DbError> {
-    sqlx::query_as(
-        "SELECT actor, action, target, detail,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
-         FROM audit_log ORDER BY id DESC LIMIT $1",
+    page_size: AuditLogPageSize,
+) -> Result<Vec<AuditLogRow>, DbError> {
+    Ok(query_audit_log(
+        pool,
+        AuditLogFilter {
+            before_id: None,
+            actor: None,
+            action: None,
+            target: None,
+            page_size,
+        },
     )
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(DbError::Query)
+    .await?
+    .entries)
 }
 
 /// Every server ban as `(mask_display, reason, set_by, kind)` — boot-loaded

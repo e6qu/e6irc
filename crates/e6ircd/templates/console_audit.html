@@ -1,0 +1,95 @@
+{% extends "console_base.html" %}
+{% block main %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">Security operations</p>
+      <h1>Audit log</h1>
+      <p class="lede">A durable, newest-first trail of privileged IRC and control-plane actions.</p>
+    </div>
+    <a class="button-link" href="/api/v1/admin/audit">Open JSON API</a>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Exact filters</h2>
+        <p>Filter on stored actor, action, or target values. Empty fields match every value.</p>
+      </div>
+      {% if has_filters || has_cursor %}
+        <a class="secondary-link" href="/console/audit">Clear filters and cursor</a>
+      {% endif %}
+    </div>
+    <form class="field-grid" method="get" action="/console/audit">
+      <label class="field">
+        <span>Actor</span>
+        <input name="actor" value="{{ actor }}" maxlength="128" autocomplete="off"
+               placeholder="alice" />
+      </label>
+      <label class="field">
+        <span>Action</span>
+        <input name="action" value="{{ action }}" maxlength="64" autocomplete="off"
+               placeholder="KLINE" />
+      </label>
+      <label class="field">
+        <span>Target</span>
+        <input name="target" value="{{ target }}" maxlength="512" autocomplete="off"
+               placeholder="user@host" />
+      </label>
+      <label class="field">
+        <span>Rows per page</span>
+        <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"
+               inputmode="numeric" required />
+      </label>
+      <div class="form-actions field-wide">
+        <button class="primary" type="submit">Apply filters</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head list-head">
+      <div>
+        <h2>Audited actions</h2>
+        <p>Stable entry IDs make each older page deterministic while new actions arrive.</p>
+      </div>
+      <span class="count">{{ entries.len() }}</span>
+    </div>
+    {% if entries.is_empty() %}
+      <p class="empty">{% if has_filters %}No audited actions match these exact filters.{% else %}No audited actions.{% endif %}</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr>
+          </thead>
+          <tbody>
+            {% for entry in entries %}
+              <tr>
+                <td class="meta">{{ entry.id }}</td>
+                <td class="meta"><time datetime="{{ entry.at }}">{{ entry.at }}</time></td>
+                <td><code>{{ entry.actor }}</code></td>
+                <td><strong>{{ entry.action }}</strong></td>
+                <td class="audit-target"><code>{{ entry.target }}</code></td>
+                <td class="audit-detail">{{ entry.detail }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+
+    <div class="pager">
+      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching actions.{% endif %}</span>
+      {% if let Some(before_id) = next_before_id %}
+        <form method="get" action="/console/audit">
+          <input type="hidden" name="actor" value="{{ actor }}" />
+          <input type="hidden" name="action" value="{{ action }}" />
+          <input type="hidden" name="target" value="{{ target }}" />
+          <input type="hidden" name="limit" value="{{ limit }}" />
+          <input type="hidden" name="before_id" value="{{ before_id }}" />
+          <button type="submit">Older actions</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+{% endblock %}

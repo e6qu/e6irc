@@ -446,7 +446,10 @@ async fn admin_observability(
     {
         Ok(history) => {
             state.telemetry.record_database_request(started.elapsed());
-            axum::Json(ObservabilityResponse { current, history }).into_response()
+            let mut response =
+                axum::Json(ObservabilityResponse { current, history }).into_response();
+            no_store(response.headers_mut());
+            response
         }
         Err(error) => {
             state.telemetry.record_database_request(started.elapsed());
@@ -465,7 +468,7 @@ async fn admin_observability(
 
 async fn admin_metrics(State(state): State<Arc<AppState>>, _admin: AdminAccount) -> Response {
     let (networks, connected) = bnc_counts(&state);
-    (
+    let mut response = (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
@@ -473,7 +476,9 @@ async fn admin_metrics(State(state): State<Arc<AppState>>, _admin: AdminAccount)
         )],
         state.telemetry.prometheus(networks, connected),
     )
-        .into_response()
+        .into_response();
+    no_store(response.headers_mut());
+    response
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -488,6 +493,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console.js", get(pages::console_script))
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
+        .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
         .route("/console/channels", get(pages::console_channels))
         .route(
@@ -2152,6 +2158,7 @@ mod pages {
         set_by: String,
     }
     struct AuditRow {
+        id: i64,
         at: String,
         actor: String,
         action: String,
@@ -2184,6 +2191,23 @@ mod pages {
         /// An error banner shown at the top when a management action failed
         /// (e.g. an invalid ban mask). `None` on the plain GET.
         error: Option<String>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_audit.html")]
+    struct ConsoleAudit {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        entries: Vec<AuditRow>,
+        actor: String,
+        action: String,
+        target: String,
+        limit: usize,
+        has_filters: bool,
+        has_cursor: bool,
+        next_before_id: Option<i64>,
     }
 
     /// Assemble the admin console view (all server-wide read data). `error` is a
@@ -2219,18 +2243,22 @@ mod pages {
                 set_by,
             })
             .collect();
-        let audit = crate::db::list_audit_log(pool, 100)
-            .await
-            .map_err(|e| super::device::admin_db_error("audit log", e))?
-            .into_iter()
-            .map(|(actor, action, target, detail, at)| AuditRow {
-                at,
-                actor,
-                action,
-                target,
-                detail,
-            })
-            .collect();
+        let audit = crate::db::list_audit_log(
+            pool,
+            crate::db::AuditLogPageSize::new(10).expect("ten is a valid audit preview size"),
+        )
+        .await
+        .map_err(|e| super::device::admin_db_error("audit log", e))?
+        .into_iter()
+        .map(|entry| AuditRow {
+            id: entry.id,
+            at: entry.created_at,
+            actor: entry.actor,
+            action: entry.action,
+            target: entry.target,
+            detail: entry.detail,
+        })
+        .collect();
         let (networks, connected) = bnc_counts(state);
         let live = state.telemetry.snapshot(networks, connected);
         Ok(Console {
@@ -2784,6 +2812,56 @@ mod pages {
             is_admin: true,
             active: "monitoring",
             view,
+        })
+    }
+
+    pub async fn console_audit(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Query(params): Query<super::device::AuditQuery>,
+    ) -> Response {
+        let (account, csrf) = match page_actor(&state, &headers, true).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+        let query = match super::device::validate_audit_query(params, 50) {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        let page = match crate::db::query_audit_log(pool_of(&state), query.database_filter()).await
+        {
+            Ok(page) => page,
+            Err(error) => return super::device::admin_db_error("audit log", error),
+        };
+        let entries = page
+            .entries
+            .into_iter()
+            .map(|entry| AuditRow {
+                id: entry.id,
+                at: entry.created_at,
+                actor: entry.actor,
+                action: entry.action,
+                target: entry.target,
+                detail: entry.detail,
+            })
+            .collect();
+        let actor = query.actor.unwrap_or_default();
+        let action = query.action.unwrap_or_default();
+        let target = query.target.unwrap_or_default();
+        let has_cursor = query.before_id.is_some();
+        render_private(ConsoleAudit {
+            account,
+            csrf,
+            is_admin: true,
+            active: "audit",
+            entries,
+            has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
+            has_cursor,
+            actor,
+            action,
+            target,
+            limit: query.page_size.value(),
+            next_before_id: page.next_before_id,
         })
     }
 

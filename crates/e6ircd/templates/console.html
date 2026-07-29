@@ -99,7 +99,10 @@
           </div>
         {% endif %}
 
-        <h2 id="audit">Audit log <span class="tag">latest {{ audit.len() }}</span></h2>
+        <div class="panel-head list-head">
+          <h2 id="audit">Recent audited actions <span class="tag">latest {{ audit.len() }}</span></h2>
+          <a class="secondary-link" href="/console/audit">Explore audit log</a>
+        </div>
         {% if audit.is_empty() %}
           <p class="empty">No audited actions.</p>
         {% else %}

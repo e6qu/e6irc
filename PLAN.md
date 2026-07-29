@@ -44,6 +44,18 @@ revocation. Deleting the current session also clears its cookie. Migration
 0040 adds stable resource ids and bounded user-agent storage, while database
 and HTTP tests prove cross-account ids cannot revoke or disclose a session.
 
+Audit-log explorer (2026-07-29): privileged actions now have a dedicated
+administrator security-operations page at `/console/audit` instead of an
+unsearchable 100-row dump on the overview. Exact actor/action/target filters
+run against matching `(filter, id DESC)` indexes, and stable `before_id`
+pagination cannot duplicate or skip rows when new actions arrive. The admin
+JSON endpoint exposes the same validated filters, entry ids, and next-page
+cursor; invalid limits, cursors, control characters, and oversized filters fail
+explicitly. Typed audit rows replace a five-string database tuple, while a
+bounded page-size type makes invalid SQL limits and cursor indexing
+unrepresentable. All personalized administrator JSON, observability, and
+Prometheus responses now carry `Cache-Control: no-store`.
+
 Conformance harness reliability (2026-07-29): the e6ircd irctest controller
 now gives commands crossing independent raw-TCP and WebSocket reader tasks a
 bounded settling window before inserting its recipient-side PING barrier.

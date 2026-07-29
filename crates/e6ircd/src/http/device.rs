@@ -165,11 +165,7 @@ pub(super) async fn admin_accounts(
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::list_accounts(pool).await {
-        Ok(names) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "accounts": names }).to_string(),
-        )
-            .into_response(),
+        Ok(names) => admin_json(serde_json::json!({ "accounts": names })),
         Err(e) => {
             eprintln!("http: admin account list failed: {e}");
             problem(
@@ -182,11 +178,13 @@ pub(super) async fn admin_accounts(
 }
 
 pub(super) fn admin_json(body: serde_json::Value) -> Response {
-    (
+    let mut response = (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),
     )
-        .into_response()
+        .into_response();
+    no_store(response.headers_mut());
+    response
 }
 
 pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response {
@@ -254,9 +252,87 @@ pub(super) async fn admin_server_bans(
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub(super) struct AuditQuery {
     pub(super) limit: Option<usize>,
+    pub(super) before_id: Option<i64>,
+    pub(super) actor: Option<String>,
+    pub(super) action: Option<String>,
+    pub(super) target: Option<String>,
+}
+
+pub(super) struct ValidatedAuditQuery {
+    pub(super) page_size: crate::db::AuditLogPageSize,
+    pub(super) before_id: Option<i64>,
+    pub(super) actor: Option<String>,
+    pub(super) action: Option<String>,
+    pub(super) target: Option<String>,
+}
+
+impl ValidatedAuditQuery {
+    pub(super) fn database_filter(&self) -> crate::db::AuditLogFilter<'_> {
+        crate::db::AuditLogFilter {
+            before_id: self.before_id,
+            actor: self.actor.as_deref(),
+            action: self.action.as_deref(),
+            target: self.target.as_deref(),
+            page_size: self.page_size,
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+fn audit_filter(
+    value: Option<String>,
+    name: &str,
+    maximum: usize,
+) -> Result<Option<String>, Response> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > maximum || value.chars().any(char::is_control) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid audit filter",
+            Some(&format!(
+                "The exact {name} filter must contain 1–{maximum} printable characters."
+            )),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+pub(super) fn validate_audit_query(
+    params: AuditQuery,
+    default_limit: usize,
+) -> Result<ValidatedAuditQuery, Response> {
+    let requested_limit = params.limit.unwrap_or(default_limit);
+    let Some(page_size) = crate::db::AuditLogPageSize::new(requested_limit) else {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid audit limit",
+            Some("The audit limit must be between 1 and 1,000."),
+        ));
+    };
+    if params.before_id.is_some_and(|id| id <= 0) {
+        return Err(problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid audit cursor",
+            Some("The before_id cursor must be a positive audit entry id."),
+        ));
+    }
+    Ok(ValidatedAuditQuery {
+        page_size,
+        before_id: params.before_id,
+        actor: audit_filter(params.actor, "actor", 128)?,
+        action: audit_filter(params.action, "action", 64)?,
+        target: audit_filter(params.target, "target", 512)?,
+    })
 }
 
 /// Query the oper audit log, newest-first (admin only).
@@ -266,23 +342,82 @@ pub(super) async fn admin_audit(
     axum::extract::Query(params): axum::extract::Query<AuditQuery>,
 ) -> Response {
     let pool = pool_of(&state);
-    let limit = match bounded_query_limit(params.limit, 100, 1000, "audit") {
-        Ok(limit) => limit,
+    let query = match validate_audit_query(params, 100) {
+        Ok(query) => query,
         Err(response) => return response,
     };
-    match crate::db::list_audit_log(pool, limit).await {
-        Ok(rows) => admin_json(serde_json::json!({
-            "audit": rows
+    match crate::db::query_audit_log(pool, query.database_filter()).await {
+        Ok(page) => admin_json(serde_json::json!({
+            "audit": page.entries
                 .into_iter()
-                .map(|(actor, action, target, detail, at)| {
+                .map(|entry| {
                     serde_json::json!({
-                        "actor": actor, "action": action, "target": target,
-                        "detail": detail, "at": at,
+                        "id": entry.id, "actor": entry.actor, "action": entry.action,
+                        "target": entry.target, "detail": entry.detail,
+                        "at": entry.created_at,
                     })
                 })
                 .collect::<Vec<_>>(),
+            "next_before_id": page.next_before_id,
         })),
         Err(e) => admin_db_error("audit log", e),
+    }
+}
+
+#[cfg(test)]
+mod audit_query_tests {
+    use super::*;
+
+    #[test]
+    fn audit_query_validation_preserves_exact_bounded_values() {
+        let query = validate_audit_query(
+            AuditQuery {
+                limit: Some(25),
+                before_id: Some(42),
+                actor: Some(" alice ".into()),
+                action: Some("KLINE".into()),
+                target: Some("user@host".into()),
+            },
+            100,
+        )
+        .expect("valid query");
+        assert_eq!(query.page_size.value(), 25);
+        assert_eq!(query.before_id, Some(42));
+        assert_eq!(query.actor.as_deref(), Some("alice"));
+        assert_eq!(query.action.as_deref(), Some("KLINE"));
+        assert_eq!(query.target.as_deref(), Some("user@host"));
+    }
+
+    #[test]
+    fn audit_query_validation_rejects_invalid_sizes_cursors_and_text() {
+        for params in [
+            AuditQuery {
+                limit: Some(0),
+                ..AuditQuery::default()
+            },
+            AuditQuery {
+                limit: Some(1_001),
+                ..AuditQuery::default()
+            },
+            AuditQuery {
+                before_id: Some(0),
+                ..AuditQuery::default()
+            },
+            AuditQuery {
+                actor: Some("bad\nactor".into()),
+                ..AuditQuery::default()
+            },
+            AuditQuery {
+                action: Some("x".repeat(65)),
+                ..AuditQuery::default()
+            },
+            AuditQuery {
+                target: Some("x".repeat(513)),
+                ..AuditQuery::default()
+            },
+        ] {
+            assert!(validate_audit_query(params, 100).is_err());
+        }
     }
 }
 

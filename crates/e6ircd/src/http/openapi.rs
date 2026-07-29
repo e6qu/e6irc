@@ -479,13 +479,24 @@ pub(super) async fn openapi() -> Response {
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/audit": {
-                "get": { "summary": "Query the oper audit log, newest-first (admin only)",
+                "get": { "summary": "Filter and page the privileged-action audit log (admin only)",
+                    "description": "Returns stable audit entry IDs newest-first. before_id selects strictly older entries, so concurrent appends cannot duplicate or skip rows. Actor, action, and target filters are exact.",
                     "security": bearer,
-                    "parameters": [ { "name": "limit", "in": "query",
-                        "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
-                            "default": 100 } } ],
-                    "responses": { "200": { "description": "audit entries" },
-                        "400": { "description": "limit outside 1–1000" },
+                    "parameters": [
+                        { "name": "limit", "in": "query",
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000,
+                                "default": 100 } },
+                        { "name": "before_id", "in": "query",
+                            "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
+                        { "name": "actor", "in": "query",
+                            "schema": { "type": "string", "maxLength": 128 } },
+                        { "name": "action", "in": "query",
+                            "schema": { "type": "string", "maxLength": 64 } },
+                        { "name": "target", "in": "query",
+                            "schema": { "type": "string", "maxLength": 512 } }
+                    ],
+                    "responses": { "200": { "description": "audit entries and next_before_id cursor" },
+                        "400": { "description": "invalid limit, cursor, or exact filter" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/stats": {
