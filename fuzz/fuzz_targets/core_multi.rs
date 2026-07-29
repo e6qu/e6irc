@@ -24,7 +24,7 @@
 //! reached through any connection takes down all of them.
 
 use e6irc_queue::{Config, Policy, Receiver, queue};
-use e6ircd::core::{ConnId, Core, CoreConfig, HistoryRow, Input, Output};
+use e6ircd::core::{ConnId, ConnectionTransport, Core, CoreConfig, HistoryRow, Input, Output};
 use libfuzzer_sys::fuzz_target;
 
 /// Advances on every read, so events get distinct timestamps and the
@@ -79,6 +79,7 @@ fuzz_target!(|data: &[u8]| {
             conn: ConnId(id),
             tx,
             host: format!("h{id}.example"),
+            transport: ConnectionTransport::Tcp,
         });
     }
 
@@ -103,7 +104,9 @@ fuzz_target!(|data: &[u8]| {
             b'T' => {
                 // Advance far enough that timeouts can actually fire.
                 tick += 20_000;
-                core.handle(Input::Tick { now: e6irc_proto::time::MonoMillis::from_millis(tick) });
+                core.handle(Input::Tick {
+                    now: e6irc_proto::time::MonoMillis::from_millis(tick),
+                });
             }
             b'X' => core.handle(Input::Closed {
                 conn: pick(rest),
@@ -129,7 +132,10 @@ fuzz_target!(|data: &[u8]| {
             b'G' => core.handle(Input::TargetsPage {
                 conn: pick(rest),
                 batch_ref: "b".into(),
-                targets: Ok(vec![(rest.get(1..).unwrap_or("#c").to_string(), e6irc_proto::time::Millis::from_millis(tick))]),
+                targets: Ok(vec![(
+                    rest.get(1..).unwrap_or("#c").to_string(),
+                    e6irc_proto::time::Millis::from_millis(tick),
+                )]),
                 label: None,
             }),
             _ => core.handle(Input::Line {

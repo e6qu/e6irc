@@ -14,7 +14,7 @@
 //! hostile peer.
 
 use e6irc_queue::{Config, Policy, queue};
-use e6ircd::core::{ConnId, Core, CoreConfig, Input};
+use e6ircd::core::{ConnId, ConnectionTransport, Core, CoreConfig, Input};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -58,6 +58,7 @@ fuzz_target!(|data: &[u8]| {
         conn,
         tx,
         host: "fuzz.host".into(),
+        transport: ConnectionTransport::Tcp,
     });
     // Each input line is one command. Bounded so a huge input is many short
     // runs rather than one enormous one.
