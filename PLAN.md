@@ -22,6 +22,25 @@ the generic `typ: JWT` emitted by Hydra as well as the recommended
 protocol remain rejected, while the signed event, issuer, audience, time,
 session identifier, and replay checks continue to identify logout tokens.
 
+Local web authentication (2026-07-29): `/login` now offers database-backed
+account/password sign-in alongside configured OpenID Connect providers and
+creates the same opaque, hashed, 14-day browser sessions as the OIDC callback.
+The local form carries a short-lived browser-binding cookie, spends the shared
+per-IP authentication budget, bounds account/password inputs, and accepts only
+the primary password—IRC app passwords cannot establish a web session or mint
+another app password. `/console/account` and `PUT /api/v1/me/password` create a
+first local password for an OIDC-only account or rotate an existing primary
+after verifying it. Rotation is serialized under the account row, and
+migration 0039 enforces at most one `local_password` credential per account.
+
+Conformance harness reliability (2026-07-29): the e6ircd irctest controller
+now gives commands crossing independent raw-TCP and WebSocket reader tasks a
+bounded settling window before inserting its recipient-side PING barrier.
+That barrier orders the recipient's input but cannot order another socket's
+not-yet-enqueued input; declaring the asynchronous ingress model in the
+controller removes the resulting WebSocket delivery race from the full pinned
+conformance suite.
+
 Control-plane console (2026-07-28): `/console/configuration` now owns typed,
 revisioned operational settings in PostgreSQL with redacted same-transaction
 audit entries and optimistic concurrency. The database URL, master-key source,
@@ -64,8 +83,9 @@ authenticated users to the canonical `/console/account` self-service page.
 That page creates and revokes IRC app passwords and personal access tokens,
 shows each new secret once, links and unlinks OpenID Connect identities, lists
 read markers, and explains BNC SASL attachment. Identity removal refuses the
-last login identity under an account-row lock and revokes every browser session
-asserted by the removed identity in the same transaction. The REST identity
+last login method under an account-row lock, permits the final OIDC unlink when
+a primary password remains, and revokes every browser session asserted by the
+removed identity in the same transaction. The REST identity
 list now includes stable identifiers and creation times and exposes the same
 owner-scoped unlink operation.
 
@@ -3718,15 +3738,7 @@ user knows the upstream SSO is still active rather than being misled into
 thinking they are fully logged out. Reversing it to best-effort local logout
 would trade a documented design decision for a different one, so it was reverted.
 
-Surfaced, not changed: **TAGMSG ignores comma-separated target lists** (takes
-only the first token — a delivery-loop restructure with STATUSMSG/cap/may_speak
-regression risk, deferred as a focused follow-up); the OIDC **discovery cache
-can serve stale JWKS across a key rotation** (bounded 15-min availability
-tradeoff, never accepts a forged token); `create_web_session`'s non-OIDC wrapper
-has no production caller (a password web-login path is intended, or it collapses
-to the test helper); and the DB layer's hardcoded `Rfc1459` fold is coupled to
-the core's fixed casemap (latent — would diverge only if the casemap became
-configurable to Ascii). Clean bills: the admin API (authZ fail-closed extractor,
+Clean bills: the admin API (authZ fail-closed extractor,
 no data exposure, no IDOR), the WS `/ws/irc` bridge (same per-IP cap + framing
 as raw TCP) and `/ws/ui` composer (CR/LF sanitization, XSS-escaped rendering,
 same-origin + CSRF), the OIDC session/cookie/back-channel-logout core (14-day

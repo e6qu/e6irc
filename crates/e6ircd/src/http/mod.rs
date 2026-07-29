@@ -156,6 +156,8 @@ impl AppState {
 /// bound them like every other client-supplied field (the network fields cap at
 /// 64/128/255) rather than accepting a multi-megabyte JSON body into storage.
 pub(super) const MAX_LABEL_LEN: usize = 64;
+pub(super) const MAX_ACCOUNT_LEN: usize = 64;
+pub(super) const MAX_PASSWORD_LEN: usize = 512;
 
 pub(super) fn label_validation_error(label: &str) -> Option<String> {
     if label.chars().count() > MAX_LABEL_LEN {
@@ -173,6 +175,24 @@ pub(super) fn label_validation_error(label: &str) -> Option<String> {
 pub(super) fn validate_label(label: &str) -> Option<Response> {
     label_validation_error(label)
         .map(|detail| problem(StatusCode::BAD_REQUEST, "Invalid label", Some(&detail)))
+}
+
+pub(super) fn credential_input_error(account: &str, password: &str) -> Option<&'static str> {
+    if account.is_empty() || account.len() > MAX_ACCOUNT_LEN {
+        return Some("Account names must contain 1–64 bytes.");
+    }
+    if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
+        return Some("Passwords must contain 1–512 bytes.");
+    }
+    None
+}
+
+pub(super) fn password_input_error(password: &str) -> Option<&'static str> {
+    if password.is_empty() || password.len() > MAX_PASSWORD_LEN {
+        Some("Passwords must contain 1–512 bytes.")
+    } else {
+        None
+    }
 }
 
 /// Resolve a bounded integer query parameter without silently changing the
@@ -458,7 +478,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/healthz", get(async || "ok"))
         .route("/readyz", get(readiness))
-        .route("/login", get(pages::login))
+        .route("/login", get(pages::login).post(pages::local_login))
         .route("/auth/signed-out", get(pages::signed_out))
         .route("/auth/validation", get(pages::validation))
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
@@ -500,6 +520,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/console/account/app-passwords",
             post(pages::console_create_app_password),
+        )
+        .route(
+            "/console/account/password",
+            post(pages::console_change_password),
         )
         .route(
             "/console/account/app-passwords/{id}/delete",
@@ -634,6 +658,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             axum::routing::delete(me_tokens_revoke),
         )
         .route("/api/v1/me/read-markers", get(me_read_markers))
+        .route("/api/v1/me/password", axum::routing::put(change_password))
         .route(
             "/api/v1/me/channels",
             get(list_owned_channels).post(register_owned_channel),
@@ -806,6 +831,10 @@ mod pages {
     #[template(path = "login.html")]
     struct Login {
         providers: Vec<String>,
+        local_enabled: bool,
+        login_state: String,
+        account: String,
+        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -829,14 +858,152 @@ mod pages {
         logout_url: String,
     }
 
-    /// Login landing: one button per configured OIDC provider.
-    pub async fn login(State(state): State<Arc<AppState>>) -> Response {
+    fn login_response(
+        state: &AppState,
+        account: String,
+        error: Option<String>,
+        status: StatusCode,
+    ) -> Response {
+        let local_enabled = state.pool.is_some();
+        let login_state = local_enabled
+            .then(super::random_browser_token)
+            .unwrap_or_default();
         let providers = state
             .oidc_providers
             .iter()
-            .map(|p| p.name.clone())
+            .map(|provider| provider.name.clone())
             .collect();
-        render_auth(Login { providers })
+        let mut response = render_auth(Login {
+            providers,
+            local_enabled,
+            login_state: login_state.clone(),
+            account,
+            error,
+        });
+        *response.status_mut() = status;
+        if local_enabled {
+            let secure = if state.secure_cookies { "; Secure" } else { "" };
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                format!(
+                    "{}={login_state}; HttpOnly; SameSite=Strict; Path=/; Max-Age=600{secure}",
+                    super::login_state_cookie_name(state.secure_cookies)
+                )
+                .parse()
+                .expect("generated cookie is a valid header"),
+            );
+        }
+        response
+    }
+
+    /// Login landing: local credentials plus one button per configured OIDC
+    /// provider. A fresh browser-bound state accompanies every local form.
+    pub async fn login(State(state): State<Arc<AppState>>) -> Response {
+        login_response(&state, String::new(), None, StatusCode::OK)
+    }
+
+    #[derive(Deserialize)]
+    pub struct LocalLoginForm {
+        login_state: String,
+        account: String,
+        password: String,
+    }
+
+    pub async fn local_login(
+        State(state): State<Arc<AppState>>,
+        _rate_limited: RateLimited,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<LocalLoginForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let Some(pool) = &state.pool else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                Some("Local account login is unavailable on this server."),
+            );
+        };
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let bound = super::cookie_value(
+            &headers,
+            super::login_state_cookie_name(state.secure_cookies),
+        )
+        .is_some_and(|cookie| {
+            cookie.len() == form.login_state.len()
+                && aws_lc_rs::constant_time::verify_slices_are_equal(
+                    cookie.as_bytes(),
+                    form.login_state.as_bytes(),
+                )
+                .is_ok()
+        });
+        if !bound {
+            return login_response(
+                &state,
+                form.account,
+                Some("This sign-in form expired. Please try again.".into()),
+                StatusCode::FORBIDDEN,
+            );
+        }
+        if let Some(detail) = credential_input_error(&form.account, &form.password) {
+            return login_response(
+                &state,
+                form.account,
+                Some(detail.into()),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        let account =
+            match crate::db::verify_local_password(pool, &form.account, &form.password).await {
+                Ok(Some(account)) => account,
+                Ok(None) => {
+                    return login_response(
+                        &state,
+                        form.account,
+                        Some("Invalid account or password.".into()),
+                        StatusCode::UNAUTHORIZED,
+                    );
+                }
+                Err(error) => {
+                    eprintln!("local login: credential verification failed: {error}");
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Authentication storage unavailable",
+                        None,
+                    );
+                }
+            };
+        let token = match crate::db::create_web_session(pool, &account).await {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("local login: session creation failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session storage failed",
+                    None,
+                );
+            }
+        };
+        let secure = if state.secure_cookies { "; Secure" } else { "" };
+        (
+            StatusCode::SEE_OTHER,
+            axum::response::AppendHeaders([
+                (header::LOCATION, "/".to_string()),
+                (
+                    header::SET_COOKIE,
+                    super::session_cookie(&token, state.secure_cookies),
+                ),
+                (
+                    header::SET_COOKIE,
+                    format!(
+                        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}",
+                        super::login_state_cookie_name(state.secure_cookies)
+                    ),
+                ),
+            ]),
+        )
+            .into_response()
     }
 
     /// Public, reload-safe landing after coordinated logout. It deliberately
@@ -1020,6 +1187,7 @@ mod pages {
         is_admin: bool,
         active: &'static str,
         credentials: Vec<CredentialView>,
+        has_local_password: bool,
         tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
         read_markers: Vec<ReadMarkerView>,
@@ -1040,7 +1208,7 @@ mod pages {
         secret_kind: &'static str,
     ) -> Result<ConsoleAccount, Response> {
         let pool = pool_of(state);
-        let credentials = crate::db::list_credentials(pool, &account)
+        let credentials: Vec<CredentialView> = crate::db::list_credentials(pool, &account)
             .await
             .map_err(|e| super::device::admin_db_error("credential list", e))?
             .into_iter()
@@ -1053,6 +1221,9 @@ mod pages {
                 last_used: last_used.unwrap_or_else(|| "Never".into()),
             })
             .collect();
+        let has_local_password = credentials
+            .iter()
+            .any(|credential| credential.kind == "local_password");
         let tokens = crate::db::list_api_tokens(pool, &account)
             .await
             .map_err(|e| super::device::admin_db_error("token list", e))?
@@ -1093,6 +1264,7 @@ mod pages {
             is_admin,
             active: "account",
             credentials,
+            has_local_password,
             tokens,
             identities,
             read_markers,
@@ -1162,6 +1334,15 @@ mod pages {
         csrf: String,
     }
 
+    #[derive(Deserialize)]
+    pub struct AccountPasswordForm {
+        csrf: String,
+        #[serde(default)]
+        current_password: String,
+        new_password: String,
+        confirm_password: String,
+    }
+
     trait AccountForm {
         fn csrf(&self) -> &str;
     }
@@ -1173,6 +1354,12 @@ mod pages {
     }
 
     impl AccountForm for AccountDeleteForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    impl AccountForm for AccountPasswordForm {
         fn csrf(&self) -> &str {
             &self.csrf
         }
@@ -1273,6 +1460,48 @@ mod pages {
         operation: &'static str,
     }
 
+    struct AccountIssueMessages {
+        success: &'static str,
+        secret_kind: &'static str,
+        cap_reached: &'static str,
+        operation: &'static str,
+    }
+
+    async fn account_issue_result(
+        state: &AppState,
+        account: String,
+        headers: &axum::http::HeaderMap,
+        result: Result<String, crate::db::DbError>,
+        messages: AccountIssueMessages,
+    ) -> Response {
+        match result {
+            Ok(secret) => {
+                account_result(
+                    state,
+                    account,
+                    headers,
+                    AccountResult::issued(
+                        StatusCode::CREATED,
+                        messages.success,
+                        secret,
+                        messages.secret_kind,
+                    ),
+                )
+                .await
+            }
+            Err(crate::db::DbError::TooManyCredentials) => {
+                account_result(
+                    state,
+                    account,
+                    headers,
+                    AccountResult::message(StatusCode::CONFLICT, messages.cap_reached),
+                )
+                .await
+            }
+            Err(error) => super::device::admin_db_error(messages.operation, error),
+        }
+    }
+
     async fn account_delete_result(
         state: &AppState,
         account: String,
@@ -1312,34 +1541,110 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        match crate::db::issue_app_password_for_account(pool_of(&state), &account, &label).await {
-            Ok(secret) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::issued(
-                        StatusCode::CREATED,
-                        "App password created. Copy it now; it cannot be shown again.",
-                        secret,
-                        "App password",
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::TooManyCredentials) => {
+        let result =
+            crate::db::issue_app_password_for_account(pool_of(&state), &account, &label).await;
+        account_issue_result(
+            &state,
+            account,
+            &headers,
+            result,
+            AccountIssueMessages {
+                success: "App password created. Copy it now; it cannot be shown again.",
+                secret_kind: "App password",
+                cap_reached: "Too many app passwords. Revoke one before creating another.",
+                operation: "app-password creation",
+            },
+        )
+        .await
+    }
+
+    pub async fn console_change_password(
+        State(state): State<Arc<AppState>>,
+        _rate_limited: RateLimited,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountPasswordForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, form) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        if let Some(detail) = (!form.current_password.is_empty())
+            .then(|| password_input_error(&form.current_password))
+            .flatten()
+            .or_else(|| password_input_error(&form.new_password))
+        {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(StatusCode::BAD_REQUEST, detail),
+            )
+            .await;
+        }
+        if form.new_password != form.confirm_password {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(
+                    StatusCode::BAD_REQUEST,
+                    "The new password and confirmation do not match.",
+                ),
+            )
+            .await;
+        }
+        let adding_first_password = form.current_password.is_empty();
+        let result = if adding_first_password {
+            crate::db::set_local_password(pool_of(&state), &account, &form.new_password).await
+        } else {
+            crate::db::change_local_password(
+                pool_of(&state),
+                &account,
+                &form.current_password,
+                &form.new_password,
+            )
+            .await
+        };
+        match result {
+            Ok(()) => {
                 account_result(
                     &state,
                     account,
                     &headers,
                     AccountResult::message(
-                        StatusCode::CONFLICT,
-                        "Too many app passwords. Revoke one before creating another.",
+                        StatusCode::OK,
+                        if adding_first_password {
+                            "Local password added."
+                        } else {
+                            "Primary password changed."
+                        },
                     ),
                 )
                 .await
             }
-            Err(error) => super::device::admin_db_error("app-password creation", error),
+            Err(crate::db::DbError::BadCredentials) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::message(
+                        StatusCode::UNAUTHORIZED,
+                        "The current password is incorrect.",
+                    ),
+                )
+                .await
+            }
+            Err(crate::db::DbError::LocalPasswordExists) => account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(
+                    StatusCode::CONFLICT,
+                    "This account already has a primary password. Enter it to rotate the password.",
+                ),
+            )
+            .await,
+            Err(error) => super::device::admin_db_error("password rotation", error),
         }
     }
 
@@ -1377,35 +1682,20 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        match crate::db::issue_api_token(pool_of(&state), &account, &label).await {
-            Ok(secret) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::issued(
-                        StatusCode::CREATED,
-                        "Personal access token created. Copy it now; it cannot be shown again.",
-                        secret,
-                        "Personal access token",
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::TooManyCredentials) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::CONFLICT,
-                        "Too many personal access tokens. Revoke one before creating another.",
-                    ),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error("token creation", error),
-        }
+        let result = crate::db::issue_api_token(pool_of(&state), &account, &label).await;
+        account_issue_result(
+            &state,
+            account,
+            &headers,
+            result,
+            AccountIssueMessages {
+                success: "Personal access token created. Copy it now; it cannot be shown again.",
+                secret_kind: "Personal access token",
+                cap_reached: "Too many personal access tokens. Revoke one before creating another.",
+                operation: "token creation",
+            },
+        )
+        .await
     }
 
     pub async fn console_revoke_api_token(
@@ -1445,22 +1735,49 @@ mod pages {
         };
         match crate::db::unlink_oidc_identity(pool_of(&state), &account, id).await {
             Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => {
-                let mut response = Redirect::to("/login").into_response();
-                response.headers_mut().insert(
-                    header::SET_COOKIE,
-                    clear_session_cookie(state.secure_cookies)
-                        .parse()
-                        .expect("session clear cookie is valid"),
-                );
-                response
+                let session_still_valid = match session_token(&headers, state.secure_cookies) {
+                    Some(token) => {
+                        crate::db::session_account(pool_of(&state), &token)
+                            .await
+                            .map_err(|error| {
+                                super::device::admin_db_error("session refresh", error)
+                            })
+                    }
+                    None => Ok(None),
+                };
+                match session_still_valid {
+                    Ok(Some(_)) => {
+                        account_result(
+                            &state,
+                            account,
+                            &headers,
+                            AccountResult::message(
+                                StatusCode::OK,
+                                "Login identity unlinked.",
+                            ),
+                        )
+                        .await
+                    }
+                    Ok(None) => {
+                        let mut response = Redirect::to("/login").into_response();
+                        response.headers_mut().insert(
+                            header::SET_COOKIE,
+                            clear_session_cookie(state.secure_cookies)
+                                .parse()
+                                .expect("session clear cookie is valid"),
+                        );
+                        response
+                    }
+                    Err(response) => response,
+                }
             }
-            Ok(crate::db::UnlinkIdentityOutcome::LastIdentity) => account_result(
+            Ok(crate::db::UnlinkIdentityOutcome::LastLoginMethod) => account_result(
                 &state,
                 account,
                 &headers,
                 AccountResult::message(
                     StatusCode::CONFLICT,
-                    "This is your last login identity. Link another provider before removing it.",
+                    "This is your last login method. Add a local password or link another provider before removing it.",
                 ),
             )
             .await,
@@ -5021,7 +5338,10 @@ mod composer_tests {
 
 #[cfg(test)]
 mod cookie_tests {
-    use super::{clear_session_cookie, oidc_state_cookie_name, session_cookie_name};
+    use super::{
+        clear_session_cookie, login_state_cookie_name, oidc_state_cookie_name, session_cookie,
+        session_cookie_name,
+    };
 
     #[test]
     fn secure_cookies_use_host_prefix() {
@@ -5029,9 +5349,11 @@ mod cookie_tests {
         // Secure+Path=/ and no Domain — dropping it would reopen fixation.
         assert_eq!(session_cookie_name(true), "__Host-e6irc_session");
         assert_eq!(oidc_state_cookie_name(true), "__Host-e6irc_oidc_state");
+        assert_eq!(login_state_cookie_name(true), "__Host-e6irc_login_state");
         // Plain-HTTP dev (no TLS) can't use `__Host-` (it requires Secure).
         assert_eq!(session_cookie_name(false), "e6irc_session");
         assert_eq!(oidc_state_cookie_name(false), "e6irc_oidc_state");
+        assert_eq!(login_state_cookie_name(false), "e6irc_login_state");
     }
 
     #[test]
@@ -5049,6 +5371,30 @@ mod cookie_tests {
         let insecure = clear_session_cookie(false);
         assert!(insecure.starts_with("e6irc_session="), "{insecure}");
         assert!(!insecure.contains("Secure"), "{insecure}");
+
+        let setter = session_cookie("opaque", true);
+        assert!(
+            setter.starts_with("__Host-e6irc_session=opaque"),
+            "{setter}"
+        );
+        assert!(setter.contains("; Secure"), "{setter}");
+        assert!(setter.contains("; HttpOnly"), "{setter}");
+        assert!(setter.contains("; SameSite=Lax"), "{setter}");
+    }
+}
+
+#[cfg(test)]
+mod credential_input_tests {
+    use super::{credential_input_error, password_input_error};
+
+    #[test]
+    fn credential_fields_are_bounded_before_argon2() {
+        assert_eq!(credential_input_error("alice", "secret"), None);
+        assert!(credential_input_error("", "secret").is_some());
+        assert!(credential_input_error(&"a".repeat(65), "secret").is_some());
+        assert!(password_input_error("").is_some());
+        assert!(password_input_error(&"p".repeat(513)).is_some());
+        assert_eq!(password_input_error(&"p".repeat(512)), None);
     }
 }
 

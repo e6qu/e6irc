@@ -55,10 +55,11 @@ pub(super) async fn openapi() -> Response {
                         "schema": { "type": "object",
                             "required": ["account", "password", "label"],
                             "properties": {
-                                "account": { "type": "string" },
-                                "password": { "type": "string" },
-                                "label": { "type": "string" } } } } } },
-                    "responses": { "200": { "description": "the app password (shown once)" },
+                                "account": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "password": { "type": "string", "minLength": 1, "maxLength": 512 },
+                                "label": { "type": "string", "maxLength": 64 } } } } } },
+                    "responses": { "201": { "description": "the app password (shown once)" },
+                        "400": { "description": "invalid account, password, or label" },
                         "401": { "description": "bad credentials" },
                         "503": { "description": "no database configured" } }
                 }
@@ -158,7 +159,7 @@ pub(super) async fn openapi() -> Response {
                     "responses": {
                         "204": { "description": "identity unlinked and its sessions revoked" },
                         "404": { "description": "identity is not linked to this account" },
-                        "409": { "description": "last linked identity cannot be removed" },
+                        "409": { "description": "last login method; add a local password or another identity first" },
                         "503": { "description": "database unavailable" }
                     }
                 }
@@ -192,6 +193,31 @@ pub(super) async fn openapi() -> Response {
             "/api/v1/me/read-markers": {
                 "get": { "summary": "List your read markers (draft/read-marker) per target",
                     "security": bearer, "responses": ok_json }
+            },
+            "/api/v1/me/password": {
+                "put": {
+                    "summary": "Change your primary local-account password",
+                    "description": "Creates a first primary password for an OIDC-only account when current_password is omitted. Existing primary passwords require their current value; an app password cannot authorize rotation.",
+                    "security": bearer,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["new_password"],
+                            "properties": {
+                                "current_password": { "type": "string", "minLength": 1, "maxLength": 512 },
+                                "new_password": { "type": "string", "minLength": 1, "maxLength": 512 }
+                            }
+                        }
+                    } } },
+                    "responses": {
+                        "204": { "description": "primary password changed" },
+                        "400": { "description": "password is empty or exceeds 512 bytes" },
+                        "401": { "description": "current primary password is incorrect" },
+                        "409": { "description": "current_password omitted but a primary password already exists" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
             },
             "/api/v1/me/channels": {
                 "get": {
@@ -343,7 +369,7 @@ pub(super) async fn openapi() -> Response {
                     "responses": ok_json }
             },
             "/api/v1/me/credentials/{id}": {
-                "delete": { "summary": "Revoke a credential", "security": bearer,
+                "delete": { "summary": "Revoke an app password", "security": bearer,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer" } }],
                     "responses": { "204": { "description": "revoked" },

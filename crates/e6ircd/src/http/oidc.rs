@@ -525,10 +525,7 @@ pub(super) async fn oidc_callback(
             (header::LOCATION, "/".to_string()),
             (
                 header::SET_COOKIE,
-                format!(
-                    "{}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{secure}",
-                    session_cookie_name(state.secure_cookies)
-                ),
+                session_cookie(&token, state.secure_cookies),
             ),
             // The state-binding cookie has done its job (the pending entry was
             // consumed above); expire it now rather than leaving it in the
@@ -1192,6 +1189,29 @@ pub(super) fn oidc_state_cookie_name(secure: bool) -> &'static str {
     } else {
         "e6irc_oidc_state"
     }
+}
+
+pub(super) fn login_state_cookie_name(secure: bool) -> &'static str {
+    if secure {
+        "__Host-e6irc_login_state"
+    } else {
+        "e6irc_login_state"
+    }
+}
+
+pub(super) fn random_browser_token() -> String {
+    use argon2::password_hash::rand_core::RngCore;
+    let mut bytes = [0u8; 32];
+    argon2::password_hash::rand_core::OsRng.fill_bytes(&mut bytes);
+    e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-")
+}
+
+pub(super) fn session_cookie(token: &str, secure: bool) -> String {
+    let sec = if secure { "; Secure" } else { "" };
+    format!(
+        "{}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=1209600{sec}",
+        session_cookie_name(secure)
+    )
 }
 
 /// The `Set-Cookie` value that clears the session cookie. Must use the same

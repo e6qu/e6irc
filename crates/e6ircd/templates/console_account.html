@@ -26,12 +26,42 @@
     </section>
   {% endif %}
 
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>{% if has_local_password %}Primary password{% else %}Add a local password{% endif %}</h2>
+        <p>{% if has_local_password %}Used for local web sign-in, IRC identification, and authorizing new app passwords.{% else %}This account currently signs in through OpenID Connect. Add a password to enable local web and IRC credential sign-in too.{% endif %}</p>
+      </div>
+      <span class="tag">Argon2id</span>
+    </div>
+    <form class="field-grid" method="post" action="/console/account/password">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      {% if has_local_password %}
+        <label class="field">
+          <span>Current password</span>
+          <input type="password" name="current_password" maxlength="512" autocomplete="current-password" required />
+        </label>
+      {% endif %}
+      <label class="field">
+        <span>New password</span>
+        <input type="password" name="new_password" maxlength="512" autocomplete="new-password" required />
+      </label>
+      <label class="field">
+        <span>Confirm new password</span>
+        <input type="password" name="confirm_password" maxlength="512" autocomplete="new-password" required />
+      </label>
+      <div class="field field-wide">
+        <button class="primary" type="submit">{% if has_local_password %}Change password{% else %}Add password{% endif %}</button>
+      </div>
+    </form>
+  </section>
+
   <div class="access-grid">
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>IRC app passwords</h2>
-          <p>Use these for SASL PLAIN from IRC clients. The primary account password cannot be revoked here.</p>
+          <h2>IRC credentials</h2>
+          <p>The primary password and per-client SASL PLAIN app passwords. The primary account password cannot be revoked here.</p>
         </div>
         <span class="count">{{ credentials.len() }}</span>
       </div>
@@ -136,7 +166,7 @@
       </div>
     {% endif %}
     {% if identities.is_empty() %}
-      <p class="empty">No linked login identities. This account can use IRC credentials but cannot sign in through the web login page.</p>
+      <p class="empty">{% if has_local_password %}No linked single sign-on identities. Local password sign-in remains available.{% else %}No login method is configured for this account.{% endif %}</p>
     {% else %}
       <div class="identity-list">
         {% for identity in identities %}
@@ -146,13 +176,13 @@
               <code>{{ identity.subject }}</code>
               <small>Linked {{ identity.created }}</small>
             </div>
-            {% if identities.len() > 1 %}
+            {% if identities.len() > 1 || has_local_password %}
               <form method="post" action="/console/account/identities/{{ identity.id }}/delete" data-confirm="Unlink this identity and revoke its browser sessions?">
                 <input type="hidden" name="csrf" value="{{ csrf }}" />
                 <button class="danger" type="submit">Unlink</button>
               </form>
             {% else %}
-              <span class="tag">Last identity</span>
+              <span class="tag">Last login method</span>
             {% endif %}
           </article>
         {% endfor %}

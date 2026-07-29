@@ -833,10 +833,11 @@ in-memory hot ring buffer (§11.3) serves recent history without touching PG.
 
 ### 9.1 Account model
 
-One `accounts` row per user regardless of origin. An account may have any
-combination of: local password, N app passwords, N OIDC identities. Web
-"user section" manages all of them. NickServ `REGISTER` creates the same
-kind of account the OIDC first-login path creates.
+One `accounts` row per user regardless of origin. An account may have zero or
+one local password, N app passwords, and N OIDC identities. A partial unique
+index makes a second primary password unrepresentable in storage. The web
+"user section" manages all of them. NickServ `REGISTER` creates the same kind
+of account the OIDC first-login path creates.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge; the capability's advertised value states
@@ -858,7 +859,11 @@ supplied.
   auto-provisions an account (nick derived from `preferred_username`,
   conflict → user picks). Subsequent logins match on (issuer, subject),
   never on email.
-- Local-account login form (argon2id verify) for accounts without OIDC.
+- Local-account login form (argon2id verify) for accounts without OIDC. It
+  accepts only the primary password, not an IRC app password, is covered by the
+  per-IP authentication rate limit, bounds every credential field before
+  Argon2, and binds each form to a short-lived `HttpOnly; SameSite=Strict`
+  browser cookie to prevent login CSRF/session planting.
 - Session: opaque random token, hash stored server-side (`web_sessions`),
   `HttpOnly; Secure; SameSite=Lax` cookie. CSRF: state-changing
   server-rendered forms carry a per-session HMAC token in the request body and
@@ -924,12 +929,17 @@ counterpart at `/console/my-sessions` lets any signed-in user see and disconnect
 account and refuses a self-service kill of a session not authenticated as the
 caller, so it can never touch anyone else's. The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
-and revoking app passwords and personal access tokens, linking and safely
-unlinking login identities, and inspecting persisted read markers. App
+or rotating the primary password, creating and revoking app passwords and
+personal access tokens, linking and safely unlinking login identities, and
+inspecting persisted read markers. An OIDC-provisioned account can add its
+first local password without presenting a nonexistent current password;
+subsequent rotations require the current primary and never accept an app
+password. App
 passwords and tokens are displayed exactly once; only hashes are retained.
 Identity unlink is transactional: the account row serializes concurrent
-requests, the last login identity cannot be removed, and sessions asserted by
-the removed identity are revoked in the same transaction. The old `/account`
+requests, the last login method cannot be removed, and sessions asserted by
+the removed identity are revoked in the same transaction. A final OIDC
+identity is removable when a primary password remains. The old `/account`
 URL is an authenticated redirect to this canonical page.
 
 The shell also contains `/console/configuration`, the database-backed operational control

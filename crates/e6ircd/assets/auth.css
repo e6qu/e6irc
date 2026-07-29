@@ -88,6 +88,74 @@ h1 {
   margin-top: 2rem;
 }
 
+.login-form {
+  display: grid;
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.login-form label {
+  display: grid;
+  gap: 0.45rem;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.login-form input {
+  width: 100%;
+  min-height: 3.25rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  padding: 0.7rem 0.85rem;
+}
+
+.login-form input:focus-visible {
+  border-color: var(--focus);
+  outline: 0.2rem solid color-mix(in srgb, var(--focus) 30%, transparent);
+  outline-offset: 0.1rem;
+}
+
+.login-form .primary-action {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.auth-error {
+  margin-top: 1.5rem;
+  border: 1px solid #d13a4a;
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, #d13a4a 10%, var(--surface));
+  color: var(--text);
+  padding: 0.85rem 1rem;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin: 1.75rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+
+.auth-divider::before,
+.auth-divider::after {
+  height: 1px;
+  flex: 1;
+  background: var(--border);
+  content: "";
+}
+
+.unavailable {
+  margin-top: 2rem;
+}
+
 .identity {
   display: grid;
   gap: 0.75rem;

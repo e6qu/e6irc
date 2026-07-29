@@ -30,6 +30,13 @@ pub(super) async fn create_app_password(
         Ok(b) => b,
         Err(r) => return r,
     };
+    if let Some(detail) = credential_input_error(&req.account, &req.password) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid account or password",
+            Some(detail),
+        );
+    }
     if let Some(resp) = validate_label(&req.label) {
         return resp;
     }
@@ -57,6 +64,63 @@ pub(super) async fn create_app_password(
         ),
         Err(e) => {
             eprintln!("http: app password issuance failed: {e}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChangePasswordRequest {
+    #[serde(default)]
+    pub(super) current_password: Option<String>,
+    pub(super) new_password: String,
+}
+
+/// Rotate the authenticated account's primary password. An app password
+/// cannot authorize this operation.
+pub(super) async fn change_password(
+    State(state): State<Arc<AppState>>,
+    _rl: RateLimited,
+    Authenticated(account): Authenticated,
+    body: Result<axum::Json<ChangePasswordRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let req = match super::parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if let Some(detail) = req
+        .current_password
+        .as_deref()
+        .and_then(password_input_error)
+        .or_else(|| password_input_error(&req.new_password))
+    {
+        return problem(StatusCode::BAD_REQUEST, "Invalid password", Some(detail));
+    }
+    let result = match req.current_password {
+        Some(current) => {
+            crate::db::change_local_password(pool_of(&state), &account, &current, &req.new_password)
+                .await
+        }
+        None => crate::db::set_local_password(pool_of(&state), &account, &req.new_password).await,
+    };
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::db::DbError::BadCredentials) => problem(
+            StatusCode::UNAUTHORIZED,
+            "Current password is incorrect",
+            None,
+        ),
+        Err(crate::db::DbError::LocalPasswordExists) => problem(
+            StatusCode::CONFLICT,
+            "Current password is required",
+            Some("This account already has a primary password."),
+        ),
+        Err(error) => {
+            eprintln!("http: password rotation failed: {error}");
             problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",
@@ -143,8 +207,8 @@ pub(super) async fn me_identities(
 }
 
 /// Unlink one of the caller's OIDC identities. The database refuses the last
-/// identity and revokes every web session asserted by the removed identity in
-/// the same transaction.
+/// login method and revokes every web session asserted by the removed identity
+/// in the same transaction.
 pub(super) async fn me_identity_unlink(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
@@ -153,10 +217,10 @@ pub(super) async fn me_identity_unlink(
     let pool = pool_of(&state);
     match crate::db::unlink_oidc_identity(pool, &account, id).await {
         Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => StatusCode::NO_CONTENT.into_response(),
-        Ok(crate::db::UnlinkIdentityOutcome::LastIdentity) => problem(
+        Ok(crate::db::UnlinkIdentityOutcome::LastLoginMethod) => problem(
             StatusCode::CONFLICT,
-            "Last login identity",
-            Some("Link another identity before removing this one."),
+            "Last login method",
+            Some("Add a local password or link another identity before removing this one."),
         ),
         Ok(crate::db::UnlinkIdentityOutcome::NotFound) => {
             problem(StatusCode::NOT_FOUND, "No such identity", None)
