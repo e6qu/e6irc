@@ -712,7 +712,7 @@ async fn account_url_redirects_to_the_complete_account_console() {
     assert_eq!(status, 200, "{head}");
     assert!(body.contains("Account &amp; access"), "{body}");
     assert!(body.contains("<strong>alice</strong>"), "{body}");
-    assert!(body.contains("IRC app passwords"), "{body}");
+    assert!(body.contains("IRC credentials"), "{body}");
     assert!(body.contains("Personal access tokens"), "{body}");
     assert!(body.contains("Login identities"), "{body}");
     assert!(body.contains("Read state"), "{body}");
