@@ -207,6 +207,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     resource id. A guessed id cannot disclose or revoke another account's
     session, and the opaque authentication token and its hash never enter an
     inventory row.
+  - `AuditLogRow`/`AuditLogPageSize` — the audit read binds named columns into
+    a typed row instead of returning five transposition-prone strings, and an
+    invalid zero/oversized page cannot reach SQL or cursor arithmetic. Stable
+    `id < before_id` pagination excludes concurrent appends by construction.
   - `WhoxRow` — WHOX reply fields are a struct, not a row of same-typed
     `&str`, so two fields cannot be transposed at a call site.
   - `HistoryDbRow` — the history read binds columns by **name**
@@ -827,7 +831,10 @@ Principal tables (columns abridged):
   (`GREATEST`) and the returned committed value drives the core mirror and
   client acknowledgement; an enqueue or PostgreSQL failure is never reported
   as success. Anonymous connections use explicitly session-local markers.
-- `audit_log` (oper/admin actions, API mutations)
+- `audit_log` (stable id, actor, action, target, detail, creation time for
+  privileged oper/control-plane actions). Exact actor/action/target queries use
+  `(filter, id DESC)` indexes and paginate with `id < before_id`; a concurrently
+  appended action is therefore never duplicated into an older page.
 
 Write path for messages: producers push to an in-process MPSC; a writer pool
 batches into multi-row `INSERT ... UNNEST` (or COPY for bulk) with group
@@ -920,9 +927,11 @@ Personal access tokens (hashed at rest, scoped, expiring) via
 with the CSRF rules above). Admin endpoints additionally require the
 account's admin flag. The same admin-gated data is also served as a
 server-rendered management **console** at `/console` (accounts, registered
-channels, server bans, audit log); it shares the `pages` module,
-`render_private`, and the exact admin gate the `/api/v1/admin/*` JSON endpoints
-use, so it can never surface server-wide data to a non-admin. Beyond the read
+channels, server bans, audit preview), with a dedicated filterable,
+cursor-paginated security-operations view at `/console/audit`; it shares the
+`pages` module, `render_private`, and the exact admin gate the
+`/api/v1/admin/*` JSON endpoints use, so it can never surface server-wide data
+to a non-admin. Beyond the read
 views, the console can **act**: add/remove a K/D/X-line, unregister a registered
 channel, and — from a live client-sessions view at `/console/sessions` — KILL a
 session by nick. These run on the core worker via `Input::Admin { req, reply }`
@@ -1173,7 +1182,9 @@ Surface (initial):
   canonical MLOCK, access flags, founder transfer, unregister)
 - `history`: paged queries per §11.2
 - `admin`: accounts, global bans (kline-equivalents), server stats,
-  audit-log query, live/historical observability, Prometheus exposition
+  exact-filtered/stable-cursor audit-log query, live/historical observability,
+  Prometheus exposition. Personalized administrator JSON and metrics responses
+  carry `Cache-Control: no-store`.
 - `healthz` (liveness; no auth)
 - `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
 

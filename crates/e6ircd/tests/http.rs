@@ -539,6 +539,17 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
+    let audit_parameters = v["paths"]["/api/v1/admin/audit"]["get"]["parameters"]
+        .as_array()
+        .expect("audit query parameters");
+    for name in ["limit", "before_id", "actor", "action", "target"] {
+        assert!(
+            audit_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name),
+            "OpenAPI audit query is missing {name}"
+        );
+    }
     assert!(v["paths"]["/api/v1/me/identities/{id}"]["delete"].is_object());
     assert!(v["paths"]["/api/v1/me/password"]["put"].is_object());
     assert!(v["paths"]["/api/v1/auth/oidc/backchannel-logout"]["post"].is_object());
@@ -1096,8 +1107,14 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let observability = format!(
         "GET /api/v1/admin/observability?minutes=60 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let (status, _, body) = request(http, &observability).await;
+    let (status, observability_headers, body) = request(http, &observability).await;
     assert_eq!(status, 200, "{body}");
+    assert!(
+        observability_headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{observability_headers}"
+    );
     let body: serde_json::Value = serde_json::from_str(&body).expect("observability JSON");
     assert!(body["current"]["active_connections"].is_u64());
     assert!(body["current"]["core_latency"]["p95_us"].is_u64());
@@ -1133,6 +1150,12 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, headers, body) = request(http, &metrics).await;
     assert_eq!(status, 200, "{body}");
     assert!(headers.contains("text/plain; version=0.0.4"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
     assert!(body.contains("e6irc_connections{state=\"registered\"}"));
     assert!(body.contains("e6irc_core_latency_seconds_bucket"));
 
@@ -1868,8 +1891,14 @@ async fn admin_accounts_endpoint_is_gated() {
     let (status, _, _) = request(http, &getauth(&bob_token)).await;
     assert_eq!(status, 403);
     // admin -> 200 + both accounts
-    let (status, _, body) = request(http, &getauth(&alice_token)).await;
+    let (status, headers, body) = request(http, &getauth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let names: Vec<&str> = v["accounts"]
         .as_array()
@@ -1899,8 +1928,14 @@ async fn admin_accounts_endpoint_is_gated() {
         assert_eq!(status, 401, "{path} unauthenticated");
         let (status, _, _) = request(http, &auth(&bob_token)).await;
         assert_eq!(status, 403, "{path} non-admin");
-        let (status, _, body) = request(http, &auth(&alice_token)).await;
+        let (status, headers, body) = request(http, &auth(&alice_token)).await;
         assert_eq!(status, 200, "{path}: {body}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("cache-control: no-store"),
+            "admin response is cacheable: {headers}"
+        );
         let v: serde_json::Value = serde_json::from_str(&body).expect("json");
         // Every admin read endpoint returns its keyed payload: a non-empty
         // array for the list endpoints, a present value for stats' counts.
@@ -2028,6 +2063,149 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
     ] {
         assert!(body.contains(needle), "console missing {needle:?}: {body}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
+    let url = support::test_db("audit_explorer_filters_pages_and_escapes_for_admins_only").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("alice session");
+    let bob_session = e6ircd::db::create_web_session(&pool, "bob", None)
+        .await
+        .expect("bob session");
+    for (actor, action, target, detail) in [
+        ("alice", "OPER", "alice", ""),
+        ("bob", "KLINE", "first@host", "<script>alert(1)</script>"),
+        ("alice", "KLINE", "second@host", "abuse"),
+        ("alice", "CONFIG", "server", "revision 2"),
+        ("bob", "KLINE", "third@host", "spam"),
+    ] {
+        e6ircd::db::insert_audit_log(&pool, actor, action, target, detail)
+            .await
+            .expect("seed audit entry");
+    }
+
+    let config = Config {
+        server_name: "irc.audit.example".into(),
+        network_name: "AuditNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let cookie_get = |path: &str, session: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    let (status, headers, body) = request(
+        http,
+        &cookie_get("/api/v1/admin/audit?limit=2", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
+    let first: serde_json::Value = serde_json::from_str(&body).expect("first page JSON");
+    assert_eq!(first["audit"].as_array().expect("audit rows").len(), 2);
+    assert!(first["audit"][0]["id"].as_i64().is_some(), "{body}");
+    let cursor = first["next_before_id"].as_i64().expect("next page cursor");
+
+    e6ircd::db::insert_audit_log(&pool, "alice", "OPER", "alice", "concurrent")
+        .await
+        .expect("concurrent audit append");
+    let older_path = format!("/api/v1/admin/audit?limit=2&before_id={cursor}");
+    let (status, _, older_body) = request(http, &cookie_get(&older_path, &alice_session)).await;
+    assert_eq!(status, 200, "{older_body}");
+    let older: serde_json::Value = serde_json::from_str(&older_body).expect("older page JSON");
+    assert!(
+        older["audit"]
+            .as_array()
+            .expect("older rows")
+            .iter()
+            .all(|entry| entry["id"].as_i64().is_some_and(|id| id < cursor)),
+        "cursor admitted a newer or duplicate entry: {older_body}"
+    );
+
+    let filtered = "/api/v1/admin/audit?actor=alice&action=KLINE&target=second%40host";
+    let (status, _, filtered_body) = request(http, &cookie_get(filtered, &alice_session)).await;
+    assert_eq!(status, 200, "{filtered_body}");
+    let filtered: serde_json::Value = serde_json::from_str(&filtered_body).expect("filtered JSON");
+    assert_eq!(
+        filtered["audit"].as_array().expect("filtered rows").len(),
+        1,
+        "{filtered_body}"
+    );
+    assert_eq!(filtered["audit"][0]["detail"], "abuse");
+
+    let (status, _, page) = request(http, &cookie_get("/console/audit", &alice_session)).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("<h1>Audit log</h1>"), "{page}");
+    assert!(page.contains("Exact filters"), "{page}");
+    assert!(
+        page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
+        "{page}"
+    );
+    assert!(!page.contains("<script>alert(1)</script>"), "{page}");
+    let (status, _, short_page) =
+        request(http, &cookie_get("/console/audit?limit=2", &alice_session)).await;
+    assert_eq!(status, 200, "{short_page}");
+    assert!(short_page.contains("Older actions"), "{short_page}");
+
+    let (status, _, filtered_page) = request(
+        http,
+        &cookie_get("/console/audit?action=CONFIG", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 200, "{filtered_page}");
+    assert!(filtered_page.contains("revision 2"), "{filtered_page}");
+    assert!(!filtered_page.contains("third@host"), "{filtered_page}");
+
+    let (status, headers, _) = request(http, &get("/console/audit")).await;
+    assert_eq!(status, 303, "{headers}");
+    assert!(
+        headers.to_ascii_lowercase().contains("location: /login"),
+        "{headers}"
+    );
+    let (status, _, _) = request(http, &cookie_get("/console/audit", &bob_session)).await;
+    assert_eq!(status, 403);
+    let (status, _, invalid) = request(
+        http,
+        &cookie_get("/api/v1/admin/audit?before_id=0", &alice_session),
+    )
+    .await;
+    assert_eq!(status, 400, "{invalid}");
+    assert!(invalid.contains("Invalid audit cursor"), "{invalid}");
 }
 
 /// Admin console server-management actions: add/remove a server ban and drop a

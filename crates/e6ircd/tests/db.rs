@@ -13,6 +13,10 @@ use tokio::net::TcpStream;
 
 mod support;
 
+fn audit_page_size(value: usize) -> db::AuditLogPageSize {
+    db::AuditLogPageSize::new(value).expect("test audit page size is in range")
+}
+
 /// `query_history` now returns `Result` (a DB fault is surfaced, not folded
 /// into an empty page); these tests exercise the happy path, so a query error
 /// is a test failure — unwrap it here rather than at every call site.
@@ -2882,14 +2886,16 @@ async fn channel_registration_stores_initial_topic_in_its_insert() {
             1000
         )]
     );
-    let audit = db::list_audit_log(&pool, 1).await.expect("audit");
-    let (actor, action, target, detail, _) = &audit[0];
+    let audit = db::list_audit_log(&pool, audit_page_size(1))
+        .await
+        .expect("audit");
+    let entry = &audit[0];
     assert_eq!(
         (
-            actor.as_str(),
-            action.as_str(),
-            target.as_str(),
-            detail.as_str()
+            entry.actor.as_str(),
+            entry.action.as_str(),
+            entry.target.as_str(),
+            entry.detail.as_str()
         ),
         ("boss", "CHANNEL_REGISTER", "#c", "")
     );
@@ -3331,7 +3337,9 @@ async fn owned_channel_control_is_scoped_and_complete() {
             .len(),
         1
     );
-    let audit = db::list_audit_log(&pool, 20).await.expect("audit");
+    let audit = db::list_audit_log(&pool, audit_page_size(20))
+        .await
+        .expect("audit");
     for action in [
         "CHANNEL_TOPIC",
         "CHANNEL_MLOCK",
@@ -3340,7 +3348,7 @@ async fn owned_channel_control_is_scoped_and_complete() {
         "CHANNEL_FOUNDER",
     ] {
         assert!(
-            audit.iter().any(|entry| entry.1 == action),
+            audit.iter().any(|entry| entry.action == action),
             "missing atomic owner-channel audit action {action}: {audit:#?}"
         );
     }
@@ -3446,9 +3454,16 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
             "kline".to_string(),
         )]
     );
-    let audit = db::list_audit_log(&pool, 10).await.expect("audit");
+    let audit = db::list_audit_log(&pool, audit_page_size(10))
+        .await
+        .expect("audit");
     assert_eq!(
-        (&audit[0].0, &audit[0].1, &audit[0].2, &audit[0].3),
+        (
+            &audit[0].actor,
+            &audit[0].action,
+            &audit[0].target,
+            &audit[0].detail
+        ),
         (
             &"god".to_string(),
             &"KLINE".to_string(),
@@ -3481,9 +3496,11 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         }
     ));
     assert!(db::list_server_bans(&pool).await.expect("bans").is_empty());
-    let audit = db::list_audit_log(&pool, 10).await.expect("audit");
-    assert_eq!(audit[0].1, "UNKLINE");
-    assert_eq!(audit[0].2, "Baddie@*");
+    let audit = db::list_audit_log(&pool, audit_page_size(10))
+        .await
+        .expect("audit");
+    assert_eq!(audit[0].action, "UNKLINE");
+    assert_eq!(audit[0].target, "Baddie@*");
 }
 
 #[tokio::test]
@@ -3585,14 +3602,95 @@ async fn audit_log_records_and_lists() {
     db::insert_audit_log(&pool, "god", "KLINE", "baddie@*", "spam")
         .await
         .expect("a2");
-    let list = db::list_audit_log(&pool, 10).await.expect("list");
+    let list = db::list_audit_log(&pool, audit_page_size(10))
+        .await
+        .expect("list");
     // newest-first
     assert_eq!(list.len(), 2);
     assert_eq!(
-        (&list[0].1, &list[0].2),
+        (&list[0].action, &list[0].target),
         (&"KLINE".to_string(), &"baddie@*".to_string())
     );
-    assert_eq!(&list[1].1, &"OPER".to_string());
+    assert_eq!(&list[1].action, &"OPER".to_string());
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn audit_log_filters_and_cursor_pages_are_stable() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("audit_log_filters_and_cursor_pages_are_stable").await,
+    )
+    .await
+    .expect("connect");
+    for (actor, action, target, detail) in [
+        ("alice", "OPER", "alice", ""),
+        ("bob", "KLINE", "first@host", "spam"),
+        ("alice", "KLINE", "second@host", "abuse"),
+        ("alice", "CONFIG", "server", "revision 2"),
+    ] {
+        db::insert_audit_log(&pool, actor, action, target, detail)
+            .await
+            .expect("seed audit entry");
+    }
+
+    let first = db::query_audit_log(
+        &pool,
+        db::AuditLogFilter {
+            before_id: None,
+            actor: None,
+            action: None,
+            target: None,
+            page_size: audit_page_size(2),
+        },
+    )
+    .await
+    .expect("first page");
+    assert_eq!(first.entries.len(), 2);
+    let cursor = first.next_before_id.expect("older page cursor");
+    assert_eq!(cursor, first.entries[1].id);
+
+    db::insert_audit_log(&pool, "bob", "OPER", "bob", "concurrent")
+        .await
+        .expect("concurrent append");
+    let second = db::query_audit_log(
+        &pool,
+        db::AuditLogFilter {
+            before_id: Some(cursor),
+            actor: None,
+            action: None,
+            target: None,
+            page_size: audit_page_size(2),
+        },
+    )
+    .await
+    .expect("second page");
+    assert!(
+        second.entries.iter().all(|entry| entry.id < cursor),
+        "cursor page admitted a newer or duplicate row: {second:#?}"
+    );
+    assert!(
+        first
+            .entries
+            .iter()
+            .all(|first| second.entries.iter().all(|second| first.id != second.id)),
+        "cursor pages overlapped"
+    );
+
+    let filtered = db::query_audit_log(
+        &pool,
+        db::AuditLogFilter {
+            before_id: None,
+            actor: Some("alice"),
+            action: Some("KLINE"),
+            target: Some("second@host"),
+            page_size: audit_page_size(10),
+        },
+    )
+    .await
+    .expect("filtered page");
+    assert_eq!(filtered.entries.len(), 1);
+    assert_eq!(filtered.entries[0].detail, "abuse");
+    assert_eq!(filtered.next_before_id, None);
 }
 
 #[tokio::test]
@@ -3631,14 +3729,21 @@ async fn managed_configuration_rejects_stale_writes_without_auditing_them() {
     assert_eq!(loaded.revision, saved.revision);
     assert_eq!(loaded.settings, changed);
     assert_eq!(loaded.updated_by, "alice");
-    let audit = db::list_audit_log(&pool, 10).await.expect("audit");
+    let audit = db::list_audit_log(&pool, audit_page_size(10))
+        .await
+        .expect("audit");
     assert_eq!(
         audit.len(),
         1,
         "the failed compare-and-swap must not leave an audit record"
     );
     assert_eq!(
-        (&audit[0].0, &audit[0].1, &audit[0].2, &audit[0].3),
+        (
+            &audit[0].actor,
+            &audit[0].action,
+            &audit[0].target,
+            &audit[0].detail
+        ),
         (
             &"alice".to_string(),
             &"CONFIG".to_string(),
