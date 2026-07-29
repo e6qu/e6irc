@@ -33,6 +33,14 @@ first local password for an OIDC-only account or rotate an existing primary
 after verifying it. Rotation is serialized under the account row, and
 migration 0039 enforces at most one `local_password` credential per account.
 
+Conformance harness reliability (2026-07-29): the e6ircd irctest controller
+now gives commands crossing independent raw-TCP and WebSocket reader tasks a
+bounded settling window before inserting its recipient-side PING barrier.
+That barrier orders the recipient's input but cannot order another socket's
+not-yet-enqueued input; declaring the asynchronous ingress model in the
+controller removes the resulting WebSocket delivery race from the full pinned
+conformance suite.
+
 Control-plane console (2026-07-28): `/console/configuration` now owns typed,
 revisioned operational settings in PostgreSQL with redacted same-transaction
 audit entries and optimistic concurrency. The database URL, master-key source,

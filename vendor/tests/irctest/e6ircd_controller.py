@@ -123,6 +123,12 @@ class E6ircdController(BaseServerController, DirectoryBasedController):
         if faketime is not None:
             raise NotImplementedByController("faketime")
         assert self.proc is None
+        # irctest synchronizes a recipient by sending PING on that recipient's
+        # socket. That orders commands already in the core queue, but it cannot
+        # order a command still crossing another connection's independent
+        # WebSocket reader task. Give only WebSocket cases time to reach the
+        # shared core; raw-only cases retain the zero-delay fast path.
+        self.sync_sleep_time = 0.1 if websocket_port is not None else 0.0
         self.port = port
         self.hostname = hostname
         self.create_config()
