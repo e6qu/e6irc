@@ -253,7 +253,9 @@ try {
   });
   await page.goto(`${applicationOrigin}/?network=demo`);
   await page.getByText("#room", { exact: true }).first().waitFor();
-  await page.locator("#nickcount").waitFor({ state: "visible" });
+  await page.waitForFunction(
+    () => document.getElementById("nickcount")?.textContent === "3",
+  );
   assert.equal(await page.locator("#nickcount").textContent(), "3");
   assert.equal(namesRequestedBeforeSnapshot, false, "NAMES was requested before replay completed");
   assert.match(await page.locator("#network-select").innerText(), /reconnect backoff/);
