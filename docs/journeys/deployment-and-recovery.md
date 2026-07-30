@@ -39,22 +39,27 @@ real server in the database, browser, protocol, bridge, and CLI jobs.
 
 - Every pull request builds/tests all workspace features on Linux, macOS, and
   Windows for x86-64 and ARM64.
-- A version tag builds the production image natively on Linux amd64 and arm64,
-  verifies each image’s runtime shape, and publishes a multi-architecture GHCR
-  manifest.
+- Every merge to `main` builds the production image natively on Linux amd64
+  and arm64, verifies each image’s runtime shape, and publishes one immutable
+  12-character commit-SHA multi-architecture GHCR manifest.
+- Each architecture digest receives signed build-provenance and SPDX SBOM
+  attestations as OCI referrers. The assembled multi-architecture digest
+  receives signed provenance, and the workflow verifies each attestation
+  through the same public consumer command operators use.
 - The runtime image is `debian:bookworm-slim`; the server runs as an
   unprivileged user and contains the embedded web client.
-- `deploy/` supplies the Terraform/ECS example and its deployment contract.
+- `deploy/` supplies the Terraform/ECS example, its deployment contract, and a
+  hardened systemd service for native Linux installation.
 
 **Current product boundary.** The repository does not publish native
-Linux/macOS/Windows binary archives, a systemd unit, musl artifacts, or a
-scratch/distroless image. Cross-platform CI establishes source portability,
-not those distribution artifacts. Container provenance/SBOM emission is not
-enabled in the release workflow.
+Linux/macOS/Windows binary archives, musl artifacts, or a scratch/distroless
+image. Cross-platform CI establishes source portability; the systemd unit is
+an installation contract, not a binary package.
 
 **Evidence.** The production-container CI job builds and inspects the image.
 The release workflow verifies per-architecture images before manifest
-publication; tag publication itself necessarily runs only on a release tag.
+publication, generates and verifies the attestations, and validates the final
+manifest shape. `systemd-analyze verify` checks the service in CI.
 
 ## Restart without losing durable state
 
@@ -81,7 +86,10 @@ cap contracts.
 
 **Evidence.** Graceful shutdown and worker flush behavior are unit/integration
 tested; BNC backlog, read markers, channels, bans, browser sessions, and
-history each have restart/boot-load PostgreSQL tests.
+history each have restart/boot-load PostgreSQL tests. The Chromium acceptance
+journey additionally sends real upstream traffic, stops the daemon with
+SIGTERM and requires exit zero, starts a new process on the same database, and
+proves the session, network, reconnected runtime, and backlog together.
 
 ## Recover from PostgreSQL interruption
 
@@ -139,10 +147,12 @@ target of approximately 100,000 concurrent connections on one machine.
 4. Correlate results with process monitoring and host RSS/CPU.
 
 **Current qualification boundary.** The harness has results through 2,000
-local clients. The runtime has one core worker (the N=1 form of the target
-topology); core sharding, timer-wheel scheduling, per-connection memory budget,
-numeric acceptance targets, and a tuned-host 100k run are not implemented or
-qualified. No reduced-scale load regression runs in CI.
+local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires
+every fan-out delivery plus graceful process shutdown; the harness itself exits
+nonzero on any client or delivery loss. The runtime has one core worker (the
+N=1 form of the target topology); core sharding, timer-wheel scheduling,
+per-connection memory budget, numeric performance targets, and a tuned-host
+100k run are not implemented or qualified.
 
 **Evidence.** Harness correctness has unit/integration coverage and recorded
 manual baselines. The 100k design target is not a shipped performance claim.

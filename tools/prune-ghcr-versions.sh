@@ -30,4 +30,4 @@ for id in $ids; do
   gh api -X DELETE "${base}/${id}" >/dev/null
   count=$((count + 1))
 done
-echo "pruned ${count} image version(s); kept the newest ${keep} release(s)"
+echo "pruned ${count} image/attestation version(s); kept the newest ${keep} release group(s)"

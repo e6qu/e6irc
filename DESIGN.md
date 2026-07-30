@@ -399,7 +399,7 @@ e6irc/
 │   │                         #   step-schedulable for deterministic tests
 │   ├── e6ircd/               # the monolithic server binary
 │   ├── e6irc-client/         # client library: connection, TLS, SASL (PLAIN +
-│   │                         #   OAUTHBEARER device flow), chathistory (shared by CLI/TUI)
+│   │                         #   OAUTHBEARER), chathistory helpers
 │   ├── e6irc-cli/            # scripting-oriented CLI client binary
 │   └── e6irc-tui/            # ratatui TUI client binary
 ├── web/                      # Vite project (vanilla JavaScript chat client)
@@ -1136,7 +1136,8 @@ above the trait, provides for every network kind:
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
   are mirrored to all attached clients (self-echo via `echo-message`).
 - **Detached buffering**: events accumulate per buffer with per-client read
-  markers (`read-marker` cap ↔ web client ↔ TUI all share position).
+  markers (`read-marker` cap and web client share position; native clients can
+  use the same protocol, while the shipped TUI does not yet synchronize it).
 - **Playback**: modern clients pull via `CHATHISTORY`; legacy clients get
   timestamp-prefixed backlog replay on attach (soju-style, configurable
   per client).
@@ -1302,8 +1303,11 @@ Surface (initial):
 - `healthz` (liveness; no auth)
 - `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
 
-The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored and
-always served (no feature gate, no utoipa dependency).
+The OpenAPI 3.1 document at `/api/v1/openapi.json` is hand-authored for
+request/response semantics and always served (no feature gate, no utoipa
+dependency). Its method/path inventory and the Axum API router are generated
+from one route catalog; a mismatch is a unit-test failure and the endpoint
+refuses to serve a plausible but incomplete contract.
 
 ---
 
@@ -1427,13 +1431,15 @@ tail output, `e6irc login`, device-flow orchestration, or token caching.
 
 ### 14.2 `e6irc-tui`
 
-The shipped ratatui client uses `e6irc-client` for one plaintext,
-unauthenticated connection. It has bounded channel/query buffers,
-Alt-Left/Right switching, bounded scrollback, `/join`, `/win`, `/quit`, and
-loud disconnect/write-failure state. It does not currently expose TLS, SASL,
-OAUTHBEARER/device login, BNC network selection, reconnect, CHATHISTORY
-loading, or shared read-marker state. “Multi-buffer” therefore means several
-channels/queries inside one connection, not several networks.
+The shipped ratatui client uses one owned `e6irc-client::ConnectionOptions`
+request for plaintext/public-CA TLS and anonymous, SASL PLAIN, or SASL
+OAUTHBEARER registration. An `account/network` SASL account selects an owned
+BNC network. It has bounded channel/query buffers, Alt-Left/Right switching,
+bounded scrollback, `/join`, `/win`, `/quit`, automatic reconnect with the
+same explicit request, and loud disconnect/write/drop state. It does not
+currently orchestrate device login, load CHATHISTORY, or synchronize shared
+read markers. “Multi-buffer” therefore means several channels/queries inside
+one connection, not several simultaneous networks.
 
 ### 14.3 A client's input is untrusted too
 
@@ -1567,15 +1573,19 @@ Layers, bottom to top:
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
    running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
    over real sockets, including TLS.
-8. **UI tests**: Playwright drives real OIDC/Shauth authentication and the
-   embedded application in Chromium. Active chat state uses browser-side
-   network/history/WebSocket doubles, while real `/ws/ui` relay and
-   self-service CRUD are exercised at HTTP/WebSocket integration level. There
-   is no current browser → real `/ws/ui` → driver → peer acceptance test.
+8. **UI tests**: Playwright drives real OIDC/Shauth and local-password
+   authentication in Chromium. Focused replay/race/membership cases use
+   browser-side network/history/WebSocket doubles. A separate full-stack case
+   creates a network through the console, crosses real PostgreSQL, registry,
+   IRC-driver, local TCP-upstream, and `/ws/ui` paths in both directions,
+   inspects operations data, then gracefully restarts the daemon and proves
+   session/network/backlog recovery.
 9. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
-   exact fan-out delivery, and latency percentiles. Recorded manual baselines
-   reach 2,000 clients; load is not a CI job, numeric acceptance thresholds
-   and RSS/connection budget are not set, and the 100k run is not qualified.
+   exact fan-out delivery, and latency percentiles; any client or delivery loss
+   is a nonzero process exit. CI exercises 64 clients across eight channels
+   against a real daemon. Recorded manual baselines reach 2,000 clients;
+   numeric performance thresholds and RSS/connection budget are not set, and
+   the 100k run is not qualified.
 
 ---
 
@@ -1604,16 +1614,22 @@ Layers, bottom to top:
   reported as restart-required; no response claims those values were applied
   to the running core.
 - CI builds and tests source on Linux, macOS, and Windows for amd64 and arm64.
-  Tagged releases publish a **multi-architecture container image**
+  Each merge to `main` publishes a **multi-architecture container image**
   (linux/amd64 and linux/arm64) whose runtime base is
-  `debian:bookworm-slim`. Native binary archives, a systemd unit, musl
-  artifacts, and scratch/distroless images are not currently shipped.
+  `debian:bookworm-slim`. Each architecture digest has signed build-provenance
+  and SPDX-SBOM attestations; the assembled manifest has signed provenance,
+  and the release workflow verifies them after publication. A hardened,
+  CI-validated systemd unit is shipped for native Linux installation. Native
+  binary archives, musl artifacts, and scratch/distroless images are not
+  currently shipped.
 - The production container built and embedded the Vite client before the Rust
   release build; no build step ran at startup. Each merge to `main` published
   one immutable 12-character commit-SHA manifest plus direct `-amd64` and
   `-arm64` image manifests to GitHub Container Registry. Mutable `latest` and
   branch tags were not published, the manifest shape was verified after push,
   and only the newest 20 release groups were retained.
+  Untagged OCI attestation referrers are retained and pruned by the same
+  oldest-kept-release boundary rather than accumulating outside those groups.
 
 ---
 

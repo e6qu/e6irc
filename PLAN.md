@@ -19,6 +19,35 @@ The 2026-07-30 whole-product traceability audit is in
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
 
+Whole-product gap closure (2026-07-30): the real Chromium/Dex journey now adds
+a local password, signs out, submits local login, verifies the default Libera
+preset, creates a custom network through the console, exchanges traffic with a
+local IRC peer through PostgreSQL/registry/driver/`/ws/ui`, inspects live
+operations/backlog, then SIGTERMs and restarts the actual daemon and proves the
+session, network, reconnection, and persisted message together. Deterministic
+browser doubles remain for replay-race and membership edge cases.
+
+The API route catalog now constructs every documented Axum method router and
+the exact operation set the hand-authored OpenAPI semantics must match. Drift
+is both a unit-test failure and an explicit live 500, closing the former
+representative-path gap. Native clients share one typed connection request;
+the TUI exposes TLS, SASL PLAIN/OAUTHBEARER, BNC `account/network` targeting,
+and reconnect with explicit disconnected-send/drop behavior. The load harness
+now exits nonzero for every client loss, timeout, socket error, or missing
+fan-out delivery, and a real-daemon 64-client/eight-channel correctness smoke
+runs in CI.
+
+The release workflow keeps direct architecture manifests while attaching
+signed build provenance and SPDX SBOMs as OCI referrers, attests the assembled
+multi-architecture manifest, and verifies every attestation after publication.
+`deploy/e6ircd.service` adds a hardened native Linux service contract validated
+by `systemd-analyze`. The journey corpus and deployment instructions now
+describe these exact shipped boundaries, including the actual every-`main`
+release trigger. Driving the new journey in current Chromium also found that
+the network-name input's character-class hyphen was invalid under HTML's
+Unicode-set regular-expression mode; the escaped literal now keeps native form
+validation and server validation aligned without a browser console error.
+
 IRC network creation and post-merge audit (2026-07-29): the console no longer
 suggests the invalid selector `Libera Chat` and then returns a bare
 problem+json page for rejecting its space. The add form now defaults to the
@@ -5172,26 +5201,30 @@ Done (this phase's remaining, now landed):
   the Vite chat client remains a separate vanilla-JavaScript bundle. Composer
   slash-commands DONE (see Phase 4). (DESIGN §13)
 
-## Phase 8 — Native clients 🔶 shipped commands proven; product scope narrower than target (audited 2026-07-30)
+## Phase 8 — Native clients 🔶 shipped commands proven; history/device scope narrower than target (audited 2026-07-30)
 Done:
 - `e6irc-client` lib (tokio connection, proto framing, owned messages,
-  PING-answering register + SASL PLAIN); `e6irc-cli` with
+  PING-answering registration, public-CA TLS, SASL PLAIN/OAUTHBEARER, and one
+  owned `ConnectionOptions` request shared by both native clients);
+  `e6irc-cli` with
   send/tail/raw subcommands and --account/--password SASL, e2e-tested
   against a real e6ircd (plain + SASL); `e6irc-tui` (ratatui,
-  terminal-independent App state unit-tested).
+  terminal-independent App state unit-tested). The TUI exposes TLS with a
+  certificate-name override, SASL PLAIN/OAUTHBEARER, `account/network` BNC
+  selection, and automatic reconnect. Disconnected input and raced outbound
+  lines are visibly refused/count-reported rather than echoed or replayed.
 - The server-side OAUTHBEARER device grant is part of Phase 4; no native
   binary currently orchestrates it. TUI multi-buffer: one buffer per
   channel/query, Alt-←/→ switch,
   `/join`/`/win`, per-buffer scrollback (PgUp/PgDn), message routing
-  (channel/PM), buffer bar. Multi-server/BNC selection is not exposed by the
-  TUI; it would require authenticated BNC selection or a multi-connection
-  loop plus configuration.
+  (channel/PM), buffer bar. The current TUI is one simultaneous connection;
+  its account argument selects one owned BNC network.
 - The client library supports TLS, SASL PLAIN/OAUTHBEARER, and shared history
   helpers. The CLI exposes TLS, SASL PLAIN, `e6irc history`, and `e6irc api`
   (one authenticated REST request over plain HTTP, bearer token or
   E6IRC_API_TOKEN). It does not expose OAUTHBEARER/device login, token caching,
-  or JSON tail output. The TUI exposes plaintext unauthenticated transport,
-  not TLS/SASL/history/read-marker/reconnect/BNC selection. (DESIGN §14;
+  or JSON tail output. The TUI does not load history/read markers or orchestrate
+  device login. (DESIGN §14;
   `docs/journeys/bridges-clients-and-automation.md`)
 
 ## Phase 9 — Bridge SPI ✅ (2026-07-19)
@@ -5271,8 +5304,9 @@ Qualification boundary:
   ephemeral-port range, socket buffers — macOS caps loopback hard). The
   harness is the instrument; the run is a hosting task.
 - This is also code- and contract-incomplete: fan-out/latency acceptance
-  numbers and the per-connection memory budget are unset; no reduced-scale
-  load gate runs in CI; the runtime has one core worker; sharding,
+  numbers and the per-connection memory budget are unset; the reduced-scale
+  CI gate checks exact delivery but deliberately makes no host-performance
+  claim; the runtime has one core worker; sharding,
   timer-wheel scheduling, and whole-core deterministic replay are target
   architecture rather than shipped behavior. (DESIGN §7.3–7.4, §17;
   `docs/journeys/coverage.md`)

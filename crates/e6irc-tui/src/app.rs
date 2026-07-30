@@ -101,6 +101,7 @@ pub struct App {
     pub current: usize,
     pub input: String,
     pub should_quit: bool,
+    connected: bool,
     /// The buffer cap has been reported to the user; say it once, not per line.
     buffer_limit_reported: bool,
 }
@@ -121,8 +122,16 @@ impl App {
             current: 0,
             input: String::new(),
             should_quit: false,
+            connected: true,
             buffer_limit_reported: false,
         }
+    }
+
+    /// Update whether sends can reach the server. The network task reconnects
+    /// independently; the model refuses input while it is down so a line is
+    /// never rendered as sent and queued for surprise delivery later.
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
     }
 
     pub fn current(&self) -> &Buffer {
@@ -276,6 +285,10 @@ impl App {
         }
         if let Some(chan) = line.strip_prefix("/join ").map(str::trim) {
             if !chan.is_empty() {
+                if !self.connected {
+                    self.status("not connected — JOIN not sent");
+                    return Action::None;
+                }
                 // The user's own /join is refused the same way as a
                 // server-driven one, but it is worth saying so: silently not
                 // switching would look like the command did nothing.
@@ -294,6 +307,10 @@ impl App {
             {
                 self.current = n;
             }
+            return Action::None;
+        }
+        if !self.connected {
+            self.status("not connected — message not sent");
             return Action::None;
         }
         let target = self.current().name.clone();
@@ -424,6 +441,28 @@ mod tests {
         }
         assert_eq!(app.on_enter(), Action::Send("PRIVMSG #c :ho".into()));
         assert_eq!(app.current().log.last().unwrap().text, "ho");
+    }
+
+    #[test]
+    fn disconnected_input_is_not_echoed_or_queued() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.set_connected(false);
+        for character in "unsent".chars() {
+            app.on_char(character);
+        }
+        assert_eq!(app.on_enter(), Action::None);
+        assert_eq!(app.current().log.len(), 1);
+        assert_eq!(
+            app.current().log[0].text,
+            "not connected — message not sent"
+        );
+
+        for character in "/join #lost".chars() {
+            app.on_char(character);
+        }
+        assert_eq!(app.on_enter(), Action::None);
+        assert_eq!(app.buffers.len(), 1);
+        assert_eq!(app.current().log[1].text, "not connected — JOIN not sent");
     }
 
     #[test]

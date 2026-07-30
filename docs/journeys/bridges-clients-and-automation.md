@@ -81,24 +81,28 @@ SASL PLAIN flags for IRC commands.
 
 **Shipped flow.**
 
-1. Connect to one plaintext `host:port` with a nick and initial channel.
-2. Register without SASL and join the channel.
+1. Connect to one `host:port` with a nick and initial channel, using plaintext
+   or public-CA TLS with an optional certificate-name override.
+2. Register anonymously, with SASL PLAIN, or with SASL OAUTHBEARER. For a BNC
+   attachment, `--account account/network` selects the owned network.
 3. Receive into bounded buffers, switch buffers with Alt-Left/Right, scroll
    with Page Up/Down, and use `/join`, `/win`, and `/quit`.
 4. Channel/direct messages create and update buffers; server-originated text
    is represented by terminal-safe types.
-5. Disconnect or outbound write failure becomes visible status rather than a
-   false sent message.
+5. A live disconnect starts bounded-delay reconnect attempts with the same
+   explicit transport/authentication request. Input is disabled while
+   disconnected, and anything racing the disconnect is counted and reported
+   rather than replayed late or shown as a false successful send.
 
 **Evidence.** The terminal-independent application state is unit-tested and
-fuzzed with arbitrary server messages; transport failure and bounded queue/
-scrollback behavior are tested. There is no pseudo-terminal/full-screen e2e.
+fuzzed with arbitrary server messages; authentication/transport argument
+shapes, disconnect refusal, transport failure, and bounded queue/scrollback
+behavior are tested. TLS and authentication use the same connection request
+as the real-socket CLI coverage. There is no pseudo-terminal/full-screen e2e.
 
-**Current product boundary.** The TUI is a single-connection plaintext,
-unauthenticated client. It does not expose TLS, SASL PLAIN/OAUTHBEARER, device
-login, BNC network selection, automatic reconnect, CHATHISTORY loading, or
-shared read-marker state. “Multi-buffer” means channel/query buffers inside
-that one connection, not multiple servers.
+**Current product boundary.** The TUI does not orchestrate device login,
+CHATHISTORY loading, or shared read-marker state. “Multi-buffer” means
+channel/query buffers inside one connection, not simultaneous servers.
 
 ## Build another native client
 
@@ -110,8 +114,11 @@ protocol behavior.
 - `e6irc-client` provides plaintext/public-CA TLS connection, framing through
   `e6irc-proto`, registration, SASL PLAIN, SASL OAUTHBEARER, PING handling,
   owned messages, terminal-safe output, and shared CHATHISTORY helpers.
-- The caller owns reconnection, credential acquisition/storage, UI state, and
-  higher-level network selection.
+- `ConnectionOptions` owns the transport, TLS name, registration identity, and
+  an authentication enum whose variants make half-specified SASL impossible.
+  A reconnecting caller can therefore reuse the exact request.
+- The caller owns reconnect policy, credential acquisition/storage, UI state,
+  and higher-level network selection.
 
 **Failure contract.** EOF, invalid/oversized lines, TLS/authentication failure,
 and write failure are returned. Lossy steady-state reading contains a
@@ -142,8 +149,8 @@ Authentication, role, owner scope, validation, conflict, stale state,
 dependency, and rate-limit failures retain distinct status/problem behavior.
 List endpoints never return secret plaintext.
 
-**Evidence.** The hand-authored OpenAPI document is served and representative
-paths are checked in CI; most resource families have direct HTTP/PostgreSQL
-integration tests. The test does not mechanically derive every router method
-from the axum route table, so exhaustive route/spec drift prevention is not
-proven.
+**Evidence.** One route catalog constructs the Axum API method routers and the
+complete method/path inventory; the hand-authored OpenAPI semantics must match
+that inventory exactly. Drift fails a unit test and the live endpoint returns
+an explicit 500 rather than an incomplete contract. Resource families retain
+direct HTTP/PostgreSQL integration tests for their behavior.

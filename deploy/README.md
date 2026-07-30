@@ -13,7 +13,41 @@ build step exists in the runtime image. The `.github/workflows/release.yml`
 workflow publishes `ghcr.io/e6qu/e6irc:<short-sha>` plus the direct
 `<short-sha>-amd64` and `<short-sha>-arm64` images on every push to `main`.
 It publishes no mutable branch or `latest` tag and retains the newest 20
-release groups.
+release groups, including their untagged provenance/SBOM referrers.
+
+Each architecture digest carries signed GitHub build provenance and an SPDX
+software bill of materials as OCI referrers; the assembled commit-SHA manifest
+carries signed assembly provenance. Verify them after authenticating `gh` for
+the repository:
+
+```sh
+gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha> -R e6qu/e6irc
+gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha>-amd64 \
+  -R e6qu/e6irc --predicate-type https://spdx.dev/Document/v2.3
+```
+
+## Native Linux service
+
+`e6ircd.service` is the validated systemd installation contract. Install the
+server at `/usr/local/bin/e6ircd`, create a locked-down `e6irc` system user and
+group, place the configuration at `/etc/e6irc/e6ircd.toml` with any referenced
+key/certificate files readable by that account, then install and enable the
+unit:
+
+```sh
+sudo install -D -m 0755 target/release/e6ircd /usr/local/bin/e6ircd
+sudo useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin e6irc
+sudo install -d -o root -g e6irc -m 0750 /etc/e6irc
+sudo install -o root -g e6irc -m 0640 e6ircd.toml /etc/e6irc/e6ircd.toml
+sudo install -m 0644 deploy/e6ircd.service /etc/systemd/system/e6ircd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now e6ircd
+```
+
+The unit uses SIGTERM and a 15-second stop budget so the daemon’s bounded
+graceful flush completes. It grants no ambient capabilities and makes the host
+filesystem read-only to the process; listeners on privileged ports therefore
+need a reverse proxy or an explicit, reviewed service override.
 
 ## Bootstrap configuration (env → TOML)
 

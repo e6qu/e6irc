@@ -70,6 +70,11 @@ cargo build --release -p e6ircd
 # CLI client
 cargo build --release -p e6irc-cli
 ./target/release/e6irc --addr 127.0.0.1:6667 send '#chan' 'hello'
+
+# TUI client (TLS + BNC account/network selection)
+cargo build --profile release-client -p e6irc-tui
+./target/release-client/e6irc-tui --server bnc.example:6697 --tls \
+  --account alice/libera --password 'app-password' --channel '#e6irc'
 ```
 
 Optional features: `embed-web` (bake the built web client into the

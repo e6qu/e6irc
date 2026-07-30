@@ -43,6 +43,9 @@ latency (µs): p50 4210.0  p90 8800.5  p99 12030.1  max 13990.2
 receives each burst message once). The latency line is true end-to-end
 per delivery (sender stamps each message's send time; receivers subtract
 it), so the tail reflects real queue time under burst, not a mean.
+Any failed client, timeout, socket error, or missing delivery makes the harness
+exit nonzero; printed partial measurements can therefore never be mistaken for
+a successful qualification.
 
 ## Toward the 100k-connection target (DESIGN §7.3, §17)
 
@@ -70,8 +73,10 @@ Run `sweep.sh` to walk client counts and tabulate the results:
 tools/load/sweep.sh 127.0.0.1:6667 "100 500 1000 5000 20000"
 ```
 
-The full 100k run, fan-out/latency acceptance targets, timer-wheel scheduling,
-core sharding, a per-connection memory budget, and a CI performance gate are
-outside the current qualification evidence. This harness is the measurement
-instrument, not proof that the target has been met; see
-`docs/journeys/coverage.md`.
+CI runs 64 clients across eight channels with a four-message burst against a
+real debug daemon, requiring exact fan-out and graceful shutdown. This is a
+correctness regression, not a performance baseline. The full 100k run,
+fan-out/latency performance targets, timer-wheel scheduling, core sharding,
+and a per-connection memory budget remain outside the current qualification
+evidence. This harness is the measurement instrument, not proof that the target
+has been met; see `docs/journeys/coverage.md`.
