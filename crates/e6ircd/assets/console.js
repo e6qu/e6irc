@@ -54,6 +54,32 @@
     tls.addEventListener("change", markCustom);
   }
 
+  for (const clear of document.querySelectorAll("[data-sasl-clear]")) {
+    const form = clear.closest("form");
+    const account = form?.querySelector("[data-sasl-account]");
+    const password = form?.querySelector("[data-sasl-password]");
+    if (
+      !(clear instanceof HTMLInputElement) ||
+      !(account instanceof HTMLInputElement) ||
+      !(password instanceof HTMLInputElement)
+    ) {
+      continue;
+    }
+    clear.addEventListener("change", () => {
+      if (clear.checked) {
+        account.dataset.previousValue = account.value;
+        account.value = "";
+        password.value = "";
+        account.disabled = true;
+        password.disabled = true;
+      } else {
+        account.disabled = false;
+        account.value = account.dataset.previousValue || "";
+        password.disabled = password.dataset.storageAvailable !== "true";
+      }
+    });
+  }
+
   const refresh = async (panel) => {
     const status = document.getElementById(panel.dataset.refreshStatus);
     panel.setAttribute("aria-busy", "true");

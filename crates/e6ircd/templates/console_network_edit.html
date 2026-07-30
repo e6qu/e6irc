@@ -11,8 +11,13 @@
           <label class="field"><span>Nickname</span><input name="nick" value="{{ nick }}" required /></label>
           <label class="field field-wide"><span>Real name <em>optional</em></span><input name="realname" value="{{ realname }}" /></label>
           <label class="field field-wide"><span>Channels to join <em>optional</em></span><input name="autojoin" value="{{ autojoin }}" /><small>Comma-separated channel names.</small></label>
+          <label class="field"><span>Upstream SASL account <em>optional</em></span><input name="sasl_account" autocomplete="username" value="{{ sasl_account }}" maxlength="255" data-sasl-account /></label>
+          <label class="field"><span>New SASL password <em>optional</em></span><input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" data-sasl-password data-storage-available="{% if can_store_secrets %}true{% else %}false{% endif %}" {% if !can_store_secrets %}disabled{% endif %} /><small>Leave blank to keep an existing stored password; required when adding credentials.</small></label>
+          {% if !can_store_secrets %}
+            <div class="banner-info field-wide"><div><strong>Replacing credentials is unavailable.</strong> This deployment has no master key, so e6irc refuses to store a password in plaintext. Remove stored credentials here, or restore the master key before saving a network that still uses them.</div></div>
+          {% endif %}
+          <label class="check field-wide"><input type="checkbox" name="clear_sasl" data-sasl-clear /><span><strong>Remove stored SASL credentials</strong><small>The stored account and encrypted password will both be removed.</small></span></label>
           <label class="check field-wide"><input type="checkbox" name="tls"{% if tls %} checked{% endif %} /><span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span></label>
-          <div class="banner-info field-wide"><div><strong>Upstream credentials are replace-only.</strong> Remove and recreate this network to change its SASL password; the old secret is never returned to the browser.</div></div>
           <div class="form-actions field-wide"><button class="primary" type="submit">Save changes</button><a class="rowlink" href="/console/networks">Cancel</a></div>
         </form>
         </section>

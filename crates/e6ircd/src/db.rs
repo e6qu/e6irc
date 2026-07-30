@@ -3314,36 +3314,33 @@ pub async fn set_bnc_network_enabled(
     Ok(done.rows_affected() > 0)
 }
 
-/// Update `account`'s network `name` connection/identity fields (addr, tls,
-/// nick, realname, autojoin). The SASL credentials and `kind` are deliberately
-/// left unchanged — a credential/kind change goes through delete+recreate, so
-/// this never has to preserve-or-replace a sealed secret. Returns whether a row
-/// matched (false ⇒ no such network for that owner).
-#[allow(clippy::too_many_arguments)] // one column per parameter; a struct would just re-list them
+/// Update all mutable fields of `account`'s network `name`. Secret values in
+/// `network` are already sealed; this storage edge never receives plaintext.
+/// The kind, stable name, and enabled state are deliberately immutable here.
+/// Returns whether a row matched (false ⇒ no such network for that owner).
 pub async fn update_bnc_network(
     pool: &PgPool,
     account: &str,
     name: &str,
-    addr: &str,
-    tls: bool,
-    nick: &str,
-    realname: Option<&str>,
-    autojoin: &[String],
+    network: &BncNetworkRow,
 ) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let done = sqlx::query(
         "UPDATE bnc_networks n
-         SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7
+         SET addr = $3, tls = $4, nick = $5, realname = $6, autojoin = $7,
+             sasl_account = $8, sasl_password_sealed = $9
          FROM accounts a
          WHERE n.account_id = a.id AND a.name_folded = $1 AND lower(n.name) = lower($2)",
     )
     .bind(&folded)
     .bind(name)
-    .bind(addr)
-    .bind(tls)
-    .bind(nick)
-    .bind(realname)
-    .bind(autojoin)
+    .bind(&network.addr)
+    .bind(network.tls)
+    .bind(&network.nick)
+    .bind(&network.realname)
+    .bind(&network.autojoin)
+    .bind(&network.sasl_account)
+    .bind(&network.sasl_password_sealed)
     .execute(pool)
     .await
     .map_err(DbError::Query)?;

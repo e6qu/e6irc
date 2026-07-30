@@ -722,7 +722,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v1/me/networks/{name}",
-            get(get_network).delete(delete_network).patch(patch_network),
+            get(get_network)
+                .put(update_network)
+                .delete(delete_network)
+                .patch(patch_network),
         )
         .route("/api/v1/me/networks/{name}/buffer", get(network_buffer))
         .route("/api/v1/history", get(history))
@@ -4200,6 +4203,8 @@ mod pages {
         nick: String,
         realname: String,
         autojoin: String,
+        sasl_account: String,
+        can_store_secrets: bool,
         error: Option<String>,
     }
 
@@ -4266,6 +4271,12 @@ mod pages {
         realname: String,
         #[serde(default)]
         autojoin: String,
+        #[serde(default)]
+        sasl_account: String,
+        #[serde(default)]
+        sasl_password: String,
+        #[serde(default)]
+        clear_sasl: Option<String>,
     }
 
     /// Admin console: server-wide read views (accounts, registered channels,
@@ -4741,6 +4752,8 @@ mod pages {
         nick: String,
         realname: String,
         autojoin: String,
+        sasl_account: String,
+        can_store_secrets: bool,
         error: Option<String>,
     ) -> Response {
         let is_admin = is_admin_account(state, &account); // shell nav only
@@ -4755,6 +4768,8 @@ mod pages {
             nick,
             realname,
             autojoin,
+            sasl_account,
+            can_store_secrets,
             error,
         })
     }
@@ -4793,6 +4808,8 @@ mod pages {
             row.nick,
             row.realname.unwrap_or_default(),
             row.autojoin.join(", "),
+            row.sasl_account.unwrap_or_default(),
+            state.secret_key.is_some(),
             None,
         )
     }
@@ -4834,6 +4851,21 @@ mod pages {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .collect();
+        let sasl_account = f.sasl_account.trim();
+        let sasl_password = (!f.sasl_password.is_empty()).then_some(f.sasl_password.as_str());
+        let sasl = if f.clear_sasl.as_deref() == Some("on") {
+            // The checkbox is the explicit operation. Values may still arrive
+            // from a no-JavaScript browser whose pre-filled account field was
+            // not disabled; removal wins rather than making that UI path fail.
+            IrcSaslUpdate::Clear
+        } else if sasl_account.is_empty() && sasl_password.is_none() {
+            IrcSaslUpdate::Clear
+        } else {
+            IrcSaslUpdate::Set {
+                account: sasl_account,
+                password: sasl_password,
+            }
+        };
         let result = update_network_core(
             &state,
             registry,
@@ -4844,6 +4876,7 @@ mod pages {
             &f.nick,
             realname.as_deref(),
             &autojoin,
+            sasl,
         )
         .await;
         let error = match result {
@@ -4864,6 +4897,8 @@ mod pages {
             f.nick,
             f.realname,
             f.autojoin,
+            f.sasl_account,
+            state.secret_key.is_some(),
             Some(error),
         )
     }

@@ -349,8 +349,9 @@ async fn wait_for_reconnect(
     ends: &mut DriverEnds,
     backoff: &mut Backoff,
     attempt_elapsed: std::time::Duration,
+    failure: NetworkFailure,
 ) -> bool {
-    ends.emit(ConnectionEvent::Reconnecting);
+    ends.emit(ConnectionEvent::Reconnecting(failure));
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
@@ -388,7 +389,6 @@ pub(crate) async fn run_with_backoff<C>(
                     ),
                     _ => unreachable!("matched only terminal rejections"),
                 };
-                ends.classify_error(failure);
                 consecutive_rejections += 1;
                 if consecutive_rejections >= MAX_CONSECUTIVE_REGISTRATION_REJECTIONS {
                     ends.emit(event);
@@ -403,16 +403,15 @@ pub(crate) async fn run_with_backoff<C>(
                     ends.shutdown_signalled().await;
                     return;
                 }
-                if !wait_for_reconnect(ends, &mut backoff, started.elapsed()).await {
+                if !wait_for_reconnect(ends, &mut backoff, started.elapsed(), failure).await {
                     return;
                 }
             }
             SessionOutcome::Dropped(failure) => {
                 // A transient (non-auth) drop: a connection-level failure that
                 // may well recover, so keep retrying and reset the auth counter.
-                ends.classify_error(failure);
                 consecutive_rejections = 0;
-                if !wait_for_reconnect(ends, &mut backoff, started.elapsed()).await {
+                if !wait_for_reconnect(ends, &mut backoff, started.elapsed(), failure).await {
                     return;
                 }
             }
@@ -734,8 +733,10 @@ pub enum DriverEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionEvent {
     Connected,
-    /// A transient failure ended the current attempt; another attempt follows.
-    Reconnecting,
+    /// A classified transient failure ended the current attempt; another
+    /// attempt follows. Carrying the reason makes an unclassified disconnect
+    /// impossible for every driver using the public SPI.
+    Reconnecting(NetworkFailure),
     /// Repeated credential rejection parked the driver until it is reconfigured.
     AuthenticationFailed,
     /// Repeated IRC registration rejection parked the driver until reconfigured.
@@ -759,11 +760,6 @@ pub struct NetworkHandle {
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     /// Runtime state and per-network counters, shared with the driver endpoint.
     runtime: std::sync::Arc<NetworkRuntime>,
-    /// Sticky connection state: set on Connected, cleared on any failure.
-    /// A live `Connected` event is broadcast-only and missed by a client
-    /// that subscribes just after it fires; this flag lets any observer
-    /// read the current state regardless of subscribe timing.
-    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
 }
@@ -903,12 +899,14 @@ struct NetworkRuntimeState {
     connected_at: Option<e6irc_proto::time::Millis>,
     attempt_started: std::time::Instant,
     connect_latency_ms: Option<u64>,
+    connection_attempts: u64,
+    errors: u64,
+    last_error_at: Option<e6irc_proto::time::Millis>,
+    last_error: Option<NetworkFailure>,
 }
 
 struct NetworkRuntime {
     state: std::sync::Mutex<NetworkRuntimeState>,
-    connection_attempts: std::sync::atomic::AtomicU64,
-    errors: std::sync::atomic::AtomicU64,
     attached_clients: std::sync::atomic::AtomicU64,
     lines_in: std::sync::atomic::AtomicU64,
     bytes_in: std::sync::atomic::AtomicU64,
@@ -916,8 +914,6 @@ struct NetworkRuntime {
     bytes_out: std::sync::atomic::AtomicU64,
     last_input_at: std::sync::atomic::AtomicU64,
     last_output_at: std::sync::atomic::AtomicU64,
-    last_error_at: std::sync::atomic::AtomicU64,
-    last_error: std::sync::Mutex<Option<NetworkFailure>>,
 }
 
 impl NetworkRuntime {
@@ -929,9 +925,11 @@ impl NetworkRuntime {
                 connected_at: None,
                 attempt_started: std::time::Instant::now(),
                 connect_latency_ms: None,
+                connection_attempts: 0,
+                errors: 0,
+                last_error_at: None,
+                last_error: None,
             }),
-            connection_attempts: std::sync::atomic::AtomicU64::new(0),
-            errors: std::sync::atomic::AtomicU64::new(0),
             attached_clients: std::sync::atomic::AtomicU64::new(0),
             lines_in: std::sync::atomic::AtomicU64::new(0),
             bytes_in: std::sync::atomic::AtomicU64::new(0),
@@ -939,35 +937,26 @@ impl NetworkRuntime {
             bytes_out: std::sync::atomic::AtomicU64::new(0),
             last_input_at: std::sync::atomic::AtomicU64::new(0),
             last_output_at: std::sync::atomic::AtomicU64::new(0),
-            last_error_at: std::sync::atomic::AtomicU64::new(0),
-            last_error: std::sync::Mutex::new(None),
         }
     }
 
     fn begin_attempt(&self) {
-        let attempt = self
-            .connection_attempts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut state = self.state.lock().expect("network runtime poisoned");
-        state.lifecycle = if attempt == 0 {
+        state.lifecycle = if state.connection_attempts == 0 {
             NetworkLifecycle::Connecting
         } else {
             NetworkLifecycle::Reconnecting
         };
+        state.connection_attempts = state.connection_attempts.saturating_add(1);
         state.state_changed_at = epoch_millis();
         state.attempt_started = std::time::Instant::now();
     }
 
     fn connected(&self) {
-        if self
-            .connection_attempts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
-            self.connection_attempts
-                .store(1, std::sync::atomic::Ordering::Relaxed);
-        }
         let mut state = self.state.lock().expect("network runtime poisoned");
+        if state.connection_attempts == 0 {
+            state.connection_attempts = 1;
+        }
         let now = epoch_millis();
         state.lifecycle = NetworkLifecycle::Connected;
         state.state_changed_at = now;
@@ -981,25 +970,29 @@ impl NetworkRuntime {
         );
     }
 
-    fn failed(&self, terminal: Option<NetworkLifecycle>) {
-        self.operational_error();
+    fn failed(&self, terminal: Option<NetworkLifecycle>, failure: NetworkFailure) {
         let now = epoch_millis();
         let mut state = self.state.lock().expect("network runtime poisoned");
         state.lifecycle = terminal.unwrap_or(NetworkLifecycle::Reconnecting);
         state.state_changed_at = now;
         state.connected_at = None;
+        Self::set_error(&mut state, now, failure);
     }
 
-    fn operational_error(&self) {
-        self.errors
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fn operational_error(&self, failure: NetworkFailure) {
         let now = epoch_millis();
-        self.last_error_at
-            .store(now.as_millis(), std::sync::atomic::Ordering::Relaxed);
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        Self::set_error(&mut state, now, failure);
     }
 
-    fn classify_error(&self, failure: NetworkFailure) {
-        *self.last_error.lock().expect("network runtime poisoned") = Some(failure);
+    fn set_error(
+        state: &mut NetworkRuntimeState,
+        now: e6irc_proto::time::Millis,
+        failure: NetworkFailure,
+    ) {
+        state.errors = state.errors.saturating_add(1);
+        state.last_error_at = Some(now);
+        state.last_error = Some(failure);
     }
 
     fn record_input(&self, bytes: usize) {
@@ -1030,8 +1023,7 @@ fn record_network_error(
     telemetry: &std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>,
     failure: NetworkFailure,
 ) {
-    runtime.classify_error(failure);
-    runtime.operational_error();
+    runtime.operational_error(failure);
     if let Some(telemetry) = telemetry.lock().expect("telemetry hook poisoned").as_ref() {
         telemetry.record_error(crate::observability::ErrorKind::Bouncer);
     }
@@ -1282,7 +1274,12 @@ impl NetworkHandle {
     /// The current upstream connection state. Unlike the `Connected` event
     /// this is not lost to subscribe timing — safe to poll after `start`.
     pub fn is_connected(&self) -> bool {
-        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+        self.runtime
+            .state
+            .lock()
+            .expect("network runtime poisoned")
+            .lifecycle
+            == NetworkLifecycle::Connected
     }
 
     /// Count one attached client until the returned guard is dropped.
@@ -1312,21 +1309,11 @@ impl NetworkHandle {
             connected_at: state.connected_at,
             last_input_at: atomic_millis(&self.runtime.last_input_at),
             last_output_at: atomic_millis(&self.runtime.last_output_at),
-            last_error_at: atomic_millis(&self.runtime.last_error_at),
-            last_error: *self
-                .runtime
-                .last_error
-                .lock()
-                .expect("network runtime poisoned"),
+            last_error_at: state.last_error_at,
+            last_error: state.last_error,
             connect_latency_ms: state.connect_latency_ms,
-            connection_attempts: self
-                .runtime
-                .connection_attempts
-                .load(std::sync::atomic::Ordering::Relaxed),
-            errors: self
-                .runtime
-                .errors
-                .load(std::sync::atomic::Ordering::Relaxed),
+            connection_attempts: state.connection_attempts,
+            errors: state.errors,
             attached_clients: self
                 .runtime
                 .attached_clients
@@ -1360,6 +1347,10 @@ impl NetworkHandle {
             connected_at: state.connected_at,
             attempt_started: state.attempt_started,
             connect_latency_ms: state.connect_latency_ms,
+            connection_attempts: state.connection_attempts,
+            errors: state.errors,
+            last_error_at: state.last_error_at,
+            last_error: state.last_error,
         }
     }
 
@@ -1377,7 +1368,6 @@ impl NetworkHandle {
         let (command_tx, command_rx) = mpsc::channel(BNC_COMMAND_QUEUE);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
-        let connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runtime = std::sync::Arc::new(NetworkRuntime::new());
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle = NetworkHandle {
@@ -1386,7 +1376,6 @@ impl NetworkHandle {
             shutdown: shutdown_tx,
             buffer: buffer.clone(),
             runtime: runtime.clone(),
-            connected: connected.clone(),
             telemetry: telemetry.clone(),
         };
         // A process-wide counter gives each driver a distinct, stable jitter
@@ -1399,7 +1388,6 @@ impl NetworkHandle {
             shutdown: shutdown_rx,
             buffer,
             runtime,
-            connected,
             telemetry,
             reconnect_seed,
         };
@@ -1434,7 +1422,6 @@ pub struct DriverEnds {
     shutdown: tokio::sync::watch::Receiver<bool>,
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     runtime: std::sync::Arc<NetworkRuntime>,
-    connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
     /// Stable per-driver value seeding this driver's reconnect jitter, so
@@ -1444,13 +1431,6 @@ pub struct DriverEnds {
 }
 
 impl DriverEnds {
-    /// Record a credential-safe diagnostic before emitting a failure event.
-    /// The event owns counters and timestamps; this method owns only the closed
-    /// failure classification exposed by monitoring.
-    pub(crate) fn classify_error(&self, failure: NetworkFailure) {
-        self.runtime.classify_error(failure);
-    }
-
     /// Record a recoverable failure that does not end the driver session, such
     /// as one rejected outbound bridge message. Reconnect outcomes are counted
     /// by their lifecycle event instead; this path owns both classification and
@@ -1492,25 +1472,24 @@ impl DriverEnds {
         let broadcast = match event {
             ConnectionEvent::Connected => {
                 self.runtime.connected();
-                self.connected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 DriverEvent::Connected
             }
-            ConnectionEvent::Reconnecting
-            | ConnectionEvent::AuthenticationFailed
-            | ConnectionEvent::RegistrationFailed => {
-                self.connected
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                let terminal = match event {
-                    ConnectionEvent::AuthenticationFailed => {
-                        Some(NetworkLifecycle::AuthenticationFailed)
+            failure_event => {
+                let (terminal, failure) = match failure_event {
+                    ConnectionEvent::Reconnecting(failure) => (None, failure),
+                    ConnectionEvent::AuthenticationFailed => (
+                        Some(NetworkLifecycle::AuthenticationFailed),
+                        NetworkFailure::AuthenticationRejected,
+                    ),
+                    ConnectionEvent::RegistrationFailed => (
+                        Some(NetworkLifecycle::RegistrationFailed),
+                        NetworkFailure::RegistrationRejected,
+                    ),
+                    ConnectionEvent::Connected => {
+                        unreachable!("connected handled before failure transition")
                     }
-                    ConnectionEvent::RegistrationFailed => {
-                        Some(NetworkLifecycle::RegistrationFailed)
-                    }
-                    _ => None,
                 };
-                self.runtime.failed(terminal);
+                self.runtime.failed(terminal, failure);
                 if let Some(telemetry) = self
                     .telemetry
                     .lock()
@@ -1844,8 +1823,9 @@ mod tests {
         assert!(connected.connect_latency_ms.is_some());
 
         drop(attachment);
-        ends.classify_error(NetworkFailure::ConnectionLost);
-        ends.emit(ConnectionEvent::Reconnecting);
+        ends.emit(ConnectionEvent::Reconnecting(
+            NetworkFailure::ConnectionLost,
+        ));
         let reconnecting = handle.runtime_snapshot();
         assert_eq!(reconnecting.lifecycle, NetworkLifecycle::Reconnecting);
         assert_eq!(reconnecting.errors, 1);
@@ -1859,8 +1839,11 @@ mod tests {
         ends.emit(ConnectionEvent::AuthenticationFailed);
         let failed = handle.runtime_snapshot();
         assert_eq!(failed.lifecycle, NetworkLifecycle::AuthenticationFailed);
+        assert_eq!(
+            failed.last_error,
+            Some(NetworkFailure::AuthenticationRejected)
+        );
 
-        ends.classify_error(NetworkFailure::RegistrationRejected);
         ends.emit(ConnectionEvent::RegistrationFailed);
         let rejected = handle.runtime_snapshot();
         assert_eq!(rejected.lifecycle, NetworkLifecycle::RegistrationFailed);

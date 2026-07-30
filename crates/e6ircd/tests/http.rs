@@ -1,7 +1,7 @@
 //! e2e tests for the HTTP layer, over real sockets with a raw
 //! HTTP/1.1 client (no client library needed for these shapes).
 
-use e6ircd::config::{Config, HttpConfig, ListenerConfig};
+use e6ircd::config::{Config, HttpConfig, ListenerConfig, SecretsConfig};
 use e6ircd::net;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -86,6 +86,23 @@ fn form_value(value: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
+}
+
+struct TemporaryFile(std::path::PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+fn temporary_path(label: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "e6irc-http-{label}-{}-{sequence}",
+        std::process::id()
+    ))
 }
 
 #[tokio::test]
@@ -372,6 +389,37 @@ async fn bnc_network_management_lifecycle() {
     assert_eq!(detail["runtime"]["state"], "connected");
     assert_eq!(detail["has_sasl_password"], false);
 
+    // Full configuration replacement is available through REST as well. The
+    // credential action is mandatory even when there is no secret to change.
+    let update = format!(
+        r##"{{"addr":"{up}","tls":false,"nick":"alice_updated","realname":"Alice","autojoin":["#other"],"credentials":{{"action":"keep"}}}}"##
+    );
+    let update_req = format!(
+        "PUT /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{update}",
+        update.len()
+    );
+    let (status, _, body) = request(http, &update_req).await;
+    assert_eq!(status, 204, "update: {body}");
+    let (status, _, detail) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{detail}");
+    let detail: serde_json::Value = serde_json::from_str(&detail).expect("updated detail json");
+    assert_eq!(detail["nick"], "alice_updated");
+    assert_eq!(detail["realname"], "Alice");
+    assert_eq!(detail["autojoin"], serde_json::json!(["#other"]));
+
+    let ambiguous = format!(r#"{{"addr":"{up}","tls":false,"nick":"ignored"}}"#);
+    let ambiguous_req = format!(
+        "PUT /api/v1/me/networks/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ambiguous}",
+        ambiguous.len()
+    );
+    let (status, _, _) = request(http, &ambiguous_req).await;
+    assert_eq!(
+        status, 400,
+        "an omitted credential action must not silently preserve or clear"
+    );
+
     // disable it: the flag flips and the driver stops (no live handle, so
     // `connected` is null), while the config row survives.
     let patch = |enabled: bool| {
@@ -431,6 +479,27 @@ async fn bnc_network_upstream_secret_requires_master_key() {
     let token = e6ircd::db::issue_api_token(&pool, "alice", "test")
         .await
         .expect("token");
+    e6ircd::db::create_bnc_network(
+        &pool,
+        "alice",
+        &e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Irc,
+            name: "stored-secret".into(),
+            addr: "up.example:6697".into(),
+            tls: true,
+            nick: "alice_".into(),
+            realname: None,
+            autojoin: vec![],
+            sasl_account: Some("alice".into()),
+            // Simulates a deployment whose key was removed after credentials
+            // had already been stored. Boot cannot open it, but explicit
+            // credential removal must still recover the network.
+            sasl_password_sealed: Some("enc:v2:unavailable-without-key".into()),
+            enabled: true,
+        },
+    )
+    .await
+    .expect("stored credential row");
     drop(pool);
 
     // server with NO [secrets] key configured
@@ -470,6 +539,26 @@ async fn bnc_network_upstream_secret_requires_master_key() {
         status, 409,
         "must refuse to store an upstream secret unsealed"
     );
+
+    let remove = r#"{"addr":"up.example:6697","tls":true,"nick":"alice_","credentials":{"action":"remove"}}"#;
+    let remove_req = format!(
+        "PUT /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{remove}",
+        remove.len()
+    );
+    let (status, _, body) = request(http, &remove_req).await;
+    assert_eq!(
+        status, 204,
+        "removing an unreadable stored credential must recover the network: {body}"
+    );
+    let detail_req = format!(
+        "GET /api/v1/me/networks/stored-secret HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &detail_req).await;
+    assert_eq!(status, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).expect("network detail");
+    assert_eq!(detail["has_sasl_account"], false, "{body}");
+    assert_eq!(detail["has_sasl_password"], false, "{body}");
 }
 
 // ---- embedded web client (DESIGN §13.3) ---------------------------------
@@ -530,6 +619,10 @@ async fn openapi_spec_is_served() {
     );
     assert!(
         v["paths"]["/api/v1/me/networks/{name}"]["get"].is_object(),
+        "{body}"
+    );
+    assert!(
+        v["paths"]["/api/v1/me/networks/{name}"]["put"].is_object(),
         "{body}"
     );
     assert!(v["paths"]["/api/v1/me/channels"]["get"].is_object());
@@ -1375,6 +1468,10 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn console_edit_network_updates_fields() {
     let url = support::test_db("console_edit_network_updates_fields").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("network-edit-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -1413,10 +1510,11 @@ async fn console_edit_network_updates_fields() {
             secure_cookies: false,
             admin_accounts: vec![],
         }),
-        database: Some(DatabaseConfig { url }),
+        database: Some(DatabaseConfig { url: url.clone() }),
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
+        secrets: Some(SecretsConfig { key_file: key_path }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1447,7 +1545,10 @@ async fn console_edit_network_updates_fields() {
     let (status, _, form) = request(http, &edit_get).await;
     assert_eq!(status, 200, "{form}");
     assert!(
-        form.contains("value=\"alice_\"") && form.contains("irc.example:6667"),
+        form.contains("value=\"alice_\"")
+            && form.contains("irc.example:6667")
+            && form.contains("name=\"sasl_password\"")
+            && form.contains("name=\"clear_sasl\""),
         "{form}"
     );
 
@@ -1473,6 +1574,85 @@ async fn console_edit_network_updates_fields() {
         page2.contains("newbie") && page2.contains("irc.new.example:6697"),
         "{page2}"
     );
+
+    // Add credentials entirely through the edit UI. The response never echoes
+    // the password, while storage receives a context-bound encrypted value.
+    let credentials = format!(
+        "csrf={csrf}&addr=irc.new.example%3A6697&nick=newbie&realname=Bob&\
+         autojoin=%23lobby&tls=on&sasl_account=alice-login&sasl_password=upstream-secret"
+    );
+    let credential_post = format!(
+        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{credentials}",
+        credentials.len()
+    );
+    let (status, _, body) = request(http, &credential_post).await;
+    assert_eq!(status, 303, "{body}");
+    assert!(!body.contains("upstream-secret"), "{body}");
+    let verification_pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("verification connection");
+    let with_credentials = e6ircd::db::get_bnc_network(&verification_pool, "alice", "work")
+        .await
+        .expect("read credentials")
+        .expect("network");
+    assert_eq!(
+        with_credentials.sasl_account.as_deref(),
+        Some("alice-login")
+    );
+    let sealed = with_credentials
+        .sasl_password_sealed
+        .as_deref()
+        .expect("sealed password");
+    assert_ne!(sealed, "upstream-secret");
+    assert_eq!(
+        secret_key
+            .open(sealed, &e6ircd::bouncer::bnc_secret_context("alice"))
+            .expect("decrypt stored password"),
+        "upstream-secret"
+    );
+
+    // Changing only the public SASL account preserves the exact encrypted
+    // password; a blank password is the write-only "keep" operation.
+    let account_only = format!(
+        "csrf={csrf}&addr=irc.new.example%3A6697&nick=newbie&tls=on&sasl_account=alice-renamed"
+    );
+    let account_post = format!(
+        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{account_only}",
+        account_only.len()
+    );
+    let (status, _, body) = request(http, &account_post).await;
+    assert_eq!(status, 303, "{body}");
+    let renamed = e6ircd::db::get_bnc_network(&verification_pool, "alice", "work")
+        .await
+        .expect("read renamed account")
+        .expect("network");
+    assert_eq!(renamed.sasl_account.as_deref(), Some("alice-renamed"));
+    assert_eq!(
+        renamed.sasl_password_sealed,
+        with_credentials.sasl_password_sealed
+    );
+
+    // Explicit removal clears both halves rather than leaving a stored secret
+    // behind after the visible account disappears.
+    let clear = format!("csrf={csrf}&addr=irc.new.example%3A6697&nick=newbie&tls=on&clear_sasl=on");
+    let clear_post = format!(
+        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{clear}",
+        clear.len()
+    );
+    let (status, _, body) = request(http, &clear_post).await;
+    assert_eq!(status, 303, "{body}");
+    let cleared = e6ircd::db::get_bnc_network(&verification_pool, "alice", "work")
+        .await
+        .expect("read cleared credentials")
+        .expect("network");
+    assert_eq!(cleared.sasl_account, None);
+    assert_eq!(cleared.sasl_password_sealed, None);
 
     // The SSRF guard applies to a changed address too: an internal IP is refused
     // and the form re-renders (200) with an error banner.

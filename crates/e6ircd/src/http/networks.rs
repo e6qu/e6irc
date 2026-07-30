@@ -461,10 +461,103 @@ pub(super) fn validate_irc_upstream(
     check_upstream_bounds(addr, nick, realname, autojoin)
 }
 
-/// Update the connection/identity fields of one of the caller's IRC networks
-/// (addr, tls, nick, realname, autojoin — not the SASL credentials), persist
-/// them, and rebuild the live driver so the change takes effect. Shared by the
-/// account page and the console.
+/// How an IRC edit mutates the write-only upstream credentials. A blank
+/// password is never overloaded to mean both "keep" and "clear": callers must
+/// choose one of these states explicitly.
+pub(super) enum IrcSaslUpdate<'a> {
+    Keep,
+    Clear,
+    Set {
+        account: &'a str,
+        /// `None` preserves the current sealed password while changing only
+        /// the public account name. `Some` replaces the encrypted secret.
+        password: Option<&'a str>,
+    },
+}
+
+fn apply_irc_sasl_update(
+    state: &AppState,
+    owner: &str,
+    row: &mut crate::db::BncNetworkRow,
+    update: IrcSaslUpdate<'_>,
+) -> Result<(), NetworkMutationError> {
+    let (account, password) = match update {
+        IrcSaslUpdate::Keep => return Ok(()),
+        IrcSaslUpdate::Clear => {
+            row.sasl_account = None;
+            row.sasl_password_sealed = None;
+            return Ok(());
+        }
+        IrcSaslUpdate::Set { account, password } => (account.trim(), password),
+    };
+    if account.is_empty() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Incomplete upstream SASL",
+            Some("enter a SASL account or explicitly remove the stored credentials"),
+        ));
+    }
+    let has_control = |value: &str| value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0));
+    if account.len() > 255
+        || password.is_some_and(|value| value.len() > 512)
+        || has_control(account)
+        || password.is_some_and(has_control)
+    {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid upstream SASL",
+            Some("credentials exceed their length bounds or contain CR, LF or NUL"),
+        ));
+    }
+    row.sasl_account = Some(account.to_string());
+    if let Some(password) = password {
+        if password.is_empty() {
+            return Err(network_error(
+                StatusCode::BAD_REQUEST,
+                "Incomplete upstream SASL",
+                Some("a replacement password must not be empty"),
+            ));
+        }
+        let key = state.secret_key.as_ref().ok_or_else(|| {
+            network_error(
+                StatusCode::CONFLICT,
+                "No master key configured",
+                Some("the server cannot store upstream credentials without [secrets]"),
+            )
+        })?;
+        row.sasl_password_sealed =
+            Some(key.seal(password, &crate::bouncer::bnc_secret_context(owner)));
+    } else if row.sasl_password_sealed.is_none() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Incomplete upstream SASL",
+            Some("enter a password for this SASL account"),
+        ));
+    }
+    Ok(())
+}
+
+/// Construct a prospective driver before the caller mutates durable state.
+/// Edit uses the row's current enabled flag; enable/disable supplies its target
+/// flag. Keeping secret opening and factory-error mapping here prevents those
+/// mutation paths from drifting into different failure semantics.
+fn prospective_network_driver(
+    state: &AppState,
+    account: &str,
+    row: &crate::db::BncNetworkRow,
+    should_run: bool,
+) -> Result<Option<Box<dyn crate::bouncer::NetworkDriver>>, NetworkMutationError> {
+    if !should_run {
+        return Ok(None);
+    }
+    crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
+        .map(Some)
+        .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
+}
+
+/// Update all mutable connection, identity, and credential fields of one of the
+/// caller's IRC networks, persist them, and rebuild the live driver so the
+/// change takes effect. Shared by the account page and the console.
 #[allow(clippy::too_many_arguments)] // one field per parameter; a struct would just re-list them
 pub(super) async fn update_network_core(
     state: &AppState,
@@ -476,11 +569,12 @@ pub(super) async fn update_network_core(
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
+    sasl: IrcSaslUpdate<'_>,
 ) -> Result<(), NetworkMutationError> {
     validate_irc_upstream(addr, nick, realname, autojoin)?;
     let pool = pool_of(state);
     // This form edits IRC connection/identity fields; a bridge (matrix/discord/
-    // slack) has no such fields and its credentials change via delete+recreate.
+    // slack) has different fields and is managed through its integration UI.
     // Refuse to overwrite a non-IRC row's addr/nick/etc. through it (a direct
     // POST to the edit URL, since the UI hides the link for bridges).
     let mut row = match crate::db::get_bnc_network(pool, account, name).await {
@@ -517,19 +611,11 @@ pub(super) async fn update_network_core(
     row.nick = nick.to_string();
     row.realname = realname.map(str::to_string);
     row.autojoin = autojoin.to_vec();
-    let driver = if row.enabled {
-        Some(
-            crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account).map_err(
-                |error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)),
-            )?,
-        )
-    } else {
-        None
-    };
+    apply_irc_sasl_update(state, account, &mut row, sasl)?;
+    let driver = prospective_network_driver(state, account, &row, row.enabled)?;
 
     require_network_updated(
-        crate::db::update_bnc_network(pool, account, name, addr, tls, nick, realname, autojoin)
-            .await,
+        crate::db::update_bnc_network(pool, account, name, &row).await,
         "update failed",
     )?;
     if let Some(driver) = driver {
@@ -804,6 +890,73 @@ pub(super) struct PatchNetwork {
     pub(super) enabled: bool,
 }
 
+/// Full mutable IRC-network configuration for `PUT`. Credential handling is a
+/// required tagged action so omitted JSON can never ambiguously mean either
+/// preserve or erase a write-only secret.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpdateNetwork {
+    pub(super) addr: String,
+    pub(super) tls: bool,
+    pub(super) nick: String,
+    #[serde(default)]
+    pub(super) realname: Option<String>,
+    #[serde(default)]
+    pub(super) autojoin: Vec<String>,
+    pub(super) credentials: UpdateNetworkCredentials,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum UpdateNetworkCredentials {
+    Keep,
+    Remove,
+    Set {
+        account: String,
+        #[serde(default)]
+        password: Option<String>,
+    },
+}
+
+/// Replace all mutable configuration of one caller-owned IRC network and
+/// restart its driver. The stable name, driver kind, and enabled state are not
+/// changed by this endpoint.
+pub(super) async fn update_network(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    Path(name): Path<String>,
+    JsonBody(req): JsonBody<UpdateNetwork>,
+) -> Response {
+    let Some(registry) = &state.bnc_registry else {
+        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+    };
+    let sasl = match &req.credentials {
+        UpdateNetworkCredentials::Keep => IrcSaslUpdate::Keep,
+        UpdateNetworkCredentials::Remove => IrcSaslUpdate::Clear,
+        UpdateNetworkCredentials::Set { account, password } => IrcSaslUpdate::Set {
+            account,
+            password: password.as_deref(),
+        },
+    };
+    if let Err(error) = update_network_core(
+        &state,
+        registry,
+        &account,
+        &name,
+        &req.addr,
+        req.tls,
+        &req.nick,
+        req.realname.as_deref(),
+        &req.autojoin,
+        sasl,
+    )
+    .await
+    {
+        return error.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Persist a network's enabled flag and start or stop its always-on driver.
 /// Enabling builds from the stored row first, so a missing key/factory failure
 /// cannot require a compensating database rollback.
@@ -835,11 +988,7 @@ pub(super) async fn set_network_enabled_core(
                 ));
             }
         };
-        Some(
-            crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), account).map_err(
-                |error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)),
-            )?,
-        )
+        prospective_network_driver(state, account, &row, true)?
     } else {
         None
     };
@@ -916,8 +1065,9 @@ mod tests {
     #[test]
     fn runtime_json_exposes_only_the_safe_failure_classification() {
         let (handle, ends) = crate::bouncer::NetworkHandle::channels(8);
-        ends.classify_error(crate::bouncer::NetworkFailure::SecureConnectionFailed);
-        ends.emit(crate::bouncer::ConnectionEvent::Reconnecting);
+        ends.emit(crate::bouncer::ConnectionEvent::Reconnecting(
+            crate::bouncer::NetworkFailure::SecureConnectionFailed,
+        ));
         let json = runtime_json(&handle.runtime_snapshot());
         assert_eq!(
             json["last_error"]["code"], "secure_connection_failed",
