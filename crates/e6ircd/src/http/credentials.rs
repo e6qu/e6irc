@@ -2,6 +2,149 @@
 
 use super::*;
 
+#[derive(Deserialize)]
+pub(super) struct ProfileRequest {
+    pub(super) contact_email: Option<String>,
+}
+
+pub(super) async fn me_profile(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+) -> Response {
+    match crate::db::account_contact_email(pool_of(&state), &account).await {
+        Ok(contact_email) => {
+            let mut response = (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "account": account,
+                    "contact_email": contact_email,
+                })
+                .to_string(),
+            )
+                .into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Err(error) => database_unavailable("profile read", error),
+    }
+}
+
+pub(super) async fn update_me_profile(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    JsonBody(request): JsonBody<ProfileRequest>,
+) -> Response {
+    let contact_email = match request.contact_email.as_deref() {
+        Some(email) => match crate::identity::ContactEmail::parse(email) {
+            Ok(email) => Some(email),
+            Err(error) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid contact email",
+                    Some(&error.to_string()),
+                );
+            }
+        },
+        None => None,
+    };
+    match crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => database_unavailable("profile update", error),
+    }
+}
+
+pub(super) async fn export_me(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+) -> Response {
+    match crate::db::export_account_json(pool_of(&state), &account).await {
+        Ok(Some(export)) => {
+            let mut response = (
+                [
+                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"e6irc-account-export.json\"",
+                    ),
+                ],
+                export,
+            )
+                .into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Ok(None) => problem(StatusCode::NOT_FOUND, "No such account", None),
+        Err(error) => database_unavailable("account export", error),
+    }
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct SecurityActivityQuery {
+    limit: Option<usize>,
+    before_id: Option<i64>,
+}
+
+pub(super) async fn me_security_activity(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    Query(query): Query<SecurityActivityQuery>,
+) -> Response {
+    let page_size = match query.limit.map_or_else(
+        || crate::db::AuditLogPageSize::new(100),
+        crate::db::AuditLogPageSize::new,
+    ) {
+        Some(page_size) => page_size,
+        None => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid security activity limit",
+                Some("The security activity limit must be between 1 and 1,000."),
+            );
+        }
+    };
+    if query.before_id.is_some_and(|id| id <= 0) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid security activity cursor",
+            Some("The before_id cursor must be a positive activity entry id."),
+        );
+    }
+    match crate::db::query_account_security_activity(
+        pool_of(&state),
+        &account,
+        query.before_id,
+        page_size,
+    )
+    .await
+    {
+        Ok(page) => {
+            let mut response = (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "activity": page.entries.into_iter().map(|entry| {
+                        serde_json::json!({
+                            "id": entry.id,
+                            "actor": entry.actor,
+                            "action": entry.action,
+                            "target": entry.target,
+                            "detail": entry.detail,
+                            "at": entry.created_at,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "next_before_id": page.next_before_id,
+                })
+                .to_string(),
+            )
+                .into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Err(error) => database_unavailable("security activity", error),
+    }
+}
+
 fn database_unavailable(operation: &str, error: impl std::fmt::Display) -> Response {
     eprintln!("http: {operation} failed: {error}");
     problem(
@@ -258,10 +401,13 @@ pub(super) async fn me_tokens_list(
         Ok(rows) => {
             let tokens: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(|(id, label, created_at, expires_at)| {
+                .map(|token| {
                     serde_json::json!({
-                        "id": id, "label": label,
-                        "created_at": created_at, "expires_at": expires_at,
+                        "id": token.id,
+                        "label": token.label,
+                        "created_at": token.created_at,
+                        "expires_at": token.expires_at,
+                        "scopes": token.scopes.iter().collect::<Vec<_>>(),
                     })
                 })
                 .collect();
@@ -301,4 +447,42 @@ pub(super) async fn revoke_credential(
         "No such credential",
         "credential revoke",
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeleteOwnAccountRequest {
+    pub(super) confirmation: String,
+}
+
+pub(super) async fn delete_own_account(
+    State(state): State<Arc<AppState>>,
+    SessionMutation(account): SessionMutation,
+    JsonBody(request): JsonBody<DeleteOwnAccountRequest>,
+) -> Response {
+    if request.confirmation != account {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Account confirmation does not match",
+            Some("Supply the exact display-cased account name."),
+        );
+    }
+    let account_id = match crate::db::account_id_by_name(pool_of(&state), &account).await {
+        Ok(Some(account_id)) => account_id,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
+        Err(error) => return database_unavailable("account deletion target", error),
+    };
+    match super::delete_account_lifecycle(&state, &account, account_id, true).await {
+        Ok(_) => {
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                clear_session_cookie(state.secure_cookies)
+                    .parse()
+                    .expect("session clear cookie is valid"),
+            );
+            response
+        }
+        Err((status, detail)) => problem(status, "Account deletion failed", Some(&detail)),
+    }
 }

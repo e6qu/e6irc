@@ -2215,6 +2215,7 @@ fn nickserv_register_creates_account() {
         vec![e6ircd::core::DbRequest::CreateAccount {
             conn: alice,
             name: "alice".into(),
+            contact_email: None,
             password: "hunter2".into(),
             origin: e6ircd::core::AccountOrigin::NickServ,
         }]
@@ -2236,6 +2237,84 @@ fn nickserv_register_creates_account() {
     let bob = s.register(2, "bob");
     s.line(bob, "WHOIS alice");
     assert!(has_numeric(&s.drain(bob), "330"));
+}
+
+#[test]
+fn account_registration_persists_only_valid_normalized_contact_email() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "draft/account-registration");
+    s.drain(alice);
+    s.line(
+        alice,
+        "REGISTER * Alice+IRC@Example.COM correct-horse-battery",
+    );
+    assert_eq!(
+        s.db_requests(),
+        vec![e6ircd::core::DbRequest::CreateAccount {
+            conn: alice,
+            name: "alice".into(),
+            contact_email: Some(
+                e6ircd::identity::ContactEmail::parse("Alice+IRC@example.com")
+                    .expect("valid contact email")
+            ),
+            password: "correct-horse-battery".into(),
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        }]
+    );
+
+    s.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::AccountExists {
+            origin: e6ircd::core::AccountOrigin::RegisterCommand,
+        },
+    });
+    s.drain(alice);
+    s.line(alice, "REGISTER * not-an-email correct-horse-battery");
+    let out = s.drain(alice);
+    assert!(
+        out.iter()
+            .any(|line| line.contains("FAIL REGISTER INVALID_EMAIL")),
+        "{out:#?}"
+    );
+    assert!(
+        s.db_requests().is_empty(),
+        "invalid contact data must not reach storage"
+    );
+}
+
+#[test]
+fn nickserv_registration_stores_contact_email_and_rejects_extra_arguments() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    s.line(
+        alice,
+        "PRIVMSG NickServ :REGISTER hunter2 Alice@Example.COM",
+    );
+    assert_eq!(
+        s.db_requests(),
+        vec![e6ircd::core::DbRequest::CreateAccount {
+            conn: alice,
+            name: "alice".into(),
+            contact_email: Some(
+                e6ircd::identity::ContactEmail::parse("Alice@example.com")
+                    .expect("valid contact email")
+            ),
+            password: "hunter2".into(),
+            origin: e6ircd::core::AccountOrigin::NickServ,
+        }]
+    );
+
+    s.line(
+        alice,
+        "PRIVMSG NickServ :REGISTER hunter2 alice@example.com ignored",
+    );
+    assert!(s.db_requests().is_empty());
+    assert!(
+        s.drain(alice)
+            .iter()
+            .any(|line| line.contains("Syntax: REGISTER")),
+        "extra accepted-but-ignored arguments must fail loudly"
+    );
 }
 
 #[test]
@@ -7239,6 +7318,7 @@ fn register_command_refuses_a_name_other_than_the_callers_nick() {
             vec![e6ircd::core::DbRequest::CreateAccount {
                 conn: alice,
                 name: "alice".into(),
+                contact_email: None,
                 password: "hunter2".into(),
                 origin: e6ircd::core::AccountOrigin::RegisterCommand,
             }],

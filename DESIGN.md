@@ -614,7 +614,9 @@ which gives:
 driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
 
 - Bounded MPSC ring buffer; accepted envelopes carry a per-queue monotonic
-  sequence number.
+  sequence number. The bound is an admission limit, not an eager allocation:
+  storage grows only with admitted envelopes, which prevents every empty
+  per-connection SendQ from reserving its maximum capacity.
 - **No silent loss**: `try_push` returns `Err(Full(event))` — the
   producer decides (kill the slow consumer's connection, exert
   backpressure, or shed *with accounting*). Delivered-or-returned is an
@@ -706,9 +708,12 @@ tracking. Any nontrivial optimization lands with evidence that proves it:
   p50/p90/p99/max latency under a controlled environment. The harness accepts
   explicit minimum-rate/maximum-P99 thresholds and treats missing, duplicate,
   out-of-range, and malformed deliveries as failures. Every pull request runs
-  a deliberately generous 64-client regression gate; manual baselines reach
-  2,000 clients. Production-host budgets and the 100k qualification remain a
-  target boundary, not a shipped performance claim.
+  a deliberately generous 64-client regression gate, including Linux daemon
+  resident-memory sampling and a 1 MiB incremental RSS/connection ceiling;
+  manual baselines reach 2,000 clients. The harness accepts a stricter
+  host-specific RSS ceiling alongside throughput and latency thresholds.
+  Production-host budgets and the 100k qualification remain a target boundary,
+  not a shipped performance claim.
 
 ### 7.5 IRCv3 capabilities
 
@@ -839,9 +844,18 @@ typed database failure instead of parking an HTTP or worker caller indefinitely.
 
 Principal tables (columns abridged):
 
-- `accounts` (id, name/casefolded, created_at, flags). The closed flag bits are
-  durable administrator authority and suspension; a database constraint rejects
-  every other value. At least one durable administrator remains active.
+- `accounts` (id, name/casefolded, private contact email, created_at, flags).
+  The closed flag bits are durable administrator authority and suspension; a
+  database constraint rejects every other value. At least one effective
+  durable-or-configured administrator remains active across HTTP deletion.
+- `retired_account_names` (casefolded name, deletion time) permanently reserves
+  deleted identities. The account-name transaction lock serializes create and
+  delete, while a storage trigger makes a future unwrapped account insert reject
+  a retired name independently of application routing.
+- `account_invitations` (opaque token digest, proposed account/contact/
+  authority, issuer, creation/expiry, consumption/accepted-account metadata).
+  A partial unique index admits at most one live invitation per folded name;
+  bearer plaintext is returned once and never stored.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
   revocable, shown once at creation
@@ -904,7 +918,8 @@ A supervised five-minute storage-maintenance worker applies the live
 UI-managed `[storage]` policy independently of monitoring. Each transaction
 removes at most 10,000 expired message-history rows, audit events, browser
 sessions, personal access tokens, device grants, and consumed OpenID Connect
-logout tokens from each collection. Time-order indexes and the global
+logout tokens, plus expired/revoked/consumed account invitations, from each
+collection. Time-order indexes and the global
 acquisition/statement/lock deadlines bound both the selection and the
 transaction. Filling any batch is logged with per-collection provenance and
 the next fixed cycle continues draining it; database failure is counted and
@@ -958,11 +973,38 @@ choke point rejects suspended accounts.
 
 Durable administrator authority is independently grantable/revocable by
 immutable account ID. The acting administrator cannot demote itself, and the
-last active durable administrator cannot be demoted. Configured administrator
-grants remain a distinct restart-scoped authority source; the directory shows
-both sources, and revoking a durable grant cannot falsely remove a still-active
-configuration grant. Every durable authority transition is audited and updates
-the live HTTP authorization registry immediately.
+last active effective durable-or-configured administrator cannot be suspended
+or removed. Configured administrator grants remain a distinct restart-scoped
+authority source; the directory shows both sources, and revoking a durable
+grant cannot falsely remove a still-active configuration grant. Every durable
+authority transition is audited and updates the live HTTP authorization
+registry immediately.
+
+Administrators can also provision a local account immediately or issue a
+1–30-day single-use invitation. Invitation issuance validates the same account
+name and typed private contact email as direct creation, takes the shared
+  per-name advisory lock, enforces a per-administrator pending cap, and stores
+  only the SHA-256 digest of a 256-bit bearer. The administrator directory is
+  a bounded, stable newest-first cursor page. Acceptance is rate-limited and
+bound to a short-lived `HttpOnly; SameSite=Strict` browser cookie; password
+hashing, account/contact/authority creation, invitation consumption, and audit
+commit in one transaction before the browser session is issued. Expired,
+revoked, consumed, and unknown bearers deliberately share one public
+unavailable response.
+
+Permanent deletion is a succession operation rather than a cascading accident.
+The target must found no registered channel and cannot be the last active
+effective administrator, including authority supplied by deployment
+configuration. The shared account/network mutation lane first installs a
+folded authentication deny key in the ordered core. The final transaction
+rechecks every invariant, reserves the name permanently, purges pending/
+consumed invitation contact data, device grants, owned BNC buffer, sent and
+direct-message history, and then deletes the account so credentials, sessions,
+identity links, networks, markers, and access rows cascade. The redacted audit
+event and retirement commit together. On database failure the HTTP boundary
+removes the live deny key before returning the error; success stops owned
+drivers and clears live administrator authority. No shipped creation path—or
+the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge; the capability's advertised value states
@@ -972,15 +1014,22 @@ account always takes the registering nick's name, which keeps "the account you
 registered is the nick you were holding" true — and that in turn is what lets
 direct-message conversations be keyed by account (§11.1.1). Registration before
 the connection completes is off by default: a half-open connection creating
-accounts is a spam vector unless the operator opts in. e6ircd cannot send
-verification mail, so `email-required` only enforces that an address was
-supplied.
+accounts is a spam vector unless the operator opts in. A registration email is
+parsed once into a bounded ASCII mailbox with a canonical lowercase DNS domain,
+then stored as private account profile data; it is never exposed by the account
+directory. e6ircd does not claim to have verified locally supplied mail because
+it does not send verification messages. `email-required` therefore requires
+valid contact data, while OpenID Connect domain admission separately requires a
+provider-verified email claim.
 
 ### 9.2 Web login
 
 - **OIDC** authorization-code + PKCE against one or more providers
-  registered in config (issuer URL, client id/secret, allowed domains
-  option). Discovery + JWKS cached with proper refresh. First login
+  registered in config (issuer URL, client id/secret, allowed email domains
+  option). A non-empty domain policy admits only a syntactically valid,
+  provider-verified email whose canonical domain exactly matches an entry;
+  parent/subdomain relationships never become implicit wildcards. Discovery +
+  JWKS cached with proper refresh. First login
   auto-provisions an account (nick derived from `preferred_username`,
   conflict → user picks). Subsequent logins match on (issuer, subject),
   never on email.
@@ -1037,10 +1086,27 @@ CERTFP is explicitly out of scope for v1 (not selected).
 
 ### 9.4 REST API authentication
 
-Personal access tokens (hashed at rest, scoped, expiring) via
-`Authorization: Bearer`, or the web session cookie (for the browser clients,
-with the CSRF rules above). Admin endpoints additionally require the
-account's durable administrator flag or a configured administrator grant.
+Personal access tokens are hashed at rest, expire after a caller-selected
+1–365 days (30 by default), and carry a non-empty closed grant set:
+`read`, `write`, `administrator`, and `irc`. `Authorization: Bearer` requires
+`read` for safe API methods and `write` for mutations; administrator routes
+also require both the `administrator` grant and the account's current durable
+or configured administrator authority. IRC SASL OAUTHBEARER independently
+requires `irc`. Device authorization issues `read`/`write`/`irc`, never
+administrator authority. Token issuance and device approval require the
+browser session plus its `X-E6IRC-CSRF` value, so an existing bearer cannot
+mint a broader replacement. Every unsafe cookie-authenticated REST method
+requires that same header at the shared authentication boundary. The web
+session cookie remains the browser credential, with the CSRF rules above.
+
+Authenticated API requests share a per-account token bucket across browser
+sessions and personal access tokens (240 requests per minute by default).
+Administrator operations use a separate, smaller per-account bucket (60 per
+minute by default). Both are UI-managed, bounded in memory, and fail closed
+when the bucket registry cannot admit another active account. The HTTP service
+also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
+limit, and 30-second request deadline before work can consume unbounded
+process resources.
 The same admin-gated data is also served as a
 server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit preview), with a dedicated filterable,
@@ -1107,11 +1173,34 @@ first local password without presenting a nonexistent current password;
 subsequent rotations require the current primary and never accept an app
 password. App
 passwords and tokens are displayed exactly once; only hashes are retained.
+The same page reads and updates the private contact email used by registration
+policy and account recovery contact. The typed email value is canonicalized at
+the HTTP/IRC boundary, changes are audited without recording the address or its
+domain, and public account posture never includes it.
 Identity unlink is transactional: the account row serializes concurrent
 requests, the last login method cannot be removed, and sessions asserted by
 the removed identity are revoked in the same transaction. A final OIDC
 identity is removable when a primary password remains. The old `/account`
 URL is an authenticated redirect to this canonical page.
+
+The same page presents the account's newest security activity, with stable
+cursor pagination at `/api/v1/me/security-activity`, and downloads a versioned
+non-cacheable JSON attachment at `/api/v1/me/export`. The export is built from
+one PostgreSQL statement snapshot and includes retained personal content and
+secret-free configuration/posture; password hashes, bearer/session/invitation
+digests, plaintext bearer values, provider identity tokens/session IDs, device
+codes, and sealed upstream credentials are absent. Credential, token, identity,
+browser-session, login/logout, provider-logout, invitation, account-state, and
+deletion transitions emit redacted account-visible audit events.
+
+`/console/accounts` additionally owns immediate local account creation,
+single-use invitation issuance/revocation, and permanent deletion with exact
+display-name confirmation. The matching REST resources are
+`POST /api/v1/admin/accounts`, `DELETE /api/v1/admin/accounts/{id}`,
+`GET|POST /api/v1/admin/invitations`, and
+`DELETE /api/v1/admin/invitations/{id}`. Self-deletion is
+`DELETE /api/v1/me/account` and requires a cookie session plus its CSRF value;
+a personal access token cannot delete the identity that issued it.
 
 The shell also contains `/console/configuration`, the database-backed operational control
 plane. Its singleton `server_settings` row is a typed JSON document with an
@@ -1128,6 +1217,12 @@ rendered back. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
 supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.
+
+Server-rendered data tables carry screen-reader captions, and navigation
+landmarks carry accessible names. `tools/check-template-accessibility.py`
+checks those structural contracts across the complete Askama template
+directory in CI so a newly added operational table cannot silently regress to
+an unnamed grid.
 
 The console is also the home of `/console/networks` — a per-user BNC network
 manager with add/remove/enable-disable, and **edit** of an IRC
@@ -1694,10 +1789,11 @@ Layers, bottom to top:
    command streams, and arbitrary server output into the TUI model.
    `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive, but the
    seeded whole-core scheduler/replay described in §7.3 is not implemented.
-   A separate all-feature coverage job runs the workspace suite and rejects
-   line coverage below 55%; the floor is a regression ratchet, while dedicated
-   PostgreSQL/browser jobs supply environment-dependent acceptance evidence
-   outside that percentage.
+   A separate all-feature coverage job combines the portable workspace suite
+   with the real PostgreSQL database and HTTP lifecycle suites, then rejects
+   line coverage below 80%; the floor is a regression ratchet. Provider/browser
+   jobs supply their environment-dependent acceptance evidence outside that
+   percentage.
 3. **irctest** (progval/irctest) run in CI against `e6ircd` — the same
    suite Solanum/Ergo use.
 4. **Compatibility** (§7.7): the vendored Libera-snapshot ISUPPORT
@@ -1739,9 +1835,11 @@ Layers, bottom to top:
    supplied-threshold failure is a nonzero process exit. CI exercises 64
    clients across eight channels against a real daemon with generous
    catastrophic-regression floors (10 connects/s, 100 deliveries/s, P99 below
-   five seconds). Recorded manual baselines reach 2,000 clients; production
-   performance thresholds and an RSS/connection budget are not set, and the
-   100k run is not qualified.
+   five seconds). The Linux smoke also samples the daemon's pre-run and peak
+   resident set and rejects incremental growth above 1 MiB per requested
+   connection; controlled hosts can supply a stricter bytes/connection
+   ceiling. Recorded manual baselines reach 2,000 clients; production
+   performance thresholds and the 100k run are not qualified.
 
 ---
 

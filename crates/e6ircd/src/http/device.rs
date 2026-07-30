@@ -126,7 +126,7 @@ pub(super) async fn approve_user_code(
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 pub(super) async fn device_approve(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    SessionMutation(account): SessionMutation,
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
     match approve_user_code(&state, &account, &req.user_code).await {
@@ -140,26 +140,6 @@ pub(super) async fn device_approve(
                 None,
             )
         }
-    }
-}
-
-/// Authenticate, then require the account be an admin (per config).
-/// Returns the account name, or a 401/403 response.
-pub(super) async fn require_admin(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> Result<String, Response> {
-    let account = authenticate(state, headers).await?;
-    let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-    if state
-        .admin_accounts
-        .read()
-        .expect("administrator registry lock")
-        .contains(&folded)
-    {
-        Ok(account)
-    } else {
-        Err(problem(StatusCode::FORBIDDEN, "Admin only", None))
     }
 }
 
@@ -360,6 +340,235 @@ pub(super) async fn admin_account_state(
             "message": message,
         })),
         Err((status, detail)) => problem(status, "Account state change failed", Some(&detail)),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminCreateAccountBody {
+    account: String,
+    password: String,
+    contact_email: Option<String>,
+    #[serde(default)]
+    administrator: bool,
+}
+
+pub(super) async fn admin_create_account(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminCreateAccountBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let account_id = match super::create_account_lifecycle(
+        &state,
+        &actor,
+        &body.account,
+        &body.password,
+        body.contact_email.as_deref(),
+        body.administrator,
+    )
+    .await
+    {
+        Ok(account_id) => account_id,
+        Err((status, detail)) => {
+            return problem(status, "Account creation failed", Some(&detail));
+        }
+    };
+    let mut response = admin_json(serde_json::json!({
+        "id": account_id,
+        "account": body.account,
+        "administrator": body.administrator,
+    }));
+    *response.status_mut() = StatusCode::CREATED;
+    response
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminCreateAccountInvitationBody {
+    account: String,
+    contact_email: Option<String>,
+    expires_in_days: u16,
+    #[serde(default)]
+    administrator: bool,
+}
+
+#[derive(Default, serde::Deserialize)]
+pub(super) struct AccountInvitationDirectoryQuery {
+    limit: Option<usize>,
+    before_id: Option<i64>,
+}
+
+#[allow(clippy::result_large_err)] // Err is the standard full problem Response
+fn validate_account_invitation_directory_query(
+    params: AccountInvitationDirectoryQuery,
+    default_limit: usize,
+) -> Result<(crate::db::AccountInvitationPageSize, Option<i64>), Response> {
+    let page_size = bounded_admin_page_size(
+        params.limit,
+        default_limit,
+        crate::db::AccountInvitationPageSize::new,
+        "Invalid invitation-directory limit",
+        "The invitation-directory limit must be between 1 and 1,000.",
+    )?;
+    let before_id = positive_admin_cursor(
+        params.before_id,
+        "Invalid invitation-directory cursor",
+        "The before_id cursor must be a positive invitation id.",
+    )?;
+    Ok((page_size, before_id))
+}
+
+pub(super) async fn admin_account_invitations(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAccount,
+    axum::extract::Query(params): axum::extract::Query<AccountInvitationDirectoryQuery>,
+) -> Response {
+    let (page_size, before_id) = match validate_account_invitation_directory_query(params, 100) {
+        Ok(query) => query,
+        Err(response) => return response,
+    };
+    match crate::db::list_account_invitations(pool_of(&state), before_id, page_size).await {
+        Ok(page) => admin_json(serde_json::json!({
+            "invitations": page.entries.into_iter().map(|invitation| {
+                serde_json::json!({
+                    "id": invitation.id,
+                    "account": invitation.account_name,
+                    "contact_email": invitation.contact_email,
+                    "administrator": invitation.administrator,
+                    "created_by": invitation.created_by,
+                    "created_at": invitation.created_at,
+                    "expires_at": invitation.expires_at,
+                })
+            }).collect::<Vec<_>>(),
+            "next_before_id": page.next_before_id,
+        })),
+        Err(error) => admin_db_error("account invitation directory", error),
+    }
+}
+
+pub(super) async fn admin_create_account_invitation(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<
+        axum::Json<AdminCreateAccountInvitationBody>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if !crate::sanitize::valid_nick(&body.account, MAX_ACCOUNT_LEN) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid account",
+            Some("The account must be a valid IRC nickname of at most 64 bytes."),
+        );
+    }
+    let contact_email = match body.contact_email.as_deref() {
+        Some(contact_email) => match crate::identity::ContactEmail::parse(contact_email) {
+            Ok(contact_email) => Some(contact_email),
+            Err(error) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid contact email",
+                    Some(&error.to_string()),
+                );
+            }
+        },
+        None => None,
+    };
+    let Some(lifetime) = crate::identity::AccountInvitationLifetimeDays::new(body.expires_in_days)
+    else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid invitation lifetime",
+            Some("Invitation lifetime must be between 1 and 30 days."),
+        );
+    };
+    match crate::db::issue_account_invitation(
+        pool_of(&state),
+        &body.account,
+        contact_email.as_ref(),
+        body.administrator,
+        lifetime,
+        &actor,
+    )
+    .await
+    {
+        Ok(token) => {
+            let invitation_url = super::account_invitation_url(&state, &token);
+            let mut response = admin_json(serde_json::json!({
+                "account": body.account,
+                "administrator": body.administrator,
+                "expires_in_days": body.expires_in_days,
+                "invitation_url": invitation_url,
+                "note": "This bearer link is shown once and cannot be retrieved later.",
+            }));
+            *response.status_mut() = StatusCode::CREATED;
+            response
+        }
+        Err(crate::db::DbError::DuplicateAccount(_)) => problem(
+            StatusCode::CONFLICT,
+            "Account name unavailable",
+            Some("The name exists, is retired, or already has a pending invitation."),
+        ),
+        Err(crate::db::DbError::TooManyInvitations) => problem(
+            StatusCode::CONFLICT,
+            "Too many pending invitations",
+            Some("Revoke or wait for an existing invitation to expire."),
+        ),
+        Err(error) => admin_db_error("account invitation issuance", error),
+    }
+}
+
+pub(super) async fn admin_revoke_account_invitation(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(invitation_id): axum::extract::Path<i64>,
+) -> Response {
+    match crate::db::revoke_account_invitation(pool_of(&state), invitation_id, &actor).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
+        Err(error) => admin_db_error("account invitation revocation", error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountDeletionBody {
+    confirmation: String,
+}
+
+pub(super) async fn admin_delete_account(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(account_id): axum::extract::Path<i64>,
+    body: Result<axum::Json<AccountDeletionBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
+        Err(error) => return admin_db_error("account deletion target", error),
+    };
+    if body.confirmation != target {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Account confirmation does not match",
+            Some("Supply the exact display-cased account name."),
+        );
+    }
+    match super::delete_account_lifecycle(&state, &actor, account_id, false).await {
+        Ok(message) => admin_json(serde_json::json!({ "message": message })),
+        Err((status, detail)) => problem(status, "Account deletion failed", Some(&detail)),
     }
 }
 
@@ -893,6 +1102,7 @@ mod admin_query_tests {
 
 pub(super) async fn me(
     State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // A *valid* session cookie yields the rich OIDC identity (email/role/
@@ -913,6 +1123,7 @@ pub(super) async fn me(
                         "role": identity.role,
                         "provider": identity.provider,
                         "release_revision": state.application_release_revision,
+                        "csrf_token": state.csrf_token(&token),
                         "logout_url": format!(
                             "/api/v1/auth/logout?csrf={}",
                             state.csrf_token(&token)
@@ -937,25 +1148,38 @@ pub(super) async fn me(
             }
         }
     }
-    match authenticate(&state, &headers).await {
-        Ok(account) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "account": account }).to_string(),
-        )
-            .into_response(),
-        Err(response) => response,
-    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "account": account }).to_string(),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
 pub(super) struct TokenRequest {
     pub(super) label: String,
+    #[serde(default = "default_token_scopes")]
+    pub(super) scopes: Vec<crate::identity::ApiTokenScope>,
+    #[serde(default = "default_token_lifetime_days")]
+    pub(super) expires_in_days: u16,
+}
+
+fn default_token_scopes() -> Vec<crate::identity::ApiTokenScope> {
+    vec![
+        crate::identity::ApiTokenScope::Read,
+        crate::identity::ApiTokenScope::Write,
+        crate::identity::ApiTokenScope::Irc,
+    ]
+}
+
+const fn default_token_lifetime_days() -> u16 {
+    crate::identity::ApiTokenLifetimeDays::DEFAULT.value()
 }
 
 /// Mint a PAT for the authenticated account (shown once).
 pub(super) async fn create_api_token(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    SessionMutation(account): SessionMutation,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -965,17 +1189,33 @@ pub(super) async fn create_api_token(
     if let Some(resp) = validate_label(&req.label) {
         return resp;
     }
+    let Some(scopes) = crate::identity::ApiTokenScopes::new(req.scopes.iter().copied()) else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid token scopes",
+            Some("Choose at least one closed token scope."),
+        );
+    };
+    let Some(lifetime) = crate::identity::ApiTokenLifetimeDays::new(req.expires_in_days) else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid token lifetime",
+            Some("expires_in_days must be between 1 and 365."),
+        );
+    };
     let pool = pool_of(&state);
     // The per-account PAT cap is enforced atomically inside `issue_api_token`
     // (count + insert in one FOR UPDATE transaction), so there is no racy
     // list-then-insert here: two concurrent creates can't both slip past cap-1.
-    match crate::db::issue_api_token(pool, &account, &req.label).await {
+    match crate::db::issue_scoped_api_token(pool, &account, &req.label, scopes, lifetime).await {
         Ok(token) => (
             StatusCode::CREATED,
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::json!({
                 "token": token,
                 "label": req.label,
+                "scopes": scopes.iter().collect::<Vec<_>>(),
+                "expires_in_days": lifetime.value(),
                 "note": "Store this now; it is not retrievable later.",
             })
             .to_string(),

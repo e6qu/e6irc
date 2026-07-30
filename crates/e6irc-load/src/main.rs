@@ -12,7 +12,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use e6irc_client::Connection;
@@ -33,6 +33,11 @@ struct Args {
     minimum_connect_rate: Option<f64>,
     minimum_fanout_rate: Option<f64>,
     maximum_p99_ms: Option<f64>,
+    /// Linux process whose resident memory is sampled during the run.
+    server_pid: Option<u32>,
+    /// Maximum incremental peak resident bytes divided by the requested
+    /// connection count. Requires `server_pid`.
+    maximum_server_rss_per_connection_bytes: Option<u64>,
 }
 
 impl Args {
@@ -61,6 +66,8 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
         minimum_connect_rate: None,
         minimum_fanout_rate: None,
         maximum_p99_ms: None,
+        server_pid: None,
+        maximum_server_rss_per_connection_bytes: None,
     };
     let mut it = arguments.into_iter();
     while let Some(flag) = it.next() {
@@ -118,6 +125,25 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
                     "--maximum-p99-ms",
                 )?);
             }
+            "--server-pid" => {
+                let value = parse_positive_u64(
+                    &it.next()
+                        .ok_or_else(|| "--server-pid needs a value".to_string())?,
+                    "--server-pid",
+                )?;
+                args.server_pid = Some(
+                    u32::try_from(value)
+                        .map_err(|_| "--server-pid exceeds the platform PID range".to_string())?,
+                );
+            }
+            "--maximum-server-rss-per-connection-bytes" => {
+                args.maximum_server_rss_per_connection_bytes = Some(parse_positive_u64(
+                    &it.next().ok_or_else(|| {
+                        "--maximum-server-rss-per-connection-bytes needs a value".to_string()
+                    })?,
+                    "--maximum-server-rss-per-connection-bytes",
+                )?);
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -133,6 +159,9 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
             "--clients must exceed --channels (each channel needs a sender + a receiver)".into(),
         );
     }
+    if args.maximum_server_rss_per_connection_bytes.is_some() && args.server_pid.is_none() {
+        return Err("--maximum-server-rss-per-connection-bytes requires --server-pid".to_string());
+    }
     Ok(args)
 }
 
@@ -146,6 +175,16 @@ fn parse_positive_float(s: &str, flag: &str) -> Result<f64, String> {
         .map_err(|_| format!("{flag} needs a positive number"))?;
     if !value.is_finite() || value <= 0.0 {
         return Err(format!("{flag} needs a positive finite number"));
+    }
+    Ok(value)
+}
+
+fn parse_positive_u64(s: &str, flag: &str) -> Result<u64, String> {
+    let value: u64 = s
+        .parse()
+        .map_err(|_| format!("{flag} needs a positive integer"))?;
+    if value == 0 {
+        return Err(format!("{flag} needs a positive integer"));
     }
     Ok(value)
 }
@@ -211,6 +250,53 @@ fn elapsed_nanos(start: Instant) -> u64 {
     start.elapsed().as_nanos().min((u64::MAX - 1) as u128) as u64
 }
 
+#[cfg(target_os = "linux")]
+fn read_server_rss_bytes(pid: u32) -> std::io::Result<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    parse_linux_rss_bytes(&status)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_rss_bytes(status: &str) -> std::io::Result<u64> {
+    let mut fields = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .ok_or_else(|| std::io::Error::other("VmRSS is absent from the server process status"))?
+        .split_ascii_whitespace();
+    let (Some(amount), Some("kB"), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(std::io::Error::other(
+            "VmRSS does not use the expected '<integer> kB' form",
+        ));
+    };
+    let kilobytes = amount
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::other("VmRSS is not an integer"))?;
+    kilobytes
+        .checked_mul(1024)
+        .ok_or_else(|| std::io::Error::other("server resident-memory count overflowed bytes"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_server_rss_bytes(_pid: u32) -> std::io::Result<u64> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "--server-pid resident-memory sampling is supported on Linux",
+    ))
+}
+
+async fn sample_server_rss(
+    pid: u32,
+    baseline: u64,
+    finished: Arc<AtomicBool>,
+) -> std::io::Result<u64> {
+    let mut peak = baseline;
+    while !finished.load(Ordering::Relaxed) {
+        peak = peak.max(read_server_rss_bytes(pid)?);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Ok(peak.max(read_server_rss_bytes(pid)?))
+}
+
 struct DeliverySet {
     seen: Vec<bool>,
 }
@@ -245,6 +331,23 @@ async fn run(args: Args) -> bool {
         args.clients, args.channels, args.addr, args.burst
     );
 
+    let rss_finished = Arc::new(AtomicBool::new(false));
+    let rss_measurement = match args.server_pid {
+        Some(pid) => match read_server_rss_bytes(pid) {
+            Ok(baseline) => {
+                let finished = rss_finished.clone();
+                Some((
+                    baseline,
+                    tokio::spawn(sample_server_rss(pid, baseline, finished)),
+                ))
+            }
+            Err(error) => {
+                eprintln!("server RSS measurement failed before the run: {error}");
+                return false;
+            }
+        },
+        None => None,
+    };
     let run_start = Instant::now();
     let ready = Arc::new(Barrier::new(args.clients));
     let metrics = Arc::new(Metrics {
@@ -283,6 +386,21 @@ async fn run(args: Args) -> bool {
             }
         }
     }
+    rss_finished.store(true, Ordering::Relaxed);
+    let rss_report = match rss_measurement {
+        Some((baseline, task)) => match task.await {
+            Ok(Ok(peak)) => Some((baseline, peak)),
+            Ok(Err(error)) => {
+                eprintln!("server RSS measurement failed during the run: {error}");
+                return false;
+            }
+            Err(error) => {
+                eprintln!("server RSS sampler task failed: {error}");
+                return false;
+            }
+        },
+        None => None,
+    };
 
     let ok = args.clients - failures;
     let connect_secs = metrics.connect_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
@@ -333,6 +451,21 @@ async fn run(args: Args) -> bool {
         eprintln!("incomplete fan-out: received {delivered} of {expected} required deliveries");
     }
     let mut thresholds_met = true;
+    if let Some((baseline, peak)) = rss_report {
+        let incremental = peak.saturating_sub(baseline);
+        let per_connection =
+            incremental.saturating_add(args.clients as u64 - 1) / args.clients as u64;
+        println!(
+            "server RSS: baseline {baseline} bytes, peak {peak} bytes, \
+             incremental {incremental} bytes ({per_connection} bytes/connection)"
+        );
+        if let Some(maximum) = args.maximum_server_rss_per_connection_bytes
+            && per_connection > maximum
+        {
+            thresholds_met = false;
+            eprintln!("server RSS threshold failed: {per_connection} > {maximum} bytes/connection");
+        }
+    }
     if let Some(minimum) = args.minimum_connect_rate
         && connect_rate < minimum
     {
@@ -540,6 +673,8 @@ mod tests {
         assert!(args(&["--clients", "8", "--channels", "8"]).is_err());
         assert!(args(&["--minimum-connect-rate", "0"]).is_err());
         assert!(args(&["--maximum-p99-ms", "NaN"]).is_err());
+        assert!(args(&["--maximum-server-rss-per-connection-bytes", "1048576"]).is_err());
+        assert!(args(&["--server-pid", "0"]).is_err());
         let parsed = args(&[
             "--clients",
             "64",
@@ -553,12 +688,21 @@ mod tests {
             "100",
             "--maximum-p99-ms",
             "5000",
+            "--server-pid",
+            "123",
+            "--maximum-server-rss-per-connection-bytes",
+            "1048576",
         ])
         .unwrap();
         assert_eq!(parsed.clients, 64);
         assert_eq!(parsed.minimum_connect_rate, Some(10.0));
         assert_eq!(parsed.minimum_fanout_rate, Some(100.0));
         assert_eq!(parsed.maximum_p99_ms, Some(5000.0));
+        assert_eq!(parsed.server_pid, Some(123));
+        assert_eq!(
+            parsed.maximum_server_rss_per_connection_bytes,
+            Some(1_048_576)
+        );
     }
 
     #[test]
@@ -588,5 +732,16 @@ mod tests {
         assert_eq!(pctl_us(&samples, 0.50), 3.0);
         assert_eq!(pctl_us(&samples, 0.99), 5.0);
         assert_eq!(pctl_us(&[], 0.99), 0.0);
+    }
+
+    #[test]
+    fn linux_rss_parser_requires_the_kernel_status_shape() {
+        assert_eq!(
+            parse_linux_rss_bytes("Name:\te6ircd\nVmRSS:\t1234 kB\n").unwrap(),
+            1_263_616
+        );
+        assert!(parse_linux_rss_bytes("Name:\te6ircd\n").is_err());
+        assert!(parse_linux_rss_bytes("VmRSS:\t12 MB\n").is_err());
+        assert!(parse_linux_rss_bytes("VmRSS:\tnot-a-number kB\n").is_err());
     }
 }

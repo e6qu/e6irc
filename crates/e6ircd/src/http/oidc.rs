@@ -414,6 +414,18 @@ pub(super) async fn oidc_callback(
     };
     let issuer = claims.issuer().as_str();
     let subject = claims.subject().as_str();
+    let email = claims.email().map(|value| value.as_str().to_string());
+    if !email_domain_admitted(
+        &provider,
+        email.as_deref(),
+        claims.email_verified() == Some(true),
+    ) {
+        return problem(
+            StatusCode::FORBIDDEN,
+            "Identity is outside the provider's allowed email domains",
+            Some("A verified email claim in an allowed domain is required."),
+        );
+    }
     let sid = jwt_string_claim(&id_token.to_string(), "sid")
         .ok()
         .flatten();
@@ -452,7 +464,6 @@ pub(super) async fn oidc_callback(
     // extended-join, account= tag); strip anything that isn't a safe nick-like
     // character so a spaced/control-laden username can't split a line.
     let preferred = crate::sanitize::account_name(&preferred);
-    let email = claims.email().map(|value| value.as_str().to_string());
     // The `role` claim is free-form text from the provider, but the server only
     // models `developer`/`admin` (they gate the shauth developer portal) and the
     // `web_sessions.oidc_role` CHECK admits only those two. Parse it into `Role`
@@ -549,6 +560,23 @@ pub(super) async fn oidc_callback(
         ]),
     )
         .into_response()
+}
+
+fn email_domain_admitted(
+    provider: &OidcProviderConfig,
+    email: Option<&str>,
+    email_verified: bool,
+) -> bool {
+    provider.allowed_email_domains.is_empty()
+        || (email_verified
+            && email
+                .and_then(|email| crate::identity::ContactEmail::parse(email).ok())
+                .is_some_and(|email| {
+                    provider
+                        .allowed_email_domains
+                        .iter()
+                        .any(|domain| domain.admits(&email))
+                }))
 }
 
 pub(super) const BACKCHANNEL_LOGOUT_EVENT: &str =
@@ -896,7 +924,71 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for Authenticated {
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        authenticate(state, &parts.headers).await.map(Authenticated)
+        let principal = authenticate_principal(state, &parts.headers).await?;
+        authorize_api_request(state, &principal.credential, parts, false)
+            .map_err(|denial| api_authorization_response(denial, parts.uri.path()))?;
+        spend_api_budget(state, &principal.account, false).map_err(rate_limit_response)?;
+        Ok(Authenticated(principal.account))
+    }
+}
+
+/// A cookie-authenticated, session-bound browser mutation.
+///
+/// Token issuance and device approval can mint new bearer authority. Allowing
+/// an existing bearer to call either endpoint would let a narrow token expand
+/// its own scopes. Requiring the browser session and its constant-time checked
+/// CSRF header makes that escalation unrepresentable at the handler boundary.
+pub(crate) struct SessionMutation(pub(crate) String);
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for SessionMutation {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let Some(session) = session_token(&parts.headers, state.secure_cookies) else {
+            return Err(problem(
+                StatusCode::UNAUTHORIZED,
+                "Browser session required",
+                None,
+            ));
+        };
+        let csrf = parts
+            .headers
+            .get("x-e6irc-csrf")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !state.csrf_valid(&session, csrf) {
+            return Err(problem(
+                StatusCode::FORBIDDEN,
+                "Invalid or missing CSRF token",
+                None,
+            ));
+        }
+        let pool = state.pool.as_ref().ok_or_else(|| {
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                None,
+            )
+        })?;
+        match crate::db::session_account(pool, &session).await {
+            Ok(Some(account)) => {
+                let account = require_active_account(pool, account).await?;
+                spend_api_budget(state, &account, false).map_err(rate_limit_response)?;
+                Ok(SessionMutation(account))
+            }
+            Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
+            Err(error) => {
+                eprintln!("http: session mutation lookup failed: {error}");
+                Err(problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable",
+                    None,
+                ))
+            }
+        }
     }
 }
 
@@ -919,7 +1011,21 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for AdminAccount {
         // Keep the resolved account in the typed gate: read handlers may ignore
         // it, while audited mutations can attribute the actor without
         // authenticating a second time along a divergent path.
-        require_admin(state, &parts.headers).await.map(AdminAccount)
+        let principal = authenticate_principal(state, &parts.headers).await?;
+        authorize_api_request(state, &principal.credential, parts, true)
+            .map_err(|denial| api_authorization_response(denial, parts.uri.path()))?;
+        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&principal.account);
+        if state
+            .admin_accounts
+            .read()
+            .expect("administrator registry lock")
+            .contains(&folded)
+        {
+            spend_api_budget(state, &principal.account, true).map_err(rate_limit_response)?;
+            Ok(AdminAccount(principal.account))
+        } else {
+            Err(problem(StatusCode::FORBIDDEN, "Admin only", None))
+        }
     }
 }
 
@@ -973,6 +1079,37 @@ pub(super) async fn authenticate(
     state: &AppState,
     headers: &axum::http::HeaderMap,
 ) -> Result<String, Response> {
+    authenticate_principal(state, headers)
+        .await
+        .map(|principal| principal.account)
+}
+
+#[derive(Debug, Clone)]
+struct RequestPrincipal {
+    account: String,
+    credential: RequestCredential,
+}
+
+#[derive(Debug, Clone)]
+enum RequestCredential {
+    /// Browser sessions carry interactive authority but unsafe REST methods
+    /// must prove possession of the session-bound CSRF value.
+    Session(String),
+    /// Tokens carry only the explicit grant checked for the requested method.
+    ApiToken(crate::identity::ApiTokenScopes),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiAuthorizationDenial {
+    Csrf,
+    Scope(crate::identity::ApiTokenScope),
+    AdministratorScope,
+}
+
+async fn authenticate_principal(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<RequestPrincipal, Response> {
     let Some(pool) = &state.pool else {
         return Err(problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -985,8 +1122,15 @@ pub(super) async fn authenticate(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
-        return match crate::db::api_token_account(pool, bearer).await {
-            Ok(Some(account)) => require_active_account(pool, account).await,
+        return match crate::db::api_token_principal(pool, bearer).await {
+            Ok(Some(principal)) => {
+                require_active_account(pool, principal.account)
+                    .await
+                    .map(|account| RequestPrincipal {
+                        account,
+                        credential: RequestCredential::ApiToken(principal.scopes),
+                    })
+            }
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Invalid token", None)),
             Err(e) => {
                 eprintln!("http: token lookup failed: {e}");
@@ -1000,7 +1144,14 @@ pub(super) async fn authenticate(
     }
     if let Some(token) = session_token(headers, state.secure_cookies) {
         return match crate::db::session_account(pool, &token).await {
-            Ok(Some(account)) => require_active_account(pool, account).await,
+            Ok(Some(account)) => {
+                require_active_account(pool, account)
+                    .await
+                    .map(|account| RequestPrincipal {
+                        account,
+                        credential: RequestCredential::Session(token),
+                    })
+            }
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
             Err(e) => {
                 eprintln!("http: session lookup failed: {e}");
@@ -1013,6 +1164,125 @@ pub(super) async fn authenticate(
         };
     }
     Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None))
+}
+
+fn authorize_api_request(
+    state: &AppState,
+    credential: &RequestCredential,
+    parts: &axum::http::request::Parts,
+    administrator_route: bool,
+) -> Result<(), ApiAuthorizationDenial> {
+    let RequestCredential::ApiToken(scopes) = credential else {
+        if parts.method != axum::http::Method::GET && parts.method != axum::http::Method::HEAD {
+            let RequestCredential::Session(session) = credential else {
+                unreachable!("closed request credential set")
+            };
+            let csrf = parts
+                .headers
+                .get("x-e6irc-csrf")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !state.csrf_valid(session, csrf) {
+                return Err(ApiAuthorizationDenial::Csrf);
+            }
+        }
+        return Ok(());
+    };
+    let operation =
+        if parts.method == axum::http::Method::GET || parts.method == axum::http::Method::HEAD {
+            crate::identity::ApiTokenScope::Read
+        } else {
+            crate::identity::ApiTokenScope::Write
+        };
+    if !scopes.contains(operation) {
+        return Err(ApiAuthorizationDenial::Scope(operation));
+    }
+    if administrator_route && !scopes.contains(crate::identity::ApiTokenScope::Administrator) {
+        return Err(ApiAuthorizationDenial::AdministratorScope);
+    }
+    Ok(())
+}
+
+fn api_authorization_response(denial: ApiAuthorizationDenial, path: &str) -> Response {
+    match denial {
+        ApiAuthorizationDenial::Csrf => {
+            problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None)
+        }
+        ApiAuthorizationDenial::Scope(scope) => problem(
+            StatusCode::FORBIDDEN,
+            "Token scope denied",
+            Some(&format!(
+                "The token does not grant the {} scope required for {path}.",
+                scope.as_str()
+            )),
+        ),
+        ApiAuthorizationDenial::AdministratorScope => problem(
+            StatusCode::FORBIDDEN,
+            "Token scope denied",
+            Some("The token does not grant the administrator scope."),
+        ),
+    }
+}
+
+const MAX_API_RATE_BUCKETS: usize = 65_536;
+const API_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const API_RATE_BUCKET_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn spend_api_budget(state: &AppState, account: &str, administrator: bool) -> Result<(), u64> {
+    let burst = if administrator {
+        state.administrator_api_rate_burst
+    } else {
+        state.api_rate_burst
+    };
+    let key = (
+        e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account),
+        administrator,
+    );
+    let now = std::time::Instant::now();
+    let mut buckets = state.api_buckets.lock().expect("API rate limiter lock");
+    if !buckets.contains_key(&key) && buckets.len() >= MAX_API_RATE_BUCKETS {
+        buckets.retain(|_, (_, last)| now.duration_since(*last) < API_RATE_BUCKET_STALE_AFTER);
+        if buckets.len() >= MAX_API_RATE_BUCKETS {
+            return Err(1);
+        }
+    }
+    spend_api_bucket(&mut buckets, key, burst, now)
+}
+
+fn spend_api_bucket(
+    buckets: &mut std::collections::HashMap<(String, bool), (f64, std::time::Instant)>,
+    key: (String, bool),
+    burst: usize,
+    now: std::time::Instant,
+) -> Result<(), u64> {
+    let (tokens, last) = buckets.entry(key).or_insert((burst as f64, now));
+    let elapsed = now.duration_since(*last).as_secs_f64();
+    let refill_per_second = burst as f64 / API_RATE_WINDOW.as_secs_f64();
+    *tokens = (*tokens + elapsed * refill_per_second).min(burst as f64);
+    *last = now;
+    if *tokens >= 1.0 {
+        *tokens -= 1.0;
+        Ok(())
+    } else {
+        let retry_after = ((1.0 - *tokens) / refill_per_second).ceil().max(1.0) as u64;
+        Err(retry_after)
+    }
+}
+
+fn rate_limit_response(retry_after: u64) -> Response {
+    let mut response = problem(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Account request limit exceeded",
+        Some("Retry after the interval in the Retry-After header."),
+    );
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        retry_after
+            .to_string()
+            .parse()
+            .expect("numeric Retry-After is a valid header"),
+    );
+    response
 }
 
 async fn require_active_account(pool: &sqlx::PgPool, account: String) -> Result<String, Response> {
@@ -1261,4 +1531,80 @@ pub(super) fn session_user_agent(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .and_then(crate::db::SessionUserAgent::from_header)
+}
+
+#[cfg(test)]
+mod domain_policy_tests {
+    use super::*;
+
+    fn provider(domains: &[&str]) -> OidcProviderConfig {
+        OidcProviderConfig {
+            name: "corp".into(),
+            issuer_url: "https://identity.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "secret".into(),
+            scopes: vec![],
+            allowed_email_domains: domains
+                .iter()
+                .map(|domain| crate::identity::EmailDomain::parse(domain).expect("test domain"))
+                .collect(),
+            end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
+        }
+    }
+
+    #[test]
+    fn allowed_domain_policy_is_exact_verified_and_fail_closed() {
+        let unrestricted = provider(&[]);
+        assert!(email_domain_admitted(&unrestricted, None, false));
+
+        let restricted = provider(&["example.com"]);
+        assert!(email_domain_admitted(
+            &restricted,
+            Some("Alice@Example.COM"),
+            true
+        ));
+        assert!(!email_domain_admitted(
+            &restricted,
+            Some("alice@example.com"),
+            false
+        ));
+        assert!(!email_domain_admitted(
+            &restricted,
+            Some("alice@sub.example.com"),
+            true
+        ));
+        assert!(!email_domain_admitted(&restricted, None, true));
+        assert!(!email_domain_admitted(
+            &restricted,
+            Some("not-an-email"),
+            true
+        ));
+    }
+
+    #[test]
+    fn account_rate_buckets_are_bounded_by_time_and_rate_class() {
+        let start = std::time::Instant::now();
+        let mut buckets = std::collections::HashMap::new();
+        let ordinary = ("alice".to_string(), false);
+        assert!(spend_api_bucket(&mut buckets, ordinary.clone(), 2, start).is_ok());
+        assert!(spend_api_bucket(&mut buckets, ordinary.clone(), 2, start).is_ok());
+        assert_eq!(
+            spend_api_bucket(&mut buckets, ordinary.clone(), 2, start),
+            Err(30)
+        );
+        assert!(
+            spend_api_bucket(
+                &mut buckets,
+                ordinary,
+                2,
+                start + std::time::Duration::from_secs(30)
+            )
+            .is_ok()
+        );
+        assert!(
+            spend_api_bucket(&mut buckets, ("alice".to_string(), true), 1, start).is_ok(),
+            "administrator and ordinary budgets are intentionally independent"
+        );
+    }
 }

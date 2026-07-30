@@ -28,13 +28,9 @@ pub(super) struct HistoryParams {
 /// endpoint, not a divergence in what is stored.
 pub(super) async fn history(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    Authenticated(account): Authenticated,
     Query(params): Query<HistoryParams>,
 ) -> Response {
-    let account = match authenticate(&state, &headers).await {
-        Ok(account) => account,
-        Err(response) => return response,
-    };
     let pool = pool_of(&state);
     // Authorize the target: without a view of live membership this endpoint
     // must fail closed, so restrict it to channels the account has a

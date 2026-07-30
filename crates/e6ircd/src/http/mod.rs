@@ -129,6 +129,11 @@ pub struct AppState {
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
     pub auth_buckets: Mutex<HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+    /// Per-account ordinary/administrator API token buckets. The boolean key
+    /// distinguishes the smaller administrator budget.
+    pub api_rate_burst: usize,
+    pub administrator_api_rate_burst: usize,
+    pub api_buckets: Mutex<HashMap<(String, bool), (f64, std::time::Instant)>>,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
@@ -399,21 +404,29 @@ pub(super) async fn mutate_account_suspension(
         prepared
     };
 
-    let change = crate::db::set_account_suspended(pool, account_id, suspended, actor)
-        .await
-        .map_err(|error| match error {
-            crate::db::DbError::CannotSuspendSelf | crate::db::DbError::LastAdministrator => {
-                (StatusCode::CONFLICT, error.to_string())
-            }
-            _ => {
-                eprintln!("account lifecycle mutation failed: {error}");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable".into(),
-                )
-            }
-        })?
-        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+    let configured_administrators: Vec<String> =
+        state.configured_admin_accounts.iter().cloned().collect();
+    let change = crate::db::set_account_suspended(
+        pool,
+        account_id,
+        suspended,
+        actor,
+        &configured_administrators,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::db::DbError::CannotSuspendSelf | crate::db::DbError::LastAdministrator => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        _ => {
+            eprintln!("account lifecycle mutation failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    })?
+    .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
         let stopped_networks = registry.remove_owner(&change.folded);
@@ -474,21 +487,29 @@ pub(super) async fn mutate_account_administrator(
     administrator: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let change = crate::db::set_account_administrator(pool, account_id, administrator, actor)
-        .await
-        .map_err(|error| match error {
-            crate::db::DbError::CannotDemoteSelf | crate::db::DbError::LastAdministrator => {
-                (StatusCode::CONFLICT, error.to_string())
-            }
-            _ => {
-                eprintln!("account authority mutation failed: {error}");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable".into(),
-                )
-            }
-        })?
-        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+    let configured_administrators: Vec<String> =
+        state.configured_admin_accounts.iter().cloned().collect();
+    let change = crate::db::set_account_administrator(
+        pool,
+        account_id,
+        administrator,
+        actor,
+        &configured_administrators,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::db::DbError::CannotDemoteSelf | crate::db::DbError::LastAdministrator => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        _ => {
+            eprintln!("account authority mutation failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    })?
+    .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
     let configured = state.configured_admin_accounts.contains(&change.folded);
     let mut effective = state
         .admin_accounts
@@ -513,6 +534,185 @@ pub(super) async fn mutate_account_administrator(
         format!(
             "Removed durable administrator authority from {}.",
             change.name
+        )
+    })
+}
+
+pub(super) async fn create_account_lifecycle(
+    state: &AppState,
+    actor: &str,
+    account: &str,
+    password: &str,
+    contact_email: Option<&str>,
+    administrator: bool,
+) -> Result<i64, (StatusCode, String)> {
+    if !crate::sanitize::valid_nick(account, MAX_ACCOUNT_LEN) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "The account must be a valid IRC nickname of at most 64 bytes.".into(),
+        ));
+    }
+    if let Some(detail) = password_input_error(password) {
+        return Err((StatusCode::BAD_REQUEST, detail.into()));
+    }
+    let contact_email = contact_email
+        .map(crate::identity::ContactEmail::parse)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let pool = state.pool.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No database configured".into(),
+    ))?;
+    let account_id = crate::db::create_account_by_administrator(
+        pool,
+        account,
+        password,
+        contact_email.as_ref(),
+        administrator,
+        actor,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::db::DbError::DuplicateAccount(_) => {
+            (StatusCode::CONFLICT, "Account already exists.".into())
+        }
+        _ => {
+            eprintln!("administrator account creation failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    })?;
+    if administrator {
+        state
+            .admin_accounts
+            .write()
+            .expect("administrator registry lock")
+            .insert(e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account));
+    }
+    Ok(account_id)
+}
+
+fn account_invitation_url(state: &AppState, token: &str) -> String {
+    let path = format!("/invite/{token}");
+    state
+        .public_url
+        .as_deref()
+        .map(|base| format!("{}{path}", base.trim_end_matches('/')))
+        .unwrap_or(path)
+}
+
+pub(super) async fn delete_account_lifecycle(
+    state: &AppState,
+    actor: &str,
+    account_id: i64,
+    allow_self: bool,
+) -> Result<String, (StatusCode, String)> {
+    let pool = account_mutation_pool(state, account_id)?;
+    let registry = state.bnc_registry.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Network registry unavailable".into(),
+    ))?;
+    let _network_mutation = registry.mutation_guard().await;
+    let configured_administrators: Vec<String> =
+        state.configured_admin_accounts.iter().cloned().collect();
+    let target = crate::db::account_deletion_target(pool, account_id, &configured_administrators)
+        .await
+        .map_err(account_deletion_error)?
+        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+    let actor_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(actor);
+    if !allow_self && target.folded == actor_folded {
+        return Err((
+            StatusCode::CONFLICT,
+            "Use the self-service account deletion control for your own account.".into(),
+        ));
+    }
+
+    core_action(
+        state,
+        crate::core::AdminRequest::SetAccountSuspended {
+            account: target.folded.clone(),
+            suspended: true,
+            reason: "Account permanently deleted".into(),
+            actor: actor.to_string(),
+        },
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Could not establish the live authentication gate: {error}"),
+        )
+    })?;
+
+    let deleted = match crate::db::delete_account_permanently(
+        pool,
+        account_id,
+        actor,
+        &configured_administrators,
+    )
+    .await
+    {
+        Ok(Some(deleted)) => deleted,
+        Ok(None) => {
+            undo_account_deletion_gate(state, &target.folded, actor).await?;
+            return Err((StatusCode::NOT_FOUND, "No such account".into()));
+        }
+        Err(error) => {
+            undo_account_deletion_gate(state, &target.folded, actor).await?;
+            return Err(account_deletion_error(error));
+        }
+    };
+    let stopped_networks = registry.remove_owner(&deleted.folded);
+    state
+        .admin_accounts
+        .write()
+        .expect("administrator registry lock")
+        .remove(&deleted.folded);
+    Ok(format!(
+        "Permanently deleted {} and stopped {stopped_networks} owned network(s). The account name is retired.",
+        deleted.name
+    ))
+}
+
+fn account_deletion_error(error: crate::db::DbError) -> (StatusCode, String) {
+    match error {
+        crate::db::DbError::AccountOwnsChannels(_) | crate::db::DbError::LastAdministrator => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        _ => {
+            eprintln!("account deletion failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    }
+}
+
+async fn undo_account_deletion_gate(
+    state: &AppState,
+    account: &str,
+    actor: &str,
+) -> Result<(), (StatusCode, String)> {
+    core_action(
+        state,
+        crate::core::AdminRequest::SetAccountSuspended {
+            account: account.to_string(),
+            suspended: false,
+            reason: "Account deletion did not commit".into(),
+            actor: actor.to_string(),
+        },
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "Deletion did not commit and the live authentication gate could not be removed: {error}"
+            ),
         )
     })
 }
@@ -772,6 +972,10 @@ documented_routes! {
     "/api/v1/auth/device/token" => { post: device_token },
     "/api/v1/auth/device/approve" => { post: device_approve },
     "/api/v1/me" => { get: me },
+    "/api/v1/me/profile" => { get: me_profile, patch: update_me_profile },
+    "/api/v1/me/account" => { delete: delete_own_account },
+    "/api/v1/me/export" => { get: export_me },
+    "/api/v1/me/security-activity" => { get: me_security_activity },
     "/api/v1/me/identities" => { get: me_identities },
     "/api/v1/me/identities/{id}" => { delete: me_identity_unlink },
     "/api/v1/me/sessions" => { get: list_browser_sessions },
@@ -803,8 +1007,16 @@ documented_routes! {
     },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
-    "/api/v1/admin/accounts" => { get: admin_accounts },
-    "/api/v1/admin/accounts/{id}" => { patch: admin_account_state },
+    "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },
+    "/api/v1/admin/accounts/{id}" => {
+        patch: admin_account_state,
+        delete: admin_delete_account,
+    },
+    "/api/v1/admin/invitations" => {
+        get: admin_account_invitations,
+        post: admin_create_account_invitation,
+    },
+    "/api/v1/admin/invitations/{id}" => { delete: admin_revoke_account_invitation },
     "/api/v1/admin/connections" => { get: admin_connections },
     "/api/v1/admin/connections/{id}" => { delete: admin_disconnect_connection },
     "/api/v1/admin/channels" => { get: admin_channels },
@@ -822,6 +1034,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/bootstrap",
             get(pages::bootstrap).post(pages::bootstrap_submit),
         )
+        .route(
+            "/invite/{token}",
+            get(pages::account_invitation).post(pages::accept_account_invitation),
+        )
         .route("/auth/signed-out", get(pages::signed_out))
         .route("/auth/validation", get(pages::validation))
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
@@ -830,6 +1046,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
         .route("/console/accounts", get(pages::console_accounts))
+        .route(
+            "/console/accounts/create",
+            post(pages::console_create_account),
+        )
+        .route(
+            "/console/accounts/invitations",
+            post(pages::console_create_invitation),
+        )
+        .route(
+            "/console/accounts/invitations/{id}/delete",
+            post(pages::console_revoke_invitation),
+        )
+        .route(
+            "/console/accounts/{id}/delete",
+            post(pages::console_delete_account),
+        )
         .route(
             "/console/accounts/{id}/suspension",
             post(pages::console_account_suspension),
@@ -844,6 +1076,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
+        .route(
+            "/console/account/profile",
+            post(pages::console_update_profile),
+        )
+        .route(
+            "/console/account/delete",
+            post(pages::console_delete_own_account),
+        )
         .route("/console/channels", get(pages::console_channels))
         .route(
             "/console/channels/topic",
@@ -1026,6 +1266,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             observe_http,
+        ))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(1024))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30),
         ))
         .with_state(state)
 }
@@ -1424,6 +1670,208 @@ mod pages {
         )
     }
 
+    #[derive(Template)]
+    #[template(path = "invite.html")]
+    struct AccountInvitation {
+        token: String,
+        invitation_state: String,
+        account: String,
+        administrator: bool,
+        expires_at: String,
+        error: Option<String>,
+    }
+
+    fn invitation_state_cookie_name(secure: bool) -> &'static str {
+        if secure {
+            "__Host-e6irc_invitation_state"
+        } else {
+            "e6irc_invitation_state"
+        }
+    }
+
+    fn valid_invitation_token(token: &str) -> bool {
+        token.len() == 48
+            && token.starts_with("e6i_")
+            && token[4..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'='))
+    }
+
+    fn invitation_response(
+        state: &AppState,
+        token: String,
+        preview: crate::db::AccountInvitationPreview,
+        error: Option<String>,
+        status: StatusCode,
+    ) -> Response {
+        let invitation_state = super::random_browser_token();
+        let mut response = render_auth(AccountInvitation {
+            token,
+            invitation_state: invitation_state.clone(),
+            account: preview.account_name,
+            administrator: preview.administrator,
+            expires_at: preview.expires_at,
+            error,
+        });
+        *response.status_mut() = status;
+        let secure = if state.secure_cookies { "; Secure" } else { "" };
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            format!(
+                "{}={invitation_state}; HttpOnly; SameSite=Strict; Path=/; Max-Age=600{secure}",
+                invitation_state_cookie_name(state.secure_cookies)
+            )
+            .parse()
+            .expect("generated cookie is a valid header"),
+        );
+        response
+    }
+
+    pub async fn account_invitation(
+        State(state): State<Arc<AppState>>,
+        Path(token): Path<String>,
+    ) -> Response {
+        if !valid_invitation_token(&token) {
+            return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
+        }
+        let Some(pool) = &state.pool else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                None,
+            );
+        };
+        match crate::db::account_invitation_preview(pool, &token).await {
+            Ok(Some(preview)) => invitation_response(&state, token, preview, None, StatusCode::OK),
+            Ok(None) => problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
+            Err(error) => {
+                eprintln!("account invitation lookup failed: {error}");
+                problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Invitation storage unavailable",
+                    None,
+                )
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountInvitationAcceptanceForm {
+        invitation_state: String,
+        password: String,
+        password_confirmation: String,
+    }
+
+    pub async fn accept_account_invitation(
+        State(state): State<Arc<AppState>>,
+        _rate_limited: RateLimited,
+        headers: axum::http::HeaderMap,
+        Path(token): Path<String>,
+        form: Result<
+            axum::Form<AccountInvitationAcceptanceForm>,
+            axum::extract::rejection::FormRejection,
+        >,
+    ) -> Response {
+        if !valid_invitation_token(&token) {
+            return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
+        }
+        let Some(pool) = &state.pool else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                None,
+            );
+        };
+        let preview = match crate::db::account_invitation_preview(pool, &token).await {
+            Ok(Some(preview)) => preview,
+            Ok(None) => return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
+            Err(error) => {
+                eprintln!("account invitation lookup failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Invitation storage unavailable",
+                    None,
+                );
+            }
+        };
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        if !browser_state_matches(
+            &headers,
+            invitation_state_cookie_name(state.secure_cookies),
+            &form.invitation_state,
+        ) {
+            return invitation_response(
+                &state,
+                token,
+                preview,
+                Some("This invitation form expired. Please try again.".into()),
+                StatusCode::FORBIDDEN,
+            );
+        }
+        if let Some(detail) = password_input_error(&form.password) {
+            return invitation_response(
+                &state,
+                token,
+                preview,
+                Some(detail.into()),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        if form.password != form.password_confirmation {
+            return invitation_response(
+                &state,
+                token,
+                preview,
+                Some("Password confirmation does not match.".into()),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        let account = match crate::db::accept_account_invitation(pool, &token, &form.password).await
+        {
+            Ok(account) => account,
+            Err(crate::db::DbError::InvitationUnavailable) => {
+                return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
+            }
+            Err(error) => {
+                eprintln!("account invitation acceptance failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Invitation storage unavailable",
+                    None,
+                );
+            }
+        };
+        if preview.administrator {
+            state
+                .admin_accounts
+                .write()
+                .expect("administrator registry lock")
+                .insert(e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account));
+        }
+        let user_agent = super::session_user_agent(&headers);
+        let session = match crate::db::create_web_session(pool, &account, user_agent.as_ref()).await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("invited account session creation failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Account created; session storage failed",
+                    Some("Sign in with the new account to continue."),
+                );
+            }
+        };
+        authenticated_redirect(
+            &session,
+            "/console",
+            invitation_state_cookie_name(state.secure_cookies),
+            state.secure_cookies,
+        )
+    }
+
     #[derive(Deserialize)]
     pub struct LocalLoginForm {
         login_state: String,
@@ -1732,6 +2180,7 @@ mod pages {
         label: String,
         created: String,
         expires: String,
+        scopes: String,
     }
 
     struct IdentityView {
@@ -1758,6 +2207,8 @@ mod pages {
         tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
         read_markers: Vec<ReadMarkerView>,
+        security_activity: Vec<AuditRow>,
+        contact_email: String,
         link_providers: Vec<String>,
         outcome: Option<String>,
         success: bool,
@@ -1795,11 +2246,17 @@ mod pages {
             .await
             .map_err(|e| super::device::admin_db_error("token list", e))?
             .into_iter()
-            .map(|(id, label, created, expires)| ApiTokenView {
-                id,
-                label,
-                created,
-                expires: expires.unwrap_or_else(|| "No expiry".into()),
+            .map(|token| ApiTokenView {
+                id: token.id,
+                label: token.label,
+                created: token.created_at,
+                expires: token.expires_at,
+                scopes: token
+                    .scopes
+                    .iter()
+                    .map(crate::identity::ApiTokenScope::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
             })
             .collect();
         let identities = crate::db::list_oidc_identities(pool, &account)
@@ -1819,6 +2276,29 @@ mod pages {
             .into_iter()
             .map(|(target, timestamp)| ReadMarkerView { target, timestamp })
             .collect();
+        let contact_email = crate::db::account_contact_email(pool, &account)
+            .await
+            .map_err(|e| super::device::admin_db_error("profile read", e))?
+            .unwrap_or_default();
+        let security_activity = crate::db::query_account_security_activity(
+            pool,
+            &account,
+            None,
+            crate::db::AuditLogPageSize::new(50).expect("static activity page size is valid"),
+        )
+        .await
+        .map_err(|e| super::device::admin_db_error("security activity", e))?
+        .entries
+        .into_iter()
+        .map(|entry| AuditRow {
+            id: entry.id,
+            at: entry.created_at,
+            actor: entry.actor,
+            action: entry.action,
+            target: entry.target,
+            detail: entry.detail,
+        })
+        .collect();
         let is_admin = is_admin_account(state, &account);
         let link_providers = state
             .oidc_providers
@@ -1835,6 +2315,8 @@ mod pages {
             tokens,
             identities,
             read_markers,
+            security_activity,
+            contact_email,
             link_providers,
             outcome,
             success,
@@ -1910,6 +2392,106 @@ mod pages {
         }
     }
 
+    pub async fn console_update_profile(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountContactForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, form) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        let contact_email = if form.contact_email.trim().is_empty() {
+            None
+        } else {
+            match crate::identity::ContactEmail::parse(form.contact_email.trim()) {
+                Ok(email) => Some(email),
+                Err(error) => {
+                    return account_result(
+                        &state,
+                        account,
+                        &headers,
+                        AccountResult::message(StatusCode::BAD_REQUEST, error.to_string()),
+                    )
+                    .await;
+                }
+            }
+        };
+        let result =
+            crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
+                .await;
+        let view = match result {
+            Ok(()) => AccountResult::message(
+                StatusCode::OK,
+                if contact_email.is_some() {
+                    "Contact email updated."
+                } else {
+                    "Contact email removed."
+                },
+            ),
+            Err(error) => {
+                eprintln!("http: contact email update failed: {error}");
+                AccountResult::message(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Contact email was not changed.",
+                )
+            }
+        };
+        account_result(&state, account, &headers, view).await
+    }
+
+    pub async fn console_delete_own_account(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<
+            axum::Form<AccountPermanentDeleteForm>,
+            axum::extract::rejection::FormRejection,
+        >,
+    ) -> Response {
+        let (account, form) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        if form.confirmation != account {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(
+                    StatusCode::BAD_REQUEST,
+                    "Account confirmation does not match. Supply the exact display-cased account name.",
+                ),
+            )
+            .await;
+        }
+        let account_id = match crate::db::account_id_by_name(pool_of(&state), &account).await {
+            Ok(Some(account_id)) => account_id,
+            Ok(None) => return Redirect::to("/login").into_response(),
+            Err(error) => return super::device::admin_db_error("account deletion target", error),
+        };
+        match delete_account_lifecycle(&state, &account, account_id, true).await {
+            Ok(_) => {
+                let mut response = Redirect::to("/login").into_response();
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    clear_session_cookie(state.secure_cookies)
+                        .parse()
+                        .expect("session clear cookie is valid"),
+                );
+                response
+            }
+            Err((status, detail)) => {
+                account_result(
+                    &state,
+                    account,
+                    &headers,
+                    AccountResult::message(status, detail),
+                )
+                .await
+            }
+        }
+    }
+
     #[derive(Deserialize)]
     pub struct AccountLabelForm {
         csrf: String,
@@ -1917,8 +2499,36 @@ mod pages {
     }
 
     #[derive(Deserialize)]
+    pub struct AccountContactForm {
+        csrf: String,
+        #[serde(default)]
+        contact_email: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountTokenForm {
+        csrf: String,
+        label: String,
+        expires_in_days: u16,
+        #[serde(default)]
+        scope_read: Option<String>,
+        #[serde(default)]
+        scope_write: Option<String>,
+        #[serde(default)]
+        scope_administrator: Option<String>,
+        #[serde(default)]
+        scope_irc: Option<String>,
+    }
+
+    #[derive(Deserialize)]
     pub struct AccountDeleteForm {
         csrf: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountPermanentDeleteForm {
+        csrf: String,
+        confirmation: String,
     }
 
     #[derive(Deserialize)]
@@ -1940,7 +2550,25 @@ mod pages {
         }
     }
 
+    impl AccountForm for AccountTokenForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    impl AccountForm for AccountContactForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
     impl AccountForm for AccountDeleteForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    impl AccountForm for AccountPermanentDeleteForm {
         fn csrf(&self) -> &str {
             &self.csrf
         }
@@ -2263,13 +2891,67 @@ mod pages {
     pub async fn console_create_api_token(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
+        form: Result<axum::Form<AccountTokenForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let (account, label) = match account_label_actor(&state, &headers, form).await {
+        let (account, form) = match account_form_actor(&state, &headers, form).await {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let result = crate::db::issue_api_token(pool_of(&state), &account, &label).await;
+        if let Some(error) = label_validation_error(&form.label) {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(StatusCode::BAD_REQUEST, error),
+            )
+            .await;
+        }
+        let scopes = [
+            form.scope_read
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Read),
+            form.scope_write
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Write),
+            form.scope_administrator
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Administrator),
+            form.scope_irc
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Irc),
+        ]
+        .into_iter()
+        .flatten();
+        let Some(scopes) = crate::identity::ApiTokenScopes::new(scopes) else {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(StatusCode::BAD_REQUEST, "Choose at least one token scope."),
+            )
+            .await;
+        };
+        let Some(lifetime) = crate::identity::ApiTokenLifetimeDays::new(form.expires_in_days)
+        else {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(
+                    StatusCode::BAD_REQUEST,
+                    "Token lifetime must be between 1 and 365 days.",
+                ),
+            )
+            .await;
+        };
+        let result = crate::db::issue_scoped_api_token(
+            pool_of(&state),
+            &account,
+            &form.label,
+            scopes,
+            lifetime,
+        )
+        .await;
         account_issue_result(
             &state,
             account,
@@ -2753,11 +3435,17 @@ mod pages {
         is_admin: bool,
         active: &'static str,
         entries: Vec<crate::db::AccountDirectoryRow>,
+        invitations: Vec<crate::db::AccountInvitationRow>,
+        invitation_before_id: Option<i64>,
+        invitation_next_before_id: Option<i64>,
         name: String,
         limit: usize,
         has_filter: bool,
         has_cursor: bool,
         next_before_id: Option<i64>,
+        outcome: Option<String>,
+        success: bool,
+        invitation_url: Option<String>,
     }
 
     #[derive(Template)]
@@ -3481,24 +4169,51 @@ mod pages {
         })
     }
 
-    pub async fn console_accounts(
-        State(state): State<Arc<AppState>>,
-        AdminPageActor { account, csrf }: AdminPageActor,
-        Query(params): Query<super::device::AccountDirectoryQuery>,
+    struct AccountDirectorySubmission {
+        outcome: String,
+        success: bool,
+        invitation_url: Option<String>,
+    }
+
+    async fn console_accounts_response(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        params: super::device::AccountDirectoryQuery,
+        invitation_before_id: Option<i64>,
+        submission: Option<AccountDirectorySubmission>,
     ) -> Response {
         let query = match super::device::validate_account_directory_query(params, 50) {
             Ok(query) => query,
             Err(response) => return response,
         };
-        let mut page = match crate::db::query_account_directory(
-            pool_of(&state),
-            query.database_filter(),
+        let mut page =
+            match crate::db::query_account_directory(pool_of(state), query.database_filter()).await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    return super::device::admin_db_error("account directory", error);
+                }
+            };
+        if invitation_before_id.is_some_and(|id| id <= 0) {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid invitation-directory cursor",
+                Some("The invitation_before_id cursor must be a positive invitation id."),
+            );
+        }
+        let invitation_page_size =
+            crate::db::AccountInvitationPageSize::new(50).expect("fixed page size is valid");
+        let invitation_page = match crate::db::list_account_invitations(
+            pool_of(state),
+            invitation_before_id,
+            invitation_page_size,
         )
         .await
         {
-            Ok(page) => page,
+            Ok(invitations) => invitations,
             Err(error) => {
-                return super::device::admin_db_error("account directory", error);
+                return super::device::admin_db_error("account invitation directory", error);
             }
         };
         let actor_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
@@ -3510,18 +4225,61 @@ mod pages {
         }
         let name = query.name.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
+        let (outcome, success, invitation_url) =
+            submission.map_or((None, true, None), |submission| {
+                (
+                    Some(submission.outcome),
+                    submission.success,
+                    submission.invitation_url,
+                )
+            });
         render_private(ConsoleAccounts {
             account,
             csrf,
             is_admin: true,
             active: "accounts",
             entries: page.entries,
+            invitations: invitation_page.entries,
+            invitation_before_id,
+            invitation_next_before_id: invitation_page.next_before_id,
             has_filter: !name.is_empty(),
             has_cursor,
             name,
             limit: query.page_size.value(),
             next_before_id: page.next_before_id,
+            outcome,
+            success,
+            invitation_url,
         })
+    }
+
+    pub async fn console_accounts(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+        Query(params): Query<ConsoleAccountsQuery>,
+    ) -> Response {
+        let invitation_before_id = params.invitation_before_id;
+        console_accounts_response(
+            &state,
+            account,
+            csrf,
+            super::device::AccountDirectoryQuery {
+                limit: params.limit,
+                before_id: params.before_id,
+                name: params.name,
+            },
+            invitation_before_id,
+            None,
+        )
+        .await
+    }
+
+    #[derive(Default, Deserialize)]
+    pub struct ConsoleAccountsQuery {
+        limit: Option<usize>,
+        before_id: Option<i64>,
+        name: Option<String>,
+        invitation_before_id: Option<i64>,
     }
 
     #[derive(Deserialize)]
@@ -3536,12 +4294,8 @@ mod pages {
         Path(account_id): Path<i64>,
         form: Result<axum::Form<AccountSuspensionForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         match mutate_account_suspension(&state, &actor, account_id, form.suspended).await {
@@ -3562,12 +4316,8 @@ mod pages {
         Path(account_id): Path<i64>,
         form: Result<axum::Form<AccountAdministratorForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         match mutate_account_administrator(&state, &actor, account_id, form.administrator).await {
@@ -3577,6 +4327,201 @@ mod pages {
                 "Administrator authority change failed",
                 Some(&detail),
             ),
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountCreateForm {
+        csrf: String,
+        account: String,
+        password: String,
+        #[serde(default)]
+        contact_email: String,
+        #[serde(default)]
+        administrator: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountInvitationForm {
+        csrf: String,
+        account: String,
+        #[serde(default)]
+        contact_email: String,
+        expires_in_days: u16,
+        #[serde(default)]
+        administrator: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountInvitationRevokeForm {
+        csrf: String,
+    }
+
+    pub async fn console_create_account(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountCreateForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let contact_email =
+            (!form.contact_email.trim().is_empty()).then_some(form.contact_email.trim());
+        match create_account_lifecycle(
+            &state,
+            &actor,
+            &form.account,
+            &form.password,
+            contact_email,
+            form.administrator.as_deref() == Some("on"),
+        )
+        .await
+        {
+            Ok(_) => Redirect::to("/console/accounts").into_response(),
+            Err((status, detail)) => problem(status, "Account creation failed", Some(&detail)),
+        }
+    }
+
+    pub async fn console_create_invitation(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountInvitationForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let result = if !crate::sanitize::valid_nick(&form.account, MAX_ACCOUNT_LEN) {
+            Err((
+                StatusCode::BAD_REQUEST,
+                "The account must be a valid IRC nickname of at most 64 bytes.".to_string(),
+            ))
+        } else {
+            let contact_email = if form.contact_email.trim().is_empty() {
+                Ok(None)
+            } else {
+                crate::identity::ContactEmail::parse(form.contact_email.trim())
+                    .map(Some)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
+            };
+            let lifetime =
+                crate::identity::AccountInvitationLifetimeDays::new(form.expires_in_days).ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "Invitation lifetime must be between 1 and 30 days.".to_string(),
+                ));
+            match (contact_email, lifetime) {
+                (Ok(contact_email), Ok(lifetime)) => crate::db::issue_account_invitation(
+                    pool_of(&state),
+                    &form.account,
+                    contact_email.as_ref(),
+                    form.administrator.as_deref() == Some("on"),
+                    lifetime,
+                    &actor,
+                )
+                .await
+                .map_err(|error| match error {
+                    crate::db::DbError::DuplicateAccount(_) => (
+                        StatusCode::CONFLICT,
+                        "The account name already exists, is retired, or has a pending invitation."
+                            .to_string(),
+                    ),
+                    crate::db::DbError::TooManyInvitations => {
+                        (StatusCode::CONFLICT, error.to_string())
+                    }
+                    _ => {
+                        eprintln!("account invitation issuance failed: {error}");
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Invitation storage unavailable.".to_string(),
+                        )
+                    }
+                }),
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        };
+        let (status, outcome, invitation_url) = match result {
+            Ok(token) => {
+                let url = account_invitation_url(&state, &token);
+                (
+                    StatusCode::OK,
+                    "Invitation issued. Copy the single-use link before leaving this page."
+                        .to_string(),
+                    Some(url),
+                )
+            }
+            Err((status, detail)) => (status, detail, None),
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        let mut response = console_accounts_response(
+            &state,
+            actor,
+            csrf,
+            super::device::AccountDirectoryQuery::default(),
+            None,
+            Some(AccountDirectorySubmission {
+                outcome,
+                success: status.is_success(),
+                invitation_url,
+            }),
+        )
+        .await;
+        *response.status_mut() = status;
+        response
+    }
+
+    pub async fn console_revoke_invitation(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(invitation_id): Path<i64>,
+        form: Result<
+            axum::Form<AccountInvitationRevokeForm>,
+            axum::extract::rejection::FormRejection,
+        >,
+    ) -> Response {
+        let (_form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        match crate::db::revoke_account_invitation(pool_of(&state), invitation_id, &actor).await {
+            Ok(true) => Redirect::to("/console/accounts").into_response(),
+            Ok(false) => problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
+            Err(error) => super::device::admin_db_error("account invitation revocation", error),
+        }
+    }
+
+    pub async fn console_delete_account(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(account_id): Path<i64>,
+        form: Result<
+            axum::Form<AccountPermanentDeleteForm>,
+            axum::extract::rejection::FormRejection,
+        >,
+    ) -> Response {
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
+            Err(response) => return response,
+        };
+        let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
+            Ok(Some(target)) => target,
+            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
+            Err(error) => {
+                return super::device::admin_db_error("account deletion target", error);
+            }
+        };
+        if form.confirmation != target {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Account confirmation does not match",
+                Some("Supply the exact display-cased account name."),
+            );
+        }
+        match delete_account_lifecycle(&state, &actor, account_id, false).await {
+            Ok(_) => Redirect::to("/console/accounts").into_response(),
+            Err((status, detail)) => problem(status, "Account deletion failed", Some(&detail)),
         }
     }
 
@@ -3760,6 +4705,8 @@ mod pages {
         max_connections_per_ip: String,
         command_burst: String,
         auth_rate_burst: String,
+        api_rate_burst: String,
+        administrator_api_rate_burst: String,
         registration_burst: String,
         trusted_proxies: String,
         listeners: String,
@@ -3783,6 +4730,7 @@ mod pages {
         issuer_url: String,
         client_id: String,
         scopes: String,
+        allowed_email_domains: String,
         token_method: &'static str,
     }
 
@@ -3817,6 +4765,10 @@ mod pages {
         command_burst: String,
         #[serde(default)]
         auth_rate_burst: String,
+        #[serde(default)]
+        api_rate_burst: String,
+        #[serde(default)]
+        administrator_api_rate_burst: String,
         #[serde(default)]
         registration_burst: String,
         #[serde(default)]
@@ -3972,6 +4924,11 @@ mod pages {
                     .map(str::to_string)
                     .collect(),
                 auth_rate_burst: optional_number(&form.auth_rate_burst, "Authentication burst")?,
+                api_rate_burst: optional_number(&form.api_rate_burst, "Authenticated API burst")?,
+                administrator_api_rate_burst: optional_number(
+                    &form.administrator_api_rate_burst,
+                    "Administrator API burst",
+                )?,
                 registration_burst: optional_number(
                     &form.registration_burst,
                     "Registration burst",
@@ -4033,6 +4990,12 @@ mod pages {
                 issuer_url: provider.issuer_url.clone(),
                 client_id: provider.client_id.clone(),
                 scopes: provider.scopes.join(" "),
+                allowed_email_domains: provider
+                    .allowed_email_domains
+                    .iter()
+                    .map(crate::identity::EmailDomain::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 token_method: match provider.token_endpoint_auth_method {
                     crate::config::TokenEndpointAuthMethod::ClientSecretBasic => {
                         "client_secret_basic"
@@ -4074,6 +5037,10 @@ mod pages {
             max_connections_per_ip: optional_number_display(settings.limits.max_connections_per_ip),
             command_burst: optional_number_display(settings.limits.command_burst),
             auth_rate_burst: optional_number_display(settings.limits.auth_rate_burst),
+            api_rate_burst: optional_number_display(settings.limits.api_rate_burst),
+            administrator_api_rate_burst: optional_number_display(
+                settings.limits.administrator_api_rate_burst,
+            ),
             registration_burst: optional_number_display(settings.limits.registration_burst),
             trusted_proxies: settings.limits.trusted_proxies.join("\n"),
             listeners: display_listeners(&settings.listeners),
@@ -4290,6 +5257,8 @@ mod pages {
         client_secret: String,
         #[serde(default)]
         scopes: String,
+        #[serde(default)]
+        allowed_email_domains: String,
         #[serde(default)]
         end_session_endpoint: String,
         token_endpoint_auth_method: String,
@@ -4527,6 +5496,14 @@ mod pages {
                 _ => return Err("Unknown token endpoint authentication method.".into()),
             };
             let name = form.name.trim().to_string();
+            let allowed_email_domains = form
+                .allowed_email_domains
+                .split([',', ' ', '\n'])
+                .map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map(crate::identity::EmailDomain::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
             settings
                 .oidc_providers
                 .push(crate::config::OidcProviderConfig {
@@ -4541,6 +5518,7 @@ mod pages {
                         .filter(|scope| !scope.is_empty())
                         .map(str::to_string)
                         .collect(),
+                    allowed_email_domains,
                     end_session_endpoint: (!form.end_session_endpoint.trim().is_empty())
                         .then(|| form.end_session_endpoint.trim().to_string()),
                     token_endpoint_auth_method: method,
@@ -5777,6 +6755,44 @@ mod pages {
         Ok(account)
     }
 
+    trait CsrfForm {
+        fn csrf(&self) -> &str;
+    }
+
+    macro_rules! csrf_forms {
+        ($($form:ty),+ $(,)?) => {
+            $(
+                impl CsrfForm for $form {
+                    fn csrf(&self) -> &str {
+                        &self.csrf
+                    }
+                }
+            )+
+        };
+    }
+
+    csrf_forms!(
+        AccountSuspensionForm,
+        AccountAdministratorForm,
+        AccountCreateForm,
+        AccountInvitationForm,
+        AccountInvitationRevokeForm,
+        AccountPermanentDeleteForm,
+    );
+
+    /// Parse and authorize an administrator-owned browser form as one gate so
+    /// mutations cannot drift between subtly different CSRF/admin prologues.
+    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
+    async fn parse_admin_form<T: CsrfForm>(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(T, String), Response> {
+        let form = parse_form(form)?;
+        let actor = require_admin_form_actor(state, headers, form.csrf()).await?;
+        Ok((form, actor))
+    }
+
     /// Ask the core for one already-validated bounded connection page.
     async fn list_live_connections(
         state: &AppState,
@@ -5970,6 +6986,23 @@ mod pages {
         reason: String,
     }
 
+    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
+    fn parse_disconnect_form(
+        connection_id: u64,
+        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(String, String), Response> {
+        if connection_id == 0 {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid live-connection id",
+                None,
+            ));
+        }
+        let form = parse_form(form)?;
+        let reason = validate_disconnect_reason(form.reason)?;
+        Ok((form.csrf, reason))
+    }
+
     /// Render one bounded live-connection page. `own` forces the account filter
     /// for self-service and also includes the caller's capped durable browser
     /// logins.
@@ -6093,6 +7126,20 @@ mod pages {
         validate_live_connection_query(LiveConnectionQueryParams::default(), 50)
     }
 
+    async fn sessions_error_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        own: bool,
+        message: String,
+    ) -> Response {
+        let query = match default_live_connection_query() {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        render_sessions_page(state, headers, account, own, query, Some(message)).await
+    }
+
     /// Console → bounded live connection directory (admin-gated).
     pub async fn console_sessions(
         State(state): State<Arc<AppState>>,
@@ -6115,15 +7162,8 @@ mod pages {
         Path(connection_id): Path<u64>,
         form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        if connection_id == 0 {
-            return problem(StatusCode::BAD_REQUEST, "Invalid live-connection id", None);
-        }
-        let f = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let reason = match validate_disconnect_reason(f.reason) {
-            Ok(reason) => reason,
+        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         let make = |actor| crate::core::AdminRequest::DisconnectConnection {
@@ -6131,14 +7171,10 @@ mod pages {
             reason,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console/sessions", make).await {
+        match run_admin_form(&state, &headers, &csrf, "/console/sessions", make).await {
             Ok(response) => response,
             Err((account, message)) => {
-                let query = match default_live_connection_query() {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                render_sessions_page(&state, &headers, account, false, query, Some(message)).await
+                sessions_error_page(&state, &headers, account, false, message).await
             }
         }
     }
@@ -6168,18 +7204,11 @@ mod pages {
         Path(connection_id): Path<u64>,
         form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        if connection_id == 0 {
-            return problem(StatusCode::BAD_REQUEST, "Invalid live-connection id", None);
-        }
-        let f = match parse_form(form) {
-            Ok(form) => form,
+        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
-        let reason = match validate_disconnect_reason(f.reason) {
-            Ok(reason) => reason,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &f.csrf).await {
+        let account = match require_form_actor(&state, &headers, &csrf).await {
             Ok(account) => account,
             Err(response) => return response,
         };
@@ -6190,13 +7219,7 @@ mod pages {
         };
         match core_action(&state, request).await {
             Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(message) => {
-                let query = match default_live_connection_query() {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                render_sessions_page(&state, &headers, account, true, query, Some(message)).await
-            }
+            Err(message) => sessions_error_page(&state, &headers, account, true, message).await,
         }
     }
 
@@ -6206,19 +7229,7 @@ mod pages {
         account: String,
         message: &'static str,
     ) -> Response {
-        let query = match default_live_connection_query() {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        render_sessions_page(
-            state,
-            headers,
-            account,
-            true,
-            query,
-            Some(message.to_owned()),
-        )
-        .await
+        sessions_error_page(state, headers, account, true, message.to_owned()).await
     }
 
     /// Console → revoke one durable browser session owned by the caller.
@@ -7124,6 +8135,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             client_id: "e6irc".into(),
             client_secret: "secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         };
@@ -7196,6 +8208,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             client_id: "e6irc".into(),
             client_secret: "secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         };

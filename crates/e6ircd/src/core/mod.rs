@@ -470,6 +470,7 @@ pub enum DbRequest {
     CreateAccount {
         conn: ConnId,
         name: String,
+        contact_email: Option<crate::identity::ContactEmail>,
         password: String,
         /// Which command asked, so the answer speaks that command's language.
         origin: AccountOrigin,

@@ -6,6 +6,7 @@
       <h1>Account &amp; access</h1>
       <p class="lede">Manage the credentials, API access, and login identities attached to <strong>{{ account }}</strong>. Secrets are displayed once and stored only as hashes.</p>
     </div>
+    <a class="button-link" href="/api/v1/me/export">Download my data</a>
   </div>
 
   {% if let Some(message) = outcome %}
@@ -25,6 +26,25 @@
       </div>
     </section>
   {% endif %}
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Contact email</h2>
+        <p>Private account recovery and operator-contact metadata. e6irc stores it but does not claim to verify or send mail to it.</p>
+      </div>
+      <span class="tag">Private</span>
+    </div>
+    <form class="inline-create" method="post" action="/console/account/profile">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field">
+        <span>Email address</span>
+        <input type="email" name="contact_email" maxlength="254" value="{{ contact_email }}" placeholder="alice@example.com" />
+      </label>
+      <button class="primary" type="submit">Save contact email</button>
+    </form>
+    <p class="section-note">Leave the field empty and save to remove the stored address.</p>
+  </section>
 
   <section class="panel">
     <div class="panel-head">
@@ -78,6 +98,7 @@
       {% else %}
         <div class="scroll">
           <table>
+            <caption class="sr-only">IRC credentials</caption>
             <thead><tr><th>Kind</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
             <tbody>
               {% for credential in credentials %}
@@ -109,7 +130,7 @@
       <div class="panel-head">
         <div>
           <h2>Personal access tokens</h2>
-          <p>Bearer tokens for API clients and automation. Tokens currently carry the account's full API authority.</p>
+          <p>Expiring bearer grants for API clients, IRC authentication, and automation.</p>
         </div>
         <span class="count">{{ tokens.len() }}</span>
       </div>
@@ -119,6 +140,22 @@
           <span>Label</span>
           <input name="label" maxlength="64" placeholder="Monitoring automation" required />
         </label>
+        <label class="field">
+          <span>Lifetime</span>
+          <select name="expires_in_days">
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+            <option value="365">365 days</option>
+          </select>
+        </label>
+        <fieldset class="field">
+          <legend>Scopes</legend>
+          <label><input type="checkbox" name="scope_read" checked /> Read</label>
+          <label><input type="checkbox" name="scope_write" checked /> Write</label>
+          <label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>
+          {% if is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}
+        </fieldset>
         <button class="primary" type="submit">Create token</button>
       </form>
       {% if tokens.is_empty() %}
@@ -126,11 +163,13 @@
       {% else %}
         <div class="scroll">
           <table>
-            <thead><tr><th>Label</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
+            <caption class="sr-only">Personal access tokens</caption>
+            <thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
             <tbody>
               {% for token in tokens %}
                 <tr>
                   <td>{{ token.label }}</td>
+                  <td><code>{{ token.scopes }}</code></td>
                   <td>{{ token.created }}</td>
                   <td>{{ token.expires }}</td>
                   <td>
@@ -207,5 +246,59 @@
         {% endfor %}
       </div>
     {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Security activity</h2>
+        <p>Your 50 most recent retained security and administrator events. The JSON API provides stable cursor pagination for older entries.</p>
+      </div>
+      <span class="count">{{ security_activity.len() }}</span>
+    </div>
+    {% if security_activity.is_empty() %}
+      <p class="empty">No retained security activity.</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <caption class="sr-only">Security activity</caption>
+          <thead><tr><th>Time (UTC)</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead>
+          <tbody>
+            {% for event in security_activity %}
+              <tr>
+                <td><time datetime="{{ event.at }}">{{ event.at }}</time></td>
+                <td><span class="tag">{{ event.action }}</span></td>
+                <td><code>{{ event.actor }}</code></td>
+                <td><code>{{ event.target }}</code></td>
+                <td>{{ event.detail }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="section-note"><a href="/api/v1/me/security-activity">Open security activity JSON</a></p>
+    {% endif %}
+  </section>
+
+  <section class="panel danger-panel" aria-labelledby="delete-account-title">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Danger zone</p>
+        <h2 id="delete-account-title">Permanently delete this account</h2>
+        <p>This revokes every credential and session, erases private history, stops owned networks, and retires the account name. It cannot be undone.</p>
+      </div>
+    </div>
+    <form class="field-grid" method="post" action="/console/account/delete"
+          data-confirm="Permanently delete {{ account }} and all account-owned data? This cannot be undone.">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field field-wide">
+        <span>Type <code>{{ account }}</code> to confirm</span>
+        <input name="confirmation" autocomplete="off" required />
+      </label>
+      <div class="form-actions field-wide">
+        <button class="danger" type="submit">Delete my account permanently</button>
+      </div>
+    </form>
+    <p class="section-note">If this account founded registered channels, transfer or drop them first. The final active administrator—whether granted by storage or configuration—cannot be deleted.</p>
   </section>
 {% endblock %}

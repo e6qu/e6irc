@@ -17,6 +17,23 @@ The 2026-07-30 whole-product traceability audit is in
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
 
+V1 closure identity and API admission (2026-07-30): account registration now
+parses and persists a normalized private contact email, while the self-service
+console and `/api/v1/me/profile` provide owner-scoped replacement/removal with
+redacted audit provenance. OpenID Connect provider configuration accepts a
+typed exact-domain allowlist and admits both login and linking only from a
+provider-verified matching email claim. Personal access tokens carry a closed,
+non-empty read/write/administrator/IRC grant set and mandatory 1–365-day
+expiry; HTTP, administrator, and SASL ingress enforce the corresponding grant,
+and session-bound CSRF protects every unsafe cookie-authenticated API method
+while preventing a bearer from minting broader authority.
+Browser sessions and tokens share bounded per-account API admission, with a
+separate smaller administrator budget; aggregate HTTP body, concurrency, and
+deadline limits bound unauthenticated process pressure. Unit, core,
+PostgreSQL, real HTTP, device, and OpenID Connect suites cover normalization,
+privacy, exact policy, grant separation, no escalation, expiry, and
+cross-bearer rate sharing.
+
 Journey-contract closure (2026-07-30): all 47 shipped outcomes now use one
 complete actor/precondition/flow/failure/security/evidence structure, and the
 coverage matrix has one exact linked row per journey using only the defined
@@ -130,9 +147,11 @@ same-sender ordered fence that catches duplicates, uses nanosecond timestamps, r
 malformed/out-of-range delivery identifiers, and supports explicit connect,
 fan-out, and P99 acceptance thresholds. The real-daemon CI smoke applies
 generous catastrophic-regression floors. A separate all-feature coverage job
-ratchets workspace line coverage at 55%. The journey matrix now distinguishes
-component-proven Discord/Slack logic from their unqualified live transports
-and records these composer, native-client, load, and coverage contracts.
+combines the portable workspace suite with the real PostgreSQL database and
+HTTP lifecycle suites before ratcheting production line coverage at 80%. The
+journey matrix now distinguishes component-proven Discord/Slack logic from
+their unqualified live transports and records these composer, native-client,
+load, and coverage contracts.
 
 Native-client and distribution closure (2026-07-30): `e6irc login` now drives
 the device authorization grant into a private, atomic, origin-bound token
@@ -5452,17 +5471,52 @@ Done:
   release, macOS: 1 channel gave 290 connects/s + 59k msg/s at 131 ms
   p50; 200 channels gave 6042 connects/s + 122k msg/s at 37 ms p50.
   Numbers recorded in tools/load/README.md.
+- Empty bounded queues allocate lazily rather than reserving their full
+  admission limit, removing the default SendQ's eager 1,024-envelope cost from
+  every idle connection. The Linux load harness samples the server PID's
+  pre-run and peak resident set, reports incremental bytes per requested
+  connection, and can fail on a supplied ceiling. The real-daemon CI smoke
+  enforces a generous 1 MiB/connection catastrophic-regression bound alongside
+  its delivery, throughput, latency, and shutdown gates.
 Qualification boundary:
 - The 100k-connection run itself needs a tuned Linux host (fd limits,
   ephemeral-port range, socket buffers — macOS caps loopback hard). The
   harness is the instrument; the run is a hosting task.
-- Production-host fan-out/latency acceptance numbers and the per-connection
-  memory budget are unset; the reduced-scale CI gate checks exact delivery and
-  deliberately generous catastrophic-regression thresholds without making a
-  host-performance claim. The runtime has one core worker; sharding,
+- Production-host fan-out/latency/RSS acceptance numbers are unset; the
+  reduced-scale CI gate checks exact delivery and deliberately generous
+  catastrophic-regression thresholds without making a host-performance claim.
+  The runtime has one core worker; sharding,
   timer-wheel scheduling, and whole-core deterministic replay are target
   architecture rather than shipped behavior. (DESIGN §7.3–7.4, §17;
   `docs/journeys/coverage.md`)
+
+## Phase 14 — Account lifecycle closure ✅ (2026-07-30)
+
+- Administrators can create local accounts immediately or issue/revoke
+  1–30-day, digest-only, single-use account invitations through both the
+  console and the documented REST API. Recipients choose their password in a
+  browser-bound acceptance flow; account/contact/authority creation,
+  invitation consumption, and audit commit atomically.
+- **Account & access** now exposes owner-scoped security activity and a
+  versioned JSON export of all retained account data. The export is one
+  PostgreSQL statement snapshot and excludes hashes, bearer values/digests,
+  provider tokens/session IDs, device codes, and sealed upstream credentials.
+  Credential, token, identity, browser-session, login/logout, provider-logout,
+  invitation, and lifecycle actions write redacted account-visible events.
+- Self-service and administrator permanent deletion require exact display-name
+  confirmation, explicit registered-channel succession, and another active
+  effective durable-or-configured administrator. The ordered core denies new
+  authentication before the transaction purges account-owned private data and
+  cascades credentials/sessions/networks; the registry then stops live drivers.
+  Deleted names are permanently retired under a per-name advisory lock and a
+  PostgreSQL account-insert trigger.
+- The OpenAPI method/path inventory, server-rendered controls, database
+  invariants, real-socket HTTP journey, two-context Chromium onboarding/export/
+  deletion journey, DESIGN model, and user-journey traceability all describe
+  the same lifecycle.
+- Every server-rendered data table now has a screen-reader caption and every
+  navigation landmark has an accessible name. A dependency-free template guard
+  enforces both structural contracts in CI.
 
 ## Known remaining scope (audit 2026-07-19)
 

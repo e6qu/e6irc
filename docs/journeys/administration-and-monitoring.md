@@ -100,8 +100,8 @@ audit state.
 handler/API. Filter sizes, page sizes, and cursor shapes are bounded and
 validated. User strings are escaped in HTML and never become metric labels.
 Database failure is an error state, not an empty directory. Self-suspension,
-self-demotion, and suspending or demoting the last active durable administrator
-are explicit conflicts.
+self-demotion, and suspending or demoting the last active effective
+durable-or-configured administrator are explicit conflicts.
 Invalid stored network configuration prevents reactivation before the durable
 state changes. A post-commit core/runtime reconciliation failure reports the
 exact safe partial state so retry can reconcile it.

@@ -316,6 +316,67 @@ try {
     await page.getByRole("heading", { name: heading, exact: true }).waitFor();
   }
 
+  // Cross invitation onboarding and permanent self-service deletion through
+  // two independent browser contexts. The administrator sees the bearer link
+  // once; the recipient chooses its own password, receives its own session,
+  // downloads a secret-free export, sees security activity, and deletes the
+  // account with explicit confirmation.
+  const accountDirectoryResponse = await page.goto(`${applicationOrigin}/console/accounts`);
+  assert.equal(
+    accountDirectoryResponse?.status(),
+    200,
+    `account directory navigation failed at ${page.url()}:\n${await page.locator("main").innerText()}`,
+  );
+  await page.getByRole("heading", { name: "Account directory", exact: true }).waitFor();
+  const inviteAccount = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "Invite an account", exact: true }),
+  });
+  await inviteAccount.getByLabel("Account name", { exact: true }).fill("browserguest");
+  await inviteAccount.getByLabel("Contact email (optional)", { exact: true }).fill("Guest@Example.COM");
+  await inviteAccount.getByLabel("Lifetime", { exact: true }).selectOption("1");
+  await inviteAccount.getByRole("button", { name: "Issue invitation", exact: true }).click();
+  await page.getByRole("status").waitFor();
+  assert.match(await page.getByRole("status").innerText(), /Invitation issued/);
+  const invitationURL = (await page.locator("#issued-invitation").innerText()).trim();
+  assert.match(invitationURL, /^http:\/\/127\.0\.0\.1:18083\/invite\/e6i_/);
+
+  const guestContext = await browser.newContext();
+  try {
+    const guest = await guestContext.newPage();
+    await guest.goto(invitationURL);
+    await guest.getByRole("heading", { name: "Create browserguest", exact: true }).waitFor();
+    await guest.getByLabel("Password", { exact: true }).fill("browser-guest-password");
+    await guest.getByLabel("Confirm password", { exact: true }).fill("browser-guest-password");
+    await guest.getByRole("button", { name: "Create account", exact: true }).click();
+    await guest.waitForURL(`${applicationOrigin}/console`);
+
+    await guest.goto(`${applicationOrigin}/console/account`);
+    await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
+    assert.match(await guest.locator("main").innerText(), /ACCOUNT_LOGIN/);
+    const exportResponse = await guestContext.request.get(`${applicationOrigin}/api/v1/me/export`);
+    assert.equal(exportResponse.status(), 200);
+    assert.match(exportResponse.headers()["content-disposition"], /e6irc-account-export\.json/);
+    const exported = await exportResponse.json();
+    assert.equal(exported.account.name, "browserguest");
+    assert.equal(exported.account.contact_email, "Guest@example.com");
+
+    const deleteAccount = guest.locator("section").filter({
+      has: guest.getByRole("heading", {
+        name: "Permanently delete this account",
+        exact: true,
+      }),
+    });
+    await deleteAccount.getByLabel("Type browserguest to confirm", { exact: true }).fill("browserguest");
+    guest.once("dialog", (dialog) => dialog.accept());
+    await deleteAccount
+      .getByRole("button", { name: "Delete my account permanently", exact: true })
+      .click();
+    await guest.waitForURL(`${applicationOrigin}/login`);
+    assert.equal((await guestContext.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
+  } finally {
+    await guestContext.close();
+  }
+
   await page.goto(`${applicationOrigin}/console/monitoring`);
   await page.getByRole("heading", { name: "Monitoring", exact: true }).waitFor();
   await page.getByRole("heading", { name: "Queue pressure", exact: true }).waitFor();

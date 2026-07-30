@@ -47,6 +47,7 @@
         {% else %}
           <div class="scroll">
             <table>
+              <caption class="sr-only">{{ p.meta.name }} bridge networks</caption>
               <thead><tr><th>Status</th><th>Network</th><th>Owner</th><th></th></tr></thead>
               <tbody>
                 {% for n in p.networks %}

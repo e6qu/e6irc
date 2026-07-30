@@ -62,23 +62,29 @@ registration, PostgreSQL is ready, and cookies are correctly configured.
    PKCE verifier, then redirects to the provider.
 3. The callback validates state, issuer, signature, audience, nonce, and code
    exchange before trusting the subject.
-4. `(issuer, subject)` resolves a linked e6irc account. First login provisions
+4. When the provider has an allowed-domain policy, the callback additionally
+   requires a provider-verified, syntactically valid email whose canonical
+   domain exactly matches one configured domain.
+5. `(issuer, subject)` resolves a linked e6irc account. First login provisions
    one according to registration policy; later logins reuse it.
-5. The server creates a bounded browser session, retains the provider logout
+6. The server creates a bounded browser session, retains the provider logout
    hint when supplied, and enters the application.
 
 **Visible failures and recovery.** Unknown/disabled provider, stale or replayed
-state, callback mismatch, invalid claims, registration denial, identity
-conflict, session-cap conflict, and provider/network/database failures all fail
-closed. No local session is created from partially validated claims. The
-validation and signed-out pages remain reload-safe. A valid provider result
-for a suspended account ends with an explicit account-unavailable response and
-no browser session.
+state, callback mismatch, invalid claims, missing/unverified/malformed or
+non-matching email under an allowed-domain policy, registration denial,
+identity conflict, session-cap conflict, and provider/network/database
+failures all fail closed. Parent and subdomains do not match by implication.
+No local session is created from partially validated claims. The validation
+and signed-out pages remain reload-safe. A valid provider result for a
+suspended account ends with an explicit account-unavailable response and no
+browser session.
 
 **Security and observability.** State is one-time and expiring; PKCE binds the
-authorization code; identities are globally unique. Front-channel and
-back-channel logout use correlation rather than trusting browser-supplied
-account data.
+authorization code; identities are globally unique. Email-domain admission is
+a typed exact-match policy over a verified provider claim, not suffix matching.
+Front-channel and back-channel logout use correlation rather than trusting
+browser-supplied account data.
 
 **Evidence.** Proven against a real e6ircd, PostgreSQL, Dex, and Chromium by
 `full_oidc_login_provisions_account_and_session`,
@@ -99,16 +105,18 @@ after an unlink.
 
 1. **Account & access** lists linked identities without provider secrets.
 2. **Link** starts a fresh provider flow marked as a link operation.
-3. The callback attaches the validated `(issuer, subject)` to the initiating
-   account only if no other account owns it.
+3. The callback applies the provider's verified exact-email-domain policy,
+   then attaches the validated `(issuer, subject)` to the initiating account
+   only if no other account owns it.
 4. Unlink requires an authenticated, CSRF-protected console form or the
    owner-scoped `DELETE /api/v1/me/identities/{id}`.
 5. The account remains usable through its remaining credentials/identities.
 
 **Visible failures and recovery.** Linking an identity owned by another account
-is a conflict, never a move. Unlinking an identity outside the caller’s account
-is indistinguishable from absence. The server refuses a mutation that would
-violate the account’s access invariants.
+is a conflict, never a move. Missing/unverified or non-matching email under a
+provider domain policy is rejected before linking. Unlinking an identity
+outside the caller’s account is indistinguishable from absence. The server
+refuses a mutation that would violate the account’s access invariants.
 
 **Security and observability.** Link state and PKCE are bound to the initiating
 session. The callback trusts only validated issuer/subject identity, unlink is
@@ -119,6 +127,52 @@ written to audit details.
 `oidc_identity_link_flow_and_conflict` and
 `oidc_identity_link_list_and_conflict`; console rendering/mutation is covered
 by `account_console_manages_credentials_tokens_and_identities`.
+
+## Join through an administrator invitation
+
+**Actor and goal.** An administrator wants to onboard a named local account
+without choosing or learning the recipient's password; the recipient wants to
+claim that account through the UI.
+
+**Preconditions.** PostgreSQL and HTTP are ready, the administrator has an
+active browser session or administrator-capable personal access token, and the
+requested account name neither exists nor has been retired.
+
+**Flow.**
+
+1. The administrator opens **Account directory** or posts to
+   `/api/v1/admin/invitations`, chooses the account name, optional private
+   contact email, 1–30-day lifetime, and optional durable administrator grant.
+2. e6irc stores only a SHA-256 digest and displays the single-use bearer link
+   once. The secret is sent to the recipient through a trusted channel.
+3. The recipient opens `/invite/{token}`. A short-lived
+   `HttpOnly; SameSite=Strict` cookie binds the acceptance form to that browser.
+4. The recipient chooses and confirms a primary password.
+5. Password hashing, account/contact/authority creation, invitation
+   consumption, and the audit event commit atomically. e6irc creates a bounded
+   browser session and enters the console.
+6. The administrator directory lists only live invitation metadata and can
+   revoke an exact invitation without retrieving its bearer value.
+
+**Visible failures and recovery.** Invalid or retired names, duplicate pending
+invitations, malformed private contact data, out-of-range lifetime, per-admin
+cap exhaustion, stale browser state, expired/revoked/consumed tokens, password
+mismatch, and storage failure are explicit. Public lookup deliberately gives
+the same unavailable result for every unusable bearer. A failed account
+transaction does not consume the invitation.
+
+**Security and observability.** Tokens carry 256 random bits, are hashed at
+rest, expire, and are single-use. Invitation/contact secrets never enter audit
+details, directories, metrics, or logs. Issuance/revocation/acceptance is
+audited with folded account provenance, and administrator authority becomes
+live only after its durable creation commits.
+
+**Evidence.** PostgreSQL test
+`account_invitations_are_single_use_expiring_and_digest_only`, real-socket HTTP
+test `invitation_creation_export_and_permanent_deletion_work_end_to_end`, and
+the two-context Chromium journey in `tools/test-oidc-browser.mjs` cross
+issuance, browser binding, acceptance, login, one-use rejection, and
+revocation-safe metadata.
 
 ## Sign out locally and across an identity provider
 
@@ -251,8 +305,9 @@ credential exists yet.
 - Change/add the primary password from **Account & access**.
 - Create an app password for IRC/BNC, copy the one-time plaintext, then revoke
   it independently.
-- Create a personal access token for API/OAUTHBEARER, copy it once, list its
-  secret-free posture, then revoke it independently.
+- Create a time-bounded personal access token with only the API/IRC grants it
+  needs, copy it once, list its secret-free posture, then revoke it
+  independently.
 - List browser sessions, revoke one, or revoke all other browser sessions.
 - List live IRC connections and disconnect an exact connection ID.
 - Sign out locally; when provider metadata supports it, coordinated logout also
@@ -260,8 +315,10 @@ credential exists yet.
 
 **Visible failures and recovery.** Credential/session caps are hard conflicts.
 An app password cannot rotate the primary password. The primary credential
-cannot be deleted through generic revocation. Exact-resource deletes are
-owner-scoped and idempotent only where the API contract says so.
+cannot be deleted through generic revocation. Expired or under-scoped personal
+access tokens are rejected, and a bearer cannot mint broader credentials.
+Exact-resource deletes are owner-scoped and idempotent only where the API
+contract says so.
 
 **Security and observability.** New app passwords and tokens are rendered once;
 only hashes and secret-free posture remain. Rotation and revocation are

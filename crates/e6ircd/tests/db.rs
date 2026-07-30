@@ -146,6 +146,80 @@ async fn verify_password_roundtrip() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_contact_email_is_stored_normalized_and_private_by_default() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("account_contact_email_is_stored_normalized_and_private_by_default")
+            .await,
+    )
+    .await
+    .expect("connect");
+    let email =
+        e6ircd::identity::ContactEmail::parse("Alice+IRC@Example.COM").expect("valid email");
+    db::create_account_with_contact(&pool, "Alice", "password", Some(&email))
+        .await
+        .expect("create");
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT contact_email FROM accounts WHERE name_folded = 'alice'")
+            .fetch_one(&pool)
+            .await
+            .expect("contact email");
+    assert_eq!(stored.as_deref(), Some("Alice+IRC@example.com"));
+
+    let directory = db::query_account_directory(
+        &pool,
+        db::AccountDirectoryFilter {
+            before_id: None,
+            exact_name: None,
+            page_size: account_page_size(10),
+        },
+    )
+    .await
+    .expect("account directory");
+    let serialized = format!("{:?}", directory.entries);
+    assert!(
+        !serialized.contains("Alice+IRC"),
+        "contact email is private and must not leak through the administrator directory"
+    );
+
+    let replacement =
+        e6ircd::identity::ContactEmail::parse("new-contact@example.net").expect("valid email");
+    db::set_account_contact_email(&pool, "Alice", Some(&replacement))
+        .await
+        .expect("replace");
+    assert_eq!(
+        db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email"),
+        Some("new-contact@example.net".into())
+    );
+    let audit: (String, String) = sqlx::query_as(
+        "SELECT action, detail FROM audit_log
+         WHERE action = 'ACCOUNT_CONTACT_UPDATE'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("contact audit");
+    assert_eq!(audit.0, "ACCOUNT_CONTACT_UPDATE");
+    assert_eq!(audit.1, "contact email replaced");
+    assert!(
+        !audit.1.contains("example"),
+        "the private address must not enter audit detail"
+    );
+    db::set_account_contact_email(&pool, "alice", None)
+        .await
+        .expect("remove");
+    assert_eq!(
+        db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email"),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn sasl_over_real_socket() {
     let url = support::test_db("sasl_over_real_socket").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
@@ -697,6 +771,15 @@ async fn credential_list_and_revoke() {
     }
     let http = running.http_addr.expect("http");
     let auth = format!("Cookie: e6irc_session={session}\r\n");
+    let (status, body) = http_req(
+        http,
+        &format!("GET /api/v1/me HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}\r\n"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let me: serde_json::Value = serde_json::from_str(&body).expect("current account JSON");
+    let csrf = me["csrf_token"].as_str().expect("session CSRF token");
+    let mutation_auth = format!("{auth}X-E6IRC-CSRF: {csrf}\r\n");
 
     // list → local_password + 2 app_passwords = 3
     let (status, body) = http_req(
@@ -727,7 +810,7 @@ async fn credential_list_and_revoke() {
     // authenticated revoke → 204, then list shows 2
     let (status, _) = http_req(
         http,
-        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}\r\n"),
+        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{mutation_auth}\r\n"),
     )
     .await;
     assert_eq!(status, 204);
@@ -744,7 +827,7 @@ async fn credential_list_and_revoke() {
     // revoking again → 404
     let (status, _) = http_req(
         http,
-        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}\r\n"),
+        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{mutation_auth}\r\n"),
     )
     .await;
     assert_eq!(status, 404);
@@ -984,6 +1067,60 @@ async fn api_tokens_are_capped_per_account() {
     assert!(
         matches!(over, Err(db::DbError::TooManyCredentials)),
         "the 33rd PAT must be refused: {over:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn api_token_storage_rejects_invalid_grants_and_lifetimes() {
+    let url = support::test_db("api_token_storage_rejects_invalid_grants_and_lifetimes").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "token-shape", "pw")
+        .await
+        .expect("create");
+    let account_id: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = 'token-shape'")
+            .fetch_one(&pool)
+            .await
+            .expect("account id");
+
+    for (index, scopes) in [
+        Vec::<String>::new(),
+        vec!["read".into(), "read".into()],
+        vec!["future".into()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = sqlx::query(
+            "INSERT INTO api_tokens (
+                 token_hash, account_id, label, scopes, expires_at
+             )
+             VALUES ($1, $2, 'invalid', $3, now() + interval '1 day')",
+        )
+        .bind(vec![index as u8])
+        .bind(account_id)
+        .bind(scopes)
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "invalid scope set {index} was stored");
+    }
+
+    let invalid_lifetime = sqlx::query(
+        "INSERT INTO api_tokens (
+             token_hash, account_id, label, scopes, created_at, expires_at
+         )
+         VALUES (
+             decode('ff', 'hex'), $1, 'invalid lifetime', ARRAY['read'],
+             now(), now() - interval '1 second'
+         )",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        invalid_lifetime.is_err(),
+        "expiry at or before creation was stored"
     );
 }
 
@@ -3689,9 +3826,12 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
         "WITH account AS (
              SELECT id FROM accounts WHERE name_folded = 'alice'
          ), expired_token AS (
-             INSERT INTO api_tokens (token_hash, account_id, label, expires_at)
+             INSERT INTO api_tokens (
+                 token_hash, account_id, label, created_at, expires_at
+             )
              SELECT decode(repeat('ab', 32), 'hex'), id, 'expired',
-                    now() - interval '1 hour' FROM account
+                    now() - interval '2 hours', now() - interval '1 hour'
+             FROM account
          ), expired_session AS (
              INSERT INTO web_sessions (token_hash, account_id, expires_at)
              SELECT decode(repeat('cd', 32), 'hex'), id,
@@ -4881,7 +5021,7 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
             .expect("approve device")
     );
 
-    let change = db::set_account_suspended(&pool, bob_id, true, "Alice")
+    let change = db::set_account_suspended(&pool, bob_id, true, "Alice", &[])
         .await
         .expect("suspend")
         .expect("Bob exists");
@@ -4939,7 +5079,7 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
         Err(db::DbError::BadCredentials)
     ));
 
-    db::set_account_suspended(&pool, bob_id, false, "Alice")
+    db::set_account_suspended(&pool, bob_id, false, "Alice", &[])
         .await
         .expect("reactivate")
         .expect("Bob exists");
@@ -4978,11 +5118,14 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
     let bob_id = db::create_account(&pool, "Bob", "second administrator password")
         .await
         .expect("Bob");
+    let carol_id = db::create_account(&pool, "Carol", "configured administrator password")
+        .await
+        .expect("Carol");
     assert!(matches!(
-        db::set_account_administrator(&pool, alice_id, false, "Alice").await,
+        db::set_account_administrator(&pool, alice_id, false, "Alice", &[]).await,
         Err(db::DbError::CannotDemoteSelf)
     ));
-    db::set_account_administrator(&pool, bob_id, true, "Alice")
+    db::set_account_administrator(&pool, bob_id, true, "Alice", &[])
         .await
         .expect("grant Bob")
         .expect("Bob");
@@ -4994,30 +5137,30 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
     );
 
     assert!(matches!(
-        db::set_account_suspended(&pool, alice_id, true, "ALICE").await,
+        db::set_account_suspended(&pool, alice_id, true, "ALICE", &[]).await,
         Err(db::DbError::CannotSuspendSelf)
     ));
-    db::set_account_suspended(&pool, alice_id, true, "Bob")
+    db::set_account_suspended(&pool, alice_id, true, "Bob", &[])
         .await
         .expect("Bob suspends Alice")
         .expect("Alice");
     assert!(matches!(
-        db::set_account_suspended(&pool, bob_id, true, "Alice").await,
+        db::set_account_suspended(&pool, bob_id, true, "Alice", &[]).await,
         Err(db::DbError::LastAdministrator)
     ));
     assert!(matches!(
-        db::set_account_administrator(&pool, bob_id, false, "Alice").await,
+        db::set_account_administrator(&pool, bob_id, false, "Alice", &[]).await,
         Err(db::DbError::LastAdministrator)
     ));
-    db::set_account_suspended(&pool, alice_id, false, "Bob")
+    db::set_account_suspended(&pool, alice_id, false, "Bob", &[])
         .await
         .expect("reactivate Alice")
         .expect("Alice");
-    db::set_account_suspended(&pool, bob_id, true, "Alice")
+    db::set_account_suspended(&pool, bob_id, true, "Alice", &[])
         .await
         .expect("Alice can now suspend Bob")
         .expect("Bob");
-    db::set_account_administrator(&pool, bob_id, false, "Alice")
+    db::set_account_administrator(&pool, bob_id, false, "Alice", &[])
         .await
         .expect("Alice can revoke Bob")
         .expect("Bob");
@@ -5027,6 +5170,33 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
             .expect("administrators"),
         ["alice"]
     );
+    let configured = ["carol".to_string()];
+    db::set_account_suspended(&pool, alice_id, true, "Bob", &configured)
+        .await
+        .expect("configured Carol preserves effective authority")
+        .expect("Alice");
+    db::set_account_administrator(&pool, alice_id, false, "Bob", &configured)
+        .await
+        .expect("configured Carol permits durable succession")
+        .expect("Alice");
+    assert!(
+        db::list_admin_accounts(&pool)
+            .await
+            .expect("durable administrators")
+            .is_empty()
+    );
+    assert!(matches!(
+        db::set_account_suspended(&pool, carol_id, true, "Bob", &configured).await,
+        Err(db::DbError::LastAdministrator)
+    ));
+    db::set_account_administrator(&pool, carol_id, true, "Bob", &configured)
+        .await
+        .expect("grant Carol durable authority")
+        .expect("Carol");
+    db::set_account_administrator(&pool, carol_id, false, "Bob", &configured)
+        .await
+        .expect("configuration keeps Carol effective after durable revocation")
+        .expect("Carol");
     let actions: Vec<String> = sqlx::query_scalar(
         "SELECT action FROM audit_log
          WHERE target = 'bob'
@@ -5037,6 +5207,364 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
     .await
     .expect("authority audit");
     assert_eq!(actions, ["ACCOUNT_ADMIN_GRANT", "ACCOUNT_ADMIN_REVOKE"]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_invitations_are_single_use_expiring_and_digest_only() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("account_invitations_are_single_use_expiring_and_digest_only").await,
+    )
+    .await
+    .expect("connect");
+    db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let email = e6ircd::identity::ContactEmail::parse("Bob@Example.COM").expect("email");
+    let token = db::issue_account_invitation(
+        &pool,
+        "Bob",
+        Some(&email),
+        true,
+        e6ircd::identity::AccountInvitationLifetimeDays::new(7).expect("lifetime"),
+        "Alice",
+    )
+    .await
+    .expect("issue");
+    let carol_token = db::issue_account_invitation(
+        &pool,
+        "Carol",
+        None,
+        false,
+        e6ircd::identity::AccountInvitationLifetimeDays::new(1).expect("lifetime"),
+        "Alice",
+    )
+    .await
+    .expect("issue second invitation");
+    assert!(token.starts_with("e6i_"));
+    let invitations = db::list_account_invitations(
+        &pool,
+        None,
+        db::AccountInvitationPageSize::new(1).expect("page size"),
+    )
+    .await
+    .expect("invitations");
+    assert_eq!(invitations.entries.len(), 1);
+    assert_eq!(invitations.entries[0].account_name, "Carol");
+    let second_page = db::list_account_invitations(
+        &pool,
+        invitations.next_before_id,
+        db::AccountInvitationPageSize::new(1).expect("page size"),
+    )
+    .await
+    .expect("second page");
+    assert_eq!(second_page.entries.len(), 1);
+    assert_eq!(second_page.entries[0].account_name, "Bob");
+    assert_eq!(second_page.next_before_id, None);
+    assert_eq!(
+        second_page.entries[0].contact_email.as_deref(),
+        Some("Bob@example.com")
+    );
+    assert!(
+        !format!("{invitations:?}").contains(&token),
+        "directory must never expose the invitation bearer"
+    );
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT token_hash FROM account_invitations WHERE id = $1")
+            .bind(second_page.entries[0].id)
+            .fetch_one(&pool)
+            .await
+            .expect("digest");
+    assert_eq!(stored.len(), 32);
+    assert_ne!(stored, token.as_bytes());
+    assert!(
+        db::account_invitation_preview(&pool, "e6i_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            .await
+            .expect("unknown preview")
+            .is_none()
+    );
+
+    let account = db::accept_account_invitation(&pool, &token, "invited password")
+        .await
+        .expect("accept");
+    assert_eq!(account, "Bob");
+    assert_eq!(
+        db::verify_local_password(&pool, "bob", "invited password")
+            .await
+            .expect("password"),
+        Some("Bob".into())
+    );
+    assert!(
+        db::account_flags(&pool, "Bob")
+            .await
+            .expect("flags")
+            .expect("Bob")
+            .is_admin()
+    );
+    assert!(matches!(
+        db::accept_account_invitation(&pool, &token, "other password").await,
+        Err(db::DbError::InvitationUnavailable)
+    ));
+    assert!(
+        db::revoke_account_invitation(&pool, invitations.entries[0].id, "Alice")
+            .await
+            .expect("revoke Carol")
+    );
+    assert!(
+        db::account_invitation_preview(&pool, &carol_token)
+            .await
+            .expect("Carol preview")
+            .is_none()
+    );
+    assert!(
+        db::list_account_invitations(
+            &pool,
+            None,
+            db::AccountInvitationPageSize::new(100).expect("page size"),
+        )
+        .await
+        .expect("invitations")
+        .entries
+        .is_empty()
+    );
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log
+         WHERE target = 'bob' AND action LIKE 'ACCOUNT_INVITATION_%'
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        actions,
+        ["ACCOUNT_INVITATION_CREATE", "ACCOUNT_INVITATION_ACCEPT"]
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn permanent_account_deletion_requires_succession_purges_and_retires() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("permanent_account_deletion_requires_succession_purges_and_retires")
+            .await,
+    )
+    .await
+    .expect("connect");
+    let alice_id = db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let bob_id = db::create_account(&pool, "Bob", "member password")
+        .await
+        .expect("Bob");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         VALUES ('#bob', '#bob', $1)",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await
+    .expect("channel");
+    assert!(matches!(
+        db::account_deletion_target(&pool, bob_id, &[]).await,
+        Err(db::DbError::AccountOwnsChannels(1))
+    ));
+    assert!(matches!(
+        db::delete_account_permanently(&pool, bob_id, "Alice", &[]).await,
+        Err(db::DbError::AccountOwnsChannels(1))
+    ));
+    assert!(
+        db::set_channel_founder(&pool, "#bob", "alice")
+            .await
+            .expect("transfer")
+    );
+    let session = db::create_web_session(&pool, "Bob", None)
+        .await
+        .expect("session");
+    let api_token = db::issue_api_token(&pool, "Bob", "automation")
+        .await
+        .expect("token");
+    sqlx::query(
+        "INSERT INTO bnc_networks (account_id, name, addr, nick)
+         VALUES ($1, 'libera', 'irc.libera.chat:6697', 'Bob')",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await
+    .expect("network");
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line)
+         VALUES ('bob', 'libera', ':server NOTICE Bob :private backlog')",
+    )
+    .execute(&pool)
+    .await
+    .expect("buffer");
+    sqlx::query(
+        "INSERT INTO messages
+            (msgid, target, sender_prefix, sender_account, kind, body, ts, dm_peers)
+         VALUES
+            ('bob-sent', '#test', 'Bob!u@h', 'bob', 'privmsg', 'sent', now(), NULL),
+            ('bob-dm', 'alice!bob', 'Alice!u@h', 'alice', 'privmsg', 'private',
+             now(), ARRAY['alice', 'bob'])",
+    )
+    .execute(&pool)
+    .await
+    .expect("messages");
+    let (_device_code, user_code) = db::create_device_grant(&pool).await.expect("device");
+    assert!(
+        db::approve_device_grant(&pool, &user_code, "Bob")
+            .await
+            .expect("approve")
+    );
+
+    let deleted = db::delete_account_permanently(&pool, bob_id, "Alice", &[])
+        .await
+        .expect("delete")
+        .expect("Bob");
+    assert_eq!(deleted.name, "Bob");
+    assert_eq!(
+        db::account_name_by_id(&pool, bob_id).await.expect("lookup"),
+        None
+    );
+    assert_eq!(
+        db::session_account(&pool, &session).await.expect("session"),
+        None
+    );
+    assert_eq!(
+        db::api_token_account(&pool, &api_token)
+            .await
+            .expect("token"),
+        None
+    );
+    let residues: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM bnc_buffer WHERE owner = 'bob'),
+            (SELECT count(*) FROM messages
+             WHERE sender_account = 'bob' OR dm_peers @> ARRAY['bob']),
+            (SELECT count(*) FROM device_grants WHERE account = 'Bob')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("residues");
+    assert_eq!(residues, (0, 0, 0));
+    assert!(matches!(
+        db::create_account(&pool, "bOB", "new owner").await,
+        Err(db::DbError::DuplicateAccount(_))
+    ));
+    let direct = sqlx::query("INSERT INTO accounts (name, name_folded) VALUES ('BOB', 'bob')")
+        .execute(&pool)
+        .await;
+    assert!(direct.is_err(), "storage trigger must reject retired names");
+    sqlx::query("DELETE FROM channels WHERE name_folded = '#bob'")
+        .execute(&pool)
+        .await
+        .expect("drop transferred channel");
+    assert!(matches!(
+        db::account_deletion_target(&pool, alice_id, &[]).await,
+        Err(db::DbError::LastAdministrator)
+    ));
+    sqlx::query("UPDATE accounts SET flags = 0 WHERE id = $1")
+        .bind(alice_id)
+        .execute(&pool)
+        .await
+        .expect("make Alice configuration-only administrator");
+    assert!(matches!(
+        db::account_deletion_target(&pool, alice_id, &["alice".into(), "ghost".into()]).await,
+        Err(db::DbError::LastAdministrator)
+    ));
+    db::create_account(&pool, "Dana", "administrator candidate")
+        .await
+        .expect("Dana");
+    assert!(
+        db::account_deletion_target(&pool, alice_id, &["alice".into(), "dana".into()])
+            .await
+            .expect("effective administrator check")
+            .is_some(),
+        "a second existing active configuration-backed administrator is a recovery path"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_export_and_security_activity_are_owner_scoped_and_secret_free() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("account_export_and_security_activity_are_owner_scoped_and_secret_free")
+            .await,
+    )
+    .await
+    .expect("connect");
+    let email = e6ircd::identity::ContactEmail::parse("Alice@Example.COM").expect("email");
+    let alice_id = db::create_account_with_contact(
+        &pool,
+        "Alice",
+        "highly confidential password",
+        Some(&email),
+    )
+    .await
+    .expect("Alice");
+    db::create_account(&pool, "Bob", "other password")
+        .await
+        .expect("Bob");
+    let session = db::create_web_session(&pool, "Alice", None)
+        .await
+        .expect("session");
+    let bearer = db::issue_api_token(&pool, "Alice", "secret-token-label")
+        .await
+        .expect("token");
+    sqlx::query(
+        "INSERT INTO bnc_networks
+            (account_id, name, addr, tls, nick, sasl_account, sasl_password_sealed)
+         VALUES ($1, 'libera', 'irc.libera.chat:6697', true, 'Alice',
+                 'alice', 'enc:v1:must-not-export')",
+    )
+    .bind(alice_id)
+    .execute(&pool)
+    .await
+    .expect("network");
+    db::insert_audit_log(&pool, "bob", "ACCOUNT_SUSPEND", "alice", "")
+        .await
+        .expect("admin event");
+    db::insert_audit_log(&pool, "bob", "OTHER_EVENT", "bob", "private to Bob")
+        .await
+        .expect("other event");
+
+    let export = db::export_account_json(&pool, "ALICE")
+        .await
+        .expect("export")
+        .expect("Alice");
+    let value: serde_json::Value = serde_json::from_str(&export).expect("valid JSON");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["account"]["name"], "Alice");
+    assert_eq!(value["account"]["contact_email"], "Alice@example.com");
+    assert_eq!(value["networks"][0]["has_sasl_password"], true);
+    assert!(
+        !export.contains("enc:v1:must-not-export")
+            && !export.contains("highly confidential password")
+            && !export.contains(&session)
+            && !export.contains(&bearer),
+        "export must contain metadata and personal data, never live or stored secrets"
+    );
+    let activity = db::query_account_security_activity(&pool, "Alice", None, audit_page_size(100))
+        .await
+        .expect("activity");
+    assert!(
+        activity
+            .entries
+            .iter()
+            .any(|entry| entry.action == "ACCOUNT_LOGIN")
+    );
+    assert!(
+        activity
+            .entries
+            .iter()
+            .any(|entry| entry.action == "ACCOUNT_SUSPEND")
+    );
+    assert!(
+        activity
+            .entries
+            .iter()
+            .all(|entry| entry.detail != "private to Bob"),
+        "another account's activity must not leak"
+    );
 }
 
 #[tokio::test]
@@ -5079,10 +5607,11 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("sessions");
     sqlx::query(
-        "INSERT INTO api_tokens (token_hash, account_id, label, expires_at)
+        "INSERT INTO api_tokens (token_hash, account_id, label, created_at, expires_at)
          VALUES
-           (decode('03', 'hex'), $1, 'old', now() - interval '1 second'),
-           (decode('04', 'hex'), $1, 'new', now() + interval '1 day')",
+           (decode('03', 'hex'), $1, 'old',
+            now() - interval '2 seconds', now() - interval '1 second'),
+           (decode('04', 'hex'), $1, 'new', now(), now() + interval '1 day')",
     )
     .bind(account_id)
     .execute(&pool)
@@ -5106,6 +5635,16 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .execute(&pool)
     .await
     .expect("logout tokens");
+    sqlx::query(
+        "INSERT INTO account_invitations
+            (token_hash, account_name, name_folded, created_by, created_at, expires_at)
+         VALUES
+            (decode('05', 'hex'), 'Expired', 'expired', 'alice',
+             now() - interval '2 days', now() - interval '1 day')",
+    )
+    .execute(&pool)
+    .await
+    .expect("account invitations");
 
     let report = db::run_storage_maintenance(&pool, 30, 365)
         .await
@@ -5116,22 +5655,24 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     assert_eq!(report.api_tokens, 1);
     assert_eq!(report.device_grants, 1);
     assert_eq!(report.logout_tokens, 1);
+    assert_eq!(report.account_invitations, 1);
     assert!(!report.saturated);
-    let counts: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let counts: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT count(*) FROM messages),
            (SELECT count(*) FROM audit_log),
            (SELECT count(*) FROM web_sessions),
            (SELECT count(*) FROM api_tokens),
            (SELECT count(*) FROM device_grants),
-           (SELECT count(*) FROM oidc_logout_tokens)",
+           (SELECT count(*) FROM oidc_logout_tokens),
+           (SELECT count(*) FROM account_invitations)",
     )
     .fetch_one(&pool)
     .await
     .expect("retained row counts");
     assert_eq!(
         counts,
-        (1, 1, 1, 1, 1, 1),
+        (1, 1, 1, 1, 1, 1, 0),
         "every collection retained only its live/recent row"
     );
 }

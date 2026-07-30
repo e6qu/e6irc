@@ -769,7 +769,7 @@ pub(crate) async fn run_storage_maintenance(
                 eprintln!(
                     "storage maintenance filled a bounded batch \
                      (messages={}, audit_events={}, web_sessions={}, api_tokens={}, \
-                     device_grants={}, logout_tokens={}); expired rows remain eligible \
+                     device_grants={}, logout_tokens={}, account_invitations={}); expired rows remain eligible \
                      for the next cycle",
                     report.messages,
                     report.audit_events,
@@ -777,6 +777,7 @@ pub(crate) async fn run_storage_maintenance(
                     report.api_tokens,
                     report.device_grants,
                     report.logout_tokens,
+                    report.account_invitations,
                 );
             }
             Ok(_report) => {}

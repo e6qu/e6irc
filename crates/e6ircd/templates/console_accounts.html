@@ -9,6 +9,137 @@
     <a class="button-link" href="/api/v1/admin/accounts">Open JSON API</a>
   </div>
 
+  {% if let Some(message) = outcome %}
+    <div class="{% if success %}banner-success{% else %}banner-error{% endif %}" role="{% if success %}status{% else %}alert{% endif %}">{{ message }}</div>
+  {% endif %}
+
+  {% if let Some(value) = invitation_url %}
+    <section class="secret-reveal" aria-labelledby="invitation-link-title">
+      <div>
+        <p class="eyebrow">Shown once</p>
+        <h2 id="invitation-link-title">Account invitation link</h2>
+        <p>The bearer secret is not stored. Copy this link now and send it through a trusted channel.</p>
+      </div>
+      <div class="secret-value">
+        <code id="issued-invitation">{{ value }}</code>
+        <button type="button" data-copy-target="issued-invitation">Copy</button>
+      </div>
+    </section>
+  {% endif %}
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Invite an account</h2>
+        <p>Issue a single-use, expiring link. The recipient chooses the password; e6irc stores only the link digest.</p>
+      </div>
+    </div>
+    <form class="field-grid" method="post" action="/console/accounts/invitations">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field">
+        <span>Account name</span>
+        <input name="account" maxlength="64" autocomplete="off" placeholder="alice" required />
+      </label>
+      <label class="field">
+        <span>Contact email (optional)</span>
+        <input type="email" name="contact_email" maxlength="254" autocomplete="off" placeholder="alice@example.com" />
+      </label>
+      <label class="field">
+        <span id="invitation-lifetime-label">Lifetime</span>
+        <select name="expires_in_days" aria-labelledby="invitation-lifetime-label">
+          <option value="1">1 day</option>
+          <option value="7" selected>7 days</option>
+          <option value="14">14 days</option>
+          <option value="30">30 days</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Authority</span>
+        <span><input type="checkbox" name="administrator" /> Durable administrator</span>
+      </label>
+      <div class="form-actions field-wide">
+        <button class="primary" type="submit">Issue invitation</button>
+      </div>
+    </form>
+
+    {% if invitations.is_empty() %}
+      <p class="empty">No pending invitations.</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <caption class="sr-only">Pending account invitations</caption>
+          <thead>
+            <tr><th>Account</th><th>Contact</th><th>Authority</th><th>Issued by</th><th>Expires (UTC)</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for invitation in invitations %}
+              <tr>
+                <td><strong><code>{{ invitation.account_name }}</code></strong></td>
+                <td>{% if let Some(email) = invitation.contact_email %}{{ email }}{% else %}<span class="meta">Not supplied</span>{% endif %}</td>
+                <td>{% if invitation.administrator %}<span class="tag">administrator</span>{% else %}<span class="tag">member</span>{% endif %}</td>
+                <td><code>{{ invitation.created_by }}</code></td>
+                <td><time datetime="{{ invitation.expires_at }}">{{ invitation.expires_at }}</time></td>
+                <td>
+                  <form class="cell-form" method="post"
+                        action="/console/accounts/invitations/{{ invitation.id }}/delete"
+                        data-confirm="Revoke the invitation for {{ invitation.account_name }}?">
+                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <button class="danger" type="submit">Revoke</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+    <div class="pager">
+      <span class="meta">{% if invitation_before_id.is_some() %}Showing an older invitation page.{% else %}Showing the newest pending invitations.{% endif %}</span>
+      {% if let Some(before_id) = invitation_next_before_id %}
+        <form method="get" action="/console/accounts">
+          <input type="hidden" name="name" value="{{ name }}" />
+          <input type="hidden" name="limit" value="{{ limit }}" />
+          {% if let Some(account_before_id) = next_before_id %}
+            <input type="hidden" name="before_id" value="{{ account_before_id }}" />
+          {% endif %}
+          <input type="hidden" name="invitation_before_id" value="{{ before_id }}" />
+          <button type="submit">Older invitations</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Create an account</h2>
+        <p>Provision a local account with an initial password. Contact email is private operator metadata and is not treated as verified.</p>
+      </div>
+    </div>
+    <form class="field-grid" method="post" action="/console/accounts/create">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field">
+        <span>Account name</span>
+        <input name="account" maxlength="64" autocomplete="off" placeholder="alice" required />
+      </label>
+      <label class="field">
+        <span>Initial password</span>
+        <input type="password" name="password" maxlength="512" autocomplete="new-password" required />
+      </label>
+      <label class="field">
+        <span>Contact email (optional)</span>
+        <input type="email" name="contact_email" maxlength="254" autocomplete="off" placeholder="alice@example.com" />
+      </label>
+      <label class="field">
+        <span>Authority</span>
+        <span><input type="checkbox" name="administrator" /> Durable administrator</span>
+      </label>
+      <div class="form-actions field-wide">
+        <button class="primary" type="submit">Create account</button>
+      </div>
+    </form>
+  </section>
+
   <section class="panel">
     <div class="panel-head">
       <div>
@@ -49,6 +180,7 @@
     {% else %}
       <div class="scroll">
         <table>
+          <caption class="sr-only">Account directory</caption>
           <thead>
             <tr>
               <th>ID</th><th>Account</th><th>Created (UTC)</th><th>Login methods</th>
@@ -86,6 +218,7 @@
                 </td>
                 <td>
                   {% if !entry.current %}
+                    <div class="account-actions">
                     <form class="cell-form" method="post"
                           action="/console/accounts/{{ entry.id }}/suspension"
                           data-confirm="{% if entry.suspended %}Reactivate {{ entry.name }} and restart its enabled networks?{% else %}Suspend {{ entry.name }}, revoke its sessions and tokens, disconnect its clients, and stop its networks?{% endif %}">
@@ -95,7 +228,7 @@
                         {% if entry.suspended %}Reactivate{% else %}Suspend{% endif %}
                       </button>
                     </form>
-                    <form class="cell-form" method="post"
+                    <form class="cell-form account-delete-form" method="post"
                           action="/console/accounts/{{ entry.id }}/administrator"
                           data-confirm="{% if entry.administrator %}Remove durable administrator authority from {{ entry.name }}? A configuration grant, if shown, remains effective until configuration changes and restart.{% else %}Grant durable administrator authority to {{ entry.name }}?{% endif %}">
                       <input type="hidden" name="csrf" value="{{ csrf }}" />
@@ -104,6 +237,17 @@
                         {% if entry.administrator %}Revoke durable admin{% else %}Grant durable admin{% endif %}
                       </button>
                     </form>
+                    <form class="cell-form" method="post"
+                          action="/console/accounts/{{ entry.id }}/delete"
+                          data-confirm="Permanently delete {{ entry.name }}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.">
+                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <label class="field">
+                        <span>Type <code>{{ entry.name }}</code> to delete</span>
+                        <input name="confirmation" autocomplete="off" required />
+                      </label>
+                      <button class="danger" type="submit">Delete permanently</button>
+                    </form>
+                    </div>
                   {% else %}
                     <span class="meta">Current account</span>
                   {% endif %}
@@ -122,9 +266,13 @@
           <input type="hidden" name="name" value="{{ name }}" />
           <input type="hidden" name="limit" value="{{ limit }}" />
           <input type="hidden" name="before_id" value="{{ before_id }}" />
+          {% if let Some(invitation_before_id) = invitation_before_id %}
+            <input type="hidden" name="invitation_before_id" value="{{ invitation_before_id }}" />
+          {% endif %}
           <button type="submit">Older accounts</button>
         </form>
       {% endif %}
     </div>
+    <p class="section-note">An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person.</p>
   </section>
 {% endblock %}

@@ -21,18 +21,22 @@ a design target rather than current behavior.
 | [Register and configure a channel](channels-and-account.md#register-and-configure-a-channel) | Proven | Core, PostgreSQL, services, console, and REST lifecycle tests | — |
 | [Recreate a registered channel](channels-and-account.md#recreate-a-registered-channel) | Proven | Core recreation plus PostgreSQL boot-load tests | — |
 | [Manage IRC credentials](channels-and-account.md#manage-irc-credentials) | Proven | Credential storage, console/API, and real-socket SASL tests | — |
-| [Manage personal access tokens and read state](channels-and-account.md#manage-personal-access-tokens-and-read-state) | Proven | Token lifecycle, bearer/OAUTHBEARER, marker persistence, API, and console tests | — |
+| [Manage a private account profile](channels-and-account.md#manage-a-private-account-profile) | Proven | Typed email parser plus real PostgreSQL registration/privacy/audit and console mutation tests | — |
+| [Manage personal access tokens and read state](channels-and-account.md#manage-personal-access-tokens-and-read-state) | Proven | Scoped/expiring token lifecycle, no-escalation/shared-rate HTTP, bearer/OAUTHBEARER, marker persistence, API, and console tests | — |
 | [Inspect and terminate sessions](channels-and-account.md#inspect-and-terminate-sessions) | Proven | Owner-scoped browser/live-session inventory and exact-revocation tests | — |
+| [Review security activity and export account data](channels-and-account.md#review-security-activity-and-export-account-data) | Proven | Owner-isolated PostgreSQL export/activity, real HTTP attachment, and Chromium recipient journey | — |
+| [Permanently delete an account](channels-and-account.md#permanently-delete-an-account) | Proven | PostgreSQL succession/purge/retirement invariants plus real HTTP/core/BNC and Chromium self-deletion | — |
 | [Discover service identity and readiness before sign-in](deployment-and-recovery.md#discover-service-identity-and-readiness-before-sign-in) | Proven | Real public server/liveness/readiness/login/OpenAPI HTTP tests | — |
 | [First production boot](deployment-and-recovery.md#first-production-boot) | Proven | Actual daemon against an isolated empty PostgreSQL container proves migrations, import, readiness, and IRC traffic; CI also inspects the production image | — |
 | [Deploy a release](deployment-and-recovery.md#deploy-a-release) | Proven | Six-platform builds, deterministic package test, image shape, and publication contract | Tag publication itself runs only for a matching release tag |
 | [Restart without losing durable state](deployment-and-recovery.md#restart-without-losing-durable-state) | Proven | Chromium gracefully restarts the real daemon and proves session/network/runtime/backlog recovery | — |
 | [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Proven | Named PostgreSQL stop/start under real daemon, probe, database-backed HTTP, and hot IRC traffic proves bounded failure and recovery | — |
 | [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Secret open/seal/wrong-key startup, CLI, and write-refusal tests | Recovery is restore-or-replace, not in-place re-encryption |
-| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate and recorded 2,000-client baselines | 100,000-client tuned-host result and production budgets are absent |
+| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate, daemon RSS/connection threshold, lazy SendQ allocation, and recorded 2,000-client baselines | 100,000-client tuned-host result, sharded core, and production thresholds are absent |
 | [Sign in with a local password](identity-and-access.md#sign-in-with-a-local-password) | Proven | Chromium adds a password, signs out, and completes real local login against e6ircd/PostgreSQL | — |
 | [Sign in with OpenID Connect](identity-and-access.md#sign-in-with-openid-connect) | Proven | Real e6ircd, PostgreSQL, Dex, and Chromium plus exact Shauth journey | Provider diversity beyond Dex/Shauth |
 | [Link or unlink an OpenID Connect identity](identity-and-access.md#link-or-unlink-an-openid-connect-identity) | Proven | Real Dex/PostgreSQL conflict and console/API lifecycle tests | — |
+| [Join through an administrator invitation](identity-and-access.md#join-through-an-administrator-invitation) | Proven | Digest-only PostgreSQL lifecycle, real HTTP browser binding, and two-context Chromium acceptance | — |
 | [Sign out locally and across an identity provider](identity-and-access.md#sign-out-locally-and-across-an-identity-provider) | Proven | Generic session/front/back-channel tests plus exact Shauth coordinated browser logout | Provider diversity beyond Dex/Shauth |
 | [Authorize an input-constrained device](identity-and-access.md#authorize-an-input-constrained-device) | Proven | Real CLI through HTTP/PostgreSQL approval/consume to private cache and authenticated API | — |
 | [Authenticate an IRC or BNC client](identity-and-access.md#authenticate-an-irc-or-bnc-client) | Proven | Real socket PLAIN/OAUTHBEARER/BNC routing tests plus CLI and terminal client paths | — |
@@ -92,8 +96,10 @@ deterministic whole-core scheduler/replay, timer-wheel work, and several
 zero-copy/performance mechanisms described as target architecture in DESIGN
 are not present. The reduced CI run has numeric catastrophic-regression
 thresholds, but there are no production-host acceptance thresholds,
-per-connection RSS budget, sharded-core evidence, or 100k qualification
-result.
+production-qualified per-connection RSS budget, sharded-core evidence, or
+100k qualification result. The Linux smoke does enforce a deliberately
+generous incremental RSS/connection regression ceiling, and the load harness
+accepts stricter host-qualified memory, throughput, and latency limits.
 
 ### Native-client product parity
 

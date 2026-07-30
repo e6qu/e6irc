@@ -2,7 +2,7 @@
 //! as the "external network" and verify it registers, relays, and
 //! buffers upstream traffic.
 
-use e6ircd::bouncer::{DriverEvent, IrcNetwork, NetworkConfig, SendOutcome};
+use e6ircd::bouncer::{DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle, SendOutcome};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::net;
 
@@ -22,6 +22,38 @@ async fn upstream() -> std::net::SocketAddr {
     net::start(config).await.expect("start").addrs[0]
 }
 
+/// Subscribe first, then inspect the sticky state. The driver runs on another
+/// executor thread, so "no await since start" does not prevent `Connected`
+/// from being broadcast before this test subscribes.
+async fn wait_connected(
+    handle: &NetworkHandle,
+    events: &mut tokio::sync::broadcast::Receiver<DriverEvent>,
+) {
+    if handle.is_connected() {
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DriverEvent::Connected) => return,
+                Ok(DriverEvent::Disconnected) => {
+                    panic!("driver disconnected before connecting");
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if handle.is_connected() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("driver event stream closed before connecting");
+                }
+            }
+        }
+    })
+    .await
+    .expect("driver did not connect");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn driver_registers_relays_and_buffers() {
     let addr = upstream().await;
@@ -33,21 +65,8 @@ async fn driver_registers_relays_and_buffers() {
         autojoin: vec!["#bnc".into()],
         ..NetworkConfig::default()
     });
-    // subscribe before the driver task runs (no await yet) so no events race us
     let mut events = handle.subscribe();
-
-    // wait for Connected
-    let connected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Ok(DriverEvent::Connected) => return,
-                Ok(_) => {}
-                Err(_) => panic!("driver stopped"),
-            }
-        }
-    })
-    .await;
-    assert!(connected.is_ok(), "driver never connected");
+    wait_connected(&handle, &mut events).await;
 
     // a separate client joins #bnc and messages it
     let mut other = e6irc_client::Connection::connect(&addr.to_string())
@@ -226,18 +245,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
     // Establish a causal phase boundary instead of racing the test's line burst
     // against registration. Once Connected is observed, the same established
     // socket is instructed to send the malformed and ordinary lines.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Ok(DriverEvent::Connected) => return,
-                Ok(DriverEvent::Disconnected) => panic!("driver disconnected during registration"),
-                Ok(_) => {}
-                Err(_) => panic!("driver stopped"),
-            }
-        }
-    })
-    .await
-    .expect("driver never completed registration");
+    wait_connected(&handle, &mut events).await;
     send_lines.send(()).expect("mock upstream stopped");
 
     // Collect events until the post-bad-line message arrives; assert no
@@ -584,21 +592,7 @@ async fn driver_authenticates_to_sasl_upstream() {
         ..NetworkConfig::default()
     });
     let mut events = handle.subscribe();
-    let connected = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-        loop {
-            match events.recv().await {
-                Ok(DriverEvent::Connected) => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
-        }
-    })
-    .await
-    .expect("timeout");
-    assert!(
-        connected,
-        "driver failed to SASL-authenticate to the upstream"
-    );
+    wait_connected(&handle, &mut events).await;
 
     // Connected implies SASL success (register_sasl errors on 904, so
     // 001 only follows successful AUTHENTICATE). Confirm the upstream

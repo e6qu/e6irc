@@ -278,7 +278,10 @@ and host process/memory/CPU telemetry is available.
 2. Run `e6irc-load` or `tools/load/sweep.sh` across client/channel counts.
 3. Measure connect/register/join rate, exact fan-out delivery, and
    end-to-end latency percentiles.
-4. Correlate results with process monitoring and host RSS/CPU.
+4. Pass the e6ircd process ID and a maximum incremental RSS-per-connection
+   budget so the harness samples and enforces daemon memory rather than relying
+   on an operator to transcribe it.
+5. Correlate results with broader host CPU and socket telemetry.
 
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires
@@ -286,11 +289,13 @@ every unique expected sequence exactly once, at least 10 connections/second,
 at least 100 fan-out deliveries/second, P99 below five seconds, and graceful
 process shutdown. The harness exits nonzero on client/socket loss, malformed,
 missing, duplicate, or out-of-range deliveries, or a supplied threshold
-violation. The shared-runner thresholds catch catastrophic regressions without
-claiming production-host performance. The runtime has one core worker (the N=1
-form of the target topology); core sharding, timer-wheel scheduling,
-per-connection memory budget, production performance targets, and a tuned-host
-100k run are not implemented or qualified.
+violation. Linux CI also rejects incremental server RSS above 1 MiB per
+requested connection, and the queue contract proves an empty SendQ does not
+preallocate its maximum envelope count. The shared-runner thresholds catch
+catastrophic regressions without claiming production-host performance. The
+runtime has one core worker (the N=1 form of the target topology); core
+sharding, timer-wheel scheduling, production performance targets, and a
+tuned-host 100k run are not implemented or qualified.
 
 **Security and observability.** The harness uses synthetic bounded payloads and
 reports aggregate rates/latency rather than credentials or user content. Exact
@@ -298,5 +303,7 @@ sequence accounting detects missing, duplicate, malformed, or cross-channel
 delivery, while host telemetry supplies resource provenance for any published
 result.
 
-**Evidence.** Harness correctness has unit/integration coverage and recorded
-manual baselines. The 100k design target is not a shipped performance claim.
+**Evidence.** Harness correctness has unit/integration coverage, Linux
+daemon-RSS parsing and threshold coverage, lazy queue-allocation regression
+coverage, and recorded manual baselines. The 100k design target is not a
+shipped performance claim.

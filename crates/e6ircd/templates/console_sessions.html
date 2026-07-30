@@ -39,6 +39,7 @@
       {% else %}
         <div class="scroll">
           <table>
+            <caption class="sr-only">Active browser sessions</caption>
             <thead>
               <tr><th>Browser</th><th>Sign-in method</th><th>Created</th><th>Expires</th><th></th></tr>
             </thead>
@@ -143,6 +144,7 @@
     {% else %}
       <div class="scroll">
         <table>
+          <caption class="sr-only">{% if show_browser_sessions %}Your live IRC connections{% else %}All live IRC connections{% endif %}</caption>
           <thead>
             <tr><th>ID</th><th>Client</th><th>Transport</th><th>Account</th><th>Connected / idle</th><th>Channels</th><th></th></tr>
           </thead>
