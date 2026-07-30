@@ -1109,7 +1109,15 @@ observable rather than silently starting with missing history.
 `/console/integrations` (admin) manages the chat-platform bridges:
 per-platform build availability, the complete stored inventory (including
 disabled bridges and bridges whose feature is absent), status, inspect,
-pause/resume, and add/remove. A network's `kind`
+pause/resume, add/remove, and a platform-shaped edit form. The form replaces
+endpoints, Matrix identity, and channel selection while treating credential
+inputs as write-only: blank preserves the encrypted value, Matrix/Discord can
+replace their password/token, and Slack can independently replace either
+token. Provider bases are empty only when the driver has a defined default;
+otherwise they are absolute HTTP(S) URLs without embedded credentials, query,
+or fragment. This validation lives in the shared driver factory as well as the
+HTTP boundary, so configuration, stored rows, REST, and console cannot construct
+different notions of a valid bridge. A network's `kind`
 (`irc`/`matrix`/`discord`/`slack`) is a column on
 `bnc_networks`, so bridges are runtime-managed just like IRC upstreams — created
 via the console or REST, persisted, and started by the one feature-gated
@@ -1120,6 +1128,11 @@ bot token) seals that too, while an IRC `sasl_account` login name stays plaintex
 Create, edit, and enable construct the prospective driver before mutating
 PostgreSQL, so a missing key or factory rejection cannot leave durable state
 claiming a driver configuration that never entered the live registry.
+Create, edit, enable/disable, and delete also hold one asynchronous registry
+mutation gate across their database and live-registry transitions. Concurrent
+control-plane requests therefore have a single order and cannot resurrect a
+deleted driver, publish an older edit after a newer one, or leave storage and
+the running registry representing different operations.
 
 ---
 

@@ -2,7 +2,7 @@
 //! (driver connected to an e6ircd-as-upstream), receives buffered +
 //! live traffic, and its sent lines reach the upstream.
 
-use e6ircd::bouncer::{IrcNetwork, NetworkConfig, attach};
+use e6ircd::bouncer::{IrcNetwork, NetworkConfig, NetworkHandle, attach};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::net;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -21,6 +21,29 @@ async fn upstream() -> std::net::SocketAddr {
     net::start(config).await.expect("start").addrs[0]
 }
 
+/// Wait for the driver's sticky connected state without losing the one-shot
+/// broadcast between `start` and `subscribe`. Subscribing first and then
+/// checking the authoritative state closes both sides of that race.
+async fn wait_connected(handle: &NetworkHandle) {
+    let mut events = handle.subscribe();
+    if handle.is_connected() {
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(e6ircd::bouncer::DriverEvent::Connected) => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("driver event stream closed before connecting");
+                }
+            }
+        }
+    })
+    .await
+    .expect("driver did not connect");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn attached_client_gets_playback_and_live_and_can_send() {
     let addr = upstream().await;
@@ -32,9 +55,7 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
         autojoin: vec!["#room".into()],
         ..NetworkConfig::default()
     });
-    let mut ev = handle.subscribe();
-    // wait for connect
-    while ev.recv().await != Ok(e6ircd::bouncer::DriverEvent::Connected) {}
+    wait_connected(&handle).await;
 
     // a peer posts a message BEFORE the client attaches -> goes to buffer
     let mut peer = e6irc_client::Connection::connect(&addr.to_string())
@@ -121,7 +142,10 @@ async fn attached_client_gets_playback_and_live_and_can_send() {
 
     drop(cw);
     drop(client);
-    let _ = attach_task.await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), attach_task)
+        .await
+        .expect("attach did not stop after its client closed")
+        .expect("attach task panicked");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -133,8 +157,7 @@ async fn two_clients_attach_to_one_always_on_network() {
         autojoin: vec!["#multi".into()],
         ..NetworkConfig::default()
     }));
-    let mut ev = handle.subscribe();
-    while ev.recv().await != Ok(e6ircd::bouncer::DriverEvent::Connected) {}
+    wait_connected(&handle).await;
 
     // two clients attach
     let (c1, s1) = tokio::io::duplex(64 * 1024);

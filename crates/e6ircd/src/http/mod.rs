@@ -696,6 +696,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(pages::console_integrations).post(pages::console_add_bridge),
         )
         .route(
+            "/console/integrations/{name}/edit",
+            get(pages::console_edit_bridge).post(pages::console_update_bridge),
+        )
+        .route(
             "/console/integrations/delete",
             post(pages::console_delete_bridge),
         )
@@ -4202,6 +4206,29 @@ mod pages {
         error: Option<String>,
     }
 
+    #[derive(Template)]
+    #[template(path = "console_bridge_edit.html")]
+    struct ConsoleBridgeEdit {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        name: String,
+        platform: &'static str,
+        needs_nick: bool,
+        needs_account: bool,
+        account_label: &'static str,
+        password_label: &'static str,
+        addr: String,
+        addr_required: bool,
+        nick: String,
+        autojoin: String,
+        has_sasl_account: bool,
+        has_sasl_password: bool,
+        can_store_secrets: bool,
+        error: Option<String>,
+    }
+
     struct NetworkOperationsView {
         state: String,
         connected: bool,
@@ -4242,6 +4269,7 @@ mod pages {
         autojoin: String,
         enabled: bool,
         editable: bool,
+        bridge_editable: bool,
         has_sasl_account: bool,
         has_sasl_password: bool,
         view: NetworkOperationsView,
@@ -4492,10 +4520,11 @@ mod pages {
                 Ok(view) => view,
                 Err(response) => return response,
             };
+        let is_admin = is_admin_account(&state, &account);
         render_private(ConsoleNetworkDetail {
             account: account.clone(),
             csrf,
-            is_admin: is_admin_account(&state, &account),
+            is_admin,
             active: "networks",
             name: network.name,
             kind: network.kind.as_db_str(),
@@ -4506,6 +4535,7 @@ mod pages {
             autojoin: network.autojoin.join(", "),
             enabled: network.enabled,
             editable: network.kind == crate::config::NetworkKind::Irc,
+            bridge_editable: network.kind.is_bridge() && is_admin,
             has_sasl_account: network.sasl_account.is_some(),
             has_sasl_password: network.sasl_password_sealed.is_some(),
             view,
@@ -4635,21 +4665,9 @@ mod pages {
         let Some(registry) = &state.bnc_registry else {
             return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
         };
-        match crate::db::delete_bnc_network(pool_of(state), account, name).await {
-            Ok(true) => {
-                registry.remove(Some(account), name);
-                Ok(())
-            }
-            Ok(false) => Err(problem(StatusCode::NOT_FOUND, "No such network", None)),
-            Err(e) => {
-                eprintln!("network delete: {e}");
-                Err(problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                ))
-            }
-        }
+        delete_network_core(state, registry, account, name, EditableNetworkKind::Any)
+            .await
+            .map_err(NetworkMutationError::into_response)
     }
 
     /// Delete a network from the console and return to the canonical list.
@@ -4847,16 +4865,16 @@ mod pages {
             .collect();
         let sasl_account = f.sasl_account.trim();
         let sasl_password = (!f.sasl_password.is_empty()).then_some(f.sasl_password.as_str());
-        let sasl = if f.clear_sasl.as_deref() == Some("on") {
+        let credentials = if f.clear_sasl.as_deref() == Some("on") {
             // The checkbox is the explicit operation. Values may still arrive
             // from a no-JavaScript browser whose pre-filled account field was
             // not disabled; removal wins rather than making that UI path fail.
-            IrcSaslUpdate::Clear
+            NetworkCredentialUpdate::Remove
         } else if sasl_account.is_empty() && sasl_password.is_none() {
-            IrcSaslUpdate::Clear
+            NetworkCredentialUpdate::Remove
         } else {
-            IrcSaslUpdate::Set {
-                account: sasl_account,
+            NetworkCredentialUpdate::Set {
+                account: Some(sasl_account),
                 password: sasl_password,
             }
         };
@@ -4865,12 +4883,13 @@ mod pages {
             registry,
             &account,
             &name,
+            EditableNetworkKind::Irc,
             &f.addr,
             tls,
             &f.nick,
             realname.as_deref(),
             &autojoin,
-            sasl,
+            credentials,
         )
         .await;
         let error = match result {
@@ -4907,17 +4926,63 @@ mod pages {
         /// here). A config-file / shared bridge is managed via config, not here.
         manageable: bool,
     }
-    struct BridgePlatform {
+    struct BridgePlatformMeta {
         name: &'static str,
-        kind: &'static str,
-        built: bool,
+        kind: crate::config::NetworkKind,
+        feature: &'static str,
         configure: &'static str,
-        /// Fields the add-bridge form should collect for this platform.
-        needs_addr: bool,
+        addr_required: bool,
         needs_nick: bool,
         needs_account: bool,
         account_label: &'static str,
         password_label: &'static str,
+    }
+
+    const BRIDGE_PLATFORMS: &[BridgePlatformMeta] = &[
+        BridgePlatformMeta {
+            name: "Matrix",
+            kind: crate::config::NetworkKind::Matrix,
+            feature: "matrix",
+            configure: "A homeserver bridged as a network: messages relay both ways.",
+            addr_required: true,
+            needs_nick: true,
+            needs_account: false,
+            account_label: "",
+            password_label: "Login password",
+        },
+        BridgePlatformMeta {
+            name: "Discord",
+            kind: crate::config::NetworkKind::Discord,
+            feature: "discord",
+            configure: "A Discord bot session; autojoin lists the channel IDs to bridge.",
+            addr_required: false,
+            needs_nick: false,
+            needs_account: false,
+            account_label: "",
+            password_label: "Bot token",
+        },
+        BridgePlatformMeta {
+            name: "Slack",
+            kind: crate::config::NetworkKind::Slack,
+            feature: "slack",
+            configure: "A Slack workspace; autojoin lists the channels to bridge.",
+            addr_required: false,
+            needs_nick: false,
+            needs_account: true,
+            account_label: "Bot token (xoxb-)",
+            password_label: "App token (xapp-)",
+        },
+    ];
+
+    fn bridge_platform_meta(
+        kind: crate::config::NetworkKind,
+    ) -> Option<&'static BridgePlatformMeta> {
+        BRIDGE_PLATFORMS.iter().find(|meta| meta.kind == kind)
+    }
+
+    struct BridgePlatform {
+        meta: &'static BridgePlatformMeta,
+        built: bool,
         networks: Vec<BridgeNet>,
     }
 
@@ -4995,44 +5060,14 @@ mod pages {
             );
             networks
         };
-        let platforms = vec![
-            BridgePlatform {
-                name: "Matrix",
-                kind: "matrix",
-                built: cfg!(feature = "matrix"),
-                configure: "A homeserver bridged as a network: messages relay both ways.",
-                needs_addr: true,
-                needs_nick: true,
-                needs_account: false,
-                account_label: "",
-                password_label: "Login password",
-                networks: bridge_nets("matrix"),
-            },
-            BridgePlatform {
-                name: "Discord",
-                kind: "discord",
-                built: cfg!(feature = "discord"),
-                configure: "A Discord bot session; autojoin lists the channel IDs to bridge.",
-                needs_addr: false,
-                needs_nick: false,
-                needs_account: false,
-                account_label: "",
-                password_label: "Bot token",
-                networks: bridge_nets("discord"),
-            },
-            BridgePlatform {
-                name: "Slack",
-                kind: "slack",
-                built: cfg!(feature = "slack"),
-                configure: "A Slack workspace; autojoin lists the channels to bridge.",
-                needs_addr: false,
-                needs_nick: false,
-                needs_account: true,
-                account_label: "Bot token (xoxb-)",
-                password_label: "App token (xapp-)",
-                networks: bridge_nets("slack"),
-            },
-        ];
+        let platforms = BRIDGE_PLATFORMS
+            .iter()
+            .map(|meta| BridgePlatform {
+                meta,
+                built: kind_feature_available(meta.kind),
+                networks: bridge_nets(meta.feature),
+            })
+            .collect();
         Ok(ConsoleIntegrations {
             account,
             csrf,
@@ -5079,6 +5114,21 @@ mod pages {
         csrf: String,
         kind: String,
         name: String,
+        #[serde(default)]
+        addr: String,
+        #[serde(default)]
+        nick: String,
+        #[serde(default)]
+        sasl_account: String,
+        #[serde(default)]
+        sasl_password: String,
+        #[serde(default)]
+        autojoin: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct BridgeEditFormFields {
+        csrf: String,
         #[serde(default)]
         addr: String,
         #[serde(default)]
@@ -5667,6 +5717,157 @@ mod pages {
         }
     }
 
+    async fn owned_bridge(
+        state: &AppState,
+        account: &str,
+        name: &str,
+    ) -> Result<crate::db::BncNetworkRow, Response> {
+        match crate::db::get_bnc_network(pool_of(state), account, name).await {
+            Ok(Some(row)) if row.kind.is_bridge() => Ok(row),
+            Ok(Some(_)) => Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Not a bridge",
+                Some("IRC networks are managed on the BNC networks page"),
+            )),
+            Ok(None) => Err(problem(StatusCode::NOT_FOUND, "No such bridge", None)),
+            Err(error) => Err(super::device::admin_db_error("bridge fetch", error)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn console_bridge_edit_page(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        row: crate::db::BncNetworkRow,
+        addr: String,
+        nick: String,
+        autojoin: String,
+        error: Option<String>,
+    ) -> Response {
+        let Some(meta) = bridge_platform_meta(row.kind) else {
+            return problem(StatusCode::BAD_REQUEST, "Not a bridge", None);
+        };
+        render_private(ConsoleBridgeEdit {
+            account,
+            csrf,
+            is_admin: true,
+            active: "integrations",
+            name: row.name,
+            platform: meta.name,
+            needs_nick: meta.needs_nick,
+            needs_account: meta.needs_account,
+            account_label: meta.account_label,
+            password_label: meta.password_label,
+            addr,
+            addr_required: meta.addr_required,
+            nick,
+            autojoin,
+            has_sasl_account: row.sasl_account.is_some(),
+            has_sasl_password: row.sasl_password_sealed.is_some(),
+            can_store_secrets: state.secret_key.is_some(),
+            error,
+        })
+    }
+
+    /// Console → Integrations: edit one account-owned bridge. Stored secrets
+    /// are represented only by presence indicators and are never rendered.
+    pub async fn console_edit_bridge(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+        Path(name): Path<String>,
+    ) -> Response {
+        let row = match owned_bridge(&state, &account, &name).await {
+            Ok(row) => row,
+            Err(response) => return response,
+        };
+        console_bridge_edit_page(
+            &state,
+            account,
+            csrf,
+            row.clone(),
+            row.addr,
+            row.nick,
+            row.autojoin.join(", "),
+            None,
+        )
+    }
+
+    /// Validate and atomically replace one account-owned bridge's mutable
+    /// endpoint, identity, channel list, and any explicitly supplied tokens.
+    /// Blank token inputs preserve the encrypted stored value.
+    pub async fn console_update_bridge(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(name): Path<String>,
+        form: Result<axum::Form<BridgeEditFormFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let account = match require_admin_form_actor(&state, &headers, &form.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let autojoin: Vec<String> = form
+            .autojoin
+            .split(',')
+            .map(str::trim)
+            .filter(|channel| !channel.is_empty())
+            .map(str::to_string)
+            .collect();
+        let account_secret = (!form.sasl_account.is_empty()).then_some(form.sasl_account.as_str());
+        let password_secret =
+            (!form.sasl_password.is_empty()).then_some(form.sasl_password.as_str());
+        let credentials = if account_secret.is_none() && password_secret.is_none() {
+            NetworkCredentialUpdate::Keep
+        } else {
+            NetworkCredentialUpdate::Set {
+                account: account_secret,
+                password: password_secret,
+            }
+        };
+        let result = update_network_core(
+            &state,
+            registry,
+            &account,
+            &name,
+            EditableNetworkKind::Bridge,
+            &form.addr,
+            true,
+            &form.nick,
+            None,
+            &autojoin,
+            credentials,
+        )
+        .await;
+        let error = match result {
+            Ok(()) => return Redirect::to("/console/integrations").into_response(),
+            Err(error) => error.message(),
+        };
+        let row = match owned_bridge(&state, &account, &name).await {
+            Ok(row) => row,
+            Err(response) => return response,
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        console_bridge_edit_page(
+            &state,
+            account,
+            csrf,
+            row,
+            form.addr,
+            form.nick,
+            form.autojoin,
+            Some(error),
+        )
+    }
+
     /// Console → Integrations: add a bridge (admin). Maps the platform form onto
     /// `CreateNetwork` and reuses `create_network_core` (schema, per-kind secret
     /// sealing, feature-gated driver construction) — so a console-created bridge
@@ -5743,19 +5944,17 @@ mod pages {
         let Some(registry) = &state.bnc_registry else {
             return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
         };
-        let pool = pool_of(&state);
-        match crate::db::delete_bnc_network(pool, &account, &f.name).await {
-            Ok(true) => registry.remove(Some(&account), &f.name),
-            Ok(false) => {
-                let msg = format!("No such bridge '{}'.", f.name);
-                return console_integrations_error(&state, &headers, account, msg).await;
-            }
-            Err(e) => {
-                eprintln!("console: bridge delete: {e}");
-                let msg = "Database unavailable — bridge not removed.".to_string();
-                return console_integrations_error(&state, &headers, account, msg).await;
-            }
-        };
+        if let Err(error) = delete_network_core(
+            &state,
+            registry,
+            &account,
+            &f.name,
+            EditableNetworkKind::Bridge,
+        )
+        .await
+        {
+            return console_integrations_error(&state, &headers, account, error.message()).await;
+        }
         Redirect::to("/console/integrations").into_response()
     }
 

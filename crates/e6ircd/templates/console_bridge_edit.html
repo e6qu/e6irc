@@ -1,0 +1,48 @@
+{% extends "console_base.html" %}
+{% block main %}
+  {% if let Some(err) = error %}
+    <p class="banner-error" role="alert">{{ err }}</p>
+  {% endif %}
+  <div class="page-head">
+    <div>
+      <p class="eyebrow">{{ platform }} bridge</p>
+      <h1>Edit {{ name }}</h1>
+      <p class="lede">Saving validates the complete bridge configuration before replacing its live connection.</p>
+    </div>
+    <a class="button-link secondary-link" href="/console/integrations">All integrations</a>
+  </div>
+  <section class="panel">
+    <form class="network-form" method="post" action="/console/integrations/{{ name }}/edit">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field field-wide">
+        <span>Homeserver / API base {% if !addr_required %}<em>optional</em>{% endif %}</span>
+        <input name="addr" value="{{ addr }}" placeholder="{% if addr_required %}https://chat.example.com{% else %}Provider default{% endif %}" {% if addr_required %}required{% endif %} />
+        <small>{% if addr_required %}Use an absolute HTTP or HTTPS URL.{% else %}Leave blank to use the provider's standard API endpoint.{% endif %}</small>
+      </label>
+      {% if needs_nick %}
+        <label class="field"><span>Provider user</span><input name="nick" value="{{ nick }}" autocomplete="username" required /></label>
+      {% else %}
+        <input type="hidden" name="nick" value="" />
+      {% endif %}
+      <label class="field field-wide"><span>Rooms / channel IDs <em>optional</em></span><input name="autojoin" value="{{ autojoin }}" /><small>Comma-separated; the expected identifier depends on the provider.</small></label>
+      {% if needs_account %}
+        <label class="field">
+          <span>New {{ account_label }} <em>optional</em></span>
+          <input type="password" name="sasl_account" autocomplete="new-password" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
+          <small>{% if has_sasl_account %}A token is stored. Leave blank to keep it.{% else %}No token is stored; enter one before saving.{% endif %}</small>
+        </label>
+      {% else %}
+        <input type="hidden" name="sasl_account" value="" />
+      {% endif %}
+      <label class="field">
+        <span>New {{ password_label }} <em>optional</em></span>
+        <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" {% if !can_store_secrets %}disabled{% endif %} />
+        <small>{% if has_sasl_password %}A secret is stored. Leave blank to keep it.{% else %}No secret is stored; enter one before saving.{% endif %}</small>
+      </label>
+      {% if !can_store_secrets %}
+        <div class="banner-info field-wide"><div><strong>Replacing tokens is unavailable.</strong> This deployment has no master key, so e6irc refuses to store provider credentials in plaintext. Existing encrypted values remain untouched.</div></div>
+      {% endif %}
+      <div class="form-actions field-wide"><button class="primary" type="submit">Save bridge</button><a class="rowlink" href="/console/integrations">Cancel</a></div>
+    </form>
+  </section>
+{% endblock %}

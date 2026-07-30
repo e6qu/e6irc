@@ -30,6 +30,7 @@ a design target rather than current behavior.
 | Monitoring/history/metrics | Proven by component/integration | Telemetry + PostgreSQL retention + HTTP/console | No external scrape/alert stack |
 | Local bridge | Proven | In-process driver and common attach path | — |
 | IRC driver | Proven locally | Local upstream SASL/relay/reconnect/lifecycle | Live Libera is opt-in |
+| Bridge configuration management | Proven | All-feature console/API → PostgreSQL edit journey for Matrix, Discord, and Slack; write-only and partial-rotation assertions | Live provider acceptance is listed per driver below |
 | Matrix bridge | Proven | Real pinned Conduit, both directions | Other homeserver implementations |
 | Discord bridge | Partially proven | Offline protocol/mapping/backoff tests | Live gateway/REST needs bot and guild |
 | Slack bridge | Partially proven | Offline protocol/mapping/backoff tests | Live Socket Mode/Web API needs app/workspace |
@@ -55,8 +56,9 @@ mean every possible environment or fault has been tested.
 - HTTP handler tests cover authentication/role/CSRF/no-store behavior and
   complete mutation lifecycles rather than template snapshots alone.
 - OIDC crosses a real provider and browser; Matrix crosses a real homeserver.
-- CI builds all features together and each bridge independently, then tests
-  every supported operating-system/architecture cell.
+- CI builds all features together and each bridge independently, tests every
+  supported operating-system/architecture cell, and runs bridge-management HTTP
+  journeys against PostgreSQL with all features.
 - The production container is built and inspected as a deployable artifact.
 
 ## Material qualification boundaries
@@ -122,7 +124,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `deny` | licenses, advisories, bans, and dependency-source policy |
 | `test` | all-feature workspace behavior on six OS/architecture cells |
 | `coverage` | all-feature workspace line-coverage regression floor |
-| `db-tests` | real PostgreSQL storage/HTTP/OIDC/browser/BNC/`ws_ui`/CLI journeys |
+| `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/CLI journeys |
 | `production-container` | deployable image and embedded web-client shape |
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | deterministic archive contract plus real PTY render/message/terminal-restore journey |

@@ -12,6 +12,7 @@ fn document() -> serde_json::Value {
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } }
     ]);
+    let network_name_parameter = channel_name_parameter.clone();
     let channel_access_parameters = serde_json::json!([
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } },
@@ -511,11 +512,13 @@ fn document() -> serde_json::Value {
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
                     "security": bearer, "responses": ok_json },
                 "post": { "summary": "Create a BNC network and start its driver",
+                    "description": "kind defaults to `irc`. IRC requires addr/nick and optional paired SASL credentials. Matrix requires an HTTP(S) homeserver in addr, a provider user in nick, tls=true, and sasl_password. Discord requires tls=true, empty nick, a bot token in sasl_password, and an optional HTTP(S) API base in addr. Slack requires tls=true, empty nick, a bot token in sasl_account, an app token in sasl_password, and an optional HTTP(S) API base in addr. realname is IRC-only.",
                     "security": bearer,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object",
                             "required": ["name", "addr", "nick"],
                             "properties": {
+                                "kind": { "type": "string", "enum": ["irc", "matrix", "discord", "slack"], "default": "irc" },
                                 "name": { "type": "string" },
                                 "addr": { "type": "string" },
                                 "tls": { "type": "boolean" },
@@ -530,15 +533,13 @@ fn document() -> serde_json::Value {
             "/api/v1/me/networks/{name}": {
                 "get": { "summary": "Read one BNC network and its live runtime diagnostics",
                     "security": bearer,
-                    "parameters": [{ "name": "name", "in": "path", "required": true,
-                        "schema": { "type": "string" } }],
+                    "parameters": network_name_parameter,
                     "responses": { "200": { "description": "stored configuration and runtime counters; secrets are presence booleans only" },
                         "404": { "description": "no such network" } } },
-                "put": { "summary": "Replace a BNC network's mutable IRC configuration and restart its driver",
-                    "description": "The credential action is required and explicit: `keep` preserves the write-only secret, `remove` clears the account and password, and `set` replaces the account plus an optional new password (omitting the password preserves an existing encrypted password).",
+                "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
+                    "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token.",
                     "security": bearer,
-                    "parameters": [{ "name": "name", "in": "path", "required": true,
-                        "schema": { "type": "string" } }],
+                    "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
                             "required": ["addr", "tls", "nick", "credentials"],
@@ -557,7 +558,7 @@ fn document() -> serde_json::Value {
                                             "required": ["action"],
                                             "properties": { "action": { "const": "remove" } } },
                                         { "type": "object", "additionalProperties": false,
-                                            "required": ["action", "account"],
+                                            "required": ["action"],
                                             "properties": {
                                                 "action": { "const": "set" },
                                                 "account": { "type": "string" },
@@ -567,13 +568,12 @@ fn document() -> serde_json::Value {
                                 }
                             } } } } },
                     "responses": { "204": { "description": "updated and live driver replaced" },
-                        "400": { "description": "invalid IRC configuration or credential action" },
+                        "400": { "description": "invalid kind-specific configuration or credential action" },
                         "404": { "description": "no such network" },
                         "409": { "description": "cannot seal credentials or start replacement driver" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
                     "security": bearer,
-                    "parameters": [{ "name": "name", "in": "path", "required": true,
-                        "schema": { "type": "string" } }],
+                    "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "required": ["enabled"],
                             "properties": { "enabled": { "type": "boolean" } } } } } },
@@ -582,8 +582,7 @@ fn document() -> serde_json::Value {
                         "409": { "description": "cannot start (stored secret, no master key)" } } },
                 "delete": { "summary": "Delete a BNC network and stop its driver",
                     "security": bearer,
-                    "parameters": [{ "name": "name", "in": "path", "required": true,
-                        "schema": { "type": "string" } }],
+                    "parameters": network_name_parameter,
                     "responses": { "204": { "description": "deleted" },
                         "404": { "description": "no such network" } } }
             },

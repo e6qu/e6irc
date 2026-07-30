@@ -19,31 +19,31 @@
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>{{ p.name }} {% if p.built %}<span class="tag">built in</span>{% else %}<span class="tag">not built</span>{% endif %}</h2>
-          <p>{{ p.configure }}</p>
+          <h2>{{ p.meta.name }} {% if p.built %}<span class="tag">built in</span>{% else %}<span class="tag">not built</span>{% endif %}</h2>
+          <p>{{ p.meta.configure }}</p>
         </div>
         <span class="count">{{ p.networks.len() }}</span>
       </div>
       {% if !p.built %}
-        <p class="empty">This binary was built without <code>--features {{ p.kind }}</code>.</p>
+        <p class="empty">This binary was built without <code>--features {{ p.meta.feature }}</code>.</p>
       {% endif %}
       {% if p.built %}
         {% if bouncer_enabled %}
           <form class="inline-config-form" method="post" action="/console/integrations">
             <input type="hidden" name="csrf" value="{{ csrf }}" />
-            <input type="hidden" name="kind" value="{{ p.kind }}" />
-            <label class="field"><span>Network name</span><input name="name" placeholder="{{ p.kind }}-main" required /></label>
-            {% if p.needs_addr %}<label class="field"><span>Homeserver / API base</span><input name="addr" placeholder="https://chat.example.com" required /></label>{% endif %}
-            {% if p.needs_nick %}<label class="field"><span>Provider user</span><input name="nick" autocomplete="username" required /></label>{% endif %}
-            {% if p.needs_account %}<label class="field"><span>{{ p.account_label }}</span><input type="password" name="sasl_account" autocomplete="new-password" required /></label>{% endif %}
-            <label class="field"><span>{{ p.password_label }}</span><input type="password" name="sasl_password" autocomplete="new-password" required /></label>
+            <input type="hidden" name="kind" value="{{ p.meta.feature }}" />
+            <label class="field"><span>Network name</span><input name="name" placeholder="{{ p.meta.feature }}-main" required /></label>
+            <label class="field"><span>Homeserver / API base {% if !p.meta.addr_required %}<em>optional</em>{% endif %}</span><input name="addr" placeholder="{% if p.meta.addr_required %}https://chat.example.com{% else %}Provider default{% endif %}" {% if p.meta.addr_required %}required{% endif %} /></label>
+            {% if p.meta.needs_nick %}<label class="field"><span>Provider user</span><input name="nick" autocomplete="username" required /></label>{% endif %}
+            {% if p.meta.needs_account %}<label class="field"><span>{{ p.meta.account_label }}</span><input type="password" name="sasl_account" autocomplete="new-password" required /></label>{% endif %}
+            <label class="field"><span>{{ p.meta.password_label }}</span><input type="password" name="sasl_password" autocomplete="new-password" required /></label>
             <label class="field"><span>Rooms / channel IDs</span><input name="autojoin" placeholder="comma-separated" /></label>
-            <div class="form-actions field-wide"><button class="primary" type="submit">Add {{ p.name }} bridge</button></div>
+            <div class="form-actions field-wide"><button class="primary" type="submit">Add {{ p.meta.name }} bridge</button></div>
           </form>
         {% endif %}
       {% endif %}
       {% if p.networks.is_empty() %}
-          <p class="empty">No {{ p.name }} bridges configured.</p>
+          <p class="empty">No {{ p.meta.name }} bridges configured.</p>
         {% else %}
           <div class="scroll">
             <table>
@@ -57,6 +57,7 @@
                     <td class="row-actions">
                       {% if n.manageable %}
                         <a class="rowlink" href="/console/networks/{{ n.name }}">Inspect</a>
+                        <a class="rowlink" href="/console/integrations/{{ n.name }}/edit">Edit</a>
                         <form method="post" action="/console/integrations/toggle">
                           <input type="hidden" name="csrf" value="{{ csrf }}" />
                           <input type="hidden" name="name" value="{{ n.name }}" />

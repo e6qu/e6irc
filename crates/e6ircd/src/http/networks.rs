@@ -141,8 +141,8 @@ pub(super) struct CreateNetwork {
     pub(super) realname: Option<String>,
     #[serde(default)]
     pub(super) autojoin: Vec<String>,
-    /// Upstream SASL account + password (plaintext over the API; stored
-    /// sealed). Both or neither.
+    /// Kind-specific account/login field. Plaintext over the API; sealed when
+    /// the selected driver treats it as a secret.
     #[serde(default)]
     pub(super) sasl_account: Option<String>,
     #[serde(default)]
@@ -421,7 +421,7 @@ pub(super) fn check_upstream_bounds(
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Invalid character",
-            Some("nick, realname and autojoin must not contain CR, LF or NUL"),
+            Some("addr, nick, realname and autojoin must not contain CR, LF or NUL"),
         ));
     }
     if upstream_addr_is_internal(addr) {
@@ -461,130 +461,258 @@ pub(super) fn validate_irc_upstream(
     check_upstream_bounds(addr, nick, realname, autojoin)
 }
 
-/// How an IRC edit mutates the write-only upstream credentials. A blank
-/// password is never overloaded to mean both "keep" and "clear": callers must
-/// choose one of these states explicitly.
-pub(super) enum IrcSaslUpdate<'a> {
+/// Which stored driver kinds a mutation surface is allowed to edit. The IRC and
+/// Integrations forms use disjoint variants so posting one form to another
+/// kind's URL cannot reinterpret its generic storage columns.
+#[derive(Clone, Copy)]
+pub(super) enum EditableNetworkKind {
+    Any,
+    Irc,
+    Bridge,
+}
+
+fn editable_kind_accepts(
+    editable_kind: EditableNetworkKind,
+    kind: crate::config::NetworkKind,
+) -> bool {
+    match editable_kind {
+        EditableNetworkKind::Any => true,
+        EditableNetworkKind::Irc => kind == crate::config::NetworkKind::Irc,
+        EditableNetworkKind::Bridge => kind.is_bridge(),
+    }
+}
+
+/// How an edit mutates write-only upstream credentials. Optional fields inside
+/// `Set` mean "preserve this one secret", while `Keep` preserves the complete
+/// credential set and `Remove` is supported only by IRC (bridges require their
+/// credentials to remain constructible).
+pub(super) enum NetworkCredentialUpdate<'a> {
     Keep,
-    Clear,
+    Remove,
     Set {
-        account: &'a str,
-        /// `None` preserves the current sealed password while changing only
-        /// the public account name. `Some` replaces the encrypted secret.
+        account: Option<&'a str>,
         password: Option<&'a str>,
     },
 }
 
-fn apply_irc_sasl_update(
+fn seal_network_secret(
+    state: &AppState,
+    owner: &str,
+    value: &str,
+) -> Result<String, NetworkMutationError> {
+    let key = state.secret_key.as_ref().ok_or_else(|| {
+        network_error(
+            StatusCode::CONFLICT,
+            "No master key configured",
+            Some("the server cannot store upstream credentials without [secrets]"),
+        )
+    })?;
+    Ok(key.seal(value, &crate::bouncer::bnc_secret_context(owner)))
+}
+
+fn validate_credential_field(value: &str, maximum: usize) -> Result<(), NetworkMutationError> {
+    crate::bouncer::validate_network_credential(value, maximum).map_err(|error| {
+        network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid upstream credentials",
+            Some(&error),
+        )
+    })
+}
+
+fn apply_network_credentials(
     state: &AppState,
     owner: &str,
     row: &mut crate::db::BncNetworkRow,
-    update: IrcSaslUpdate<'_>,
+    update: NetworkCredentialUpdate<'_>,
 ) -> Result<(), NetworkMutationError> {
-    let (account, password) = match update {
-        IrcSaslUpdate::Keep => return Ok(()),
-        IrcSaslUpdate::Clear => {
+    use crate::config::NetworkKind;
+    match (row.kind, update) {
+        (_, NetworkCredentialUpdate::Keep) => Ok(()),
+        (NetworkKind::Irc, NetworkCredentialUpdate::Remove) => {
             row.sasl_account = None;
             row.sasl_password_sealed = None;
-            return Ok(());
+            Ok(())
         }
-        IrcSaslUpdate::Set { account, password } => (account.trim(), password),
-    };
-    if account.is_empty() {
-        return Err(network_error(
+        (_, NetworkCredentialUpdate::Remove) => Err(network_error(
             StatusCode::BAD_REQUEST,
-            "Incomplete upstream SASL",
-            Some("enter a SASL account or explicitly remove the stored credentials"),
-        ));
-    }
-    let has_control = |value: &str| value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0));
-    if account.len() > 255
-        || password.is_some_and(|value| value.len() > 512)
-        || has_control(account)
-        || password.is_some_and(has_control)
-    {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Invalid upstream SASL",
-            Some("credentials exceed their length bounds or contain CR, LF or NUL"),
-        ));
-    }
-    row.sasl_account = Some(account.to_string());
-    if let Some(password) = password {
-        if password.is_empty() {
-            return Err(network_error(
-                StatusCode::BAD_REQUEST,
-                "Incomplete upstream SASL",
-                Some("a replacement password must not be empty"),
-            ));
+            "Bridge credentials are required",
+            Some("replace bridge credentials or keep the stored values"),
+        )),
+        (NetworkKind::Irc, NetworkCredentialUpdate::Set { account, password }) => {
+            let account = account.map(str::trim).filter(|value| !value.is_empty());
+            let Some(account) = account else {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Incomplete upstream SASL",
+                    Some("enter a SASL account or explicitly remove the stored credentials"),
+                ));
+            };
+            validate_credential_field(account, 255)?;
+            row.sasl_account = Some(account.to_string());
+            if let Some(password) = password {
+                validate_credential_field(password, 512)?;
+                row.sasl_password_sealed = Some(seal_network_secret(state, owner, password)?);
+            } else if row.sasl_password_sealed.is_none() {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Incomplete upstream SASL",
+                    Some("enter a password for this SASL account"),
+                ));
+            }
+            Ok(())
         }
-        let key = state.secret_key.as_ref().ok_or_else(|| {
-            network_error(
-                StatusCode::CONFLICT,
-                "No master key configured",
-                Some("the server cannot store upstream credentials without [secrets]"),
-            )
-        })?;
-        row.sasl_password_sealed =
-            Some(key.seal(password, &crate::bouncer::bnc_secret_context(owner)));
-    } else if row.sasl_password_sealed.is_none() {
-        return Err(network_error(
+        (
+            NetworkKind::Matrix | NetworkKind::Discord,
+            NetworkCredentialUpdate::Set { account, password },
+        ) => {
+            if account.is_some() {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Unsupported credential field",
+                    Some("Matrix and Discord use only the password/token field"),
+                ));
+            }
+            let Some(password) = password else {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Incomplete bridge credentials",
+                    Some("provide a replacement password/token or keep the stored value"),
+                ));
+            };
+            validate_credential_field(password, 512)?;
+            row.sasl_account = None;
+            row.sasl_password_sealed = Some(seal_network_secret(state, owner, password)?);
+            Ok(())
+        }
+        (NetworkKind::Slack, NetworkCredentialUpdate::Set { account, password }) => {
+            if account.is_none() && password.is_none() {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Incomplete bridge credentials",
+                    Some("replace at least one Slack token or keep the stored values"),
+                ));
+            }
+            if let Some(account) = account {
+                validate_credential_field(account, 255)?;
+                row.sasl_account = Some(seal_network_secret(state, owner, account)?);
+            } else if row.sasl_account.is_none() {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Incomplete bridge credentials",
+                    Some("enter the Slack bot token"),
+                ));
+            }
+            if let Some(password) = password {
+                validate_credential_field(password, 512)?;
+                row.sasl_password_sealed = Some(seal_network_secret(state, owner, password)?);
+            } else if row.sasl_password_sealed.is_none() {
+                return Err(network_error(
+                    StatusCode::BAD_REQUEST,
+                    "Incomplete bridge credentials",
+                    Some("enter the Slack app token"),
+                ));
+            }
+            Ok(())
+        }
+        (NetworkKind::Local, _) => Err(network_error(
             StatusCode::BAD_REQUEST,
-            "Incomplete upstream SASL",
-            Some("enter a password for this SASL account"),
-        ));
+            "Unsupported network kind",
+            Some("local networks are configured at the server level"),
+        )),
     }
-    Ok(())
 }
 
-/// Construct a prospective driver before the caller mutates durable state.
-/// Edit uses the row's current enabled flag; enable/disable supplies its target
-/// flag. Keeping secret opening and factory-error mapping here prevents those
-/// mutation paths from drifting into different failure semantics.
-fn prospective_network_driver(
-    state: &AppState,
-    account: &str,
-    row: &crate::db::BncNetworkRow,
-    should_run: bool,
-) -> Result<Option<Box<dyn crate::bouncer::NetworkDriver>>, NetworkMutationError> {
-    if !should_run {
-        return Ok(None);
-    }
-    crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
-        .map(Some)
-        .map_err(|error| network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error)))
-}
-
-/// Update all mutable connection, identity, and credential fields of one of the
-/// caller's IRC networks, persist them, and rebuild the live driver so the
-/// change takes effect. Shared by the account page and the console.
-#[allow(clippy::too_many_arguments)] // one field per parameter; a struct would just re-list them
-pub(super) async fn update_network_core(
-    state: &AppState,
-    registry: &crate::bouncer::Registry,
-    account: &str,
-    name: &str,
+fn validate_bridge_upstream(
+    kind: crate::config::NetworkKind,
     addr: &str,
     tls: bool,
     nick: &str,
     realname: Option<&str>,
     autojoin: &[String],
-    sasl: IrcSaslUpdate<'_>,
 ) -> Result<(), NetworkMutationError> {
-    validate_irc_upstream(addr, nick, realname, autojoin)?;
+    use crate::config::NetworkKind;
+    check_upstream_bounds(addr, nick, realname, autojoin)?;
+    if !tls {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid bridge transport",
+            Some(
+                "bridge transports require tls=true; their endpoint scheme controls HTTP security",
+            ),
+        ));
+    }
+    if realname.is_some() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported bridge field",
+            Some("realname applies only to IRC networks"),
+        ));
+    }
+    crate::bouncer::validate_bridge_base(kind, addr).map_err(|error| {
+        network_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid bridge endpoint",
+            Some(&error),
+        )
+    })?;
+    match kind {
+        NetworkKind::Matrix if addr.is_empty() || nick.is_empty() => Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Missing Matrix fields",
+            Some("Matrix requires a homeserver URL and provider user"),
+        )),
+        NetworkKind::Discord | NetworkKind::Slack if !nick.is_empty() => Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported bridge field",
+            Some("nick applies only to IRC and Matrix networks"),
+        )),
+        NetworkKind::Matrix | NetworkKind::Discord | NetworkKind::Slack => Ok(()),
+        _ => Err(network_error(StatusCode::BAD_REQUEST, "Not a bridge", None)),
+    }
+}
+
+/// Construct and validate a prospective driver before durable state changes.
+/// Disabled IRC networks may be repaired without opening an unreadable old
+/// secret; bridge edits always validate their required credentials and typed
+/// endpoint, even while paused.
+fn prospective_network_driver(
+    state: &AppState,
+    account: &str,
+    row: &crate::db::BncNetworkRow,
+    should_run: bool,
+    validate_while_stopped: bool,
+) -> Result<Option<Box<dyn crate::bouncer::NetworkDriver>>, NetworkMutationError> {
+    if !should_run && !validate_while_stopped {
+        return Ok(None);
+    }
+    let driver = crate::bouncer::driver_from_row(row, state.secret_key.as_deref(), account)
+        .map_err(|error| {
+            network_error(StatusCode::CONFLICT, "Cannot start network", Some(&error))
+        })?;
+    Ok(should_run.then_some(driver))
+}
+
+/// Update all mutable configuration of one caller-owned network and replace its
+/// running driver. The registry mutation gate makes the database write and
+/// runtime transition one serialized control-plane operation.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn update_network_core(
+    state: &AppState,
+    registry: &crate::bouncer::Registry,
+    account: &str,
+    name: &str,
+    editable_kind: EditableNetworkKind,
+    addr: &str,
+    tls: bool,
+    nick: &str,
+    realname: Option<&str>,
+    autojoin: &[String],
+    credentials: NetworkCredentialUpdate<'_>,
+) -> Result<(), NetworkMutationError> {
+    let _mutation = registry.mutation_guard().await;
     let pool = pool_of(state);
-    // This form edits IRC connection/identity fields; a bridge (matrix/discord/
-    // slack) has different fields and is managed through its integration UI.
-    // Refuse to overwrite a non-IRC row's addr/nick/etc. through it (a direct
-    // POST to the edit URL, since the UI hides the link for bridges).
     let mut row = match crate::db::get_bnc_network(pool, account, name).await {
-        Ok(Some(row)) if row.kind != crate::config::NetworkKind::Irc => {
-            return Err(network_error(
-                StatusCode::BAD_REQUEST,
-                "Not an IRC network",
-                Some("bridges are managed on the Integrations page, not edited here"),
-            ));
-        }
         Ok(Some(row)) => row,
         Ok(None) => {
             return Err(network_error(
@@ -593,8 +721,8 @@ pub(super) async fn update_network_core(
                 None,
             ));
         }
-        Err(e) => {
-            eprintln!("http: network update kind check: {e}");
+        Err(error) => {
+            eprintln!("http: network update lookup: {error}");
             return Err(network_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Database unavailable",
@@ -602,17 +730,30 @@ pub(super) async fn update_network_core(
             ));
         }
     };
-
-    // Construct the prospective live driver before changing durable state.
-    // Missing/corrupt sealed credentials can therefore never leave the edited
-    // database row disagreeing with the still-running old driver.
+    if !editable_kind_accepts(editable_kind, row.kind) {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Wrong network editor",
+            Some(if row.kind.is_bridge() {
+                "bridges are managed on the Integrations page"
+            } else {
+                "IRC networks are managed on the BNC networks page"
+            }),
+        ));
+    }
+    if row.kind == crate::config::NetworkKind::Irc {
+        validate_irc_upstream(addr, nick, realname, autojoin)?;
+    } else {
+        validate_bridge_upstream(row.kind, addr, tls, nick, realname, autojoin)?;
+    }
     row.addr = addr.to_string();
     row.tls = tls;
     row.nick = nick.to_string();
     row.realname = realname.map(str::to_string);
     row.autojoin = autojoin.to_vec();
-    apply_irc_sasl_update(state, account, &mut row, sasl)?;
-    let driver = prospective_network_driver(state, account, &row, row.enabled)?;
+    apply_network_credentials(state, account, &mut row, credentials)?;
+    let driver =
+        prospective_network_driver(state, account, &row, row.enabled, row.kind.is_bridge())?;
 
     require_network_updated(
         crate::db::update_bnc_network(pool, account, name, &row).await,
@@ -689,30 +830,30 @@ pub(super) async fn create_network_core(
     if kind == NetworkKind::Irc {
         validate_irc_upstream(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
     } else {
-        check_upstream_bounds(&req.addr, &req.nick, req.realname.as_deref(), &req.autojoin)?;
+        validate_bridge_upstream(
+            kind,
+            &req.addr,
+            req.tls,
+            &req.nick,
+            req.realname.as_deref(),
+            &req.autojoin,
+        )?;
     }
     // Fields that are create-only (the name) or SASL-specific (bounds + the NUL
     // check that matters because PLAIN uses NUL as its field separator, and the
     // sealed-secret size cap) are checked here rather than in the shared helper.
-    let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
-    if req.name.len() > 64
-        || req.sasl_account.as_ref().is_some_and(|a| a.len() > 255)
-        || req.sasl_password.as_ref().is_some_and(|p| p.len() > 512)
-    {
+    if req.name.len() > 64 {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Field too long",
-            Some("network fields exceed their length bounds"),
+            Some("network names are limited to 64 bytes"),
         ));
     }
-    if req.sasl_account.as_deref().is_some_and(has_control)
-        || req.sasl_password.as_deref().is_some_and(has_control)
-    {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Invalid character",
-            Some("SASL fields must not contain CR, LF or NUL"),
-        ));
+    if let Some(account) = req.sasl_account.as_deref() {
+        validate_credential_field(account, 255)?;
+    }
+    if let Some(password) = req.sasl_password.as_deref() {
+        validate_credential_field(password, 512)?;
     }
     // For IRC the SASL pair is both-or-neither (account = login name, password =
     // secret). Bridges don't follow that rule — their required fields are checked
@@ -722,6 +863,13 @@ pub(super) async fn create_network_core(
             StatusCode::BAD_REQUEST,
             "Incomplete upstream SASL",
             Some("provide both sasl_account and sasl_password, or neither"),
+        ));
+    }
+    if matches!(kind, NetworkKind::Matrix | NetworkKind::Discord) && req.sasl_account.is_some() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Unsupported credential field",
+            Some("Matrix and Discord use only sasl_password for their password/token"),
         ));
     }
     // Seal secrets for storage, per kind. The password is always a secret and is
@@ -787,6 +935,7 @@ pub(super) async fn create_network_core(
     // `create_bnc_network` (count + insert in one FOR UPDATE transaction), so
     // there is no racy list-then-insert here — two concurrent creates can't both
     // slip past cap-1 and each spawn an always-on driver.
+    let _mutation = registry.mutation_guard().await;
     match crate::db::create_bnc_network(pool, account, &row).await {
         Ok(_) => {}
         Err(crate::db::DbError::TooManyNetworks) => {
@@ -912,15 +1061,16 @@ pub(super) enum UpdateNetworkCredentials {
     Keep,
     Remove,
     Set {
-        account: String,
+        #[serde(default)]
+        account: Option<String>,
         #[serde(default)]
         password: Option<String>,
     },
 }
 
-/// Replace all mutable configuration of one caller-owned IRC network and
-/// restart its driver. The stable name, driver kind, and enabled state are not
-/// changed by this endpoint.
+/// Replace all mutable configuration of one caller-owned network and restart
+/// its driver. The stored kind selects the exact IRC/bridge field contract; the
+/// stable name, driver kind, and enabled state are unchanged.
 pub(super) async fn update_network(
     State(state): State<Arc<AppState>>,
     Authenticated(account): Authenticated,
@@ -930,11 +1080,11 @@ pub(super) async fn update_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let sasl = match &req.credentials {
-        UpdateNetworkCredentials::Keep => IrcSaslUpdate::Keep,
-        UpdateNetworkCredentials::Remove => IrcSaslUpdate::Clear,
-        UpdateNetworkCredentials::Set { account, password } => IrcSaslUpdate::Set {
-            account,
+    let credentials = match &req.credentials {
+        UpdateNetworkCredentials::Keep => NetworkCredentialUpdate::Keep,
+        UpdateNetworkCredentials::Remove => NetworkCredentialUpdate::Remove,
+        UpdateNetworkCredentials::Set { account, password } => NetworkCredentialUpdate::Set {
+            account: account.as_deref(),
             password: password.as_deref(),
         },
     };
@@ -943,12 +1093,13 @@ pub(super) async fn update_network(
         registry,
         &account,
         &name,
+        EditableNetworkKind::Any,
         &req.addr,
         req.tls,
         &req.nick,
         req.realname.as_deref(),
         &req.autojoin,
-        sasl,
+        credentials,
     )
     .await
     {
@@ -967,6 +1118,7 @@ pub(super) async fn set_network_enabled_core(
     name: &str,
     enabled: bool,
 ) -> Result<(), NetworkMutationError> {
+    let _mutation = registry.mutation_guard().await;
     let pool = pool_of(state);
 
     let driver = if enabled {
@@ -988,7 +1140,7 @@ pub(super) async fn set_network_enabled_core(
                 ));
             }
         };
-        prospective_network_driver(state, account, &row, true)?
+        prospective_network_driver(state, account, &row, true, false)?
     } else {
         None
     };
@@ -1002,6 +1154,54 @@ pub(super) async fn set_network_enabled_core(
     } else {
         registry.remove(Some(account), name);
     }
+    Ok(())
+}
+
+/// Delete one owner-scoped network and stop its driver under the same mutation
+/// gate used by create/edit/toggle, so concurrent control-plane operations
+/// cannot resurrect a driver whose durable row was removed.
+pub(super) async fn delete_network_core(
+    state: &AppState,
+    registry: &crate::bouncer::Registry,
+    account: &str,
+    name: &str,
+    editable_kind: EditableNetworkKind,
+) -> Result<(), NetworkMutationError> {
+    let _mutation = registry.mutation_guard().await;
+    let row = match crate::db::get_bnc_network(pool_of(state), account, name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Err(network_error(
+                StatusCode::NOT_FOUND,
+                "No such network",
+                None,
+            ));
+        }
+        Err(error) => {
+            eprintln!("http: network delete lookup: {error}");
+            return Err(network_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    };
+    if !editable_kind_accepts(editable_kind, row.kind) {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Wrong network editor",
+            Some(if row.kind.is_bridge() {
+                "bridges are managed on the Integrations page"
+            } else {
+                "IRC networks are managed on the BNC networks page"
+            }),
+        ));
+    }
+    require_network_updated(
+        crate::db::delete_bnc_network(pool_of(state), account, name).await,
+        "delete failed",
+    )?;
+    registry.remove(Some(account), name);
     Ok(())
 }
 
@@ -1037,21 +1237,9 @@ pub(super) async fn delete_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    let pool = pool_of(&state);
-    match crate::db::delete_bnc_network(pool, &account, &name).await {
-        Ok(true) => {
-            registry.remove(Some(&account), &name);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(false) => problem(StatusCode::NOT_FOUND, "No such network", None),
-        Err(e) => {
-            eprintln!("http: network delete failed: {e}");
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            )
-        }
+    match delete_network_core(&state, registry, &account, &name, EditableNetworkKind::Any).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 

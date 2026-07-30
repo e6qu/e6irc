@@ -347,9 +347,13 @@ pub struct NetworkEntry {
     /// (DB-backed) reuses this ownership.
     #[serde(default)]
     pub owner: Option<String>,
-    /// Upstream address (host:port). Ignored for `local`.
+    /// IRC `host:port` or a bridge's HTTP(S) provider base. Empty selects the
+    /// provider default only for bridge kinds that define one. Ignored for
+    /// `local`.
     #[serde(default)]
     pub addr: String,
+    /// IRC transport security. Bridge entries require `true` as the canonical
+    /// marker that the transport is HTTP(S), whose URL scheme controls security.
     #[serde(default)]
     pub tls: bool,
     pub nick: String,
@@ -359,9 +363,11 @@ pub struct NetworkEntry {
     pub autojoin: Vec<String>,
     #[serde(default = "default_bnc_buffer")]
     pub buffer_cap: usize,
-    /// Upstream SASL account (with sasl_password enables SASL PLAIN).
+    /// IRC SASL account, or Slack bot token. Matrix and Discord reject it.
     #[serde(default)]
     pub sasl_account: Option<String>,
+    /// IRC SASL password, Matrix login password, Discord bot token, or Slack
+    /// app token.
     #[serde(default)]
     pub sasl_password: Option<String>,
 }
@@ -1045,6 +1051,64 @@ impl Config {
                     n.name
                 )));
             }
+            if let Some(account) = n.sasl_account.as_deref() {
+                crate::bouncer::validate_network_credential(account, 255).map_err(|error| {
+                    ConfigError::Invalid(format!(
+                        "network '{}' has invalid sasl_account: {error}",
+                        n.name
+                    ))
+                })?;
+            }
+            if let Some(password) = n.sasl_password.as_deref() {
+                crate::bouncer::validate_network_credential(password, 512).map_err(|error| {
+                    ConfigError::Invalid(format!(
+                        "network '{}' has invalid sasl_password: {error}",
+                        n.name
+                    ))
+                })?;
+            }
+            if n.kind == NetworkKind::Irc && n.sasl_account.is_some() != n.sasl_password.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "network '{}' (kind=irc) requires both sasl_account and sasl_password, or neither",
+                    n.name
+                )));
+            }
+            if n.kind.is_bridge() {
+                if !n.tls {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind={}) requires tls=true as its HTTP transport marker",
+                        n.name,
+                        n.kind.as_db_str()
+                    )));
+                }
+                if n.realname.is_some() {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind={}) does not accept realname",
+                        n.name,
+                        n.kind.as_db_str()
+                    )));
+                }
+                if matches!(n.kind, NetworkKind::Discord | NetworkKind::Slack) && !n.nick.is_empty()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind={}) does not accept nick",
+                        n.name,
+                        n.kind.as_db_str()
+                    )));
+                }
+                if matches!(n.kind, NetworkKind::Matrix | NetworkKind::Discord)
+                    && n.sasl_account.is_some()
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "network '{}' (kind={}) does not accept sasl_account",
+                        n.name,
+                        n.kind.as_db_str()
+                    )));
+                }
+                crate::bouncer::validate_bridge_base(n.kind, &n.addr).map_err(|error| {
+                    ConfigError::Invalid(format!("network '{}': {error}", n.name))
+                })?;
+            }
             match n.kind {
                 NetworkKind::Irc if n.addr.is_empty() => {
                     return Err(ConfigError::Invalid(format!(
@@ -1058,9 +1122,9 @@ impl Config {
                         n.name
                     )));
                 }
-                NetworkKind::Matrix if n.addr.is_empty() => {
+                NetworkKind::Matrix if n.nick.is_empty() => {
                     return Err(ConfigError::Invalid(format!(
-                        "network '{}' (kind=matrix) requires addr (homeserver URL)",
+                        "network '{}' (kind=matrix) requires nick (provider user)",
                         n.name
                     )));
                 }
@@ -1456,6 +1520,98 @@ mod tests {
             ..Config::default()
         };
         cfg.validate().expect("bracketed IPv6 address is valid");
+    }
+
+    #[test]
+    fn bridge_config_uses_the_same_canonical_shapes_as_the_driver_factory() {
+        let bridge_config = |network| Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+                websocket: false,
+            }],
+            networks: vec![network],
+            bnc: bnc(),
+            database: db(),
+            ..Config::default()
+        };
+        let mut matrix = net("matrix", None);
+        matrix.kind = NetworkKind::Matrix;
+        matrix.addr = "https://matrix.example".into();
+        matrix.tls = true;
+        matrix.nick = "@alice:matrix.example".into();
+        matrix.sasl_password = Some("secret".into());
+        bridge_config(matrix.clone())
+            .validate()
+            .expect("canonical Matrix config");
+
+        matrix.addr = "matrix.example".into();
+        assert!(
+            bridge_config(matrix)
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP(S)")
+        );
+
+        let mut slack = net("slack", None);
+        slack.kind = NetworkKind::Slack;
+        slack.addr.clear();
+        slack.tls = true;
+        slack.nick.clear();
+        slack.sasl_account = Some("xoxb-token".into());
+        slack.sasl_password = Some("xapp-token".into());
+        bridge_config(slack.clone())
+            .validate()
+            .expect("canonical Slack config with provider endpoint");
+
+        slack.nick = "ignored-user".into();
+        assert!(
+            bridge_config(slack)
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("does not accept nick")
+        );
+    }
+
+    #[test]
+    fn configured_network_credentials_are_complete_nonempty_and_bounded() {
+        let config = |network| Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+                websocket: false,
+            }],
+            networks: vec![network],
+            bnc: bnc(),
+            database: db(),
+            ..Config::default()
+        };
+        let mut irc = net("irc-sasl", None);
+        irc.sasl_account = Some("alice".into());
+        assert!(
+            config(irc)
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("both sasl_account and sasl_password")
+        );
+
+        let mut slack = net("slack-empty", None);
+        slack.kind = NetworkKind::Slack;
+        slack.addr.clear();
+        slack.tls = true;
+        slack.nick.clear();
+        slack.sasl_account = Some(String::new());
+        slack.sasl_password = Some("xapp-token".into());
+        assert!(
+            config(slack)
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty")
+        );
     }
 
     #[test]
