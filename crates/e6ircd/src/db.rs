@@ -1076,22 +1076,7 @@ pub async fn account_deletion_target(
         ));
     }
     if flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded) {
-        let other_active: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM accounts
-             WHERE id <> $1
-               AND ((flags & $2) = $2 OR name_folded = ANY($4))
-               AND (flags & $3) = 0",
-        )
-        .bind(account_id)
-        .bind(ACCOUNT_FLAG_ADMIN)
-        .bind(ACCOUNT_FLAG_SUSPENDED)
-        .bind(configured_administrators)
-        .fetch_one(pool)
-        .await
-        .map_err(DbError::Query)?;
-        if other_active == 0 {
-            return Err(DbError::LastAdministrator);
-        }
+        require_other_active_administrator(pool, account_id, configured_administrators).await?;
     }
     Ok(Some(AccountDeletionTarget {
         id: account_id,
@@ -1128,22 +1113,12 @@ pub async fn delete_account_permanently(
         ));
     }
     if flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded) {
-        let other_active: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM accounts
-             WHERE id <> $1
-               AND ((flags & $2) = $2 OR name_folded = ANY($4))
-               AND (flags & $3) = 0",
+        require_other_active_administrator(
+            &mut *transaction,
+            account_id,
+            configured_administrators,
         )
-        .bind(account_id)
-        .bind(ACCOUNT_FLAG_ADMIN)
-        .bind(ACCOUNT_FLAG_SUSPENDED)
-        .bind(configured_administrators)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
-        if other_active == 0 {
-            return Err(DbError::LastAdministrator);
-        }
+        .await?;
     }
     sqlx::query(
         "INSERT INTO retired_account_names (name_folded) VALUES ($1)
@@ -1288,11 +1263,17 @@ async fn lock_account_state(
         .map_err(DbError::Query)
 }
 
-async fn require_other_active_administrator(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// Preserve the system-wide invariant that an account mutation cannot remove
+/// the final active administrator, regardless of whether that authority came
+/// from durable flags or configuration.
+async fn require_other_active_administrator<'e, E>(
+    executor: E,
     account_id: i64,
     configured_administrators: &[String],
-) -> Result<(), DbError> {
+) -> Result<(), DbError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let other_active_administrators: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM accounts
          WHERE id <> $1
@@ -1303,7 +1284,7 @@ async fn require_other_active_administrator(
     .bind(ACCOUNT_FLAG_ADMIN)
     .bind(ACCOUNT_FLAG_SUSPENDED)
     .bind(configured_administrators)
-    .fetch_one(&mut **transaction)
+    .fetch_one(executor)
     .await
     .map_err(DbError::Query)?;
     if other_active_administrators == 0 {
@@ -1324,6 +1305,26 @@ async fn write_account_flags(
         .await
         .map(|_| ())
         .map_err(DbError::Query)
+}
+
+/// Lock one active account row for a credential/session issuance transaction.
+/// Every issuance path must reject deleted and suspended accounts under the
+/// same lock before it counts or inserts account-owned authority.
+async fn lock_active_account_id(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    folded: &str,
+) -> Result<i64, DbError> {
+    let account_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE name_folded = $1 AND (flags & $2) = 0
+         FOR UPDATE",
+    )
+    .bind(folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Query)?;
+    account_id.ok_or(DbError::BadCredentials)
 }
 
 /// Grant or revoke durable administrator authority by immutable account ID.
@@ -1350,8 +1351,12 @@ pub async fn set_account_administrator(
         && flags & ACCOUNT_FLAG_ADMIN != 0
         && !configured_administrators.contains(&folded)
     {
-        require_other_active_administrator(&mut transaction, account_id, configured_administrators)
-            .await?;
+        require_other_active_administrator(
+            &mut *transaction,
+            account_id,
+            configured_administrators,
+        )
+        .await?;
     }
     let next_flags = if administrator {
         flags | ACCOUNT_FLAG_ADMIN
@@ -1394,8 +1399,12 @@ pub async fn set_account_suspended(
     }
     if suspended && (flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded))
     {
-        require_other_active_administrator(&mut transaction, account_id, configured_administrators)
-            .await?;
+        require_other_active_administrator(
+            &mut *transaction,
+            account_id,
+            configured_administrators,
+        )
+        .await?;
     }
     let next_flags = if suspended {
         flags | ACCOUNT_FLAG_SUSPENDED
@@ -1564,21 +1573,9 @@ pub async fn issue_app_password_for_account(
     // cap the comment promises (this endpoint runs on the concurrent REST
     // layer, not the serial worker).
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM accounts
-         WHERE name_folded = $1 AND (flags & $2) = 0
-         FOR UPDATE",
-    )
-    .bind(&folded)
-    .bind(ACCOUNT_FLAG_SUSPENDED)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(DbError::Query)?;
     // The account row was gone (deleted since authentication): reject rather
     // than hand back an app password that was never stored.
-    let Some(account_id) = account_id else {
-        return Err(DbError::BadCredentials);
-    };
+    let account_id = lock_active_account_id(&mut tx, &folded).await?;
     let app_pw_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM account_credentials
          WHERE account_id = $1 AND kind = 'app_password'",
@@ -5369,19 +5366,7 @@ pub async fn create_web_session_with_identity(
     // lets concurrent logins exceed the cap. Rolling out the oldest login keeps
     // a credential-owning user able to sign in and recover the account instead
     // of letting a filled session set permanently lock out the login surface.
-    let account_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM accounts
-         WHERE name_folded = $1 AND (flags & $2) = 0
-         FOR UPDATE",
-    )
-    .bind(&folded)
-    .bind(ACCOUNT_FLAG_SUSPENDED)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(DbError::Query)?;
-    let Some(account_id) = account_id else {
-        return Err(DbError::BadCredentials);
-    };
+    let account_id = lock_active_account_id(&mut tx, &folded).await?;
     sqlx::query("DELETE FROM web_sessions WHERE account_id = $1 AND expires_at <= now()")
         .bind(account_id)
         .execute(&mut *tx)
@@ -5810,19 +5795,7 @@ pub async fn issue_scoped_api_token(
     // insert, overshooting the cap — the same TOCTOU `issue_app_password` closes.
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM accounts
-         WHERE name_folded = $1 AND (flags & $2) = 0
-         FOR UPDATE",
-    )
-    .bind(&folded)
-    .bind(ACCOUNT_FLAG_SUSPENDED)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(DbError::Query)?;
-    let Some(account_id) = account_id else {
-        return Err(DbError::BadCredentials);
-    };
+    let account_id = lock_active_account_id(&mut tx, &folded).await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE account_id = $1")
         .bind(account_id)
         .fetch_one(&mut *tx)
@@ -6000,6 +5973,24 @@ pub async fn list_api_tokens(
         .collect()
 }
 
+/// Finish an owner-scoped credential revocation with its durable audit record
+/// in the same transaction. App-password and personal-access-token deletion
+/// differ only in their target table and audit vocabulary.
+async fn commit_credential_revocation(
+    mut transaction: sqlx::Transaction<'_, sqlx::Postgres>,
+    folded: &str,
+    result: sqlx::postgres::PgQueryResult,
+    action: &str,
+    detail: &str,
+) -> Result<bool, DbError> {
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    insert_audit_log_with(&mut *transaction, folded, action, folded, detail).await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(true)
+}
+
 /// Revoke one of `account`'s PATs by id. Returns whether a row was deleted
 /// (false = not found / not owned).
 pub async fn delete_api_token(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
@@ -6014,19 +6005,14 @@ pub async fn delete_api_token(pool: &PgPool, account: &str, id: i64) -> Result<b
     .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    if result.rows_affected() == 0 {
-        return Ok(false);
-    }
-    insert_audit_log_with(
-        &mut *transaction,
+    commit_credential_revocation(
+        transaction,
         &folded,
+        result,
         "ACCOUNT_TOKEN_REVOKE",
-        &folded,
         "personal access token revoked",
     )
-    .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
-    Ok(true)
+    .await
 }
 
 // ---- credential management ----------------------------------------------
@@ -6074,19 +6060,14 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
     .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    if result.rows_affected() == 0 {
-        return Ok(false);
-    }
-    insert_audit_log_with(
-        &mut *transaction,
+    commit_credential_revocation(
+        transaction,
         &folded,
+        result,
         "ACCOUNT_APP_PASSWORD_REVOKE",
-        &folded,
         "app password revoked",
     )
-    .await?;
-    transaction.commit().await.map_err(DbError::Query)?;
-    Ok(true)
+    .await
 }
 
 #[cfg(test)]

@@ -242,39 +242,40 @@ impl fmt::Display for InvalidApiTokenScopes {
 
 impl std::error::Error for InvalidApiTokenScopes {}
 
-/// A bounded personal-access-token lifetime in whole days.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApiTokenLifetimeDays(u16);
+macro_rules! bounded_lifetime_days {
+    ($(#[$meta:meta])* $name:ident, default = $default:literal, max = $max:literal) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name(u16);
 
-impl ApiTokenLifetimeDays {
-    pub const DEFAULT: Self = Self(30);
-    pub const MAX: u16 = 365;
+        impl $name {
+            pub const DEFAULT: Self = Self($default);
+            pub const MAX: u16 = $max;
 
-    pub fn new(days: u16) -> Option<Self> {
-        (1..=Self::MAX).contains(&days).then_some(Self(days))
-    }
+            pub fn new(days: u16) -> Option<Self> {
+                (1..=Self::MAX).contains(&days).then_some(Self(days))
+            }
 
-    pub const fn value(self) -> u16 {
-        self.0
-    }
+            pub const fn value(self) -> u16 {
+                self.0
+            }
+        }
+    };
 }
 
-/// A bounded account-invitation lifetime in whole days.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AccountInvitationLifetimeDays(u16);
+bounded_lifetime_days!(
+    /// A bounded personal-access-token lifetime in whole days.
+    ApiTokenLifetimeDays,
+    default = 30,
+    max = 365
+);
 
-impl AccountInvitationLifetimeDays {
-    pub const DEFAULT: Self = Self(7);
-    pub const MAX: u16 = 30;
-
-    pub fn new(days: u16) -> Option<Self> {
-        (1..=Self::MAX).contains(&days).then_some(Self(days))
-    }
-
-    pub const fn value(self) -> u16 {
-        self.0
-    }
-}
+bounded_lifetime_days!(
+    /// A bounded account-invitation lifetime in whole days.
+    AccountInvitationLifetimeDays,
+    default = 7,
+    max = 30
+);
 
 #[cfg(test)]
 mod tests {

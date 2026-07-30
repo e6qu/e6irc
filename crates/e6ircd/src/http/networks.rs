@@ -482,6 +482,48 @@ fn editable_kind_accepts(
     }
 }
 
+/// Resolve one owner-scoped row and enforce the editor/driver-kind boundary in
+/// one place. Update and delete must reject exactly the same missing,
+/// unavailable, and cross-surface cases.
+async fn editable_network(
+    state: &AppState,
+    account: &str,
+    name: &str,
+    editable_kind: EditableNetworkKind,
+    operation: &str,
+) -> Result<crate::db::BncNetworkRow, NetworkMutationError> {
+    let row = match crate::db::get_bnc_network(pool_of(state), account, name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Err(network_error(
+                StatusCode::NOT_FOUND,
+                "No such network",
+                None,
+            ));
+        }
+        Err(error) => {
+            eprintln!("http: network {operation} lookup: {error}");
+            return Err(network_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ));
+        }
+    };
+    if !editable_kind_accepts(editable_kind, row.kind) {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Wrong network editor",
+            Some(if row.kind.is_bridge() {
+                "bridges are managed on the Integrations page"
+            } else {
+                "IRC networks are managed on the BNC networks page"
+            }),
+        ));
+    }
+    Ok(row)
+}
+
 /// How an edit mutates write-only upstream credentials. Optional fields inside
 /// `Set` mean "preserve this one secret", while `Keep` preserves the complete
 /// credential set and `Remove` is supported only by IRC (bridges require their
@@ -712,35 +754,7 @@ pub(super) async fn update_network_core(
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
     let pool = pool_of(state);
-    let mut row = match crate::db::get_bnc_network(pool, account, name).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            return Err(network_error(
-                StatusCode::NOT_FOUND,
-                "No such network",
-                None,
-            ));
-        }
-        Err(error) => {
-            eprintln!("http: network update lookup: {error}");
-            return Err(network_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
-    };
-    if !editable_kind_accepts(editable_kind, row.kind) {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Wrong network editor",
-            Some(if row.kind.is_bridge() {
-                "bridges are managed on the Integrations page"
-            } else {
-                "IRC networks are managed on the BNC networks page"
-            }),
-        ));
-    }
+    let mut row = editable_network(state, account, name, editable_kind, "update").await?;
     if row.kind == crate::config::NetworkKind::Irc {
         validate_irc_upstream(addr, nick, realname, autojoin)?;
     } else {
@@ -1168,35 +1182,7 @@ pub(super) async fn delete_network_core(
     editable_kind: EditableNetworkKind,
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
-    let row = match crate::db::get_bnc_network(pool_of(state), account, name).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            return Err(network_error(
-                StatusCode::NOT_FOUND,
-                "No such network",
-                None,
-            ));
-        }
-        Err(error) => {
-            eprintln!("http: network delete lookup: {error}");
-            return Err(network_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable",
-                None,
-            ));
-        }
-    };
-    if !editable_kind_accepts(editable_kind, row.kind) {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Wrong network editor",
-            Some(if row.kind.is_bridge() {
-                "bridges are managed on the Integrations page"
-            } else {
-                "IRC networks are managed on the BNC networks page"
-            }),
-        ));
-    }
+    editable_network(state, account, name, editable_kind, "delete").await?;
     require_network_updated(
         crate::db::delete_bnc_network(pool_of(state), account, name).await,
         "delete failed",

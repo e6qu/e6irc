@@ -4169,15 +4169,19 @@ mod pages {
         })
     }
 
+    struct AccountDirectorySubmission {
+        outcome: String,
+        success: bool,
+        invitation_url: Option<String>,
+    }
+
     async fn console_accounts_response(
         state: &AppState,
         account: String,
         csrf: String,
         params: super::device::AccountDirectoryQuery,
         invitation_before_id: Option<i64>,
-        outcome: Option<String>,
-        success: bool,
-        invitation_url: Option<String>,
+        submission: Option<AccountDirectorySubmission>,
     ) -> Response {
         let query = match super::device::validate_account_directory_query(params, 50) {
             Ok(query) => query,
@@ -4221,6 +4225,14 @@ mod pages {
         }
         let name = query.name.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
+        let (outcome, success, invitation_url) =
+            submission.map_or((None, true, None), |submission| {
+                (
+                    Some(submission.outcome),
+                    submission.success,
+                    submission.invitation_url,
+                )
+            });
         render_private(ConsoleAccounts {
             account,
             csrf,
@@ -4246,14 +4258,17 @@ mod pages {
         AdminPageActor { account, csrf }: AdminPageActor,
         Query(params): Query<ConsoleAccountsQuery>,
     ) -> Response {
+        let invitation_before_id = params.invitation_before_id;
         console_accounts_response(
             &state,
             account,
             csrf,
-            params.accounts,
-            params.invitation_before_id,
-            None,
-            true,
+            super::device::AccountDirectoryQuery {
+                limit: params.limit,
+                before_id: params.before_id,
+                name: params.name,
+            },
+            invitation_before_id,
             None,
         )
         .await
@@ -4261,8 +4276,9 @@ mod pages {
 
     #[derive(Default, Deserialize)]
     pub struct ConsoleAccountsQuery {
-        #[serde(flatten)]
-        accounts: super::device::AccountDirectoryQuery,
+        limit: Option<usize>,
+        before_id: Option<i64>,
+        name: Option<String>,
         invitation_before_id: Option<i64>,
     }
 
@@ -4278,12 +4294,8 @@ mod pages {
         Path(account_id): Path<i64>,
         form: Result<axum::Form<AccountSuspensionForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         match mutate_account_suspension(&state, &actor, account_id, form.suspended).await {
@@ -4304,12 +4316,8 @@ mod pages {
         Path(account_id): Path<i64>,
         form: Result<axum::Form<AccountAdministratorForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         match mutate_account_administrator(&state, &actor, account_id, form.administrator).await {
@@ -4354,12 +4362,8 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<AccountCreateForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         let contact_email =
@@ -4384,12 +4388,8 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<AccountInvitationForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         let result = if !crate::sanitize::valid_nick(&form.account, MAX_ACCOUNT_LEN) {
@@ -4445,14 +4445,12 @@ mod pages {
                 let url = account_invitation_url(&state, &token);
                 (
                     StatusCode::OK,
-                    Some(
-                        "Invitation issued. Copy the single-use link before leaving this page."
-                            .to_string(),
-                    ),
+                    "Invitation issued. Copy the single-use link before leaving this page."
+                        .to_string(),
                     Some(url),
                 )
             }
-            Err((status, detail)) => (status, Some(detail), None),
+            Err((status, detail)) => (status, detail, None),
         };
         let csrf = session_token(&headers, state.secure_cookies)
             .map(|session| state.csrf_token(&session))
@@ -4463,9 +4461,11 @@ mod pages {
             csrf,
             super::device::AccountDirectoryQuery::default(),
             None,
-            outcome,
-            status.is_success(),
-            invitation_url,
+            Some(AccountDirectorySubmission {
+                outcome,
+                success: status.is_success(),
+                invitation_url,
+            }),
         )
         .await;
         *response.status_mut() = status;
@@ -4481,12 +4481,8 @@ mod pages {
             axum::extract::rejection::FormRejection,
         >,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (_form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         match crate::db::revoke_account_invitation(pool_of(&state), invitation_id, &actor).await {
@@ -4505,12 +4501,8 @@ mod pages {
             axum::extract::rejection::FormRejection,
         >,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(actor) => actor,
+        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
@@ -6763,6 +6755,44 @@ mod pages {
         Ok(account)
     }
 
+    trait CsrfForm {
+        fn csrf(&self) -> &str;
+    }
+
+    macro_rules! csrf_forms {
+        ($($form:ty),+ $(,)?) => {
+            $(
+                impl CsrfForm for $form {
+                    fn csrf(&self) -> &str {
+                        &self.csrf
+                    }
+                }
+            )+
+        };
+    }
+
+    csrf_forms!(
+        AccountSuspensionForm,
+        AccountAdministratorForm,
+        AccountCreateForm,
+        AccountInvitationForm,
+        AccountInvitationRevokeForm,
+        AccountPermanentDeleteForm,
+    );
+
+    /// Parse and authorize an administrator-owned browser form as one gate so
+    /// mutations cannot drift between subtly different CSRF/admin prologues.
+    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
+    async fn parse_admin_form<T: CsrfForm>(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(T, String), Response> {
+        let form = parse_form(form)?;
+        let actor = require_admin_form_actor(state, headers, form.csrf()).await?;
+        Ok((form, actor))
+    }
+
     /// Ask the core for one already-validated bounded connection page.
     async fn list_live_connections(
         state: &AppState,
@@ -6956,6 +6986,23 @@ mod pages {
         reason: String,
     }
 
+    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
+    fn parse_disconnect_form(
+        connection_id: u64,
+        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(String, String), Response> {
+        if connection_id == 0 {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid live-connection id",
+                None,
+            ));
+        }
+        let form = parse_form(form)?;
+        let reason = validate_disconnect_reason(form.reason)?;
+        Ok((form.csrf, reason))
+    }
+
     /// Render one bounded live-connection page. `own` forces the account filter
     /// for self-service and also includes the caller's capped durable browser
     /// logins.
@@ -7079,6 +7126,20 @@ mod pages {
         validate_live_connection_query(LiveConnectionQueryParams::default(), 50)
     }
 
+    async fn sessions_error_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        account: String,
+        own: bool,
+        message: String,
+    ) -> Response {
+        let query = match default_live_connection_query() {
+            Ok(query) => query,
+            Err(response) => return response,
+        };
+        render_sessions_page(state, headers, account, own, query, Some(message)).await
+    }
+
     /// Console → bounded live connection directory (admin-gated).
     pub async fn console_sessions(
         State(state): State<Arc<AppState>>,
@@ -7101,15 +7162,8 @@ mod pages {
         Path(connection_id): Path<u64>,
         form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        if connection_id == 0 {
-            return problem(StatusCode::BAD_REQUEST, "Invalid live-connection id", None);
-        }
-        let f = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let reason = match validate_disconnect_reason(f.reason) {
-            Ok(reason) => reason,
+        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
         let make = |actor| crate::core::AdminRequest::DisconnectConnection {
@@ -7117,14 +7171,10 @@ mod pages {
             reason,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console/sessions", make).await {
+        match run_admin_form(&state, &headers, &csrf, "/console/sessions", make).await {
             Ok(response) => response,
             Err((account, message)) => {
-                let query = match default_live_connection_query() {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                render_sessions_page(&state, &headers, account, false, query, Some(message)).await
+                sessions_error_page(&state, &headers, account, false, message).await
             }
         }
     }
@@ -7154,18 +7204,11 @@ mod pages {
         Path(connection_id): Path<u64>,
         form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        if connection_id == 0 {
-            return problem(StatusCode::BAD_REQUEST, "Invalid live-connection id", None);
-        }
-        let f = match parse_form(form) {
-            Ok(form) => form,
+        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
+            Ok(parsed) => parsed,
             Err(response) => return response,
         };
-        let reason = match validate_disconnect_reason(f.reason) {
-            Ok(reason) => reason,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &f.csrf).await {
+        let account = match require_form_actor(&state, &headers, &csrf).await {
             Ok(account) => account,
             Err(response) => return response,
         };
@@ -7176,13 +7219,7 @@ mod pages {
         };
         match core_action(&state, request).await {
             Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(message) => {
-                let query = match default_live_connection_query() {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                render_sessions_page(&state, &headers, account, true, query, Some(message)).await
-            }
+            Err(message) => sessions_error_page(&state, &headers, account, true, message).await,
         }
     }
 
@@ -7192,19 +7229,7 @@ mod pages {
         account: String,
         message: &'static str,
     ) -> Response {
-        let query = match default_live_connection_query() {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        render_sessions_page(
-            state,
-            headers,
-            account,
-            true,
-            query,
-            Some(message.to_owned()),
-        )
-        .await
+        sessions_error_page(state, headers, account, true, message.to_owned()).await
     }
 
     /// Console → revoke one durable browser session owned by the caller.
