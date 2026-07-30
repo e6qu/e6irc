@@ -3843,6 +3843,8 @@ mod pages {
             )
             .await;
         }
+        let outcome =
+            format!("Configuration saved: {detail}. Restart the server to apply this change.");
         match crate::db::save_managed_config(
             pool_of(state),
             current.revision,
@@ -3855,18 +3857,7 @@ mod pages {
             Ok(snapshot) => {
                 *current = snapshot.clone();
                 drop(current);
-                render_configuration(
-                    state,
-                    account,
-                    csrf,
-                    snapshot,
-                    Some(
-                        "Configuration saved. Restart the server to apply this access change."
-                            .into(),
-                    ),
-                    true,
-                )
-                .await
+                render_configuration(state, account, csrf, snapshot, Some(outcome), true).await
             }
             Err(error) => {
                 render_configuration_error(

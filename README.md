@@ -124,6 +124,8 @@ silent fallbacks, provenance required, make bug classes unrepresentable).
 Before you stop, the tree must be green: `cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets` (in each feature config),
 `cargo test --workspace`, `cargo deny check`, and `tools/check-noops.sh`.
+The product-level traceability contract is checked by
+`tools/check-journeys.py`.
 
 ## License
 

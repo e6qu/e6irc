@@ -8,40 +8,52 @@ a design target rather than current behavior.
 
 | Journey | State | Strongest automated evidence | Boundary not crossed by CI |
 |---|---|---|---|
-| Local browser login | Proven | Chromium adds a password, signs out, and submits the local-login form against real e6ircd/PostgreSQL | — |
-| OpenID Connect login/logout | Proven | Real e6ircd + PostgreSQL + Dex + Chromium; separate Shauth job | Provider diversity beyond Dex/Shauth |
-| Identity link/unlink | Proven | Real Dex + PostgreSQL plus console/API | — |
-| Device authorization grant | Proven | Real CLI → e6ircd HTTP → PostgreSQL approval/consume → private cache → authenticated API; verification page has separate browser/API coverage | — |
-| SASL PLAIN/OAUTHBEARER local IRC | Proven | Real sockets + PostgreSQL + CLI plus shared client request; PTY drives the TUI's real authentication/registration path | — |
-| IRC registration/channel messaging | Proven | Core/e2e, irctest, fuzz, six-platform matrix | Live third-party server interop is opt-in |
-| Direct messages and durable history | Proven | Core + PostgreSQL authorization/pagination/restart | — |
-| Channel governance/services | Proven | Core + PostgreSQL + API/console + irctest services | — |
-| IRC operator/ban/audit | Proven | Core + PostgreSQL atomic mutation/audit + console/API | — |
-| WebSocket IRC | Proven | Real WebSocket protocol integration | Browser third-party client not driven |
-| Web chat state machine | Proven in browser with mocked transport | Chromium replay/race/NAMES/leave/query plus send-acknowledgement/refusal tests | Focused edge-state cases replace `/ws/ui` and upstream |
-| `/ws/ui` relay | Proven at protocol level | Real HTTP/WebSocket + upstream test, including correlated composer acceptance | Chromium crosses this path in the full browser-chat journey |
-| Full browser chat | Proven | Chromium → console/API → PostgreSQL → registry → IRC driver → local TCP peer → `/ws/ui`, both directions | Public-network interop remains opt-in |
-| Network preset creation | Proven through UI/storage/runtime | Chromium verifies the Libera preset; custom creation crosses console/PostgreSQL/driver | Public Libera endpoint is opt-in |
-| BNC attach/auth/route | Proven | Real listener + upstream + PostgreSQL | Newly included in database CI |
-| BNC persistence/restart | Proven | Real PostgreSQL restart/trim/wire-form tests | — |
-| Per-network operations UI | Proven | Chromium inspects connected state and persisted live traffic from the real upstream | — |
-| Managed configuration | Proven by component/integration | Validation, CAS/audit, listener runtime, HTTP | No browser sweep of every subsection |
-| Directories/policy/sessions | Proven | PostgreSQL cursor/filter + HTTP role/scoping | — |
-| Monitoring/history/metrics | Proven by component/integration | Telemetry + PostgreSQL retention + HTTP/console | No external scrape/alert stack |
-| Local bridge | Proven | In-process driver and common attach path | — |
-| IRC driver | Proven locally | Local upstream SASL/relay/reconnect/lifecycle | Live Libera is opt-in |
-| Bridge configuration management | Proven | All-feature console/API → PostgreSQL edit journey for Matrix, Discord, and Slack; write-only and partial-rotation assertions | Live provider acceptance is listed per driver below |
-| Matrix bridge | Proven | Real pinned Conduit, both directions | Other homeserver implementations |
-| Discord bridge | Partially proven | Offline protocol/mapping/backoff tests | Live gateway/REST needs bot and guild |
-| Slack bridge | Partially proven | Offline protocol/mapping/backoff tests | Live Socket Mode/Web API needs app/workspace |
-| CLI shipped commands | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON e2e | — |
-| TUI shipped behavior | Proven | Real PTY + e6ircd for registration/render/inbound/outbound/restore; duplex history/read-marker protocol plus bounded-composer/writer/model/fuzz tests | — |
-| REST resource families | Proven at route and family level | Exact router/OpenAPI method-path catalog + extensive real HTTP/PostgreSQL tests | Schema semantics remain hand-authored and directly tested |
-| First boot/migrations | Proven by component/integration | Config + migrations + database suites + production image | No fresh external-host acceptance script |
-| Graceful restart/durable reload | Proven | Chromium journey gracefully restarts the real daemon and recovers session, network, connection, and backlog; domain tests cover the rest | — |
-| Cross-platform source portability and native distribution | Proven | Linux/macOS/Windows × x86-64/ARM64 all-feature CI; version-tag native matrix publishes deterministic provenance-attested archives | — |
-| Multi-architecture container | Proven on every `main` merge | Native amd64/arm64 builds, shape verification, signed provenance, and SPDX SBOM attestations | — |
-| 100k single-host target | Unproven | Duplicate-proof exact-delivery 64-client CI gate with generous numeric thresholds plus manual baselines through 2,000 clients | Target architecture, production budgets/thresholds, and tuned-host qualification are incomplete |
+| [Bootstrap and manage the server through the UI](administration-and-monitoring.md#bootstrap-and-manage-the-server-through-the-ui) | Partially proven | Typed configuration, revision/audit, PostgreSQL, and live BNC-listener tests | No browser mutation sweep of every subsection |
+| [Explore accounts, channels, policy, and audit](administration-and-monitoring.md#explore-accounts-channels-policy-and-audit) | Proven | Real PostgreSQL directory/filter/action HTTP journeys | — |
+| [Inspect and terminate live connections](administration-and-monitoring.md#inspect-and-terminate-live-connections) | Proven | Real core directory plus owner/admin exact-disconnect HTTP journeys | — |
+| [Monitor traffic, connections, latency, availability, and errors](administration-and-monitoring.md#monitor-traffic-connections-latency-availability-and-errors) | Proven | Telemetry arithmetic, runtime accounting, PostgreSQL retention, console, JSON, and metrics tests | External alerting is not part of e6irc |
+| [Audit privileged changes](administration-and-monitoring.md#audit-privileged-changes) | Proven | Core audit events and atomic PostgreSQL mutation/audit tests | — |
+| [Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge) | Partially proven | All-feature management journey and live pinned Matrix oracle | Discord and Slack require commercial credentials |
+| [Use the scripting CLI](bridges-clients-and-automation.md#use-the-scripting-cli) | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON executable journeys | — |
+| [Use the terminal UI](bridges-clients-and-automation.md#use-the-terminal-ui) | Proven | Real pseudo-terminal/e6ircd journey plus duplex protocol, model, and fuzz tests | — |
+| [Build another native client](bridges-clients-and-automation.md#build-another-native-client) | Proven | Shared-client tests plus CLI, TUI, load, TLS, and live-server consumers | — |
+| [Automate the REST API](bridges-clients-and-automation.md#automate-the-rest-api) | Proven | Exact router/OpenAPI catalog and real HTTP/PostgreSQL resource-family tests | OpenAPI schemas remain hand-authored and directly tested |
+| [Register and configure a channel](channels-and-account.md#register-and-configure-a-channel) | Proven | Core, PostgreSQL, services, console, and REST lifecycle tests | — |
+| [Recreate a registered channel](channels-and-account.md#recreate-a-registered-channel) | Proven | Core recreation plus PostgreSQL boot-load tests | — |
+| [Manage IRC credentials](channels-and-account.md#manage-irc-credentials) | Proven | Credential storage, console/API, and real-socket SASL tests | — |
+| [Manage personal access tokens and read state](channels-and-account.md#manage-personal-access-tokens-and-read-state) | Proven | Token lifecycle, bearer/OAUTHBEARER, marker persistence, API, and console tests | — |
+| [Inspect and terminate sessions](channels-and-account.md#inspect-and-terminate-sessions) | Proven | Owner-scoped browser/live-session inventory and exact-revocation tests | — |
+| [Discover service identity and readiness before sign-in](deployment-and-recovery.md#discover-service-identity-and-readiness-before-sign-in) | Proven | Real public server/liveness/readiness/login/OpenAPI HTTP tests | — |
+| [First production boot](deployment-and-recovery.md#first-production-boot) | Partially proven | Configuration/migration/import/boot-load tests and inspected production image | No fresh external-host acceptance |
+| [Deploy a release](deployment-and-recovery.md#deploy-a-release) | Proven | Six-platform builds, deterministic package test, image shape, and publication contract | Tag publication itself runs only for a matching release tag |
+| [Restart without losing durable state](deployment-and-recovery.md#restart-without-losing-durable-state) | Proven | Chromium gracefully restarts the real daemon and proves session/network/runtime/backlog recovery | — |
+| [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Partially proven | Readiness and database failure propagation tests | No long-lived kill/restore chaos journey under mixed traffic |
+| [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Secret open/seal/wrong-key startup, CLI, and write-refusal tests | Recovery is restore-or-replace, not in-place re-encryption |
+| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate and recorded 2,000-client baselines | 100,000-client tuned-host result and production budgets are absent |
+| [Sign in with a local password](identity-and-access.md#sign-in-with-a-local-password) | Proven | Chromium adds a password, signs out, and completes real local login against e6ircd/PostgreSQL | — |
+| [Sign in with OpenID Connect](identity-and-access.md#sign-in-with-openid-connect) | Proven | Real e6ircd, PostgreSQL, Dex, and Chromium plus exact Shauth journey | Provider diversity beyond Dex/Shauth |
+| [Link or unlink an OpenID Connect identity](identity-and-access.md#link-or-unlink-an-openid-connect-identity) | Proven | Real Dex/PostgreSQL conflict and console/API lifecycle tests | — |
+| [Sign out locally and across an identity provider](identity-and-access.md#sign-out-locally-and-across-an-identity-provider) | Proven | Generic session/front/back-channel tests plus exact Shauth coordinated browser logout | Provider diversity beyond Dex/Shauth |
+| [Authorize an input-constrained device](identity-and-access.md#authorize-an-input-constrained-device) | Proven | Real CLI through HTTP/PostgreSQL approval/consume to private cache and authenticated API | — |
+| [Authenticate an IRC or BNC client](identity-and-access.md#authenticate-an-irc-or-bnc-client) | Proven | Real socket PLAIN/OAUTHBEARER/BNC routing tests plus CLI and terminal client paths | — |
+| [Rotate and revoke access](identity-and-access.md#rotate-and-revoke-access) | Proven | Credential, token, session, exact connection, and coordinated-logout journeys | — |
+| [Connect and register](irc-and-services.md#connect-and-register) | Proven | Real sockets, TLS, core/e2e, database, irctest, property, and fuzz tests | Public third-party server interop is separately opt-in |
+| [Join and participate in a channel](irc-and-services.md#join-and-participate-in-a-channel) | Proven | Core integration and both irctest suites | — |
+| [Send a direct message](irc-and-services.md#send-a-direct-message) | Proven | Core delivery and PostgreSQL participant authorization/pagination tests | — |
+| [Resume history and synchronize read state](irc-and-services.md#resume-history-and-synchronize-read-state) | Proven | Core/PostgreSQL selector, restart, REST, native-client, and marker tests | — |
+| [Register an account or channel through services](irc-and-services.md#register-an-account-or-channel-through-services) | Proven | Core services, persistence-backed irctest, PostgreSQL, and console/API tests | — |
+| [Operate and protect the network through IRC](irc-and-services.md#operate-and-protect-the-network-through-irc) | Proven | Core operator/ban tests and atomic PostgreSQL policy/audit tests | — |
+| [Connect through IRC-over-WebSocket](irc-and-services.md#connect-through-irc-over-websocket) | Proven | Real WebSocket protocol integration across supported framing modes | A third-party browser client is not driven |
+| [Make network management available](networks-and-bouncer.md#make-network-management-available) | Proven | Configuration validation and live runtime listener management tests | — |
+| [Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network](networks-and-bouncer.md#add-libera-chat-oftc-efnet-snoonet-or-a-custom-irc-network) | Externally qualified | Chromium verifies safe preset defaults; console/API crosses PostgreSQL and a local live driver | Public Libera DNS/TLS/SASL uses the opt-in probe |
+| [Diagnose an upstream connection](networks-and-bouncer.md#diagnose-an-upstream-connection) | Proven | Runtime snapshot/error-ledger tests and real Chromium operations inspection | — |
+| [Attach any IRC client to an owned network](networks-and-bouncer.md#attach-any-irc-client-to-an-owned-network) | Proven | Real listener/upstream/PostgreSQL authentication, routing, and refusal tests | — |
+| [Persist and replay while detached or across restart](networks-and-bouncer.md#persist-and-replay-while-detached-or-across-restart) | Proven | Real PostgreSQL restart, trim, deletion, and wire-form tests | — |
+| [Edit, pause, resume, or delete a network](networks-and-bouncer.md#edit-pause-resume-or-delete-a-network) | Proven | Console/API lifecycle, registry, race, and WebSocket detachment tests | — |
+| [Enter chat and choose a network](web-chat.md#enter-chat-and-choose-a-network) | Proven | Chromium crosses authentication, inventory, PostgreSQL, registry, driver, and `/ws/ui` | Public-network interop remains opt-in |
+| [Receive replay and live messages without gaps or duplicates](web-chat.md#receive-replay-and-live-messages-without-gaps-or-duplicates) | Proven | Deterministic Chromium edge cases plus real upstream/persistence/restart path | — |
+| [Join, converse, and leave](web-chat.md#join-converse-and-leave) | Proven | Chromium acknowledgement/refusal/lifecycle cases and real bidirectional upstream journey | — |
+| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Browser authentication/navigation plus handler-level role, page, and mutation journeys | Chromium does not click every administrator mutation |
 
 “—” means the defined journey boundary is crossed by current CI; it does not
 mean every possible environment or fault has been tested.

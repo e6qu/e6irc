@@ -50,6 +50,15 @@ fn get(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
 }
 
+fn cookie_form_post(path: &str, session: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 fn csrf_from_html(html: &str) -> &str {
     html.split("name=\"csrf\" value=\"")
         .nth(1)
@@ -1457,6 +1466,208 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         Some("127.0.0.1:0".parse().unwrap())
     );
     drop(pool);
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
+}
+
+/// Every credential-bearing collection on the Configuration page crosses the
+/// same real form → validation/sealing → revision/audit → PostgreSQL path.
+/// This protects the controls that a scalar-only configuration test cannot
+/// cover and proves that rendered responses never disclose submitted secrets.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn console_configuration_manages_every_credential_collection() {
+    let url = support::test_db("console_configuration_manages_every_credential_collection").await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("managed-configuration-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("account");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.collections.example".into(),
+        network_name: "CollectionsNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: Some("http://irc.collections.example".into()),
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(e6ircd::config::DatabaseConfig { url: url.clone() }),
+        secrets: Some(SecretsConfig { key_file: key_path }),
+        ..Config::default()
+    };
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http");
+    let page_request = format!(
+        "GET /console/configuration HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page) = request(http, &page_request).await;
+    assert_eq!(status, 200, "{page}");
+    let csrf = csrf_from_html(&page).to_string();
+
+    let oper_secret = "operator-password-must-not-render";
+    let oper_form = format!("csrf={csrf}&name=netop&password={oper_secret}");
+    let (status, _, page) = request(
+        http,
+        &cookie_form_post("/console/configuration/opers", &session, &oper_form),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("added IRC operator netop"), "{page}");
+    assert!(page.contains("<code>netop</code>"), "{page}");
+    assert!(!page.contains(oper_secret), "{page}");
+
+    let oidc_secret = "provider-secret-must-not-render";
+    let oidc_form = format!(
+        "csrf={csrf}&name=workforce&issuer_url=https%3A%2F%2Fid.example&\
+         client_id=e6irc&client_secret={oidc_secret}&scopes=openid+profile&\
+         end_session_endpoint=https%3A%2F%2Fid.example%2Flogout&\
+         token_endpoint_auth_method=client_secret_post"
+    );
+    let (status, _, page) = request(
+        http,
+        &cookie_form_post("/console/configuration/oidc", &session, &oidc_form),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(
+        page.contains("added OpenID Connect provider workforce"),
+        "{page}"
+    );
+    assert!(page.contains("https://id.example"), "{page}");
+    assert!(!page.contains(oidc_secret), "{page}");
+
+    let upstream_secret = "upstream-password-must-not-render";
+    let network_form = format!(
+        "csrf={csrf}&name=staffnet&owner=alice&kind=irc&\
+         addr=irc.example%3A6697&tls=on&nick=alice&realname=Alice&\
+         autojoin=%23staff&buffer_cap=321&sasl_account=alice-login&\
+         sasl_password={upstream_secret}"
+    );
+    let (status, _, page) = request(
+        http,
+        &cookie_form_post(
+            "/console/configuration/shared-networks",
+            &session,
+            &network_form,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("added server network staffnet"), "{page}");
+    assert!(page.contains("irc.example:6697"), "{page}");
+    assert!(!page.contains(upstream_secret), "{page}");
+
+    let verification_pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("verification pool");
+    let snapshot = e6ircd::db::load_managed_config(&verification_pool)
+        .await
+        .expect("managed configuration");
+    assert_eq!(snapshot.revision, 4);
+    assert_eq!(snapshot.updated_by, "alice");
+    assert_eq!(snapshot.settings.opers.len(), 1);
+    assert_eq!(
+        secret_key
+            .open(
+                &snapshot.settings.opers[0].password,
+                e6ircd::secret::CONFIG_CONTEXT,
+            )
+            .expect("open operator password"),
+        oper_secret
+    );
+    assert_eq!(snapshot.settings.oidc_providers.len(), 1);
+    assert_eq!(
+        secret_key
+            .open(
+                &snapshot.settings.oidc_providers[0].client_secret,
+                e6ircd::secret::CONFIG_CONTEXT,
+            )
+            .expect("open provider secret"),
+        oidc_secret
+    );
+    assert_eq!(snapshot.settings.networks.len(), 1);
+    let stored_network = &snapshot.settings.networks[0];
+    assert_eq!(stored_network.owner.as_deref(), Some("alice"));
+    assert_eq!(stored_network.autojoin, ["#staff"]);
+    assert_eq!(stored_network.buffer_cap, 321);
+    assert_eq!(
+        secret_key
+            .open(
+                stored_network
+                    .sasl_password
+                    .as_deref()
+                    .expect("stored upstream password"),
+                e6ircd::secret::CONFIG_CONTEXT,
+            )
+            .expect("open upstream password"),
+        upstream_secret
+    );
+
+    let audit_details: Vec<String> =
+        sqlx::query_scalar("SELECT detail FROM audit_log WHERE action = 'CONFIG' ORDER BY id")
+            .fetch_all(&verification_pool)
+            .await
+            .expect("configuration audit");
+    assert_eq!(audit_details.len(), 3);
+    assert!(audit_details[0].contains("added IRC operator netop"));
+    assert!(audit_details[1].contains("added OpenID Connect provider workforce"));
+    assert!(audit_details[2].contains("added server network staffnet"));
+    for detail in &audit_details {
+        assert!(!detail.contains(oper_secret), "{detail}");
+        assert!(!detail.contains(oidc_secret), "{detail}");
+        assert!(!detail.contains(upstream_secret), "{detail}");
+    }
+
+    for (path, body, message) in [
+        (
+            "/console/configuration/opers/delete",
+            format!("csrf={csrf}&name=netop"),
+            "removed IRC operator netop",
+        ),
+        (
+            "/console/configuration/oidc/delete",
+            format!("csrf={csrf}&name=workforce"),
+            "removed OpenID Connect provider workforce",
+        ),
+        (
+            "/console/configuration/shared-networks/delete",
+            format!("csrf={csrf}&name=staffnet&owner=alice"),
+            "removed server network staffnet",
+        ),
+    ] {
+        let (status, _, page) = request(http, &cookie_form_post(path, &session, &body)).await;
+        assert_eq!(status, 200, "{page}");
+        assert!(page.contains(message), "{page}");
+    }
+    let snapshot = e6ircd::db::load_managed_config(&verification_pool)
+        .await
+        .expect("managed configuration after deletes");
+    assert_eq!(snapshot.revision, 7);
+    assert!(snapshot.settings.opers.is_empty());
+    assert!(snapshot.settings.oidc_providers.is_empty());
+    assert!(snapshot.settings.networks.is_empty());
+    verification_pool.close().await;
+
     assert_eq!(
         running.shutdown.run().await,
         e6ircd::net::ShutdownOutcome::Flushed

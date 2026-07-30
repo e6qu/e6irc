@@ -32,6 +32,12 @@ registry unavailability, upstream connection failure, and socket closure each
 produce a visible state. Retrying must create one new attachment rather than
 stacking duplicate handlers.
 
+**Security and observability.** Network inventory and attachment are
+cookie-authenticated and owner-scoped; the WebSocket enforces same-origin
+policy. Server-controlled text reaches the document only through text nodes,
+and connection/attachment/error state is counted without user text in metric
+labels.
+
 **Evidence.** The embedded-shell, authentication, zero-network, deliberate
 REST-failure, network-creation, and authenticated WebSocket states are
 browser-tested against a real daemon. Focused client-state cases use browser
@@ -42,6 +48,10 @@ attachment.
 
 **Actor and goal.** A reconnecting user wants stored backlog followed by live
 traffic in one ordered conversation.
+
+**Preconditions.** The selected network exists, the browser session and
+WebSocket attachment are valid, and PostgreSQL is configured when replay must
+survive process restart.
 
 **Flow.**
 
@@ -59,6 +69,11 @@ the working live stream. Socket closure marks the connection disconnected.
 Malformed events are rejected or ignored according to their explicit protocol
 contract without corrupting other buffers.
 
+**Security and observability.** History and replay use the same owner/network
+authorization. Buffers, requested history, and deduplication indexes are
+bounded; upstream text is rendered as text, while replay/database failures are
+visible and classified without logging conversation bodies.
+
 **Evidence.** Browser tests exercise replay boundaries, history races, and
 deduplication with deterministic transport. The full-stack browser case also
 drives a real upstream line through persistence, the multiplexer, and
@@ -69,6 +84,10 @@ same session can inspect the persisted line afterward.
 
 **Actor and goal.** A user wants to join a channel or open a direct
 conversation, send and receive messages, and close it intentionally.
+
+**Preconditions.** The selected WebSocket attachment is connected, the
+upstream session permits the requested target/action, and the browser has a
+current network and conversation selection.
 
 **Flow.**
 
@@ -93,6 +112,11 @@ visibly without truncating the message into different content. Removing the
 selected network detaches the WebSocket. Channel leave and direct-message
 close are different actions and remain different in both UI and wire behavior.
 
+**Security and observability.** Browser text is validated as a complete IRC
+line at the WebSocket boundary and again by the driver/core path. Pending
+sends, buffers, members, and sent-history are bounded; acceptance/refusal is
+correlated by opaque request identifier and message bodies stay out of metrics.
+
 **Evidence.** Browser state tests cover NAMES, direct-message close, channel
 leave, delayed acknowledgement, and refusal without false echo. A real local
 IRC peer observes the Chromium composer’s exact PRIVMSG after a correlated
@@ -105,6 +129,10 @@ and detachment on network removal.
 **Actor and goal.** A user wants chat, network configuration, channel
 governance, sessions, and account access to feel like one product.
 
+**Preconditions.** The user has a valid browser session; administrator-only
+destinations additionally require the account to be in the effective
+administrator set.
+
 **Flow.**
 
 - Global navigation exposes the surfaces allowed by the signed-in role.
@@ -116,9 +144,16 @@ governance, sessions, and account access to feel like one product.
 - Sign out leaves the application at a public, reload-safe confirmation page
   with a clear route back to authentication.
 
-**Failure contract.** A non-administrator receives the same authorization
+**Visible failures and recovery.** A non-administrator receives the same authorization
 boundary at the handler, regardless of whether a link was hidden. Server
-errors render an error state rather than an empty collection.
+errors render an error state rather than an empty collection. Expired sessions
+return to authentication, and sign-out ends at the reload-safe signed-out page.
+
+**Security and observability.** Navigation visibility is only presentation;
+each destination independently authenticates, authorizes, and applies CSRF to
+mutations. Private pages are non-cacheable and use a restrictive content
+security policy; errors expose a safe problem rather than secrets or raw
+database/provider text.
 
 **Evidence.** Role gating and each server-rendered page are covered at HTTP
 level. Browser coverage proves application navigation around authentication

@@ -9,7 +9,11 @@ network registry even when raw IRC attachment is disabled.
 **Actor and goal.** An administrator wants users to create always-on networks
 through the UI.
 
-**Preconditions and flow.**
+**Preconditions.** PostgreSQL is reachable, the administrator is named in the
+effective managed configuration, and a stable master key is available if
+upstream credentials will be stored.
+
+**Flow.**
 
 1. Configure PostgreSQL and a stable secret key. PostgreSQL owns the network
    registry; the key is required only when storing an upstream password.
@@ -26,6 +30,11 @@ passwordless networks may still be created, but password fields are disabled
 and plaintext storage is refused. A failed listener rebind leaves the old
 working listener active and reports the error.
 
+**Security and observability.** The configuration form is administrator-only,
+session-authenticated, and CSRF-protected. Revisions and redacted audit records
+identify each change; listener state and bind failure are exposed without
+including credentials.
+
 **Evidence.** Proven by configuration validation/runtime-listener unit tests
 and `console_configuration_enables_and_persists_bnc_listener`.
 
@@ -33,6 +42,10 @@ and `console_configuration_enables_and_persists_bnc_listener`.
 
 **Actor and goal.** An account holder wants an always-on upstream configured
 entirely through **BNC networks**.
+
+**Preconditions.** PostgreSQL and the network registry are ready, the caller
+has a browser session, and a master key is configured if upstream SASL
+credentials are supplied.
 
 **Flow.**
 
@@ -68,6 +81,12 @@ entirely through **BNC networks**.
 - A synchronous driver-construction failure happens before insertion. Once
   storage succeeds, registry insertion owns the running/retrying driver.
 
+**Security and observability.** The mutation is owner-scoped and
+CSRF-protected. Endpoints pass syntax, prohibited-address, DNS-result, and TLS
+certificate checks; passwords are write-only and sealed. Runtime status,
+traffic, latency, attempts, and closed error codes identify the result without
+exposing the password or raw provider text.
+
 **Evidence.** Preset integrity and server-side application have unit tests.
 `console_add_and_delete_network_via_the_console` proves console creation and
 deletion with PostgreSQL; `bnc_network_management_lifecycle` proves API
@@ -79,6 +98,10 @@ Libera DNS/TLS/SASL behavior is externally qualified rather than CI-proven.
 
 **Actor and goal.** An account holder wants to understand whether a network is
 working and why it is not.
+
+**Preconditions.** The caller owns or may use the named network and has a valid
+browser session. PostgreSQL is required for persisted backlog and historical
+monitoring; live runtime diagnosis remains tied to the registry.
 
 **Flow.**
 
@@ -98,6 +121,11 @@ absent, disabled, connecting, or failed. Runtime timestamps reset on a
 restart/reconfiguration and are labeled as such. Stored credentials are shown
 only as presence/posture.
 
+**Security and observability.** Detail, operations, buffer, and runtime
+selection repeat owner authorization. Error reasons use a closed redacted
+classification, counters are bounded, and message text is confined to the
+owner’s backlog rather than metrics or global logs.
+
 **Evidence.** Snapshot/accounting/error-ledger behavior is unit-tested; network
 detail/operations rendering and owner scoping are HTTP-tested; monitoring
 aggregation/history is tested at HTTP/DB level.
@@ -106,6 +134,10 @@ aggregation/history is tested at HTTP/DB level.
 
 **Actor and goal.** A user wants a normal IRC client to resume an always-on
 network.
+
+**Preconditions.** The BNC listener is enabled and reachable, the owned/shared
+network is enabled, and the account has a primary or app password for SASL
+PLAIN.
 
 **Flow.**
 
@@ -126,6 +158,11 @@ cross-account selection are refused before attachment. An unavailable
 upstream may still allow stored backlog replay, but it is not described as a
 live connection.
 
+**Security and observability.** Authentication precedes case-insensitive
+owner-scoped lookup; the network name cannot select another account’s driver.
+Attachment counts, traffic, exact connection identifiers, and bounded failure
+categories are visible only through owner/administrator controls.
+
 **Evidence.** Proven end-to-end over real sockets and PostgreSQL by the BNC
 authentication/routing/rejection/chunking tests and network-management
 lifecycle test. These tests now run in the database CI job.
@@ -134,6 +171,9 @@ lifecycle test. These tests now run in the database CI job.
 
 **Actor and goal.** A user wants messages received with no clients attached to
 survive reconnection and process restart.
+
+**Preconditions.** PostgreSQL is configured, the network is enabled, and its
+driver receives upstream lines while no BNC or web client is attached.
 
 **Flow.**
 
@@ -150,6 +190,11 @@ survive reconnection and process restart.
 do not fabricate durable success. Removing/replacing a network aborts the old
 persistence task so it cannot retain a ghost driver.
 
+**Security and observability.** Buffer rows are keyed by casefolded owner and
+network, replay is owner-authorized, wire lines and collections are bounded,
+and retention trims only the selected network. Failures record safe categories
+without leaking line content.
+
 **Evidence.** Proven by restart-spanning replay, trim isolation, deletion
 purge, wire-form, and detached buffer API tests against PostgreSQL.
 
@@ -157,6 +202,9 @@ purge, wire-form, and detached buffer API tests against PostgreSQL.
 
 **Actor and goal.** An owner wants lifecycle control without editing files or
 restarting the daemon.
+
+**Preconditions.** The caller owns the network, the registry and PostgreSQL
+are ready, and a master key exists for any credential replacement.
 
 **Flow.**
 
@@ -174,6 +222,11 @@ restarting the daemon.
 **Visible failures and recovery.** Every transition reports conflict,
 validation, storage, or runtime failure. A stale runtime handle, leaked task,
 or partial rename is not an accepted state.
+
+**Security and observability.** Console mutations are CSRF-protected and API
+mutations require owner authentication. The mutation gate serializes storage
+and runtime transitions; secrets remain write-only while lifecycle, traffic,
+attachments, latency, and redacted errors remain inspectable.
 
 **Evidence.** Proven by console edit/create/delete tests, API full-replacement
 and patch lifecycle tests, registry unit tests, and WebSocket detachment on
