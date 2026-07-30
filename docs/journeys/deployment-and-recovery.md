@@ -103,7 +103,10 @@ when archives are requested.
   receives signed provenance, and the workflow verifies each attestation
   through the same public consumer command operators use.
 - The runtime image is `debian:bookworm-slim`; the server runs as an
-  unprivileged user and contains the embedded web client.
+  unprivileged user and contains the embedded web client and every compiled
+  bridge driver.
+- Environment bootstrap renders to an unpredictable mode-`0600` file unless
+  an operator explicitly supplies the path.
 - `deploy/` supplies the Terraform/ECS example, its deployment contract, and a
   hardened systemd service for native Linux installation.
 - A tag exactly equal to `v` plus the workspace version builds `e6ircd`,
@@ -128,7 +131,9 @@ publication, generates and verifies the attestations, and validates the final
 manifest shape. Ordinary pull-request CI proves the native packager's exact
 members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
-incomplete archive set. `systemd-analyze verify` checks the service in CI.
+incomplete archive set. `systemd-analyze verify` checks the service in CI,
+the same gate compares its stop budget to the daemon flush budget, and the
+portable entrypoint test executes both generated-path and operator-path modes.
 
 ## Restart without losing durable state
 
@@ -152,6 +157,10 @@ time for bounded flush paths.
    sessions from PostgreSQL.
 6. Start enabled networks and listeners from the loaded revision.
 
+While serving, main supervises the core, PostgreSQL worker, and listener tasks.
+An unexpected task return or panic enters this same shutdown flow and results
+in a non-zero process exit.
+
 **Visible failures and recovery.** Shutdown timeouts and write failures are
 logged; the process does not wait forever. A new process does not claim old
 runtime connection duration. Durable rows remain bounded by their retention/
@@ -162,8 +171,9 @@ with the configured external key and never logs them. Shutdown and boot stages,
 flush failures, driver reconnects, readiness, and new runtime timestamps make
 the transition visible without pretending ephemeral sessions survived.
 
-**Evidence.** Graceful shutdown and worker flush behavior are unit/integration
-tested; BNC backlog, read markers, channels, bans, browser sessions, and
+**Evidence.** Graceful shutdown, critical-task outcome provenance, and worker
+flush behavior are unit/integration tested; BNC backlog, read markers,
+channels, bans, browser sessions, and
 history each have restart/boot-load PostgreSQL tests. The Chromium acceptance
 journey additionally sends real upstream traffic, stops the daemon with
 SIGTERM and requires exit zero, starts a new process on the same database, and
@@ -193,8 +203,10 @@ restored.
 **Visible failures and recovery.** Requests that require PostgreSQL return
 dependency errors and readiness remains false until a real query succeeds
 again. The readiness query and shared pool acquisition each have explicit
-two-second application deadlines, so an interrupted database cannot leave the
-deployment probe or an unrelated database-backed request hanging indefinitely.
+two-second application deadlines. Every pooled connection also carries a
+15-second statement deadline and five-second lock deadline, so an interrupted,
+wedged, or contended database cannot leave a database-backed request hanging
+indefinitely.
 Retrying after recovery re-enters the normal database worker path; the server
 never reports an unwritten mutation as durable.
 

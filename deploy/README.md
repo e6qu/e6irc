@@ -62,18 +62,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now e6ircd
 ```
 
-The unit uses SIGTERM and a 15-second stop budget so the daemon’s bounded
-graceful flush completes. It grants no ambient capabilities and makes the host
-filesystem read-only to the process; listeners on privileged ports therefore
-need a reverse proxy or an explicit, reviewed service override.
+The unit uses SIGTERM and a 35-second stop budget, exceeding the daemon’s
+30-second bounded PostgreSQL flush budget so systemd cannot kill a still-clean
+shutdown first. It grants no ambient capabilities and makes the host filesystem
+read-only to the process; listeners on privileged ports therefore need a
+reverse proxy or an explicit, reviewed service override.
 
 ## Bootstrap configuration (env → TOML)
 
 `e6ircd` reads a TOML config file. `deploy/docker-entrypoint.sh` renders that
 file from environment at container start (the deployment injects secrets —
 `E6IRC_DATABASE_URL`, `E6IRC_OIDC_CLIENT_SECRET` — from AWS Secrets Manager)
-and then execs the server. Missing required values fail the container loudly
-rather than starting half-configured. On the first database-backed start,
+and then execs the server. The generated file has mode `0600`; when no explicit
+path is supplied its name is unpredictable. Missing required values fail the
+container loudly rather than starting half-configured. On the first database-backed start,
 operational values are imported into the revisioned `server_settings` row.
 After that, administrators manage them at `/console/configuration`; the
 database URL, secrets-key source, HTTP bind, immutable release revision, and

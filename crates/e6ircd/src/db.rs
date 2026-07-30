@@ -22,6 +22,8 @@ use e6irc_queue::{Receiver, Sender};
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+const DATABASE_STATEMENT_TIMEOUT_MS: i64 = 15_000;
+const DATABASE_LOCK_TIMEOUT_MS: i64 = 5_000;
 
 #[derive(Debug)]
 pub enum DbError {
@@ -90,6 +92,19 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
     // longer default acquisition timeout.
     let pool = PgPoolOptions::new()
         .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                    .bind(DATABASE_STATEMENT_TIMEOUT_MS.to_string())
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                    .bind(DATABASE_LOCK_TIMEOUT_MS.to_string())
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(url)
         .await
         .map_err(DbError::Connect)?;

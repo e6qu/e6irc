@@ -16,7 +16,7 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 COPY --from=web-build /src/web/dist ./web/dist
-RUN cargo build --release -p e6ircd --features embed-web
+RUN cargo build --release -p e6ircd --all-features
 
 FROM debian:bookworm-slim
 RUN apt-get update \

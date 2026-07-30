@@ -92,6 +92,7 @@ fn run(args: &[String]) -> ExitCode {
     runtime.block_on(async {
         match net::start(config).await {
             Ok(running) => {
+                let mut running = running;
                 for addr in &running.addrs {
                     println!("listening on {addr}");
                 }
@@ -100,10 +101,20 @@ fn run(args: &[String]) -> ExitCode {
                 // queue (DESIGN §18). The flush is the correctness point — the
                 // DB worker's buffered history must reach PostgreSQL, never be
                 // dropped by an abrupt process exit.
-                wait_for_shutdown_signal().await;
-                eprintln!("e6ircd: shutting down");
+                let critical_failure = tokio::select! {
+                    () = wait_for_shutdown_signal() => None,
+                    failure = running.shutdown.wait_for_critical_failure() => Some(failure),
+                };
+                if let Some(failure) = &critical_failure {
+                    eprintln!("e6ircd: {failure}");
+                } else {
+                    eprintln!("e6ircd: shutting down");
+                }
                 match running.shutdown.run().await {
-                    net::ShutdownOutcome::Flushed => ExitCode::SUCCESS,
+                    net::ShutdownOutcome::Flushed if critical_failure.is_none() => {
+                        ExitCode::SUCCESS
+                    }
+                    net::ShutdownOutcome::Flushed => ExitCode::FAILURE,
                     net::ShutdownOutcome::FlushTimedOut => {
                         eprintln!(
                             "e6ircd: DB flush did not complete before timeout; \
@@ -113,6 +124,14 @@ fn run(args: &[String]) -> ExitCode {
                     }
                     net::ShutdownOutcome::WorkerPanicked => {
                         eprintln!("e6ircd: DB worker panicked during shutdown");
+                        ExitCode::FAILURE
+                    }
+                    net::ShutdownOutcome::CoreTimedOut => {
+                        eprintln!("e6ircd: core worker did not stop before shutdown timeout");
+                        ExitCode::FAILURE
+                    }
+                    net::ShutdownOutcome::CorePanicked => {
+                        eprintln!("e6ircd: core worker panicked during shutdown");
                         ExitCode::FAILURE
                     }
                 }

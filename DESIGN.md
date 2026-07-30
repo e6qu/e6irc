@@ -832,9 +832,10 @@ on startup (refusing to start on drift, loudly). CI provisions `postgres:18`
 for every database-backed suite — legacy majors are deliberately not a
 support target, so "it happens to work on an older server" is not a claim
 this project makes or tests. The shared application pool has a two-second
-acquisition deadline: dependency loss or pool exhaustion becomes a typed
-database failure for HTTP and worker callers instead of parking them on the
-library default timeout.
+acquisition deadline, a 15-second PostgreSQL statement deadline, and a
+five-second lock-acquisition deadline on every pooled connection. Dependency
+loss, pool exhaustion, a wedged query, or a contended lock therefore becomes a
+typed database failure instead of parking an HTTP or worker caller indefinitely.
 
 Principal tables (columns abridged):
 
@@ -1529,13 +1530,16 @@ but the CLI, TUI, and BNC must surface the rejection.
   negligible at config-secret volumes. `e6ircd genkey` mints a key;
   `e6ircd seal` encrypts stdin. (Key rotation re-seals values with a new
   key; a versioned `enc:vN:` prefix leaves room for an XChaCha upgrade.)
-- TLS ≥ 1.2 everywhere (rustls); HSTS on the web origin; WS upgrades check
-  Origin.
+- TLS ≥ 1.2 everywhere (rustls); responses carry HSTS whenever the validated
+  public origin is HTTPS (and never on an explicitly plain development
+  origin); WS upgrades check Origin.
 - Rate limits: per-IP connection/registration throttle, per-session command
   token bucket, per-account API limits (tower middleware), SASL attempt
   limits with backoff.
 - IRC network protections: kline/dline/xline equivalents managed by opers
   and via admin API, all audit-logged.
+- Every HTTP response receives a fresh server-generated 128-bit correlation
+  identifier. No client-supplied identifier is trusted as provenance.
 - No secrets in logs; `tracing` field redaction for credentials.
 - CSRF per §9.2; cookies HttpOnly/Secure; session fixation avoided by
   rotating session id at login.
@@ -1688,6 +1692,12 @@ Layers, bottom to top:
   the bounded PostgreSQL write paths within the shutdown budget. Durable
   network/history state is continuously persisted; there is no separate
   driver-checkpoint format.
+- Main owns and supervises the core and PostgreSQL worker join handles while
+  serving; listener join handles have explicit supervisors. Any unexpected
+  completion or panic names the failed task, initiates the same bounded drain,
+  and makes the process exit non-zero. HTTP-to-core control requests have a
+  five-second reply deadline, so even a live but wedged core cannot hold an
+  API request forever.
 - BNC listener changes apply live. Core identity/limits, IRC listeners, OIDC,
   operator, and access-policy changes are stored immediately and explicitly
   reported as restart-required; no response claims those values were applied
@@ -1699,6 +1709,11 @@ Layers, bottom to top:
   and SPDX-SBOM attestations; the assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.
+  The container daemon is built with every bridge plus the embedded web
+  client, and its environment-rendered bootstrap file is mode `0600` at an
+  unpredictable temporary path unless the operator explicitly chooses one.
+  The systemd stop budget mechanically exceeds the daemon's bounded
+  PostgreSQL flush budget.
   A version tag equal to `v` plus the workspace version publishes deterministic
   archives containing `e6ircd`, `e6irc`, and `e6irc-tui` for Linux, macOS, and
   Windows on x86-64 and ARM64. Each archive has a GitHub build-provenance

@@ -76,6 +76,25 @@ pub struct Running {
     pub shutdown: ShutdownHandle,
 }
 
+/// A task whose unexpected exit invalidates the process. The daemon reports
+/// the exact task and join outcome, performs the same bounded graceful drain
+/// as a signal-triggered shutdown, and exits non-zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalTaskFailure {
+    pub task: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for CriticalTaskFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "critical task {} stopped: {}",
+            self.task, self.reason
+        )
+    }
+}
+
 /// Everything `main` needs to shut the server down cleanly on SIGTERM/SIGINT.
 /// Built by [`start`]; see [`ShutdownHandle::run`] for the sequence.
 pub struct ShutdownHandle {
@@ -85,10 +104,16 @@ pub struct ShutdownHandle {
     /// The core worker's input sender. Pushing [`Input::Shutdown`] makes the
     /// core notify clients and then stop, which drops the DB request sender.
     core_tx: Sender<Input>,
+    /// The core is the authority for all live state. Main watches this handle
+    /// while serving and treats any pre-shutdown completion as fatal.
+    core_worker: Option<tokio::task::JoinHandle<()>>,
     /// The DB worker task, awaited (bounded) so its buffered `log_batch` reaches
     /// PostgreSQL before exit. `None` when no `[database]` is configured (there
     /// is then no worker and nothing buffered to lose).
     db_worker: Option<tokio::task::JoinHandle<()>>,
+    /// Listener handles are supervised in detached join-watchers because the
+    /// shutdown path only needs their abort handles.
+    critical_failures: tokio::sync::mpsc::UnboundedReceiver<CriticalTaskFailure>,
     /// Runtime-managed BNC listener. Unlike the bootstrap listeners, this can
     /// be replaced from the console, so shutdown must address the controller
     /// rather than only the task that happened to exist at startup.
@@ -105,9 +130,46 @@ pub enum ShutdownOutcome {
     FlushTimedOut,
     /// The DB worker task panicked while draining.
     WorkerPanicked,
+    /// The core did not stop within the bounded shutdown interval.
+    CoreTimedOut,
+    /// The core task panicked while processing live state.
+    CorePanicked,
 }
 
 impl ShutdownHandle {
+    /// Wait until a critical task exits before shutdown was requested.
+    pub async fn wait_for_critical_failure(&mut self) -> CriticalTaskFailure {
+        let core_worker = self
+            .core_worker
+            .as_mut()
+            .expect("critical-failure wait is called only while the core is running");
+        if let Some(db_worker) = self.db_worker.as_mut() {
+            tokio::select! {
+                result = core_worker => {
+                    self.core_worker = None;
+                    critical_join_failure("IRC core", result)
+                }
+                result = db_worker => {
+                    self.db_worker = None;
+                    critical_join_failure("PostgreSQL worker", result)
+                }
+                failure = self.critical_failures.recv() => {
+                    failure.expect("listener supervisors remain alive while serving")
+                }
+            }
+        } else {
+            tokio::select! {
+                result = core_worker => {
+                    self.core_worker = None;
+                    critical_join_failure("IRC core", result)
+                }
+                failure = self.critical_failures.recv() => {
+                    failure.expect("listener supervisors remain alive while serving")
+                }
+            }
+        }
+    }
+
     /// Run the graceful-shutdown sequence (DESIGN §18): stop accepting new
     /// connections, ask the core to notify clients and stop, then wait for the
     /// DB worker to flush its buffered history. Returns once the worker has
@@ -131,6 +193,13 @@ impl ShutdownHandle {
         // producer count up. (The core breaks on the Shutdown event regardless;
         // this just keeps the shutdown intent honest.)
         drop(self.core_tx);
+        if let Some(worker) = self.core_worker {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_join_error)) => return ShutdownOutcome::CorePanicked,
+                Err(_elapsed) => return ShutdownOutcome::CoreTimedOut,
+            }
+        }
         // 3. Wait for the DB worker to observe its now-dropped sender, drain,
         //    and flush. Bounded so a wedged database can't hang the shutdown.
         let Some(worker) = self.db_worker else {
@@ -142,6 +211,32 @@ impl ShutdownHandle {
             Err(_elapsed) => ShutdownOutcome::FlushTimedOut,
         }
     }
+}
+
+fn critical_join_failure(
+    task: &'static str,
+    result: Result<(), tokio::task::JoinError>,
+) -> CriticalTaskFailure {
+    let reason = match result {
+        Ok(()) => "exited unexpectedly".to_string(),
+        Err(error) if error.is_panic() => format!("panicked: {error}"),
+        Err(error) if error.is_cancelled() => format!("was cancelled: {error}"),
+        Err(error) => format!("failed: {error}"),
+    };
+    CriticalTaskFailure { task, reason }
+}
+
+fn supervise_listener(
+    name: &'static str,
+    task: tokio::task::JoinHandle<()>,
+    failures: tokio::sync::mpsc::UnboundedSender<CriticalTaskFailure>,
+) -> tokio::task::AbortHandle {
+    let abort = task.abort_handle();
+    tokio::spawn(async move {
+        let failure = critical_join_failure(name, task.await);
+        drop(failures.send(failure));
+    });
+    abort
 }
 
 #[derive(Debug)]
@@ -384,6 +479,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         core_tx.monitor(),
         db_tx.monitor(),
     ));
+    let (critical_tx, critical_rx) = tokio::sync::mpsc::unbounded_channel();
     let managed_config =
         managed_config.map(|snapshot| Arc::new(tokio::sync::RwLock::new(snapshot)));
     // SASL is only advertised when a database exists to answer verification
@@ -550,6 +646,20 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             auth_rate_burst: config.limits.auth_rate_burst,
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             conn_limiter: limiter.clone(),
+            request_id_prefix: {
+                use aws_lc_rs::rand::SecureRandom;
+                let mut bytes = [0u8; 8];
+                aws_lc_rs::rand::SystemRandom::new()
+                    .fill(&mut bytes)
+                    .map_err(|_| io::Error::other("system RNG for HTTP request identifiers"))?;
+                u64::from_le_bytes(bytes)
+            },
+            request_id_counter: std::sync::atomic::AtomicU64::new(0),
+            hsts_enabled: config
+                .http
+                .as_ref()
+                .and_then(|http| http.public_url.as_deref())
+                .is_some_and(|url| url.starts_with("https://")),
         }))
     } else {
         None
@@ -571,7 +681,11 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     eprintln!("http server exited: {e}");
                 }
             });
-            listeners.push(http_task.abort_handle());
+            listeners.push(supervise_listener(
+                "HTTP listener",
+                http_task,
+                critical_tx.clone(),
+            ));
             Some(bound)
         }
         None => None,
@@ -654,7 +768,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .collect(),
         );
     }
-    tokio::spawn(core_worker(core, core_rx));
+    let core_worker = tokio::spawn(core_worker(core, core_rx));
 
     // Liveness reaper tick: drives the core's registration deadline and idle
     // PING/PONG timeout so a silent connection can't hold a session forever.
@@ -693,7 +807,11 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     eprintln!("ws-irc listener exited: {e}");
                 }
             });
-            listeners.push(ws_task.abort_handle());
+            listeners.push(supervise_listener(
+                "WebSocket IRC listener",
+                ws_task,
+                critical_tx.clone(),
+            ));
             continue;
         }
         let acceptor = match &listener_config.tls {
@@ -709,8 +827,13 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             limiter.clone(),
             telemetry.clone(),
         ));
-        listeners.push(accept_task.abort_handle());
+        listeners.push(supervise_listener(
+            "IRC listener",
+            accept_task,
+            critical_tx.clone(),
+        ));
     }
+    drop(critical_tx);
     Ok(Running {
         addrs,
         http_addr,
@@ -718,7 +841,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         shutdown: ShutdownHandle {
             listeners,
             core_tx,
+            core_worker: Some(core_worker),
             db_worker,
+            critical_failures: critical_rx,
             bnc_listener,
         },
     })
@@ -1057,6 +1182,22 @@ mod tests {
     use crate::core::Input;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    #[tokio::test]
+    async fn critical_task_outcomes_preserve_exit_and_panic_provenance() {
+        let exited = tokio::spawn(async {}).await;
+        let failure = critical_join_failure("test worker", exited);
+        assert_eq!(failure.task, "test worker");
+        assert_eq!(failure.reason, "exited unexpectedly");
+
+        let panicked = tokio::spawn(async {
+            panic!("intentional supervised-task test panic");
+        })
+        .await;
+        let failure = critical_join_failure("test worker", panicked);
+        assert_eq!(failure.task, "test worker");
+        assert!(failure.reason.starts_with("panicked:"));
+    }
 
     /// A stream whose read never completes (a partitioned/dead peer) and whose
     /// writes are silently accepted — so the connection can only end if the

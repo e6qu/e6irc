@@ -141,6 +141,8 @@ console views require an administrator session.
    `/api/v1/admin/metrics` returns Prometheus text.
 7. Network **Operations** provides owner-scoped per-network detail that global
    aggregates intentionally omit.
+8. Every HTTP response carries a fresh server-generated correlation identifier;
+   HTTPS public origins also carry HSTS.
 
 **Visible failures and recovery.** Invalid windows are rejected/bounded.
 Sampling/storage failure is logged and counted without making liveness depend
@@ -158,7 +160,8 @@ retention is bounded and pruned transactionally.
 **Evidence.** Telemetry arithmetic/formatting, runtime network accounting,
 queue monitor transitions, bounded Prometheus labels, and schema-v2 history
 compatibility are unit-tested. Readiness, metrics/observability authorization,
-queue JSON/Prometheus/UI rendering, persistence, retention, monitoring
+correlation IDs, HTTPS-only HSTS, queue JSON/Prometheus/UI rendering,
+persistence, retention, monitoring
 page/panel, and per-network operations are covered by HTTP/PostgreSQL tests.
 The real Chromium/PostgreSQL journey opens Monitoring, verifies both runtime
 queues in the rendered page, proves a restart-required core-capacity edit does

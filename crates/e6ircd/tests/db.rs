@@ -4748,3 +4748,24 @@ async fn concurrent_browser_session_issuance_enforces_the_active_cap() {
     }
     assert_eq!(retained, db::MAX_BROWSER_SESSIONS_PER_ACCOUNT);
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn every_pooled_connection_has_statement_and_lock_deadlines() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("every_pooled_connection_has_statement_and_lock_deadlines").await,
+    )
+    .await
+    .expect("connect");
+
+    let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&pool)
+        .await
+        .expect("statement timeout");
+    let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+        .fetch_one(&pool)
+        .await
+        .expect("lock timeout");
+    assert_eq!(statement_timeout, "15s");
+    assert_eq!(lock_timeout, "5s");
+}

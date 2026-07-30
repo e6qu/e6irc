@@ -34,6 +34,18 @@ Previously implicit visitor discovery/readiness and coordinated sign-out are
 now first-class journeys rather than clauses hidden inside monitoring and
 credential rotation.
 
+Production-completion PR foundation (2026-07-30): the process now owns and
+supervises its critical core, PostgreSQL, HTTP, WebSocket, and raw IRC tasks.
+An unexpected exit triggers a bounded drain and non-zero process result rather
+than leaving a superficially live daemon. HTTP-to-core replies, PostgreSQL
+pool acquisition, statements, and lock acquisition all have explicit
+deadlines. Every HTTP response has a fresh server-generated correlation ID,
+and HTTPS public origins emit HSTS. The production container now compiles all
+bridge features, creates its generated bootstrap config at an unpredictable
+mode-0600 path, and has a portable entrypoint contract test. The systemd gate
+mechanically requires its stop budget to exceed the daemon's database flush
+budget.
+
 Runtime-pressure and operational-browser closure (2026-07-30): the custom
 bounded queue now exposes a payload-free monitor, and the daemon registers the
 fixed core and database queues in snapshot schema v3. Their depth, capacity,

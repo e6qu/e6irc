@@ -2,6 +2,7 @@
 //! in-process by the same binary (DESIGN §12).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -126,6 +127,13 @@ pub struct AppState {
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
+    /// Random per-process prefix plus a monotonic suffix generate opaque,
+    /// bounded correlation identifiers without accepting an untrusted request
+    /// header into logs or responses.
+    pub(crate) request_id_prefix: u64,
+    pub(crate) request_id_counter: AtomicU64,
+    /// HSTS is safe only when the configured public origin is HTTPS.
+    pub(crate) hsts_enabled: bool,
 }
 
 impl AppState {
@@ -149,6 +157,11 @@ impl AppState {
                 token.as_bytes(),
             )
             .is_ok()
+    }
+
+    fn next_request_id(&self) -> String {
+        let suffix = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{:016x}{suffix:016x}", self.request_id_prefix)
     }
 }
 
@@ -279,6 +292,8 @@ async fn core_reply(
     state: &AppState,
     req: crate::core::AdminRequest,
 ) -> Result<crate::core::AdminReply, String> {
+    const CORE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state
         .core_tx
@@ -288,8 +303,11 @@ async fn core_reply(
     {
         return Err("core worker unavailable".into());
     }
-    rx.await
-        .map_err(|_| "core worker dropped the request".into())
+    match tokio::time::timeout(CORE_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_closed)) => Err("core worker dropped the request".into()),
+        Err(_elapsed) => Err("core worker did not answer within 5 seconds".into()),
+    }
 }
 
 #[cfg(test)]
@@ -331,7 +349,20 @@ async fn observe_http(
     next: Next,
 ) -> Response {
     let started = Instant::now();
-    let response = next.run(request).await;
+    let request_id = state.next_request_id();
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "x-request-id",
+        request_id.parse().expect("generated request identifier"),
+    );
+    if state.hsts_enabled {
+        response.headers_mut().insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            "max-age=31536000; includeSubDomains"
+                .parse()
+                .expect("static HSTS header"),
+        );
+    }
     state
         .telemetry
         .record_http_request(started.elapsed(), response.status().is_server_error());

@@ -50,6 +50,13 @@ fn get(path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
 }
 
+fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
 fn cookie_form_post(path: &str, session: &str, body: &str) -> String {
     format!(
         "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -121,6 +128,36 @@ async fn healthz_is_public_and_ok() {
     let (status, _, body) = request(http, &get("/healthz")).await;
     assert_eq!(status, 200);
     assert_eq!(body, "ok");
+}
+
+#[tokio::test]
+async fn every_response_has_a_fresh_server_correlation_id_and_https_hsts() {
+    let mut config = test_config();
+    let http_config = config.http.as_mut().expect("HTTP config");
+    http_config.public_url = Some("https://irc.http.example".into());
+    http_config.secure_cookies = true;
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("http bound");
+
+    let (_, first_headers, _) = request(http, &get("/healthz")).await;
+    let (_, second_headers, _) = request(http, &get("/api/v1/nope")).await;
+    let first_id = response_header(&first_headers, "x-request-id").expect("request ID");
+    let second_id = response_header(&second_headers, "x-request-id").expect("request ID");
+    assert_eq!(first_id.len(), 32);
+    assert!(first_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        response_header(&first_headers, "strict-transport-security"),
+        Some("max-age=31536000; includeSubDomains")
+    );
+
+    let running = net::start(test_config()).await.expect("plain HTTP start");
+    let http = running.http_addr.expect("HTTP bound");
+    let (_, headers, _) = request(http, &get("/healthz")).await;
+    assert!(
+        response_header(&headers, "strict-transport-security").is_none(),
+        "HSTS over an explicitly plain public origin would make development hosts unreachable"
+    );
 }
 
 #[tokio::test]
