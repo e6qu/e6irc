@@ -83,7 +83,7 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
         Ok((next, _)) => next,
         Err(e) => {
             eprintln!("matrix: initial sync failed: {e}");
-            return super::SessionOutcome::Dropped;
+            return super::SessionOutcome::Dropped(super::NetworkFailure::UpstreamRequestFailed);
         }
     };
 
@@ -112,7 +112,9 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
                 }
                 Err(e) => {
                     eprintln!("matrix: sync error: {e}");
-                    return super::SessionOutcome::Dropped;
+                    return super::SessionOutcome::Dropped(
+                        super::NetworkFailure::UpstreamRequestFailed,
+                    );
                 }
             },
             cmd = ends.next_command() => match cmd {

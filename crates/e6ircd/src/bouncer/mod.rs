@@ -232,7 +232,11 @@ impl Backoff {
 /// upstream traffic.
 pub(crate) enum SessionOutcome {
     Stopped,
-    Dropped,
+    /// A transient session failure that is safe to retry. Carrying the closed,
+    /// credential-safe reason in the outcome makes a reasonless reconnect
+    /// unrepresentable: every driver must tell monitoring why the attempt
+    /// ended before the shared runner can schedule another one.
+    Dropped(NetworkFailure),
     /// The upstream rejected the credentials (a terminal auth/registration
     /// numeric), which — unlike a transient drop — will not succeed on a plain
     /// retry. [`run_with_backoff`] counts these and stops re-dialing after a few
@@ -300,7 +304,7 @@ impl ConnectFail {
             }
             Self::Transient(e) => {
                 eprintln!("{who}: connect failed: {e}");
-                SessionOutcome::Dropped
+                SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
             }
         }
     }
@@ -403,9 +407,10 @@ pub(crate) async fn run_with_backoff<C>(
                     return;
                 }
             }
-            SessionOutcome::Dropped => {
+            SessionOutcome::Dropped(failure) => {
                 // A transient (non-auth) drop: a connection-level failure that
                 // may well recover, so keep retrying and reset the auth counter.
+                ends.classify_error(failure);
                 consecutive_rejections = 0;
                 if !wait_for_reconnect(ends, &mut backoff, started.elapsed()).await {
                     return;
@@ -504,6 +509,7 @@ pub(crate) async fn relay_routed<F, Fut>(
                 if let Err(e) = deliver(id.clone(), text).await {
                     eprintln!("{platform}: send to {id} failed: {e}");
                     // A delivery failure is not a silent drop (DESIGN §2).
+                    ends.record_error(NetworkFailure::UpstreamWriteFailed);
                     ends.emit_line(undelivered_notice(platform, kind, &id));
                 }
             }
@@ -800,6 +806,11 @@ pub enum NetworkFailure {
     ConnectionLost,
     KeepaliveTimedOut,
     UpstreamWriteFailed,
+    UpstreamRequestFailed,
+    UpstreamProtocolFailed,
+    ChannelMappingFailed,
+    BacklogStorageFailed,
+    BacklogStorageLagged,
     CommandQueueFull,
     DriverStopped,
 }
@@ -818,6 +829,11 @@ impl NetworkFailure {
             Self::ConnectionLost => "connection_lost",
             Self::KeepaliveTimedOut => "keepalive_timed_out",
             Self::UpstreamWriteFailed => "upstream_write_failed",
+            Self::UpstreamRequestFailed => "upstream_request_failed",
+            Self::UpstreamProtocolFailed => "upstream_protocol_failed",
+            Self::ChannelMappingFailed => "channel_mapping_failed",
+            Self::BacklogStorageFailed => "backlog_storage_failed",
+            Self::BacklogStorageLagged => "backlog_storage_lagged",
             Self::CommandQueueFull => "command_queue_full",
             Self::DriverStopped => "driver_stopped",
         }
@@ -839,7 +855,18 @@ impl NetworkFailure {
             Self::AutojoinFailed => "A configured JOIN could not be sent during startup.",
             Self::ConnectionLost => "The established upstream connection was lost.",
             Self::KeepaliveTimedOut => "The upstream stopped responding to keepalive checks.",
-            Self::UpstreamWriteFailed => "A line could not be written to the upstream.",
+            Self::UpstreamWriteFailed => "A message could not be sent to the upstream.",
+            Self::UpstreamRequestFailed => "An upstream API request failed.",
+            Self::UpstreamProtocolFailed => {
+                "The upstream returned an invalid or unsupported response."
+            }
+            Self::ChannelMappingFailed => {
+                "A configured bridged channel could not be mapped safely."
+            }
+            Self::BacklogStorageFailed => "The detached backlog could not be stored.",
+            Self::BacklogStorageLagged => {
+                "The detached backlog writer fell behind and missed messages."
+            }
             Self::CommandQueueFull => "The upstream command queue is full.",
             Self::DriverStopped => "The network driver is no longer accepting commands.",
         }
@@ -995,6 +1022,18 @@ impl NetworkRuntime {
             epoch_millis().as_millis(),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+}
+
+fn record_network_error(
+    runtime: &NetworkRuntime,
+    telemetry: &std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>,
+    failure: NetworkFailure,
+) {
+    runtime.classify_error(failure);
+    runtime.operational_error();
+    if let Some(telemetry) = telemetry.lock().expect("telemetry hook poisoned").as_ref() {
+        telemetry.record_error(crate::observability::ErrorKind::Bouncer);
     }
 }
 
@@ -1191,14 +1230,11 @@ impl NetworkHandle {
                 SendOutcome::Sent
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.runtime
-                    .classify_error(NetworkFailure::CommandQueueFull);
-                self.runtime.operational_error();
+                self.record_error(NetworkFailure::CommandQueueFull);
                 SendOutcome::Full
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.runtime.classify_error(NetworkFailure::DriverStopped);
-                self.runtime.operational_error();
+                self.record_error(NetworkFailure::DriverStopped);
                 SendOutcome::Closed
             }
         }
@@ -1381,8 +1417,8 @@ impl NetworkHandle {
         *self.telemetry.lock().expect("telemetry hook poisoned") = Some(telemetry);
     }
 
-    pub(crate) fn record_operational_error(&self) {
-        self.runtime.operational_error();
+    pub(crate) fn record_error(&self, failure: NetworkFailure) {
+        record_network_error(&self.runtime, &self.telemetry, failure);
     }
 }
 
@@ -1413,6 +1449,15 @@ impl DriverEnds {
     /// failure classification exposed by monitoring.
     pub(crate) fn classify_error(&self, failure: NetworkFailure) {
         self.runtime.classify_error(failure);
+    }
+
+    /// Record a recoverable failure that does not end the driver session, such
+    /// as one rejected outbound bridge message. Reconnect outcomes are counted
+    /// by their lifecycle event instead; this path owns both classification and
+    /// accounting so a timestamp can never be recorded without a reason.
+    #[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+    pub(crate) fn record_error(&self, failure: NetworkFailure) {
+        record_network_error(&self.runtime, &self.telemetry, failure);
     }
 
     /// Record a line to the detached buffer and broadcast it live. The line
@@ -1826,6 +1871,25 @@ mod tests {
         assert_eq!(failed.errors, 2);
     }
 
+    #[test]
+    fn recoverable_error_updates_network_and_server_telemetry_together() {
+        let (handle, _ends) = NetworkHandle::channels(8);
+        let telemetry = std::sync::Arc::new(crate::observability::Telemetry::new());
+        handle.set_telemetry(telemetry.clone());
+
+        handle.record_error(NetworkFailure::BacklogStorageFailed);
+
+        let runtime = handle.runtime_snapshot();
+        assert_eq!(runtime.errors, 1, "{runtime:?}");
+        assert!(runtime.last_error_at.is_some(), "{runtime:?}");
+        assert_eq!(
+            runtime.last_error,
+            Some(NetworkFailure::BacklogStorageFailed),
+            "{runtime:?}"
+        );
+        assert_eq!(telemetry.snapshot(0, 0).errors["bouncer"], 1);
+    }
+
     /// A driver must stop when the registry signals shutdown, even while a
     /// command sender is outstanding (as an attached client holds). Before this,
     /// the driver observed only all-senders-dropped, so an attached client kept
@@ -1917,6 +1981,14 @@ mod tests {
             }
         })
         .await;
+        let runtime = handle.runtime_snapshot();
+        assert_eq!(runtime.errors, 1, "{runtime:?}");
+        assert!(runtime.last_error_at.is_some(), "{runtime:?}");
+        assert_eq!(
+            runtime.last_error,
+            Some(NetworkFailure::UpstreamWriteFailed),
+            "{runtime:?}"
+        );
         let lines = handle.buffer_snapshot();
         assert!(
             !lines.iter().any(|l| l.contains("id_a")),

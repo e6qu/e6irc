@@ -75,9 +75,9 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
             } else {
                 super::NetworkFailure::ConnectionFailed
             };
-            return dropped(ends, failure);
+            return dropped(failure);
         }
-        Err(_) => return dropped(ends, super::NetworkFailure::ConnectionTimedOut),
+        Err(_) => return dropped(super::NetworkFailure::ConnectionTimedOut),
     };
     let register_fut = async {
         match &config.sasl {
@@ -95,7 +95,6 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         // connection error, so the reconnect loop can stop re-dialing rather
         // than hammer the upstream with the same rejected credentials forever.
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            ends.classify_error(super::NetworkFailure::AuthenticationRejected);
             return super::SessionOutcome::AuthRejected;
         }
         Ok(Err(e))
@@ -106,15 +105,14 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                     | std::io::ErrorKind::Unsupported
             ) =>
         {
-            ends.classify_error(super::NetworkFailure::RegistrationRejected);
             return super::SessionOutcome::RegistrationRejected;
         }
-        Ok(Err(_)) => return dropped(ends, super::NetworkFailure::RegistrationFailed),
-        Err(_) => return dropped(ends, super::NetworkFailure::RegistrationTimedOut),
+        Ok(Err(_)) => return dropped(super::NetworkFailure::RegistrationFailed),
+        Err(_) => return dropped(super::NetworkFailure::RegistrationTimedOut),
     }
     for chan in &config.autojoin {
         if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
-            return dropped(ends, super::NetworkFailure::AutojoinFailed);
+            return dropped(super::NetworkFailure::AutojoinFailed);
         }
     }
     ends.emit(ConnectionEvent::Connected);
@@ -144,7 +142,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                         if m.command == "PING" {
                             let token = m.params.first().cloned().unwrap_or_default();
                             if conn.send_line(&format!("PONG :{token}")).await.is_err() {
-                                return dropped(ends, super::NetworkFailure::UpstreamWriteFailed);
+                                return dropped(super::NetworkFailure::UpstreamWriteFailed);
                             }
                             continue;
                         }
@@ -171,16 +169,16 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                 // recoverable per-line error is now `Ok(Some((None, _)))` above,
                 // never conflated with the stream ending.
                 Ok(Ok(None)) | Ok(Err(_)) => {
-                    return dropped(ends, super::NetworkFailure::ConnectionLost);
+                    return dropped(super::NetworkFailure::ConnectionLost);
                 }
                 Err(_) => {
                     // Idle past the keepalive window.
                     if awaiting_keepalive {
-                        return dropped(ends, super::NetworkFailure::KeepaliveTimedOut);
+                        return dropped(super::NetworkFailure::KeepaliveTimedOut);
                     }
                     awaiting_keepalive = true;
                     if conn.send_line("PING :e6bnc-keepalive").await.is_err() {
-                        return dropped(ends, super::NetworkFailure::UpstreamWriteFailed);
+                        return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
                 }
             },
@@ -188,7 +186,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
             cmd = ends.next_command() => match cmd {
                 Some(line) => {
                     if conn.send_line(&line).await.is_err() {
-                        return dropped(ends, super::NetworkFailure::UpstreamWriteFailed);
+                        return dropped(super::NetworkFailure::UpstreamWriteFailed);
                     }
                 }
                 None => return super::SessionOutcome::Stopped, // handle dropped
@@ -197,9 +195,8 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
     }
 }
 
-fn dropped(ends: &DriverEnds, failure: super::NetworkFailure) -> super::SessionOutcome {
-    ends.classify_error(failure);
-    super::SessionOutcome::Dropped
+fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
+    super::SessionOutcome::Dropped(failure)
 }
 
 /// Idle gap before the driver sends a keepalive PING (and again before it

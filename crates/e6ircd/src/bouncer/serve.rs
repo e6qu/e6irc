@@ -175,13 +175,7 @@ impl Registry {
         // owner the registry uses, so a buffer cannot be written under one
         // spelling and looked up under another.
         let persistence = self.pool.clone().map(|pool| {
-            spawn_persistence(
-                pool,
-                key.owner.clone(),
-                key.name.clone(),
-                handle.clone(),
-                self.telemetry.clone(),
-            )
+            spawn_persistence(pool, key.owner.clone(), key.name.clone(), handle.clone())
         });
         let slot = Slot {
             handle,
@@ -269,16 +263,17 @@ fn spawn_persistence(
     owner: Option<String>,
     network: String,
     handle: Arc<NetworkHandle>,
-    telemetry: Option<Arc<crate::observability::Telemetry>>,
 ) -> tokio::task::JoinHandle<()> {
     use super::DriverEvent;
     let owner_key = owner.unwrap_or_else(|| "*".to_string());
     tokio::spawn(async move {
         let mut events = handle.subscribe();
-        if let Ok(lines) =
-            crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await
-        {
-            handle.preload_front(lines);
+        match crate::db::recent_bnc_lines(&pool, &owner_key, &network, PRELOAD_LIMIT).await {
+            Ok(lines) => handle.preload_front(lines),
+            Err(e) => {
+                handle.record_error(super::NetworkFailure::BacklogStorageFailed);
+                eprintln!("bnc: buffer restore failed for {owner_key}/{network}: {e}");
+            }
         }
         // This task is the only writer for this network, so counting its own
         // appends is what makes the amortized trim reach every network — see
@@ -290,10 +285,7 @@ fn spawn_persistence(
                     if let Err(e) =
                         crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
                     {
-                        handle.record_operational_error();
-                        if let Some(telemetry) = &telemetry {
-                            telemetry.record_error(crate::observability::ErrorKind::Bouncer);
-                        }
+                        handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                         eprintln!("bnc: buffer persist failed for {owner_key}/{network}: {e}");
                         continue;
                     }
@@ -303,10 +295,7 @@ fn spawn_persistence(
                         if let Err(e) =
                             crate::db::trim_bnc_buffer(&pool, &owner_key, &network).await
                         {
-                            handle.record_operational_error();
-                            if let Some(telemetry) = &telemetry {
-                                telemetry.record_error(crate::observability::ErrorKind::Bouncer);
-                            }
+                            handle.record_error(super::NetworkFailure::BacklogStorageFailed);
                             eprintln!("bnc: buffer trim failed for {owner_key}/{network}: {e}");
                         }
                     }
@@ -316,10 +305,7 @@ fn spawn_persistence(
                 // the stored backlog now has a gap. Surface it rather than
                 // dropping it silently.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    handle.record_operational_error();
-                    if let Some(telemetry) = &telemetry {
-                        telemetry.record_error(crate::observability::ErrorKind::Bouncer);
-                    }
+                    handle.record_error(super::NetworkFailure::BacklogStorageLagged);
                     eprintln!(
                         "bnc: persistence lagged for {owner_key}/{network}; {n} upstream \
                          line(s) missing from stored backlog"

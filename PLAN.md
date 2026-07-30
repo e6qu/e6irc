@@ -214,6 +214,15 @@ paused network remains paused across every creation path and process restart.
 Both network and bridge controls reject an invalid target state instead of
 silently treating malformed form input as a disable request.
 
+Network failure accounting (2026-07-29): transient session outcomes now carry
+a required credential-safe `NetworkFailure`, so every IRC, local, Matrix,
+Discord, and Slack reconnect records a specific owner-visible reason. Bridge
+REST, protocol, mapping, socket, keepalive, and outbound-delivery failures use
+the same closed vocabulary. Recoverable bridge sends and command-queue errors
+advance both per-network and server-wide error telemetry through one typed
+path. Detached-backlog restore, append, trim, and lag failures are likewise
+classified; restore no longer loses history through a silent fallback.
+
 Browser client completion (2026-07-28): the Vite chat shell now has a persistent
 network selector, a focused preferences menu, visible account/network/history/
 storage/notification/socket errors, a disabled composer until attachment, and a
