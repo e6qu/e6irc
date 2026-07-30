@@ -26,6 +26,24 @@ gh attestation verify oci://ghcr.io/e6qu/e6irc:<short-sha>-amd64 \
   -R e6qu/e6irc --predicate-type https://spdx.dev/Document/v2.3
 ```
 
+## Native archives
+
+A Git tag exactly matching `v<workspace-version>` publishes deterministic
+archives for Linux, macOS, and Windows on x86-64 and ARM64. Every archive
+contains the daemon, CLI, TUI, README, license, and systemd unit. Download the
+archive for the host together with `SHA256SUMS`, then verify both transport
+integrity and GitHub build provenance:
+
+```sh
+grep 'e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS \
+  | sha256sum --check
+gh attestation verify e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  -R e6qu/e6irc
+```
+
+The archives use the target's normal dynamic runtime; they are not musl/static
+packages. On Linux, extract the archive and use its systemd unit as below.
+
 ## Native Linux service
 
 `e6ircd.service` is the validated systemd installation contract. Install the

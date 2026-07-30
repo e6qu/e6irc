@@ -621,6 +621,10 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   invariant, not a best effort.
 - Consumer API: `async pop()` in runtime mode (custom waker, no tokio
   channel underneath); `try_pop()` as the nonblocking/manual-step primitive.
+- Async producers wait in FIFO order. One freed slot wakes one live producer,
+  and dropping a pending push removes its waiter registration; cancellation
+  cannot consume a future wakeup and a single pop cannot create a
+  thundering-herd repoll.
 - Instrumentation built in: depth, current FIFO/LIFO mode, and mode-switch
   count.
 - **Adaptive degraded mode (FIFO→LIFO)**: per-queue opt-in policy. When
@@ -1136,8 +1140,7 @@ above the trait, provides for every network kind:
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
   are mirrored to all attached clients (self-echo via `echo-message`).
 - **Detached buffering**: events accumulate per buffer with per-client read
-  markers (`read-marker` cap and web client share position; native clients can
-  use the same protocol, while the shipped TUI does not yet synchronize it).
+  markers (`read-marker` cap; web and TUI clients consume the same position).
 - **Playback**: modern clients pull via `CHATHISTORY`; legacy clients get
   timestamp-prefixed backlog replay on attach (soju-style, configurable
   per client).
@@ -1340,7 +1343,9 @@ contains only ten-row previews instead of unbounded policy tables. The **live ch
 client** is a small hand-written vanilla-JS IRC client (`web/src`,
 bundled by Vite): it parses IRC lines client-side into buffers and a member
 list rather than swapping server HTML, since per-channel routing and nick-list
-state are naturally client state. The socket reconnects with backoff so a
+state are naturally client state. Its embedded HTML and hashed assets carry a
+deny-by-default CSP permitting only same-origin scripts, styles, fonts, forms,
+images, and HTTP/WebSocket connections. The socket reconnects with backoff so a
 transient drop self-heals; opening the page without a `?network=` selector
 shows a picker of the caller's networks (its entry point). The persistent
 top-bar selector changes networks from every chat view, the preferences menu
@@ -1422,12 +1427,20 @@ with a `tls` section is refused at config load.
 
 Non-interactive, pipe-friendly: `e6irc send '#chan' 'msg'`,
 `e6irc tail '#chan'`, `e6irc raw`, `e6irc history …`, and
-`e6irc api <method> <path>` (authenticated REST passthrough). IRC commands
-support plaintext or public-CA TLS and optional SASL PLAIN through paired
-`--account`/`--password` flags. `api` accepts a bearer token by flag or
-`E6IRC_API_TOKEN` and deliberately speaks plain HTTP for a local or
-TLS-terminating-proxy deployment. The CLI does not currently provide JSON
-tail output, `e6irc login`, device-flow orchestration, or token caching.
+`e6irc api <method> <path>` (bounded authenticated HTTP/HTTPS passthrough).
+IRC commands support plaintext or public-CA TLS and anonymous, paired SASL
+PLAIN, or SASL OAUTHBEARER registration. `tail --json` emits one complete JSON
+object per message, including structured tags, for safe automation.
+
+`e6irc login` implements the RFC 8628 device flow: it prints the verification
+URI and user code, honors the server's polling interval/slow-down/expiry
+contract, and atomically stores the issued bearer token without printing it.
+The shared cache includes the issuing API origin so `api` cannot silently send
+it to a different `--base`; an explicit token or `E6IRC_API_TOKEN` wins without
+requiring a cache path. Unix storage is created with private directory/file
+modes and refused when group/other-readable. Windows uses the current user's
+local application-data directory and atomic replacement. Both native clients
+can use the same cache for SASL OAUTHBEARER with `--oauth-from-cache`.
 
 ### 14.2 `e6irc-tui`
 
@@ -1436,10 +1449,18 @@ request for plaintext/public-CA TLS and anonymous, SASL PLAIN, or SASL
 OAUTHBEARER registration. An `account/network` SASL account selects an owned
 BNC network. It has bounded channel/query buffers, Alt-Left/Right switching,
 bounded scrollback, `/join`, `/win`, `/quit`, automatic reconnect with the
-same explicit request, and loud disconnect/write/drop state. It does not
-currently orchestrate device login, load CHATHISTORY, or synchronize shared
-read markers. “Multi-buffer” therefore means several channels/queries inside
-one connection, not several simultaneous networks.
+same explicit request, and loud disconnect/write/drop state. On initial
+connect and reconnect it requires the history/read-marker capabilities it
+uses, rejoins every channel confirmed for the client, loads bounded
+CHATHISTORY after the server's marker (or the latest bounded window), and
+coalesces shared read-marker writes as buffer focus advances. Unread counts are
+visible and history/live overlap is deduplicated by stable message ID.
+Capability refusal fails visibly rather than degrading into a different
+experience. A pseudo-terminal journey drives the real full-screen binary
+against e6ircd and proves inbound rendering, outbound delivery, clean exit,
+and terminal restoration. “Multi-buffer” means several channels/queries inside
+one connection, not several simultaneous networks; the BNC is the
+cross-network multiplexer.
 
 ### 14.3 A client's input is untrusted too
 
@@ -1619,9 +1640,14 @@ Layers, bottom to top:
   `debian:bookworm-slim`. Each architecture digest has signed build-provenance
   and SPDX-SBOM attestations; the assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
-  CI-validated systemd unit is shipped for native Linux installation. Native
-  binary archives, musl artifacts, and scratch/distroless images are not
-  currently shipped.
+  CI-validated systemd unit is shipped for native Linux installation.
+  A version tag equal to `v` plus the workspace version publishes deterministic
+  archives containing `e6ircd`, `e6irc`, and `e6irc-tui` for Linux, macOS, and
+  Windows on x86-64 and ARM64. Each archive has a GitHub build-provenance
+  attestation and the release includes sorted SHA-256 checksums. The packager's
+  exact members, modes, and reproducibility run in ordinary CI so tag-only
+  code cannot rot. Musl artifacts and scratch/distroless images are not
+  shipped.
 - The production container built and embedded the Vite client before the Rust
   release build; no build step ran at startup. Each merge to `main` published
   one immutable 12-character commit-SHA manifest plus direct `-amd64` and

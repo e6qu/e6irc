@@ -106,8 +106,9 @@ does not silently become an incomplete “success.”
 
 **Evidence.** Proven by core history tests, extensive PostgreSQL selector and
 restart tests, persistence-backed irctest CHATHISTORY, REST history, and read
-marker tests. The shipped TUI does not yet consume these synchronization
-capabilities.
+marker tests. Duplex native-client tests prove capability negotiation and
+marker-relative history, while the TUI model tests shared-marker advancement,
+unread state, and history/live overlap.
 
 ## Register an account or channel through services
 

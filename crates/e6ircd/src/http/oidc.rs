@@ -1123,10 +1123,9 @@ pub(super) fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
-/// Frame/MIME/referrer protections for every HTML/app response. Uses only
-/// `frame-ancestors 'none'` (not a resource-restricting CSP), so it stops
-/// clickjacking without breaking the chat app's script/style/WebSocket loads.
-/// The auth pages layer a stricter `default-src 'none'` CSP on top.
+/// Frame/MIME/referrer protections for every HTML/app response. The embedded
+/// application uses only same-origin scripts, styles, fonts, and HTTP/WebSocket
+/// connections; auth and console pages layer their narrower policies on top.
 pub(super) fn security_headers(headers: &mut axum::http::HeaderMap) {
     headers.insert(
         header::X_FRAME_OPTIONS,
@@ -1134,7 +1133,9 @@ pub(super) fn security_headers(headers: &mut axum::http::HeaderMap) {
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "frame-ancestors 'none'".parse().expect("static header"),
+        "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            .parse()
+            .expect("static header"),
     );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,

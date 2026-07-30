@@ -838,8 +838,11 @@ dependencies = [
  "e6irc-proto",
  "e6ircd",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "sqlx",
  "tokio",
 ]
@@ -851,9 +854,12 @@ dependencies = [
  "e6irc-proto",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "webpki-roots 1.0.8",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

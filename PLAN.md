@@ -4,10 +4,7 @@ Phases are sequential PRs/PR-groups; each phase ends with DESIGN.md/PLAN.md/
 BUGS.md updated in the same PR. Details in DESIGN.md (section refs below);
 term definitions in [`docs/terminology.md`](docs/terminology.md).
 
-Status (audited 2026-07-30): Phases 0–7 and 9–10 ✅ complete. Phase 8
-(native clients) is 🔶: the shared library and CLI’s shipped commands are
-tested, while the TUI and device-login experience are narrower than DESIGN
-previously claimed. Phases 11–12 (Discord/Slack
+Status (audited 2026-07-30): Phases 0–10 ✅ complete. Phases 11–12 (Discord/Slack
 bridges) 🔶 code-complete behind feature flags with offline-unit-tested
 mapping logic; live verification is gated on real credentials (neither
 platform is self-hostable, so the gateway path can only be checked against
@@ -18,6 +15,28 @@ The 2026-07-30 whole-product traceability audit is in
 [`docs/journeys/`](docs/journeys/README.md), with implementation and test
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
+
+Native-client and distribution closure (2026-07-30): `e6irc login` now drives
+the device authorization grant into a private, atomic, origin-bound token
+cache shared by CLI API calls and both clients' SASL OAUTHBEARER mode. The CLI
+adds bounded HTTPS and structured JSON tail output. The TUI negotiates
+CHATHISTORY/read-marker capabilities, restores bounded history after the
+server's marker, coalesces read positions, shows unread counts, rejoins every
+confirmed channel after reconnect, and deduplicates history/live overlap by
+message ID. A real pseudo-terminal/e6ircd journey caught and fixed continuous
+redraw backpressure, duplicate replay, and swallowed terminal-restoration
+errors. Version tags now build deterministic provenance-attested archives
+containing all three binaries for the full six-platform matrix; the packager's
+members, modes, and reproducibility run on every pull request.
+
+Final historical-gap reconciliation (2026-07-30): the earlier CSP,
+Argon2/database head-of-line, graceful-shutdown, OIDC-validation, and load
+fan-out findings were verified against their later closure sweeps. The one
+remaining live concurrency defect was fixed: `e6irc-queue` now registers
+blocked producers in a cancellation-safe FIFO and wakes exactly one for each
+freed slot, rather than waking every producer and retaining cancelled waiters.
+The embedded web client now receives the strict same-origin,
+deny-by-default CSP its external Vite assets already support.
 
 Whole-product gap closure (2026-07-30): the real Chromium/Dex journey now adds
 a local password, signs out, submits local login, verifies the default Libera
@@ -40,6 +59,8 @@ runs in CI.
 The release workflow keeps direct architecture manifests while attaching
 signed build provenance and SPDX SBOMs as OCI referrers, attests the assembled
 multi-architecture manifest, and verifies every attestation after publication.
+Matching version tags also publish six native daemon/CLI/TUI archives with
+per-archive provenance and a sorted SHA-256 manifest.
 `deploy/e6ircd.service` adds a hardened native Linux service contract validated
 by `systemd-analyze`. The journey corpus and deployment instructions now
 describe these exact shipped boundaries, including the actual every-`main`
@@ -5201,31 +5222,29 @@ Done (this phase's remaining, now landed):
   the Vite chat client remains a separate vanilla-JavaScript bundle. Composer
   slash-commands DONE (see Phase 4). (DESIGN §13)
 
-## Phase 8 — Native clients 🔶 shipped commands proven; history/device scope narrower than target (audited 2026-07-30)
+## Phase 8 — Native clients ✅ (2026-07-30)
 Done:
 - `e6irc-client` lib (tokio connection, proto framing, owned messages,
-  PING-answering registration, public-CA TLS, SASL PLAIN/OAUTHBEARER, and one
-  owned `ConnectionOptions` request shared by both native clients);
-  `e6irc-cli` with
-  send/tail/raw subcommands and --account/--password SASL, e2e-tested
-  against a real e6ircd (plain + SASL); `e6irc-tui` (ratatui,
-  terminal-independent App state unit-tested). The TUI exposes TLS with a
-  certificate-name override, SASL PLAIN/OAUTHBEARER, `account/network` BNC
-  selection, and automatic reconnect. Disconnected input and raced outbound
-  lines are visibly refused/count-reported rather than echoed or replayed.
-- The server-side OAUTHBEARER device grant is part of Phase 4; no native
-  binary currently orchestrates it. TUI multi-buffer: one buffer per
-  channel/query, Alt-←/→ switch,
-  `/join`/`/win`, per-buffer scrollback (PgUp/PgDn), message routing
-  (channel/PM), buffer bar. The current TUI is one simultaneous connection;
-  its account argument selects one owned BNC network.
-- The client library supports TLS, SASL PLAIN/OAUTHBEARER, and shared history
-  helpers. The CLI exposes TLS, SASL PLAIN, `e6irc history`, and `e6irc api`
-  (one authenticated REST request over plain HTTP, bearer token or
-  E6IRC_API_TOKEN). It does not expose OAUTHBEARER/device login, token caching,
-  or JSON tail output. The TUI does not load history/read markers or orchestrate
-  device login. (DESIGN §14;
-  `docs/journeys/bridges-clients-and-automation.md`)
+  PING-answering registration, public-CA TLS, SASL PLAIN/OAUTHBEARER,
+  capability requirements, marker-aware bounded history, and one owned
+  `ConnectionOptions` request shared by both native clients).
+- `e6irc-cli` ships send/tail/raw/history commands, structured JSON tail,
+  bounded HTTP/HTTPS API requests, and RFC 8628 device login. Its private
+  origin-bound token cache is atomically replaced and can authenticate API
+  calls or SASL OAUTHBEARER. A PostgreSQL/e6ircd/CLI integration starts and
+  approves a real grant, consumes it into the cache, then authenticates
+  `/api/v1/me`; real-socket tests also cover plain/SASL/OAuth IRC, history,
+  JSON, TLS, and failure exits.
+- `e6irc-tui` provides bounded channel/query buffers, RFC1459-equivalent
+  buffer identity, one-based/name `/win`, Alt-Left/Right switching,
+  PgUp/PgDn scrollback, `/join`, `/quit`, TLS, paired PLAIN or direct/cached
+  OAUTHBEARER, and automatic reconnect. Initial/reconnect joins negotiate
+  capabilities, reload history after the shared marker, rejoin every
+  confirmed channel, expose unread counts, coalesce marker writes, and reject
+  sends during disconnect rather than replaying them. Unit/fuzz tests protect
+  model state; the real pseudo-terminal journey proves rendering, inbound and
+  outbound traffic, `/quit`, and clean terminal restoration. One TUI process
+  attaches to one network; cross-network multiplexing is the BNC's job.
 
 ## Phase 9 — Bridge SPI ✅ (2026-07-19)
 - `NetworkDriver` trait (kind + `start(self: Box<Self>) -> NetworkHandle`)
