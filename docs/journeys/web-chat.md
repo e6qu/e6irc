@@ -212,5 +212,10 @@ security policy; errors expose a safe problem rather than secrets or raw
 database/provider text.
 
 **Evidence.** Role gating and each server-rendered page are covered at HTTP
-level. Browser coverage proves application navigation around authentication
-and logout, but does not click every self-service and administrator mutation.
+level. The real Chromium journey crosses OpenID Connect and local
+authentication, visits account/network/channel and every administrator
+directory, edits every managed-configuration subsection and credential
+collection, adds and removes a server ban, verifies its audit trail, inspects
+live queue monitoring, and completes the reload-safe sign-out/recovery flow.
+Focused HTTP journeys prove the remaining owner and administrator mutation
+families with their role and CSRF boundaries.

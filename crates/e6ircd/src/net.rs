@@ -380,7 +380,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         capacity: 1024,
         policy: Policy::Fifo,
     });
-    let telemetry = Arc::new(Telemetry::new());
+    let telemetry = Arc::new(Telemetry::observing_queues(
+        core_tx.monitor(),
+        db_tx.monitor(),
+    ));
     let managed_config =
         managed_config.map(|snapshot| Arc::new(tokio::sync::RwLock::new(snapshot)));
     // SASL is only advertised when a database exists to answer verification

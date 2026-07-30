@@ -76,7 +76,9 @@ redacted audit records for mutations.
 
 **Evidence.** Proven by PostgreSQL cursor/filter/posture tests and
 administrator-only API/console integration tests, including escaping and
-mutation actions.
+mutation actions. The real Chromium/PostgreSQL journey visits every full
+administrator directory, adds and removes a K-Line through the rendered
+policy controls, and confirms both actions in the audit explorer.
 
 ## Inspect and terminate live connections
 
@@ -110,7 +112,7 @@ credentials or raw authentication material.
 **Evidence.** Proven by admin/owner and self-scoped connection integration
 tests.
 
-## Monitor traffic, connections, latency, availability, and errors
+## Monitor traffic, connections, queue pressure, latency, availability, and errors
 
 **Actor and goal.** An administrator wants to answer “is the service healthy,
 what is busy, and where is time/failure accumulating?” from e6irc itself.
@@ -126,12 +128,15 @@ console views require an administrator session.
    `SELECT 1`.
 3. Fixed process counters/gauges/histograms track IRC traffic, upstream
    traffic, current IRC clients/BNC attachments, network availability, core/
-   PostgreSQL/HTTP latency, and categorized errors.
+   PostgreSQL/HTTP latency, categorized errors, and the depth, capacity,
+   FIFO/LIFO mode, and mode-switch count of the fixed core and database
+   queues.
 4. A configured sampler stores typed, bounded snapshots in
    `observability_samples` and prunes outside the retention window in the same
    transaction.
-5. **Monitoring** renders selectable time windows, deltas/trends, cumulative
-   latency histograms, and an error ledger.
+5. **Monitoring** renders selectable time windows, deltas/trends, queue
+   capacity pressure, current queue state, cumulative latency histograms, and
+   an error ledger.
 6. `/api/v1/admin/observability` returns JSON history;
    `/api/v1/admin/metrics` returns Prometheus text.
 7. Network **Operations** provides owner-scoped per-network detail that global
@@ -139,19 +144,28 @@ console views require an administrator session.
 
 **Visible failures and recovery.** Invalid windows are rejected/bounded.
 Sampling/storage failure is logged and counted without making liveness depend
-on the metrics database. Metric dimensions are fixed; account/network/channel
-names and secrets cannot create unbounded cardinality or disclosure.
+on the metrics database. Metric dimensions are fixed: only the statically
+registered `core` and `db` queues become process-wide queue labels.
+Per-connection SendQ names, account/network/channel names, and secrets cannot
+create unbounded cardinality or disclosure. Historical schema-v2 samples
+remain readable and simply have no queue series.
 
 **Security and observability.** Liveness/readiness disclose only dependency
 state; detailed JSON, metrics, and console history are administrator-only and
 non-cacheable. Series and error reasons use closed dimensions, and historical
 retention is bounded and pruned transactionally.
 
-**Evidence.** Telemetry arithmetic/formatting and runtime network accounting
-are unit-tested. Readiness, metrics/observability authorization, persistence,
-retention, monitoring page/panel, and per-network operations are covered by
-HTTP/PostgreSQL tests. There is no alerting or external dashboard shipped;
-Prometheus is an export surface.
+**Evidence.** Telemetry arithmetic/formatting, runtime network accounting,
+queue monitor transitions, bounded Prometheus labels, and schema-v2 history
+compatibility are unit-tested. Readiness, metrics/observability authorization,
+queue JSON/Prometheus/UI rendering, persistence, retention, monitoring
+page/panel, and per-network operations are covered by HTTP/PostgreSQL tests.
+The real Chromium/PostgreSQL journey opens Monitoring, verifies both runtime
+queues in the rendered page, proves a restart-required core-capacity edit does
+not misrepresent the still-active queue, then checks the configured capacity
+appears in schema-v3 JSON after restart.
+There is no alerting or external dashboard shipped; Prometheus is an export
+surface.
 
 ## Audit privileged changes
 

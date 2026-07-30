@@ -2487,6 +2487,21 @@ mod pages {
         title: String,
     }
 
+    struct QueueBar {
+        core_height: u64,
+        database_height: u64,
+        title: String,
+    }
+
+    struct QueueView {
+        label: &'static str,
+        depth: u64,
+        capacity: u64,
+        pressure: u64,
+        mode: String,
+        mode_switches: u64,
+    }
+
     struct MonitoringWindowLink {
         label: &'static str,
         minutes: u64,
@@ -2595,6 +2610,8 @@ mod pages {
         upstream_bars: Vec<UpstreamBar>,
         error_bars: Vec<ErrorBar>,
         latency_bars: Vec<LatencyBar>,
+        queue_bars: Vec<QueueBar>,
+        queues: Vec<QueueView>,
         errors: Vec<ErrorView>,
         sampled_age: String,
         history_samples: usize,
@@ -2666,6 +2683,13 @@ mod pages {
         } else {
             (value.saturating_mul(100) / peak.max(1)).max(1)
         }
+    }
+
+    fn queue_pressure(queue: Option<&crate::observability::QueueSnapshot>) -> u64 {
+        queue
+            .filter(|queue| queue.capacity > 0)
+            .map(|queue| queue.depth.saturating_mul(100) / queue.capacity)
+            .unwrap_or(0)
     }
 
     fn snapshot_error_total(snapshot: &crate::observability::Snapshot) -> u64 {
@@ -2888,6 +2912,34 @@ mod pages {
                 ),
             })
             .collect();
+        let queue_bars = history
+            .iter()
+            .map(|snapshot| {
+                let core = queue_pressure(snapshot.queues.get("core"));
+                let database = queue_pressure(snapshot.queues.get("db"));
+                QueueBar {
+                    core_height: core,
+                    database_height: database,
+                    title: format!(
+                        "Core {core}% · PostgreSQL {database}% · {}",
+                        format_age(current.sampled_at_ms, snapshot.sampled_at_ms)
+                    ),
+                }
+            })
+            .collect();
+        let queues = [("core", "IRC core"), ("db", "Database worker")]
+            .into_iter()
+            .filter_map(|(name, label)| {
+                current.queues.get(name).map(|queue| QueueView {
+                    label,
+                    depth: queue.depth,
+                    capacity: queue.capacity,
+                    pressure: queue_pressure(Some(queue)),
+                    mode: queue.mode.label().to_uppercase(),
+                    mode_switches: queue.mode_switches,
+                })
+            })
+            .collect();
         let errors = current
             .errors
             .iter()
@@ -2944,6 +2996,8 @@ mod pages {
             upstream_bars,
             error_bars,
             latency_bars,
+            queue_bars,
+            queues,
             errors,
             sampled_age: format_age(current.sampled_at_ms, current.sampled_at_ms),
             history_samples: history.len().saturating_sub(1),

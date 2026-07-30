@@ -34,6 +34,20 @@ Previously implicit visitor discovery/readiness and coordinated sign-out are
 now first-class journeys rather than clauses hidden inside monitoring and
 credential rotation.
 
+Runtime-pressure and operational-browser closure (2026-07-30): the custom
+bounded queue now exposes a payload-free monitor, and the daemon registers the
+fixed core and database queues in snapshot schema v3. Their depth, capacity,
+FIFO/LIFO mode, and mode-switch totals flow through retained PostgreSQL
+samples, administrator JSON, fixed-label Prometheus metrics, and live/history
+console views; schema-v2 samples remain readable. The real Chromium journey
+now visits every administrator directory, verifies queue HTML/JSON, performs a
+K-Line add/remove through rendered controls, and confirms the durable audit
+trail. It also pins queue-capacity provenance across a restart-required edit:
+telemetry reports the allocation enforcing backpressure now, then reports the
+new managed capacity only after daemon restart. The corresponding journey
+contracts and evidence matrix describe the exact browser, PostgreSQL, runtime,
+and external-alerting boundaries.
+
 Product-evidence closure (2026-07-30): preferences and desktop notifications
 are now a first-class journey, including opt-in, hidden-tab selection, typed
 local persistence, failure recovery, and the browser/operating-system privacy

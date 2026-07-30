@@ -21,7 +21,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 #[cfg(loom)]
+use loom::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+#[cfg(loom)]
 use loom::sync::{Arc, Mutex};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Arc, Mutex};
 
@@ -48,9 +52,59 @@ pub enum Policy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Mode {
     Fifo,
     Lifo,
+}
+
+/// A point-in-time, payload-free view of a queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueSnapshot {
+    pub name: &'static str,
+    pub depth: usize,
+    pub capacity: usize,
+    pub mode: Mode,
+    pub mode_switches: u64,
+}
+
+/// A clonable, payload-free handle for exporting bounded queue telemetry.
+#[derive(Clone)]
+pub struct QueueMonitor {
+    name: &'static str,
+    capacity: usize,
+    metrics: Arc<QueueMetrics>,
+}
+
+struct QueueMetrics {
+    enabled: AtomicBool,
+    depth: AtomicUsize,
+    mode: AtomicU8,
+    mode_switches: AtomicU64,
+}
+
+impl QueueMonitor {
+    pub fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            name: self.name,
+            depth: self.metrics.depth.load(Ordering::Relaxed),
+            capacity: self.capacity,
+            mode: if self.metrics.mode.load(Ordering::Relaxed) == Mode::Fifo as u8 {
+                Mode::Fifo
+            } else {
+                Mode::Lifo
+            },
+            mode_switches: self.metrics.mode_switches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl std::fmt::Debug for QueueMonitor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueMonitor")
+            .field("snapshot", &self.snapshot())
+            .finish()
+    }
 }
 
 /// An accepted event with its per-queue identity.
@@ -90,6 +144,12 @@ pub fn queue<T>(config: Config) -> (Sender<T>, Receiver<T>) {
     }
     let shared = Arc::new(Shared {
         config,
+        metrics: Arc::new(QueueMetrics {
+            enabled: AtomicBool::new(false),
+            depth: AtomicUsize::new(0),
+            mode: AtomicU8::new(Mode::Fifo as u8),
+            mode_switches: AtomicU64::new(0),
+        }),
         state: Mutex::new(State {
             buf: VecDeque::with_capacity(config.capacity),
             next_seq: 0,
@@ -122,6 +182,7 @@ pub struct Receiver<T> {
 
 struct Shared<T> {
     config: Config,
+    metrics: Arc<QueueMetrics>,
     state: Mutex<State<T>>,
 }
 
@@ -174,6 +235,21 @@ impl<T> Shared<T> {
     fn lock(&self) -> impl std::ops::DerefMut<Target = State<T>> + '_ {
         self.state.lock().expect("queue mutex poisoned")
     }
+
+    fn publish(&self, state: &State<T>) {
+        if !self.metrics.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.publish_unconditionally(state);
+    }
+
+    fn publish_unconditionally(&self, state: &State<T>) {
+        self.metrics.depth.store(state.buf.len(), Ordering::Relaxed);
+        self.metrics.mode.store(state.mode as u8, Ordering::Relaxed);
+        self.metrics
+            .mode_switches
+            .store(state.mode_switches, Ordering::Relaxed);
+    }
 }
 
 impl<T> Sender<T> {
@@ -193,6 +269,7 @@ impl<T> Sender<T> {
             seq = state.next_sequence();
             state.buf.push_back(Envelope { seq, payload });
             state.update_mode(self.shared.config.policy);
+            self.shared.publish(&state);
             waker = state.waker.take();
         }
         if let Some(waker) = waker {
@@ -203,6 +280,17 @@ impl<T> Sender<T> {
 
     pub fn depth(&self) -> usize {
         self.shared.lock().buf.len()
+    }
+
+    pub fn monitor(&self) -> QueueMonitor {
+        let state = self.shared.lock();
+        self.shared.publish_unconditionally(&state);
+        self.shared.metrics.enabled.store(true, Ordering::Release);
+        QueueMonitor {
+            name: self.shared.config.name,
+            capacity: self.shared.config.capacity,
+            metrics: self.shared.metrics.clone(),
+        }
     }
 
     /// Await capacity, then push. `Err(payload)` if the receiver is
@@ -255,6 +343,7 @@ impl<T> Future for Push<'_, T> {
                     payload: this.payload.take().expect("push future polled after ready"),
                 });
                 state.update_mode(this.sender.shared.config.policy);
+                this.sender.shared.publish(&state);
                 receiver_waker = state.waker.take();
                 result = Poll::Ready(Ok(seq));
             } else {
@@ -317,6 +406,7 @@ impl<T> Receiver<T> {
                 Mode::Lifo => state.buf.pop_back(),
             }?;
             state.update_mode(self.shared.config.policy);
+            self.shared.publish(&state);
             waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
         }
         if let Some(waker) = waker {
@@ -342,6 +432,7 @@ impl<T> Receiver<T> {
             match popped {
                 Some(_) => {
                     state.update_mode(self.shared.config.policy);
+                    self.shared.publish(&state);
                     waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
                 }
                 None => {
@@ -509,10 +600,22 @@ mod tests {
         for i in 0..7 {
             tx.try_push(i).unwrap();
         }
+        let monitor = tx.monitor();
+        assert_eq!(monitor.snapshot().depth, 7);
         assert_eq!(rx.mode(), Mode::Fifo);
         tx.try_push(7).unwrap(); // depth hits high watermark
         assert_eq!(rx.mode(), Mode::Lifo);
         assert_eq!(rx.mode_switches(), 1);
+        assert_eq!(
+            monitor.snapshot(),
+            QueueSnapshot {
+                name: "adaptive",
+                depth: 8,
+                capacity: 10,
+                mode: Mode::Lifo,
+                mode_switches: 1,
+            }
+        );
 
         // LIFO: freshest first
         assert_eq!(rx.try_pop().unwrap().payload, 7);
@@ -527,6 +630,8 @@ mod tests {
         }
         assert_eq!(rx.mode(), Mode::Fifo);
         assert_eq!(rx.mode_switches(), 2);
+        assert_eq!(monitor.snapshot().mode, Mode::Fifo);
+        assert_eq!(monitor.snapshot().mode_switches, 2);
 
         // back in FIFO: oldest of the remainder first
         assert_eq!(rx.try_pop().unwrap().payload, 0);

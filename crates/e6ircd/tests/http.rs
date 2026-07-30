@@ -1283,6 +1283,10 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         "Upstream availability",
         "New errors",
         "P95 latency",
+        "Queue pressure",
+        "Runtime queues",
+        "IRC core",
+        "Database worker",
         "data-refresh-url=\"/console/monitoring/panel?minutes=60\"",
         "/api/v1/admin/observability?minutes=60",
         "Authenticated raw IRC and web attachments",
@@ -1329,6 +1333,10 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let body: serde_json::Value = serde_json::from_str(&body).expect("observability JSON");
     assert!(body["current"]["active_connections"].is_u64());
     assert!(body["current"]["core_latency"]["p95_us"].is_u64());
+    assert!(body["current"]["queues"]["core"]["depth"].is_u64());
+    assert_eq!(body["current"]["queues"]["core"]["capacity"], 65_536);
+    assert_eq!(body["current"]["queues"]["db"]["capacity"], 1_024);
+    assert_eq!(body["current"]["queues"]["core"]["mode"], "fifo");
     assert!(body["history"].is_array());
     let invalid_observability = format!(
         "GET /api/v1/admin/observability?minutes=10081 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -1369,6 +1377,9 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     );
     assert!(body.contains("e6irc_connections{state=\"registered\"}"));
     assert!(body.contains("e6irc_core_latency_seconds_bucket"));
+    assert!(body.contains("e6irc_queue_depth{queue=\"core\"}"));
+    assert!(body.contains("e6irc_queue_capacity{queue=\"db\"} 1024"));
+    assert!(body.contains("e6irc_queue_mode{queue=\"core\",mode=\"fifo\"} 1"));
 
     let form = format!(
         "csrf={csrf}&revision=1&server_name=irc.control.example&network_name=ControlNet&\

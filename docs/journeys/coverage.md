@@ -9,9 +9,9 @@ a design target rather than current behavior.
 | Journey | State | Strongest automated evidence | Boundary not crossed by CI |
 |---|---|---|---|
 | [Bootstrap and manage the server through the UI](administration-and-monitoring.md#bootstrap-and-manage-the-server-through-the-ui) | Proven | Chromium edits every scalar subsection and credential collection across real HTTP, PostgreSQL, audit/revision, and live BNC listener state | — |
-| [Explore accounts, channels, policy, and audit](administration-and-monitoring.md#explore-accounts-channels-policy-and-audit) | Proven | Real PostgreSQL directory/filter/action HTTP journeys | — |
+| [Explore accounts, channels, policy, and audit](administration-and-monitoring.md#explore-accounts-channels-policy-and-audit) | Proven | Real PostgreSQL directory/filter/action HTTP journeys plus Chromium K-Line add/remove/audit proof | — |
 | [Inspect and terminate live connections](administration-and-monitoring.md#inspect-and-terminate-live-connections) | Proven | Real core directory plus owner/admin exact-disconnect HTTP journeys | — |
-| [Monitor traffic, connections, latency, availability, and errors](administration-and-monitoring.md#monitor-traffic-connections-latency-availability-and-errors) | Proven | Telemetry arithmetic, runtime accounting, PostgreSQL retention, console, JSON, and metrics tests | External alerting is not part of e6irc |
+| [Monitor traffic, connections, queue pressure, latency, availability, and errors](administration-and-monitoring.md#monitor-traffic-connections-queue-pressure-latency-availability-and-errors) | Proven | Queue/runtime telemetry, schema compatibility, PostgreSQL retention, console/JSON/Prometheus tests, and live Chromium inspection | External alerting is not part of e6irc |
 | [Audit privileged changes](administration-and-monitoring.md#audit-privileged-changes) | Proven | Core audit events and atomic PostgreSQL mutation/audit tests | — |
 | [Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge) | Partially proven | All-feature management journey and live pinned Matrix oracle | Discord and Slack require commercial credentials |
 | [Use the scripting CLI](bridges-clients-and-automation.md#use-the-scripting-cli) | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON executable journeys | — |
@@ -54,7 +54,7 @@ a design target rather than current behavior.
 | [Receive replay and live messages without gaps or duplicates](web-chat.md#receive-replay-and-live-messages-without-gaps-or-duplicates) | Proven | Deterministic Chromium edge cases plus real upstream/persistence/restart path | — |
 | [Join, converse, and leave](web-chat.md#join-converse-and-leave) | Proven | Chromium acknowledgement/refusal/lifecycle cases and real bidirectional upstream journey | — |
 | [Personalize web chat and desktop notifications](web-chat.md#personalize-web-chat-and-desktop-notifications) | Proven | Client edge-case tests plus Chromium theme reload, permission, exact notification, and opt-out over real upstream traffic | Operating-system presentation after the browser API is Chromium's responsibility |
-| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Browser authentication/navigation plus handler-level role, page, and mutation journeys | Chromium does not click every administrator mutation |
+| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Chromium visits every administrator directory and performs configuration, credential, network, policy, monitoring, audit, and sign-out workflows; focused HTTP covers remaining mutations | — |
 
 “—” means the defined journey boundary is crossed by current CI; it does not
 mean every possible environment or fault has been tested.
@@ -81,6 +81,7 @@ mean every possible environment or fault has been tested.
 The Chromium suite contains both layers: deterministic browser-side
 REST/history/WebSocket replacements for replay races and membership edge
 states, and one complete local acceptance path through real console forms,
+administrator directories and policy/audit actions, queue monitoring,
 PostgreSQL, the registry, an IRC driver, a TCP upstream, `/ws/ui`, persistence,
 operations diagnostics, graceful daemon restart, and session recovery.
 
