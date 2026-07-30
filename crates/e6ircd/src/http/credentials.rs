@@ -2,6 +2,59 @@
 
 use super::*;
 
+#[derive(Deserialize)]
+pub(super) struct ProfileRequest {
+    pub(super) contact_email: Option<String>,
+}
+
+pub(super) async fn me_profile(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+) -> Response {
+    match crate::db::account_contact_email(pool_of(&state), &account).await {
+        Ok(contact_email) => {
+            let mut response = (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "account": account,
+                    "contact_email": contact_email,
+                })
+                .to_string(),
+            )
+                .into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Err(error) => database_unavailable("profile read", error),
+    }
+}
+
+pub(super) async fn update_me_profile(
+    State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
+    JsonBody(request): JsonBody<ProfileRequest>,
+) -> Response {
+    let contact_email = match request.contact_email.as_deref() {
+        Some(email) => match crate::identity::ContactEmail::parse(email) {
+            Ok(email) => Some(email),
+            Err(error) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid contact email",
+                    Some(&error.to_string()),
+                );
+            }
+        },
+        None => None,
+    };
+    match crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => database_unavailable("profile update", error),
+    }
+}
+
 fn database_unavailable(operation: &str, error: impl std::fmt::Display) -> Response {
     eprintln!("http: {operation} failed: {error}");
     problem(
@@ -258,10 +311,13 @@ pub(super) async fn me_tokens_list(
         Ok(rows) => {
             let tokens: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(|(id, label, created_at, expires_at)| {
+                .map(|token| {
                     serde_json::json!({
-                        "id": id, "label": label,
-                        "created_at": created_at, "expires_at": expires_at,
+                        "id": token.id,
+                        "label": token.label,
+                        "created_at": token.created_at,
+                        "expires_at": token.expires_at,
+                        "scopes": token.scopes.iter().collect::<Vec<_>>(),
                     })
                 })
                 .collect();

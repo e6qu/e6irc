@@ -49,9 +49,23 @@ pub(super) fn services_dispatch(
 pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str]) {
     match command {
         "REGISTER" => {
-            let Some(&password) = args.first() else {
-                state.service_notice(conn, "NickServ", "Syntax: REGISTER <password> [email]");
-                return;
+            let (password, contact_email) = match args {
+                [password] if !state.config.registration_require_email => (*password, None),
+                [password, email] => match crate::identity::ContactEmail::parse(email) {
+                    Ok(email) => (*password, Some(email)),
+                    Err(_) => {
+                        state.service_notice(
+                            conn,
+                            "NickServ",
+                            "Invalid email address. Syntax: REGISTER <password> [email]",
+                        );
+                        return;
+                    }
+                },
+                _ => {
+                    state.service_notice(conn, "NickServ", "Syntax: REGISTER <password> [email]");
+                    return;
+                }
             };
             if state.sessions[&conn].account.is_some() {
                 state.service_notice(conn, "NickServ", "You are already logged in.");
@@ -83,6 +97,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             let request = crate::core::DbRequest::CreateAccount {
                 conn,
                 name,
+                contact_email,
                 password: password.to_string(),
                 origin: crate::core::AccountOrigin::NickServ,
             };

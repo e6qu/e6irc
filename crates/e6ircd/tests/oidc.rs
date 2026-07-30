@@ -44,6 +44,9 @@ async fn full_oidc_login_provisions_account_and_session() {
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![
+                e6ircd::identity::EmailDomain::parse("kilgore.trout").expect("test domain"),
+            ],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         }],
@@ -176,11 +179,24 @@ async fn pat_bearer_auth_works() {
     let running = net::start(config).await.expect("start");
     let base = format!("http://{}", running.http_addr.expect("http"));
     let client = reqwest::Client::new();
+    let session_me: serde_json::Value = client
+        .get(format!("{base}/api/v1/me"))
+        .header("cookie", format!("e6irc_session={session}"))
+        .send()
+        .await
+        .expect("session me")
+        .json()
+        .await
+        .expect("session me json");
+    let csrf = session_me["csrf_token"]
+        .as_str()
+        .expect("session CSRF token");
 
     // mint a PAT using the session cookie
     let resp = client
         .post(format!("{base}/api/v1/me/tokens"))
         .header("cookie", format!("e6irc_session={session}"))
+        .header("x-e6irc-csrf", csrf)
         .json(&serde_json::json!({"label": "ci"}))
         .send()
         .await
@@ -260,6 +276,7 @@ async fn oidc_identity_link_flow_and_conflict() {
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         }],
@@ -385,6 +402,7 @@ async fn oidc_silent_sso_reuses_provider_session() {
             client_id: "e6irc-test".into(),
             client_secret: "e6irc-test-secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         }],

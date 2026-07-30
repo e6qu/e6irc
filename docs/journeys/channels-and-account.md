@@ -97,35 +97,78 @@ every list/revoke operation is owner-scoped.
 **Evidence.** Proven by credential DB tests, real-socket SASL tests, HTTP API,
 and `account_console_manages_credentials_tokens_and_identities`.
 
+## Manage a private account profile
+
+**Actor and goal.** An account holder wants to inspect, add, replace, or remove
+the private contact email associated with the account.
+
+**Preconditions.** The caller has an authenticated browser or API session and
+PostgreSQL is ready. A newly registered account may already have contact data
+when registration policy requested it.
+
+**Flow.**
+
+1. Open **Account & access** or read `/api/v1/me/profile`.
+2. View the account name and current contact email; the response is private and
+   non-cacheable.
+3. Submit a replacement email or an empty value to remove it.
+4. The server parses the mailbox once, canonicalizes its DNS domain, stores the
+   typed value, and returns the updated private profile.
+
+**Visible failures and recovery.** Empty local/domain parts, non-ASCII or
+control characters, malformed DNS labels, and over-limit input are rejected
+without changing storage. A suspended or missing account and a database
+failure are explicit; the form preserves a safe value for correction.
+
+**Security and observability.** The email is private account data: it is absent
+from public and administrator account directories, metric labels, logs, and
+audit details. Audit records state only whether contact data was replaced or
+removed. Browser form mutation is session-authenticated and CSRF-protected;
+API reads and writes are owner-scoped, and a cookie-authenticated API write
+requires the session-bound CSRF header.
+
+**Evidence.** Contact parsing is covered by typed-value unit tests; real
+PostgreSQL tests prove normalized registration, private directory behavior,
+replace/remove, and redacted audit details. The server-rendered account journey
+proves the browser workflow.
+
 ## Manage personal access tokens and read state
 
 **Actor and goal.** A user wants API/OAUTHBEARER access and an inspectable
 multi-device read position.
 
-**Preconditions.** The account has an authenticated browser/API session,
-PostgreSQL is ready, and marker targets refer to a conversation the account may
-access.
+**Preconditions.** The account has an authenticated browser session for token
+issuance, PostgreSQL is ready, and marker targets refer to a conversation the
+account may access.
 
 **Flow.**
 
-- Create a personal access token, copy its plaintext once, list metadata, and
-  revoke by ID.
-- Present it as HTTP bearer authentication or IRC SASL OAUTHBEARER.
+- Choose a 1–365-day lifetime and a non-empty subset of `read`, `write`,
+  `administrator`, and `irc`; create the token through a session-bound
+  CSRF-protected request, copy its plaintext once, list its exact grants and
+  expiry, and revoke by ID.
+- Present it as HTTP bearer authentication for methods its read/write/admin
+  grants permit, or as IRC SASL OAUTHBEARER when it carries `irc`.
 - Read the account’s target/position map through **Account & access** or
   `/api/v1/me/read-markers`.
 - Update positions over IRC MARKREAD.
 
-**Visible failures and recovery.** Token caps are enforced transactionally. Revoked tokens
-fail authentication. Token strings never appear in listings, HTML, audit
-details, or metrics.
+**Visible failures and recovery.** Empty/unknown grants, an out-of-range
+lifetime, missing browser CSRF, token-cap exhaustion, expiry, revocation, or an
+insufficient grant returns an explicit error. A bearer token cannot use the
+issuance route to expand its own authority. Token strings never appear in
+listings, HTML, audit details, or metrics.
 
 **Security and observability.** Tokens are random, shown once, hashed at rest,
-and owner-scoped on list/revoke. Marker queries cannot enumerate another
-account’s conversations; message bodies and target names are excluded from
-metric labels.
+owner-scoped on list/revoke, and bounded by mandatory expiry. Browser sessions
+and bearer tokens for one account share the same bounded API admission budget;
+administrator calls have their own smaller budget. Marker queries cannot
+enumerate another account’s conversations; message bodies and target names are
+excluded from metric labels.
 
 **Evidence.** Proven by token cap/list/revoke, bearer authentication,
-OAUTHBEARER socket, marker persistence/restart, API, and console tests.
+scope/lifetime/expiry enforcement, no-escalation and shared-account-rate HTTP
+tests, OAUTHBEARER socket, marker persistence/restart, API, and console tests.
 
 ## Inspect and terminate sessions
 

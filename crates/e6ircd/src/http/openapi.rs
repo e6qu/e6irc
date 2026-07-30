@@ -4,7 +4,11 @@ use super::*;
 
 /// Build the OpenAPI 3.1 description consumed by generated clients.
 fn document() -> serde_json::Value {
-    let bearer = serde_json::json!([{ "bearer": [] }]);
+    let authenticated = serde_json::json!([
+        { "bearer": [] },
+        { "browserSession": [] },
+        { "secureBrowserSession": [] }
+    ]);
     let ok_json = serde_json::json!({
         "200": { "description": "OK", "content": { "application/json": {} } }
     });
@@ -101,7 +105,19 @@ fn document() -> serde_json::Value {
                 "bearer": {
                     "type": "http",
                     "scheme": "bearer",
-                    "description": "A personal access token (see POST /api/v1/me/tokens).",
+                    "description": "An expiring personal access token. GET/HEAD operations require read, mutations require write, administrator routes additionally require administrator, and IRC SASL OAUTHBEARER requires irc.",
+                },
+                "browserSession": {
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": "e6irc_session",
+                    "description": "The development-mode opaque browser session. Unsafe REST methods also require the session-bound value from /api/v1/me in X-E6IRC-CSRF.",
+                },
+                "secureBrowserSession": {
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": "__Host-e6irc_session",
+                    "description": "The production Secure, host-bound opaque browser session. Unsafe REST methods also require the session-bound value from /api/v1/me in X-E6IRC-CSRF.",
                 }
             }
         },
@@ -144,14 +160,42 @@ fn document() -> serde_json::Value {
                 }
             },
             "/api/v1/me": {
-                "get": { "summary": "The authenticated account", "security": bearer,
+                "get": { "summary": "The authenticated account", "security": authenticated,
                     "responses": ok_json }
+            },
+            "/api/v1/me/profile": {
+                "get": {
+                    "summary": "Read your private account profile",
+                    "security": authenticated,
+                    "responses": { "200": { "description": "account and optional contact_email" } }
+                },
+                "patch": {
+                    "summary": "Replace or remove your private contact email",
+                    "description": "The address is parsed and bounded before storage. JSON null removes it. The audit event records only replaced/removed, never the address.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["contact_email"],
+                            "properties": {
+                                "contact_email": {
+                                    "type": ["string", "null"],
+                                    "maxLength": 254
+                                }
+                            }
+                        }
+                    } } },
+                    "responses": {
+                        "204": { "description": "profile updated" },
+                        "400": { "description": "invalid contact email" }
+                    }
+                }
             },
             "/api/v1/me/sessions": {
                 "get": {
                     "summary": "List your active browser sessions",
                     "description": "Returns at most 32 owner-scoped stable IDs, creation/expiry times, login method, provider, bounded User-Agent provenance, and whether a row is the request's current cookie session. A new login atomically revokes the oldest active row at the cap. Session tokens and hashes are never returned.",
-                    "security": bearer,
+                    "security": authenticated,
                     "responses": {
                         "200": { "description": "unexpired browser sessions, current first" },
                         "503": { "description": "database unavailable" }
@@ -162,7 +206,7 @@ fn document() -> serde_json::Value {
                 "delete": {
                     "summary": "Revoke one of your browser sessions",
                     "description": "The session ID is scoped to the authenticated account in the deletion query. Revoking the current cookie session also clears its browser cookie.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer", "format": "int64" } }],
                     "responses": {
@@ -176,7 +220,7 @@ fn document() -> serde_json::Value {
                 "get": {
                     "summary": "Filter and page your live IRC connections",
                     "description": "Returns only registered connections currently authenticated to the caller. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. IDs identify exact live resources; before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": own_connection_parameters,
                     "responses": {
                         "200": { "description": "owner-scoped connection posture and next_before_id cursor" },
@@ -190,7 +234,7 @@ fn document() -> serde_json::Value {
                 "delete": {
                     "summary": "Disconnect one of your exact live IRC connections",
                     "description": "Core ownership is rechecked against the authenticated account at mutation time. Another account's or a stale ID is indistinguishable from a missing resource.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": connection_mutation_parameters(),
                     "responses": {
                         "204": { "description": "connection disconnected" },
@@ -271,7 +315,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/oidc/{provider}/link": {
                 "get": { "summary": "Link an OIDC identity to your account (redirects to the provider)",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": [{ "name": "provider", "in": "path", "required": true,
                         "schema": { "type": "string" } }],
                     "responses": { "307": { "description": "redirect into the provider" },
@@ -280,12 +324,12 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/identities": {
                 "get": { "summary": "List OIDC identities linked to your account",
-                    "security": bearer, "responses": ok_json }
+                    "security": authenticated, "responses": ok_json }
             },
             "/api/v1/me/identities/{id}": {
                 "delete": {
                     "summary": "Unlink one of your OIDC identities and revoke its browser sessions",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer" } }],
                     "responses": {
@@ -306,31 +350,65 @@ fn document() -> serde_json::Value {
                         "400": { "description": "authorization_pending / expired_token / invalid_grant" } } }
             },
             "/api/v1/auth/device/approve": {
-                "post": { "summary": "Approve a device grant by user_code", "security": bearer,
+                "post": {
+                    "summary": "Approve a device grant from a browser session",
+                    "description": "Requires the cookie-authenticated session and its X-E6IRC-CSRF header. Personal access tokens cannot mint a replacement bearer through device approval.",
                     "responses": { "204": { "description": "approved" },
+                        "401": { "description": "browser session required" },
+                        "403": { "description": "invalid or missing CSRF token" },
                         "404": { "description": "no such pending code" } } }
             },
             "/api/v1/me/tokens": {
-                "get": { "summary": "List your personal access tokens (never the token)",
-                    "security": bearer, "responses": ok_json },
-                "post": { "summary": "Mint a personal access token (shown once)",
-                    "security": bearer, "responses": ok_json }
+                "get": {
+                    "summary": "List your expiring scoped personal access tokens (never the token)",
+                    "description": "Returns the stable identifier, label, creation and expiry timestamps, and the closed scope set. Token material and hashes are never returned.",
+                    "security": authenticated, "responses": ok_json },
+                "post": {
+                    "summary": "Mint an expiring scoped personal access token (shown once)",
+                    "description": "Requires a browser session and its X-E6IRC-CSRF header. Existing bearer tokens cannot expand their own grant.",
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["label"],
+                            "properties": {
+                                "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "scopes": {
+                                    "type": "array", "minItems": 1, "maxItems": 4,
+                                    "uniqueItems": true,
+                                    "items": { "type": "string",
+                                        "enum": ["read", "write", "administrator", "irc"] },
+                                    "default": ["read", "write", "irc"]
+                                },
+                                "expires_in_days": {
+                                    "type": "integer", "minimum": 1, "maximum": 365,
+                                    "default": 30
+                                }
+                            }
+                        }
+                    } } },
+                    "responses": {
+                        "201": { "description": "token material, exact scopes, and bounded lifetime" },
+                        "400": { "description": "invalid label, empty/unknown scopes, or lifetime" },
+                        "403": { "description": "the issuing bearer lacks write scope" },
+                        "409": { "description": "the account token cap is reached" }
+                    }
+                }
             },
             "/api/v1/me/tokens/{id}": {
                 "delete": { "summary": "Revoke one of your personal access tokens",
-                    "security": bearer,
+                    "security": authenticated,
                     "responses": { "204": { "description": "revoked" },
                         "404": { "description": "no such token" } } }
             },
             "/api/v1/me/read-markers": {
                 "get": { "summary": "List your read markers (draft/read-marker) per target",
-                    "security": bearer, "responses": ok_json }
+                    "security": authenticated, "responses": ok_json }
             },
             "/api/v1/me/password": {
                 "put": {
                     "summary": "Change your primary local-account password",
                     "description": "Creates a first primary password for an OIDC-only account when current_password is omitted. Existing primary passwords require their current value; an app password cannot authorize rotation.",
-                    "security": bearer,
+                    "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
@@ -354,7 +432,7 @@ fn document() -> serde_json::Value {
             "/api/v1/me/channels": {
                 "get": {
                     "summary": "List registered channels you founded with durable configuration",
-                    "security": bearer,
+                    "security": authenticated,
                     "responses": {
                         "200": { "description": "channels, retained topics, KEEPTOPIC, MLOCK, and access grants" },
                         "503": { "description": "database unavailable" }
@@ -363,7 +441,7 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Register a live channel currently operated by your account",
                     "description": "An identified live session for the authenticated account must be a channel operator. The current topic, founder row, and audit record are stored before the live ownership map changes.",
-                    "security": bearer,
+                    "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
@@ -385,7 +463,7 @@ fn document() -> serde_json::Value {
             "/api/v1/me/channels/{name}": {
                 "get": {
                     "summary": "Read one registered channel you founded",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": channel_name_parameter,
                     "responses": {
                         "200": { "description": "durable channel configuration" },
@@ -395,7 +473,7 @@ fn document() -> serde_json::Value {
                 "patch": {
                     "summary": "Change a retained topic, KEEPTOPIC, MLOCK, or founder",
                     "description": "The body is a tagged operation: set_topic, set_keeptopic, set_mlock, or transfer_founder. Exactly one storage-confirmed mutation is applied.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": channel_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
@@ -456,7 +534,7 @@ fn document() -> serde_json::Value {
                 },
                 "delete": {
                     "summary": "Unregister a channel you founded and remove all durable settings",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": channel_name_parameter,
                     "responses": {
                         "200": { "description": "unregistered" },
@@ -468,7 +546,7 @@ fn document() -> serde_json::Value {
             "/api/v1/me/channels/{name}/access/{account}": {
                 "put": {
                     "summary": "Set auto-op/auto-voice access for a registered account",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": channel_access_parameters,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false, "required": ["flags"],
@@ -488,7 +566,7 @@ fn document() -> serde_json::Value {
                 },
                 "delete": {
                     "summary": "Remove one channel access grant",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": channel_access_parameters,
                     "responses": {
                         "200": { "description": "removed" },
@@ -497,11 +575,11 @@ fn document() -> serde_json::Value {
                 }
             },
             "/api/v1/me/credentials": {
-                "get": { "summary": "List the account's credentials", "security": bearer,
+                "get": { "summary": "List the account's credentials", "security": authenticated,
                     "responses": ok_json }
             },
             "/api/v1/me/credentials/{id}": {
-                "delete": { "summary": "Revoke an app password", "security": bearer,
+                "delete": { "summary": "Revoke an app password", "security": authenticated,
                     "parameters": [{ "name": "id", "in": "path", "required": true,
                         "schema": { "type": "integer" } }],
                     "responses": { "204": { "description": "revoked" },
@@ -510,10 +588,10 @@ fn document() -> serde_json::Value {
             "/api/v1/me/networks": {
                 "get": { "summary": "List the account's BNC networks with live upstream status",
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
-                    "security": bearer, "responses": ok_json },
+                    "security": authenticated, "responses": ok_json },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "description": "kind defaults to `irc`. IRC requires addr/nick and optional paired SASL credentials. Matrix requires an HTTP(S) homeserver in addr, a provider user in nick, tls=true, and sasl_password. Discord requires tls=true, empty nick, a bot token in sasl_password, and an optional HTTP(S) API base in addr. Slack requires tls=true, empty nick, a bot token in sasl_account, an app token in sasl_password, and an optional HTTP(S) API base in addr. realname is IRC-only.",
-                    "security": bearer,
+                    "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object",
                             "required": ["name", "addr", "nick"],
@@ -532,13 +610,13 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/networks/{name}": {
                 "get": { "summary": "Read one BNC network and its live runtime diagnostics",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": network_name_parameter,
                     "responses": { "200": { "description": "stored configuration and runtime counters; secrets are presence booleans only" },
                         "404": { "description": "no such network" } } },
                 "put": { "summary": "Replace a BNC network's mutable configuration and restart its driver",
                     "description": "The stored kind selects the same IRC/Matrix/Discord/Slack field contract documented on create. The credential action is required and explicit: `keep` preserves write-only values; `remove` clears paired IRC SASL and is rejected for bridges; `set` replaces supplied values. IRC requires account and may omit password to preserve it. Matrix/Discord accept only password. Slack accepts account, password, or both and preserves an omitted token.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "additionalProperties": false,
@@ -572,7 +650,7 @@ fn document() -> serde_json::Value {
                         "404": { "description": "no such network" },
                         "409": { "description": "cannot seal credentials or start replacement driver" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": { "type": "object", "required": ["enabled"],
@@ -581,14 +659,14 @@ fn document() -> serde_json::Value {
                         "404": { "description": "no such network" },
                         "409": { "description": "cannot start (stored secret, no master key)" } } },
                 "delete": { "summary": "Delete a BNC network and stop its driver",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": network_name_parameter,
                     "responses": { "204": { "description": "deleted" },
                         "404": { "description": "no such network" } } }
             },
             "/api/v1/me/networks/{name}/buffer": {
                 "get": { "summary": "Recent buffered upstream lines for a network (oldest-first)",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": [
                         { "name": "name", "in": "path", "required": true,
                             "schema": { "type": "string" } },
@@ -599,13 +677,13 @@ fn document() -> serde_json::Value {
                         "404": { "description": "no such network" } } }
             },
             "/api/v1/history": {
-                "get": { "summary": "Paged message history for the account", "security": bearer,
+                "get": { "summary": "Paged message history for the account", "security": authenticated,
                     "responses": ok_json }
             },
             "/api/v1/admin/accounts": {
                 "get": { "summary": "Filter and page administrator-safe account posture (admin only)",
                     "description": "Returns stable account IDs newest-first. before_id selects strictly older accounts, so concurrent registration cannot duplicate or skip rows. The optional name filter is exact under RFC1459 case-folding. Counts omit expired browser sessions and personal access tokens; no credential, token, session, identity-subject, or network-secret material is returned.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": account_directory_parameters,
                     "responses": { "200": { "description": "account posture entries and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, or exact account filter" },
@@ -615,7 +693,7 @@ fn document() -> serde_json::Value {
                 "patch": {
                     "summary": "Change account suspension or durable administrator authority (admin only)",
                     "description": "Exactly one desired state is accepted per request. Suspension commits credential revocation and an audit record before the live core and owned-network registry are reconciled. Self-suspension, self-demotion, and removing or suspending the last active durable administrator are rejected.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": [{
                         "name": "id",
                         "in": "path",
@@ -655,7 +733,7 @@ fn document() -> serde_json::Value {
                 "get": {
                     "summary": "Filter and page all live IRC connections (admin only)",
                     "description": "Returns a bounded newest-first projection of registered clients across TCP, TLS, WebSocket, and the local in-process transport. IDs and next_before_id are exact decimal strings so JavaScript clients cannot round them. Nick and account filters use RFC1459 case-folding. before_id selects strictly older connections, so concurrent accepts cannot duplicate into an older page.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": admin_connection_parameters,
                     "responses": {
                         "200": { "description": "connection posture entries and next_before_id cursor" },
@@ -669,7 +747,7 @@ fn document() -> serde_json::Value {
                 "delete": {
                     "summary": "Disconnect one exact live IRC connection (admin only)",
                     "description": "Targets the immutable connection resource rather than resolving a mutable nick. The shared core disconnect path emits the terminal ERROR, operator notice, and audit record.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": connection_mutation_parameters(),
                     "responses": {
                         "204": { "description": "connection disconnected" },
@@ -683,7 +761,7 @@ fn document() -> serde_json::Value {
             "/api/v1/admin/channels": {
                 "get": { "summary": "Filter and page registered-channel policy (admin only)",
                     "description": "Returns stable registration IDs newest-first. before_id selects strictly older rows, so concurrent registration cannot duplicate or skip entries. Optional channel and founder filters are exact under RFC1459 case-folding.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": registered_channel_parameters,
                     "responses": { "200": { "description": "registered-channel posture and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, channel, or founder filter" },
@@ -692,7 +770,7 @@ fn document() -> serde_json::Value {
             "/api/v1/admin/bans": {
                 "get": { "summary": "Filter and page persisted K/D/X-line policy (admin only)",
                     "description": "Returns stable policy IDs newest-first. before_id selects strictly older rows, so concurrent policy additions cannot duplicate or skip entries. Kind is a closed exact filter; mask matching is exact under RFC1459 case-folding while display casing is preserved.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": server_ban_parameters,
                     "responses": { "200": { "description": "server-ban policy and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, kind, or mask filter" },
@@ -701,7 +779,7 @@ fn document() -> serde_json::Value {
             "/api/v1/admin/audit": {
                 "get": { "summary": "Filter and page the privileged-action audit log (admin only)",
                     "description": "Returns stable audit entry IDs newest-first. before_id selects strictly older entries, so concurrent appends cannot duplicate or skip rows. Actor, action, and target filters are exact.",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": audit_parameters,
                     "responses": { "200": { "description": "audit entries and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, or exact filter" },
@@ -709,13 +787,13 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/admin/stats": {
                 "get": { "summary": "Aggregate server counts (admin only)",
-                    "security": bearer,
+                    "security": authenticated,
                     "responses": { "200": { "description": "counts" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
-                    "security": bearer,
+                    "security": authenticated,
                     "parameters": [{ "name": "minutes", "in": "query",
                         "schema": { "type": "integer", "minimum": 1, "maximum": 10080,
                             "default": 60 } }],
@@ -726,7 +804,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/admin/metrics": {
                 "get": { "summary": "Prometheus exposition (admin only)",
-                    "security": bearer,
+                    "security": authenticated,
                     "responses": { "200": { "description": "Prometheus text exposition" },
                         "403": { "description": "not an admin account" } } }
             }

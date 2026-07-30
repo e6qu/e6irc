@@ -62,23 +62,29 @@ registration, PostgreSQL is ready, and cookies are correctly configured.
    PKCE verifier, then redirects to the provider.
 3. The callback validates state, issuer, signature, audience, nonce, and code
    exchange before trusting the subject.
-4. `(issuer, subject)` resolves a linked e6irc account. First login provisions
+4. When the provider has an allowed-domain policy, the callback additionally
+   requires a provider-verified, syntactically valid email whose canonical
+   domain exactly matches one configured domain.
+5. `(issuer, subject)` resolves a linked e6irc account. First login provisions
    one according to registration policy; later logins reuse it.
-5. The server creates a bounded browser session, retains the provider logout
+6. The server creates a bounded browser session, retains the provider logout
    hint when supplied, and enters the application.
 
 **Visible failures and recovery.** Unknown/disabled provider, stale or replayed
-state, callback mismatch, invalid claims, registration denial, identity
-conflict, session-cap conflict, and provider/network/database failures all fail
-closed. No local session is created from partially validated claims. The
-validation and signed-out pages remain reload-safe. A valid provider result
-for a suspended account ends with an explicit account-unavailable response and
-no browser session.
+state, callback mismatch, invalid claims, missing/unverified/malformed or
+non-matching email under an allowed-domain policy, registration denial,
+identity conflict, session-cap conflict, and provider/network/database
+failures all fail closed. Parent and subdomains do not match by implication.
+No local session is created from partially validated claims. The validation
+and signed-out pages remain reload-safe. A valid provider result for a
+suspended account ends with an explicit account-unavailable response and no
+browser session.
 
 **Security and observability.** State is one-time and expiring; PKCE binds the
-authorization code; identities are globally unique. Front-channel and
-back-channel logout use correlation rather than trusting browser-supplied
-account data.
+authorization code; identities are globally unique. Email-domain admission is
+a typed exact-match policy over a verified provider claim, not suffix matching.
+Front-channel and back-channel logout use correlation rather than trusting
+browser-supplied account data.
 
 **Evidence.** Proven against a real e6ircd, PostgreSQL, Dex, and Chromium by
 `full_oidc_login_provisions_account_and_session`,
@@ -99,16 +105,18 @@ after an unlink.
 
 1. **Account & access** lists linked identities without provider secrets.
 2. **Link** starts a fresh provider flow marked as a link operation.
-3. The callback attaches the validated `(issuer, subject)` to the initiating
-   account only if no other account owns it.
+3. The callback applies the provider's verified exact-email-domain policy,
+   then attaches the validated `(issuer, subject)` to the initiating account
+   only if no other account owns it.
 4. Unlink requires an authenticated, CSRF-protected console form or the
    owner-scoped `DELETE /api/v1/me/identities/{id}`.
 5. The account remains usable through its remaining credentials/identities.
 
 **Visible failures and recovery.** Linking an identity owned by another account
-is a conflict, never a move. Unlinking an identity outside the caller’s account
-is indistinguishable from absence. The server refuses a mutation that would
-violate the account’s access invariants.
+is a conflict, never a move. Missing/unverified or non-matching email under a
+provider domain policy is rejected before linking. Unlinking an identity
+outside the caller’s account is indistinguishable from absence. The server
+refuses a mutation that would violate the account’s access invariants.
 
 **Security and observability.** Link state and PKCE are bound to the initiating
 session. The callback trusts only validated issuer/subject identity, unlink is
@@ -251,8 +259,9 @@ credential exists yet.
 - Change/add the primary password from **Account & access**.
 - Create an app password for IRC/BNC, copy the one-time plaintext, then revoke
   it independently.
-- Create a personal access token for API/OAUTHBEARER, copy it once, list its
-  secret-free posture, then revoke it independently.
+- Create a time-bounded personal access token with only the API/IRC grants it
+  needs, copy it once, list its secret-free posture, then revoke it
+  independently.
 - List browser sessions, revoke one, or revoke all other browser sessions.
 - List live IRC connections and disconnect an exact connection ID.
 - Sign out locally; when provider metadata supports it, coordinated logout also
@@ -260,8 +269,10 @@ credential exists yet.
 
 **Visible failures and recovery.** Credential/session caps are hard conflicts.
 An app password cannot rotate the primary password. The primary credential
-cannot be deleted through generic revocation. Exact-resource deletes are
-owner-scoped and idempotent only where the API contract says so.
+cannot be deleted through generic revocation. Expired or under-scoped personal
+access tokens are rejected, and a bearer cannot mint broader credentials.
+Exact-resource deletes are owner-scoped and idempotent only where the API
+contract says so.
 
 **Security and observability.** New app passwords and tokens are rendered once;
 only hashes and secret-free posture remain. Rotation and revocation are

@@ -146,6 +146,80 @@ async fn verify_password_roundtrip() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn account_contact_email_is_stored_normalized_and_private_by_default() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("account_contact_email_is_stored_normalized_and_private_by_default")
+            .await,
+    )
+    .await
+    .expect("connect");
+    let email =
+        e6ircd::identity::ContactEmail::parse("Alice+IRC@Example.COM").expect("valid email");
+    db::create_account_with_contact(&pool, "Alice", "password", Some(&email))
+        .await
+        .expect("create");
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT contact_email FROM accounts WHERE name_folded = 'alice'")
+            .fetch_one(&pool)
+            .await
+            .expect("contact email");
+    assert_eq!(stored.as_deref(), Some("Alice+IRC@example.com"));
+
+    let directory = db::query_account_directory(
+        &pool,
+        db::AccountDirectoryFilter {
+            before_id: None,
+            exact_name: None,
+            page_size: account_page_size(10),
+        },
+    )
+    .await
+    .expect("account directory");
+    let serialized = format!("{:?}", directory.entries);
+    assert!(
+        !serialized.contains("Alice+IRC"),
+        "contact email is private and must not leak through the administrator directory"
+    );
+
+    let replacement =
+        e6ircd::identity::ContactEmail::parse("new-contact@example.net").expect("valid email");
+    db::set_account_contact_email(&pool, "Alice", Some(&replacement))
+        .await
+        .expect("replace");
+    assert_eq!(
+        db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email"),
+        Some("new-contact@example.net".into())
+    );
+    let audit: (String, String) = sqlx::query_as(
+        "SELECT action, detail FROM audit_log
+         WHERE action = 'ACCOUNT_CONTACT_UPDATE'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("contact audit");
+    assert_eq!(audit.0, "ACCOUNT_CONTACT_UPDATE");
+    assert_eq!(audit.1, "contact email replaced");
+    assert!(
+        !audit.1.contains("example"),
+        "the private address must not enter audit detail"
+    );
+    db::set_account_contact_email(&pool, "alice", None)
+        .await
+        .expect("remove");
+    assert_eq!(
+        db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email"),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn sasl_over_real_socket() {
     let url = support::test_db("sasl_over_real_socket").await;
     let pool = db::connect_and_migrate(&url).await.expect("connect");
@@ -697,6 +771,15 @@ async fn credential_list_and_revoke() {
     }
     let http = running.http_addr.expect("http");
     let auth = format!("Cookie: e6irc_session={session}\r\n");
+    let (status, body) = http_req(
+        http,
+        &format!("GET /api/v1/me HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}\r\n"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let me: serde_json::Value = serde_json::from_str(&body).expect("current account JSON");
+    let csrf = me["csrf_token"].as_str().expect("session CSRF token");
+    let mutation_auth = format!("{auth}X-E6IRC-CSRF: {csrf}\r\n");
 
     // list → local_password + 2 app_passwords = 3
     let (status, body) = http_req(
@@ -727,7 +810,7 @@ async fn credential_list_and_revoke() {
     // authenticated revoke → 204, then list shows 2
     let (status, _) = http_req(
         http,
-        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}\r\n"),
+        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{mutation_auth}\r\n"),
     )
     .await;
     assert_eq!(status, 204);
@@ -744,7 +827,7 @@ async fn credential_list_and_revoke() {
     // revoking again → 404
     let (status, _) = http_req(
         http,
-        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{auth}\r\n"),
+        &format!("DELETE /api/v1/me/credentials/{app_id} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n{mutation_auth}\r\n"),
     )
     .await;
     assert_eq!(status, 404);
@@ -984,6 +1067,60 @@ async fn api_tokens_are_capped_per_account() {
     assert!(
         matches!(over, Err(db::DbError::TooManyCredentials)),
         "the 33rd PAT must be refused: {over:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn api_token_storage_rejects_invalid_grants_and_lifetimes() {
+    let url = support::test_db("api_token_storage_rejects_invalid_grants_and_lifetimes").await;
+    let pool = db::connect_and_migrate(&url).await.expect("connect");
+    db::create_account(&pool, "token-shape", "pw")
+        .await
+        .expect("create");
+    let account_id: i64 =
+        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = 'token-shape'")
+            .fetch_one(&pool)
+            .await
+            .expect("account id");
+
+    for (index, scopes) in [
+        Vec::<String>::new(),
+        vec!["read".into(), "read".into()],
+        vec!["future".into()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = sqlx::query(
+            "INSERT INTO api_tokens (
+                 token_hash, account_id, label, scopes, expires_at
+             )
+             VALUES ($1, $2, 'invalid', $3, now() + interval '1 day')",
+        )
+        .bind(vec![index as u8])
+        .bind(account_id)
+        .bind(scopes)
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "invalid scope set {index} was stored");
+    }
+
+    let invalid_lifetime = sqlx::query(
+        "INSERT INTO api_tokens (
+             token_hash, account_id, label, scopes, created_at, expires_at
+         )
+         VALUES (
+             decode('ff', 'hex'), $1, 'invalid lifetime', ARRAY['read'],
+             now(), now() - interval '1 second'
+         )",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        invalid_lifetime.is_err(),
+        "expiry at or before creation was stored"
     );
 }
 
@@ -3689,9 +3826,12 @@ async fn account_directory_posture_filters_and_cursor_pages_are_stable() {
         "WITH account AS (
              SELECT id FROM accounts WHERE name_folded = 'alice'
          ), expired_token AS (
-             INSERT INTO api_tokens (token_hash, account_id, label, expires_at)
+             INSERT INTO api_tokens (
+                 token_hash, account_id, label, created_at, expires_at
+             )
              SELECT decode(repeat('ab', 32), 'hex'), id, 'expired',
-                    now() - interval '1 hour' FROM account
+                    now() - interval '2 hours', now() - interval '1 hour'
+             FROM account
          ), expired_session AS (
              INSERT INTO web_sessions (token_hash, account_id, expires_at)
              SELECT decode(repeat('cd', 32), 'hex'), id,
@@ -5079,10 +5219,11 @@ async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
     .await
     .expect("sessions");
     sqlx::query(
-        "INSERT INTO api_tokens (token_hash, account_id, label, expires_at)
+        "INSERT INTO api_tokens (token_hash, account_id, label, created_at, expires_at)
          VALUES
-           (decode('03', 'hex'), $1, 'old', now() - interval '1 second'),
-           (decode('04', 'hex'), $1, 'new', now() + interval '1 day')",
+           (decode('03', 'hex'), $1, 'old',
+            now() - interval '2 seconds', now() - interval '1 second'),
+           (decode('04', 'hex'), $1, 'new', now(), now() + interval '1 day')",
     )
     .bind(account_id)
     .execute(&pool)

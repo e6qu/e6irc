@@ -93,6 +93,13 @@ serde_json = { version = "1.0.150", default-features = false, features = [
     "std",
 ] }
 http = { version = "1.4.2", default-features = false, features = ["std"] }
+# Aggregate HTTP admission controls; account-keyed rate admission remains
+# application-owned because its key comes from authenticated identity.
+tower = { version = "0.5.3", default-features = false, features = ["limit"] }
+tower-http = { version = "0.6.11", default-features = false, features = [
+    "limit",
+    "timeout",
+] }
 # openidconnect 4.0.1 (2025-07-06): certified-flow OIDC RP (code+PKCE).
 # reqwest is its HTTP client, rustls-only to keep the single TLS stack.
 openidconnect = { version = "4.0.1", default-features = false, features = [

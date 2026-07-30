@@ -679,6 +679,9 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             trusted_proxies,
             auth_rate_burst: config.limits.auth_rate_burst,
             auth_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            api_rate_burst: config.limits.api_rate_burst.unwrap_or(240),
+            administrator_api_rate_burst: config.limits.administrator_api_rate_burst.unwrap_or(60),
+            api_buckets: std::sync::Mutex::new(std::collections::HashMap::new()),
             conn_limiter: limiter.clone(),
             request_id_prefix: {
                 use aws_lc_rs::rand::SecureRandom;

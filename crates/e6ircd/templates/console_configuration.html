@@ -150,6 +150,8 @@
         <label class="field"><span>Connections per IP</span><input type="number" min="1" name="max_connections_per_ip" value="{{ max_connections_per_ip }}" /></label>
         <label class="field"><span>Command burst</span><input type="number" min="1" name="command_burst" value="{{ command_burst }}" /></label>
         <label class="field"><span>Authentication burst</span><input type="number" min="1" name="auth_rate_burst" value="{{ auth_rate_burst }}" /></label>
+        <label class="field"><span>Authenticated API requests/minute</span><input type="number" min="1" name="api_rate_burst" value="{{ api_rate_burst }}" placeholder="240" /></label>
+        <label class="field"><span>Administrator API requests/minute</span><input type="number" min="1" name="administrator_api_rate_burst" value="{{ administrator_api_rate_burst }}" placeholder="60" /></label>
         <label class="field"><span>Registration burst</span><input type="number" min="1" name="registration_burst" value="{{ registration_burst }}" /></label>
         <label class="field field-wide"><span>Trusted proxies</span><textarea name="trusted_proxies" rows="3">{{ trusted_proxies }}</textarea><small>One CIDR per line.</small></label>
       </div>
@@ -293,6 +295,7 @@
               <div><strong>{{ provider.name }}</strong><span class="tag">{{ provider.token_method }}</span></div>
               <code>{{ provider.issuer_url }}</code>
               <span class="meta">Client {{ provider.client_id }} · scopes {{ provider.scopes }}</span>
+              <span class="meta">Allowed email domains: {% if provider.allowed_email_domains.is_empty() %}any verified provider identity{% else %}{{ provider.allowed_email_domains }}{% endif %}</span>
               <form method="post" action="/console/configuration/oidc/delete">
                 <input type="hidden" name="csrf" value="{{ csrf }}" />
                 <input type="hidden" name="name" value="{{ provider.name }}" />
@@ -309,6 +312,7 @@
         <label class="field"><span>Client ID</span><input name="client_id" required /></label>
         <label class="field"><span>Client secret</span><input type="password" name="client_secret" autocomplete="new-password" required /></label>
         <label class="field"><span>Scopes</span><input name="scopes" value="profile email" /></label>
+        <label class="field"><span>Allowed email domains <em>optional</em></span><input name="allowed_email_domains" placeholder="example.com, subsidiary.example" /></label>
         <label class="field"><span>Token authentication</span><select name="token_endpoint_auth_method"><option value="client_secret_basic">client_secret_basic</option><option value="client_secret_post">client_secret_post</option></select></label>
         <label class="field field-wide"><span>End-session endpoint <em>optional</em></span><input type="url" name="end_session_endpoint" /></label>
         <div class="form-actions field-wide"><button class="primary" type="submit">Add identity provider</button></div>

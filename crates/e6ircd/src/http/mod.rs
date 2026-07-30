@@ -129,6 +129,11 @@ pub struct AppState {
     pub auth_rate_burst: Option<usize>,
     /// Per-client-IP auth token buckets: `(tokens, last_refill)`.
     pub auth_buckets: Mutex<HashMap<std::net::IpAddr, (f64, std::time::Instant)>>,
+    /// Per-account ordinary/administrator API token buckets. The boolean key
+    /// distinguishes the smaller administrator budget.
+    pub api_rate_burst: usize,
+    pub administrator_api_rate_burst: usize,
+    pub api_buckets: Mutex<HashMap<(String, bool), (f64, std::time::Instant)>>,
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
@@ -772,6 +777,7 @@ documented_routes! {
     "/api/v1/auth/device/token" => { post: device_token },
     "/api/v1/auth/device/approve" => { post: device_approve },
     "/api/v1/me" => { get: me },
+    "/api/v1/me/profile" => { get: me_profile, patch: update_me_profile },
     "/api/v1/me/identities" => { get: me_identities },
     "/api/v1/me/identities/{id}" => { delete: me_identity_unlink },
     "/api/v1/me/sessions" => { get: list_browser_sessions },
@@ -844,6 +850,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
+        .route(
+            "/console/account/profile",
+            post(pages::console_update_profile),
+        )
         .route("/console/channels", get(pages::console_channels))
         .route(
             "/console/channels/topic",
@@ -1026,6 +1036,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             observe_http,
+        ))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(1024))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(30),
         ))
         .with_state(state)
 }
@@ -1732,6 +1748,7 @@ mod pages {
         label: String,
         created: String,
         expires: String,
+        scopes: String,
     }
 
     struct IdentityView {
@@ -1758,6 +1775,7 @@ mod pages {
         tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
         read_markers: Vec<ReadMarkerView>,
+        contact_email: String,
         link_providers: Vec<String>,
         outcome: Option<String>,
         success: bool,
@@ -1795,11 +1813,17 @@ mod pages {
             .await
             .map_err(|e| super::device::admin_db_error("token list", e))?
             .into_iter()
-            .map(|(id, label, created, expires)| ApiTokenView {
-                id,
-                label,
-                created,
-                expires: expires.unwrap_or_else(|| "No expiry".into()),
+            .map(|token| ApiTokenView {
+                id: token.id,
+                label: token.label,
+                created: token.created_at,
+                expires: token.expires_at,
+                scopes: token
+                    .scopes
+                    .iter()
+                    .map(crate::identity::ApiTokenScope::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
             })
             .collect();
         let identities = crate::db::list_oidc_identities(pool, &account)
@@ -1819,6 +1843,10 @@ mod pages {
             .into_iter()
             .map(|(target, timestamp)| ReadMarkerView { target, timestamp })
             .collect();
+        let contact_email = crate::db::account_contact_email(pool, &account)
+            .await
+            .map_err(|e| super::device::admin_db_error("profile read", e))?
+            .unwrap_or_default();
         let is_admin = is_admin_account(state, &account);
         let link_providers = state
             .oidc_providers
@@ -1835,6 +1863,7 @@ mod pages {
             tokens,
             identities,
             read_markers,
+            contact_email,
             link_providers,
             outcome,
             success,
@@ -1910,10 +1939,80 @@ mod pages {
         }
     }
 
+    pub async fn console_update_profile(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<AccountContactForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let (account, form) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+        let contact_email = if form.contact_email.trim().is_empty() {
+            None
+        } else {
+            match crate::identity::ContactEmail::parse(form.contact_email.trim()) {
+                Ok(email) => Some(email),
+                Err(error) => {
+                    return account_result(
+                        &state,
+                        account,
+                        &headers,
+                        AccountResult::message(StatusCode::BAD_REQUEST, error.to_string()),
+                    )
+                    .await;
+                }
+            }
+        };
+        let result =
+            crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
+                .await;
+        let view = match result {
+            Ok(()) => AccountResult::message(
+                StatusCode::OK,
+                if contact_email.is_some() {
+                    "Contact email updated."
+                } else {
+                    "Contact email removed."
+                },
+            ),
+            Err(error) => {
+                eprintln!("http: contact email update failed: {error}");
+                AccountResult::message(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Contact email was not changed.",
+                )
+            }
+        };
+        account_result(&state, account, &headers, view).await
+    }
+
     #[derive(Deserialize)]
     pub struct AccountLabelForm {
         csrf: String,
         label: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountContactForm {
+        csrf: String,
+        #[serde(default)]
+        contact_email: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountTokenForm {
+        csrf: String,
+        label: String,
+        expires_in_days: u16,
+        #[serde(default)]
+        scope_read: Option<String>,
+        #[serde(default)]
+        scope_write: Option<String>,
+        #[serde(default)]
+        scope_administrator: Option<String>,
+        #[serde(default)]
+        scope_irc: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -1935,6 +2034,18 @@ mod pages {
     }
 
     impl AccountForm for AccountLabelForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    impl AccountForm for AccountTokenForm {
+        fn csrf(&self) -> &str {
+            &self.csrf
+        }
+    }
+
+    impl AccountForm for AccountContactForm {
         fn csrf(&self) -> &str {
             &self.csrf
         }
@@ -2263,13 +2374,67 @@ mod pages {
     pub async fn console_create_api_token(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
+        form: Result<axum::Form<AccountTokenForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let (account, label) = match account_label_actor(&state, &headers, form).await {
+        let (account, form) = match account_form_actor(&state, &headers, form).await {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let result = crate::db::issue_api_token(pool_of(&state), &account, &label).await;
+        if let Some(error) = label_validation_error(&form.label) {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(StatusCode::BAD_REQUEST, error),
+            )
+            .await;
+        }
+        let scopes = [
+            form.scope_read
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Read),
+            form.scope_write
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Write),
+            form.scope_administrator
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Administrator),
+            form.scope_irc
+                .is_some()
+                .then_some(crate::identity::ApiTokenScope::Irc),
+        ]
+        .into_iter()
+        .flatten();
+        let Some(scopes) = crate::identity::ApiTokenScopes::new(scopes) else {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(StatusCode::BAD_REQUEST, "Choose at least one token scope."),
+            )
+            .await;
+        };
+        let Some(lifetime) = crate::identity::ApiTokenLifetimeDays::new(form.expires_in_days)
+        else {
+            return account_result(
+                &state,
+                account,
+                &headers,
+                AccountResult::message(
+                    StatusCode::BAD_REQUEST,
+                    "Token lifetime must be between 1 and 365 days.",
+                ),
+            )
+            .await;
+        };
+        let result = crate::db::issue_scoped_api_token(
+            pool_of(&state),
+            &account,
+            &form.label,
+            scopes,
+            lifetime,
+        )
+        .await;
         account_issue_result(
             &state,
             account,
@@ -3760,6 +3925,8 @@ mod pages {
         max_connections_per_ip: String,
         command_burst: String,
         auth_rate_burst: String,
+        api_rate_burst: String,
+        administrator_api_rate_burst: String,
         registration_burst: String,
         trusted_proxies: String,
         listeners: String,
@@ -3783,6 +3950,7 @@ mod pages {
         issuer_url: String,
         client_id: String,
         scopes: String,
+        allowed_email_domains: String,
         token_method: &'static str,
     }
 
@@ -3817,6 +3985,10 @@ mod pages {
         command_burst: String,
         #[serde(default)]
         auth_rate_burst: String,
+        #[serde(default)]
+        api_rate_burst: String,
+        #[serde(default)]
+        administrator_api_rate_burst: String,
         #[serde(default)]
         registration_burst: String,
         #[serde(default)]
@@ -3972,6 +4144,11 @@ mod pages {
                     .map(str::to_string)
                     .collect(),
                 auth_rate_burst: optional_number(&form.auth_rate_burst, "Authentication burst")?,
+                api_rate_burst: optional_number(&form.api_rate_burst, "Authenticated API burst")?,
+                administrator_api_rate_burst: optional_number(
+                    &form.administrator_api_rate_burst,
+                    "Administrator API burst",
+                )?,
                 registration_burst: optional_number(
                     &form.registration_burst,
                     "Registration burst",
@@ -4033,6 +4210,12 @@ mod pages {
                 issuer_url: provider.issuer_url.clone(),
                 client_id: provider.client_id.clone(),
                 scopes: provider.scopes.join(" "),
+                allowed_email_domains: provider
+                    .allowed_email_domains
+                    .iter()
+                    .map(crate::identity::EmailDomain::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 token_method: match provider.token_endpoint_auth_method {
                     crate::config::TokenEndpointAuthMethod::ClientSecretBasic => {
                         "client_secret_basic"
@@ -4074,6 +4257,10 @@ mod pages {
             max_connections_per_ip: optional_number_display(settings.limits.max_connections_per_ip),
             command_burst: optional_number_display(settings.limits.command_burst),
             auth_rate_burst: optional_number_display(settings.limits.auth_rate_burst),
+            api_rate_burst: optional_number_display(settings.limits.api_rate_burst),
+            administrator_api_rate_burst: optional_number_display(
+                settings.limits.administrator_api_rate_burst,
+            ),
             registration_burst: optional_number_display(settings.limits.registration_burst),
             trusted_proxies: settings.limits.trusted_proxies.join("\n"),
             listeners: display_listeners(&settings.listeners),
@@ -4290,6 +4477,8 @@ mod pages {
         client_secret: String,
         #[serde(default)]
         scopes: String,
+        #[serde(default)]
+        allowed_email_domains: String,
         #[serde(default)]
         end_session_endpoint: String,
         token_endpoint_auth_method: String,
@@ -4527,6 +4716,14 @@ mod pages {
                 _ => return Err("Unknown token endpoint authentication method.".into()),
             };
             let name = form.name.trim().to_string();
+            let allowed_email_domains = form
+                .allowed_email_domains
+                .split([',', ' ', '\n'])
+                .map(str::trim)
+                .filter(|domain| !domain.is_empty())
+                .map(crate::identity::EmailDomain::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
             settings
                 .oidc_providers
                 .push(crate::config::OidcProviderConfig {
@@ -4541,6 +4738,7 @@ mod pages {
                         .filter(|scope| !scope.is_empty())
                         .map(str::to_string)
                         .collect(),
+                    allowed_email_domains,
                     end_session_endpoint: (!form.end_session_endpoint.trim().is_empty())
                         .then(|| form.end_session_endpoint.trim().to_string()),
                     token_endpoint_auth_method: method,
@@ -7124,6 +7322,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             client_id: "e6irc".into(),
             client_secret: "secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         };
@@ -7196,6 +7395,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             client_id: "e6irc".into(),
             client_secret: "secret".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         };

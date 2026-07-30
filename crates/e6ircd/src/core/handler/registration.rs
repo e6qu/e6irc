@@ -232,6 +232,23 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
+    let contact_email = if *email == "*" {
+        None
+    } else {
+        match crate::identity::ContactEmail::parse(email) {
+            Ok(email) => Some(email),
+            Err(_) => {
+                register_fail(
+                    state,
+                    conn,
+                    "INVALID_EMAIL",
+                    &nick,
+                    "Supply a valid email address or * when email is optional",
+                );
+                return;
+            }
+        }
+    };
     if state.sessions[&conn].account.is_some() {
         register_fail(
             state,
@@ -282,6 +299,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let request = crate::core::DbRequest::CreateAccount {
         conn,
         name: nick.clone(),
+        contact_email,
         password: password.to_string(),
         origin: crate::core::AccountOrigin::RegisterCommand,
     };

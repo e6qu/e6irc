@@ -196,6 +196,14 @@ pub struct LimitsConfig {
     /// `None` disables auth rate limiting.
     #[serde(default)]
     pub auth_rate_burst: Option<usize>,
+    /// Authenticated REST requests per account per minute. `None` uses the
+    /// built-in production default.
+    #[serde(default)]
+    pub api_rate_burst: Option<usize>,
+    /// Administrator REST requests per administrator per minute. `None` uses
+    /// the smaller built-in production default.
+    #[serde(default)]
+    pub administrator_api_rate_burst: Option<usize>,
     /// Token-bucket size for account creation (REGISTER / NickServ REGISTER),
     /// per client IP; the bucket refills to full over one hour. Bounds bulk
     /// account minting from one address. `None` disables the throttle.
@@ -539,6 +547,10 @@ pub struct OidcProviderConfig {
     /// `offline_access`.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// When non-empty, only verified email claims in one of these exact
+    /// canonical domains may sign in or link through this provider.
+    #[serde(default)]
+    pub allowed_email_domains: Vec<crate::identity::EmailDomain>,
     /// RP-initiated logout (OIDC end-session) endpoint. When set, e6irc's
     /// logout redirects the browser here with `id_token_hint` and
     /// `post_logout_redirect_uri` so the identity provider's SSO session is
@@ -859,6 +871,16 @@ impl Config {
                 "limits.auth_rate_burst must be nonzero when set".into(),
             ));
         }
+        if self.limits.api_rate_burst == Some(0) {
+            return Err(ConfigError::Invalid(
+                "limits.api_rate_burst must be nonzero when set".into(),
+            ));
+        }
+        if self.limits.administrator_api_rate_burst == Some(0) {
+            return Err(ConfigError::Invalid(
+                "limits.administrator_api_rate_burst must be nonzero when set".into(),
+            ));
+        }
         if self.limits.registration_burst == Some(0) {
             return Err(ConfigError::Invalid(
                 "limits.registration_burst must be nonzero when set (0 refuses every account \
@@ -937,6 +959,16 @@ impl Config {
                         "OIDC provider '{}' requires client_id and client_secret",
                         provider.name
                     )));
+                }
+                let mut allowed_domains = std::collections::HashSet::new();
+                for domain in &provider.allowed_email_domains {
+                    if !allowed_domains.insert(domain.as_str()) {
+                        return Err(ConfigError::Invalid(format!(
+                            "OIDC provider '{}' repeats allowed email domain '{}'",
+                            provider.name,
+                            domain.as_str()
+                        )));
+                    }
                 }
                 // In production (secure cookies) the issuer must be HTTPS:
                 // discovery and JWKS are fetched from it, so plaintext lets an
@@ -1978,6 +2010,7 @@ mod tests {
                 client_id: "e6irc".into(),
                 client_secret: "secret".into(),
                 scopes: vec![],
+                allowed_email_domains: vec![],
                 end_session_endpoint: end_session.map(str::to_string),
                 token_endpoint_auth_method: Default::default(),
             }],
@@ -2067,6 +2100,7 @@ mod tests {
             client_id: "e6irc2".into(),
             client_secret: "secret2".into(),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         });
@@ -2078,6 +2112,48 @@ mod tests {
                 .contains("duplicate OIDC issuer"),
             "duplicate issuer must be rejected"
         );
+    }
+
+    #[test]
+    fn oidc_allowed_email_domains_are_canonical_and_unique() {
+        let mut config = oidc_config("corp", "https://auth.example", None);
+        config.oidc_providers[0].allowed_email_domains = vec![
+            crate::identity::EmailDomain::parse("Example.COM").expect("domain"),
+            crate::identity::EmailDomain::parse("example.com").expect("domain"),
+        ];
+        let error = config.validate().expect_err("duplicate domain");
+        assert!(error.to_string().contains("repeats allowed email domain"));
+
+        let parsed: Config = toml::from_str(
+            r#"
+server_name = "irc.example"
+network_name = "Example"
+application_release_revision = "0123456789ab"
+
+[[listeners]]
+addr = "127.0.0.1:6667"
+
+[database]
+url = "postgres://db.example/e6irc"
+
+[http]
+addr = "127.0.0.1:8080"
+public_url = "https://chat.example"
+
+[[oidc]]
+name = "corp"
+issuer_url = "https://auth.example"
+client_id = "e6irc"
+client_secret = "secret"
+allowed_email_domains = ["Example.COM", "subsidiary.example"]
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed.oidc_providers[0].allowed_email_domains[0].as_str(),
+            "example.com"
+        );
+        parsed.validate().expect("valid domain policy");
     }
 
     #[test]
@@ -2164,6 +2240,7 @@ mod tests {
                 client_id: "cid".into(),
                 client_secret: key.seal("oidcsecret", crate::secret::CONFIG_CONTEXT),
                 scopes: vec![],
+                allowed_email_domains: vec![],
                 end_session_endpoint: None,
                 token_endpoint_auth_method: Default::default(),
             }],

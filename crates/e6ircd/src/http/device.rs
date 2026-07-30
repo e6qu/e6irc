@@ -126,7 +126,7 @@ pub(super) async fn approve_user_code(
 /// Approve a device grant as the signed-in user (cookie-authenticated).
 pub(super) async fn device_approve(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    SessionMutation(account): SessionMutation,
     JsonBody(req): JsonBody<DeviceApproveReq>,
 ) -> Response {
     match approve_user_code(&state, &account, &req.user_code).await {
@@ -140,26 +140,6 @@ pub(super) async fn device_approve(
                 None,
             )
         }
-    }
-}
-
-/// Authenticate, then require the account be an admin (per config).
-/// Returns the account name, or a 401/403 response.
-pub(super) async fn require_admin(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> Result<String, Response> {
-    let account = authenticate(state, headers).await?;
-    let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-    if state
-        .admin_accounts
-        .read()
-        .expect("administrator registry lock")
-        .contains(&folded)
-    {
-        Ok(account)
-    } else {
-        Err(problem(StatusCode::FORBIDDEN, "Admin only", None))
     }
 }
 
@@ -893,6 +873,7 @@ mod admin_query_tests {
 
 pub(super) async fn me(
     State(state): State<Arc<AppState>>,
+    Authenticated(account): Authenticated,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // A *valid* session cookie yields the rich OIDC identity (email/role/
@@ -913,6 +894,7 @@ pub(super) async fn me(
                         "role": identity.role,
                         "provider": identity.provider,
                         "release_revision": state.application_release_revision,
+                        "csrf_token": state.csrf_token(&token),
                         "logout_url": format!(
                             "/api/v1/auth/logout?csrf={}",
                             state.csrf_token(&token)
@@ -937,25 +919,38 @@ pub(super) async fn me(
             }
         }
     }
-    match authenticate(&state, &headers).await {
-        Ok(account) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::json!({ "account": account }).to_string(),
-        )
-            .into_response(),
-        Err(response) => response,
-    }
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "account": account }).to_string(),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
 pub(super) struct TokenRequest {
     pub(super) label: String,
+    #[serde(default = "default_token_scopes")]
+    pub(super) scopes: Vec<crate::identity::ApiTokenScope>,
+    #[serde(default = "default_token_lifetime_days")]
+    pub(super) expires_in_days: u16,
+}
+
+fn default_token_scopes() -> Vec<crate::identity::ApiTokenScope> {
+    vec![
+        crate::identity::ApiTokenScope::Read,
+        crate::identity::ApiTokenScope::Write,
+        crate::identity::ApiTokenScope::Irc,
+    ]
+}
+
+const fn default_token_lifetime_days() -> u16 {
+    crate::identity::ApiTokenLifetimeDays::DEFAULT.value()
 }
 
 /// Mint a PAT for the authenticated account (shown once).
 pub(super) async fn create_api_token(
     State(state): State<Arc<AppState>>,
-    Authenticated(account): Authenticated,
+    SessionMutation(account): SessionMutation,
     body: Result<axum::Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let req = match super::parse_json(body) {
@@ -965,17 +960,33 @@ pub(super) async fn create_api_token(
     if let Some(resp) = validate_label(&req.label) {
         return resp;
     }
+    let Some(scopes) = crate::identity::ApiTokenScopes::new(req.scopes.iter().copied()) else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid token scopes",
+            Some("Choose at least one closed token scope."),
+        );
+    };
+    let Some(lifetime) = crate::identity::ApiTokenLifetimeDays::new(req.expires_in_days) else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid token lifetime",
+            Some("expires_in_days must be between 1 and 365."),
+        );
+    };
     let pool = pool_of(&state);
     // The per-account PAT cap is enforced atomically inside `issue_api_token`
     // (count + insert in one FOR UPDATE transaction), so there is no racy
     // list-then-insert here: two concurrent creates can't both slip past cap-1.
-    match crate::db::issue_api_token(pool, &account, &req.label).await {
+    match crate::db::issue_scoped_api_token(pool, &account, &req.label, scopes, lifetime).await {
         Ok(token) => (
             StatusCode::CREATED,
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::json!({
                 "token": token,
                 "label": req.label,
+                "scopes": scopes.iter().collect::<Vec<_>>(),
+                "expires_in_days": lifetime.value(),
                 "note": "Store this now; it is not retrievable later.",
             })
             .to_string(),

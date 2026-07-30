@@ -17,6 +17,23 @@ The 2026-07-30 whole-product traceability audit is in
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
 
+V1 closure identity and API admission (2026-07-30): account registration now
+parses and persists a normalized private contact email, while the self-service
+console and `/api/v1/me/profile` provide owner-scoped replacement/removal with
+redacted audit provenance. OpenID Connect provider configuration accepts a
+typed exact-domain allowlist and admits both login and linking only from a
+provider-verified matching email claim. Personal access tokens carry a closed,
+non-empty read/write/administrator/IRC grant set and mandatory 1–365-day
+expiry; HTTP, administrator, and SASL ingress enforce the corresponding grant,
+and session-bound CSRF protects every unsafe cookie-authenticated API method
+while preventing a bearer from minting broader authority.
+Browser sessions and tokens share bounded per-account API admission, with a
+separate smaller administrator budget; aggregate HTTP body, concurrency, and
+deadline limits bound unauthenticated process pressure. Unit, core,
+PostgreSQL, real HTTP, device, and OpenID Connect suites cover normalization,
+privacy, exact policy, grant separation, no escalation, expiry, and
+cross-bearer rate sharing.
+
 Journey-contract closure (2026-07-30): all 47 shipped outcomes now use one
 complete actor/precondition/flow/failure/security/evidence structure, and the
 coverage matrix has one exact linked row per journey using only the defined

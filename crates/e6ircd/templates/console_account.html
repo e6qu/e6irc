@@ -29,6 +29,25 @@
   <section class="panel">
     <div class="panel-head">
       <div>
+        <h2>Contact email</h2>
+        <p>Private account recovery and operator-contact metadata. e6irc stores it but does not claim to verify or send mail to it.</p>
+      </div>
+      <span class="tag">Private</span>
+    </div>
+    <form class="inline-create" method="post" action="/console/account/profile">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field">
+        <span>Email address</span>
+        <input type="email" name="contact_email" maxlength="254" value="{{ contact_email }}" placeholder="alice@example.com" />
+      </label>
+      <button class="primary" type="submit">Save contact email</button>
+    </form>
+    <p class="section-note">Leave the field empty and save to remove the stored address.</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
         <h2>{% if has_local_password %}Primary password{% else %}Add a local password{% endif %}</h2>
         <p>{% if has_local_password %}Used for local web sign-in, IRC identification, and authorizing new app passwords.{% else %}This account currently signs in through OpenID Connect. Add a password to enable local web and IRC credential sign-in too.{% endif %}</p>
       </div>
@@ -109,7 +128,7 @@
       <div class="panel-head">
         <div>
           <h2>Personal access tokens</h2>
-          <p>Bearer tokens for API clients and automation. Tokens currently carry the account's full API authority.</p>
+          <p>Expiring bearer grants for API clients, IRC authentication, and automation.</p>
         </div>
         <span class="count">{{ tokens.len() }}</span>
       </div>
@@ -119,6 +138,22 @@
           <span>Label</span>
           <input name="label" maxlength="64" placeholder="Monitoring automation" required />
         </label>
+        <label class="field">
+          <span>Lifetime</span>
+          <select name="expires_in_days">
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+            <option value="365">365 days</option>
+          </select>
+        </label>
+        <fieldset class="field">
+          <legend>Scopes</legend>
+          <label><input type="checkbox" name="scope_read" checked /> Read</label>
+          <label><input type="checkbox" name="scope_write" checked /> Write</label>
+          <label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>
+          {% if is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}
+        </fieldset>
         <button class="primary" type="submit">Create token</button>
       </form>
       {% if tokens.is_empty() %}
@@ -126,11 +161,12 @@
       {% else %}
         <div class="scroll">
           <table>
-            <thead><tr><th>Label</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
+            <thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
             <tbody>
               {% for token in tokens %}
                 <tr>
                   <td>{{ token.label }}</td>
+                  <td><code>{{ token.scopes }}</code></td>
                   <td>{{ token.created }}</td>
                   <td>{{ token.expires }}</td>
                   <td>

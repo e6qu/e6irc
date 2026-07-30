@@ -3953,7 +3953,8 @@ async fn admin_connection_directory_and_disconnect_controls() {
     };
     let delete = format!(
         "DELETE /api/v1/admin/connections/{api_connection_id}?reason=api-cleanup HTTP/1.1\r\n\
-         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+         Host: t\r\nCookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, head, body) = request(http, &delete).await;
     assert_eq!(status, 204, "{body}");
@@ -4072,7 +4073,8 @@ async fn my_sessions_are_scoped_to_the_caller() {
     assert_eq!(owner_page["connections"][0]["nick"], "alicecli");
     let delete_bob_api = format!(
         "DELETE /api/v1/me/connections/{bob_connection_id}?reason=nope HTTP/1.1\r\n\
-         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+         Host: t\r\nCookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, _, body) = request(http, &delete_bob_api).await;
     assert_eq!(status, 404, "{body}");
@@ -4131,7 +4133,8 @@ async fn my_sessions_are_scoped_to_the_caller() {
     };
     let delete_alice_api = format!(
         "DELETE /api/v1/me/connections/{alice_api_connection_id}?reason=owner-api HTTP/1.1\r\n\
-         Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+         Host: t\r\nCookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, head, body) = request(http, &delete_alice_api).await;
     assert_eq!(status, 204, "{body}");
@@ -4267,7 +4270,9 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
         .expect("list bob")[0]
         .id;
     let cross_account = format!(
-        "DELETE /api/v1/me/sessions/{bob_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+        "DELETE /api/v1/me/sessions/{bob_id} HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={current}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, _, _) = request(http, &cross_account).await;
     assert_eq!(status, 404);
@@ -4279,7 +4284,9 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     );
 
     let revoke_other = format!(
-        "DELETE /api/v1/me/sessions/{other_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+        "DELETE /api/v1/me/sessions/{other_id} HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={current}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, headers, _) = request(http, &revoke_other).await;
     assert_eq!(status, 204, "{headers}");
@@ -4317,7 +4324,9 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     );
 
     let revoke_current = format!(
-        "DELETE /api/v1/me/sessions/{current_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={current}\r\nConnection: close\r\n\r\n"
+        "DELETE /api/v1/me/sessions/{current_id} HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={current}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, headers, _) = request(http, &revoke_current).await;
     assert_eq!(status, 204, "{headers}");
@@ -4927,6 +4936,61 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
+    let contact_form = format!("csrf={csrf}&contact_email=Alice%2BIRC%40Example.COM");
+    let update_contact = format!(
+        "POST /console/account/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{contact_form}",
+        contact_form.len()
+    );
+    let (status, _, body) = request(http, &update_contact).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("Contact email updated") && body.contains("value=\"Alice+IRC@example.com\""),
+        "{body}"
+    );
+    assert_eq!(
+        e6ircd::db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email"),
+        Some("Alice+IRC@example.com".into())
+    );
+    let profile_get = format!(
+        "GET /api/v1/me/profile HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, body) = request(http, &profile_get).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(headers.contains("cache-control: no-store"), "{headers}");
+    let profile: serde_json::Value = serde_json::from_str(&body).expect("private profile");
+    assert_eq!(profile["account"], "alice");
+    assert_eq!(profile["contact_email"], "Alice+IRC@example.com");
+
+    let api_profile = r#"{"contact_email":"Second@New.Example"}"#;
+    let missing_csrf = format!(
+        "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{api_profile}",
+        api_profile.len()
+    );
+    let (status, _, body) = request(http, &missing_csrf).await;
+    assert_eq!(status, 403, "{body}");
+    let patch_profile = format!(
+        "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{api_profile}",
+        api_profile.len()
+    );
+    let (status, _, body) = request(http, &patch_profile).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        e6ircd::db::account_contact_email(&pool, "alice")
+            .await
+            .expect("updated contact email"),
+        Some("Second@new.example".into())
+    );
+
     let password_form =
         format!("csrf={csrf}&current_password=pw&new_password=new-pw&confirm_password=new-pw");
     let change_password = format!(
@@ -4952,8 +5016,17 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     );
 
     let api_password = r#"{"current_password":"new-pw","new_password":"api-pw"}"#;
+    let api_change_without_csrf = format!(
+        "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{api_password}",
+        api_password.len()
+    );
+    let (status, _, body) = request(http, &api_change_without_csrf).await;
+    assert_eq!(status, 403, "{body}");
     let api_change = format!(
         "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{api_password}",
         api_password.len()
@@ -4991,7 +5064,8 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .map(|row| row.0)
         .expect("created app password");
 
-    let token_form = format!("csrf={csrf}&label=Automation");
+    let token_form =
+        format!("csrf={csrf}&label=Automation&expires_in_days=90&scope_read=on&scope_irc=on");
     let create_token = format!(
         "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
@@ -5003,7 +5077,8 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert!(
         body.contains("Personal access token created")
             && body.contains("e6p_")
-            && body.contains(">Automation<"),
+            && body.contains(">Automation<")
+            && body.contains("read, irc"),
         "{body}"
     );
     let tokens = e6ircd::db::list_api_tokens(&pool, "alice")
@@ -5011,11 +5086,22 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .expect("tokens");
     let token_id = tokens
         .iter()
-        .find(|(_, label, _, _)| label == "Automation")
-        .map(|row| row.0)
+        .find(|row| row.label == "Automation")
+        .map(|row| row.id)
         .expect("created token");
+    let token = tokens
+        .iter()
+        .find(|row| row.id == token_id)
+        .expect("created token metadata");
+    assert!(token.scopes.contains(e6ircd::identity::ApiTokenScope::Read));
+    assert!(token.scopes.contains(e6ircd::identity::ApiTokenScope::Irc));
+    assert!(
+        !token
+            .scopes
+            .contains(e6ircd::identity::ApiTokenScope::Write)
+    );
 
-    let bad_form = "csrf=wrong&label=Rejected";
+    let bad_form = "csrf=wrong&label=Rejected&expires_in_days=30&scope_read=on";
     let bad_create = format!(
         "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
@@ -5052,7 +5138,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
             .await
             .expect("tokens after revoke")
             .iter()
-            .all(|row| row.0 != token_id)
+            .all(|row| row.id != token_id)
     );
 
     let identities = e6ircd::db::list_oidc_identities(&pool, "alice")
@@ -5084,7 +5170,8 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert_eq!(remaining.len(), 1);
     let last_delete = format!(
         "DELETE /api/v1/me/identities/{} HTTP/1.1\r\nHost: t\r\n\
-         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n",
+         Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n",
         remaining[0].0
     );
     let (status, _, body) = request(http, &last_delete).await;
@@ -5159,9 +5246,16 @@ async fn device_authorization_grant_flow() {
     // approve as alice (cookie), lowercased to prove normalization
     let ap_body = format!(r#"{{"user_code":"{}"}}"#, user_code.to_lowercase());
     let cookie = format!("Cookie: e6irc_session={session}\r\n");
+    let me_request =
+        format!("GET /api/v1/me HTTP/1.1\r\nHost: t\r\n{cookie}Connection: close\r\n\r\n");
+    let (status, _, me_body) = request(http, &me_request).await;
+    assert_eq!(status, 200, "{me_body}");
+    let me_json: serde_json::Value = serde_json::from_str(&me_body).expect("me JSON");
+    let csrf = me_json["csrf_token"].as_str().expect("session CSRF token");
+    let browser_headers = format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n");
     let (status, _, _) = request(
         http,
-        &post("/api/v1/auth/device/approve", &cookie, &ap_body),
+        &post("/api/v1/auth/device/approve", &browser_headers, &ap_body),
     )
     .await;
     assert_eq!(status, 204);
@@ -5321,6 +5415,214 @@ async fn me_tokens_list_and_revoke() {
     // Revoking an unknown id → 404.
     let (status, _, _) = request(http, &auth("DELETE", "/api/v1/me/tokens/999999")).await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn personal_access_token_scopes_gate_reads_writes_admin_and_irc() {
+    use e6ircd::identity::{ApiTokenLifetimeDays, ApiTokenScope, ApiTokenScopes};
+
+    let url =
+        support::test_db("personal_access_token_scopes_gate_reads_writes_admin_and_irc").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let lifetime = ApiTokenLifetimeDays::new(7).expect("bounded lifetime");
+    let read = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "read",
+        ApiTokenScopes::new([ApiTokenScope::Read]).expect("scope"),
+        lifetime,
+    )
+    .await
+    .expect("read token");
+    let write = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "write",
+        ApiTokenScopes::new([ApiTokenScope::Write]).expect("scope"),
+        lifetime,
+    )
+    .await
+    .expect("write token");
+    let admin_read = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "admin read",
+        ApiTokenScopes::new([ApiTokenScope::Read, ApiTokenScope::Administrator]).expect("scopes"),
+        lifetime,
+    )
+    .await
+    .expect("admin token");
+    let irc = e6ircd::db::issue_scoped_api_token(
+        &pool,
+        "alice",
+        "irc",
+        ApiTokenScopes::new([ApiTokenScope::Irc]).expect("scope"),
+        lifetime,
+    )
+    .await
+    .expect("IRC token");
+    assert_eq!(
+        e6ircd::db::api_token_account(&pool, &read)
+            .await
+            .expect("read token lookup"),
+        None,
+        "a read-only API grant must not silently gain IRC authentication"
+    );
+    assert_eq!(
+        e6ircd::db::api_token_account(&pool, &irc)
+            .await
+            .expect("IRC token lookup"),
+        Some("alice".into())
+    );
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.scopes.example".into(),
+        network_name: "ScopeNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let bearer = |method: &str, path: &str, token: &str| {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+
+    let (status, _, _) = request(http, &bearer("GET", "/api/v1/me", &read)).await;
+    assert_eq!(status, 200);
+    let (status, _, body) = request(http, &bearer("DELETE", "/api/v1/me/tokens/999", &read)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("write"), "{body}");
+
+    let (status, _, body) = request(http, &bearer("GET", "/api/v1/me", &write)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("read"), "{body}");
+    let token_body = r#"{"label":"scope escalation","scopes":["administrator"]}"#;
+    let mint_with_bearer = format!(
+        "POST /api/v1/me/tokens HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {write}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n\
+         {token_body}",
+        token_body.len()
+    );
+    let (status, _, body) = request(http, &mint_with_bearer).await;
+    assert_eq!(status, 401, "{body}");
+    assert!(
+        body.contains("Browser session required"),
+        "a narrow bearer must not mint a broader bearer: {body}"
+    );
+
+    let (status, _, body) = request(http, &bearer("GET", "/api/v1/admin/stats", &read)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("administrator"), "{body}");
+    let (status, _, body) = request(http, &bearer("GET", "/api/v1/admin/stats", &admin_read)).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, _, body) = request(http, &bearer("GET", "/api/v1/me", &irc)).await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("read"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn authenticated_api_limit_is_per_account_shared_across_bearers_and_bounded() {
+    let url = support::test_db(
+        "authenticated_api_limit_is_per_account_shared_across_bearers_and_bounded",
+    )
+    .await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "alice", "automation")
+        .await
+        .expect("Alice token");
+    let alice_session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("Alice session");
+    let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "automation")
+        .await
+        .expect("Bob token");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.api-rate.example".into(),
+        network_name: "RateNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url }),
+        limits: e6ircd::config::LimitsConfig {
+            api_rate_burst: Some(2),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+    let bearer = |token: &str| {
+        format!(
+            "GET /api/v1/me HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    let cookie = format!(
+        "GET /api/v1/me HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={alice_session}\r\nConnection: close\r\n\r\n"
+    );
+
+    assert_eq!(request(http, &bearer(&alice_token)).await.0, 200);
+    assert_eq!(
+        request(http, &cookie).await.0,
+        200,
+        "cookie and token authentication share the same account budget"
+    );
+    let (status, headers, body) = request(http, &bearer(&alice_token)).await;
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        headers.to_ascii_lowercase().contains("retry-after:"),
+        "{headers}"
+    );
+    assert_eq!(
+        request(http, &bearer(&bob_token)).await.0,
+        200,
+        "another account has an independent bounded bucket"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5581,6 +5883,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
             token_endpoint_auth_method: Default::default(),
         }],
@@ -5812,6 +6115,7 @@ async fn application_entry_is_fail_closed_and_starts_provider_authorization() {
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: Some("https://auth.example/oauth2/sessions/logout".into()),
             token_endpoint_auth_method: Default::default(),
         }],
@@ -5895,6 +6199,7 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
             client_id: "e6irc".into(),
             client_secret: "x".repeat(32),
             scopes: vec![],
+            allowed_email_domains: vec![],
             end_session_endpoint: None,
             token_endpoint_auth_method: Default::default(),
         }],

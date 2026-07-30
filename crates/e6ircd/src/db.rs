@@ -40,6 +40,8 @@ pub enum DbError {
     InvalidNetworkKind(String),
     /// Persisted server settings do not decode into the closed typed schema.
     InvalidServerSettings(String),
+    /// Persisted token scopes are outside the closed authorization model.
+    InvalidApiTokenScopes(String),
     /// A console write was based on an older settings revision.
     StaleServerSettings,
     /// Unknown account or wrong password (indistinguishable on purpose).
@@ -81,6 +83,9 @@ impl std::fmt::Display for DbError {
             }
             Self::InvalidServerSettings(error) => {
                 write!(f, "invalid persisted server settings: {error}")
+            }
+            Self::InvalidApiTokenScopes(error) => {
+                write!(f, "invalid persisted personal access token scopes: {error}")
             }
             Self::StaleServerSettings => write!(f, "server settings changed concurrently"),
             Self::BadCredentials => write!(f, "invalid account or password"),
@@ -470,15 +475,26 @@ async fn insert_primary_password(
 /// Create an account with a local password. Used by NickServ REGISTER
 /// and by tests/admin tooling.
 pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result<i64, DbError> {
+    create_account_with_contact(pool, name, password, None).await
+}
+
+/// Create an account with an optional validated contact email.
+pub async fn create_account_with_contact(
+    pool: &PgPool,
+    name: &str,
+    password: &str,
+    contact_email: Option<&crate::identity::ContactEmail>,
+) -> Result<i64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(name);
     let hash = hash_password(password.to_string()).await?;
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO accounts (name, name_folded) VALUES ($1, $2)
+        "INSERT INTO accounts (name, name_folded, contact_email) VALUES ($1, $2, $3)
          ON CONFLICT (name_folded) DO NOTHING RETURNING id",
     )
     .bind(name)
     .bind(&folded)
+    .bind(contact_email.map(crate::identity::ContactEmail::as_str))
     .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?
@@ -486,6 +502,58 @@ pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result
     insert_primary_password(&mut tx, id, &hash).await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(id)
+}
+
+/// Read the authenticated account's private contact email.
+pub async fn account_contact_email(
+    pool: &PgPool,
+    account: &str,
+) -> Result<Option<String>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT contact_email FROM accounts WHERE name_folded = $1")
+            .bind(folded)
+            .fetch_optional(pool)
+            .await
+            .map_err(DbError::Query)?;
+    Ok(row.and_then(|(email,)| email))
+}
+
+/// Replace or remove an account's private contact email and write a redacted
+/// security event in the same transaction.
+pub async fn set_account_contact_email(
+    pool: &PgPool,
+    account: &str,
+    contact_email: Option<&crate::identity::ContactEmail>,
+) -> Result<(), DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let updated = sqlx::query(
+        "UPDATE accounts SET contact_email = $2
+         WHERE name_folded = $1 AND (flags & $3) = 0",
+    )
+    .bind(&folded)
+    .bind(contact_email.map(crate::identity::ContactEmail::as_str))
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    if updated.rows_affected() == 0 {
+        return Err(DbError::UnknownAccount(account.to_string()));
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &folded,
+        "ACCOUNT_CONTACT_UPDATE",
+        &folded,
+        if contact_email.is_some() {
+            "contact email replaced"
+        } else {
+            "contact email removed"
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)
 }
 
 /// Whether the one-time first-account bootstrap has already been consumed.
@@ -1008,6 +1076,7 @@ async fn run_worker_inner(
                 DbRequest::CreateAccount {
                     conn,
                     name,
+                    contact_email,
                     password,
                     origin,
                 } => {
@@ -1016,7 +1085,14 @@ async fn run_worker_inner(
                     let telemetry = telemetry.clone();
                     tokio::spawn(async move {
                         let started = Instant::now();
-                        let reply = handle_create_account(&pool, name, &password, origin).await;
+                        let reply = handle_create_account(
+                            &pool,
+                            name,
+                            contact_email.as_ref(),
+                            &password,
+                            origin,
+                        )
+                        .await;
                         let unavailable =
                             matches!(&reply, DbReply::AccountRegisterUnavailable { .. });
                         if let Some(telemetry) = telemetry {
@@ -3002,10 +3078,11 @@ impl VerifyOutcome {
 async fn handle_create_account(
     pool: &PgPool,
     name: String,
+    contact_email: Option<&crate::identity::ContactEmail>,
     password: &str,
     origin: crate::core::AccountOrigin,
 ) -> DbReply {
-    match create_account(pool, &name, password).await {
+    match create_account_with_contact(pool, &name, password, contact_email).await {
         Ok(_) => DbReply::AccountCreated {
             account: name,
             origin,
@@ -3138,7 +3215,14 @@ pub async fn poll_device_grant(
     if let Some(account) = approved {
         // Mint in the same transaction: on any error `tx` drops without commit,
         // rolling the DELETE back so the grant survives for the next poll.
-        let token = insert_api_token(&mut *tx, &account, token_label).await?;
+        let token = insert_api_token(
+            &mut *tx,
+            &account,
+            token_label,
+            crate::identity::ApiTokenScopes::device_access(),
+            crate::identity::ApiTokenLifetimeDays::DEFAULT,
+        )
+        .await?;
         tx.commit().await.map_err(DbError::Query)?;
         return Ok(DeviceStatus::Approved(token));
     }
@@ -4708,8 +4792,9 @@ pub async fn delete_other_web_sessions(
 
 // ---- personal access tokens ---------------------------------------------
 
-/// Mint a PAT for an account. `e6p_`-prefixed opaque token shown once;
-/// SHA-256 stored. No expiry until scoped tokens land.
+/// Mint a full-access PAT using the bounded default lifetime. Kept as the
+/// internal/test convenience entry point; user-facing issuance calls
+/// [`issue_scoped_api_token`] with the exact requested grant.
 /// Most PATs one account may hold via the REST create endpoint, matching the
 /// REST layer's `MAX_CREDENTIALS_PER_ACCOUNT`. Bounds authenticated storage
 /// growth. (The device-grant login path mints through `insert_api_token`
@@ -4718,6 +4803,23 @@ pub async fn delete_other_web_sessions(
 const MAX_API_TOKENS_PER_ACCOUNT: i64 = 32;
 
 pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Result<String, DbError> {
+    issue_scoped_api_token(
+        pool,
+        account,
+        label,
+        crate::identity::ApiTokenScopes::full_access(),
+        crate::identity::ApiTokenLifetimeDays::DEFAULT,
+    )
+    .await
+}
+
+pub async fn issue_scoped_api_token(
+    pool: &PgPool,
+    account: &str,
+    label: &str,
+    scopes: crate::identity::ApiTokenScopes,
+    lifetime: crate::identity::ApiTokenLifetimeDays,
+) -> Result<String, DbError> {
     // Cap and insert in one transaction with the account row locked FOR UPDATE.
     // A count-then-insert across two pool statements (which is what the REST
     // handler used to do) lets two concurrent requests each read cap-1 and both
@@ -4747,7 +4849,7 @@ pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Resul
     }
     // The account row is locked in this tx, so `insert_api_token`'s own
     // name-folded lookup resolves the same row under the lock.
-    let token = insert_api_token(&mut *tx, account, label).await?;
+    let token = insert_api_token(&mut *tx, account, label, scopes, lifetime).await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(token)
 }
@@ -4757,7 +4859,13 @@ pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Resul
 /// pool or *inside a transaction* — the device-grant path mints here in the
 /// same transaction that consumes the grant, so consume and mint commit or roll
 /// back together.
-async fn insert_api_token<'e, E>(executor: E, account: &str, label: &str) -> Result<String, DbError>
+async fn insert_api_token<'e, E>(
+    executor: E,
+    account: &str,
+    label: &str,
+    scopes: crate::identity::ApiTokenScopes,
+    lifetime: crate::identity::ApiTokenLifetimeDays,
+) -> Result<String, DbError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -4770,14 +4878,17 @@ where
     );
     let folded = CaseMapping::Rfc1459.casefold(account);
     let inserted = sqlx::query(
-        "INSERT INTO api_tokens (token_hash, account_id, label)
-         SELECT $1, a.id, $2 FROM accounts a
+        "INSERT INTO api_tokens (token_hash, account_id, label, scopes, expires_at)
+         SELECT $1, a.id, $2, $5, now() + make_interval(days => $6)
+         FROM accounts a
          WHERE a.name_folded = $3 AND (a.flags & $4) = 0",
     )
     .bind(token_hash(&token))
     .bind(label)
     .bind(&folded)
     .bind(ACCOUNT_FLAG_SUSPENDED)
+    .bind(scopes.database_values())
+    .bind(i32::from(lifetime.value()))
     .execute(executor)
     .await
     .map_err(DbError::Query)?;
@@ -4794,6 +4905,7 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
            AND (t.expires_at IS NULL OR t.expires_at > now())
+           AND 'irc' = ANY(t.scopes)
            AND (a.flags & $2) = 0",
     )
     .bind(token_hash(token))
@@ -4803,17 +4915,77 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
     .map_err(DbError::Query)
 }
 
-/// List an account's PATs as `(id, label, created_at RFC3339, expires_at
-/// RFC3339|null)` — never the token or its hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTokenPrincipal {
+    pub account: String,
+    pub scopes: crate::identity::ApiTokenScopes,
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiTokenPrincipalRow {
+    account: String,
+    scopes: Vec<String>,
+}
+
+/// Resolve an unexpired token into its account and closed permission set.
+pub async fn api_token_principal(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<ApiTokenPrincipal>, DbError> {
+    let row: Option<ApiTokenPrincipalRow> = sqlx::query_as(
+        "SELECT a.name AS account, t.scopes
+         FROM api_tokens t
+         JOIN accounts a ON a.id = t.account_id
+         WHERE t.token_hash = $1
+           AND t.expires_at > now()
+           AND (a.flags & $2) = 0",
+    )
+    .bind(token_hash(token))
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    row.map(|row| {
+        Ok(ApiTokenPrincipal {
+            account: row.account,
+            scopes: crate::identity::ApiTokenScopes::from_database(row.scopes)
+                .map_err(|error| DbError::InvalidApiTokenScopes(error.to_string()))?,
+        })
+    })
+    .transpose()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiTokenMetadata {
+    pub id: i64,
+    pub label: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub scopes: crate::identity::ApiTokenScopes,
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiTokenMetadataRow {
+    id: i64,
+    label: String,
+    created_at: String,
+    expires_at: String,
+    scopes: Vec<String>,
+}
+
+/// List an account's bounded PAT grants — never the token or its hash.
 pub async fn list_api_tokens(
     pool: &PgPool,
     account: &str,
-) -> Result<Vec<(i64, String, String, Option<String>)>, DbError> {
+) -> Result<Vec<ApiTokenMetadata>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    sqlx::query_as(
+    let rows: Vec<ApiTokenMetadataRow> = sqlx::query_as(
         "SELECT t.id, t.label,
-                to_char(t.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                to_char(t.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                to_char(t.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                to_char(t.expires_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at,
+                t.scopes
          FROM api_tokens t JOIN accounts a ON a.id = t.account_id
          WHERE a.name_folded = $1
          ORDER BY t.id",
@@ -4821,7 +4993,19 @@ pub async fn list_api_tokens(
     .bind(&folded)
     .fetch_all(pool)
     .await
-    .map_err(DbError::Query)
+    .map_err(DbError::Query)?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ApiTokenMetadata {
+                id: row.id,
+                label: row.label,
+                created_at: row.created_at,
+                expires_at: row.expires_at,
+                scopes: crate::identity::ApiTokenScopes::from_database(row.scopes)
+                    .map_err(|error| DbError::InvalidApiTokenScopes(error.to_string()))?,
+            })
+        })
+        .collect()
 }
 
 /// Revoke one of `account`'s PATs by id. Returns whether a row was deleted

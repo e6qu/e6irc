@@ -972,15 +972,22 @@ account always takes the registering nick's name, which keeps "the account you
 registered is the nick you were holding" true — and that in turn is what lets
 direct-message conversations be keyed by account (§11.1.1). Registration before
 the connection completes is off by default: a half-open connection creating
-accounts is a spam vector unless the operator opts in. e6ircd cannot send
-verification mail, so `email-required` only enforces that an address was
-supplied.
+accounts is a spam vector unless the operator opts in. A registration email is
+parsed once into a bounded ASCII mailbox with a canonical lowercase DNS domain,
+then stored as private account profile data; it is never exposed by the account
+directory. e6ircd does not claim to have verified locally supplied mail because
+it does not send verification messages. `email-required` therefore requires
+valid contact data, while OpenID Connect domain admission separately requires a
+provider-verified email claim.
 
 ### 9.2 Web login
 
 - **OIDC** authorization-code + PKCE against one or more providers
-  registered in config (issuer URL, client id/secret, allowed domains
-  option). Discovery + JWKS cached with proper refresh. First login
+  registered in config (issuer URL, client id/secret, allowed email domains
+  option). A non-empty domain policy admits only a syntactically valid,
+  provider-verified email whose canonical domain exactly matches an entry;
+  parent/subdomain relationships never become implicit wildcards. Discovery +
+  JWKS cached with proper refresh. First login
   auto-provisions an account (nick derived from `preferred_username`,
   conflict → user picks). Subsequent logins match on (issuer, subject),
   never on email.
@@ -1037,10 +1044,27 @@ CERTFP is explicitly out of scope for v1 (not selected).
 
 ### 9.4 REST API authentication
 
-Personal access tokens (hashed at rest, scoped, expiring) via
-`Authorization: Bearer`, or the web session cookie (for the browser clients,
-with the CSRF rules above). Admin endpoints additionally require the
-account's durable administrator flag or a configured administrator grant.
+Personal access tokens are hashed at rest, expire after a caller-selected
+1–365 days (30 by default), and carry a non-empty closed grant set:
+`read`, `write`, `administrator`, and `irc`. `Authorization: Bearer` requires
+`read` for safe API methods and `write` for mutations; administrator routes
+also require both the `administrator` grant and the account's current durable
+or configured administrator authority. IRC SASL OAUTHBEARER independently
+requires `irc`. Device authorization issues `read`/`write`/`irc`, never
+administrator authority. Token issuance and device approval require the
+browser session plus its `X-E6IRC-CSRF` value, so an existing bearer cannot
+mint a broader replacement. Every unsafe cookie-authenticated REST method
+requires that same header at the shared authentication boundary. The web
+session cookie remains the browser credential, with the CSRF rules above.
+
+Authenticated API requests share a per-account token bucket across browser
+sessions and personal access tokens (240 requests per minute by default).
+Administrator operations use a separate, smaller per-account bucket (60 per
+minute by default). Both are UI-managed, bounded in memory, and fail closed
+when the bucket registry cannot admit another active account. The HTTP service
+also enforces a 1 MiB request-body limit, 1,024-request aggregate concurrency
+limit, and 30-second request deadline before work can consume unbounded
+process resources.
 The same admin-gated data is also served as a
 server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit preview), with a dedicated filterable,
@@ -1107,6 +1131,10 @@ first local password without presenting a nonexistent current password;
 subsequent rotations require the current primary and never accept an app
 password. App
 passwords and tokens are displayed exactly once; only hashes are retained.
+The same page reads and updates the private contact email used by registration
+policy and account recovery contact. The typed email value is canonicalized at
+the HTTP/IRC boundary, changes are audited without recording the address or its
+domain, and public account posture never includes it.
 Identity unlink is transactional: the account row serializes concurrent
 requests, the last login method cannot be removed, and sessions asserted by
 the removed identity are revoked in the same transaction. A final OIDC

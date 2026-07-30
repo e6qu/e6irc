@@ -21,7 +21,8 @@ a design target rather than current behavior.
 | [Register and configure a channel](channels-and-account.md#register-and-configure-a-channel) | Proven | Core, PostgreSQL, services, console, and REST lifecycle tests | — |
 | [Recreate a registered channel](channels-and-account.md#recreate-a-registered-channel) | Proven | Core recreation plus PostgreSQL boot-load tests | — |
 | [Manage IRC credentials](channels-and-account.md#manage-irc-credentials) | Proven | Credential storage, console/API, and real-socket SASL tests | — |
-| [Manage personal access tokens and read state](channels-and-account.md#manage-personal-access-tokens-and-read-state) | Proven | Token lifecycle, bearer/OAUTHBEARER, marker persistence, API, and console tests | — |
+| [Manage a private account profile](channels-and-account.md#manage-a-private-account-profile) | Proven | Typed email parser plus real PostgreSQL registration/privacy/audit and console mutation tests | — |
+| [Manage personal access tokens and read state](channels-and-account.md#manage-personal-access-tokens-and-read-state) | Proven | Scoped/expiring token lifecycle, no-escalation/shared-rate HTTP, bearer/OAUTHBEARER, marker persistence, API, and console tests | — |
 | [Inspect and terminate sessions](channels-and-account.md#inspect-and-terminate-sessions) | Proven | Owner-scoped browser/live-session inventory and exact-revocation tests | — |
 | [Discover service identity and readiness before sign-in](deployment-and-recovery.md#discover-service-identity-and-readiness-before-sign-in) | Proven | Real public server/liveness/readiness/login/OpenAPI HTTP tests | — |
 | [First production boot](deployment-and-recovery.md#first-production-boot) | Proven | Actual daemon against an isolated empty PostgreSQL container proves migrations, import, readiness, and IRC traffic; CI also inspects the production image | — |
