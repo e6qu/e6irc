@@ -321,7 +321,13 @@ try {
   // once; the recipient chooses its own password, receives its own session,
   // downloads a secret-free export, sees security activity, and deletes the
   // account with explicit confirmation.
-  await page.goto(`${applicationOrigin}/console/accounts`);
+  const accountDirectoryResponse = await page.goto(`${applicationOrigin}/console/accounts`);
+  assert.equal(
+    accountDirectoryResponse?.status(),
+    200,
+    `account directory navigation failed at ${page.url()}:\n${await page.locator("main").innerText()}`,
+  );
+  await page.getByRole("heading", { name: "Account directory", exact: true }).waitFor();
   const inviteAccount = page.locator("section").filter({
     has: page.getByRole("heading", { name: "Invite an account", exact: true }),
   });

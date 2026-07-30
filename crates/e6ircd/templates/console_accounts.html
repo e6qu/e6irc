@@ -45,8 +45,8 @@
         <input type="email" name="contact_email" maxlength="254" autocomplete="off" placeholder="alice@example.com" />
       </label>
       <label class="field">
-        <span>Lifetime</span>
-        <select name="expires_in_days">
+        <span id="invitation-lifetime-label">Lifetime</span>
+        <select name="expires_in_days" aria-labelledby="invitation-lifetime-label">
           <option value="1">1 day</option>
           <option value="7" selected>7 days</option>
           <option value="14">14 days</option>
