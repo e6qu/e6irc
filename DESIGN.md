@@ -9,7 +9,9 @@ AGPL-compatible (permissive licenses are fine; license compliance is enforced
 in CI with `cargo-deny`).
 
 Unfamiliar term? See [`docs/terminology.md`](docs/terminology.md) — the
-glossary of IRC, OpenID Connect, and deployment vocabulary used here.
+glossary of IRC, OpenID Connect, and deployment vocabulary used here. The
+product outcomes and their automated evidence are mapped in
+[`docs/journeys/`](docs/journeys/README.md).
 
 ---
 
@@ -579,7 +581,19 @@ strip = "symbols"
 
 ### 7.3 Queue-based core: state model at 100k+ connections
 
-**Architecture rule.** The server is a set of **single-threaded event
+**Current implementation and target boundary.** The shipped server has one
+single-threaded core worker (N=1) owning all sessions, nicks, and channels.
+Connection tasks and the database writer communicate through bounded queues;
+the driver/attach layer also uses bounded tokio channels. `e6irc-queue`
+provides the delivered-or-returned, sequence, manual-pop, adaptive-mode, and
+loom-checked contracts below. Core sharding, cross-shard routing, the
+whole-core seeded scheduler/trace replay, and timer-wheel worker described
+later in this section are the target architecture for qualifying the 100k
+goal, not shipped behavior. Current qualification evidence and journey impact
+are tracked in `tools/load/README.md` and
+`docs/journeys/coverage.md`.
+
+**Target architecture rule.** The server is a set of **single-threaded event
 loops ("workers") that own their state exclusively**; the *only*
 communication between workers — and between I/O tasks and workers — is
 our custom queue (`e6irc-queue`). No shared mutable state, no cross-worker
@@ -599,29 +613,31 @@ which gives:
 **`e6irc-queue` (custom, in-repo — for the core↔DB and SendQ paths; the
 driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
 
-- Bounded MPSC ring buffer; envelopes carry a per-queue monotonic
-  sequence number and source id (trace/replay identity).
+- Bounded MPSC ring buffer; accepted envelopes carry a per-queue monotonic
+  sequence number.
 - **No silent loss**: `try_push` returns `Err(Full(event))` — the
   producer decides (kill the slow consumer's connection, exert
   backpressure, or shed *with accounting*). Delivered-or-returned is an
   invariant, not a best effort.
 - Consumer API: `async pop()` in runtime mode (custom waker, no tokio
-  channel underneath); `step()` under the manual scheduler.
-- Instrumentation built in: depth gauge, enqueue/dequeue trace hooks.
+  channel underneath); `try_pop()` as the nonblocking/manual-step primitive.
+- Instrumentation built in: depth, current FIFO/LIFO mode, and mode-switch
+  count.
 - **Adaptive degraded mode (FIFO→LIFO)**: per-queue opt-in policy. When
   depth crosses a high watermark the queue flips to LIFO dequeue — under
   overload the *freshest* events are served first and stale work is what
   waits — flipping back to FIFO at a low watermark (hysteresis). Mode
-  changes are never silent: counter + trace hook + metrics. Only wired
-  for queues whose consumers tolerate reordering (envelopes carry seq
+  changes are observable through the mode-switch counter. Only wired for
+  queues whose consumers tolerate reordering (envelopes carry seq
   numbers, so downstream can restore order or detect staleness); queues
   whose ordering is semantic — e.g. a shard's command stream — stay
-  strict FIFO.
+  strict FIFO. The queue exposes its mode-switch counter; exporting it into
+  process telemetry is separate wiring.
 - **Verified**: loom model-checks the concurrency core (push/pop/wake
   under all interleavings); property tests pin FIFO-per-producer,
   bounded-memory, and delivered-or-returned invariants.
 
-**Worker topology:**
+**Target worker topology (current core uses one worker):**
 
 - **Core shards** (N ≈ cores): each owns the sessions, nick table
   partition, and channel table partition for its hash range
@@ -643,9 +659,14 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
 
 ### 7.4 Performance engineering (cross-cutting)
 
-State-of-the-art throughput and latency practices are the default coding
-discipline on hot paths — with the rule that any nontrivial optimization
-lands together with the benchmark that proves it:
+The following is the performance target and review checklist, not a claim that
+every mechanism is present. Shipped foundations include borrowed IRC parsing,
+`Cow` tag/ISUPPORT unescaping, shared `Bytes` output, bounded queues, and
+release LTO. The server does not currently have capability-variant
+serialize-once fan-out, vectored SendQ writes, Arc-swapped configuration,
+copy-on-write recipient snapshots, slab/generation session IDs, buffer pools,
+batched accepts, timer wheels, Criterion microbenchmarks, or per-PR load
+tracking. Any nontrivial optimization lands with evidence that proves it:
 
 - **Zero-copy end-to-end**: parsing borrows from the receive buffer
   (§7.1); a routed message is serialized once per capability variant and
@@ -676,9 +697,11 @@ lands together with the benchmark that proves it:
   evaluated in the scale-hardening phase; allocator swap
   (mimalloc/jemalloc) decided by benchmark behind a feature flag, not by
   fashion.
-- **Measured, always**: criterion microbenches live beside hot modules;
-  `tools/load` macrobenchmarks track p50/p99/p999 fan-out latency and
-  throughput per-PR so regressions are visible immediately.
+- **Measured, always (target)**: microbenchmarks live beside hot modules;
+  `tools/load` macrobenchmarks track fan-out latency and throughput under a
+  controlled environment. Today the load harness reports
+  p50/p90/p99/max and has manual baselines through 2,000 clients; it is not a
+  per-PR CI gate.
 
 ### 7.5 IRCv3 capabilities
 
@@ -1394,20 +1417,23 @@ with a `tls` section is refused at config load.
 ### 14.1 `e6irc-cli` — scripting client
 
 Non-interactive, pipe-friendly: `e6irc send '#chan' 'msg'`,
-`e6irc tail '#chan'` (follow, `--json` line output), `e6irc history …`,
-`e6irc api <method> <path>` (authenticated REST passthrough). Auth via app
-password or the OAUTHBEARER device flow (`e6irc login`), token cached in
-the OS keyring where available, plain file fallback with 0600 perms —
-chosen explicitly by flag, never silently.
+`e6irc tail '#chan'`, `e6irc raw`, `e6irc history …`, and
+`e6irc api <method> <path>` (authenticated REST passthrough). IRC commands
+support plaintext or public-CA TLS and optional SASL PLAIN through paired
+`--account`/`--password` flags. `api` accepts a bearer token by flag or
+`E6IRC_API_TOKEN` and deliberately speaks plain HTTP for a local or
+TLS-terminating-proxy deployment. The CLI does not currently provide JSON
+tail output, `e6irc login`, device-flow orchestration, or token caching.
 
 ### 14.2 `e6irc-tui`
 
-ratatui client using `e6irc-client`: multi-network (via BNC username
-addressing), buffer sidebar with unread/read-marker state shared with the
-web client, chathistory infinite scroll, SASL PLAIN + device-flow login.
-It is a *general* IRCv3 client (works against Libera directly too) — which
-doubles as a continuous test of our client library against the compat
-target.
+The shipped ratatui client uses `e6irc-client` for one plaintext,
+unauthenticated connection. It has bounded channel/query buffers,
+Alt-Left/Right switching, bounded scrollback, `/join`, `/win`, `/quit`, and
+loud disconnect/write-failure state. It does not currently expose TLS, SASL,
+OAUTHBEARER/device login, BNC network selection, reconnect, CHATHISTORY
+loading, or shared read-marker state. “Multi-buffer” therefore means several
+channels/queries inside one connection, not several networks.
 
 ### 14.3 A client's input is untrusted too
 
@@ -1507,24 +1533,21 @@ third-party metrics stack.
 implementation follows (green), then refactor; no feature lands without
 tests at the appropriate level. The **testing pyramid** shapes the suite —
 many fast unit/property tests, fewer integration tests, a small set of
-acceptance/UI/e2e tests at the top. User-visible behavior is additionally
-specified as **BDD-style acceptance tests**: Given/When/Then scenarios
-written against a running server, using a small in-repo scenario DSL
-(dev-only code; no runtime dependency and no BDD-framework crate). UI
-behavior is tested through a real browser; API and network behavior is
-tested end-to-end against a real `e6ircd` + PostgreSQL.
+acceptance/UI/e2e tests at the top. User-visible behavior and its evidence are
+cataloged in `docs/journeys/`. Acceptance is currently expressed as direct
+Rust integration tests and targeted browser/shell scripts; there is no shared
+Given/When/Then scenario DSL.
 
 Layers, bottom to top:
 
 1. **Unit/property**: proto crate (parser round-trips, casemapping,
    CAP/SASL state machines), multiplexer buffer logic; **loom
    model-checking** of `e6irc-queue`'s concurrency core.
-2. **Fuzzing**: cargo-fuzz on parser + tag unescape (CI smoke; longer runs
-   scheduled).
-2b. **Deterministic simulation**: the queue-based core (§7.3) under a
-   seeded single-threaded scheduler with mocked I/O — randomized event
-   interleavings, reproducible by seed; step-debugger doubles as the
-   failure-investigation tool.
+2. **Fuzzing**: CI smoke runs every declared cargo-fuzz target, including
+   parser/tag input, serialization, single- and multi-client stateful core
+   command streams, and arbitrary server output into the TUI model.
+   `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive, but the
+   seeded whole-core scheduler/replay described in §7.3 is not implemented.
 3. **irctest** (progval/irctest) run in CI against `e6ircd` — the same
    suite Solanum/Ergo use.
 4. **Compatibility** (§7.7): the vendored Libera-snapshot ISUPPORT
@@ -1534,21 +1557,25 @@ Layers, bottom to top:
    second opt-in probe drives the actual BNC path through DNS vetting,
    pinned-address TLS, registration, and lifecycle reporting against Libera.
 5. **Integration**: BNC `irc` driver against an e6ircd upstream
-   (reconnect, SASL, playback); OIDC flows against a dockerized Keycloak
-   (or dex).
-6. **BDD acceptance**: Given/When/Then scenarios for user journeys
-   (register → identify → join → message; OIDC first login provisions an
-   account; attach second client → playback; app-password revocation cuts
-   access; …) executed against a real server instance.
+   (reconnect, SASL, playback); OIDC flows against dockerized Dex; the Matrix
+   bridge against pinned Conduit. The PostgreSQL job explicitly runs the
+   ignored database, HTTP, OIDC, BNC, `/ws/ui`, and CLI suites with their
+   required environment.
+6. **Journey acceptance**: the scenarios in `docs/journeys/` map outcomes to
+   direct real-server integration tests. The matrix identifies partial
+   journeys where adjacent layers are proven separately.
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
    running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
    over real sockets, including TLS.
-8. **UI tests**: Playwright (dev tooling inside `web/`) drives the browser
-   client in headless Chromium against a running server — login, live
-   message receive over `/ws/ui`, and self-service CRUD.
-9. **Load**: `tools/load/` tokio flood-client; CI perf job at reduced scale,
-   manual 100k-connection benchmark procedure documented with target
-   numbers (connect rate, fan-out p99, RSS/connection).
+8. **UI tests**: Playwright drives real OIDC/Shauth authentication and the
+   embedded application in Chromium. Active chat state uses browser-side
+   network/history/WebSocket doubles, while real `/ws/ui` relay and
+   self-service CRUD are exercised at HTTP/WebSocket integration level. There
+   is no current browser → real `/ws/ui` → driver → peer acceptance test.
+9. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
+   exact fan-out delivery, and latency percentiles. Recorded manual baselines
+   reach 2,000 clients; load is not a CI job, numeric acceptance thresholds
+   and RSS/connection budget are not set, and the 100k run is not qualified.
 
 ---
 
@@ -1568,17 +1595,19 @@ Layers, bottom to top:
   binds the replacement socket, swaps only after success, and retains the
   working listener on failure. Disabling the attach socket does not stop
   always-on networks or the web client.
-- Graceful shutdown: stop accepting, notify clients, flush PG write queue,
-  checkpoint driver state.
+- Graceful shutdown: stop accepting, notify clients, stop drivers, and flush
+  the bounded PostgreSQL write paths within the shutdown budget. Durable
+  network/history state is continuously persisted; there is no separate
+  driver-checkpoint format.
 - BNC listener changes apply live. Core identity/limits, IRC listeners, OIDC,
   operator, and access-policy changes are stored immediately and explicitly
   reported as restart-required; no response claims those values were applied
   to the running core.
-- Ships as: prebuilt release binaries for **Linux, macOS, and Windows
-  (amd64 + arm64 each)**, a systemd unit example, and a **multi-arch
-  docker image** (linux/amd64 and linux/arm64 manifest; scratch/distroless
-  — the binary is static-friendly apart from libc, musl target evaluated
-  in CI on both architectures).
+- CI builds and tests source on Linux, macOS, and Windows for amd64 and arm64.
+  Tagged releases publish a **multi-architecture container image**
+  (linux/amd64 and linux/arm64) whose runtime base is
+  `debian:bookworm-slim`. Native binary archives, a systemd unit, musl
+  artifacts, and scratch/distroless images are not currently shipped.
 - The production container built and embedded the Vite client before the Rust
   release build; no build step ran at startup. Each merge to `main` published
   one immutable 12-character commit-SHA manifest plus direct `-amd64` and

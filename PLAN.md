@@ -4,17 +4,20 @@ Phases are sequential PRs/PR-groups; each phase ends with DESIGN.md/PLAN.md/
 BUGS.md updated in the same PR. Details in DESIGN.md (section refs below);
 term definitions in [`docs/terminology.md`](docs/terminology.md).
 
-Status (2026-07-19): Phases 0–10 ✅ complete. Phases 11–12 (Discord/Slack
+Status (audited 2026-07-30): Phases 0–7 and 9–10 ✅ complete. Phase 8
+(native clients) is 🔶: the shared library and CLI’s shipped commands are
+tested, while the TUI and device-login experience are narrower than DESIGN
+previously claimed. Phases 11–12 (Discord/Slack
 bridges) 🔶 code-complete behind feature flags with offline-unit-tested
 mapping logic; live verification is gated on real credentials (neither
 platform is self-hostable, so the gateway path can only be checked against
-the live API). Phase 13 (scale) — the load harness is complete with real
-multi-channel baselines; the 100k run is environment-blocked (needs a tuned
-Linux host). The **Known remaining scope** audit below (fuller services,
-admin/self REST API, CHATHISTORY subcommands, oper server-bans, ChanServ
-SET options) is now fully built and tested — the only open work is the two
-environment-blocked verifications above. Legend: ✅ done · 🔶 partial ·
-⛔ blocked (reason).
+the live API). Phase 13 (scale) is 🔶: the load harness has real
+multi-channel baselines, but the current N=1 core, absent numeric/RSS targets,
+and absent tuned-host 100k result mean the design target is not qualified.
+The 2026-07-30 whole-product traceability audit is in
+[`docs/journeys/`](docs/journeys/README.md), with implementation and test
+boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
+🔶 partial · ⛔ blocked (reason).
 
 IRC network creation and post-merge audit (2026-07-29): the console no longer
 suggests the invalid selector `Libera Chat` and then returns a bare
@@ -5169,22 +5172,27 @@ Done (this phase's remaining, now landed):
   the Vite chat client remains a separate vanilla-JavaScript bundle. Composer
   slash-commands DONE (see Phase 4). (DESIGN §13)
 
-## Phase 8 — Native clients ✅ (2026-07-19)
+## Phase 8 — Native clients 🔶 shipped commands proven; product scope narrower than target (audited 2026-07-30)
 Done:
 - `e6irc-client` lib (tokio connection, proto framing, owned messages,
   PING-answering register + SASL PLAIN); `e6irc-cli` with
   send/tail/raw subcommands and --account/--password SASL, e2e-tested
   against a real e6ircd (plain + SASL); `e6irc-tui` (ratatui,
   terminal-independent App state unit-tested).
-- OAUTHBEARER device-flow login (server broker, Phase 4). TUI
-  multi-buffer: one buffer per channel/query, Alt-←/→ switch,
+- The server-side OAUTHBEARER device grant is part of Phase 4; no native
+  binary currently orchestrates it. TUI multi-buffer: one buffer per
+  channel/query, Alt-←/→ switch,
   `/join`/`/win`, per-buffer scrollback (PgUp/PgDn), message routing
-  (channel/PM), buffer bar. (True multi-*server* is the BNC's job — a
-  client attaches to one network; cross-server-in-one-TUI would need a
-  multi-connection loop + config.)
-- Client TLS, `e6irc history`, SASL PLAIN, SASL OAUTHBEARER, and the
-  `e6irc api` subcommand — one authenticated REST request over plain
-  HTTP, bearer token or E6IRC_API_TOKEN — all landed. (DESIGN §14)
+  (channel/PM), buffer bar. Multi-server/BNC selection is not exposed by the
+  TUI; it would require authenticated BNC selection or a multi-connection
+  loop plus configuration.
+- The client library supports TLS, SASL PLAIN/OAUTHBEARER, and shared history
+  helpers. The CLI exposes TLS, SASL PLAIN, `e6irc history`, and `e6irc api`
+  (one authenticated REST request over plain HTTP, bearer token or
+  E6IRC_API_TOKEN). It does not expose OAUTHBEARER/device login, token caching,
+  or JSON tail output. The TUI exposes plaintext unauthenticated transport,
+  not TLS/SASL/history/read-marker/reconnect/BNC selection. (DESIGN §14;
+  `docs/journeys/bridges-clients-and-automation.md`)
 
 ## Phase 9 — Bridge SPI ✅ (2026-07-19)
 - `NetworkDriver` trait (kind + `start(self: Box<Self>) -> NetworkHandle`)
@@ -5241,7 +5249,7 @@ faithful oracle is the live Web/Socket-Mode API, needing a real workspace
 + app. That live integration test is the remaining step, gated on
 credentials. (DESIGN §10.5)
 
-## Phase 13 — Scale hardening 🔶 harness complete; 100k run environment-blocked (2026-07-19)
+## Phase 13 — Scale hardening 🔶 harness complete; target architecture and qualification incomplete (audited 2026-07-30)
 Done:
 - Load-test harness (`crates/e6irc-load`, `e6irc-load` binary): opens N
   concurrent clients over the real e6irc-client, times connect+register+
@@ -5258,15 +5266,16 @@ Done:
   release, macOS: 1 channel gave 290 connects/s + 59k msg/s at 131 ms
   p50; 200 channels gave 6042 connects/s + 122k msg/s at 37 ms p50.
   Numbers recorded in tools/load/README.md.
-Remaining (environment-blocked, not code-blocked):
+Qualification boundary:
 - The 100k-connection run itself needs a tuned Linux host (fd limits,
   ephemeral-port range, socket buffers — macOS caps loopback hard). The
   harness is the instrument; the run is a hosting task.
-- Fan-out/latency **target** numbers, timer wheels, and the per-connection
-  memory budget follow from that run. The residual latency the harness
-  already shows at scale is the single core worker (N=1 of the sharded
-  design) serializing every channel's fan-out — core sharding is the open
-  hardening item. (DESIGN §7.3, §17)
+- This is also code- and contract-incomplete: fan-out/latency acceptance
+  numbers and the per-connection memory budget are unset; no reduced-scale
+  load gate runs in CI; the runtime has one core worker; sharding,
+  timer-wheel scheduling, and whole-core deterministic replay are target
+  architecture rather than shipped behavior. (DESIGN §7.3–7.4, §17;
+  `docs/journeys/coverage.md`)
 
 ## Known remaining scope (audit 2026-07-19)
 
@@ -5359,13 +5368,10 @@ not built yet. Ranked by value:
    implemented and, like every oper action, audit-logged. The admin API's
    `GET /api/v1/admin/bans` lists all kinds with their `kind` field.
 
-All five audit items (1–5) are now fully addressed in code: fuller
+All five 2026-07-19 audit items (1–5) are fully addressed in code: fuller
 services, the CHATHISTORY subcommands, the REST admin/self surface, the
 oper server-ban + audit surface, and the ChanServ SET options (FOUNDER,
-KEEPTOPIC, MLOCK, with GUARD declined for a documented reason). What
-remains is not code but two **environment-blocked** verifications: the
-Discord/Slack bridges' live check (needs real credentials — neither
-platform is self-hostable, so the gateway path can only be exercised
-against the live API) and the 100k-connection load run (needs a tuned
-Linux host). Both are outside what can be closed from this repository
-alone.
+KEEPTOPIC, MLOCK, with GUARD declined for a documented reason). The later
+whole-product audit supersedes the “two verifications” conclusion that once
+followed here: current user-journey and qualification boundaries are recorded
+in `docs/journeys/coverage.md`.

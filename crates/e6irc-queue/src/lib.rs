@@ -1,7 +1,9 @@
-//! Bounded MPSC queue: the only inter-subsystem communication primitive
-//! in e6ircd (DESIGN §7.3). Built in-repo — instead of a channel crate —
-//! so it can be step-scheduled in deterministic tests, traced, and
-//! model-checked with loom.
+//! Bounded MPSC queue used by the core, database worker, SendQs, WebSocket
+//! output, and local driver (DESIGN §7.3). The driver/attach layer also uses
+//! bounded tokio channels. This queue is built in-repo so it has an explicit
+//! manual-pop primitive for deterministic tests and can be model-checked with
+//! loom. A whole-core scheduler/trace-replay layer is a design target, not
+//! part of this crate today.
 //!
 //! Guarantees:
 //! - **Delivered or returned**: `try_push` never loses an event; on a
@@ -25,7 +27,7 @@ use std::sync::{Arc, Mutex};
 /// Static configuration of one queue.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
-    /// Name for traces and metrics.
+    /// Diagnostic name included in construction failures.
     pub name: &'static str,
     /// Maximum number of buffered events; `try_push` fails beyond it.
     pub capacity: usize,
