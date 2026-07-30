@@ -14,7 +14,23 @@ write it out. Every acronym in the codebase should be defined on this page.
 
 See also: [`DESIGN.md`](../DESIGN.md) for the architecture and the
 engineering laws, [`AGENTS.md`](../AGENTS.md) for working conventions, and
-[`PLAN.md`](../PLAN.md) for build status.
+[`PLAN.md`](../PLAN.md) for build status. End-to-end product outcomes and
+their test evidence are in [`docs/journeys/`](journeys/README.md).
+
+---
+
+## Product and evidence
+
+**User journey** — an end-to-end outcome sought by a person or calling
+system. A journey can cross browser, REST, WebSocket, IRC, driver, and
+PostgreSQL boundaries; a page or endpoint is only one step. Journey documents
+state prerequisites, success, visible failure/recovery, security and
+observability contracts, and the automated evidence for the complete outcome.
+
+**Qualification boundary** — a boundary that current automated evidence does
+not cross, such as replacing a real WebSocket with a browser mock or requiring
+live commercial credentials. It distinguishes “components have tests” from
+“the user outcome is proven.”
 
 ---
 

@@ -60,8 +60,9 @@ The harness and the server both need OS headroom well above defaults:
 - **Backlog & buffers** — raise `net.core.somaxconn` and the listen backlog;
   watch `net.ipv4.tcp_mem` / socket buffer pressure.
 - **Server sizing** — `core_queue`, `sendq`, and `max_hot_channels` in the
-  server config govern memory under load; size them per the memory-budget
-  work (still open in Phase 13) before a full 100k run.
+  server config govern memory under load. A 100k qualification must first set
+  and enforce a per-connection memory budget; no such budget is part of the
+  current release contract.
 
 Run `sweep.sh` to walk client counts and tabulate the results:
 
@@ -69,6 +70,8 @@ Run `sweep.sh` to walk client counts and tabulate the results:
 tools/load/sweep.sh 127.0.0.1:6667 "100 500 1000 5000 20000"
 ```
 
-The full 100k run, fan-out/latency **targets**, timer wheels, and the
-per-connection memory budget remain open Phase 13 items — this harness is
-the instrument they will be measured with.
+The full 100k run, fan-out/latency acceptance targets, timer-wheel scheduling,
+core sharding, a per-connection memory budget, and a CI performance gate are
+outside the current qualification evidence. This harness is the measurement
+instrument, not proof that the target has been met; see
+`docs/journeys/coverage.md`.
