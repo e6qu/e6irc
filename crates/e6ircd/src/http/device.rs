@@ -151,7 +151,12 @@ pub(super) async fn require_admin(
 ) -> Result<String, Response> {
     let account = authenticate(state, headers).await?;
     let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-    if state.admin_accounts.contains(&folded) {
+    if state
+        .admin_accounts
+        .read()
+        .expect("administrator registry lock")
+        .contains(&folded)
+    {
         Ok(account)
     } else {
         Err(problem(StatusCode::FORBIDDEN, "Admin only", None))
@@ -278,7 +283,12 @@ pub(super) async fn admin_accounts(
         Ok(page) => admin_json(serde_json::json!({
             "accounts": page.entries
                 .into_iter()
-                .map(|entry| serde_json::json!({
+                .map(|entry| {
+                    let folded =
+                        e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
+                    let configured =
+                        state.configured_admin_accounts.contains(&folded);
+                    serde_json::json!({
                     "id": entry.id,
                     "name": entry.name,
                     "created_at": entry.created_at,
@@ -293,11 +303,63 @@ pub(super) async fn admin_accounts(
                         "networks": entry.networks,
                         "founded_channels": entry.founded_channels,
                     },
-                }))
+                    "administrator": entry.administrator || configured,
+                    "administrator_sources": {
+                        "durable": entry.administrator,
+                        "configuration": configured,
+                    },
+                    "suspended": entry.suspended,
+                })})
                 .collect::<Vec<_>>(),
             "next_before_id": page.next_before_id,
         })),
         Err(e) => admin_db_error("account directory", e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountStateBody {
+    suspended: Option<bool>,
+    administrator: Option<bool>,
+}
+
+pub(super) async fn admin_account_state(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(account_id): axum::extract::Path<i64>,
+    body: Result<axum::Json<AccountStateBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let mutation = match (body.suspended, body.administrator) {
+        (Some(suspended), None) => {
+            super::mutate_account_suspension(&state, &actor, account_id, suspended)
+                .await
+                .map(|message| ("suspended", suspended, message))
+        }
+        (None, Some(administrator)) => {
+            super::mutate_account_administrator(&state, &actor, account_id, administrator)
+                .await
+                .map(|message| ("administrator", administrator, message))
+        }
+        _ => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid account state change",
+                Some("Set exactly one of suspended or administrator."),
+            );
+        }
+    };
+    match mutation {
+        Ok((field, value, message)) => admin_json(serde_json::json!({
+            "account_id": account_id,
+            (field): value,
+            "message": message,
+        })),
+        Err((status, detail)) => problem(status, "Account state change failed", Some(&detail)),
     }
 }
 

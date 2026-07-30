@@ -10140,3 +10140,127 @@ fn immutable_connection_disconnect_cannot_follow_a_reused_nick() {
     );
     assert!(matches!(exact, AdminReply::Ok(_)));
 }
+
+#[test]
+fn account_suspension_disconnects_every_session_and_gates_late_auth_verdicts() {
+    use e6ircd::core::{AdminReply, LiveConnectionPageSize, LiveConnectionQuery};
+
+    let mut server = TestServer::new();
+    let alice_one = server.register(10, "AliceOne");
+    identify(&mut server, alice_one, "Alice");
+    let alice_two = server.register(20, "AliceTwo");
+    identify(&mut server, alice_two, "aLICE");
+    let bob = server.register(30, "Bob");
+    identify(&mut server, bob, "Bob");
+
+    let suspended = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::SetAccountSuspended {
+            account: "ALICE".into(),
+            suspended: true,
+            reason: "Account suspended".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(matches!(suspended, AdminReply::Ok(_)));
+    for connection in [alice_one, alice_two] {
+        assert!(
+            server
+                .drain(connection)
+                .iter()
+                .any(|line| line.contains("ERROR") && line.contains("Account suspended")),
+            "every casing of the suspended account is disconnected"
+        );
+    }
+    server.line(bob, "PING :still-here");
+    assert!(
+        server.drain(bob).iter().any(|line| line.contains(" PONG ")),
+        "another account is untouched"
+    );
+
+    // Model the race that matters: PostgreSQL has already verified the
+    // password, but its reply reaches the ordered core after suspension.
+    let late = server.register(40, "LateAlice");
+    server.line(late, "PRIVMSG NickServ :IDENTIFY Alice pw");
+    assert_eq!(
+        server
+            .db_requests()
+            .into_iter()
+            .filter(|request| matches!(request, e6ircd::core::DbRequest::VerifyPassword { .. }))
+            .count(),
+        1
+    );
+    server.core.handle(Input::DbReply {
+        conn: late,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "Alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    assert!(
+        server
+            .drain(late)
+            .iter()
+            .any(|line| line.contains("Invalid password")),
+        "a late success is converted to a denial"
+    );
+
+    let query = LiveConnectionQuery {
+        before_id: None,
+        exact_nick: None,
+        exact_account: Some("alice".into()),
+        transport: None,
+        oper: None,
+        page_size: LiveConnectionPageSize::new(10).expect("page size"),
+    };
+    let AdminReply::Connections(page) = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::ListConnections {
+            query: query.clone(),
+        },
+    ) else {
+        panic!("expected connection page");
+    };
+    assert!(page.entries.is_empty(), "no Alice session survived");
+
+    let reactivated = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::SetAccountSuspended {
+            account: "alice".into(),
+            suspended: false,
+            reason: "Account reactivated".into(),
+            actor: "admin".into(),
+        },
+    );
+    assert!(matches!(reactivated, AdminReply::Ok(_)));
+    identify(&mut server, late, "Alice");
+    let AdminReply::Connections(page) = core_admin(
+        &mut server,
+        e6ircd::core::AdminRequest::ListConnections { query },
+    ) else {
+        panic!("expected connection page");
+    };
+    assert_eq!(page.entries.len(), 1, "reactivation removes the live gate");
+}
+
+#[test]
+fn suspended_accounts_are_gated_from_the_first_core_event_after_restart() {
+    let mut server = TestServer::new();
+    server.core.preload_suspended_accounts(vec!["alice".into()]);
+    let alice = server.register(10, "Alice");
+    server.line(alice, "PRIVMSG NickServ :IDENTIFY Alice pw");
+    server.db_requests();
+    server.core.handle(Input::DbReply {
+        conn: alice,
+        reply: e6ircd::core::DbReply::PasswordVerified {
+            account: "Alice".into(),
+            origin: e6ircd::core::CredentialOrigin::NickServIdentify,
+        },
+    });
+    assert!(
+        server
+            .drain(alice)
+            .iter()
+            .any(|line| line.contains("Invalid password"))
+    );
+}

@@ -12,7 +12,7 @@ ExecStart=/usr/local/bin/e6ircd --config /etc/e6irc/e6ircd.toml
 Restart=on-failure
 RestartSec=2s
 KillSignal=SIGTERM
-TimeoutStopSec=15s
+TimeoutStopSec=35s
 LimitNOFILE=262144
 UMask=0077
 

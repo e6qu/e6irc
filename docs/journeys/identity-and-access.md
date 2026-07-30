@@ -30,7 +30,9 @@ session cookie.
 bad credential, rate limit, session-cap conflict, or database error produces a
 non-success response and no authenticated cookie. An app password is not
 accepted as the primary browser password. The user can revoke old browser
-sessions from **Your sessions** before retrying if the cap is reached.
+sessions from **Your sessions** before retrying if the cap is reached. A
+suspended account is indistinguishable from an invalid credential and cannot
+mint a new session.
 
 **Security and observability.** Passwords are Argon2 hashes in the credential
 store. Login failures do not disclose whether an account exists. Authentication
@@ -69,7 +71,9 @@ registration, PostgreSQL is ready, and cookies are correctly configured.
 state, callback mismatch, invalid claims, registration denial, identity
 conflict, session-cap conflict, and provider/network/database failures all fail
 closed. No local session is created from partially validated claims. The
-validation and signed-out pages remain reload-safe.
+validation and signed-out pages remain reload-safe. A valid provider result
+for a suspended account ends with an explicit account-unavailable response and
+no browser session.
 
 **Security and observability.** State is one-time and expiring; PKCE binds the
 authorization code; identities are globally unique. Front-channel and

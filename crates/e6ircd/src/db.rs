@@ -22,6 +22,10 @@ use e6irc_queue::{Receiver, Sender};
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+const DATABASE_STATEMENT_TIMEOUT_MS: i64 = 15_000;
+const DATABASE_LOCK_TIMEOUT_MS: i64 = 5_000;
+const ACCOUNT_FLAG_ADMIN: i64 = 1;
+const ACCOUNT_FLAG_SUSPENDED: i64 = 2;
 
 #[derive(Debug)]
 pub enum DbError {
@@ -52,6 +56,15 @@ pub enum DbError {
     TooManyNetworks,
     /// The channel already holds the maximum number of access entries.
     TooManyAccessEntries,
+    /// Browser bootstrap is permanently closed once any account exists.
+    AlreadyInitialized,
+    /// An administrator attempted to suspend the account authenticating the
+    /// request.
+    CannotSuspendSelf,
+    /// An administrator attempted to remove its own durable authority.
+    CannotDemoteSelf,
+    /// At least one active durable administrator must remain.
+    LastAdministrator,
 }
 
 impl std::fmt::Display for DbError {
@@ -77,6 +90,14 @@ impl std::fmt::Display for DbError {
             Self::TooManyCredentials => write!(f, "account holds too many app passwords"),
             Self::TooManyNetworks => write!(f, "account holds too many networks"),
             Self::TooManyAccessEntries => write!(f, "channel holds too many access entries"),
+            Self::AlreadyInitialized => write!(f, "server account bootstrap is already complete"),
+            Self::CannotSuspendSelf => write!(f, "an administrator cannot suspend itself"),
+            Self::CannotDemoteSelf => {
+                write!(f, "an administrator cannot remove its own authority")
+            }
+            Self::LastAdministrator => {
+                write!(f, "the last active administrator cannot be suspended")
+            }
         }
     }
 }
@@ -90,11 +111,173 @@ pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
     // longer default acquisition timeout.
     let pool = PgPoolOptions::new()
         .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                    .bind(DATABASE_STATEMENT_TIMEOUT_MS.to_string())
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                    .bind(DATABASE_LOCK_TIMEOUT_MS.to_string())
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(url)
         .await
         .map_err(DbError::Connect)?;
     MIGRATOR.run(&pool).await.map_err(DbError::Migrate)?;
     Ok(pool)
+}
+
+const STORAGE_MAINTENANCE_BATCH: u64 = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageMaintenanceReport {
+    pub messages: u64,
+    pub audit_events: u64,
+    pub web_sessions: u64,
+    pub api_tokens: u64,
+    pub device_grants: u64,
+    pub logout_tokens: u64,
+    /// At least one collection filled its bounded batch and may have more
+    /// expired rows. The supervised worker emits this explicitly and retries
+    /// on its next fixed maintenance tick.
+    pub saturated: bool,
+}
+
+async fn execute_maintenance_delete(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    statement: &'static str,
+    retention_days: Option<i32>,
+    limit: i64,
+) -> Result<u64, DbError> {
+    let query = sqlx::query(statement);
+    let query = match retention_days {
+        Some(days) => query.bind(days).bind(limit),
+        None => query.bind(limit),
+    };
+    query
+        .execute(&mut **transaction)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(DbError::Query)
+}
+
+/// Delete one bounded batch from every time-retained/expiring collection.
+/// Each statement uses an indexed or time-ordered candidate set and every
+/// pooled statement still has the global PostgreSQL deadline, so maintenance
+/// cannot monopolize the database or grow one unbounded transaction.
+pub async fn run_storage_maintenance(
+    pool: &PgPool,
+    history_retention_days: u64,
+    audit_retention_days: u64,
+) -> Result<StorageMaintenanceReport, DbError> {
+    let history_days = i32::try_from(history_retention_days)
+        .map_err(|_| DbError::InvalidServerSettings("history retention exceeds INT".into()))?;
+    let audit_days = i32::try_from(audit_retention_days)
+        .map_err(|_| DbError::InvalidServerSettings("audit retention exceeds INT".into()))?;
+    let limit = STORAGE_MAINTENANCE_BATCH as i64;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let messages = execute_maintenance_delete(
+        &mut transaction,
+        "WITH expired AS (
+             SELECT id FROM messages
+             WHERE ts < now() - make_interval(days => $1)
+             ORDER BY ts, id
+             LIMIT $2
+         )
+         DELETE FROM messages m USING expired e WHERE m.id = e.id",
+        Some(history_days),
+        limit,
+    )
+    .await?;
+    let audit_events = execute_maintenance_delete(
+        &mut transaction,
+        "WITH expired AS (
+             SELECT id FROM audit_log
+             WHERE created_at < now() - make_interval(days => $1)
+             ORDER BY created_at, id
+             LIMIT $2
+         )
+         DELETE FROM audit_log a USING expired e WHERE a.id = e.id",
+        Some(audit_days),
+        limit,
+    )
+    .await?;
+    let web_sessions = execute_maintenance_delete(
+        &mut transaction,
+        "DELETE FROM web_sessions
+         WHERE token_hash IN (
+             SELECT token_hash FROM web_sessions
+             WHERE expires_at <= now()
+             ORDER BY expires_at
+             LIMIT $1
+         )",
+        None,
+        limit,
+    )
+    .await?;
+    let api_tokens = execute_maintenance_delete(
+        &mut transaction,
+        "DELETE FROM api_tokens
+         WHERE token_hash IN (
+             SELECT token_hash FROM api_tokens
+             WHERE expires_at <= now()
+             ORDER BY expires_at
+             LIMIT $1
+         )",
+        None,
+        limit,
+    )
+    .await?;
+    let device_grants = execute_maintenance_delete(
+        &mut transaction,
+        "DELETE FROM device_grants
+         WHERE id IN (
+             SELECT id FROM device_grants
+             WHERE expires_at <= now()
+             ORDER BY expires_at, id
+             LIMIT $1
+         )",
+        None,
+        limit,
+    )
+    .await?;
+    let logout_tokens = execute_maintenance_delete(
+        &mut transaction,
+        "DELETE FROM oidc_logout_tokens o
+         WHERE (o.issuer, o.jti) IN (
+             SELECT issuer, jti FROM oidc_logout_tokens
+             WHERE expires_at <= now()
+             ORDER BY expires_at, issuer, jti
+             LIMIT $1
+         )",
+        None,
+        limit,
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    let saturated = [
+        messages,
+        audit_events,
+        web_sessions,
+        api_tokens,
+        device_grants,
+        logout_tokens,
+    ]
+    .into_iter()
+    .any(|deleted| deleted == STORAGE_MAINTENANCE_BATCH);
+    Ok(StorageMaintenanceReport {
+        messages,
+        audit_events,
+        web_sessions,
+        api_tokens,
+        device_grants,
+        logout_tokens,
+        saturated,
+    })
 }
 
 pub(crate) async fn store_observability_sample(
@@ -267,6 +450,23 @@ pub async fn save_managed_config(
     })
 }
 
+async fn insert_primary_password(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+    hash: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO account_credentials (account_id, kind, argon2_hash)
+         VALUES ($1, 'local_password', $2)",
+    )
+    .bind(account_id)
+    .bind(hash)
+    .execute(&mut **transaction)
+    .await
+    .map(|_| ())
+    .map_err(DbError::Query)
+}
+
 /// Create an account with a local password. Used by NickServ REGISTER
 /// and by tests/admin tooling.
 pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result<i64, DbError> {
@@ -283,17 +483,278 @@ pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result
     .await
     .map_err(DbError::Query)?
     .ok_or_else(|| DbError::DuplicateAccount(name.to_string()))?;
-    sqlx::query(
-        "INSERT INTO account_credentials (account_id, kind, argon2_hash)
-         VALUES ($1, 'local_password', $2)",
-    )
-    .bind(id)
-    .bind(&hash)
-    .execute(&mut *tx)
-    .await
-    .map_err(DbError::Query)?;
+    insert_primary_password(&mut tx, id, &hash).await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(id)
+}
+
+/// Whether the one-time first-account bootstrap has already been consumed.
+pub async fn has_accounts(pool: &PgPool) -> Result<bool, DbError> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts)")
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::Query)
+}
+
+/// Create the only possible first account and make it an administrator in the
+/// same transaction. The table lock serializes this with every ordinary
+/// account INSERT, so browser bootstrap and IRC registration cannot both
+/// observe an empty store and mint separate "first" accounts.
+pub async fn bootstrap_first_admin(
+    pool: &PgPool,
+    name: &str,
+    password: &str,
+) -> Result<i64, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(name);
+    let hash = hash_password(password.to_string()).await?;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    sqlx::query("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    let initialized: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts)")
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    if initialized {
+        return Err(DbError::AlreadyInitialized);
+    }
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded, flags)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(&folded)
+    .bind(ACCOUNT_FLAG_ADMIN)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    insert_primary_password(&mut transaction, account_id, &hash).await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &folded,
+        "ACCOUNT_BOOTSTRAP",
+        &folded,
+        "first administrator created through one-time browser bootstrap",
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(account_id)
+}
+
+/// Durable account posture used by authentication and administrator gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountFlags(i64);
+
+impl AccountFlags {
+    pub fn is_admin(self) -> bool {
+        self.0 & ACCOUNT_FLAG_ADMIN != 0
+    }
+
+    pub fn is_suspended(self) -> bool {
+        self.0 & ACCOUNT_FLAG_SUSPENDED != 0
+    }
+}
+
+pub async fn account_flags(pool: &PgPool, account: &str) -> Result<Option<AccountFlags>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    sqlx::query_scalar("SELECT flags FROM accounts WHERE name_folded = $1")
+        .bind(folded)
+        .fetch_optional(pool)
+        .await
+        .map(|flags| flags.map(AccountFlags))
+        .map_err(DbError::Query)
+}
+
+/// Folded account keys holding durable administrator authority, loaded once
+/// into the live HTTP authorization registry at startup.
+pub async fn list_admin_accounts(pool: &PgPool) -> Result<Vec<String>, DbError> {
+    sqlx::query_scalar("SELECT name_folded FROM accounts WHERE (flags & $1) = $1 ORDER BY id")
+        .bind(ACCOUNT_FLAG_ADMIN)
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)
+}
+
+/// Folded account keys whose durable suspension must be seeded into the core
+/// before it accepts an authentication verdict.
+pub async fn list_suspended_accounts(pool: &PgPool) -> Result<Vec<String>, DbError> {
+    sqlx::query_scalar("SELECT name_folded FROM accounts WHERE (flags & $1) = $1 ORDER BY id")
+        .bind(ACCOUNT_FLAG_SUSPENDED)
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)
+}
+
+pub async fn account_name_by_id(pool: &PgPool, account_id: i64) -> Result<Option<String>, DbError> {
+    sqlx::query_scalar("SELECT name FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(DbError::Query)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStateChange {
+    pub name: String,
+    pub folded: String,
+    pub suspended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountAuthorityChange {
+    pub name: String,
+    pub folded: String,
+    pub administrator: bool,
+}
+
+type LockedAccountState = (String, String, i64);
+
+async fn lock_account_state(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<Option<LockedAccountState>, DbError> {
+    sqlx::query_as("SELECT name, name_folded, flags FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(account_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(DbError::Query)
+}
+
+async fn require_other_active_administrator(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+) -> Result<(), DbError> {
+    let other_active_administrators: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM accounts
+         WHERE id <> $1
+           AND (flags & $2) = $2
+           AND (flags & $3) = 0",
+    )
+    .bind(account_id)
+    .bind(ACCOUNT_FLAG_ADMIN)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(DbError::Query)?;
+    if other_active_administrators == 0 {
+        return Err(DbError::LastAdministrator);
+    }
+    Ok(())
+}
+
+async fn write_account_flags(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: i64,
+    flags: i64,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE accounts SET flags = $1 WHERE id = $2")
+        .bind(flags)
+        .bind(account_id)
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(DbError::Query)
+}
+
+/// Grant or revoke durable administrator authority by immutable account ID.
+/// The actor cannot demote itself and the final active durable administrator
+/// cannot be removed, so every committed state retains a recovery path.
+pub async fn set_account_administrator(
+    pool: &PgPool,
+    account_id: i64,
+    administrator: bool,
+    actor: &str,
+) -> Result<Option<AccountAuthorityChange>, DbError> {
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let Some((name, folded, flags)) = lock_account_state(&mut transaction, account_id).await?
+    else {
+        return Ok(None);
+    };
+    if !administrator && folded == actor_folded {
+        return Err(DbError::CannotDemoteSelf);
+    }
+    if !administrator && flags & ACCOUNT_FLAG_ADMIN != 0 {
+        require_other_active_administrator(&mut transaction, account_id).await?;
+    }
+    let next_flags = if administrator {
+        flags | ACCOUNT_FLAG_ADMIN
+    } else {
+        flags & !ACCOUNT_FLAG_ADMIN
+    };
+    write_account_flags(&mut transaction, account_id, next_flags).await?;
+    let action = if administrator {
+        "ACCOUNT_ADMIN_GRANT"
+    } else {
+        "ACCOUNT_ADMIN_REVOKE"
+    };
+    insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(Some(AccountAuthorityChange {
+        name,
+        folded,
+        administrator,
+    }))
+}
+
+/// Suspend or reactivate one account by immutable id. Suspension, credential
+/// revocation, and its audit record commit together; no request can observe a
+/// suspended flag while retaining an older browser/PAT/device grant.
+pub async fn set_account_suspended(
+    pool: &PgPool,
+    account_id: i64,
+    suspended: bool,
+    actor: &str,
+) -> Result<Option<AccountStateChange>, DbError> {
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let Some((name, folded, flags)) = lock_account_state(&mut transaction, account_id).await?
+    else {
+        return Ok(None);
+    };
+    if suspended && folded == actor_folded {
+        return Err(DbError::CannotSuspendSelf);
+    }
+    if suspended && flags & ACCOUNT_FLAG_ADMIN != 0 {
+        require_other_active_administrator(&mut transaction, account_id).await?;
+    }
+    let next_flags = if suspended {
+        flags | ACCOUNT_FLAG_SUSPENDED
+    } else {
+        flags & !ACCOUNT_FLAG_SUSPENDED
+    };
+    write_account_flags(&mut transaction, account_id, next_flags).await?;
+    if suspended {
+        sqlx::query("DELETE FROM web_sessions WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+        sqlx::query("DELETE FROM api_tokens WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+        sqlx::query("DELETE FROM device_grants WHERE account = $1")
+            .bind(&name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+    }
+    let action = if suspended {
+        "ACCOUNT_SUSPEND"
+    } else {
+        "ACCOUNT_REACTIVATE"
+    };
+    insert_audit_log_with(&mut *transaction, &actor_folded, action, &folded, "").await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(Some(AccountStateChange {
+        name,
+        folded,
+        suspended,
+    }))
 }
 
 /// The single Argon2 configuration used for every password hash and verify,
@@ -426,12 +887,16 @@ pub async fn issue_app_password_for_account(
     // cap the comment promises (this endpoint runs on the concurrent REST
     // layer, not the serial worker).
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
-            .bind(&folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(DbError::Query)?;
+    let account_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE name_folded = $1 AND (flags & $2) = 0
+         FOR UPDATE",
+    )
+    .bind(&folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
     // The account row was gone (deleted since authentication): reject rather
     // than hand back an app password that was never stored.
     let Some(account_id) = account_id else {
@@ -2716,6 +3181,16 @@ pub struct AccountDirectoryRow {
     pub browser_sessions: i64,
     pub networks: i64,
     pub founded_channels: i64,
+    pub administrator: bool,
+    pub suspended: bool,
+    /// Presentation-only marker set by the authenticated console boundary.
+    /// The database query always returns false because "current" is relative
+    /// to the request actor, not durable account state.
+    pub current: bool,
+    /// Presentation-only authority source set by the HTTP boundary.
+    pub configured_administrator: bool,
+    /// Presentation-only union of durable and configured authority.
+    pub effective_administrator: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2765,7 +3240,12 @@ pub async fn query_account_directory(
                 (SELECT count(*) FROM bnc_networks n
                  WHERE n.account_id = a.id) AS networks,
                 (SELECT count(*) FROM channels ch
-                 WHERE ch.founder_account_id = a.id) AS founded_channels
+                 WHERE ch.founder_account_id = a.id) AS founded_channels,
+                (a.flags & 1) = 1 AS administrator,
+                (a.flags & 2) = 2 AS suspended,
+                FALSE AS current,
+                FALSE AS configured_administrator,
+                FALSE AS effective_administrator
          FROM accounts a WHERE TRUE",
     );
     if let Some(before_id) = filter.before_id {
@@ -2954,9 +3434,10 @@ pub async fn verify_credentials(
     let rows: Vec<(String, String, i64)> = sqlx::query_as(
         "SELECT a.name, c.argon2_hash, c.id FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
-         WHERE a.name_folded = $1",
+         WHERE a.name_folded = $1 AND (a.flags & $2) = 0",
     )
     .bind(&folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_all(pool)
     .await
     .map_err(DbError::Query)?;
@@ -2995,9 +3476,12 @@ pub async fn verify_local_password(
     let row: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT a.name, c.argon2_hash, c.id FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
-         WHERE a.name_folded = $1 AND c.kind = 'local_password'",
+         WHERE a.name_folded = $1
+           AND c.kind = 'local_password'
+           AND (a.flags & $2) = 0",
     )
     .bind(&folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
     .map_err(DbError::Query)?;
@@ -3110,15 +3594,7 @@ pub async fn set_local_password(
     if exists {
         return Err(DbError::LocalPasswordExists);
     }
-    sqlx::query(
-        "INSERT INTO account_credentials (account_id, kind, argon2_hash)
-         VALUES ($1, 'local_password', $2)",
-    )
-    .bind(account_id)
-    .bind(new_hash)
-    .execute(&mut *tx)
-    .await
-    .map_err(DbError::Query)?;
+    insert_primary_password(&mut tx, account_id, &new_hash).await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
@@ -3941,12 +4417,16 @@ pub async fn create_web_session_with_identity(
     // lets concurrent logins exceed the cap. Rolling out the oldest login keeps
     // a credential-owning user able to sign in and recover the account instead
     // of letting a filled session set permanently lock out the login surface.
-    let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
-            .bind(&folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(DbError::Query)?;
+    let account_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE name_folded = $1 AND (flags & $2) = 0
+         FOR UPDATE",
+    )
+    .bind(&folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
     let Some(account_id) = account_id else {
         return Err(DbError::BadCredentials);
     };
@@ -4244,12 +4724,16 @@ pub async fn issue_api_token(pool: &PgPool, account: &str, label: &str) -> Resul
     // insert, overshooting the cap — the same TOCTOU `issue_app_password` closes.
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1 FOR UPDATE")
-            .bind(&folded)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(DbError::Query)?;
+    let account_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM accounts
+         WHERE name_folded = $1 AND (flags & $2) = 0
+         FOR UPDATE",
+    )
+    .bind(&folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(DbError::Query)?;
     let Some(account_id) = account_id else {
         return Err(DbError::BadCredentials);
     };
@@ -4287,11 +4771,13 @@ where
     let folded = CaseMapping::Rfc1459.casefold(account);
     let inserted = sqlx::query(
         "INSERT INTO api_tokens (token_hash, account_id, label)
-         SELECT $1, a.id, $2 FROM accounts a WHERE a.name_folded = $3",
+         SELECT $1, a.id, $2 FROM accounts a
+         WHERE a.name_folded = $3 AND (a.flags & $4) = 0",
     )
     .bind(token_hash(&token))
     .bind(label)
     .bind(&folded)
+    .bind(ACCOUNT_FLAG_SUSPENDED)
     .execute(executor)
     .await
     .map_err(DbError::Query)?;
@@ -4307,9 +4793,11 @@ pub async fn api_token_account(pool: &PgPool, token: &str) -> Result<Option<Stri
         "SELECT a.name FROM api_tokens t
          JOIN accounts a ON a.id = t.account_id
          WHERE t.token_hash = $1
-           AND (t.expires_at IS NULL OR t.expires_at > now())",
+           AND (t.expires_at IS NULL OR t.expires_at > now())
+           AND (a.flags & $2) = 0",
     )
     .bind(token_hash(token))
+    .bind(ACCOUNT_FLAG_SUSPENDED)
     .fetch_optional(pool)
     .await
     .map_err(DbError::Query)

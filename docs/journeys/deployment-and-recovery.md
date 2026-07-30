@@ -43,13 +43,14 @@ embedded web assets, a database-backed control plane, and explicit readiness.
 
 **Preconditions.** The deployer has a supported binary/image, a reachable
 PostgreSQL database, durable secret storage, the required listener addresses,
-and an account name designated as the initial administrator.
+and either existing administrator authority or a one-time random token for
+creating the first durable administrator.
 
 **Flow.**
 
 1. Provide the PostgreSQL URL, stable secret-key source, immutable release
-   revision, public URL/cookie policy, initial administrator, and listener
-   bootstrap required by the chosen mode.
+   revision, public URL/cookie policy, listener bootstrap, and either static
+   administrator grants or a 32–512-byte first-administrator token.
 2. Build/install `e6ircd` or run the production container. The container builds
    the Vite client and embeds it at image-build time; startup does not compile
    assets.
@@ -62,12 +63,15 @@ and an account name designated as the initial administrator.
    behavior.
 6. Bind listeners and report `/healthz`; report `/readyz` only with the
    configured dependencies actually ready.
-7. Continue configuration from `/console/configuration`.
+7. If the account store is empty, open `/bootstrap`, create the first durable
+   administrator, verify the route has closed, and remove the deployment token.
+8. Continue configuration from `/console/configuration`.
 
 **Visible failures and recovery.** Missing/invalid configuration, migration
 failure, unavailable PostgreSQL, unreadable/wrong secret key, persisted
-configuration incompatibility, and bind failure terminate startup with a
-specific error. There is no in-memory fallback for a configured database.
+configuration incompatibility, bind failure, invalid bootstrap token, and an
+already-consumed bootstrap produce specific errors. First-account creation is
+atomic, and there is no in-memory fallback for a configured database.
 
 **Security and observability.** Secrets enter through files/environment or the
 external key source, never the image or managed configuration plaintext. Logs
@@ -103,7 +107,10 @@ when archives are requested.
   receives signed provenance, and the workflow verifies each attestation
   through the same public consumer command operators use.
 - The runtime image is `debian:bookworm-slim`; the server runs as an
-  unprivileged user and contains the embedded web client.
+  unprivileged user and contains the embedded web client and every compiled
+  bridge driver.
+- Environment bootstrap renders to an unpredictable mode-`0600` file unless
+  an operator explicitly supplies the path.
 - `deploy/` supplies the Terraform/ECS example, its deployment contract, and a
   hardened systemd service for native Linux installation.
 - A tag exactly equal to `v` plus the workspace version builds `e6ircd`,
@@ -128,7 +135,9 @@ publication, generates and verifies the attestations, and validates the final
 manifest shape. Ordinary pull-request CI proves the native packager's exact
 members, executable/document modes, and byte-for-byte reproducibility; the
 tag workflow uses that packager on all six native runners and refuses an
-incomplete archive set. `systemd-analyze verify` checks the service in CI.
+incomplete archive set. `systemd-analyze verify` checks the service in CI,
+the same gate compares its stop budget to the daemon flush budget, and the
+portable entrypoint test executes both generated-path and operator-path modes.
 
 ## Restart without losing durable state
 
@@ -152,19 +161,28 @@ time for bounded flush paths.
    sessions from PostgreSQL.
 6. Start enabled networks and listeners from the loaded revision.
 
+While serving, main supervises the core, PostgreSQL worker, protocol listeners,
+connection reaper, observability sampler, and storage-maintenance worker. An
+unexpected task return or panic enters this same shutdown flow and results in
+a non-zero process exit.
+
 **Visible failures and recovery.** Shutdown timeouts and write failures are
 logged; the process does not wait forever. A new process does not claim old
-runtime connection duration. Durable rows remain bounded by their retention/
-cap contracts.
+runtime connection duration. Durable rows remain bounded by their
+retention/cap contracts. History and audit expiry use the live console policy;
+expired browser/API/device/logout bearers are removed by the same bounded
+maintenance transaction.
 
 **Security and observability.** The process reloads sealed credentials only
 with the configured external key and never logs them. Shutdown and boot stages,
 flush failures, driver reconnects, readiness, and new runtime timestamps make
 the transition visible without pretending ephemeral sessions survived.
 
-**Evidence.** Graceful shutdown and worker flush behavior are unit/integration
-tested; BNC backlog, read markers, channels, bans, browser sessions, and
-history each have restart/boot-load PostgreSQL tests. The Chromium acceptance
+**Evidence.** Graceful shutdown, critical-task outcome provenance, worker
+flush behavior, managed retention validation, and exact PostgreSQL maintenance
+deletions are unit/integration tested; BNC backlog, read markers, channels,
+bans, browser sessions, and history each have restart/boot-load PostgreSQL
+tests. The Chromium acceptance
 journey additionally sends real upstream traffic, stops the daemon with
 SIGTERM and requires exit zero, starts a new process on the same database, and
 proves the session, network, reconnected runtime, and backlog together.
@@ -193,8 +211,10 @@ restored.
 **Visible failures and recovery.** Requests that require PostgreSQL return
 dependency errors and readiness remains false until a real query succeeds
 again. The readiness query and shared pool acquisition each have explicit
-two-second application deadlines, so an interrupted database cannot leave the
-deployment probe or an unrelated database-backed request hanging indefinitely.
+two-second application deadlines. Every pooled connection also carries a
+15-second statement deadline and five-second lock deadline, so an interrupted,
+wedged, or contended database cannot leave a database-backed request hanging
+indefinitely.
 Retrying after recovery re-enters the normal database worker path; the server
 never reports an unwritten mutation as durable.
 

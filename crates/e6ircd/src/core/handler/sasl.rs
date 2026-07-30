@@ -342,6 +342,16 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     {
         s.sasl_verify_pending = false;
     }
+    // Suspension and credential replies are serialized through the core. Once
+    // the administrative event installs this deny gate, even a successful DB
+    // verification that was already in flight is converted to a denial rather
+    // than recreating an authenticated session after the disconnect sweep.
+    if let crate::core::DbReply::PasswordVerified { account, origin } = &reply
+        && state.is_account_suspended(account)
+    {
+        verify_denied(state, conn, *origin, false);
+        return;
+    }
     match reply {
         // The verdict routes on the origin the *request* carried, never on the
         // session flags: `sasl == Verifying` and `pending_identify` can both be

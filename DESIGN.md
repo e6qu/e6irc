@@ -832,13 +832,16 @@ on startup (refusing to start on drift, loudly). CI provisions `postgres:18`
 for every database-backed suite — legacy majors are deliberately not a
 support target, so "it happens to work on an older server" is not a claim
 this project makes or tests. The shared application pool has a two-second
-acquisition deadline: dependency loss or pool exhaustion becomes a typed
-database failure for HTTP and worker callers instead of parking them on the
-library default timeout.
+acquisition deadline, a 15-second PostgreSQL statement deadline, and a
+five-second lock-acquisition deadline on every pooled connection. Dependency
+loss, pool exhaustion, a wedged query, or a contended lock therefore becomes a
+typed database failure instead of parking an HTTP or worker caller indefinitely.
 
 Principal tables (columns abridged):
 
-- `accounts` (id, name/casefolded, created_at, flags)
+- `accounts` (id, name/casefolded, created_at, flags). The closed flag bits are
+  durable administrator authority and suspension; a database constraint rejects
+  every other value. At least one durable administrator remains active.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
   revocable, shown once at creation
@@ -850,11 +853,12 @@ Principal tables (columns abridged):
 - `channel_access` (channel_id, account_id, flags) — Atheme-style FLAGS
 - `messages` — append-only history log; columns (id, msgid, target,
   sender_prefix, sender_account, kind, body, ts), indexed `(target, ts)`
-  btree + BRIN on `ts`. Native monthly range partitions and
-  partition-drop retention are a planned scale-hardening step — the write
-  path and queries are already partition-shaped (append-only, time-bounded
-  scans). Server-time and account-tag are reconstructed from `ts` and
-  `sender_account`, so no separate tags column is stored.
+  btree + BRIN on `ts`. The live storage policy retains 1–3650 days
+  (30 by default) and removes expired rows in bounded 10,000-row batches.
+  Native monthly range partitions remain the target representation at the
+  scale qualification boundary; retention semantics do not depend on that
+  representation. Server-time and account-tag are reconstructed from `ts`
+  and `sender_account`, so no separate tags column is stored.
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
   server master key (§15), enabled)
@@ -896,6 +900,17 @@ browser sessions and personal access tokens are not counted; credential
 hashes, bearer/session hashes, OpenID Connect subjects, and sealed upstream
 secrets are not selected at all.
 
+A supervised five-minute storage-maintenance worker applies the live
+UI-managed `[storage]` policy independently of monitoring. Each transaction
+removes at most 10,000 expired message-history rows, audit events, browser
+sessions, personal access tokens, device grants, and consumed OpenID Connect
+logout tokens from each collection. Time-order indexes and the global
+acquisition/statement/lock deadlines bound both the selection and the
+transaction. Filling any batch is logged with per-collection provenance and
+the next fixed cycle continues draining it; database failure is counted and
+logged. The worker's unexpected return or panic is a critical runtime failure,
+not an invisible loss of retention.
+
 Administrator registered-channel and server-ban reads are independent of the
 unbounded boot preload required by the live core. They project newest-first
 policy pages with immutable IDs, exact folded filters, and one extra row for
@@ -922,6 +937,32 @@ one local password, N app passwords, and N OIDC identities. A partial unique
 index makes a second primary password unrepresentable in storage. The web
 "user section" manages all of them. NickServ `REGISTER` creates the same kind
 of account the OIDC first-login path creates.
+
+An empty database can expose a one-time browser bootstrap only when
+`[bootstrap].token`, PostgreSQL, and HTTP are all configured. `GET /bootstrap`
+binds the form to an expiring `HttpOnly; SameSite=Strict` browser state cookie;
+the POST is authentication-rate-limited and compares only a SHA-256 digest of
+the supplied token in constant time. The transaction locks the account table,
+creates the first account, its primary password, durable administrator flag,
+and audit row atomically. Any existing account permanently closes the route,
+including an account concurrently created through IRC registration. The
+plaintext bootstrap token is not retained in HTTP state.
+
+Suspension is a durable account state, not a credential rewrite. One
+transaction sets the flag, revokes every browser session, personal access
+token, and approved device grant, and records the actor/target audit event.
+Primary and app-password hashes, OpenID Connect links, channel ownership, and
+network definitions remain so reactivation can restore the identity without
+resurrecting any revoked bearer. Every credential lookup and bearer-issuance
+choke point rejects suspended accounts.
+
+Durable administrator authority is independently grantable/revocable by
+immutable account ID. The acting administrator cannot demote itself, and the
+last active durable administrator cannot be demoted. Configured administrator
+grants remain a distinct restart-scoped authority source; the directory shows
+both sources, and revoking a durable grant cannot falsely remove a still-active
+configuration grant. Every durable authority transition is audited and updates
+the live HTTP authorization registry immediately.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge; the capability's advertised value states
@@ -954,6 +995,10 @@ supplied.
   reject a missing or invalid token before mutation. Each login records a
   bounded, display-safe user agent and a separate stable resource id; neither
   the opaque token nor its hash is exposed by session inventory.
+- Local and OpenID Connect login cannot issue a session for a suspended
+  account. OpenID Connect returns an explicit account-unavailable response
+  after validating the provider result; it never turns suspension into a
+  dependency failure or creates a partially authenticated browser session.
 - The embedded application entry point was an authentication boundary. A
   valid local session rendered the client; otherwise a single configured
   provider's ordinary authorization flow began immediately. An existing
@@ -995,7 +1040,8 @@ CERTFP is explicitly out of scope for v1 (not selected).
 Personal access tokens (hashed at rest, scoped, expiring) via
 `Authorization: Bearer`, or the web session cookie (for the browser clients,
 with the CSRF rules above). Admin endpoints additionally require the
-account's admin flag. The same admin-gated data is also served as a
+account's durable administrator flag or a configured administrator grant.
+The same admin-gated data is also served as a
 server-rendered management **console** at `/console` (accounts, registered
 channels, server bans, audit preview), with a dedicated filterable,
 cursor-paginated security-operations view at `/console/audit`; it shares the
@@ -1037,6 +1083,21 @@ account out. Individual and bulk other-session revocation remain owner-scoped
 in PostgreSQL, and deleting the current session also clears its browser cookie.
 Their REST surface is `GET /api/v1/me/sessions` and
 `DELETE /api/v1/me/sessions/{id}`.
+The account directory also projects effective administrator authority, its
+durable/configuration sources, and suspension posture.
+`PATCH /api/v1/admin/accounts/{id}` and matching CSRF-protected console forms
+change exactly one durable authority or suspension state by immutable account
+ID. Self-suspension, self-demotion, and suspending/demoting the last active
+durable administrator are conflicts. Account-state
+and network CRUD share one mutation guard. After the durable transaction,
+suspension installs a case-folded deny key on the ordered core thread before
+disconnecting every authenticated IRC session, then stops every active network
+owned by that account. A password verdict already in flight is therefore
+converted to denial instead of recreating a session after the sweep.
+Reactivation removes the core deny key and rebuilds every enabled owned
+network; invalid persisted network configuration fails before changing the
+durable state. A runtime reconciliation failure reports the exact committed
+partial state instead of claiming success.
 The console shell (`console_base.html`) is
 also home to `/console/account`, the complete self-service surface for creating
 or rotating the primary password, creating and revoking app passwords and
@@ -1056,8 +1117,9 @@ The shell also contains `/console/configuration`, the database-backed operationa
 plane. Its singleton `server_settings` row is a typed JSON document with an
 optimistic-concurrency revision, actor, and timestamp; every committed revision
 also writes a redacted `CONFIG` audit entry in the same transaction. The
-database URL, master-key source, HTTP bind, and initial administrator remain
-bootstrap values because they are prerequisites for reaching the console.
+database URL, master-key source, HTTP bind, configured administrator grants,
+and optional one-time first-administrator token remain bootstrap values
+because they are prerequisites for reaching the console.
 Identity, MOTD, IRC listeners, public URL/cookie policy, administrator grants,
 OIDC providers, operators, registration policy, resource limits, trusted
 proxies, server-level networks, and the BNC attach address are UI-managed.
@@ -1320,7 +1382,8 @@ Surface (initial):
 - `history`: paged queries per §11.2
 - `admin`: bounded, exact-filtered/stable-cursor account posture, registered
   channel policy, global K/D/X-line policy, and audit log; server stats;
-  live/historical observability; Prometheus exposition. Personalized
+  account suspension/reactivation; live/historical observability; Prometheus
+  exposition. Personalized
   administrator JSON and metrics responses carry `Cache-Control: no-store`.
 - `healthz` (liveness; no auth)
 - `readyz` (core-heartbeat and configured-PostgreSQL readiness; no auth)
@@ -1352,7 +1415,10 @@ through storage-confirmed core mutations. Empty and unauthorized inventories
 remain distinct from storage failures, and every form is session-CSRF
 protected. `/console/accounts` gives administrators a newest-first,
 case-insensitive exact-search directory of account age, login-method posture,
-active access, networks, and founded channels. It deliberately shares the
+effective administrator/suspension state, active access, networks, and founded
+channels. It can suspend/reactivate every non-current account and explains the
+credential/session/network consequences before submission. It deliberately
+shares the
 secret-free projection and stable cursor with `GET /api/v1/admin/accounts`;
 the overview requests only its newest ten rows. `/console/admin/channels` and
 `/console/bans` likewise own bounded exact-search policy directories and their
@@ -1529,16 +1595,24 @@ but the CLI, TUI, and BNC must surface the rejection.
   negligible at config-secret volumes. `e6ircd genkey` mints a key;
   `e6ircd seal` encrypts stdin. (Key rotation re-seals values with a new
   key; a versioned `enc:vN:` prefix leaves room for an XChaCha upgrade.)
-- TLS ≥ 1.2 everywhere (rustls); HSTS on the web origin; WS upgrades check
-  Origin.
+- TLS ≥ 1.2 everywhere (rustls); responses carry HSTS whenever the validated
+  public origin is HTTPS (and never on an explicitly plain development
+  origin); WS upgrades check Origin.
 - Rate limits: per-IP connection/registration throttle, per-session command
   token bucket, per-account API limits (tower middleware), SASL attempt
   limits with backoff.
 - IRC network protections: kline/dline/xline equivalents managed by opers
   and via admin API, all audit-logged.
+- Every HTTP response receives a fresh server-generated 128-bit correlation
+  identifier. No client-supplied identifier is trusted as provenance.
 - No secrets in logs; `tracing` field redaction for credentials.
 - CSRF per §9.2; cookies HttpOnly/Secure; session fixation avoided by
   rotating session id at login.
+- One-time first-administrator bootstrap uses a separate Strict browser-state
+  cookie, the shared authentication rate limit, a 32–512-byte deployment
+  secret, constant-time digest comparison, and an atomic empty-store check.
+  Account suspension revokes bearer material transactionally and is enforced
+  again by the ordered core so in-flight verification cannot race the action.
 
 ---
 
@@ -1589,7 +1663,10 @@ When PostgreSQL is configured, a sampler stores the typed JSON snapshot in
 seconds), enable switch, and retention (1–2160 hours) apply live. Every insert
 deletes rows older than the configured retention in the same transaction, so
 the history is bounded by construction rather than a separate best-effort
-cleanup job. `/healthz` remains a dependency-free liveness probe.
+cleanup job. The independently supervised storage-maintenance worker also
+reports its database latency and failures through this telemetry even when
+historical sampling is disabled. `/healthz` remains a dependency-free
+liveness probe.
 
 Logging continues to use loud stderr lines; metrics do not depend on a
 third-party metrics stack.
@@ -1671,8 +1748,11 @@ Layers, bottom to top:
 ## 18. Configuration & operations
 
 - A minimal `e6irc.toml`/environment bootstrap supplies the PostgreSQL URL,
-  secrets-key source, HTTP bind, immutable release revision, and initial
-  administrator. Unknown keys are a **startup error**.
+  secrets-key source, HTTP bind, immutable release revision, and either
+  existing administrator authority or a one-time first-administrator token.
+  Unknown keys are a **startup error**. The token is accepted only with
+  PostgreSQL and HTTP configured, is 32–512 control-free bytes, and is
+  permanently unusable after the first account exists.
 - Operational configuration is a typed, revisioned PostgreSQL snapshot managed
   at `/console/configuration`. On first start after migration, validated
   bootstrap values are imported once with provenance. Later starts load the
@@ -1688,6 +1768,12 @@ Layers, bottom to top:
   the bounded PostgreSQL write paths within the shutdown budget. Durable
   network/history state is continuously persisted; there is no separate
   driver-checkpoint format.
+- Main owns and supervises the core and PostgreSQL worker join handles while
+  serving; listener join handles have explicit supervisors. Any unexpected
+  completion or panic names the failed task, initiates the same bounded drain,
+  and makes the process exit non-zero. HTTP-to-core control requests have a
+  five-second reply deadline, so even a live but wedged core cannot hold an
+  API request forever.
 - BNC listener changes apply live. Core identity/limits, IRC listeners, OIDC,
   operator, and access-policy changes are stored immediately and explicitly
   reported as restart-required; no response claims those values were applied
@@ -1699,6 +1785,11 @@ Layers, bottom to top:
   and SPDX-SBOM attestations; the assembled manifest has signed provenance,
   and the release workflow verifies them after publication. A hardened,
   CI-validated systemd unit is shipped for native Linux installation.
+  The container daemon is built with every bridge plus the embedded web
+  client, and its environment-rendered bootstrap file is mode `0600` at an
+  unpredictable temporary path unless the operator explicitly chooses one.
+  The systemd stop budget mechanically exceeds the daemon's bounded
+  PostgreSQL flush budget.
   A version tag equal to `v` plus the workspace version publishes deterministic
   archives containing `e6ircd`, `e6irc`, and `e6irc-tui` for Linux, macOS, and
   Windows on x86-64 and ARM64. Each archive has a GitHub build-provenance

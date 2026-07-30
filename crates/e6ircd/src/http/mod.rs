@@ -2,6 +2,7 @@
 //! in-process by the same binary (DESIGN §12).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,7 +112,12 @@ pub struct AppState {
     pub secret_key: Option<std::sync::Arc<crate::secret::SecretKey>>,
     /// Accounts permitted to use the `/api/v1/admin` endpoints (rfc1459
     /// casefolded at startup). Empty = admin disabled.
-    pub admin_accounts: std::collections::HashSet<String>,
+    pub admin_accounts: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Restart-scoped administrator grants from managed/bootstrap
+    /// configuration. Kept separate from the effective registry so revoking a
+    /// durable grant cannot accidentally revoke authority that configuration
+    /// still grants (or pretend that it did).
+    pub configured_admin_accounts: std::collections::HashSet<String>,
     /// Per-startup key for deriving CSRF tokens for cookie-authenticated
     /// form posts from the server-rendered pages.
     pub csrf_key: [u8; 32],
@@ -126,6 +132,27 @@ pub struct AppState {
     /// The per-IP connection cap, shared with the TCP listeners so IRC sessions
     /// opened over `/ws/irc` count against the same budget as raw-socket ones.
     pub(crate) conn_limiter: crate::net::ConnLimiter,
+    /// Random per-process prefix plus a monotonic suffix generate opaque,
+    /// bounded correlation identifiers without accepting an untrusted request
+    /// header into logs or responses.
+    pub(crate) request_id_prefix: u64,
+    pub(crate) request_id_counter: AtomicU64,
+    /// HSTS is safe only when the configured public origin is HTTPS.
+    pub(crate) hsts_enabled: bool,
+    /// Digest of the deployment-supplied one-time bootstrap secret. Plaintext
+    /// is dropped with startup configuration before requests are accepted.
+    pub(crate) bootstrap_token_digest: Option<[u8; 32]>,
+    /// Fast presentation state; PostgreSQL remains the transactional authority
+    /// that exactly zero accounts exist.
+    pub(crate) bootstrap_available: AtomicBool,
+}
+
+pub(crate) fn bootstrap_token_digest(token: &str) -> [u8; 32] {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, token.as_bytes());
+    digest
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 output is always 32 bytes")
 }
 
 impl AppState {
@@ -149,6 +176,11 @@ impl AppState {
                 token.as_bytes(),
             )
             .is_ok()
+    }
+
+    fn next_request_id(&self) -> String {
+        let suffix = self.request_id_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{:016x}{suffix:016x}", self.request_id_prefix)
     }
 }
 
@@ -279,6 +311,8 @@ async fn core_reply(
     state: &AppState,
     req: crate::core::AdminRequest,
 ) -> Result<crate::core::AdminReply, String> {
+    const CORE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state
         .core_tx
@@ -288,8 +322,199 @@ async fn core_reply(
     {
         return Err("core worker unavailable".into());
     }
-    rx.await
-        .map_err(|_| "core worker dropped the request".into())
+    match tokio::time::timeout(CORE_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_closed)) => Err("core worker dropped the request".into()),
+        Err(_elapsed) => Err("core worker did not answer within 5 seconds".into()),
+    }
+}
+
+fn account_mutation_pool(
+    state: &AppState,
+    account_id: i64,
+) -> Result<&sqlx::PgPool, (StatusCode, String)> {
+    if account_id <= 0 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid account id".into()));
+    }
+    state.pool.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No database configured".into(),
+    ))
+}
+
+pub(super) async fn mutate_account_suspension(
+    state: &AppState,
+    actor: &str,
+    account_id: i64,
+    suspended: bool,
+) -> Result<String, (StatusCode, String)> {
+    let pool = account_mutation_pool(state, account_id)?;
+    let registry = state.bnc_registry.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Network registry unavailable".into(),
+    ))?;
+    // Account state and network CRUD share one mutation lane. Without this
+    // guard, an already-authorized network create could commit between the
+    // owner-wide stop and credential revocation, leaving a suspended
+    // account's new driver running.
+    let _network_mutation = registry.mutation_guard().await;
+    let target_name = crate::db::account_name_by_id(pool, account_id)
+        .await
+        .map_err(|error| {
+            eprintln!("account lifecycle target lookup failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+
+    let prepared_networks = if suspended {
+        Vec::new()
+    } else {
+        let rows = crate::db::list_bnc_networks(pool, &target_name)
+            .await
+            .map_err(|error| {
+                eprintln!("account reactivation network lookup failed: {error}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Could not load owned networks".into(),
+                )
+            })?;
+        let mut prepared = Vec::new();
+        for row in rows.into_iter().filter(|row| row.enabled) {
+            let driver =
+                crate::bouncer::driver_from_row(&row, state.secret_key.as_deref(), &target_name)
+                    .map_err(|error| {
+                        (
+                            StatusCode::CONFLICT,
+                            format!(
+                                "Cannot reactivate while network {} is invalid: {error}",
+                                row.name
+                            ),
+                        )
+                    })?;
+            prepared.push((row.name, driver));
+        }
+        prepared
+    };
+
+    let change = crate::db::set_account_suspended(pool, account_id, suspended, actor)
+        .await
+        .map_err(|error| match error {
+            crate::db::DbError::CannotSuspendSelf | crate::db::DbError::LastAdministrator => {
+                (StatusCode::CONFLICT, error.to_string())
+            }
+            _ => {
+                eprintln!("account lifecycle mutation failed: {error}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable".into(),
+                )
+            }
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+
+    if suspended {
+        let stopped_networks = registry.remove_owner(&change.folded);
+        core_action(
+            state,
+            crate::core::AdminRequest::SetAccountSuspended {
+                account: change.folded.clone(),
+                suspended: true,
+                reason: "Account suspended".into(),
+                actor: actor.to_string(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Account was suspended and {stopped_networks} network(s) stopped, but live IRC disconnect failed: {error}"
+                ),
+            )
+        })?;
+        Ok(format!(
+            "Suspended {} and stopped {stopped_networks} owned network(s).",
+            change.name
+        ))
+    } else {
+        core_action(
+            state,
+            crate::core::AdminRequest::SetAccountSuspended {
+                account: change.folded.clone(),
+                suspended: false,
+                reason: "Account reactivated".into(),
+                actor: actor.to_string(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Account was reactivated, but the live IRC core remained gated: {error}"),
+            )
+        })?;
+        let started_networks = prepared_networks.len();
+        for (name, driver) in prepared_networks {
+            registry.add(Some(&change.folded), &name, driver);
+        }
+        Ok(format!(
+            "Reactivated {} and started {started_networks} owned network(s).",
+            change.name
+        ))
+    }
+}
+
+pub(super) async fn mutate_account_administrator(
+    state: &AppState,
+    actor: &str,
+    account_id: i64,
+    administrator: bool,
+) -> Result<String, (StatusCode, String)> {
+    let pool = account_mutation_pool(state, account_id)?;
+    let change = crate::db::set_account_administrator(pool, account_id, administrator, actor)
+        .await
+        .map_err(|error| match error {
+            crate::db::DbError::CannotDemoteSelf | crate::db::DbError::LastAdministrator => {
+                (StatusCode::CONFLICT, error.to_string())
+            }
+            _ => {
+                eprintln!("account authority mutation failed: {error}");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Database unavailable".into(),
+                )
+            }
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+    let configured = state.configured_admin_accounts.contains(&change.folded);
+    let mut effective = state
+        .admin_accounts
+        .write()
+        .expect("administrator registry lock");
+    if administrator || configured {
+        effective.insert(change.folded.clone());
+    } else {
+        effective.remove(&change.folded);
+    }
+    Ok(if administrator {
+        format!(
+            "Granted durable administrator authority to {}.",
+            change.name
+        )
+    } else if configured {
+        format!(
+            "Removed durable administrator authority from {}; configuration still grants administrator access.",
+            change.name
+        )
+    } else {
+        format!(
+            "Removed durable administrator authority from {}.",
+            change.name
+        )
+    })
 }
 
 #[cfg(test)]
@@ -331,7 +556,20 @@ async fn observe_http(
     next: Next,
 ) -> Response {
     let started = Instant::now();
-    let response = next.run(request).await;
+    let request_id = state.next_request_id();
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "x-request-id",
+        request_id.parse().expect("generated request identifier"),
+    );
+    if state.hsts_enabled {
+        response.headers_mut().insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            "max-age=31536000; includeSubDomains"
+                .parse()
+                .expect("static HSTS header"),
+        );
+    }
     state
         .telemetry
         .record_http_request(started.elapsed(), response.status().is_server_error());
@@ -566,6 +804,7 @@ documented_routes! {
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
     "/api/v1/admin/accounts" => { get: admin_accounts },
+    "/api/v1/admin/accounts/{id}" => { patch: admin_account_state },
     "/api/v1/admin/connections" => { get: admin_connections },
     "/api/v1/admin/connections/{id}" => { delete: admin_disconnect_connection },
     "/api/v1/admin/channels" => { get: admin_channels },
@@ -579,6 +818,10 @@ documented_routes! {
 pub fn router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/login", get(pages::login).post(pages::local_login))
+        .route(
+            "/bootstrap",
+            get(pages::bootstrap).post(pages::bootstrap_submit),
+        )
         .route("/auth/signed-out", get(pages::signed_out))
         .route("/auth/validation", get(pages::validation))
         .route("/auth/shauth/logout/complete", get(shauth_logout_complete))
@@ -587,6 +830,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/account", get(pages::account_redirect))
         .route("/console", get(pages::console))
         .route("/console/accounts", get(pages::console_accounts))
+        .route(
+            "/console/accounts/{id}/suspension",
+            post(pages::console_account_suspension),
+        )
+        .route(
+            "/console/accounts/{id}/administrator",
+            post(pages::console_account_administrator),
+        )
         .route(
             "/console/admin/channels",
             get(pages::console_admin_channels),
@@ -886,6 +1137,7 @@ mod pages {
     struct Login {
         providers: Vec<String>,
         local_enabled: bool,
+        bootstrap_available: bool,
         login_state: String,
         account: String,
         error: Option<String>,
@@ -930,6 +1182,7 @@ mod pages {
         let mut response = render_auth(Login {
             providers,
             local_enabled,
+            bootstrap_available: state.bootstrap_available.load(Ordering::Acquire),
             login_state: login_state.clone(),
             account,
             error,
@@ -956,6 +1209,221 @@ mod pages {
         login_response(&state, String::new(), None, StatusCode::OK)
     }
 
+    #[derive(Template)]
+    #[template(path = "bootstrap.html")]
+    struct Bootstrap {
+        bootstrap_state: String,
+        account: String,
+        error: Option<String>,
+    }
+
+    fn bootstrap_state_cookie_name(secure: bool) -> &'static str {
+        if secure {
+            "__Host-e6irc_bootstrap_state"
+        } else {
+            "e6irc_bootstrap_state"
+        }
+    }
+
+    fn browser_state_matches(
+        headers: &axum::http::HeaderMap,
+        cookie_name: &str,
+        supplied: &str,
+    ) -> bool {
+        super::cookie_value(headers, cookie_name).is_some_and(|cookie| {
+            cookie.len() == supplied.len()
+                && aws_lc_rs::constant_time::verify_slices_are_equal(
+                    cookie.as_bytes(),
+                    supplied.as_bytes(),
+                )
+                .is_ok()
+        })
+    }
+
+    fn authenticated_redirect(
+        token: &str,
+        location: &'static str,
+        state_cookie_name: &str,
+        secure_cookies: bool,
+    ) -> Response {
+        let secure = if secure_cookies { "; Secure" } else { "" };
+        (
+            StatusCode::SEE_OTHER,
+            axum::response::AppendHeaders([
+                (header::LOCATION, location.to_string()),
+                (
+                    header::SET_COOKIE,
+                    super::session_cookie(token, secure_cookies),
+                ),
+                (
+                    header::SET_COOKIE,
+                    format!(
+                        "{state_cookie_name}=; HttpOnly; SameSite=Strict; \
+                         Path=/; Max-Age=0{secure}"
+                    ),
+                ),
+            ]),
+        )
+            .into_response()
+    }
+
+    fn bootstrap_response(
+        state: &AppState,
+        account: String,
+        error: Option<String>,
+        status: StatusCode,
+    ) -> Response {
+        if state.bootstrap_token_digest.is_none()
+            || !state.bootstrap_available.load(Ordering::Acquire)
+        {
+            return Redirect::to("/login").into_response();
+        }
+        let bootstrap_state = super::random_browser_token();
+        let mut response = render_auth(Bootstrap {
+            bootstrap_state: bootstrap_state.clone(),
+            account,
+            error,
+        });
+        *response.status_mut() = status;
+        let secure = if state.secure_cookies { "; Secure" } else { "" };
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            format!(
+                "{}={bootstrap_state}; HttpOnly; SameSite=Strict; Path=/; Max-Age=600{secure}",
+                bootstrap_state_cookie_name(state.secure_cookies)
+            )
+            .parse()
+            .expect("generated cookie is a valid header"),
+        );
+        response
+    }
+
+    pub async fn bootstrap(State(state): State<Arc<AppState>>) -> Response {
+        bootstrap_response(&state, String::new(), None, StatusCode::OK)
+    }
+
+    #[derive(Deserialize)]
+    pub struct BootstrapForm {
+        bootstrap_state: String,
+        token: String,
+        account: String,
+        password: String,
+        password_confirmation: String,
+    }
+
+    pub async fn bootstrap_submit(
+        State(state): State<Arc<AppState>>,
+        _rate_limited: RateLimited,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<BootstrapForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let Some(expected_token) = state.bootstrap_token_digest else {
+            return problem(StatusCode::NOT_FOUND, "Bootstrap unavailable", None);
+        };
+        let Some(pool) = &state.pool else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No database configured",
+                None,
+            );
+        };
+        if !state.bootstrap_available.load(Ordering::Acquire) {
+            return problem(StatusCode::CONFLICT, "Bootstrap already complete", None);
+        }
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let bound = browser_state_matches(
+            &headers,
+            bootstrap_state_cookie_name(state.secure_cookies),
+            &form.bootstrap_state,
+        );
+        if !bound {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some("This bootstrap form expired. Please try again.".into()),
+                StatusCode::FORBIDDEN,
+            );
+        }
+        let supplied_token = super::bootstrap_token_digest(&form.token);
+        if aws_lc_rs::constant_time::verify_slices_are_equal(&expected_token, &supplied_token)
+            .is_err()
+        {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some("Invalid bootstrap token.".into()),
+                StatusCode::UNAUTHORIZED,
+            );
+        }
+        if !crate::sanitize::valid_nick(&form.account, MAX_ACCOUNT_LEN) {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some("The administrator account must be a valid IRC nickname.".into()),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        if let Some(detail) = password_input_error(&form.password) {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some(detail.into()),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        if form.password != form.password_confirmation {
+            return bootstrap_response(
+                &state,
+                form.account,
+                Some("Password confirmation does not match.".into()),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        match crate::db::bootstrap_first_admin(pool, &form.account, &form.password).await {
+            Ok(_account_id) => {}
+            Err(crate::db::DbError::AlreadyInitialized) => {
+                state.bootstrap_available.store(false, Ordering::Release);
+                return problem(StatusCode::CONFLICT, "Bootstrap already complete", None);
+            }
+            Err(error) => {
+                eprintln!("browser bootstrap failed: {error}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Bootstrap storage failed",
+                    None,
+                );
+            }
+        }
+        state
+            .admin_accounts
+            .write()
+            .expect("administrator registry lock")
+            .insert(e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&form.account));
+        state.bootstrap_available.store(false, Ordering::Release);
+        let user_agent = super::session_user_agent(&headers);
+        let token =
+            match crate::db::create_web_session(pool, &form.account, user_agent.as_ref()).await {
+                Ok(token) => token,
+                Err(error) => {
+                    eprintln!("bootstrap session creation failed: {error}");
+                    return problem(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Administrator created; session storage failed",
+                        Some("Sign in with the administrator account to continue."),
+                    );
+                }
+            };
+        authenticated_redirect(
+            &token,
+            "/console",
+            bootstrap_state_cookie_name(state.secure_cookies),
+            state.secure_cookies,
+        )
+    }
+
     #[derive(Deserialize)]
     pub struct LocalLoginForm {
         login_state: String,
@@ -980,18 +1448,11 @@ mod pages {
             Ok(form) => form,
             Err(response) => return response,
         };
-        let bound = super::cookie_value(
+        let bound = browser_state_matches(
             &headers,
             super::login_state_cookie_name(state.secure_cookies),
-        )
-        .is_some_and(|cookie| {
-            cookie.len() == form.login_state.len()
-                && aws_lc_rs::constant_time::verify_slices_are_equal(
-                    cookie.as_bytes(),
-                    form.login_state.as_bytes(),
-                )
-                .is_ok()
-        });
+            &form.login_state,
+        );
         if !bound {
             return login_response(
                 &state,
@@ -1040,25 +1501,12 @@ mod pages {
                 );
             }
         };
-        let secure = if state.secure_cookies { "; Secure" } else { "" };
-        (
-            StatusCode::SEE_OTHER,
-            axum::response::AppendHeaders([
-                (header::LOCATION, "/".to_string()),
-                (
-                    header::SET_COOKIE,
-                    super::session_cookie(&token, state.secure_cookies),
-                ),
-                (
-                    header::SET_COOKIE,
-                    format!(
-                        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}",
-                        super::login_state_cookie_name(state.secure_cookies)
-                    ),
-                ),
-            ]),
+        authenticated_redirect(
+            &token,
+            "/",
+            super::login_state_cookie_name(state.secure_cookies),
+            state.secure_cookies,
         )
-            .into_response()
     }
 
     /// Public, reload-safe landing after coordinated logout. It deliberately
@@ -3042,7 +3490,7 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        let page = match crate::db::query_account_directory(
+        let mut page = match crate::db::query_account_directory(
             pool_of(&state),
             query.database_filter(),
         )
@@ -3053,6 +3501,13 @@ mod pages {
                 return super::device::admin_db_error("account directory", error);
             }
         };
+        let actor_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
+        for entry in &mut page.entries {
+            let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
+            entry.current = folded == actor_folded;
+            entry.configured_administrator = state.configured_admin_accounts.contains(&folded);
+            entry.effective_administrator = entry.administrator || entry.configured_administrator;
+        }
         let name = query.name.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
         render_private(ConsoleAccounts {
@@ -3067,6 +3522,62 @@ mod pages {
             limit: query.page_size.value(),
             next_before_id: page.next_before_id,
         })
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountSuspensionForm {
+        csrf: String,
+        suspended: bool,
+    }
+
+    pub async fn console_account_suspension(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(account_id): Path<i64>,
+        form: Result<axum::Form<AccountSuspensionForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+        match mutate_account_suspension(&state, &actor, account_id, form.suspended).await {
+            Ok(_message) => Redirect::to("/console/accounts").into_response(),
+            Err((status, detail)) => problem(status, "Account state change failed", Some(&detail)),
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccountAdministratorForm {
+        csrf: String,
+        administrator: bool,
+    }
+
+    pub async fn console_account_administrator(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path(account_id): Path<i64>,
+        form: Result<axum::Form<AccountAdministratorForm>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let form = match parse_form(form) {
+            Ok(form) => form,
+            Err(response) => return response,
+        };
+        let actor = match require_admin_form_actor(&state, &headers, &form.csrf).await {
+            Ok(actor) => actor,
+            Err(response) => return response,
+        };
+        match mutate_account_administrator(&state, &actor, account_id, form.administrator).await {
+            Ok(_message) => Redirect::to("/console/accounts").into_response(),
+            Err((status, detail)) => problem(
+                status,
+                "Administrator authority change failed",
+                Some(&detail),
+            ),
+        }
     }
 
     async fn console_admin_channels_build(
@@ -3326,6 +3837,8 @@ mod pages {
         observability_enabled: Option<String>,
         observability_sample_interval_seconds: u64,
         observability_retention_hours: u64,
+        storage_history_retention_days: u64,
+        storage_audit_retention_days: u64,
     }
 
     fn optional_number(value: &str, field: &str) -> Result<Option<usize>, String> {
@@ -3468,6 +3981,10 @@ mod pages {
                 enabled: form.observability_enabled.is_some(),
                 sample_interval_seconds: form.observability_sample_interval_seconds,
                 retention_hours: form.observability_retention_hours,
+            },
+            storage: crate::config::StorageConfig {
+                history_retention_days: form.storage_history_retention_days,
+                audit_retention_days: form.storage_audit_retention_days,
             },
             bnc_addr,
             public_url: (!form.public_url.trim().is_empty())
@@ -4384,6 +4901,8 @@ mod pages {
     fn is_admin_account(state: &AppState, account: &str) -> bool {
         state
             .admin_accounts
+            .read()
+            .expect("administrator registry lock")
             .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
     }
 
@@ -6188,6 +6707,66 @@ mod pages {
             );
         }
         response
+    }
+
+    #[cfg(test)]
+    mod bootstrap_helper_tests {
+        use super::*;
+
+        #[test]
+        fn browser_state_cookie_is_exact_constant_time_input() {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                "other=x; state=exact-value".parse().unwrap(),
+            );
+            assert!(browser_state_matches(&headers, "state", "exact-value"));
+            assert!(!browser_state_matches(&headers, "state", "exact-valuE"));
+            assert!(!browser_state_matches(&headers, "state", "short"));
+            assert!(!browser_state_matches(&headers, "missing", "exact-value"));
+            assert_eq!(bootstrap_state_cookie_name(false), "e6irc_bootstrap_state");
+            assert_eq!(
+                bootstrap_state_cookie_name(true),
+                "__Host-e6irc_bootstrap_state"
+            );
+        }
+
+        #[test]
+        fn authenticated_redirect_sets_session_and_expires_browser_state() {
+            for secure in [false, true] {
+                let response =
+                    authenticated_redirect("session-token", "/console", "state-cookie", secure);
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                assert_eq!(
+                    response.headers().get(header::LOCATION).unwrap(),
+                    "/console"
+                );
+                let cookies: Vec<_> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .map(|value| value.to_str().unwrap())
+                    .collect();
+                assert_eq!(cookies.len(), 2);
+                assert!(cookies[0].contains("session-token"));
+                assert!(cookies[0].contains("HttpOnly"));
+                assert!(cookies[1].starts_with("state-cookie=;"));
+                assert!(cookies[1].contains("Max-Age=0"));
+                assert_eq!(cookies[0].contains("; Secure"), secure);
+                assert_eq!(cookies[1].contains("; Secure"), secure);
+            }
+        }
+
+        #[test]
+        fn bootstrap_digest_is_stable_and_token_specific() {
+            let digest = super::super::bootstrap_token_digest("one-time-secret");
+            assert_eq!(
+                digest,
+                super::super::bootstrap_token_digest("one-time-secret")
+            );
+            assert_ne!(digest, super::super::bootstrap_token_digest("other-secret"));
+            assert_eq!(digest.len(), 32);
+        }
     }
 
     #[cfg(test)]

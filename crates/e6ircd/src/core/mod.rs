@@ -202,6 +202,15 @@ pub enum AdminRequest {
         reason: String,
         account: String,
     },
+    /// Reconcile one durable account suspension into the ordered live core.
+    /// Suspending installs the authentication deny gate before disconnecting
+    /// every current session; reactivation removes the gate.
+    SetAccountSuspended {
+        account: String,
+        suspended: bool,
+        reason: String,
+        actor: String,
+    },
     /// Mutate one registered channel owned by `actor`. This is the shared
     /// control-plane entry used by the owner API and console.
     MutateOwnedChannel {
@@ -1079,6 +1088,11 @@ impl Core {
     /// starts (see [`ServerState::preload_read_markers`]).
     pub fn preload_read_markers(&mut self, rows: Vec<(String, String, e6irc_proto::time::Millis)>) {
         self.state.preload_read_markers(rows);
+    }
+
+    /// Seed the durable suspension deny set before the worker loop starts.
+    pub fn preload_suspended_accounts(&mut self, accounts: Vec<String>) {
+        self.state.preload_suspended_accounts(accounts);
     }
 
     /// Process one event. All state transitions happen here, on one

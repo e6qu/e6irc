@@ -27,6 +27,12 @@ fn default_observability_sample_interval() -> u64 {
 fn default_observability_retention() -> u64 {
     168
 }
+fn default_history_retention_days() -> u64 {
+    30
+}
+fn default_audit_retention_days() -> u64 {
+    365
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +51,26 @@ impl Default for ObservabilityConfig {
             enabled: default_observability_enabled(),
             sample_interval_seconds: default_observability_sample_interval(),
             retention_hours: default_observability_retention(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Durable IRC message-history lifetime.
+    #[serde(default = "default_history_retention_days")]
+    pub history_retention_days: u64,
+    /// Privileged audit-event lifetime.
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            history_retention_days: default_history_retention_days(),
+            audit_retention_days: default_audit_retention_days(),
         }
     }
 }
@@ -108,6 +134,11 @@ pub struct Config {
     /// HTTP listener (REST API + web backend); off when absent.
     #[serde(default)]
     pub http: Option<HttpConfig>,
+    /// One-time browser bootstrap for the first administrator. It is usable
+    /// only while the account table is empty; normal login takes over after
+    /// the first successful transaction.
+    #[serde(default)]
+    pub bootstrap: Option<BootstrapConfig>,
     /// OIDC providers for web login (requires http + database).
     #[serde(default, rename = "oidc")]
     pub oidc_providers: Vec<OidcProviderConfig>,
@@ -137,6 +168,9 @@ pub struct Config {
     /// In-process operational metrics and bounded historical samples.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Database retention and expired-resource cleanup policy.
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -193,6 +227,8 @@ pub struct ManagedConfig {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
     pub bnc_addr: Option<SocketAddr>,
     pub public_url: Option<String>,
     pub secure_cookies: bool,
@@ -258,6 +294,7 @@ impl ManagedConfig {
             registration: config.registration.clone(),
             limits: config.limits.clone(),
             observability: config.observability.clone(),
+            storage: config.storage.clone(),
             bnc_addr: config.bnc.as_ref().map(|bnc| bnc.addr),
             public_url: config
                 .http
@@ -289,6 +326,7 @@ impl ManagedConfig {
         config.registration = self.registration.clone();
         config.limits = self.limits.clone();
         config.observability = self.observability.clone();
+        config.storage = self.storage.clone();
         config.bnc = self.bnc_addr.map(|addr| BncConfig { addr });
         if let Some(http) = &mut config.http {
             http.public_url.clone_from(&self.public_url);
@@ -475,6 +513,15 @@ pub struct HttpConfig {
     pub admin_accounts: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapConfig {
+    /// High-entropy one-time secret entered in the first-run browser form.
+    /// The environment entrypoint writes it only to its mode-0600 bootstrap
+    /// file, and the HTTP state retains only its SHA-256 digest.
+    pub token: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -540,6 +587,7 @@ impl Default for Config {
             max_hot_channels: default_max_hot_channels(),
             database: None,
             http: None,
+            bootstrap: None,
             oidc_providers: Vec::new(),
             application_release_revision: None,
             opers: Vec::new(),
@@ -548,6 +596,7 @@ impl Default for Config {
             secrets: None,
             limits: LimitsConfig::default(),
             observability: ObservabilityConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 }
@@ -677,6 +726,9 @@ impl Config {
         for provider in &mut self.oidc_providers {
             provider.client_secret = open_secret(&provider.client_secret, key)?;
         }
+        if let Some(bootstrap) = &mut self.bootstrap {
+            bootstrap.token = open_secret(&bootstrap.token, key)?;
+        }
         Ok(())
     }
 
@@ -698,6 +750,20 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "a [[listeners]] with websocket = true cannot also set tls (terminate TLS at a proxy)".into(),
             ));
+        }
+        if let Some(bootstrap) = &self.bootstrap {
+            if self.database.is_none() || self.http.is_none() {
+                return Err(ConfigError::Invalid(
+                    "[bootstrap] requires both [database] and [http]".into(),
+                ));
+            }
+            if !(32..=512).contains(&bootstrap.token.len())
+                || bootstrap.token.chars().any(char::is_control)
+            {
+                return Err(ConfigError::Invalid(
+                    "bootstrap.token must contain 32–512 bytes and no control characters".into(),
+                ));
+            }
         }
         // server_name is the source prefix (`:<server_name> …`) of every
         // server-originated line, so a space, control byte, or prefix-significant
@@ -770,6 +836,16 @@ impl Config {
         if !(1..=2160).contains(&self.observability.retention_hours) {
             return Err(ConfigError::Invalid(
                 "observability.retention_hours must be between 1 and 2160".into(),
+            ));
+        }
+        if !(1..=3650).contains(&self.storage.history_retention_days) {
+            return Err(ConfigError::Invalid(
+                "storage.history_retention_days must be between 1 and 3650".into(),
+            ));
+        }
+        if !(1..=3650).contains(&self.storage.audit_retention_days) {
+            return Err(ConfigError::Invalid(
+                "storage.audit_retention_days must be between 1 and 3650".into(),
             ));
         }
         if self.limits.command_burst == Some(0) {
@@ -1175,6 +1251,17 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listening_config() -> Config {
+        Config {
+            listeners: vec![ListenerConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                tls: None,
+                websocket: false,
+            }],
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn parses_minimal_config() {
@@ -1753,6 +1840,46 @@ mod tests {
     }
 
     #[test]
+    fn browser_bootstrap_requires_full_stack_and_a_strong_bounded_token() {
+        let bootstrap = Some(BootstrapConfig {
+            token: "0123456789abcdef0123456789abcdef".into(),
+        });
+        let listener = ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        };
+        let mut config = Config {
+            listeners: vec![listener],
+            bootstrap: bootstrap.clone(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err(), "database and HTTP are required");
+
+        config.database = db();
+        config.http = Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        });
+        config.validate().expect("complete browser bootstrap");
+
+        config.bootstrap = Some(BootstrapConfig {
+            token: "too-short".into(),
+        });
+        assert!(config.validate().is_err());
+        config.bootstrap = Some(BootstrapConfig {
+            token: format!("{}x", "a".repeat(512)),
+        });
+        assert!(config.validate().is_err());
+        config.bootstrap = Some(BootstrapConfig {
+            token: format!("{}\n", "a".repeat(31)),
+        });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn zero_max_connections_per_ip_is_rejected() {
         // `count >= 0` is always true, so a max of 0 refuses every connection —
         // the server would boot and silently reject all traffic.
@@ -1955,14 +2082,7 @@ mod tests {
 
     #[test]
     fn observability_bounds_are_validated() {
-        let mut config = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
-            ..Config::default()
-        };
+        let mut config = listening_config();
         config.observability.sample_interval_seconds = 4;
         assert!(
             config
@@ -1993,6 +2113,38 @@ mod tests {
             .expect("serialized field");
         let decoded: ManagedConfig = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.observability, ObservabilityConfig::default());
+    }
+
+    #[test]
+    fn storage_retention_is_bounded_and_old_settings_receive_defaults() {
+        let mut config = listening_config();
+        config.storage.history_retention_days = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("history_retention_days")
+        );
+        config.storage.history_retention_days = 30;
+        config.storage.audit_retention_days = 3651;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("audit_retention_days")
+        );
+
+        let settings = ManagedConfig::from_config(&Config::default(), None).unwrap();
+        let mut value = serde_json::to_value(settings).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("storage")
+            .expect("serialized field");
+        let decoded: ManagedConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.storage, StorageConfig::default());
     }
 
     #[test]

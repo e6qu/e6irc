@@ -10,6 +10,7 @@
 #            E6IRC_IRC_ADDR     (default 127.0.0.1:6667 — internal only)
 #            E6IRC_SECURE_COOKIES (default true)
 #            E6IRC_ADMIN_ACCOUNTS (comma-separated)
+#            E6IRC_BOOTSTRAP_TOKEN (32+ byte one-time first-admin secret)
 #            Shauth OIDC (all required together to enable SSO):
 #              E6IRC_OIDC_ISSUER  E6IRC_OIDC_CLIENT_ID  E6IRC_OIDC_CLIENT_SECRET
 #              E6IRC_OIDC_END_SESSION
@@ -18,6 +19,7 @@
 #                Shauth registers managed applications; the method belongs to
 #                the client registration, so discovery cannot report it)
 set -eu
+umask 077
 
 # Fail loudly on missing required config rather than starting half-configured.
 : "${E6IRC_SERVER_NAME:?E6IRC_SERVER_NAME is required}"
@@ -28,7 +30,13 @@ set -eu
 # Escape a value for a TOML basic (double-quoted) string.
 toml() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
-CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
+if [ -n "${E6IRC_CONFIG_PATH:-}" ]; then
+  CONFIG="$E6IRC_CONFIG_PATH"
+  : > "$CONFIG"
+  chmod 0600 "$CONFIG"
+else
+  CONFIG="$(mktemp "${TMPDIR:-/tmp}/e6irc.XXXXXX")"
+fi
 {
   printf 'server_name = "%s"\n' "$(toml "$E6IRC_SERVER_NAME")"
   printf 'network_name = "%s"\n\n' "$(toml "${E6IRC_NETWORK_NAME:-e6qu}")"
@@ -53,6 +61,10 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
   fi
   printf '\n[database]\nurl = "%s"\n' "$(toml "$E6IRC_DATABASE_URL")"
 
+  if [ -n "${E6IRC_BOOTSTRAP_TOKEN:-}" ]; then
+    printf '\n[bootstrap]\ntoken = "%s"\n' "$(toml "$E6IRC_BOOTSTRAP_TOKEN")"
+  fi
+
   if [ -n "${E6IRC_OIDC_ISSUER:-}" ]; then
     : "${E6IRC_OIDC_CLIENT_ID:?E6IRC_OIDC_CLIENT_ID is required when E6IRC_OIDC_ISSUER is set}"
     : "${E6IRC_OIDC_CLIENT_SECRET:?E6IRC_OIDC_CLIENT_SECRET is required when E6IRC_OIDC_ISSUER is set}"
@@ -68,4 +80,6 @@ CONFIG="${E6IRC_CONFIG_PATH:-/tmp/e6irc.toml}"
   fi
 } > "$CONFIG"
 
-exec /usr/local/bin/e6ircd --config "$CONFIG"
+chmod 0600 "$CONFIG"
+
+exec "${E6IRC_BINARY:-/usr/local/bin/e6ircd}" --config "$CONFIG"

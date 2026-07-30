@@ -21,3 +21,14 @@ systemd-analyze \
   --recursive-errors=no \
   --man=no \
   verify e6ircd.service
+
+stop_seconds="$(sed -n 's/^TimeoutStopSec=\([0-9][0-9]*\)s$/\1/p' "$unit")"
+flush_seconds="$(sed -n 's/.*SHUTDOWN_DB_FLUSH_TIMEOUT.*from_secs(\([0-9][0-9]*\)).*/\1/p' crates/e6ircd/src/net.rs | head -n1)"
+if [ -z "$stop_seconds" ] || [ -z "$flush_seconds" ]; then
+  echo "could not resolve systemd or daemon shutdown budget" >&2
+  exit 1
+fi
+if [ "$stop_seconds" -le "$flush_seconds" ]; then
+  echo "TimeoutStopSec=${stop_seconds}s must exceed the daemon's ${flush_seconds}s database flush budget" >&2
+  exit 1
+fi

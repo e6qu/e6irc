@@ -506,6 +506,13 @@ pub(super) async fn oidc_callback(
     .await
     {
         Ok(t) => t,
+        Err(crate::db::DbError::BadCredentials) => {
+            return problem(
+                StatusCode::FORBIDDEN,
+                "Account unavailable",
+                Some("This account cannot start a new session."),
+            );
+        }
         Err(e) => {
             eprintln!("oidc: session creation failed: {e}");
             return problem(
@@ -979,7 +986,7 @@ pub(super) async fn authenticate(
         .and_then(|v| v.strip_prefix("Bearer "))
     {
         return match crate::db::api_token_account(pool, bearer).await {
-            Ok(Some(account)) => Ok(account),
+            Ok(Some(account)) => require_active_account(pool, account).await,
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Invalid token", None)),
             Err(e) => {
                 eprintln!("http: token lookup failed: {e}");
@@ -993,7 +1000,7 @@ pub(super) async fn authenticate(
     }
     if let Some(token) = session_token(headers, state.secure_cookies) {
         return match crate::db::session_account(pool, &token).await {
-            Ok(Some(account)) => Ok(account),
+            Ok(Some(account)) => require_active_account(pool, account).await,
             Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
             Err(e) => {
                 eprintln!("http: session lookup failed: {e}");
@@ -1006,6 +1013,24 @@ pub(super) async fn authenticate(
         };
     }
     Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None))
+}
+
+async fn require_active_account(pool: &sqlx::PgPool, account: String) -> Result<String, Response> {
+    match crate::db::account_flags(pool, &account).await {
+        Ok(Some(flags)) if flags.is_suspended() => {
+            Err(problem(StatusCode::FORBIDDEN, "Account suspended", None))
+        }
+        Ok(Some(_flags)) => Ok(account),
+        Ok(None) => Err(problem(StatusCode::UNAUTHORIZED, "Not logged in", None)),
+        Err(error) => {
+            eprintln!("http: account posture lookup failed: {error}");
+            Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            ))
+        }
+    }
 }
 
 /// Resolve the real client IP: if the socket peer is a trusted proxy, take the

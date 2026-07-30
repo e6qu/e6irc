@@ -222,6 +222,28 @@ impl Registry {
         }
     }
 
+    /// Stop every active upstream owned by one account while preserving its
+    /// durable definitions for possible reactivation.
+    pub fn remove_owner(&self, owner: &str) -> usize {
+        let owner = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(owner);
+        let removed: Vec<Slot> = {
+            let mut networks = self.networks.lock().expect("registry poisoned");
+            let keys: Vec<NetworkKey> = networks
+                .keys()
+                .filter(|key| key.owner.as_deref() == Some(owner.as_str()))
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|key| networks.remove(&key))
+                .collect()
+        };
+        let count = removed.len();
+        for slot in removed {
+            slot.stop();
+        }
+        count
+    }
+
     /// The account's OWN active network of that name, if any. Deliberately does
     /// NOT fall through to a shared network: a disabled owned network is removed
     /// from the registry, so a blind fall-through would silently attach the
@@ -703,5 +725,52 @@ mod key_tests {
         assert_ne!(registered, NetworkKey::new(None, "libera"));
         // A genuinely different name is still a different key.
         assert_ne!(registered, NetworkKey::new(Some("alice"), "oftc"));
+    }
+
+    #[tokio::test]
+    async fn remove_owner_stops_exactly_that_accounts_networks() {
+        let registry = Registry {
+            networks: Mutex::new(HashMap::new()),
+            mutations: tokio::sync::Mutex::new(()),
+            pool: None,
+            telemetry: None,
+        };
+        registry.add(
+            Some("Alice"),
+            "libera",
+            Box::new(crate::bouncer::LoopbackDriver::new(16)),
+        );
+        registry.add(
+            Some("alice"),
+            "oftc",
+            Box::new(crate::bouncer::LoopbackDriver::new(16)),
+        );
+        registry.add(
+            Some("Bob"),
+            "libera",
+            Box::new(crate::bouncer::LoopbackDriver::new(16)),
+        );
+        registry.add(
+            None,
+            "shared",
+            Box::new(crate::bouncer::LoopbackDriver::new(16)),
+        );
+        let alice_libera = registry
+            .get_owned("ALICE", "LIBERA")
+            .expect("Alice network");
+        let alice_oftc = registry.get_owned("alice", "oftc").expect("Alice network");
+        let bob = registry.get_owned("bob", "libera").expect("Bob network");
+        let shared = registry.get_shared("shared").expect("shared network");
+
+        assert_eq!(registry.remove_owner("aLICE"), 2);
+        assert!(*alice_libera.watch_shutdown().borrow());
+        assert!(*alice_oftc.watch_shutdown().borrow());
+        assert!(!*bob.watch_shutdown().borrow());
+        assert!(!*shared.watch_shutdown().borrow());
+        assert!(registry.get_owned("alice", "libera").is_none());
+        assert!(registry.get_owned("alice", "oftc").is_none());
+        assert!(registry.get_owned("bob", "libera").is_some());
+        assert!(registry.get_shared("shared").is_some());
+        assert_eq!(registry.remove_owner("alice"), 0, "retries are idempotent");
     }
 }

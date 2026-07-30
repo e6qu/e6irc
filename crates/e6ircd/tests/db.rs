@@ -4748,3 +4748,390 @@ async fn concurrent_browser_session_issuance_enforces_the_active_cap() {
     }
     assert_eq!(retained, db::MAX_BROWSER_SESSIONS_PER_ACCOUNT);
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn every_pooled_connection_has_statement_and_lock_deadlines() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("every_pooled_connection_has_statement_and_lock_deadlines").await,
+    )
+    .await
+    .expect("connect");
+
+    let statement_timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&pool)
+        .await
+        .expect("statement timeout");
+    let lock_timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+        .fetch_one(&pool)
+        .await
+        .expect("lock timeout");
+    assert_eq!(statement_timeout, "15s");
+    assert_eq!(lock_timeout, "5s");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn first_admin_bootstrap_is_atomic_audited_and_one_time() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("first_admin_bootstrap_is_atomic_audited_and_one_time").await,
+    )
+    .await
+    .expect("connect");
+    assert!(!db::has_accounts(&pool).await.expect("empty account store"));
+
+    db::bootstrap_first_admin(&pool, "Alice", "correct horse battery staple")
+        .await
+        .expect("first administrator");
+    assert!(db::has_accounts(&pool).await.expect("initialized store"));
+    let flags = db::account_flags(&pool, "alice")
+        .await
+        .expect("flags query")
+        .expect("account flags");
+    assert!(flags.is_admin());
+    assert!(!flags.is_suspended());
+    assert!(matches!(
+        db::bootstrap_first_admin(&pool, "Mallory", "another strong password").await,
+        Err(db::DbError::AlreadyInitialized)
+    ));
+    let account_count: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("account count");
+    assert_eq!(account_count, 1);
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'ACCOUNT_BOOTSTRAP'")
+            .fetch_one(&pool)
+            .await
+            .expect("audit count");
+    assert_eq!(audit_count, 1);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn concurrent_first_admin_bootstraps_have_exactly_one_winner() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("concurrent_first_admin_bootstraps_have_exactly_one_winner").await,
+    )
+    .await
+    .expect("connect");
+    let alice_pool = pool.clone();
+    let bob_pool = pool.clone();
+    let (alice, bob) = tokio::join!(
+        async move {
+            db::bootstrap_first_admin(&alice_pool, "Alice", "alice administrator password").await
+        },
+        async move { db::bootstrap_first_admin(&bob_pool, "Bob", "bob administrator password").await }
+    );
+    let outcomes = [alice, bob];
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(result, Err(db::DbError::AlreadyInitialized)))
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .expect("account count"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM accounts WHERE (flags & 1) = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("administrator count"),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("suspension_revokes_every_bearer_and_blocks_new_credential_issuance")
+            .await,
+    )
+    .await
+    .expect("connect");
+    db::bootstrap_first_admin(&pool, "Alice", "correct horse battery staple")
+        .await
+        .expect("administrator");
+    let bob_id = db::create_account(&pool, "Bob", "bob password")
+        .await
+        .expect("Bob");
+    let session = db::create_web_session(&pool, "Bob", None)
+        .await
+        .expect("browser session");
+    let token = db::issue_api_token(&pool, "Bob", "automation")
+        .await
+        .expect("personal access token");
+    let (device_code, user_code) = db::create_device_grant(&pool).await.expect("device grant");
+    assert!(
+        db::approve_device_grant(&pool, &user_code, "Bob")
+            .await
+            .expect("approve device")
+    );
+
+    let change = db::set_account_suspended(&pool, bob_id, true, "Alice")
+        .await
+        .expect("suspend")
+        .expect("Bob exists");
+    assert_eq!(change.name, "Bob");
+    assert!(change.suspended);
+    assert!(
+        db::account_flags(&pool, "bob")
+            .await
+            .expect("flags")
+            .expect("Bob")
+            .is_suspended()
+    );
+    assert_eq!(
+        db::list_suspended_accounts(&pool)
+            .await
+            .expect("suspended accounts"),
+        vec!["bob"]
+    );
+    assert_eq!(
+        db::verify_credentials(&pool, "Bob", "bob password")
+            .await
+            .expect("credential query"),
+        None
+    );
+    assert_eq!(
+        db::verify_local_password(&pool, "Bob", "bob password")
+            .await
+            .expect("local credential query"),
+        None
+    );
+    assert_eq!(
+        db::session_account(&pool, &session)
+            .await
+            .expect("session lookup"),
+        None
+    );
+    assert_eq!(
+        db::api_token_account(&pool, &token)
+            .await
+            .expect("token lookup"),
+        None
+    );
+    assert!(matches!(
+        db::poll_device_grant(&pool, &device_code, "device")
+            .await
+            .expect("device lookup"),
+        db::DeviceStatus::Unknown
+    ));
+    assert!(matches!(
+        db::create_web_session(&pool, "Bob", None).await,
+        Err(db::DbError::BadCredentials)
+    ));
+    assert!(matches!(
+        db::issue_api_token(&pool, "Bob", "forbidden").await,
+        Err(db::DbError::BadCredentials)
+    ));
+
+    db::set_account_suspended(&pool, bob_id, false, "Alice")
+        .await
+        .expect("reactivate")
+        .expect("Bob exists");
+    assert_eq!(
+        db::verify_credentials(&pool, "Bob", "bob password")
+            .await
+            .expect("credential query"),
+        Some("Bob".into()),
+        "reactivation restores durable credentials but not revoked bearers"
+    );
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log
+         WHERE target = 'bob' AND action IN ('ACCOUNT_SUSPEND', 'ACCOUNT_REACTIVATE')
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("lifecycle audit");
+    assert_eq!(actions, ["ACCOUNT_SUSPEND", "ACCOUNT_REACTIVATE"]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting() {
+    let pool = db::connect_and_migrate(
+        &support::test_db(
+            "suspension_preserves_an_active_administrator_and_rejects_self_targeting",
+        )
+        .await,
+    )
+    .await
+    .expect("connect");
+    let alice_id = db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let bob_id = db::create_account(&pool, "Bob", "second administrator password")
+        .await
+        .expect("Bob");
+    assert!(matches!(
+        db::set_account_administrator(&pool, alice_id, false, "Alice").await,
+        Err(db::DbError::CannotDemoteSelf)
+    ));
+    db::set_account_administrator(&pool, bob_id, true, "Alice")
+        .await
+        .expect("grant Bob")
+        .expect("Bob");
+    assert_eq!(
+        db::list_admin_accounts(&pool)
+            .await
+            .expect("administrators"),
+        ["alice", "bob"]
+    );
+
+    assert!(matches!(
+        db::set_account_suspended(&pool, alice_id, true, "ALICE").await,
+        Err(db::DbError::CannotSuspendSelf)
+    ));
+    db::set_account_suspended(&pool, alice_id, true, "Bob")
+        .await
+        .expect("Bob suspends Alice")
+        .expect("Alice");
+    assert!(matches!(
+        db::set_account_suspended(&pool, bob_id, true, "Alice").await,
+        Err(db::DbError::LastAdministrator)
+    ));
+    assert!(matches!(
+        db::set_account_administrator(&pool, bob_id, false, "Alice").await,
+        Err(db::DbError::LastAdministrator)
+    ));
+    db::set_account_suspended(&pool, alice_id, false, "Bob")
+        .await
+        .expect("reactivate Alice")
+        .expect("Alice");
+    db::set_account_suspended(&pool, bob_id, true, "Alice")
+        .await
+        .expect("Alice can now suspend Bob")
+        .expect("Bob");
+    db::set_account_administrator(&pool, bob_id, false, "Alice")
+        .await
+        .expect("Alice can revoke Bob")
+        .expect("Bob");
+    assert_eq!(
+        db::list_admin_accounts(&pool)
+            .await
+            .expect("administrators"),
+        ["alice"]
+    );
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log
+         WHERE target = 'bob'
+           AND action IN ('ACCOUNT_ADMIN_GRANT', 'ACCOUNT_ADMIN_REVOKE')
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("authority audit");
+    assert_eq!(actions, ["ACCOUNT_ADMIN_GRANT", "ACCOUNT_ADMIN_REVOKE"]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn storage_maintenance_bounds_history_audit_and_expired_bearers() {
+    let pool = db::connect_and_migrate(
+        &support::test_db("storage_maintenance_bounds_history_audit_and_expired_bearers").await,
+    )
+    .await
+    .expect("connect");
+    let account_id = db::create_account(&pool, "Alice", "password")
+        .await
+        .expect("account");
+    sqlx::query(
+        "INSERT INTO messages (msgid, target, sender_prefix, kind, body, ts)
+         VALUES
+           ('old-message', '#test', 'Alice!u@h', 'privmsg', 'old', now() - interval '31 days'),
+           ('new-message', '#test', 'Alice!u@h', 'privmsg', 'new', now())",
+    )
+    .execute(&pool)
+    .await
+    .expect("messages");
+    sqlx::query(
+        "INSERT INTO audit_log (actor, action, target, detail, created_at)
+         VALUES
+           ('alice', 'OLD', 'server', '', now() - interval '366 days'),
+           ('alice', 'NEW', 'server', '', now())",
+    )
+    .execute(&pool)
+    .await
+    .expect("audit");
+    sqlx::query(
+        "INSERT INTO web_sessions (token_hash, account_id, expires_at)
+         VALUES
+           (decode('01', 'hex'), $1, now() - interval '1 second'),
+           (decode('02', 'hex'), $1, now() + interval '1 day')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("sessions");
+    sqlx::query(
+        "INSERT INTO api_tokens (token_hash, account_id, label, expires_at)
+         VALUES
+           (decode('03', 'hex'), $1, 'old', now() - interval '1 second'),
+           (decode('04', 'hex'), $1, 'new', now() + interval '1 day')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .expect("API tokens");
+    sqlx::query(
+        "INSERT INTO device_grants (device_code, user_code, expires_at)
+         VALUES
+           ('old-device', 'OLDDEV01', now() - interval '1 second'),
+           ('new-device', 'NEWDEV01', now() + interval '1 day')",
+    )
+    .execute(&pool)
+    .await
+    .expect("device grants");
+    sqlx::query(
+        "INSERT INTO oidc_logout_tokens (issuer, jti, expires_at)
+         VALUES
+           ('https://issuer.example', 'old', now() - interval '1 second'),
+           ('https://issuer.example', 'new', now() + interval '1 day')",
+    )
+    .execute(&pool)
+    .await
+    .expect("logout tokens");
+
+    let report = db::run_storage_maintenance(&pool, 30, 365)
+        .await
+        .expect("maintenance");
+    assert_eq!(report.messages, 1);
+    assert_eq!(report.audit_events, 1);
+    assert_eq!(report.web_sessions, 1);
+    assert_eq!(report.api_tokens, 1);
+    assert_eq!(report.device_grants, 1);
+    assert_eq!(report.logout_tokens, 1);
+    assert!(!report.saturated);
+    let counts: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT count(*) FROM messages),
+           (SELECT count(*) FROM audit_log),
+           (SELECT count(*) FROM web_sessions),
+           (SELECT count(*) FROM api_tokens),
+           (SELECT count(*) FROM device_grants),
+           (SELECT count(*) FROM oidc_logout_tokens)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("retained row counts");
+    assert_eq!(
+        counts,
+        (1, 1, 1, 1, 1, 1),
+        "every collection retained only its live/recent row"
+    );
+}
