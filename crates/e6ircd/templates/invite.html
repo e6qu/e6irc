@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>e6irc — accept invitation</title>
+    <link rel="stylesheet" href="/auth.css" />
+  </head>
+  <body>
+    <main class="auth-shell" id="main-content">
+      <section class="auth-card" aria-labelledby="invitation-title">
+        <span class="brand" aria-label="e6irc">e6irc</span>
+        <p class="eyebrow">Account invitation</p>
+        <h1 id="invitation-title">Create <code>{{ account }}</code></h1>
+        <p class="lede">Choose the password for this single-use invitation. It expires at {{ expires_at }}.</p>
+        {% if administrator %}
+          <div class="auth-notice">
+            <strong>Administrator authority</strong>
+            <span>This invitation creates a durable server administrator.</span>
+          </div>
+        {% endif %}
+        {% if let Some(message) = error %}
+          <div class="auth-error" role="alert">{{ message }}</div>
+        {% endif %}
+        <form class="login-form" method="post" action="/invite/{{ token }}">
+          <input type="hidden" name="invitation_state" value="{{ invitation_state }}" />
+          <label>
+            <span>Password</span>
+            <input type="password" name="password" maxlength="512" autocomplete="new-password" required autofocus />
+          </label>
+          <label>
+            <span>Confirm password</span>
+            <input type="password" name="password_confirmation" maxlength="512" autocomplete="new-password" required />
+          </label>
+          <button class="primary-action" type="submit">Create account</button>
+        </form>
+        <p class="section-note"><a href="/login">Back to sign in</a></p>
+      </section>
+    </main>
+  </body>
+</html>

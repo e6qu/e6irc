@@ -202,3 +202,92 @@ posture but never cookies, token hashes, or credentials.
 
 **Evidence.** Proven by HTTP/PostgreSQL owner-scoping tests and real core
 connection-directory/disconnect tests.
+
+## Review security activity and export account data
+
+**Actor and goal.** An account holder wants to understand recent access and
+take a portable copy of all retained account data without exposing reusable
+secrets.
+
+**Preconditions.** The caller is authenticated and PostgreSQL is ready.
+
+**Flow.**
+
+1. **Account & access** shows the 50 newest retained events where the exact
+   folded account is actor or target.
+2. `/api/v1/me/security-activity` pages older entries by immutable audit ID.
+3. **Download my data** requests `/api/v1/me/export` and receives a
+   non-cacheable, versioned JSON attachment.
+4. The export includes profile, non-secret credential and token metadata,
+   login identities, browser-session provenance, network configuration,
+   read markers, founded-channel policy/access, retained messages, owned BNC
+   buffer, and security activity from one PostgreSQL statement snapshot.
+
+**Visible failures and recovery.** Invalid limits/cursors, an account removed
+concurrently, and database failure return explicit non-success responses. An
+empty retained collection is represented as an empty JSON array, not omitted
+or substituted with another account's data.
+
+**Security and observability.** Password hashes, bearer/session/invitation
+digests, plaintext token values, OpenID Connect identity tokens/session IDs,
+device codes, and sealed upstream credentials are absent. Network entries
+report only whether a password exists. Exact actor/target predicates prevent
+similarly named accounts from observing one another's activity. Login,
+logout, password, app-password, token, identity, browser-session, invitation,
+account-state, and provider-logout transitions write redacted events.
+
+**Evidence.** PostgreSQL test
+`account_export_and_security_activity_are_owner_scoped_and_secret_free`, the
+real-socket lifecycle HTTP journey, and the Chromium invitation recipient
+prove attachment headers, JSON shape, secret exclusion, owner isolation, and
+visible activity.
+
+## Permanently delete an account
+
+**Actor and goal.** An account holder or administrator wants to erase an
+account and its account-owned private data without allowing old credentials or
+identity assumptions to bind to a future person.
+
+**Preconditions.** The actor has a current browser session for self-service or
+administrator authority for another account. Every registered channel founded
+by the target has been explicitly transferred or dropped, and another active
+effective administrator exists when the target has durable or configured
+administrator authority.
+
+**Flow.**
+
+1. The actor enters the exact display-cased account name and confirms the
+   irreversible action in **Account & access** or **Account directory**.
+2. e6irc acquires the shared account/network mutation lane, validates channel
+   succession and administrator recovery, and installs a folded live
+   authentication deny key in the ordered core.
+3. One database transaction repeats the invariants, reserves the folded name
+   in `retired_account_names`, purges account invitations, device grants,
+   account-owned BNC buffer, sent/direct-message history, and the account row
+   with all cascading credentials, sessions, identities, networks, markers,
+   and channel access.
+4. A redacted deletion audit event commits with the retirement. The registry
+   stops owned drivers and removes live administrator authority.
+5. Self-service clears the browser cookie and returns to sign-in. The retired
+   name can never be registered, invited, administrator-created, or
+   auto-provisioned again.
+
+**Visible failures and recovery.** A mismatched confirmation, missing account,
+founded channel, last effective administrator, unavailable live core/registry,
+or database failure is explicit. If the transaction fails after the live deny
+key is installed, e6irc removes that key before reporting failure; if rollback
+reconciliation itself fails, the response says so rather than claiming the
+account remained fully active.
+
+**Security and observability.** The account-name advisory lock serializes
+creation, invitation, OpenID Connect provisioning, and deletion. A PostgreSQL
+`BEFORE INSERT` trigger independently rejects retired names, making a future
+unwrapped insertion fail closed. Audit retains only actor/action/folded-target
+provenance, while account-owned private content is removed.
+
+**Evidence.** PostgreSQL test
+`permanent_account_deletion_requires_succession_purges_and_retires`, the
+real-socket HTTP lifecycle test, and the Chromium self-deletion journey prove
+succession refusal, durable/configured administrator recovery, live
+revocation, child-data purge, cookie clearing, storage-trigger enforcement,
+and permanent name retirement.

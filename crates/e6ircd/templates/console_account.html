@@ -6,6 +6,7 @@
       <h1>Account &amp; access</h1>
       <p class="lede">Manage the credentials, API access, and login identities attached to <strong>{{ account }}</strong>. Secrets are displayed once and stored only as hashes.</p>
     </div>
+    <a class="button-link" href="/api/v1/me/export">Download my data</a>
   </div>
 
   {% if let Some(message) = outcome %}
@@ -243,5 +244,59 @@
         {% endfor %}
       </div>
     {% endif %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div>
+        <h2>Security activity</h2>
+        <p>Your 50 most recent retained security and administrator events. The JSON API provides stable cursor pagination for older entries.</p>
+      </div>
+      <span class="count">{{ security_activity.len() }}</span>
+    </div>
+    {% if security_activity.is_empty() %}
+      <p class="empty">No retained security activity.</p>
+    {% else %}
+      <div class="scroll">
+        <table>
+          <caption class="sr-only">Security activity</caption>
+          <thead><tr><th>Time (UTC)</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead>
+          <tbody>
+            {% for event in security_activity %}
+              <tr>
+                <td><time datetime="{{ event.at }}">{{ event.at }}</time></td>
+                <td><span class="tag">{{ event.action }}</span></td>
+                <td><code>{{ event.actor }}</code></td>
+                <td><code>{{ event.target }}</code></td>
+                <td>{{ event.detail }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="section-note"><a href="/api/v1/me/security-activity">Open security activity JSON</a></p>
+    {% endif %}
+  </section>
+
+  <section class="panel danger-panel" aria-labelledby="delete-account-title">
+    <div class="panel-head">
+      <div>
+        <p class="eyebrow">Danger zone</p>
+        <h2 id="delete-account-title">Permanently delete this account</h2>
+        <p>This revokes every credential and session, erases private history, stops owned networks, and retires the account name. It cannot be undone.</p>
+      </div>
+    </div>
+    <form class="field-grid" method="post" action="/console/account/delete"
+          data-confirm="Permanently delete {{ account }} and all account-owned data? This cannot be undone.">
+      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <label class="field field-wide">
+        <span>Type <code>{{ account }}</code> to confirm</span>
+        <input name="confirmation" autocomplete="off" required />
+      </label>
+      <div class="form-actions field-wide">
+        <button class="danger" type="submit">Delete my account permanently</button>
+      </div>
+    </form>
+    <p class="section-note">If this account founded registered channels, transfer or drop them first. The final active administrator—whether granted by storage or configuration—cannot be deleted.</p>
   </section>
 {% endblock %}

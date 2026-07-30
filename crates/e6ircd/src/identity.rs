@@ -259,6 +259,23 @@ impl ApiTokenLifetimeDays {
     }
 }
 
+/// A bounded account-invitation lifetime in whole days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountInvitationLifetimeDays(u16);
+
+impl AccountInvitationLifetimeDays {
+    pub const DEFAULT: Self = Self(7);
+    pub const MAX: u16 = 30;
+
+    pub fn new(days: u16) -> Option<Self> {
+        (1..=Self::MAX).contains(&days).then_some(Self(days))
+    }
+
+    pub const fn value(self) -> u16 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +336,17 @@ mod tests {
                 "{invalid:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn invitation_lifetime_is_closed_and_bounded() {
+        assert_eq!(AccountInvitationLifetimeDays::DEFAULT.value(), 7);
+        assert!(AccountInvitationLifetimeDays::new(0).is_none());
+        assert_eq!(
+            AccountInvitationLifetimeDays::new(30).map(AccountInvitationLifetimeDays::value),
+            Some(30)
+        );
+        assert!(AccountInvitationLifetimeDays::new(31).is_none());
     }
 
     #[test]

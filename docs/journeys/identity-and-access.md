@@ -128,6 +128,52 @@ written to audit details.
 `oidc_identity_link_list_and_conflict`; console rendering/mutation is covered
 by `account_console_manages_credentials_tokens_and_identities`.
 
+## Join through an administrator invitation
+
+**Actor and goal.** An administrator wants to onboard a named local account
+without choosing or learning the recipient's password; the recipient wants to
+claim that account through the UI.
+
+**Preconditions.** PostgreSQL and HTTP are ready, the administrator has an
+active browser session or administrator-capable personal access token, and the
+requested account name neither exists nor has been retired.
+
+**Flow.**
+
+1. The administrator opens **Account directory** or posts to
+   `/api/v1/admin/invitations`, chooses the account name, optional private
+   contact email, 1–30-day lifetime, and optional durable administrator grant.
+2. e6irc stores only a SHA-256 digest and displays the single-use bearer link
+   once. The secret is sent to the recipient through a trusted channel.
+3. The recipient opens `/invite/{token}`. A short-lived
+   `HttpOnly; SameSite=Strict` cookie binds the acceptance form to that browser.
+4. The recipient chooses and confirms a primary password.
+5. Password hashing, account/contact/authority creation, invitation
+   consumption, and the audit event commit atomically. e6irc creates a bounded
+   browser session and enters the console.
+6. The administrator directory lists only live invitation metadata and can
+   revoke an exact invitation without retrieving its bearer value.
+
+**Visible failures and recovery.** Invalid or retired names, duplicate pending
+invitations, malformed private contact data, out-of-range lifetime, per-admin
+cap exhaustion, stale browser state, expired/revoked/consumed tokens, password
+mismatch, and storage failure are explicit. Public lookup deliberately gives
+the same unavailable result for every unusable bearer. A failed account
+transaction does not consume the invitation.
+
+**Security and observability.** Tokens carry 256 random bits, are hashed at
+rest, expire, and are single-use. Invitation/contact secrets never enter audit
+details, directories, metrics, or logs. Issuance/revocation/acceptance is
+audited with folded account provenance, and administrator authority becomes
+live only after its durable creation commits.
+
+**Evidence.** PostgreSQL test
+`account_invitations_are_single_use_expiring_and_digest_only`, real-socket HTTP
+test `invitation_creation_export_and_permanent_deletion_work_end_to_end`, and
+the two-context Chromium journey in `tools/test-oidc-browser.mjs` cross
+issuance, browser binding, acceptance, login, one-use rejection, and
+revocation-safe metadata.
+
 ## Sign out locally and across an identity provider
 
 **Actor and goal.** A signed-in user wants the current e6irc browser session

@@ -191,6 +191,58 @@ fn document() -> serde_json::Value {
                     }
                 }
             },
+            "/api/v1/me/account": {
+                "delete": {
+                    "summary": "Permanently delete your account",
+                    "description": "Requires a cookie-authenticated browser session, session-bound CSRF, and the exact display-cased account name. Founded channels must be transferred or dropped first. The account, credentials, sessions, networks, private history, and account-owned buffers are removed atomically and the name is permanently retired.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["confirmation"],
+                            "additionalProperties": false,
+                            "properties": { "confirmation": { "type": "string", "maxLength": 64 } }
+                        }
+                    } } },
+                    "responses": {
+                        "204": { "description": "account deleted and browser cookie cleared" },
+                        "400": { "description": "confirmation does not match" },
+                        "401": { "description": "browser session required" },
+                        "409": { "description": "account founds channels or is the final durable administrator" },
+                        "503": { "description": "database or live runtime unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/export": {
+                "get": {
+                    "summary": "Download a versioned JSON export of your retained account data",
+                    "description": "Includes profile, non-secret credential metadata, identities, browser-session provenance, network configuration without sealed passwords, read markers, founded channels, messages, BNC buffer, and security activity. Secret digests, hashes, bearer values, identity tokens, and sealed upstream passwords are excluded.",
+                    "security": authenticated,
+                    "responses": {
+                        "200": { "description": "attachment containing the account export" },
+                        "404": { "description": "account no longer exists" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/me/security-activity": {
+                "get": {
+                    "summary": "Page your security and administrator activity",
+                    "description": "Returns events where the account is the exact RFC1459-folded actor or target. before_id selects strictly older rows.",
+                    "security": authenticated,
+                    "parameters": [
+                        { "name": "limit", "in": "query",
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+                        { "name": "before_id", "in": "query",
+                            "schema": { "type": "integer", "format": "int64", "minimum": 1 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "activity entries and next_before_id cursor" },
+                        "400": { "description": "invalid limit or cursor" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
             "/api/v1/me/sessions": {
                 "get": {
                     "summary": "List your active browser sessions",
@@ -687,7 +739,30 @@ fn document() -> serde_json::Value {
                     "parameters": account_directory_parameters,
                     "responses": { "200": { "description": "account posture entries and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, or exact account filter" },
-                        "403": { "description": "not an admin account" } } }
+                        "403": { "description": "not an admin account" } } },
+                "post": {
+                    "summary": "Create a local account immediately (admin only)",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["account", "password"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "account": { "type": "string", "maxLength": 64 },
+                                "password": { "type": "string", "maxLength": 512 },
+                                "contact_email": { "type": ["string", "null"], "maxLength": 254 },
+                                "administrator": { "type": "boolean", "default": false }
+                            }
+                        }
+                    } } },
+                    "responses": {
+                        "201": { "description": "account created" },
+                        "400": { "description": "invalid account, password, or contact email" },
+                        "409": { "description": "account name exists or is retired" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
             },
             "/api/v1/admin/accounts/{id}": {
                 "patch": {
@@ -726,6 +801,86 @@ fn document() -> serde_json::Value {
                         "404": { "description": "no such account" },
                         "409": { "description": "self-targeting, last administrator, or invalid owned-network configuration" },
                         "503": { "description": "database or live runtime unavailable" }
+                    }
+                },
+                "delete": {
+                    "summary": "Permanently delete an account (admin only)",
+                    "description": "Requires the exact display-cased account name. Self-deletion must use the self-service route. Founded channels must be transferred or dropped first; the final active durable administrator is protected. Successful deletion revokes live access, purges account-owned data, stops networks, and retires the name.",
+                    "security": authenticated,
+                    "parameters": [{
+                        "name": "id", "in": "path", "required": true,
+                        "schema": { "type": "integer", "minimum": 1 }
+                    }],
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["confirmation"],
+                            "additionalProperties": false,
+                            "properties": { "confirmation": { "type": "string", "maxLength": 64 } }
+                        }
+                    } } },
+                    "responses": {
+                        "200": { "description": "account deleted and live resources stopped" },
+                        "400": { "description": "confirmation does not match" },
+                        "404": { "description": "no such account" },
+                        "409": { "description": "self target, founded channels, or final durable administrator" },
+                        "503": { "description": "database or live runtime unavailable" }
+                    }
+                }
+            },
+            "/api/v1/admin/invitations": {
+                "get": {
+                    "summary": "List live account invitations without bearer values (admin only)",
+                    "security": authenticated,
+                    "parameters": [
+                        { "name": "limit", "in": "query",
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+                        { "name": "before_id", "in": "query",
+                            "schema": { "type": "integer", "format": "int64", "minimum": 1 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "pending, unexpired invitation metadata and next_before_id cursor" },
+                        "400": { "description": "invalid limit or cursor" },
+                        "403": { "description": "not an admin account" }
+                    }
+                },
+                "post": {
+                    "summary": "Issue a single-use account invitation (admin only)",
+                    "description": "Returns the bearer invitation link once. Only its SHA-256 digest is stored.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["account", "expires_in_days"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "account": { "type": "string", "maxLength": 64 },
+                                "contact_email": { "type": ["string", "null"], "maxLength": 254 },
+                                "expires_in_days": { "type": "integer", "minimum": 1, "maximum": 30 },
+                                "administrator": { "type": "boolean", "default": false }
+                            }
+                        }
+                    } } },
+                    "responses": {
+                        "201": { "description": "invitation link shown once" },
+                        "400": { "description": "invalid account, email, or lifetime" },
+                        "409": { "description": "name unavailable or administrator invitation cap reached" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
+            },
+            "/api/v1/admin/invitations/{id}": {
+                "delete": {
+                    "summary": "Revoke one pending account invitation (admin only)",
+                    "security": authenticated,
+                    "parameters": [{
+                        "name": "id", "in": "path", "required": true,
+                        "schema": { "type": "integer", "minimum": 1 }
+                    }],
+                    "responses": {
+                        "204": { "description": "invitation revoked" },
+                        "404": { "description": "invitation is absent, expired, consumed, or already revoked" },
+                        "503": { "description": "database unavailable" }
                     }
                 }
             },

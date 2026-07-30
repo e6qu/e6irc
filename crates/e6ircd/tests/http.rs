@@ -101,6 +101,13 @@ fn bootstrap_state_from_html(html: &str) -> &str {
         .expect("bootstrap state in page")
 }
 
+fn invitation_state_from_html(html: &str) -> &str {
+    html.split("name=\"invitation_state\" value=\"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .expect("invitation state in page")
+}
+
 fn form_value(value: &str) -> String {
     value
         .bytes()
@@ -3171,6 +3178,272 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
+    let url =
+        support::test_db("invitation_creation_export_and_permanent_deletion_work_end_to_end").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let alice_id = e6ircd::db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("Alice");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "Alice", "administrator API")
+        .await
+        .expect("Alice token");
+    let alice_session = e6ircd::db::create_web_session(&pool, "Alice", None)
+        .await
+        .expect("Alice session");
+
+    let config = Config {
+        server_name: "irc.onboarding.example".into(),
+        network_name: "OnboardingNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url: url.clone() }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("HTTP");
+
+    let accounts_page = format!(
+        "GET /console/accounts HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={alice_session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &accounts_page).await;
+    assert_eq!(status, 200, "{body}");
+    for control in [
+        "Invite an account",
+        "Create an account",
+        "No pending invitations",
+    ] {
+        assert!(body.contains(control), "missing {control:?}: {body}");
+    }
+
+    let invitation_body = serde_json::json!({
+        "account": "Bob",
+        "contact_email": "Bob@Example.COM",
+        "expires_in_days": 7,
+        "administrator": false,
+    })
+    .to_string();
+    let (status, body) = post_json(
+        http,
+        "/api/v1/admin/invitations",
+        &alice_token,
+        &invitation_body,
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let invitation: serde_json::Value = serde_json::from_str(&body).expect("invitation response");
+    let invitation_url = invitation["invitation_url"]
+        .as_str()
+        .expect("single-use URL");
+    assert!(invitation_url.starts_with("/invite/e6i_"), "{body}");
+    let invitation_directory = format!(
+        "GET /api/v1/admin/invitations?limit=1 HTTP/1.1\r\nHost: t\r\n\
+         Authorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &invitation_directory).await;
+    assert_eq!(status, 200, "{body}");
+    let directory: serde_json::Value = serde_json::from_str(&body).expect("invitation directory");
+    assert_eq!(directory["invitations"][0]["account"], "Bob");
+    assert_eq!(directory["next_before_id"], serde_json::Value::Null);
+    assert!(
+        !body.contains("e6i_"),
+        "bearer leaked into directory: {body}"
+    );
+    let invalid_directory = format!(
+        "GET /api/v1/admin/invitations?limit=0 HTTP/1.1\r\nHost: t\r\n\
+         Authorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &invalid_directory).await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, invite_headers, invite_page) = request(http, &get(invitation_url)).await;
+    assert_eq!(status, 200, "{invite_page}");
+    assert!(
+        invite_page.contains("Create <code>Bob</code>"),
+        "{invite_page}"
+    );
+    assert!(!invitation_state_from_html(&invite_page).is_empty());
+    let invitation_cookie = response_header(&invite_headers, "set-cookie")
+        .expect("invitation cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_string();
+    let bad_accept =
+        "invitation_state=wrong&password=bob-password&password_confirmation=bob-password";
+    let bad_request = format!(
+        "POST {invitation_url} HTTP/1.1\r\nHost: t\r\nCookie: {invitation_cookie}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad_accept}",
+        bad_accept.len()
+    );
+    let (status, _, body) = request(http, &bad_request).await;
+    assert_eq!(status, 403, "{body}");
+
+    let (status, invite_headers, invite_page) = request(http, &get(invitation_url)).await;
+    assert_eq!(status, 200, "{invite_page}");
+    let invitation_state = invitation_state_from_html(&invite_page).to_string();
+    let invitation_cookie = response_header(&invite_headers, "set-cookie")
+        .expect("invitation cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair");
+    let accept_body = format!(
+        "invitation_state={}&password=bob-password&password_confirmation=bob-password",
+        form_value(&invitation_state)
+    );
+    let accept_request = format!(
+        "POST {invitation_url} HTTP/1.1\r\nHost: t\r\nCookie: {invitation_cookie}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{accept_body}",
+        accept_body.len()
+    );
+    let (status, accept_headers, body) = request(http, &accept_request).await;
+    assert_eq!(status, 303, "{body}");
+    assert_eq!(
+        response_header(&accept_headers, "location"),
+        Some("/console")
+    );
+    let bob_session_cookie = accept_headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("set-cookie: e6irc_session=")
+                .or_else(|| line.strip_prefix("Set-Cookie: e6irc_session="))
+        })
+        .and_then(|value| value.split(';').next())
+        .expect("Bob session cookie")
+        .to_string();
+    assert_eq!(
+        e6ircd::db::verify_local_password(&pool, "Bob", "bob-password")
+            .await
+            .expect("Bob password"),
+        Some("Bob".into())
+    );
+    let (status, _, body) = request(http, &get(invitation_url)).await;
+    assert_eq!(status, 404, "{body}");
+
+    let bob_export = format!(
+        "GET /api/v1/me/export HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={bob_session_cookie}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, body) = request(http, &bob_export).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        headers.contains("attachment; filename=\"e6irc-account-export.json\""),
+        "{headers}"
+    );
+    let export: serde_json::Value = serde_json::from_str(&body).expect("export JSON");
+    assert_eq!(export["account"]["name"], "Bob");
+    assert_eq!(export["account"]["contact_email"], "Bob@example.com");
+
+    let create_carol = serde_json::json!({
+        "account": "Carol",
+        "password": "carol password",
+        "contact_email": null,
+        "administrator": false,
+    })
+    .to_string();
+    let (status, body) =
+        post_json(http, "/api/v1/admin/accounts", &alice_token, &create_carol).await;
+    assert_eq!(status, 201, "{body}");
+    let carol_id = serde_json::from_str::<serde_json::Value>(&body).expect("Carol response")["id"]
+        .as_i64()
+        .expect("Carol id");
+    let delete_carol_body = r#"{"confirmation":"Carol"}"#;
+    let delete_carol = format!(
+        "DELETE /api/v1/admin/accounts/{carol_id} HTTP/1.1\r\nHost: t\r\n\
+         Authorization: Bearer {alice_token}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{delete_carol_body}",
+        delete_carol_body.len()
+    );
+    let (status, _, body) = request(http, &delete_carol).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(matches!(
+        e6ircd::db::create_account(&pool, "carol", "replacement").await,
+        Err(e6ircd::db::DbError::DuplicateAccount(_))
+    ));
+
+    let bob_id = e6ircd::db::account_id_by_name(&pool, "Bob")
+        .await
+        .expect("Bob lookup")
+        .expect("Bob");
+    sqlx::query(
+        "INSERT INTO channels (name, name_folded, founder_account_id)
+         VALUES ('#bob', '#bob', $1)",
+    )
+    .bind(bob_id)
+    .execute(&pool)
+    .await
+    .expect("Bob channel");
+    let bob_account_page = format!(
+        "GET /console/account HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={bob_session_cookie}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page) = request(http, &bob_account_page).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("Download my data"), "{page}");
+    assert!(page.contains("Security activity"), "{page}");
+    assert!(page.contains("Delete my account permanently"), "{page}");
+    let bob_csrf = csrf_from_html(&page).to_string();
+    let delete_bob_body = r#"{"confirmation":"Bob"}"#;
+    let delete_bob = |csrf: &str| {
+        format!(
+            "DELETE /api/v1/me/account HTTP/1.1\r\nHost: t\r\n\
+             Cookie: e6irc_session={bob_session_cookie}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{delete_bob_body}",
+            delete_bob_body.len()
+        )
+    };
+    let (status, _, body) = request(http, &delete_bob(&bob_csrf)).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("transfer or unregister"), "{body}");
+    assert!(
+        e6ircd::db::set_channel_founder(&pool, "#bob", "alice")
+            .await
+            .expect("transfer")
+    );
+    let (status, headers, body) = request(http, &delete_bob(&bob_csrf)).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(headers.contains("Max-Age=0"), "{headers}");
+    assert_eq!(
+        e6ircd::db::account_id_by_name(&pool, "Bob")
+            .await
+            .expect("Bob lookup"),
+        None
+    );
+    let (status, headers, _) = request(http, &bob_account_page).await;
+    assert_eq!(status, 303, "{headers}");
+    assert_eq!(response_header(&headers, "location"), Some("/login"));
+
+    assert!(
+        e6ircd::db::account_name_by_id(&pool, alice_id)
+            .await
+            .expect("Alice")
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

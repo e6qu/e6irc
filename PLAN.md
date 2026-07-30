@@ -5481,6 +5481,31 @@ Qualification boundary:
   architecture rather than shipped behavior. (DESIGN §7.3–7.4, §17;
   `docs/journeys/coverage.md`)
 
+## Phase 14 — Account lifecycle closure ✅ (2026-07-30)
+
+- Administrators can create local accounts immediately or issue/revoke
+  1–30-day, digest-only, single-use account invitations through both the
+  console and the documented REST API. Recipients choose their password in a
+  browser-bound acceptance flow; account/contact/authority creation,
+  invitation consumption, and audit commit atomically.
+- **Account & access** now exposes owner-scoped security activity and a
+  versioned JSON export of all retained account data. The export is one
+  PostgreSQL statement snapshot and excludes hashes, bearer values/digests,
+  provider tokens/session IDs, device codes, and sealed upstream credentials.
+  Credential, token, identity, browser-session, login/logout, provider-logout,
+  invitation, and lifecycle actions write redacted account-visible events.
+- Self-service and administrator permanent deletion require exact display-name
+  confirmation, explicit registered-channel succession, and another active
+  effective durable-or-configured administrator. The ordered core denies new
+  authentication before the transaction purges account-owned private data and
+  cascades credentials/sessions/networks; the registry then stops live drivers.
+  Deleted names are permanently retired under a per-name advisory lock and a
+  PostgreSQL account-insert trigger.
+- The OpenAPI method/path inventory, server-rendered controls, database
+  invariants, real-socket HTTP journey, two-context Chromium onboarding/export/
+  deletion journey, DESIGN model, and user-journey traceability all describe
+  the same lifecycle.
+
 ## Known remaining scope (audit 2026-07-19)
 
 A completeness audit against DESIGN.md surfaced documented-but-unbuilt

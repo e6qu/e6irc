@@ -67,6 +67,12 @@ pub enum DbError {
     CannotDemoteSelf,
     /// At least one active durable administrator must remain.
     LastAdministrator,
+    /// An account must transfer every founded channel before deletion.
+    AccountOwnsChannels(usize),
+    /// An administrator already holds the maximum number of live invitations.
+    TooManyInvitations,
+    /// A bearer invitation is unknown, expired, revoked, or already consumed.
+    InvitationUnavailable,
 }
 
 impl std::fmt::Display for DbError {
@@ -101,7 +107,22 @@ impl std::fmt::Display for DbError {
                 write!(f, "an administrator cannot remove its own authority")
             }
             Self::LastAdministrator => {
-                write!(f, "the last active administrator cannot be suspended")
+                write!(f, "at least one active administrator must remain")
+            }
+            Self::AccountOwnsChannels(count) => {
+                write!(
+                    f,
+                    "account still founds {count} channel(s); transfer or unregister them first"
+                )
+            }
+            Self::TooManyInvitations => {
+                write!(
+                    f,
+                    "administrator holds too many pending account invitations"
+                )
+            }
+            Self::InvitationUnavailable => {
+                write!(f, "account invitation is unavailable")
             }
         }
     }
@@ -146,6 +167,7 @@ pub struct StorageMaintenanceReport {
     pub api_tokens: u64,
     pub device_grants: u64,
     pub logout_tokens: u64,
+    pub account_invitations: u64,
     /// At least one collection filled its bounded batch and may have more
     /// expired rows. The supervised worker emits this explicitly and retries
     /// on its next fixed maintenance tick.
@@ -263,6 +285,19 @@ pub async fn run_storage_maintenance(
         limit,
     )
     .await?;
+    let account_invitations = execute_maintenance_delete(
+        &mut transaction,
+        "DELETE FROM account_invitations
+         WHERE id IN (
+             SELECT id FROM account_invitations
+             WHERE consumed_at IS NOT NULL OR expires_at <= now()
+             ORDER BY COALESCE(consumed_at, expires_at), id
+             LIMIT $1
+         )",
+        None,
+        limit,
+    )
+    .await?;
     transaction.commit().await.map_err(DbError::Query)?;
     let saturated = [
         messages,
@@ -271,6 +306,7 @@ pub async fn run_storage_maintenance(
         api_tokens,
         device_grants,
         logout_tokens,
+        account_invitations,
     ]
     .into_iter()
     .any(|deleted| deleted == STORAGE_MAINTENANCE_BATCH);
@@ -281,6 +317,7 @@ pub async fn run_storage_maintenance(
         api_tokens,
         device_grants,
         logout_tokens,
+        account_invitations,
         saturated,
     })
 }
@@ -472,6 +509,36 @@ async fn insert_primary_password(
     .map_err(DbError::Query)
 }
 
+const ACCOUNT_NAME_ADVISORY_LOCK_NAMESPACE: i64 = 0x6536_6972_6300_0001;
+
+async fn lock_account_name(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    folded: &str,
+) -> Result<(), DbError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(folded)
+        .bind(ACCOUNT_NAME_ADVISORY_LOCK_NAMESPACE)
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(DbError::Query)
+}
+
+async fn account_name_is_retired(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    folded: &str,
+) -> Result<bool, DbError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM retired_account_names WHERE name_folded = $1
+         )",
+    )
+    .bind(folded)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(DbError::Query)
+}
+
 /// Create an account with a local password. Used by NickServ REGISTER
 /// and by tests/admin tooling.
 pub async fn create_account(pool: &PgPool, name: &str, password: &str) -> Result<i64, DbError> {
@@ -488,6 +555,10 @@ pub async fn create_account_with_contact(
     let folded = CaseMapping::Rfc1459.casefold(name);
     let hash = hash_password(password.to_string()).await?;
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    lock_account_name(&mut tx, &folded).await?;
+    if account_name_is_retired(&mut tx, &folded).await? {
+        return Err(DbError::DuplicateAccount(name.to_string()));
+    }
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO accounts (name, name_folded, contact_email) VALUES ($1, $2, $3)
          ON CONFLICT (name_folded) DO NOTHING RETURNING id",
@@ -502,6 +573,359 @@ pub async fn create_account_with_contact(
     insert_primary_password(&mut tx, id, &hash).await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(id)
+}
+
+/// Create an administrator-provisioned local account and its audit row as one
+/// transaction. The optional authority grant is durable and immediately
+/// visible through the account directory after the HTTP boundary reconciles
+/// its live administrator registry.
+pub async fn create_account_by_administrator(
+    pool: &PgPool,
+    name: &str,
+    password: &str,
+    contact_email: Option<&crate::identity::ContactEmail>,
+    administrator: bool,
+    actor: &str,
+) -> Result<i64, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(name);
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let hash = hash_password(password.to_string()).await?;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    lock_account_name(&mut transaction, &folded).await?;
+    if account_name_is_retired(&mut transaction, &folded).await? {
+        return Err(DbError::DuplicateAccount(name.to_string()));
+    }
+    let flags = if administrator { ACCOUNT_FLAG_ADMIN } else { 0 };
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded, contact_email, flags)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (name_folded) DO NOTHING
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(&folded)
+    .bind(contact_email.map(crate::identity::ContactEmail::as_str))
+    .bind(flags)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?
+    .ok_or_else(|| DbError::DuplicateAccount(name.to_string()))?;
+    insert_primary_password(&mut transaction, account_id, &hash).await?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &actor_folded,
+        "ACCOUNT_CREATE",
+        &folded,
+        if administrator {
+            "local account created with durable administrator authority"
+        } else {
+            "local account created"
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(account_id)
+}
+
+/// Maximum live invitations one administrator may retain. Issuance and the
+/// count are serialized per actor, so concurrent requests cannot cross it.
+pub const MAX_PENDING_ACCOUNT_INVITATIONS_PER_ADMINISTRATOR: i64 = 100;
+const INVITATION_ACTOR_ADVISORY_LOCK_NAMESPACE: i64 = 0x6536_6972_6300_0002;
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AccountInvitationRow {
+    pub id: i64,
+    pub account_name: String,
+    pub contact_email: Option<String>,
+    pub administrator: bool,
+    pub created_by: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountInvitationPreview {
+    pub account_name: String,
+    pub administrator: bool,
+    pub expires_at: String,
+}
+
+/// A non-zero invitation-directory page size capped at the public API maximum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountInvitationPageSize(usize);
+
+impl AccountInvitationPageSize {
+    pub const MAX: usize = 1_000;
+
+    pub fn new(value: usize) -> Option<Self> {
+        (1..=Self::MAX).contains(&value).then_some(Self(value))
+    }
+
+    pub fn value(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AccountInvitationPage {
+    pub entries: Vec<AccountInvitationRow>,
+    pub next_before_id: Option<i64>,
+}
+
+/// Issue one opaque, single-use account invitation. Only the digest is
+/// persisted; the plaintext value is returned once.
+pub async fn issue_account_invitation(
+    pool: &PgPool,
+    name: &str,
+    contact_email: Option<&crate::identity::ContactEmail>,
+    administrator: bool,
+    lifetime: crate::identity::AccountInvitationLifetimeDays,
+    actor: &str,
+) -> Result<String, DbError> {
+    use argon2::password_hash::rand_core::RngCore;
+
+    let folded = CaseMapping::Rfc1459.casefold(name);
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let token = format!(
+        "e6i_{}",
+        e6irc_proto::base64::encode(&bytes).replace(['+', '/'], "-")
+    );
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    lock_account_name(&mut transaction, &folded).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(&actor_folded)
+        .bind(INVITATION_ACTOR_ADVISORY_LOCK_NAMESPACE)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query(
+        "UPDATE account_invitations
+         SET consumed_at = expires_at
+         WHERE name_folded = $1
+           AND consumed_at IS NULL AND expires_at <= now()",
+    )
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    if account_name_is_retired(&mut transaction, &folded).await? {
+        return Err(DbError::DuplicateAccount(name.to_string()));
+    }
+    let unavailable: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts WHERE name_folded = $1)
+             OR EXISTS (
+                 SELECT 1 FROM account_invitations
+                 WHERE name_folded = $1 AND consumed_at IS NULL
+             )",
+    )
+    .bind(&folded)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    if unavailable {
+        return Err(DbError::DuplicateAccount(name.to_string()));
+    }
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_invitations
+         WHERE created_by = $1 AND consumed_at IS NULL",
+    )
+    .bind(&actor_folded)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    if pending >= MAX_PENDING_ACCOUNT_INVITATIONS_PER_ADMINISTRATOR {
+        return Err(DbError::TooManyInvitations);
+    }
+    sqlx::query(
+        "INSERT INTO account_invitations
+            (token_hash, account_name, name_folded, contact_email,
+             administrator, created_by, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(days => $7))",
+    )
+    .bind(token_hash(&token))
+    .bind(name)
+    .bind(&folded)
+    .bind(contact_email.map(crate::identity::ContactEmail::as_str))
+    .bind(administrator)
+    .bind(&actor_folded)
+    .bind(i32::from(lifetime.value()))
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &actor_folded,
+        "ACCOUNT_INVITATION_CREATE",
+        &folded,
+        if administrator {
+            "single-use local account invitation issued with durable administrator authority"
+        } else {
+            "single-use local account invitation issued"
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(token)
+}
+
+/// Page live account invitations newest-first without exposing bearer digests.
+pub async fn list_account_invitations(
+    pool: &PgPool,
+    before_id: Option<i64>,
+    page_size: AccountInvitationPageSize,
+) -> Result<AccountInvitationPage, DbError> {
+    let fetch_limit = page_size.value() + 1;
+    let mut entries: Vec<AccountInvitationRow> = sqlx::query_as(
+        "SELECT id, account_name, contact_email, administrator, created_by,
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    AS created_at,
+                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    AS expires_at
+         FROM account_invitations
+         WHERE consumed_at IS NULL AND expires_at > now()
+           AND ($1::bigint IS NULL OR id < $1)
+         ORDER BY id DESC
+         LIMIT $2",
+    )
+    .bind(before_id)
+    .bind(fetch_limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    let next_before_id =
+        (entries.len() > page_size.value()).then(|| entries[page_size.value() - 1].id);
+    entries.truncate(page_size.value());
+    Ok(AccountInvitationPage {
+        entries,
+        next_before_id,
+    })
+}
+
+/// Revoke one pending invitation and record the action atomically.
+pub async fn revoke_account_invitation(
+    pool: &PgPool,
+    invitation_id: i64,
+    actor: &str,
+) -> Result<bool, DbError> {
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let target: Option<String> = sqlx::query_scalar(
+        "UPDATE account_invitations
+         SET consumed_at = now()
+         WHERE id = $1 AND consumed_at IS NULL AND expires_at > now()
+         RETURNING name_folded",
+    )
+    .bind(invitation_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    let Some(target) = target else {
+        return Ok(false);
+    };
+    insert_audit_log_with(
+        &mut *transaction,
+        &actor_folded,
+        "ACCOUNT_INVITATION_REVOKE",
+        &target,
+        "",
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(true)
+}
+
+/// Resolve public, non-secret invitation display data.
+pub async fn account_invitation_preview(
+    pool: &PgPool,
+    token: &str,
+) -> Result<Option<AccountInvitationPreview>, DbError> {
+    let row: Option<(String, bool, String)> = sqlx::query_as(
+        "SELECT account_name, administrator,
+                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+         FROM account_invitations
+         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(row.map(
+        |(account_name, administrator, expires_at)| AccountInvitationPreview {
+            account_name,
+            administrator,
+            expires_at,
+        },
+    ))
+}
+
+/// Consume an invitation and create its account/password in one transaction.
+pub async fn accept_account_invitation(
+    pool: &PgPool,
+    token: &str,
+    password: &str,
+) -> Result<String, DbError> {
+    let hash = hash_password(password.to_string()).await?;
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    type Invitation = (i64, String, String, Option<String>, bool);
+    let invitation: Option<Invitation> = sqlx::query_as(
+        "SELECT id, account_name, name_folded, contact_email, administrator
+         FROM account_invitations
+         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
+         FOR UPDATE",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((invitation_id, name, folded, contact_email, administrator)) = invitation else {
+        return Err(DbError::InvitationUnavailable);
+    };
+    lock_account_name(&mut transaction, &folded).await?;
+    if account_name_is_retired(&mut transaction, &folded).await? {
+        return Err(DbError::InvitationUnavailable);
+    }
+    let flags = if administrator { ACCOUNT_FLAG_ADMIN } else { 0 };
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded, contact_email, flags)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (name_folded) DO NOTHING
+         RETURNING id",
+    )
+    .bind(&name)
+    .bind(&folded)
+    .bind(contact_email)
+    .bind(flags)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?
+    .ok_or(DbError::InvitationUnavailable)?;
+    insert_primary_password(&mut transaction, account_id, &hash).await?;
+    sqlx::query(
+        "UPDATE account_invitations
+         SET consumed_at = now(), accepted_account_id = $2
+         WHERE id = $1",
+    )
+    .bind(invitation_id)
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &folded,
+        "ACCOUNT_INVITATION_ACCEPT",
+        &folded,
+        if administrator {
+            "local account created from invitation with durable administrator authority"
+        } else {
+            "local account created from invitation"
+        },
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(name)
 }
 
 /// Read the authenticated account's private contact email.
@@ -558,10 +982,13 @@ pub async fn set_account_contact_email(
 
 /// Whether the one-time first-account bootstrap has already been consumed.
 pub async fn has_accounts(pool: &PgPool) -> Result<bool, DbError> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts)")
-        .fetch_one(pool)
-        .await
-        .map_err(DbError::Query)
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts)
+             OR EXISTS (SELECT 1 FROM retired_account_names)",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)
 }
 
 /// Create the only possible first account and make it an administrator in the
@@ -580,10 +1007,13 @@ pub async fn bootstrap_first_admin(
         .execute(&mut *transaction)
         .await
         .map_err(DbError::Query)?;
-    let initialized: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM accounts)")
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
+    let initialized: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM accounts)
+             OR EXISTS (SELECT 1 FROM retired_account_names)",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
     if initialized {
         return Err(DbError::AlreadyInitialized);
     }
@@ -611,6 +1041,165 @@ pub async fn bootstrap_first_admin(
     Ok(account_id)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeletionTarget {
+    pub id: i64,
+    pub name: String,
+    pub folded: String,
+}
+
+/// Resolve and validate a deletion target without changing it. The final
+/// transaction repeats every invariant after the live core has installed its
+/// authentication gate, so a concurrent channel/admin mutation cannot cross
+/// the boundary.
+pub async fn account_deletion_target(
+    pool: &PgPool,
+    account_id: i64,
+    configured_administrators: &[String],
+) -> Result<Option<AccountDeletionTarget>, DbError> {
+    let row: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT a.name, a.name_folded, a.flags,
+                (SELECT count(*) FROM channels c
+                 WHERE c.founder_account_id = a.id)
+         FROM accounts a WHERE a.id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)?;
+    let Some((name, folded, flags, founded_channels)) = row else {
+        return Ok(None);
+    };
+    if founded_channels != 0 {
+        return Err(DbError::AccountOwnsChannels(
+            usize::try_from(founded_channels).unwrap_or(usize::MAX),
+        ));
+    }
+    if flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded) {
+        let other_active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM accounts
+             WHERE id <> $1
+               AND ((flags & $2) = $2 OR name_folded = ANY($4))
+               AND (flags & $3) = 0",
+        )
+        .bind(account_id)
+        .bind(ACCOUNT_FLAG_ADMIN)
+        .bind(ACCOUNT_FLAG_SUSPENDED)
+        .bind(configured_administrators)
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::Query)?;
+        if other_active == 0 {
+            return Err(DbError::LastAdministrator);
+        }
+    }
+    Ok(Some(AccountDeletionTarget {
+        id: account_id,
+        name,
+        folded,
+    }))
+}
+
+/// Permanently remove one account after the live core has denied new
+/// authentication. The retired-name reservation, privacy purge, account
+/// cascade, and durable audit event commit together.
+pub async fn delete_account_permanently(
+    pool: &PgPool,
+    account_id: i64,
+    actor: &str,
+    configured_administrators: &[String],
+) -> Result<Option<AccountDeletionTarget>, DbError> {
+    let actor_folded = CaseMapping::Rfc1459.casefold(actor);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let Some((name, folded, flags)) = lock_account_state(&mut transaction, account_id).await?
+    else {
+        return Ok(None);
+    };
+    lock_account_name(&mut transaction, &folded).await?;
+    let founded_channels: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM channels WHERE founder_account_id = $1")
+            .bind(account_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::Query)?;
+    if founded_channels != 0 {
+        return Err(DbError::AccountOwnsChannels(
+            usize::try_from(founded_channels).unwrap_or(usize::MAX),
+        ));
+    }
+    if flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded) {
+        let other_active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM accounts
+             WHERE id <> $1
+               AND ((flags & $2) = $2 OR name_folded = ANY($4))
+               AND (flags & $3) = 0",
+        )
+        .bind(account_id)
+        .bind(ACCOUNT_FLAG_ADMIN)
+        .bind(ACCOUNT_FLAG_SUSPENDED)
+        .bind(configured_administrators)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+        if other_active == 0 {
+            return Err(DbError::LastAdministrator);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO retired_account_names (name_folded) VALUES ($1)
+         ON CONFLICT (name_folded) DO NOTHING",
+    )
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM bnc_buffer WHERE owner = $1")
+        .bind(&folded)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query("DELETE FROM device_grants WHERE account = $1")
+        .bind(&name)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM account_invitations
+         WHERE name_folded = $1 OR created_by = $1",
+    )
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM messages
+         WHERE sender_account = $1 OR dm_peers @> ARRAY[$1::text]",
+    )
+    .bind(&folded)
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *transaction,
+        &actor_folded,
+        "ACCOUNT_DELETE",
+        &folded,
+        "account and account-owned data permanently removed; name retired",
+    )
+    .await?;
+    sqlx::query("DELETE FROM accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(Some(AccountDeletionTarget {
+        id: account_id,
+        name,
+        folded,
+    }))
+}
+
 /// Durable account posture used by authentication and administrator gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountFlags(i64);
@@ -632,6 +1221,15 @@ pub async fn account_flags(pool: &PgPool, account: &str) -> Result<Option<Accoun
         .fetch_optional(pool)
         .await
         .map(|flags| flags.map(AccountFlags))
+        .map_err(DbError::Query)
+}
+
+pub async fn account_id_by_name(pool: &PgPool, account: &str) -> Result<Option<i64>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
+        .bind(folded)
+        .fetch_optional(pool)
+        .await
         .map_err(DbError::Query)
 }
 
@@ -991,6 +1589,14 @@ pub async fn issue_app_password_for_account(
     .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_APP_PASSWORD_CREATE",
+        &folded,
+        "app password created",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(secret)
 }
@@ -1797,6 +2403,14 @@ pub async fn unlink_oidc_identity(
     .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_IDENTITY_UNLINK",
+        &folded,
+        "OpenID Connect identity unlinked and correlated sessions revoked",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(UnlinkIdentityOutcome::Unlinked)
 }
@@ -1811,9 +2425,10 @@ pub async fn link_oidc_identity(
     subject: &str,
 ) -> Result<LinkOutcome, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     let account_id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name_folded = $1")
         .bind(&folded)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(DbError::Query)?
         .ok_or(DbError::BadCredentials)?;
@@ -1824,10 +2439,19 @@ pub async fn link_oidc_identity(
     .bind(account_id)
     .bind(issuer)
     .bind(subject)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
     if inserted.is_some() {
+        insert_audit_log_with(
+            &mut *transaction,
+            &folded,
+            "ACCOUNT_IDENTITY_LINK",
+            &folded,
+            "OpenID Connect identity linked",
+        )
+        .await?;
+        transaction.commit().await.map_err(DbError::Query)?;
         return Ok(LinkOutcome::Linked);
     }
     // The pair already exists; whose is it?
@@ -1836,7 +2460,7 @@ pub async fn link_oidc_identity(
     )
     .bind(issuer)
     .bind(subject)
-    .fetch_one(pool)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
     if owner == account_id {
@@ -2890,6 +3514,210 @@ pub async fn list_audit_log(
     .entries)
 }
 
+/// Query the security-relevant activity visible to one account. Actor matches
+/// include the account's own mutations; target matches include administrator
+/// actions taken against it. Exact RFC1459 folding prevents one account from
+/// observing a similarly named account's events.
+pub async fn query_account_security_activity(
+    pool: &PgPool,
+    account: &str,
+    before_id: Option<i64>,
+    page_size: AuditLogPageSize,
+) -> Result<AuditLogPage, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let fetch_limit = page_size.value() + 1;
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT id, actor, action, target, detail,
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                    AS created_at
+         FROM audit_log
+         WHERE (actor = ",
+    );
+    query
+        .push_bind(&folded)
+        .push(" OR target = ")
+        .push_bind(&folded)
+        .push(")");
+    if let Some(before_id) = before_id {
+        query.push(" AND id < ").push_bind(before_id);
+    }
+    query
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind(fetch_limit as i64);
+    let (entries, next_before_id) = fetch_keyset_page!(pool, query, AuditLogRow, page_size.value());
+    Ok(AuditLogPage {
+        entries,
+        next_before_id,
+    })
+}
+
+/// Build a versioned JSON export of one account's retained data. Secret
+/// digests, password hashes, sealed upstream passwords, session identity
+/// tokens, device codes, and invitation bearers are deliberately absent.
+/// PostgreSQL constructs this in one statement so every section observes one
+/// statement snapshot.
+pub async fn export_account_json(pool: &PgPool, account: &str) -> Result<Option<String>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    sqlx::query_scalar(
+        r#"
+        WITH owner AS (
+            SELECT id, name, name_folded, contact_email, flags, created_at
+            FROM accounts WHERE name_folded = $1
+        )
+        SELECT jsonb_pretty(jsonb_build_object(
+            'schema_version', 1,
+            'exported_at', to_char(now() AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+            'account', jsonb_build_object(
+                'name', a.name,
+                'contact_email', a.contact_email,
+                'created_at', to_char(a.created_at AT TIME ZONE 'UTC',
+                    'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                'administrator', (a.flags & 1) = 1,
+                'suspended', (a.flags & 2) = 2
+            ),
+            'credentials', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'kind', c.kind,
+                    'label', c.label,
+                    'created_at', to_char(c.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                    'last_used_at', to_char(c.last_used_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY c.id)
+                FROM account_credentials c WHERE c.account_id = a.id
+            ), '[]'::jsonb),
+            'personal_access_tokens', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'label', t.label,
+                    'scopes', t.scopes,
+                    'created_at', to_char(t.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                    'expires_at', to_char(t.expires_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY t.id)
+                FROM api_tokens t WHERE t.account_id = a.id
+            ), '[]'::jsonb),
+            'login_identities', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'issuer', o.issuer,
+                    'subject', o.subject,
+                    'created_at', to_char(o.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY o.id)
+                FROM oidc_identities o WHERE o.account_id = a.id
+            ), '[]'::jsonb),
+            'browser_sessions', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'provider', s.oidc_provider,
+                    'email', s.oidc_email,
+                    'role', s.oidc_role,
+                    'user_agent', s.user_agent,
+                    'created_at', to_char(s.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                    'expires_at', to_char(s.expires_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY s.created_at, s.id)
+                FROM web_sessions s WHERE s.account_id = a.id
+            ), '[]'::jsonb),
+            'networks', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'kind', n.kind,
+                    'name', n.name,
+                    'address', n.addr,
+                    'tls', n.tls,
+                    'nick', n.nick,
+                    'realname', n.realname,
+                    'autojoin', n.autojoin,
+                    'sasl_account', n.sasl_account,
+                    'has_sasl_password', n.sasl_password_sealed IS NOT NULL,
+                    'enabled', n.enabled,
+                    'created_at', to_char(n.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY n.id)
+                FROM bnc_networks n WHERE n.account_id = a.id
+            ), '[]'::jsonb),
+            'read_markers', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'target', r.target,
+                    'timestamp', to_char(r.marker_ts AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY r.target)
+                FROM read_markers r WHERE r.account_id = a.id
+            ), '[]'::jsonb),
+            'founded_channels', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'name', c.name,
+                    'topic', c.topic,
+                    'topic_setter', c.topic_setter,
+                    'topic_set_at', to_char(c.topic_set_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                    'keep_topic', c.keeptopic,
+                    'mode_lock', c.mlock,
+                    'created_at', to_char(c.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                    'access', COALESCE((
+                        SELECT jsonb_agg(jsonb_build_object(
+                            'account', member.name,
+                            'flags', access.flags
+                        ) ORDER BY member.name_folded)
+                        FROM channel_access access
+                        JOIN accounts member ON member.id = access.account_id
+                        WHERE access.channel_id = c.id
+                    ), '[]'::jsonb)
+                ) ORDER BY c.id)
+                FROM channels c WHERE c.founder_account_id = a.id
+            ), '[]'::jsonb),
+            'messages', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'message_id', m.msgid,
+                    'target', m.target,
+                    'sender_prefix', m.sender_prefix,
+                    'sender_account', m.sender_account,
+                    'kind', m.kind,
+                    'body', m.body,
+                    'timestamp', to_char(m.ts AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                    'direct_message_peers', m.dm_peers,
+                    'sender_is_bot', m.sender_is_bot,
+                    'multiline', m.multiline
+                ) ORDER BY m.id)
+                FROM messages m
+                WHERE m.sender_account = a.name_folded
+                   OR m.dm_peers @> ARRAY[a.name_folded]
+            ), '[]'::jsonb),
+            'bouncer_buffer', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'network', b.network,
+                    'line', b.line,
+                    'created_at', to_char(b.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY b.id)
+                FROM bnc_buffer b WHERE b.owner = a.name_folded
+            ), '[]'::jsonb),
+            'security_activity', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'id', log.id,
+                    'actor', log.actor,
+                    'action', log.action,
+                    'target', log.target,
+                    'detail', log.detail,
+                    'created_at', to_char(log.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+                ) ORDER BY log.id)
+                FROM audit_log log
+                WHERE log.actor = a.name_folded OR log.target = a.name_folded
+            ), '[]'::jsonb)
+        ))::text
+        FROM owner a
+        "#,
+    )
+    .bind(folded)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
 /// Every server ban as `(mask_display, reason, set_by, kind)` — boot-loaded
 /// into the hot server-ban list. The first field is the display casing
 /// (`COALESCE(mask_display, mask)` so a row predating the display column falls
@@ -3221,6 +4049,15 @@ pub async fn poll_device_grant(
             token_label,
             crate::identity::ApiTokenScopes::device_access(),
             crate::identity::ApiTokenLifetimeDays::DEFAULT,
+        )
+        .await?;
+        let folded = CaseMapping::Rfc1459.casefold(&account);
+        insert_audit_log_with(
+            &mut *tx,
+            &folded,
+            "ACCOUNT_DEVICE_TOKEN_CREATE",
+            &folded,
+            "personal access token created from an approved device grant",
         )
         .await?;
         tx.commit().await.map_err(DbError::Query)?;
@@ -3646,6 +4483,14 @@ pub async fn change_local_password(
     .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_PASSWORD_CHANGE",
+        &folded,
+        "primary password changed",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
@@ -3679,6 +4524,14 @@ pub async fn set_local_password(
         return Err(DbError::LocalPasswordExists);
     }
     insert_primary_password(&mut tx, account_id, &new_hash).await?;
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_PASSWORD_ADD",
+        &folded,
+        "primary password added",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
@@ -4352,6 +5205,10 @@ pub async fn find_or_create_oidc_account(
             format!("{base}-{}", i + 1)
         };
         let folded = CaseMapping::Rfc1459.casefold(&candidate);
+        lock_account_name(&mut tx, &folded).await?;
+        if account_name_is_retired(&mut tx, &folded).await? {
+            continue;
+        }
         let id: Option<i64> = sqlx::query_scalar(
             "INSERT INTO accounts (name, name_folded) VALUES ($1, $2)
              ON CONFLICT (name_folded) DO NOTHING RETURNING id",
@@ -4552,6 +5409,18 @@ pub async fn create_web_session_with_identity(
     .execute(&mut *tx)
     .await
     .map_err(DbError::Query)?;
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_LOGIN",
+        &folded,
+        if provider.is_some() {
+            "browser session created through OpenID Connect"
+        } else {
+            "browser session created with local credentials"
+        },
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(token)
 }
@@ -4619,6 +5488,30 @@ pub async fn consume_oidc_backchannel_logout(
     if inserted.rows_affected() != 1 {
         return Err(DbError::ReplayedLogoutToken);
     }
+    let affected_accounts: Vec<String> = match sid {
+        Some(sid) => sqlx::query_scalar(
+            "SELECT DISTINCT a.name_folded
+             FROM web_sessions s JOIN accounts a ON a.id = s.account_id
+             WHERE s.oidc_issuer = $1 AND s.oidc_sid = $2
+               AND ($3::text IS NULL OR s.oidc_subject = $3)",
+        )
+        .bind(issuer)
+        .bind(sid)
+        .bind(subject)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(DbError::Query)?,
+        None => sqlx::query_scalar(
+            "SELECT DISTINCT a.name_folded
+             FROM web_sessions s JOIN accounts a ON a.id = s.account_id
+             WHERE s.oidc_issuer = $1 AND s.oidc_subject = $2",
+        )
+        .bind(issuer)
+        .bind(subject.expect("validated logout token has sid or sub"))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(DbError::Query)?,
+    };
     let deleted = match sid {
         Some(sid) => sqlx::query(
             "DELETE FROM web_sessions
@@ -4640,6 +5533,16 @@ pub async fn consume_oidc_backchannel_logout(
                 .map_err(DbError::Query)?
         }
     };
+    for account in affected_accounts {
+        insert_audit_log_with(
+            &mut *tx,
+            &account,
+            "ACCOUNT_OIDC_LOGOUT",
+            &account,
+            "browser sessions revoked by OpenID Connect back-channel logout",
+        )
+        .await?;
+    }
     tx.commit().await.map_err(DbError::Query)?;
     Ok(deleted.rows_affected())
 }
@@ -4650,12 +5553,34 @@ pub async fn revoke_oidc_frontchannel_sessions(
     issuer: &str,
     sid: &str,
 ) -> Result<u64, DbError> {
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let affected_accounts: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT a.name_folded
+         FROM web_sessions s JOIN accounts a ON a.id = s.account_id
+         WHERE s.oidc_issuer = $1 AND s.oidc_sid = $2",
+    )
+    .bind(issuer)
+    .bind(sid)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
     let deleted = sqlx::query("DELETE FROM web_sessions WHERE oidc_issuer = $1 AND oidc_sid = $2")
         .bind(issuer)
         .bind(sid)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(DbError::Query)?;
+    for account in affected_accounts {
+        insert_audit_log_with(
+            &mut *transaction,
+            &account,
+            "ACCOUNT_OIDC_LOGOUT",
+            &account,
+            "browser sessions revoked by OpenID Connect front-channel logout",
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(DbError::Query)?;
     Ok(deleted.rows_affected())
 }
 
@@ -4693,11 +5618,32 @@ pub async fn session_account(pool: &PgPool, token: &str) -> Result<Option<String
 /// Delete a session (logout). Deleting an unknown token is not an
 /// error: logout must be idempotent.
 pub async fn delete_web_session(pool: &PgPool, token: &str) -> Result<(), DbError> {
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT a.name_folded
+         FROM web_sessions s JOIN accounts a ON a.id = s.account_id
+         WHERE s.token_hash = $1",
+    )
+    .bind(token_hash(token))
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
     sqlx::query("DELETE FROM web_sessions WHERE token_hash = $1")
         .bind(token_hash(token))
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         .map_err(DbError::Query)?;
+    if let Some(owner) = owner {
+        insert_audit_log_with(
+            &mut *transaction,
+            &owner,
+            "ACCOUNT_LOGOUT",
+            &owner,
+            "browser session ended",
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
 
@@ -4754,7 +5700,8 @@ pub async fn delete_web_session_by_id(
 ) -> Result<Option<bool>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     let current_hash = current_token.map(token_hash);
-    sqlx::query_scalar(
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let deleted = sqlx::query_scalar(
         "DELETE FROM web_sessions s USING accounts a
          WHERE s.account_id = a.id AND a.name_folded = $1 AND s.id = $2
          RETURNING CASE
@@ -4765,9 +5712,22 @@ pub async fn delete_web_session_by_id(
     .bind(folded)
     .bind(id)
     .bind(current_hash)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *transaction)
     .await
-    .map_err(DbError::Query)
+    .map_err(DbError::Query)?;
+    if deleted.is_some() {
+        let folded = CaseMapping::Rfc1459.casefold(account);
+        insert_audit_log_with(
+            &mut *transaction,
+            &folded,
+            "ACCOUNT_SESSION_REVOKE",
+            &folded,
+            "browser session revoked",
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(deleted)
 }
 
 /// Revoke every other browser session owned by `account`, preserving the
@@ -4778,15 +5738,28 @@ pub async fn delete_other_web_sessions(
     current_token: &str,
 ) -> Result<u64, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     let deleted = sqlx::query(
         "DELETE FROM web_sessions s USING accounts a
          WHERE s.account_id = a.id AND a.name_folded = $1 AND s.token_hash <> $2",
     )
     .bind(folded)
     .bind(token_hash(current_token))
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
+    if deleted.rows_affected() != 0 {
+        let folded = CaseMapping::Rfc1459.casefold(account);
+        insert_audit_log_with(
+            &mut *transaction,
+            &folded,
+            "ACCOUNT_SESSIONS_REVOKE",
+            &folded,
+            "other browser sessions revoked",
+        )
+        .await?;
+    }
+    transaction.commit().await.map_err(DbError::Query)?;
     Ok(deleted.rows_affected())
 }
 
@@ -4850,6 +5823,14 @@ pub async fn issue_scoped_api_token(
     // The account row is locked in this tx, so `insert_api_token`'s own
     // name-folded lookup resolves the same row under the lock.
     let token = insert_api_token(&mut *tx, account, label, scopes, lifetime).await?;
+    insert_audit_log_with(
+        &mut *tx,
+        &folded,
+        "ACCOUNT_TOKEN_CREATE",
+        &folded,
+        "personal access token created",
+    )
+    .await?;
     tx.commit().await.map_err(DbError::Query)?;
     Ok(token)
 }
@@ -5012,16 +5993,29 @@ pub async fn list_api_tokens(
 /// (false = not found / not owned).
 pub async fn delete_api_token(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     let result = sqlx::query(
         "DELETE FROM api_tokens t USING accounts a
          WHERE t.account_id = a.id AND a.name_folded = $1 AND t.id = $2",
     )
     .bind(&folded)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    Ok(result.rows_affected() > 0)
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &folded,
+        "ACCOUNT_TOKEN_REVOKE",
+        &folded,
+        "personal access token revoked",
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(true)
 }
 
 // ---- credential management ----------------------------------------------
@@ -5057,6 +6051,7 @@ pub async fn list_credentials(pool: &PgPool, account: &str) -> Result<Vec<Creden
 /// it is not revocable here.
 pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     let result = sqlx::query(
         "DELETE FROM account_credentials c
          USING accounts a
@@ -5065,10 +6060,22 @@ pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<
     )
     .bind(&folded)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    Ok(result.rows_affected() > 0)
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+    insert_audit_log_with(
+        &mut *transaction,
+        &folded,
+        "ACCOUNT_APP_PASSWORD_REVOKE",
+        &folded,
+        "app password revoked",
+    )
+    .await?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -839,9 +839,18 @@ typed database failure instead of parking an HTTP or worker caller indefinitely.
 
 Principal tables (columns abridged):
 
-- `accounts` (id, name/casefolded, created_at, flags). The closed flag bits are
-  durable administrator authority and suspension; a database constraint rejects
-  every other value. At least one durable administrator remains active.
+- `accounts` (id, name/casefolded, private contact email, created_at, flags).
+  The closed flag bits are durable administrator authority and suspension; a
+  database constraint rejects every other value. At least one effective
+  durable-or-configured administrator remains active across HTTP deletion.
+- `retired_account_names` (casefolded name, deletion time) permanently reserves
+  deleted identities. The account-name transaction lock serializes create and
+  delete, while a storage trigger makes a future unwrapped account insert reject
+  a retired name independently of application routing.
+- `account_invitations` (opaque token digest, proposed account/contact/
+  authority, issuer, creation/expiry, consumption/accepted-account metadata).
+  A partial unique index admits at most one live invitation per folded name;
+  bearer plaintext is returned once and never stored.
 - `account_credentials` (account_id, kind: local_password | app_password,
   argon2id hash, label, last_used_at) — app passwords are per-client,
   revocable, shown once at creation
@@ -904,7 +913,8 @@ A supervised five-minute storage-maintenance worker applies the live
 UI-managed `[storage]` policy independently of monitoring. Each transaction
 removes at most 10,000 expired message-history rows, audit events, browser
 sessions, personal access tokens, device grants, and consumed OpenID Connect
-logout tokens from each collection. Time-order indexes and the global
+logout tokens, plus expired/revoked/consumed account invitations, from each
+collection. Time-order indexes and the global
 acquisition/statement/lock deadlines bound both the selection and the
 transaction. Filling any batch is logged with per-collection provenance and
 the next fixed cycle continues draining it; database failure is counted and
@@ -963,6 +973,32 @@ grants remain a distinct restart-scoped authority source; the directory shows
 both sources, and revoking a durable grant cannot falsely remove a still-active
 configuration grant. Every durable authority transition is audited and updates
 the live HTTP authorization registry immediately.
+
+Administrators can also provision a local account immediately or issue a
+1–30-day single-use invitation. Invitation issuance validates the same account
+name and typed private contact email as direct creation, takes the shared
+  per-name advisory lock, enforces a per-administrator pending cap, and stores
+  only the SHA-256 digest of a 256-bit bearer. The administrator directory is
+  a bounded, stable newest-first cursor page. Acceptance is rate-limited and
+bound to a short-lived `HttpOnly; SameSite=Strict` browser cookie; password
+hashing, account/contact/authority creation, invitation consumption, and audit
+commit in one transaction before the browser session is issued. Expired,
+revoked, consumed, and unknown bearers deliberately share one public
+unavailable response.
+
+Permanent deletion is a succession operation rather than a cascading accident.
+The target must found no registered channel and cannot be the last active
+effective administrator, including authority supplied by deployment
+configuration. The shared account/network mutation lane first installs a
+folded authentication deny key in the ordered core. The final transaction
+rechecks every invariant, reserves the name permanently, purges pending/
+consumed invitation contact data, device grants, owned BNC buffer, sent and
+direct-message history, and then deletes the account so credentials, sessions,
+identity links, networks, markers, and access rows cascade. The redacted audit
+event and retirement commit together. On database failure the HTTP boundary
+removes the live deny key before returning the error; success stops owned
+drivers and clears live administrator authority. No shipped creation path—or
+the account-table trigger—can assign a retired name to somebody else.
 
 The `draft/account-registration` `REGISTER` command creates that same account,
 so the two entry points cannot diverge; the capability's advertised value states
@@ -1140,6 +1176,25 @@ requests, the last login method cannot be removed, and sessions asserted by
 the removed identity are revoked in the same transaction. A final OIDC
 identity is removable when a primary password remains. The old `/account`
 URL is an authenticated redirect to this canonical page.
+
+The same page presents the account's newest security activity, with stable
+cursor pagination at `/api/v1/me/security-activity`, and downloads a versioned
+non-cacheable JSON attachment at `/api/v1/me/export`. The export is built from
+one PostgreSQL statement snapshot and includes retained personal content and
+secret-free configuration/posture; password hashes, bearer/session/invitation
+digests, plaintext bearer values, provider identity tokens/session IDs, device
+codes, and sealed upstream credentials are absent. Credential, token, identity,
+browser-session, login/logout, provider-logout, invitation, account-state, and
+deletion transitions emit redacted account-visible audit events.
+
+`/console/accounts` additionally owns immediate local account creation,
+single-use invitation issuance/revocation, and permanent deletion with exact
+display-name confirmation. The matching REST resources are
+`POST /api/v1/admin/accounts`, `DELETE /api/v1/admin/accounts/{id}`,
+`GET|POST /api/v1/admin/invitations`, and
+`DELETE /api/v1/admin/invitations/{id}`. Self-deletion is
+`DELETE /api/v1/me/account` and requires a cookie session plus its CSRF value;
+a personal access token cannot delete the identity that issued it.
 
 The shell also contains `/console/configuration`, the database-backed operational control
 plane. Its singleton `server_settings` row is a typed JSON document with an
