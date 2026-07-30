@@ -301,12 +301,15 @@ fn atomic_replace(_from: &Path, _to: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMPORARY_PATH: AtomicU64 = AtomicU64::new(0);
 
     fn temporary_path(name: &str) -> PathBuf {
+        let sequence = NEXT_TEMPORARY_PATH.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "e6irc-token-cache-{}-{}-{name}",
+            "e6irc-token-cache-{}-{sequence}-{name}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
         ))
     }
 
