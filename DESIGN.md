@@ -831,7 +831,10 @@ Vanilla PostgreSQL 18 (current stable) via sqlx; migrations embedded and run
 on startup (refusing to start on drift, loudly). CI provisions `postgres:18`
 for every database-backed suite — legacy majors are deliberately not a
 support target, so "it happens to work on an older server" is not a claim
-this project makes or tests.
+this project makes or tests. The shared application pool has a two-second
+acquisition deadline: dependency loss or pool exhaustion becomes a typed
+database failure for HTTP and worker callers instead of parking them on the
+library default timeout.
 
 Principal tables (columns abridged):
 
@@ -1572,7 +1575,8 @@ The snapshot is the sole source for:
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
   fixed `state`/`kind` labels;
 - `/readyz`, which fails when the single core worker's heartbeat is stale or
-  configured PostgreSQL cannot answer `SELECT 1`.
+  configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
+  query deadline.
 
 When PostgreSQL is configured, a sampler stores the typed JSON snapshot in
 `observability_samples`. The UI-managed `[observability]` interval (5–300
@@ -1623,7 +1627,10 @@ Layers, bottom to top:
    (reconnect, SASL, playback); OIDC flows against dockerized Dex; the Matrix
    bridge against pinned Conduit. The PostgreSQL job explicitly runs the
    ignored database, HTTP, OIDC, BNC, `/ws/ui`, and CLI suites with their
-   required environment.
+   required environment. A separate actual-daemon journey owns an isolated
+   empty PostgreSQL container so it can prove first-boot migrations/import and
+   stop/start recovery under simultaneous readiness, database-backed HTTP, and
+   hot IRC traffic.
 6. **Journey acceptance**: the scenarios in `docs/journeys/` map outcomes to
    direct real-server integration tests. The matrix identifies partial
    journeys where adjacent layers are proven separately.
@@ -1633,9 +1640,11 @@ Layers, bottom to top:
 8. **UI tests**: Playwright drives real OIDC/Shauth and local-password
    authentication in Chromium. Focused replay/race/membership cases use
    browser-side network/history/WebSocket doubles. A separate full-stack case
-   creates a network through the console, crosses real PostgreSQL, registry,
-   IRC-driver, local TCP-upstream, and `/ws/ui` paths in both directions,
-   inspects operations data, then gracefully restarts the daemon and proves
+   edits every managed-configuration subsection and credential collection,
+   proves persisted themes and the desktop-notification boundary, creates a
+   network through the console, crosses real PostgreSQL, registry, IRC-driver,
+   local TCP-upstream, and `/ws/ui` paths in both directions, inspects
+   operations data, then gracefully restarts the daemon and proves
    session/network/backlog recovery.
 9. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
    duplicate-proof exact fan-out sequence delivery, and latency percentiles;

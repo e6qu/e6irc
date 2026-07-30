@@ -31,7 +31,7 @@ piece in isolation does not prove the outcome a user experiences.
 |---|---|
 | [Identity and access](identity-and-access.md) | local login, OpenID Connect login/linking/logout, device authorization, password/token/session lifecycle |
 | [IRC and services](irc-and-services.md) | registration, capability negotiation, channel and direct chat, history, read markers, services, operator actions, WebSocket IRC |
-| [Web chat](web-chat.md) | enter the application, choose a network, live chat, replay/history, membership state, disconnect and recovery |
+| [Web chat](web-chat.md) | enter the application, choose a network, live chat, replay/history, membership state, themes, desktop notifications, disconnect and recovery |
 | [Networks and BNC](networks-and-bouncer.md) | enable the registry/listener, add a preset or custom network, connect and diagnose, attach an IRC client, persist/replay, edit/pause/delete |
 | [Channels and account self-service](channels-and-account.md) | register and govern a channel, manage credentials/identities, inspect and terminate sessions |
 | [Administration and monitoring](administration-and-monitoring.md) | bootstrap and managed configuration, directories and policy, traffic/latency/error monitoring, audit, readiness |

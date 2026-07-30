@@ -345,15 +345,25 @@ struct Readiness {
     database: &'static str,
 }
 
+const READINESS_DATABASE_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn database_is_ready(pool: &sqlx::PgPool) -> bool {
+    matches!(
+        tokio::time::timeout(
+            READINESS_DATABASE_TIMEOUT,
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
+        )
+        .await,
+        Ok(Ok(1))
+    )
+}
+
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let core_ready = state.telemetry.core_is_fresh(Duration::from_secs(45));
     let database_ready = match &state.pool {
         Some(pool) => {
             let started = Instant::now();
-            let ready = sqlx::query_scalar::<_, i32>("SELECT 1")
-                .fetch_one(pool)
-                .await
-                .is_ok();
+            let ready = database_is_ready(pool).await;
             state.telemetry.record_database_request(started.elapsed());
             if !ready {
                 state

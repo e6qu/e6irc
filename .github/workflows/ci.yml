@@ -171,6 +171,20 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
 
+  # A service-container job cannot stop its own PostgreSQL dependency safely.
+  # This isolated process journey owns a named disposable container so it can
+  # prove fresh migration/bootstrap, interruption, hot IRC continuity, honest
+  # readiness/API failure, pool recovery, and graceful shutdown together.
+  postgres-recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build -p e6ircd
+      - run: python3 tools/test-postgres-recovery.py
+
   production-container:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
