@@ -16,7 +16,8 @@
 //!   are observable, never silent.
 
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 #[cfg(loom)]
@@ -97,7 +98,8 @@ pub fn queue<T>(config: Config) -> (Sender<T>, Receiver<T>) {
             sender_count: 1,
             receiver_alive: true,
             waker: None,
-            push_wakers: Vec::new(),
+            push_wakers: VecDeque::new(),
+            next_push_waiter: 0,
         }),
     });
     (
@@ -132,10 +134,20 @@ struct State<T> {
     receiver_alive: bool,
     waker: Option<Waker>,
     /// Producers parked in an async `push` awaiting a free slot.
-    push_wakers: Vec<Waker>,
+    push_wakers: VecDeque<(u64, Waker)>,
+    next_push_waiter: u64,
 }
 
 impl<T> State<T> {
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_seq;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .expect("queue sequence identity exhausted");
+        sequence
+    }
+
     fn update_mode(&mut self, policy: Policy) {
         let Policy::AdaptiveLifo {
             high_watermark,
@@ -178,8 +190,7 @@ impl<T> Sender<T> {
             if state.buf.len() == self.shared.config.capacity {
                 return Err(PushError::Full(payload));
             }
-            seq = state.next_seq;
-            state.next_seq += 1;
+            seq = state.next_sequence();
             state.buf.push_back(Envelope { seq, payload });
             state.update_mode(self.shared.config.policy);
             waker = state.waker.take();
@@ -198,28 +209,99 @@ impl<T> Sender<T> {
     /// gone — the event still comes back, never silently lost. This is
     /// the backpressure primitive: a connection reader that awaits here
     /// simply stops reading its socket until the consumer catches up.
-    pub async fn push(&self, payload: T) -> Result<u64, T> {
-        let mut payload = Some(payload);
-        poll_fn(move |cx| {
-            match self.try_push(payload.take().expect("polled after ready")) {
-                Ok(seq) => Poll::Ready(Ok(seq)),
-                Err(PushError::Closed(p)) => Poll::Ready(Err(p)),
-                Err(PushError::Full(p)) => {
-                    payload = Some(p);
-                    self.shared.lock().push_wakers.push(cx.waker().clone());
-                    // Re-check: a pop may have raced our registration.
-                    match self.try_push(payload.take().expect("just stored")) {
-                        Ok(seq) => Poll::Ready(Ok(seq)),
-                        Err(PushError::Closed(p)) => Poll::Ready(Err(p)),
-                        Err(PushError::Full(p)) => {
-                            payload = Some(p);
-                            Poll::Pending
-                        }
-                    }
-                }
+    pub fn push(&self, payload: T) -> Push<'_, T> {
+        Push {
+            sender: self,
+            payload: Some(payload),
+            waiter: None,
+        }
+    }
+}
+
+/// A cancellation-safe asynchronous queue push.
+///
+/// A full queue registers this future once in FIFO waiter order. Dropping the
+/// future removes that registration, so a cancelled producer cannot consume a
+/// later wakeup and leave a live producer parked.
+pub struct Push<'a, T> {
+    sender: &'a Sender<T>,
+    payload: Option<T>,
+    waiter: Option<u64>,
+}
+
+impl<T> Unpin for Push<'_, T> {}
+
+impl<T> Future for Push<'_, T> {
+    type Output = Result<u64, T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut receiver_waker = None;
+        let result;
+        {
+            let mut state = this.sender.shared.lock();
+            if !state.receiver_alive {
+                remove_push_waiter(&mut state, this.waiter.take());
+                return Poll::Ready(Err(this
+                    .payload
+                    .take()
+                    .expect("push future polled after ready")));
             }
-        })
-        .await
+            if state.buf.len() < this.sender.shared.config.capacity {
+                remove_push_waiter(&mut state, this.waiter.take());
+                let seq = state.next_sequence();
+                state.buf.push_back(Envelope {
+                    seq,
+                    payload: this.payload.take().expect("push future polled after ready"),
+                });
+                state.update_mode(this.sender.shared.config.policy);
+                receiver_waker = state.waker.take();
+                result = Poll::Ready(Ok(seq));
+            } else {
+                let waiter = match this.waiter {
+                    Some(waiter) => waiter,
+                    None => {
+                        let waiter = state.next_push_waiter;
+                        state.next_push_waiter = state
+                            .next_push_waiter
+                            .checked_add(1)
+                            .expect("queue push-waiter identity exhausted");
+                        this.waiter = Some(waiter);
+                        waiter
+                    }
+                };
+                match state
+                    .push_wakers
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == waiter)
+                {
+                    Some((_, registered)) => registered.clone_from(cx.waker()),
+                    None => state.push_wakers.push_back((waiter, cx.waker().clone())),
+                }
+                result = Poll::Pending;
+            }
+        }
+        if let Some(waker) = receiver_waker {
+            waker.wake();
+        }
+        result
+    }
+}
+
+impl<T> Drop for Push<'_, T> {
+    fn drop(&mut self) {
+        if self.payload.is_some() {
+            let mut state = self.sender.shared.lock();
+            remove_push_waiter(&mut state, self.waiter.take());
+        }
+    }
+}
+
+fn remove_push_waiter<T>(state: &mut State<T>, waiter: Option<u64>) {
+    if let Some(waiter) = waiter {
+        state
+            .push_wakers
+            .retain(|(candidate, _)| *candidate != waiter);
     }
 }
 
@@ -227,7 +309,7 @@ impl<T> Receiver<T> {
     /// Non-blocking pop; also the primitive a deterministic stepper
     /// drives. `None` means "currently empty", not "closed".
     pub fn try_pop(&mut self) -> Option<Envelope<T>> {
-        let (env, wakers);
+        let (env, waker);
         {
             let mut state = self.shared.lock();
             env = match state.mode {
@@ -235,10 +317,10 @@ impl<T> Receiver<T> {
                 Mode::Lifo => state.buf.pop_back(),
             }?;
             state.update_mode(self.shared.config.policy);
-            wakers = std::mem::take(&mut state.push_wakers);
+            waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
         }
-        for w in wakers {
-            w.wake();
+        if let Some(waker) = waker {
+            waker.wake();
         }
         Some(env)
     }
@@ -250,7 +332,7 @@ impl<T> Receiver<T> {
     }
 
     fn poll_pop(&mut self, cx: &mut Context<'_>) -> Poll<Option<Envelope<T>>> {
-        let (popped, wakers);
+        let (popped, waker);
         {
             let mut state = self.shared.lock();
             popped = match state.mode {
@@ -260,7 +342,7 @@ impl<T> Receiver<T> {
             match popped {
                 Some(_) => {
                     state.update_mode(self.shared.config.policy);
-                    wakers = std::mem::take(&mut state.push_wakers);
+                    waker = state.push_wakers.pop_front().map(|(_, waker)| waker);
                 }
                 None => {
                     if state.sender_count == 0 {
@@ -271,8 +353,8 @@ impl<T> Receiver<T> {
                 }
             }
         }
-        for w in wakers {
-            w.wake();
+        if let Some(waker) = waker {
+            waker.wake();
         }
         Poll::Ready(popped)
     }
@@ -346,8 +428,8 @@ impl<T> Drop for Receiver<T> {
             // payloads back.
             wakers = std::mem::take(&mut state.push_wakers);
         }
-        for w in wakers {
-            w.wake();
+        for (_, waker) in wakers {
+            waker.wake();
         }
     }
 }
@@ -586,6 +668,44 @@ mod tests {
     }
 
     #[test]
+    fn one_free_slot_wakes_one_live_producer_and_cancelled_waiters_leave() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountWakes(AtomicUsize);
+        impl Wake for CountWakes {
+            fn wake(self: StdArc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (tx, mut rx) = fifo(1);
+        tx.try_push(0).unwrap();
+        let tx2 = tx.clone();
+        let mut cancelled = Box::pin(tx.push(1));
+        let mut live = Box::pin(tx2.push(2));
+        let cancelled_wakes = StdArc::new(CountWakes(AtomicUsize::new(0)));
+        let live_wakes = StdArc::new(CountWakes(AtomicUsize::new(0)));
+        let cancelled_waker = Waker::from(cancelled_wakes.clone());
+        let live_waker = Waker::from(live_wakes.clone());
+        assert!(
+            cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(&cancelled_waker))
+                .is_pending()
+        );
+        assert!(
+            live.as_mut()
+                .poll(&mut Context::from_waker(&live_waker))
+                .is_pending()
+        );
+
+        drop(cancelled);
+        assert_eq!(rx.try_pop().unwrap().payload, 0);
+        assert_eq!(cancelled_wakes.0.load(Ordering::SeqCst), 0);
+        assert_eq!(live_wakes.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     #[should_panic]
     fn zero_capacity_is_a_loud_construction_error() {
         let _ = fifo(0);
@@ -609,14 +729,12 @@ mod tests {
 mod loom_tests {
     use super::*;
 
-    /// The async backpressure path — parked-waker registration with the
-    /// post-registration re-check in `push`, and `pop`'s waker slot — under
-    /// contention: two senders block on a full capacity-1 queue while the
-    /// receiver pops both. A lost wakeup (a pop racing between a pusher's
-    /// registration and its re-check, or vice versa) parks a task forever,
-    /// which loom surfaces as a deadlocked branch; delivery stays
-    /// exactly-once. The try_push/try_pop model below can't see this: the
-    /// waker protocol only runs in the async path.
+    /// The async backpressure path — atomic parked-waker registration in
+    /// `push`, and `pop`'s FIFO wake — under contention: two senders block on a
+    /// full capacity-1 queue while the receiver pops both. A lost wakeup parks
+    /// a task forever, which loom surfaces as a deadlocked branch; delivery
+    /// stays exactly-once. The try_push/try_pop model below can't see this:
+    /// the waker protocol only runs in the async path.
     #[test]
     fn async_push_pop_wakers_lose_no_wakeup_under_all_interleavings() {
         // Bounded exploration: three threads of async machinery explode the

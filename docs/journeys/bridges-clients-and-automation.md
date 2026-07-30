@@ -54,26 +54,35 @@ with a meaningful exit status.
   PLAIN, joins a channel when needed, sends, drains the server response, and
   exits nonzero on join/delivery failure.
 - `e6irc tail TARGET [--count N]` follows matching PRIVMSG lines and answers
-  PING.
+  PING; `--json` emits one object per message with source, target, text, and
+  structured IRCv3 tags.
 - `e6irc raw` sends stdin IRC lines.
 - `e6irc history TARGET [--count N]` negotiates/queries CHATHISTORY.
-- `e6irc api METHOD PATH` performs one bounded plain-HTTP REST request using a
-  bearer token from the flag or `E6IRC_API_TOKEN`.
+- `e6irc login --base ORIGIN` starts the RFC 8628 device flow, prints the
+  verification URI and user code, polls within the server's explicit bounds,
+  and atomically saves the issued bearer token.
+- `e6irc api METHOD PATH` performs one bounded HTTP/HTTPS REST request. An
+  explicit token, `E6IRC_API_TOKEN`, or the login cache supplies bearer
+  authentication; with no `--base`, the cached issuing origin is used.
+- IRC authentication is anonymous, paired SASL PLAIN, direct OAUTHBEARER, or
+  OAUTHBEARER from that same cache.
 - IRC connections support plaintext or public-CA TLS with an explicit server
   name override.
 
 **Visible failures and recovery.** Supplying only one SASL PLAIN field is an
 error, not unauthenticated fallback. Join refusal, send rejection, disconnect,
 TLS validation failure, oversized API body/response, and non-2xx HTTP produce
-nonzero exit. Server output is terminal-sanitized.
+nonzero exit. A token is never printed. Cached tokens are origin-bound for API
+use; malformed, oversized, or group/other-readable Unix cache files fail
+rather than falling back to anonymous. Device denial, expiry, an unknown
+device error, or invalid server polling bounds fail explicitly. Server output
+is terminal-sanitized and JSON output is serializer-escaped.
 
-**Evidence.** Proven against real e6ircd sockets/API by CLI e2e tests for send,
-delivery failure, SASL, credential-shape rejection, history, TLS, and REST.
-
-**Current product boundary.** The binary does not ship `login`, device-flow
-orchestration, OS-keyring/file token caching, or JSON output for `tail`.
-OAUTHBEARER exists in the client library and server, but the CLI exposes only
-SASL PLAIN flags for IRC commands.
+**Evidence.** Real-socket/API tests cover send, delivery failure, PLAIN and
+OAUTHBEARER, credential-shape rejection, history, structured tail, TLS, and
+REST. The database job drives the actual binary through e6ircd's device
+endpoint, approves its real PostgreSQL grant, verifies the private cache, and
+uses its cached origin/token against `/api/v1/me`.
 
 ## Use the terminal UI
 
@@ -83,26 +92,38 @@ SASL PLAIN flags for IRC commands.
 
 1. Connect to one `host:port` with a nick and initial channel, using plaintext
    or public-CA TLS with an optional certificate-name override.
-2. Register anonymously, with SASL PLAIN, or with SASL OAUTHBEARER. For a BNC
-   attachment, `--account account/network` selects the owned network.
-3. Receive into bounded buffers, switch buffers with Alt-Left/Right, scroll
-   with Page Up/Down, and use `/join`, `/win`, and `/quit`.
-4. Channel/direct messages create and update buffers; server-originated text
+2. Register anonymously, with SASL PLAIN, or with direct/cached SASL
+   OAUTHBEARER. For a BNC attachment, `--account account/network` selects the
+   owned network.
+3. Require the history/read-marker capabilities in use, join the initial
+   channel, load bounded history after its shared marker (or the latest bounded
+   window), and advance the marker as the current buffer is read.
+4. Receive into bounded buffers, see background unread counts, switch buffers
+   with Alt-Left/Right, scroll with Page Up/Down, and use `/join`, one-based or
+   named `/win`, and `/quit`.
+5. Channel/direct messages create and update RFC1459-casefolded buffers;
+   history/live overlap with the same message ID is represented once;
+   server-originated text
    is represented by terminal-safe types.
-5. A live disconnect starts bounded-delay reconnect attempts with the same
-   explicit transport/authentication request. Input is disabled while
-   disconnected, and anything racing the disconnect is counted and reported
-   rather than replayed late or shown as a false successful send.
+6. A live disconnect starts bounded-delay reconnect attempts with the same
+   explicit transport/authentication request, rejoins every channel whose
+   self-JOIN was confirmed, and reloads marker-relative history. Input is
+   disabled while disconnected, and anything racing the disconnect is counted
+   and reported rather than replayed late or shown as a false successful send.
 
 **Evidence.** The terminal-independent application state is unit-tested and
 fuzzed with arbitrary server messages; authentication/transport argument
 shapes, disconnect refusal, transport failure, and bounded queue/scrollback
-behavior are tested. TLS and authentication use the same connection request
-as the real-socket CLI coverage. There is no pseudo-terminal/full-screen e2e.
+behavior are tested. Duplex protocol tests prove capability refusal,
+marker-relative CHATHISTORY, and batch completion. A pseudo-terminal test
+drives the real full-screen binary against a real e6ircd, proves inbound
+rendering and outbound delivery, enters `/quit`, and requires clean alternate-
+screen restoration.
 
-**Current product boundary.** The TUI does not orchestrate device login,
-CHATHISTORY loading, or shared read-marker state. “Multi-buffer” means
-channel/query buffers inside one connection, not simultaneous servers.
+**Product shape.** Device approval is performed once through `e6irc login`;
+the TUI consumes its shared cache. “Multi-buffer” means channel/query buffers
+inside one connection, not simultaneous servers—the BNC connection supplies
+cross-network multiplexing.
 
 ## Build another native client
 
@@ -113,12 +134,14 @@ protocol behavior.
 
 - `e6irc-client` provides plaintext/public-CA TLS connection, framing through
   `e6irc-proto`, registration, SASL PLAIN, SASL OAUTHBEARER, PING handling,
-  owned messages, terminal-safe output, and shared CHATHISTORY helpers.
+  owned messages, terminal-safe output, explicit capability requirements,
+  marker-aware CHATHISTORY helpers, and the cross-platform token-cache policy.
 - `ConnectionOptions` owns the transport, TLS name, registration identity, and
   an authentication enum whose variants make half-specified SASL impossible.
   A reconnecting caller can therefore reuse the exact request.
-- The caller owns reconnect policy, credential acquisition/storage, UI state,
-  and higher-level network selection.
+- The caller owns reconnect policy, UI state, and higher-level network
+  selection; it can reuse the shared device-token storage rather than defining
+  a second cache format.
 
 **Failure contract.** EOF, invalid/oversized lines, TLS/authentication failure,
 and write failure are returned. Lossy steady-state reading contains a

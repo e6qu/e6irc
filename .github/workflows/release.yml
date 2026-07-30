@@ -1,15 +1,16 @@
-# Publish the e6irc container image to GHCR on pushes to main. The dev
-# environment (github.com/e6qu/infra) pins the published multi-arch manifest.
+# Publish the e6irc container image to GHCR on pushes to main and publish
+# native daemon/CLI/TUI archives when a version tag is pushed.
 #
 # Tagging: each architecture is built natively on its own runner (no QEMU
 # emulation, which makes a full Rust release build painfully slow) and pushed
 # as `<short-sha>-amd64` / `<short-sha>-arm64`; a final job assembles the
 # multi-arch manifest `<short-sha>` from them. No `latest` tag is published.
-name: Release image
+name: Release image and native archives
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -19,7 +20,7 @@ permissions:
   artifact-metadata: write
 
 concurrency:
-  group: release-image-${{ github.ref }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -27,6 +28,7 @@ env:
 
 jobs:
   metadata:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -164,3 +166,97 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: tools/prune-ghcr-versions.sh "${{ github.repository_owner }}" "${{ github.event.repository.name }}" 20
+
+  native-metadata:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - name: Require the tag to match the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "tag $TAG does not match workspace version $version" >&2
+            exit 1
+          fi
+
+  native-build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: native-metadata
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Build embedded web client
+        run: npm install --global pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - name: Build the complete native product
+        run: cargo build -p e6ircd --release --all-features --target ${{ matrix.target }}
+      - name: Build native clients
+        run: cargo build -p e6irc-cli -p e6irc-tui --profile release-client --target ${{ matrix.target }}
+      - name: Package deterministic archive
+        run: python tools/package-native-release.py --target ${{ matrix.target }}
+      - name: Attest archive provenance
+        uses: actions/attest@v4.2.0
+        with:
+          subject-path: dist/e6irc-*
+      - name: Preserve archive for release assembly
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/e6irc-*
+          if-no-files-found: error
+          retention-days: 7
+
+  native-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: native-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - name: Verify the archive set and write checksums
+        run: |
+          count="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)"
+          if [ "$count" -ne 6 ]; then
+            echo "expected six native archives, found $count" >&2
+            find dist -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          (cd dist && sha256sum -- ./*.tar.gz ./*.zip | sort -k2 > SHA256SUMS)
+      - name: Publish versioned assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --generate-notes --verify-tag --title "e6irc $TAG"

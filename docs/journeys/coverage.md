@@ -11,8 +11,8 @@ a design target rather than current behavior.
 | Local browser login | Proven | Chromium adds a password, signs out, and submits the local-login form against real e6ircd/PostgreSQL | — |
 | OpenID Connect login/logout | Proven | Real e6ircd + PostgreSQL + Dex + Chromium; separate Shauth job | Provider diversity beyond Dex/Shauth |
 | Identity link/unlink | Proven | Real Dex + PostgreSQL plus console/API | — |
-| Device authorization grant | Proven at API/browser-page level | HTTP + PostgreSQL one-time consume and verification page | No shipped native client orchestrates it |
-| SASL PLAIN/OAUTHBEARER local IRC | Proven | Real sockets + PostgreSQL + CLI; native clients share one typed connection request | TUI argument/auth wiring is not a pseudo-terminal e2e |
+| Device authorization grant | Proven | Real CLI → e6ircd HTTP → PostgreSQL approval/consume → private cache → authenticated API; verification page has separate browser/API coverage | — |
+| SASL PLAIN/OAUTHBEARER local IRC | Proven | Real sockets + PostgreSQL + CLI plus shared client request; PTY drives the TUI's real authentication/registration path | — |
 | IRC registration/channel messaging | Proven | Core/e2e, irctest, fuzz, six-platform matrix | Live third-party server interop is opt-in |
 | Direct messages and durable history | Proven | Core + PostgreSQL authorization/pagination/restart | — |
 | Channel governance/services | Proven | Core + PostgreSQL + API/console + irctest services | — |
@@ -33,12 +33,12 @@ a design target rather than current behavior.
 | Matrix bridge | Proven | Real pinned Conduit, both directions | Other homeserver implementations |
 | Discord bridge | Externally qualified | Offline protocol/mapping/backoff tests | Live gateway/REST needs bot and guild |
 | Slack bridge | Externally qualified | Offline protocol/mapping/backoff tests | Live Socket Mode/Web API needs app/workspace |
-| CLI shipped commands | Proven | Real server/API/TLS/SASL e2e | No device login, token cache, or JSON tail exists |
-| TUI shipped behavior | Partially proven | Unit tests + server-message fuzz + shared TLS/SASL/OAuth transport | No history/read-sync or pseudo-terminal e2e |
+| CLI shipped commands | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON e2e | — |
+| TUI shipped behavior | Proven | Real PTY + e6ircd for registration/render/inbound/outbound/restore; duplex history/read-marker protocol plus model/fuzz tests | — |
 | REST resource families | Proven at route and family level | Exact router/OpenAPI method-path catalog + extensive real HTTP/PostgreSQL tests | Schema semantics remain hand-authored and directly tested |
 | First boot/migrations | Proven by component/integration | Config + migrations + database suites + production image | No fresh external-host acceptance script |
 | Graceful restart/durable reload | Proven | Chromium journey gracefully restarts the real daemon and recovers session, network, connection, and backlog; domain tests cover the rest | — |
-| Cross-platform source portability | Proven | Linux/macOS/Windows × x86-64/ARM64 all-feature CI | Distribution archives are not published |
+| Cross-platform source portability and native distribution | Proven | Linux/macOS/Windows × x86-64/ARM64 all-feature CI; version-tag native matrix publishes deterministic provenance-attested archives | — |
 | Multi-architecture container | Proven on every `main` merge | Native amd64/arm64 builds, shape verification, signed provenance, and SPDX SBOM attestations | — |
 | 100k single-host target | Unproven | Exact-delivery 64-client CI smoke plus manual baselines through 2,000 clients | Target architecture, budgets, thresholds, and tuned-host qualification are incomplete |
 
@@ -80,12 +80,13 @@ or 100k qualification result.
 
 ### Native-client product parity
 
-The CLI is a robust one-shot tool for its shipped commands, but it does not
-provide device-login/keyring/JSON-tail workflows. The TUI accepts plaintext or
-public-CA TLS, SASL PLAIN or OAUTHBEARER, `account/network` BNC selection, and
-automatic reconnect with explicit dropped-send status. Its remaining product
-boundary is history/read-marker synchronization and a pseudo-terminal
-acceptance test.
+The CLI implements device login, a private origin-bound token cache, bounded
+HTTP/HTTPS, structured tail output, TLS, PLAIN/OAUTHBEARER, history, and
+failure-sensitive one-shot commands. The TUI consumes the shared cache, loads
+marker-relative history, maintains shared read positions/unread state, and
+rejoins confirmed channels. The real pseudo-terminal journey protects the
+terminal boundary. One TUI process intentionally presents buffers for one
+attached network; the BNC is the cross-network multiplexer.
 
 ### External bridges and public networks
 
@@ -99,9 +100,10 @@ protocol/state logic remains in normal CI.
 Source portability and multi-architecture containers are proven. The
 repository ships a validated hardened systemd unit; every published
 architecture image has signed build provenance and an SPDX SBOM attestation,
-and the assembled manifest has signed provenance. Native binary archives,
-musl/static images, and an external alerting stack are outside the shipped
-distribution.
+and the assembled manifest has signed provenance. Matching version tags publish
+the daemon, CLI, and TUI for the same six native targets in deterministic
+archives with per-archive build provenance and SHA-256 checksums. Musl/static
+images and an external alerting stack are outside the shipped distribution.
 
 ### Specification and journey traceability
 
@@ -121,6 +123,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `db-tests` | real PostgreSQL storage/HTTP/OIDC/browser/BNC/`ws_ui`/CLI journeys |
 | `production-container` | deployable image and embedded web-client shape |
 | `load-smoke` | real daemon with 64 clients, eight channels, exact fan-out, and graceful shutdown |
+| `native-client-journeys` | deterministic archive contract plus real PTY render/message/terminal-restore journey |
 | `shauth-sso` | exact external single-sign-on/logout integration |
 | `irctest`, `irctest-services` | IRC and services conformance |
 | `matrix-bridge` | bidirectional live bridge behavior |
@@ -128,9 +131,12 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `fuzz-smoke` | parser, serializer, stateful core, multi-client core, and hostile TUI server output |
 | `size-report` | informational release binary-size visibility |
 
-The `Release image` workflow separately publishes direct amd64/arm64 images,
-verifies the assembled manifest, emits signed build/SBOM attestations, verifies
-those attestations as a consumer, and prunes complete old release groups.
+The `Release image and native archives` workflow publishes direct amd64/arm64
+images, verifies the assembled manifest, emits signed build/SBOM attestations,
+verifies those attestations as a consumer, and prunes complete old image
+groups. On a matching version tag it also builds all six native targets,
+attests each deterministic archive, checks that the complete six-file set
+arrived, writes sorted SHA-256 checksums, and creates the GitHub release.
 
 The PostgreSQL BNC and `/ws/ui` ignored integration suites belong in
 `db-tests`; the workflow invokes them explicitly. “Ignored” in their source

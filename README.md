@@ -20,8 +20,8 @@ written against Libera should work unchanged against e6ircd.
 | Crate | Binary | What it is |
 |-------|--------|-----------|
 | `e6ircd` | `e6ircd` | The server: IRCv3 daemon + REST API + web backend + OIDC RP + BNC host + Matrix bridge |
-| `e6irc-cli` | `e6irc` | Command-line client (send/tail/raw, SASL, one-shot REST calls) |
-| `e6irc-tui` | `e6irc-tui` | Terminal client (ratatui, multi-buffer, scrollback) |
+| `e6irc-cli` | `e6irc` | Command-line client (device login, send/tail/history/raw, SASL, one-shot HTTPS REST calls) |
+| `e6irc-tui` | `e6irc-tui` | Terminal client (ratatui, multi-buffer, history, shared read positions) |
 | `e6irc-client` | — | Async client library shared by the CLI/TUI and the load harness |
 | `e6irc-proto` | — | IRC message framing and parsing |
 | `e6irc-queue` | — | The core's async work queue (loom-checked) |
@@ -57,8 +57,9 @@ written against Libera should work unchanged against e6ircd.
   Static assets deploy either from a CDN or embedded into the binary
   behind the `embed-web` feature.
 - **Cross-platform**: Linux, macOS, and Windows on both x86_64 and
-  aarch64 — no cell in the matrix is a second-class port; CI builds and
-  tests all of them.
+  ARM64 — no cell in the matrix is a second-class port; CI builds and
+  tests all of them, and version tags publish provenance-attested native
+  archives containing the daemon, CLI, and TUI.
 
 ## Build & run
 
@@ -67,14 +68,43 @@ written against Libera should work unchanged against e6ircd.
 cargo build --release -p e6ircd
 ./target/release/e6ircd --config e6ircd.toml
 
-# CLI client
-cargo build --release -p e6irc-cli
-./target/release/e6irc --addr 127.0.0.1:6667 send '#chan' 'hello'
+# Native clients
+cargo build --profile release-client -p e6irc-cli -p e6irc-tui
+./target/release-client/e6irc --server 127.0.0.1:6667 send '#chan' 'hello'
 
-# TUI client (TLS + BNC account/network selection)
-cargo build --profile release-client -p e6irc-tui
+# TUI (TLS + BNC account/network selection; history/read markers are automatic)
 ./target/release-client/e6irc-tui --server bnc.example:6697 --tls \
   --account alice/libera --password 'app-password' --channel '#e6irc'
+```
+
+For a browser-approved token shared by the CLI and TUI:
+
+```sh
+e6irc login --base https://irc.example
+e6irc api GET /api/v1/me
+e6irc --server irc.example:6697 --tls --oauth-from-cache \
+  tail '#e6irc' --json
+e6irc-tui --server irc.example:6697 --tls --oauth-from-cache \
+  --channel '#e6irc'
+```
+
+The cache records its issuing API origin, is replaced atomically, and is
+private to the current user (`0600` on Unix). `--token-file` or
+`E6IRC_TOKEN_FILE` selects an explicit location.
+
+## Native releases
+
+A tag exactly matching the workspace version (for example `v0.1.0`) publishes
+six archives: Linux, macOS, and Windows for x86-64 and ARM64. Each archive
+contains `e6ircd`, `e6irc`, `e6irc-tui`, this README, the license, and the
+systemd unit. `SHA256SUMS` checks transport integrity; GitHub build provenance
+binds each archive to its source and workflow:
+
+```sh
+grep 'e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS \
+  | sha256sum --check
+gh attestation verify e6irc-0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  -R e6qu/e6irc
 ```
 
 Optional features: `embed-web` (bake the built web client into the

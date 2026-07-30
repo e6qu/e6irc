@@ -1,10 +1,15 @@
 //! e6irc — a scripting-oriented IRC CLI. Non-interactive subcommands
 //! that connect, do one job, and exit with a clear status.
 
+mod http;
+
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use e6irc_client::token_cache::{default_token_path, load_token};
 use e6irc_client::{Authentication, ConnectionOptions, TerminalSafe};
+use serde::Serialize;
 
 /// IRC numerics that mean a JOIN was refused — so a `send`/`history` client
 /// bails with a clear error instead of waiting forever for a 366 that will
@@ -43,11 +48,39 @@ struct Cli {
     #[arg(long, short, default_value = "e6irc", global = true)]
     nick: String,
     /// SASL account (enables SASL PLAIN when set with --password).
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        requires = "password",
+        conflicts_with_all = ["oauth_token", "oauth_from_cache"]
+    )]
     account: Option<String>,
     /// SASL password.
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        requires = "account",
+        conflicts_with_all = ["oauth_token", "oauth_from_cache"]
+    )]
     password: Option<String>,
+    /// SASL OAUTHBEARER token.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["account", "password", "oauth_from_cache"]
+    )]
+    oauth_token: Option<String>,
+    /// Load the SASL OAUTHBEARER token created by `e6irc login`.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["account", "password", "oauth_token"]
+    )]
+    oauth_from_cache: bool,
+    /// Token-cache path for login, API authentication, or --oauth-from-cache.
+    /// Defaults to the current platform's private application-data directory.
+    #[arg(long, global = true)]
+    token_file: Option<PathBuf>,
     /// Connect over TLS (validating against the public CA set).
     #[arg(long, global = true)]
     tls: bool,
@@ -68,6 +101,9 @@ enum Command {
         /// Stop after N messages (0 = forever).
         #[arg(long, default_value_t = 0)]
         count: usize,
+        /// Emit one structured JSON object per message.
+        #[arg(long)]
+        json: bool,
     },
     /// Send raw lines read from stdin, then exit.
     Raw,
@@ -77,23 +113,29 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         count: usize,
     },
-    /// Make one authenticated REST API request and print the response
-    /// body. Plain HTTP only — front the API with a TLS-terminating proxy
-    /// for remote use. Exit status is nonzero on a non-2xx response.
+    /// Make one bounded authenticated HTTP/HTTPS REST API request and print
+    /// the response body. Exit status is nonzero on a non-2xx response.
     Api {
         /// HTTP method (GET, POST, DELETE, …).
         method: String,
         /// Request path, e.g. /api/v1/me/networks.
         path: String,
-        /// API base URL (http://host:port).
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
-        base: String,
-        /// Bearer token; falls back to the E6IRC_API_TOKEN env var.
+        /// API base URL. Defaults to the cached login origin, then localhost.
+        #[arg(long)]
+        base: Option<String>,
+        /// Bearer token; falls back to E6IRC_API_TOKEN, then the login cache.
         #[arg(long)]
         token: Option<String>,
         /// JSON request body (for POST/PUT).
         #[arg(long)]
         body: Option<String>,
+    },
+    /// Authorize this client through the server's device login page and cache
+    /// the resulting bearer token.
+    Login {
+        /// API origin hosting the device authorization endpoints.
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        base: String,
     },
 }
 
@@ -105,22 +147,25 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("e6irc: runtime: {e}");
+            eprintln!("e6irc: runtime: {}", terminal_safe(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
     match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("e6irc: {e}");
+            eprintln!("e6irc: {}", terminal_safe(&e.to_string()));
             ExitCode::FAILURE
         }
     }
 }
 
 async fn run(cli: Cli) -> std::io::Result<()> {
-    // The `api` command speaks HTTP, not IRC — handle it before the IRC
-    // connection is opened.
+    // HTTP-only commands run before any IRC transport is opened.
+    if let Command::Login { base } = &cli.command {
+        let cache_path = token_path(cli.token_file.as_deref())?;
+        return http::login(base, &cache_path).await;
+    }
     if let Command::Api {
         method,
         path,
@@ -129,22 +174,47 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         body,
     } = &cli.command
     {
-        return run_api(method, path, base, token.clone(), body.clone()).await;
+        return http::api(
+            method,
+            path,
+            base.as_deref(),
+            token.clone(),
+            body.clone(),
+            cli.token_file.as_deref(),
+        )
+        .await;
     }
 
-    let authentication = match (&cli.account, &cli.password) {
-        (Some(account), Some(password)) => Authentication::Plain {
+    let authentication = match (
+        &cli.account,
+        &cli.password,
+        &cli.oauth_token,
+        cli.oauth_from_cache,
+    ) {
+        (Some(account), Some(password), None, false) => Authentication::Plain {
             account: account.clone(),
             password: password.clone(),
         },
-        (None, None) => Authentication::None,
-        // One credential without the other is a mistake — registering
-        // unauthenticated instead of what the user asked for would be a silent
-        // fallback of a client-observable option.
+        (None, None, Some(token), false) => Authentication::OAuthBearer {
+            token: token.clone(),
+        },
+        (None, None, None, true) => {
+            let path = token_path(cli.token_file.as_deref())?;
+            let token = load_token(&path)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no cached token at {}; run e6irc login", path.display()),
+                )
+            })?;
+            Authentication::OAuthBearer {
+                token: token.access_token().to_owned(),
+            }
+        }
+        (None, None, None, false) => Authentication::None,
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "--account and --password must be given together",
+                "choose anonymous, paired --account/--password, --oauth-token, or --oauth-from-cache",
             ));
         }
     };
@@ -205,7 +275,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
             }
         }
-        Command::Tail { target, count } => {
+        Command::Tail {
+            target,
+            count,
+            json,
+        } => {
             if target.starts_with('#') {
                 conn.send_line(&format!("JOIN {target}")).await?;
             }
@@ -236,7 +310,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 {
                     let from = msg.source.as_deref().unwrap_or("?");
                     let text = msg.params.get(1).map(String::as_str).unwrap_or("");
-                    println!("{}\t{}", terminal_safe(from), terminal_safe(text));
+                    if json {
+                        println!("{}", tail_json(&msg, from, text)?);
+                    } else {
+                        println!("{}\t{}", terminal_safe(from), terminal_safe(text));
+                    }
                     seen += 1;
                     if count != 0 && seen >= count {
                         break;
@@ -253,100 +331,21 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             }
         }
         Command::History { target, count } => {
-            // History playback needs batch + chathistory; the plain
-            // register() above didn't negotiate them, so do it here.
-            conn.send_line("CAP LS 302").await?;
-            conn.send_line("CAP REQ :batch draft/chathistory server-time")
+            conn.require_capabilities(&["batch", "draft/chathistory", "server-time"])
                 .await?;
-            // Wait for the ACK, failing loudly on NAK (the whole atomic REQ is
-            // rejected if any cap is unsupported) or a mid-negotiation close —
-            // otherwise this would block forever. Answer PINGs so the server
-            // doesn't ping-timeout us while we wait.
-            loop {
-                let Some(m) = conn.next_message_lossy().await? else {
-                    return Err(std::io::Error::other(
-                        "connection closed during CAP negotiation",
-                    ));
-                };
-                if m.command == "CAP" {
-                    match m.params.get(1).map(String::as_str) {
-                        Some("ACK") => break,
-                        Some("NAK") => {
-                            return Err(std::io::Error::other(
-                                "server does not support the caps required for history \
-                                 (batch, draft/chathistory, server-time)",
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                if m.command == "PING" {
-                    let token = m.params.first().cloned().unwrap_or_default();
-                    conn.send_line(&format!("PONG :{token}")).await?;
-                }
-            }
-            // CHATHISTORY requires channel membership.
-            conn.send_line(&format!("JOIN {target}")).await?;
-            loop {
-                // A close before 366 means no history was fetched — falling
-                // through would run CHATHISTORY on a dead socket and exit 0
-                // with empty output.
-                let Some(m) = conn.next_message_lossy().await? else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!("connection closed before the join to {target} was confirmed"),
-                    ));
-                };
-                if m.command == "366" {
-                    break;
-                }
-                if is_join_error(&m.command) {
-                    let reason = terminal_safe(&m.params.last().cloned().unwrap_or_default());
-                    return Err(std::io::Error::other(format!(
-                        "cannot join {target}: {reason}"
-                    )));
-                }
-                if m.command == "PING" {
-                    let token = m.params.first().cloned().unwrap_or_default();
-                    conn.send_line(&format!("PONG :{token}")).await?;
-                }
-            }
-            conn.send_line(&format!("CHATHISTORY LATEST {target} * {count}"))
-                .await?;
-            let mut in_batch = false;
-            while let Some(m) = conn.next_message_lossy().await? {
-                match m.command.as_str() {
-                    "PING" => {
-                        let token = m.params.first().cloned().unwrap_or_default();
-                        conn.send_line(&format!("PONG :{token}")).await?;
-                    }
-                    "BATCH" => {
-                        let opened = m
-                            .params
-                            .first()
-                            .map(|p| p.starts_with('+'))
-                            .unwrap_or(false);
-                        in_batch = opened;
-                        if !opened {
-                            break; // batch closed
-                        }
-                    }
-                    "PRIVMSG" | "NOTICE" if in_batch => {
-                        let from = m
-                            .source
-                            .as_deref()
-                            .and_then(|s| s.split('!').next())
-                            .unwrap_or("?");
-                        let text = m.params.get(1).map(String::as_str).unwrap_or("");
-                        println!("{}\t{}", terminal_safe(from), terminal_safe(text));
-                    }
-                    "FAIL" => {
-                        return Err(std::io::Error::other(format!(
-                            "CHATHISTORY failed: {}",
-                            terminal_safe(&m.params.join(" "))
-                        )));
-                    }
-                    _ => {}
+            for message in conn.join_with_latest_history(&target, count).await? {
+                if matches!(message.command.as_str(), "PRIVMSG" | "NOTICE")
+                    && message.params.first().is_some_and(|candidate| {
+                        e6irc_proto::casemap::CaseMapping::Rfc1459.eq(candidate, &target)
+                    })
+                {
+                    let from = message
+                        .source
+                        .as_deref()
+                        .and_then(|source| source.split('!').next())
+                        .unwrap_or("?");
+                    let text = message.params.get(1).map(String::as_str).unwrap_or("");
+                    println!("{}\t{}", terminal_safe(from), terminal_safe(text));
                 }
             }
             conn.send_line("QUIT :done").await?;
@@ -385,139 +384,125 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             conn.send_line("QUIT :done").await?;
             while conn.next_message_lossy().await?.is_some() {}
         }
-        Command::Api { .. } => unreachable!("handled before the IRC connect"),
+        Command::Api { .. } | Command::Login { .. } => {
+            unreachable!("handled before the IRC connect")
+        }
     }
     Ok(())
 }
 
-/// Largest API response body this will read. Generous for the JSON the API
-/// returns; the point is that some number bounds it.
-const MAX_API_RESPONSE: usize = 16 * 1024 * 1024;
+fn token_path(explicit: Option<&Path>) -> std::io::Result<PathBuf> {
+    explicit
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(default_token_path)
+}
 
-/// Minimal HTTP/1.1 client for one request/response over a `Connection:
-/// close` socket. Plain HTTP only; TLS termination belongs to a proxy.
-async fn run_api(
-    method: &str,
-    path: &str,
-    base: &str,
-    token: Option<String>,
-    body: Option<String>,
-) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+#[derive(Serialize)]
+struct JsonTag<'a> {
+    key: &'a str,
+    value: Option<&'a str>,
+}
 
-    let authority = base.strip_prefix("http://").ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "api base must start with http:// (use a TLS-terminating proxy for https)",
-        )
-    })?;
-    let authority = authority.trim_end_matches('/');
-    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    let addr = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:80")
-    };
+#[derive(Serialize)]
+struct JsonTail<'a> {
+    source: &'a str,
+    target: &'a str,
+    text: &'a str,
+    tags: Vec<JsonTag<'a>>,
+}
 
-    let token = token.or_else(|| std::env::var("E6IRC_API_TOKEN").ok());
-    let body = body.unwrap_or_default();
-
-    // These three go into the request head verbatim. This is a scripting CLI —
-    // a path or token is routinely built from a shell variable — so a CR or LF
-    // in one would let that variable append headers or a second request. Reject
-    // it here rather than sending something other than what was asked for.
-    for (what, value) in [
-        ("method", method),
-        ("path", path),
-        ("token", token.as_deref().unwrap_or("")),
-    ] {
-        if value.contains(['\r', '\n']) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{what} contains a line break"),
-            ));
-        }
-    }
-
-    let mut req = format!(
-        "{} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
-        method.to_ascii_uppercase()
-    );
-    if let Some(t) = &token {
-        req.push_str(&format!("Authorization: Bearer {t}\r\n"));
-    }
-    if !body.is_empty() {
-        req.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
-            body.len()
-        ));
-    }
-    req.push_str("\r\n");
-    req.push_str(&body);
-
-    let mut stream = TcpStream::connect(&addr).await?;
-    stream.write_all(req.as_bytes()).await?;
-    // Bounded: the response length is the server's choice, and reading to end
-    // lets it decide how much memory this process uses. Over the cap is an
-    // error, not a truncation — half a JSON document on a script's stdin is
-    // worse than a failure.
-    let mut buf = Vec::new();
-    let read = (&mut stream)
-        .take(MAX_API_RESPONSE as u64 + 1)
-        .read_to_end(&mut buf)
-        .await?;
-    if read > MAX_API_RESPONSE {
-        return Err(std::io::Error::other(format!(
-            "API response exceeds {MAX_API_RESPONSE} bytes"
-        )));
-    }
-
-    let text = String::from_utf8_lossy(&buf);
-    let (head, resp_body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
-
-    print!("{resp_body}");
-    if !resp_body.ends_with('\n') {
-        println!();
-    }
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "API request failed: HTTP {status}"
-        )))
-    }
+fn tail_json(
+    message: &e6irc_client::OwnedMessage,
+    source: &str,
+    text: &str,
+) -> std::io::Result<String> {
+    let target = message.params.first().map(String::as_str).unwrap_or("");
+    let tags = message
+        .tags
+        .iter()
+        .map(|(key, value)| JsonTag {
+            key,
+            value: value.as_deref(),
+        })
+        .collect();
+    serde_json::to_string(&JsonTail {
+        source,
+        target,
+        text,
+        tags,
+    })
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The guard runs before the socket is opened, so an injected line break is
-    /// refused without a connection — which is also what makes this testable.
-    #[tokio::test]
-    async fn api_rejects_line_breaks_in_the_request_head() {
-        for (method, path, token) in [
-            ("GET\r\nX-Evil: 1", "/api/v1/me", None),
-            ("GET", "/api/v1/me\r\nX-Evil: 1", None),
-            ("GET", "/api/v1/me", Some("t\r\nX-Evil: 1".to_string())),
-        ] {
-            let err = run_api(method, path, "http://127.0.0.1:1", token, None)
-                .await
-                .expect_err("a line break must be refused");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{path}");
-        }
-    }
-
     #[test]
     fn join_errors_are_recognized() {
         assert!(is_join_error("475"));
         assert!(!is_join_error("366"));
+    }
+
+    #[test]
+    fn authentication_shapes_are_explicit() {
+        assert!(Cli::try_parse_from(["e6irc", "send", "nick", "hello"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "e6irc",
+                "--account",
+                "alice",
+                "--password",
+                "secret",
+                "send",
+                "nick",
+                "hello",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["e6irc", "--oauth-token", "token", "send", "nick", "hello",])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["e6irc", "--oauth-from-cache", "send", "nick", "hello",]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["e6irc", "--account", "alice", "send", "nick", "hello"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "e6irc",
+                "--oauth-token",
+                "token",
+                "--oauth-from-cache",
+                "send",
+                "nick",
+                "hello",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn json_tail_is_structured_and_escapes_controls() {
+        let message = e6irc_client::OwnedMessage {
+            tags: vec![
+                ("time".into(), Some("2026-07-30T00:00:00.000Z".into())),
+                ("flag".into(), None),
+            ],
+            source: Some("alice!u@h".into()),
+            command: "PRIVMSG".into(),
+            params: vec!["#room".into(), "hello\u{1b}[2J".into()],
+        };
+        let output = tail_json(&message, "alice!u@h", &message.params[1]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["source"], "alice!u@h");
+        assert_eq!(parsed["target"], "#room");
+        assert_eq!(parsed["text"], "hello\u{1b}[2J");
+        assert_eq!(parsed["tags"][1]["key"], "flag");
+        assert_eq!(parsed["tags"][1]["value"], serde_json::Value::Null);
+        assert!(!output.contains('\u{1b}'), "control must be JSON-escaped");
     }
 }

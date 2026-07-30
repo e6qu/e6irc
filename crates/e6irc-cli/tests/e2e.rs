@@ -82,6 +82,74 @@ async fn cli_send_reaches_a_tailing_client() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_json_tail_is_machine_safe_against_a_real_server() {
+    let addr = start_server().await;
+    let mut sender = Connection::connect(&addr.to_string())
+        .await
+        .expect("connect");
+    sender.register("sender", "sender").await.expect("register");
+    sender.send_line("JOIN #json").await.expect("join");
+    loop {
+        let message = sender.next_message().await.unwrap().unwrap();
+        if message.command == "366" {
+            break;
+        }
+    }
+
+    let bin = env!("CARGO_BIN_EXE_e6irc");
+    let tail = tokio::task::spawn_blocking({
+        let addr = addr.to_string();
+        move || {
+            Command::new(bin)
+                .args([
+                    "--server",
+                    &addr,
+                    "--nick",
+                    "jsonreader",
+                    "tail",
+                    "#json",
+                    "--count",
+                    "1",
+                    "--json",
+                ])
+                .output()
+                .expect("run JSON tail")
+        }
+    });
+    loop {
+        let message = sender.next_message().await.unwrap().unwrap();
+        if message.command == "JOIN"
+            && message
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("jsonreader!"))
+        {
+            break;
+        }
+    }
+    sender
+        .send_line("PRIVMSG #json :machine-safe")
+        .await
+        .unwrap();
+    let output = tail.await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        value["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("sender!")),
+        "{value}"
+    );
+    assert_eq!(value["target"], "#json");
+    assert_eq!(value["text"], "machine-safe");
+    assert!(value["tags"].is_array());
+}
+
 /// `send` to a nick nobody holds draws a 401 after the PRIVMSG; the exit code
 /// is this tool's product, so that delivery failure must be a non-zero exit —
 /// it used to be silently drained on the way out, reporting success for a
@@ -135,7 +203,9 @@ async fn cli_sasl_login() {
     e6ircd::db::create_account(&pool, "cliuser", "clipass")
         .await
         .expect("create");
-    drop(pool);
+    let oauth_token = e6ircd::db::issue_api_token(&pool, "cliuser", "cli-e2e")
+        .await
+        .expect("issue OAuth token");
 
     let config = e6ircd::config::Config {
         server_name: "irc.clisasl.example".into(),
@@ -145,11 +215,18 @@ async fn cli_sasl_login() {
             tls: None,
             websocket: false,
         }],
+        http: Some(e6ircd::config::HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
         database: Some(e6ircd::config::DatabaseConfig { url }),
         ..e6ircd::config::Config::default()
     };
     let running = e6ircd::net::start(config).await.expect("start");
     let addr = running.addrs[0];
+    let http = running.http_addr.expect("HTTP listener");
 
     // observer joins to receive the CLI's authenticated message
     let mut observer = Connection::connect(&addr.to_string())
@@ -200,6 +277,120 @@ async fn cli_sasl_login() {
         }
     };
     assert_eq!(got.params.get(1).map(String::as_str), Some("authed hello"));
+
+    let token_directory =
+        std::env::temp_dir().join(format!("e6irc-cli-oauth-{}", std::process::id()));
+    let token_path = token_directory.join("token.json");
+    let cached =
+        e6irc_client::token_cache::CachedToken::new("http://127.0.0.1:1".into(), oauth_token)
+            .unwrap();
+    e6irc_client::token_cache::store_token(&token_path, &cached).unwrap();
+    let status = tokio::task::spawn_blocking({
+        let addr = addr.to_string();
+        let token_path = token_path.clone();
+        move || {
+            Command::new(bin)
+                .args(["--server", &addr, "--nick", "oauthcli"])
+                .arg("--oauth-from-cache")
+                .arg("--token-file")
+                .arg(token_path)
+                .args(["send", "#s", "oauth hello"])
+                .status()
+                .expect("run OAuth CLI")
+        }
+    })
+    .await
+    .expect("join");
+    assert!(status.success(), "CLI OAuth send failed");
+    let got = loop {
+        let message = observer.next_message().await.expect("read").expect("msg");
+        if message.command == "PRIVMSG"
+            && message.params.get(1).map(String::as_str) == Some("oauth hello")
+        {
+            break message;
+        }
+    };
+    assert!(
+        got.source.as_deref().unwrap_or("").starts_with("oauthcli!"),
+        "{got:?}"
+    );
+
+    // Drive the shipped device-login command against the real HTTP and
+    // PostgreSQL implementation. Approval is the one user action; the test
+    // performs it through the same database primitive used by the approval
+    // page, then proves the resulting cache authenticates an API request.
+    let device_path = token_directory.join("device-token.json");
+    let device_path_for_child = device_path.clone();
+    let base = format!("http://{http}");
+    let base_for_child = base.clone();
+    let (code_sender, code_receiver) = std::sync::mpsc::sync_channel(1);
+    let login = tokio::task::spawn_blocking(move || {
+        use std::io::{BufRead as _, BufReader};
+        use std::process::Stdio;
+
+        let mut child = Command::new(bin)
+            .arg("--token-file")
+            .arg(device_path_for_child)
+            .args(["login", "--base", &base_for_child])
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start device login");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let mut transcript = Vec::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.expect("read device-login stderr");
+            if let Some((_, code)) = line.rsplit_once(" and enter ") {
+                code_sender.send(code.to_owned()).expect("send user code");
+            }
+            transcript.push(line);
+        }
+        let status = child.wait().expect("wait for device login");
+        (status, transcript.join("\n"))
+    });
+    let user_code = tokio::task::spawn_blocking(move || {
+        code_receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("CLI did not print a device user code")
+    })
+    .await
+    .expect("receive task");
+    assert!(
+        e6ircd::db::approve_device_grant(&pool, &user_code, "cliuser")
+            .await
+            .expect("approve grant"),
+        "device grant was not pending"
+    );
+    let (status, transcript) = login.await.expect("device login task");
+    assert!(status.success(), "device login failed: {transcript}");
+    let cached = e6irc_client::token_cache::load_token(&device_path)
+        .unwrap()
+        .expect("device token cache");
+    assert_eq!(cached.base_url(), base);
+
+    let output = tokio::task::spawn_blocking({
+        let device_path = device_path.clone();
+        move || {
+            Command::new(bin)
+                .arg("--token-file")
+                .arg(device_path)
+                .args(["api", "GET", "/api/v1/me"])
+                .output()
+                .expect("use device token")
+        }
+    })
+    .await
+    .expect("API task");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("cliuser"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    std::fs::remove_dir_all(token_directory).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -385,6 +576,32 @@ async fn cli_api_hits_rest_endpoints() {
         String::from_utf8_lossy(&out.stdout).contains("ok"),
         "{:?}",
         String::from_utf8_lossy(&out.stdout)
+    );
+
+    // An explicitly supplied token must make the cache irrelevant. This is
+    // important in minimal service/container environments with no home
+    // directory from which a default cache path could be derived.
+    #[cfg(unix)]
+    let out = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || {
+            Command::new(bin)
+                .env_remove("HOME")
+                .env_remove("XDG_CONFIG_HOME")
+                .args([
+                    "api", "GET", "/healthz", "--base", &base, "--token", "explicit",
+                ])
+                .output()
+                .expect("run API with explicit token")
+        }
+    })
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     // /api/v1/server -> JSON with server_name

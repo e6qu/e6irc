@@ -35,6 +35,11 @@ impl LogLine {
 pub struct Buffer {
     pub name: String,
     pub log: Vec<LogLine>,
+    seen_msgids: std::collections::HashSet<String>,
+    msgid_order: std::collections::VecDeque<String>,
+    latest_time: Option<String>,
+    read_marker: Option<String>,
+    unread: usize,
     /// Scrollback offset in lines from the bottom (0 = following live).
     scroll: usize,
 }
@@ -44,6 +49,11 @@ impl Buffer {
         Self {
             name,
             log: Vec::new(),
+            seen_msgids: std::collections::HashSet::new(),
+            msgid_order: std::collections::VecDeque::new(),
+            latest_time: None,
+            read_marker: None,
+            unread: 0,
             scroll: 0,
         }
     }
@@ -68,6 +78,22 @@ impl Buffer {
         }
     }
 
+    fn accept_msgid(&mut self, msgid: Option<&str>) -> bool {
+        let Some(msgid) = msgid else {
+            return true;
+        };
+        if !self.seen_msgids.insert(msgid.to_owned()) {
+            return false;
+        }
+        self.msgid_order.push_back(msgid.to_owned());
+        if self.msgid_order.len() > SCROLLBACK_LINES
+            && let Some(expired) = self.msgid_order.pop_front()
+        {
+            self.seen_msgids.remove(&expired);
+        }
+        true
+    }
+
     pub fn scroll_up(&mut self, n: usize) {
         self.scroll = (self.scroll + n).min(self.log.len().saturating_sub(1));
     }
@@ -78,6 +104,10 @@ impl Buffer {
 
     pub fn scrolled_back(&self) -> bool {
         self.scroll > 0
+    }
+
+    pub fn unread(&self) -> usize {
+        self.unread
     }
 
     /// The window of lines to render for a pane `height` rows tall.
@@ -102,6 +132,8 @@ pub struct App {
     pub input: String,
     pub should_quit: bool,
     connected: bool,
+    pending_read_marker: Option<String>,
+    invalid_time_reported: bool,
     /// The buffer cap has been reported to the user; say it once, not per line.
     buffer_limit_reported: bool,
 }
@@ -123,6 +155,8 @@ impl App {
             input: String::new(),
             should_quit: false,
             connected: true,
+            pending_read_marker: None,
+            invalid_time_reported: false,
             buffer_limit_reported: false,
         }
     }
@@ -144,7 +178,9 @@ impl App {
 
     /// Index of the buffer named `name`, if open.
     fn buffer_index(&self, name: &str) -> Option<usize> {
-        self.buffers.iter().position(|b| b.name == name)
+        self.buffers
+            .iter()
+            .position(|buffer| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&buffer.name, name))
     }
 
     /// Open a buffer (or focus it if already open) and return its index.
@@ -169,12 +205,14 @@ impl App {
     pub fn next_buffer(&mut self) {
         if !self.buffers.is_empty() {
             self.current = (self.current + 1) % self.buffers.len();
+            self.focus_current();
         }
     }
 
     pub fn prev_buffer(&mut self) {
         if !self.buffers.is_empty() {
             self.current = (self.current + self.buffers.len() - 1) % self.buffers.len();
+            self.focus_current();
         }
     }
 
@@ -202,7 +240,7 @@ impl App {
                 let text = msg.params.get(1).cloned().unwrap_or_default();
                 // A channel message lands in that channel's buffer; a PM to
                 // us opens/uses a query buffer named after the sender.
-                let buffer = if target == self.nick {
+                let buffer = if e6irc_proto::casemap::CaseMapping::Rfc1459.eq(&target, &self.nick) {
                     sender.clone()
                 } else {
                     target
@@ -211,7 +249,26 @@ impl App {
                     self.note_buffer_limit();
                     return;
                 };
+                if !self.buffers[idx].accept_msgid(msg.tag("msgid")) {
+                    return;
+                }
                 self.buffers[idx].push(LogLine::new(&sender, &text));
+                if let Some(raw_time) = msg.tag("time") {
+                    if let Some(millis) = e6irc_proto::time::parse_server_time_millis(raw_time) {
+                        self.buffers[idx].latest_time =
+                            Some(e6irc_proto::time::server_time(millis));
+                    } else if !self.invalid_time_reported {
+                        self.invalid_time_reported = true;
+                        self.status(
+                            "server sent an invalid time tag; read position was not advanced",
+                        );
+                    }
+                }
+                if idx == self.current {
+                    self.queue_current_marker();
+                } else {
+                    self.buffers[idx].unread = self.buffers[idx].unread.saturating_add(1);
+                }
             }
             "JOIN" => {
                 if let Some(chan) = msg.params.first().cloned() {
@@ -241,8 +298,54 @@ impl App {
                     }
                 }
             }
+            "MARKREAD" => {
+                let Some(target) = msg.params.first() else {
+                    return;
+                };
+                let Some(index) = self.buffer_index(target) else {
+                    return;
+                };
+                let marker = msg
+                    .params
+                    .get(1)
+                    .and_then(|value| value.strip_prefix("timestamp="))
+                    .and_then(e6irc_proto::time::parse_server_time_millis)
+                    .map(e6irc_proto::time::server_time);
+                let reaches_latest = marker.as_ref().is_some_and(|marker| {
+                    self.buffers[index]
+                        .latest_time
+                        .as_ref()
+                        .is_none_or(|latest| marker >= latest)
+                });
+                self.buffers[index].read_marker = marker;
+                if reaches_latest {
+                    self.buffers[index].unread = 0;
+                }
+            }
             _ => {}
         }
+    }
+
+    fn focus_current(&mut self) {
+        self.buffers[self.current].unread = 0;
+        self.queue_current_marker();
+    }
+
+    fn queue_current_marker(&mut self) {
+        let buffer = &mut self.buffers[self.current];
+        let Some(latest) = buffer.latest_time.clone() else {
+            return;
+        };
+        if buffer.read_marker.as_deref() == Some(latest.as_str()) {
+            return;
+        }
+        self.pending_read_marker = Some(format!("MARKREAD {} timestamp={latest}", buffer.name));
+    }
+
+    /// Take the latest coalesced marker update. Multiple messages between UI
+    /// polls become one durable MARKREAD write.
+    pub fn take_read_marker_command(&mut self) -> Option<String> {
+        self.pending_read_marker.take()
     }
 
     /// Say once that the buffer limit stopped a new buffer from opening. Said
@@ -297,15 +400,23 @@ impl App {
                     return Action::None;
                 };
                 self.current = idx;
+                self.focus_current();
                 return Action::Send(format!("JOIN {chan}"));
             }
             return Action::None;
         }
         if let Some(rest) = line.strip_prefix("/win ").map(str::trim) {
-            if let Ok(n) = rest.parse::<usize>()
-                && n < self.buffers.len()
-            {
-                self.current = n;
+            let target = rest
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                .filter(|index| *index < self.buffers.len())
+                .or_else(|| self.buffer_index(rest));
+            if let Some(index) = target {
+                self.current = index;
+                self.focus_current();
+            } else {
+                self.status(format!("no buffer named or numbered {rest}"));
             }
             return Action::None;
         }
@@ -428,9 +539,17 @@ mod tests {
     #[test]
     fn private_message_opens_a_query_named_for_the_sender() {
         let mut app = App::new("#c".into(), "me".into());
-        app.on_message(&msg(":al!a@h PRIVMSG me :psst"));
+        app.on_message(&msg(":al!a@h PRIVMSG ME :psst"));
         let i = app.buffer_index("al").expect("query buffer");
         assert_eq!(app.buffers[i].log[0].text, "psst");
+    }
+
+    #[test]
+    fn rfc1459_equivalent_names_share_one_buffer() {
+        let mut app = App::new("#[room]".into(), "me".into());
+        app.on_message(&msg(":a!a@h PRIVMSG #{ROOM} :same channel"));
+        assert_eq!(app.buffers.len(), 1);
+        assert_eq!(app.current().log[0].text, "same channel");
     }
 
     #[test]
@@ -491,6 +610,29 @@ mod tests {
     }
 
     #[test]
+    fn slash_win_uses_displayed_one_based_number_or_name() {
+        let mut app = App::new("#a".into(), "me".into());
+        app.on_message(&msg(":x!x@h PRIVMSG #b :hi"));
+        app.input = "/win 2".into();
+        assert_eq!(app.on_enter(), Action::None);
+        assert_eq!(app.current().name, "#b");
+        app.input = "/win #A".into();
+        assert_eq!(app.on_enter(), Action::None);
+        assert_eq!(app.current().name, "#a");
+        app.input = "/win 0".into();
+        assert_eq!(app.on_enter(), Action::None);
+        assert!(
+            app.current()
+                .log
+                .last()
+                .unwrap()
+                .text
+                .as_str()
+                .contains("no buffer named or numbered")
+        );
+    }
+
+    #[test]
     fn slash_quit_exits() {
         let mut app = App::new("#c".into(), "me".into());
         for ch in "/quit".chars() {
@@ -516,5 +658,78 @@ mod tests {
         assert_eq!(app.current().visible(3).last().unwrap().text, "line7");
         app.scroll_down(1000);
         assert_eq!(app.current().visible(3).last().unwrap().text, "fresh");
+    }
+
+    #[test]
+    fn read_markers_coalesce_and_unread_clears_only_when_reached() {
+        let mut app = App::new("#a".into(), "me".into());
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :one",
+        ));
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:01.000Z :alice!u@h PRIVMSG #a :two",
+        ));
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #a timestamp=2026-07-30T12:00:01.000Z")
+        );
+        assert!(app.take_read_marker_command().is_none());
+
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:02.000Z :alice!u@h PRIVMSG #b :unread",
+        ));
+        let b = app.buffer_index("#b").unwrap();
+        assert_eq!(app.buffers[b].unread(), 1);
+        app.on_message(&msg(
+            ":irc.example MARKREAD #b timestamp=2026-07-30T12:00:01.000Z",
+        ));
+        assert_eq!(app.buffers[b].unread(), 1, "an older marker is not read");
+        app.on_message(&msg(
+            ":irc.example MARKREAD #b timestamp=2026-07-30T12:00:02.000Z",
+        ));
+        assert_eq!(app.buffers[b].unread(), 0);
+
+        app.on_message(&msg(
+            "@time=2026-07-30T12:00:03.000Z :alice!u@h PRIVMSG #c :focus me",
+        ));
+        app.next_buffer();
+        assert!(app.take_read_marker_command().is_none());
+        app.next_buffer();
+        assert_eq!(
+            app.take_read_marker_command().as_deref(),
+            Some("MARKREAD #c timestamp=2026-07-30T12:00:03.000Z")
+        );
+    }
+
+    #[test]
+    fn invalid_server_time_is_reported_once_and_never_replayed() {
+        let mut app = App::new("#a".into(), "me".into());
+        app.on_message(&msg("@time=bad :alice!u@h PRIVMSG #a :one"));
+        app.on_message(&msg("@time=also-bad :alice!u@h PRIVMSG #a :two"));
+        assert!(app.take_read_marker_command().is_none());
+        assert_eq!(
+            app.current()
+                .log
+                .iter()
+                .filter(|line| line.text.as_str().contains("invalid time tag"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_history_overlap_is_deduplicated_by_msgid() {
+        let mut app = App::new("#a".into(), "me".into());
+        let line = "@msgid=same;time=2026-07-30T12:00:00.000Z :alice!u@h PRIVMSG #a :once";
+        app.on_message(&msg(line));
+        app.on_message(&msg(&format!("@batch=history;{}", &line[1..])));
+        assert_eq!(
+            app.current()
+                .log
+                .iter()
+                .filter(|entry| entry.text.as_str() == "once")
+                .count(),
+            1
+        );
     }
 }

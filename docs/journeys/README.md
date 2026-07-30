@@ -20,7 +20,7 @@ piece in isolation does not prove the outcome a user experiences.
 | Channel founder | IRC services, registered-channel console/API | Account authentication plus founder/access checks |
 | IRC operator | IRC operator commands | `OPER` against managed operator configuration |
 | Administrator | Operational console and `/api/v1/admin/*`, including exact live-connection control | Account in the configured administrator set |
-| Native-client user | `e6irc`, `e6irc-tui`, or another client using `e6irc-client` | The capabilities exposed by that binary; these differ today |
+| Native-client user | `e6irc`, `e6irc-tui`, or another client using `e6irc-client` | Anonymous, SASL PLAIN, or direct/device-cached SASL OAUTHBEARER |
 | Automation/device client | REST API and RFC 8628 device authorization endpoints | Personal access token or an approved device token |
 | Bridge operator | Integrations console and managed network configuration | Administrator session |
 | Deployer/operator | `e6ircd`, migrations, container, probes, logs, metrics | Host/container and database access |

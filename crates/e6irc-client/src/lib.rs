@@ -7,6 +7,8 @@
 
 #![deny(clippy::let_underscore_must_use)]
 
+pub mod token_cache;
+
 use std::io;
 
 use e6irc_proto::framing::{LineBuffer, LineEvent};
@@ -78,6 +80,17 @@ pub struct OwnedMessage {
     pub source: Option<String>,
     pub command: String,
     pub params: Vec<String>,
+}
+
+impl OwnedMessage {
+    /// Look up one IRCv3 tag without exposing representation details to every
+    /// client state machine.
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .and_then(|(_, value)| value.as_deref())
+    }
 }
 
 /// Authentication selected for a registered client connection.
@@ -626,6 +639,181 @@ impl Connection {
         self.send_line("CAP END").await?;
         self.await_welcome(nick).await
     }
+
+    /// Require an atomic set of capabilities on an already registered
+    /// connection. A server NAK is a visible feature error, never a silent
+    /// downgrade.
+    pub async fn require_capabilities(&mut self, capabilities: &[&str]) -> io::Result<()> {
+        if capabilities.is_empty() {
+            return Ok(());
+        }
+        self.send_line(&format!("CAP REQ :{}", capabilities.join(" ")))
+            .await?;
+        loop {
+            let msg = self.recv("closed during capability negotiation").await?;
+            match msg.command.as_str() {
+                "CAP" => match msg.params.get(1).map(String::as_str) {
+                    Some("ACK") => {
+                        let acknowledged = msg.params.last().map(String::as_str).unwrap_or("");
+                        let all_acknowledged = capabilities.iter().all(|required| {
+                            acknowledged
+                                .split_whitespace()
+                                .any(|capability| capability == *required)
+                        });
+                        if all_acknowledged {
+                            return Ok(());
+                        }
+                        return Err(io::Error::other(format!(
+                            "server capability ACK omitted a requested capability: {}",
+                            capabilities.join(" ")
+                        )));
+                    }
+                    Some("NAK") => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!(
+                                "server does not support required capabilities: {}",
+                                capabilities.join(" ")
+                            ),
+                        ));
+                    }
+                    _ => {}
+                },
+                "410" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "server rejected capability negotiation",
+                    ));
+                }
+                _ => {
+                    self.answer_ping(&msg).await?;
+                }
+            }
+        }
+    }
+
+    /// Join one channel, wait for confirmation, and load its latest
+    /// CHATHISTORY batch. Messages observed during JOIN and playback are
+    /// returned in wire order so a UI can build state before its first draw.
+    pub async fn join_with_history(
+        &mut self,
+        target: &str,
+        history_count: usize,
+    ) -> io::Result<Vec<OwnedMessage>> {
+        self.join_history(target, history_count, true).await
+    }
+
+    /// Join one channel and load the latest bounded history window regardless
+    /// of its shared read marker. This is the scripting/history-inspection
+    /// shape; interactive clients normally want [`Connection::join_with_history`]
+    /// so reconnect resumes where the user stopped reading.
+    pub async fn join_with_latest_history(
+        &mut self,
+        target: &str,
+        history_count: usize,
+    ) -> io::Result<Vec<OwnedMessage>> {
+        self.join_history(target, history_count, false).await
+    }
+
+    async fn join_history(
+        &mut self,
+        target: &str,
+        history_count: usize,
+        resume_after_marker: bool,
+    ) -> io::Result<Vec<OwnedMessage>> {
+        self.send_line(&format!("JOIN {target}")).await?;
+        let mut messages = Vec::new();
+        loop {
+            let msg = self.recv("closed before JOIN was confirmed").await?;
+            if is_join_refusal(&msg.command) {
+                let detail = msg.params.last().map(String::as_str).unwrap_or("");
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("cannot join {target}: {detail}"),
+                ));
+            }
+            let joined = msg.command == "366"
+                && msg
+                    .params
+                    .iter()
+                    .any(|value| e6irc_proto::casemap::CaseMapping::Rfc1459.eq(value, target));
+            self.answer_ping(&msg).await?;
+            if msg.command != "PING" {
+                messages.push(msg);
+            }
+            if joined {
+                break;
+            }
+        }
+        if history_count == 0 {
+            return Ok(messages);
+        }
+
+        let read_marker = if resume_after_marker {
+            messages.iter().rev().find_map(|message| {
+                (message.command == "MARKREAD"
+                    && message.params.first().is_some_and(|candidate| {
+                        e6irc_proto::casemap::CaseMapping::Rfc1459.eq(candidate, target)
+                    }))
+                .then(|| message.params.get(1))
+                .flatten()
+                .and_then(|marker| marker.strip_prefix("timestamp="))
+                .and_then(e6irc_proto::time::parse_server_time_millis)
+                .map(e6irc_proto::time::server_time)
+            })
+        } else {
+            None
+        };
+        let request = match read_marker {
+            Some(marker) => {
+                format!("CHATHISTORY AFTER {target} timestamp={marker} {history_count}")
+            }
+            None => format!("CHATHISTORY LATEST {target} * {history_count}"),
+        };
+        self.send_line(&request).await?;
+        let mut history_batch = None;
+        loop {
+            let msg = self.recv("closed during CHATHISTORY playback").await?;
+            self.answer_ping(&msg).await?;
+            if msg.command == "FAIL"
+                && msg
+                    .params
+                    .first()
+                    .is_some_and(|command| command == "CHATHISTORY")
+            {
+                return Err(io::Error::other(format!(
+                    "CHATHISTORY failed: {}",
+                    msg.params.join(" ")
+                )));
+            }
+            if msg.command == "BATCH"
+                && let Some(reference) = msg.params.first()
+            {
+                if let Some(opened) = reference.strip_prefix('+')
+                    && msg.params.get(1).is_some_and(|kind| kind == "chathistory")
+                {
+                    history_batch = Some(opened.to_owned());
+                    continue;
+                }
+                if let Some(closed) = reference.strip_prefix('-')
+                    && history_batch.as_deref() == Some(closed)
+                {
+                    break;
+                }
+            }
+            if msg.command != "PING" {
+                messages.push(msg);
+            }
+        }
+        Ok(messages)
+    }
+}
+
+fn is_join_refusal(command: &str) -> bool {
+    matches!(
+        command,
+        "403" | "405" | "471" | "473" | "474" | "475" | "476" | "477" | "480"
+    )
 }
 
 /// Map a registration-refusal numeric to a terminal error, if it is one. These
@@ -813,5 +1001,96 @@ mod tests {
 
         drop(conn);
         drop(sw);
+    }
+
+    async fn assert_history_request(expected_request: &'static str, resume_after_marker: bool) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let server = tokio::spawn(async move {
+            let (sr, mut sw) = tokio::io::split(server_io);
+            let mut lines = tokio::io::BufReader::new(sr).lines();
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                "CAP REQ :batch draft/chathistory server-time draft/read-marker"
+            );
+            sw.write_all(
+                b":srv CAP nick ACK :batch draft/chathistory server-time draft/read-marker\r\n",
+            )
+            .await
+            .unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "JOIN #Room");
+            sw.write_all(b":nick!u@h JOIN #Room\r\n").await.unwrap();
+            sw.write_all(b":srv MARKREAD #Room timestamp=2026-07-30T12:00:00.000Z\r\n")
+                .await
+                .unwrap();
+            sw.write_all(b":srv 366 nick #Room :End of NAMES\r\n")
+                .await
+                .unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), expected_request);
+            sw.write_all(b":srv BATCH +history chathistory #Room\r\n")
+                .await
+                .unwrap();
+            sw.write_all(
+                b"@batch=history;time=2026-07-30T12:00:01.000Z :alice!u@h PRIVMSG #Room :unread\r\n",
+            )
+            .await
+            .unwrap();
+            sw.write_all(b":srv BATCH -history\r\n").await.unwrap();
+        });
+
+        conn.require_capabilities(&[
+            "batch",
+            "draft/chathistory",
+            "server-time",
+            "draft/read-marker",
+        ])
+        .await
+        .unwrap();
+        let messages = if resume_after_marker {
+            conn.join_with_history("#Room", 50).await.unwrap()
+        } else {
+            conn.join_with_latest_history("#Room", 50).await.unwrap()
+        };
+        assert!(messages.iter().any(|message| message.command == "MARKREAD"));
+        assert!(messages.iter().any(|message| {
+            message.command == "PRIVMSG"
+                && message.params.get(1).is_some_and(|text| text == "unread")
+        }));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_bootstrap_resumes_after_the_server_read_marker() {
+        assert_history_request(
+            "CHATHISTORY AFTER #Room timestamp=2026-07-30T12:00:00.000Z 50",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn history_inspection_ignores_the_server_read_marker() {
+        assert_history_request("CHATHISTORY LATEST #Room * 50", false).await;
+    }
+
+    #[tokio::test]
+    async fn required_capability_nak_is_not_a_downgrade() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let (_sr, mut sw) = tokio::io::split(server_io);
+        sw.write_all(b":srv CAP nick NAK :draft/read-marker\r\n")
+            .await
+            .unwrap();
+        let error = conn
+            .require_capabilities(&["draft/read-marker"])
+            .await
+            .expect_err("NAK must be visible");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }

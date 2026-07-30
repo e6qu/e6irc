@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 e6irc-client = { path = "../e6irc-client" }
 e6irc-proto = { path = "../e6irc-proto" }
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+] }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
 # tokio for the async client; clap 4.6.2 (>24h) for the CLI surface.
 tokio = { version = "1.53.0", default-features = false, features = [
     "rt",

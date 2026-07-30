@@ -50,16 +50,23 @@ real server in the database, browser, protocol, bridge, and CLI jobs.
   unprivileged user and contains the embedded web client.
 - `deploy/` supplies the Terraform/ECS example, its deployment contract, and a
   hardened systemd service for native Linux installation.
+- A tag exactly equal to `v` plus the workspace version builds `e6ircd`,
+  `e6irc`, and `e6irc-tui` natively for Linux, macOS, and Windows on x86-64
+  and ARM64. The six deterministic archives include documentation/license and
+  the systemd unit, receive build-provenance attestations, and ship with sorted
+  SHA-256 checksums.
 
-**Current product boundary.** The repository does not publish native
-Linux/macOS/Windows binary archives, musl artifacts, or a scratch/distroless
-image. Cross-platform CI establishes source portability; the systemd unit is
-an installation contract, not a binary package.
+**Product boundary.** Native archives use each platform's ordinary dynamic
+runtime. Musl/static artifacts and scratch/distroless container images are not
+part of this release shape.
 
 **Evidence.** The production-container CI job builds and inspects the image.
 The release workflow verifies per-architecture images before manifest
 publication, generates and verifies the attestations, and validates the final
-manifest shape. `systemd-analyze verify` checks the service in CI.
+manifest shape. Ordinary pull-request CI proves the native packager's exact
+members, executable/document modes, and byte-for-byte reproducibility; the
+tag workflow uses that packager on all six native runners and refuses an
+incomplete archive set. `systemd-analyze verify` checks the service in CI.
 
 ## Restart without losing durable state
 
