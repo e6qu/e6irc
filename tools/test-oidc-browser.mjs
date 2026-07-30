@@ -178,7 +178,13 @@ try {
   await upstream.waitForLine(
     (line) => line === "PRIVMSG #journey :browser sends through the real stack",
   );
-  await page.getByText("browser sends through the real stack", { exact: true }).waitFor();
+  const sentMessage = page.getByText("browser sends through the real stack", { exact: true });
+  await sentMessage.waitFor();
+  assert.equal(
+    await sentMessage.count(),
+    1,
+    "a server-admitted composer send must render exactly one local echo",
+  );
 
   // The owner-facing diagnostics must reflect that same live exchange rather
   // than merely rendering the stored row.
@@ -632,8 +638,6 @@ async function startIrcUpstream() {
         }
       } else if (command === "NAMES" && params[0]) {
         names(params[0]);
-      } else if (command === "PRIVMSG" && params[0]) {
-        send(`@time=2026-07-30T02:00:01.000Z;msgid=browser-send :${nick}!web@journey ${line}`);
       } else if (command === "PING") {
         send(`PONG ${params.join(" ")}`);
       }
