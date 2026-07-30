@@ -3,7 +3,7 @@
 # e6ircd and print one result line per count. The server must already be
 # listening at $ADDR.
 #
-#   tools/load/sweep.sh [ADDR] [COUNTS] [BURST]
+#   tools/load/sweep.sh [ADDR] [COUNTS] [BURST] [E6IRC-LOAD OPTIONS...]
 #
 # Defaults: ADDR=127.0.0.1:6667, COUNTS="100 500 1000 5000", BURST=20.
 set -euo pipefail
@@ -11,6 +11,7 @@ set -euo pipefail
 ADDR="${1:-127.0.0.1:6667}"
 COUNTS="${2:-100 500 1000 5000}"
 BURST="${3:-20}"
+EXTRA_ARGS=("${@:4}")
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="$ROOT/target/release/e6irc-load"
@@ -22,5 +23,5 @@ fi
 echo "sweep against $ADDR (burst=$BURST)"
 for n in $COUNTS; do
   echo "--- clients=$n ---"
-  "$BIN" --addr "$ADDR" --clients "$n" --burst "$BURST"
+  "$BIN" --addr "$ADDR" --clients "$n" --burst "$BURST" "${EXTRA_ARGS[@]}"
 done

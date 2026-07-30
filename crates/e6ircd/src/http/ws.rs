@@ -391,23 +391,45 @@ pub(super) async fn ws_ui_conn(
             },
             frame = socket.recv() => match frame {
                 Some(Ok(WsMessage::Text(t))) => {
-                    // One composer frame is exactly one upstream line; the
-                    // other client→upstream paths run bytes through LineBuffer,
-                    // so match that invariant here (no CRLF injection, bounded
-                    // length) instead of sending the raw frame unframed.
-                    match handle.send(&sanitize_composer_line(&composer_to_irc(&t))) {
-                        crate::bouncer::SendOutcome::Sent => {}
+                    let request = match composer_request(&t) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            let event = composer_result_event(
+                                error.request_id.as_deref(),
+                                false,
+                                Some(error.message),
+                            );
+                            if socket.send(WsMessage::text(event)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    match handle.send(&request.line) {
+                        crate::bouncer::SendOutcome::Sent => {
+                            if let Some(request_id) = request.request_id
+                                && socket
+                                    .send(WsMessage::text(composer_result_event(
+                                        Some(&request_id),
+                                        true,
+                                        None,
+                                    )))
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                        }
                         // Full: upstream congested/reconnecting. Tell the client
                         // its line was not sent rather than block (which would
                         // stall other clients sharing the queue) or drop silently.
                         crate::bouncer::SendOutcome::Full => {
-                            let notice =
-                                ":*bnc* NOTICE * :upstream busy; line not sent, try again";
-                            if socket
-                                .send(WsMessage::text(line_event(notice)))
-                                .await
-                                .is_err()
-                            {
+                            let event = composer_result_event(
+                                request.request_id.as_deref(),
+                                false,
+                                Some("upstream busy; line not sent, try again"),
+                            );
+                            if socket.send(WsMessage::text(event)).await.is_err() {
                                 break;
                             }
                         }
@@ -434,16 +456,75 @@ async fn send_unavailable(socket: &mut WebSocket) {
     );
 }
 
-/// Reduce a composer-derived line to exactly one framed IRC line: cut at the
-/// first embedded CR/LF (which would otherwise inject a second upstream line)
-/// and bound the length to the same cap the framed transports use, truncating
-/// on a UTF-8 char boundary.
-pub(super) fn sanitize_composer_line(line: &str) -> String {
-    let end = line.find(['\r', '\n']).unwrap_or(line.len());
-    let mut line = line[..end].to_string();
-    let max = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
-    line.truncate(e6irc_proto::message::floor_char_boundary(&line, max));
-    line
+#[derive(Debug)]
+struct ComposerRequest {
+    line: String,
+    request_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct ComposerRequestError {
+    request_id: Option<String>,
+    message: &'static str,
+}
+
+/// Parse and validate one web-composer request. Embedded frame delimiters and
+/// over-long lines are refused as whole requests: truncating them would make
+/// the browser's local echo claim text the upstream never received.
+fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
+    let parsed = serde_json::from_str::<serde_json::Value>(frame).ok();
+    let request_id = match parsed.as_ref().and_then(|value| value.get("id")) {
+        None => None,
+        Some(serde_json::Value::String(id))
+            if !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') =>
+        {
+            Some(id.clone())
+        }
+        Some(_) => {
+            return Err(ComposerRequestError {
+                request_id: None,
+                message: "invalid composer request identifier",
+            });
+        }
+    };
+    let line = composer_to_irc(frame);
+    if line.contains(['\r', '\n', '\0']) {
+        return Err(ComposerRequestError {
+            request_id,
+            message: "message contains an invalid line delimiter; nothing was sent",
+        });
+    }
+    if line.len() > e6irc_proto::message::MAX_LINE_LEN - 2 {
+        return Err(ComposerRequestError {
+            request_id,
+            message: "message exceeds the IRC wire limit; nothing was sent",
+        });
+    }
+    Ok(ComposerRequest { line, request_id })
+}
+
+/// A request-correlated composer result. Older/raw clients that omit an id get
+/// the same visible fixed-text NOTICE shape as before.
+fn composer_result_event(request_id: Option<&str>, accepted: bool, error: Option<&str>) -> String {
+    match request_id {
+        Some(request_id) if accepted => {
+            serde_json::json!({ "t": "sent", "v": request_id }).to_string()
+        }
+        Some(request_id) => serde_json::json!({
+            "t": "send-error",
+            "v": request_id,
+            "message": error.unwrap_or("message was not sent"),
+        })
+        .to_string(),
+        None => line_event(&format!(
+            ":*bnc* NOTICE * :{}",
+            error.unwrap_or("message was not sent")
+        )),
+    }
 }
 
 /// Translate a composer frame into an IRC line. The web composer sends a JSON
@@ -554,5 +635,43 @@ mod tests {
             event,
             serde_json::json!({ "t": "snapshot", "v": "complete" })
         );
+    }
+
+    #[test]
+    fn composer_request_is_correlated_and_never_truncated() {
+        let request =
+            composer_request(r##"{"id":"send-1","target":"#rust","message":"hi"}"##).unwrap();
+        assert_eq!(request.request_id.as_deref(), Some("send-1"));
+        assert_eq!(request.line, "PRIVMSG #rust :hi");
+
+        let injection =
+            composer_request(r##"{"id":"send-2","target":"#rust","message":"hi\r\nJOIN #bad"}"##)
+                .expect_err("embedded delimiter must reject the whole request");
+        assert_eq!(injection.request_id.as_deref(), Some("send-2"));
+        assert!(injection.message.contains("nothing was sent"));
+
+        let frame = serde_json::json!({
+            "id": "send-3",
+            "target": "#rust",
+            "message": "x".repeat(e6irc_proto::message::MAX_LINE_LEN),
+        })
+        .to_string();
+        let overlong = composer_request(&frame).expect_err("over-long line must be refused");
+        assert_eq!(overlong.request_id.as_deref(), Some("send-3"));
+        assert!(overlong.message.contains("wire limit"));
+    }
+
+    #[test]
+    fn composer_results_are_typed_and_request_correlated() {
+        let accepted: serde_json::Value =
+            serde_json::from_str(&composer_result_event(Some("a1"), true, None)).unwrap();
+        assert_eq!(accepted, serde_json::json!({ "t": "sent", "v": "a1" }));
+
+        let rejected: serde_json::Value =
+            serde_json::from_str(&composer_result_event(Some("a2"), false, Some("not sent")))
+                .unwrap();
+        assert_eq!(rejected["t"], "send-error");
+        assert_eq!(rejected["v"], "a2");
+        assert_eq!(rejected["message"], "not sent");
     }
 }

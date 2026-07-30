@@ -50,7 +50,10 @@ fi
   --addr 127.0.0.1:16671 \
   --clients 64 \
   --channels 8 \
-  --burst 4
+  --burst 4 \
+  --minimum-connect-rate 10 \
+  --minimum-fanout-rate 100 \
+  --maximum-p99-ms 5000
 
 kill -TERM "$server_pid"
 if ! wait "$server_pid"; then

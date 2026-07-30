@@ -9,12 +9,35 @@ bridges) 🔶 code-complete behind feature flags with offline-unit-tested
 mapping logic; live verification is gated on real credentials (neither
 platform is self-hostable, so the gateway path can only be checked against
 the live API). Phase 13 (scale) is 🔶: the load harness has real
-multi-channel baselines, but the current N=1 core, absent numeric/RSS targets,
-and absent tuned-host 100k result mean the design target is not qualified.
+multi-channel baselines and a reduced numeric CI gate, but the current N=1
+core, absent production-host thresholds/RSS budget, and absent tuned-host 100k
+result mean the design target is not qualified.
 The 2026-07-30 whole-product traceability audit is in
 [`docs/journeys/`](docs/journeys/README.md), with implementation and test
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
+
+Whole-product reliability and evidence sweep (2026-07-30): browser composer
+requests now carry a bounded correlation identifier and receive an explicit
+`sent`/`send-error` result. The server rejects CR/LF/NUL and over-limit derived
+lines whole instead of truncating them; the browser adds local echo/history
+only after bounded driver-queue admission, retains rejected text for retry,
+and drains pending sends visibly on socket replacement/closure. The TUI
+composer, writer queue, and complete wire lines are bounded; local echo follows
+queue admission, and read markers remain pending across temporary queue
+pressure. The shared native client requests identical metadata capabilities
+for anonymous, PLAIN, and OAUTHBEARER registration and exposes malformed or
+over-limit steady-state input as typed recoverable events, so the CLI, TUI, and
+BNC surface the rejection without turning one hostile line into a reconnect.
+
+The load harness now validates the exact numeric sequence set behind a
+same-sender ordered fence that catches duplicates, uses nanosecond timestamps, rejects
+malformed/out-of-range delivery identifiers, and supports explicit connect,
+fan-out, and P99 acceptance thresholds. The real-daemon CI smoke applies
+generous catastrophic-regression floors. A separate all-feature coverage job
+ratchets workspace line coverage at 55%. The journey matrix now distinguishes
+component-proven Discord/Slack logic from their unqualified live transports
+and records these composer, native-client, load, and coverage contracts.
 
 Native-client and distribution closure (2026-07-30): `e6irc login` now drives
 the device authorization grant into a private, atomic, origin-bound token
@@ -2250,7 +2273,7 @@ routing it to the right buffer (channel / direct message / server), maintaining 
 per-channel member list from JOIN/PART/QUIT/NICK/KICK/353, tracking topics
 (TOPIC/332), and rendering the active buffer with a buffer sidebar (unread
 badges), a member list, and a composer that targets the active buffer (the server
-still maps `{target, message}` + slash-commands to IRC). All rendering is via DOM
+maps correlated `{id, target, message}` + slash-commands to IRC). All rendering is via DOM
 APIs — never `innerHTML` on server text — so a hostile upstream line can't inject
 markup. The management pages (account, `/console/*`) keep their htmx server-
 rendered model; only the chat client moved to client-side parsing, where the
@@ -3364,12 +3387,12 @@ bouncer flapping by sending one high-byte message, an easy targeted DoS. The
 sibling in-process `local_driver` already relays lossily and never tears down;
 the upstream driver diverged. Fixed by giving the client a tolerant
 steady-state read (`next_line_relayable`) whose *distinct* outcomes make the
-conflation unrepresentable at the call site: `Ok(Some((parse, raw)))` is always
-a line to relay — a non-UTF-8/unparseable one comes back with `parse: None`
-(relay-only) rather than an error, and an over-long line is skipped without
-ending the stream — while only a real EOF (`Ok(None)`) or I/O error (`Err`)
-returns `Dropped`. The strict `next_message_with_line` the handshake relies on
-is untouched. New e2e (raw-TCP upstream sends `caf\xe9`, then an ordinary line)
+conflation unrepresentable at the call site: `RelayEvent::Line` is always a
+line to relay — a non-UTF-8/unparseable one has no parsed message but retains
+lossy raw text — `RelayEvent::Rejected` keeps an over-long line visible without
+ending the stream, and only a real EOF (`Ok(None)`) or I/O error (`Err`) returns
+`Dropped`. The strict `next_message_with_line` the handshake relies on is
+untouched. New e2e (raw-TCP upstream sends `caf\xe9`, then an ordinary line)
 proves the bad line is relayed lossily and the session survives.
 
 Three more bugs fixed (all CONFIRMED live):
@@ -4765,13 +4788,14 @@ fixed here on one PR.
    `history`, `raw`, and the QUIT drains) used it too — so a single Latin-1 /
    Shift-JIS body *any channel member can post* (IRC bodies are arbitrary bytes)
    ended the victim's session: a trivial remote DoS. Added
-   `Connection::next_message_lossy` (lossily decodes bad bytes to U+FFFD, skips a
-   still-unparseable line, keeps the link) and switched every post-registration
-   read to it, leaving the handshake on strict `next_message`. New test
-   `next_message_lossy_survives_non_utf8_line`.
+   `Connection::next_event_lossy` (lossily decodes bad bytes to U+FFFD, reports
+   a still-unparseable line as a recoverable typed event, keeps the link) and
+   switched every post-registration read to it, leaving the handshake on strict
+   `next_message`. New test
+   `next_event_lossy_survives_non_utf8_line_and_surfaces_rejections`.
 3. **Stale doc comment on `next_message`** claimed a "NUL-free" guarantee the
    framing does not make (it guarantees non-empty, not NUL-free); corrected and
-   cross-referenced to `next_message_lossy` for interactive loops.
+   cross-referenced to `next_event_lossy` for interactive loops.
 
 BNC network-name casefold sweep (2026-07-27): closed the DESIGN §2 asymmetry
 the whole-daemon sweep escalated. The `NetworkKey` folded the *owner* but stored
@@ -5193,8 +5217,8 @@ Done:
 Done (this phase's remaining, now landed):
 - `/ws/ui` live path (DESIGN §13.2): cookie/bearer WebSocket attaching
   over the multiplexer path; sends JSON line/status events and relays
-  composer input. Composer JSON ({target, message}) becomes PRIVMSG
-  (`/raw ` sends literally); raw frames pass through. Buffer snapshot is
+  composer input. Correlated composer JSON ({id, target, message}) becomes
+  PRIVMSG (`/raw ` sends literally); raw frames remain supported. Buffer snapshot is
   replayed on attach. e2e (`crates/e6ircd/tests/ws_ui.rs`: authenticated
   attach + relay both ways, unauthenticated refused) + composer unit tests.
 - Vite frontend (`web/`): dependency-free production chat shell
@@ -5306,8 +5330,11 @@ Done:
 - Load-test harness (`crates/e6irc-load`, `e6irc-load` binary): opens N
   concurrent clients over the real e6irc-client, times connect+register+
   join throughput, measures channel fan-out (one sender bursts, every
-  other client counts deliveries), and reports true end-to-end delivery
-  **latency percentiles** (p50/p90/p99/max, per-message send-stamped).
+  other client proves the exact numeric sequence set once), fences the set
+  with a same-sender ordered marker, and reports true end-to-end
+  **latency percentiles** (p50/p90/p99/max, nanosecond send-stamped).
+  Optional minimum connect/fan-out rates and maximum P99 make controlled-host
+  sweeps executable acceptance gates.
   `--tls` supported. `tools/load/` has a README (methodology + OS tuning
   for the 100k target) and `sweep.sh` (walks client counts). Verified
   across 50-2000 clients with correct fan-out accounting.
@@ -5322,10 +5349,10 @@ Qualification boundary:
 - The 100k-connection run itself needs a tuned Linux host (fd limits,
   ephemeral-port range, socket buffers — macOS caps loopback hard). The
   harness is the instrument; the run is a hosting task.
-- This is also code- and contract-incomplete: fan-out/latency acceptance
-  numbers and the per-connection memory budget are unset; the reduced-scale
-  CI gate checks exact delivery but deliberately makes no host-performance
-  claim; the runtime has one core worker; sharding,
+- Production-host fan-out/latency acceptance numbers and the per-connection
+  memory budget are unset; the reduced-scale CI gate checks exact delivery and
+  deliberately generous catastrophic-regression thresholds without making a
+  host-performance claim. The runtime has one core worker; sharding,
   timer-wheel scheduling, and whole-core deterministic replay are target
   architecture rather than shipped behavior. (DESIGN §7.3–7.4, §17;
   `docs/journeys/coverage.md`)

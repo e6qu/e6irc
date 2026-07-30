@@ -8,7 +8,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use e6irc_client::token_cache::{default_token_path, load_token};
-use e6irc_client::{Authentication, ConnectionOptions, TerminalSafe};
+use e6irc_client::{
+    Authentication, ClientEvent, Connection, ConnectionOptions, OwnedMessage, TerminalSafe,
+};
 use serde::Serialize;
 
 /// IRC numerics that mean a JOIN was refused — so a `send`/`history` client
@@ -36,6 +38,23 @@ fn is_send_error(command: &str) -> bool {
 /// [`TerminalSafe`] sanitizer before it reaches the user's terminal.
 fn terminal_safe(s: &str) -> TerminalSafe {
     TerminalSafe::from_untrusted(s)
+}
+
+/// Read one actionable message without letting malformed input either
+/// disconnect the session or disappear silently. The warning is stderr so
+/// structured/stdout command output remains machine-readable.
+async fn next_interactive_message(
+    connection: &mut Connection,
+) -> std::io::Result<Option<OwnedMessage>> {
+    loop {
+        match connection.next_event_lossy().await? {
+            Some(ClientEvent::Message(message)) => return Ok(Some(message)),
+            Some(ClientEvent::Rejected(rejected)) => {
+                eprintln!("warning: server input rejected: {rejected}");
+            }
+            None => return Ok(None),
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -238,7 +257,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     // A close before 366 means the message was never sent —
                     // falling through to PRIVMSG would write into a dead
                     // socket and exit 0 on a delivery that never happened.
-                    let Some(msg) = conn.next_message_lossy().await? else {
+                    let Some(msg) = next_interactive_message(&mut conn).await? else {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             format!("connection closed before the join to {target} was confirmed"),
@@ -266,7 +285,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // delivery-failure numeric in this window (401 no such nick, 404
             // cannot send to channel, …) means nobody received the message,
             // and the exit code is this tool's product.
-            while let Some(msg) = conn.next_message_lossy().await? {
+            while let Some(msg) = next_interactive_message(&mut conn).await? {
                 if is_send_error(&msg.command) {
                     let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                     return Err(std::io::Error::other(format!(
@@ -284,7 +303,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 conn.send_line(&format!("JOIN {target}")).await?;
             }
             let mut seen = 0;
-            while let Some(msg) = conn.next_message_lossy().await? {
+            while let Some(msg) = next_interactive_message(&mut conn).await? {
                 if msg.command == "PING" {
                     let token = msg.params.first().cloned().unwrap_or_default();
                     conn.send_line(&format!("PONG :{token}")).await?;
@@ -349,7 +368,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
             }
             conn.send_line("QUIT :done").await?;
-            while conn.next_message_lossy().await?.is_some() {}
+            while next_interactive_message(&mut conn).await?.is_some() {}
         }
         Command::Raw => {
             use tokio::io::AsyncBufReadExt;
@@ -367,7 +386,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         };
                         conn.send_line(&line).await?;
                     }
-                    msg = conn.next_message_lossy() => {
+                    msg = next_interactive_message(&mut conn) => {
                         let Some(msg) = msg? else {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
@@ -382,7 +401,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
             }
             conn.send_line("QUIT :done").await?;
-            while conn.next_message_lossy().await?.is_some() {}
+            while next_interactive_message(&mut conn).await?.is_some() {}
         }
         Command::Api { .. } | Command::Login { .. } => {
             unreachable!("handled before the IRC connect")

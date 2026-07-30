@@ -87,6 +87,24 @@ jobs:
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo test --workspace --all-features --target ${{ matrix.target }}
 
+  # Coverage is a ratchet, not a claim that one percentage proves the product.
+  # Database/provider/browser journeys run in their dedicated jobs below; this
+  # job measures the portable all-feature suite and prevents newly added
+  # production paths from silently landing without executable evidence.
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
+      - run: cargo install cargo-llvm-cov --version 0.8.4 --locked
+      - name: Enforce portable production-line coverage ratchet
+        run: cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines 55
+
   db-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -155,10 +155,14 @@ target of approximately 100,000 concurrent connections on one machine.
 
 **Current qualification boundary.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires
-every fan-out delivery plus graceful process shutdown; the harness itself exits
-nonzero on any client or delivery loss. The runtime has one core worker (the
-N=1 form of the target topology); core sharding, timer-wheel scheduling,
-per-connection memory budget, numeric performance targets, and a tuned-host
+every unique expected sequence exactly once, at least 10 connections/second,
+at least 100 fan-out deliveries/second, P99 below five seconds, and graceful
+process shutdown. The harness exits nonzero on client/socket loss, malformed,
+missing, duplicate, or out-of-range deliveries, or a supplied threshold
+violation. The shared-runner thresholds catch catastrophic regressions without
+claiming production-host performance. The runtime has one core worker (the N=1
+form of the target topology); core sharding, timer-wheel scheduling,
+per-connection memory budget, production performance targets, and a tuned-host
 100k run are not implemented or qualified.
 
 **Evidence.** Harness correctness has unit/integration coverage and recorded

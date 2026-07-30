@@ -34,10 +34,10 @@ names are sanitized and validated before entering IRC state.
   buffering, and lifecycle; live Libera is opt-in.
 - **Matrix:** proven both ways in CI against pinned Conduit.
 - **Discord:** parsing/mapping/routing/backoff is CI-proven offline; the actual
-  gateway/REST journey requires a real bot/guild and is externally qualified.
+  gateway/REST journey requires a real bot/guild and remains unqualified.
 - **Slack:** parsing/mapping/routing/backoff is CI-proven offline; the actual
-  Socket Mode/Web API journey requires a real app/workspace and is externally
-  qualified.
+  Socket Mode/Web API journey requires a real app/workspace and remains
+  unqualified.
 
 The integrations console creates/toggles/deletes bridges; editing a bridge’s
 fields uses the general network API only where that driver’s request shape is
@@ -110,6 +110,10 @@ uses its cached origin/token against `/api/v1/me`.
    self-JOIN was confirmed, and reloads marker-relative history. Input is
    disabled while disconnected, and anything racing the disconnect is counted
    and reported rather than replayed late or shown as a false successful send.
+7. The composer and outbound writer queue are bounded. A complete over-limit
+   line or full queue retains/refuses input without local echo; accepted input
+   is echoed only after queue admission, and a read-marker write remains
+   pending when admission is temporarily unavailable.
 
 **Evidence.** The terminal-independent application state is unit-tested and
 fuzzed with arbitrary server messages; authentication/transport argument
@@ -119,6 +123,10 @@ marker-relative CHATHISTORY, and batch completion. A pseudo-terminal test
 drives the real full-screen binary against a real e6ircd, proves inbound
 rendering and outbound delivery, enters `/quit`, and requires clean alternate-
 screen restoration.
+Shared-client tests also prove that anonymous, PLAIN, and OAUTHBEARER
+registration request the same metadata capabilities and that malformed or
+over-limit steady-state input is a typed, visible rejection rather than a
+disconnect or silent loss.
 
 **Product shape.** Device approval is performed once through `e6irc login`;
 the TUI consumes its shared cache. “Multi-buffer” means channel/query buffers
@@ -133,9 +141,11 @@ protocol behavior.
 **Flow.**
 
 - `e6irc-client` provides plaintext/public-CA TLS connection, framing through
-  `e6irc-proto`, registration, SASL PLAIN, SASL OAUTHBEARER, PING handling,
-  owned messages, terminal-safe output, explicit capability requirements,
-  marker-aware CHATHISTORY helpers, and the cross-platform token-cache policy.
+  `e6irc-proto`, registration, SASL PLAIN, SASL OAUTHBEARER, uniform optional
+  metadata-capability requests, PING handling, owned messages, typed
+  steady-state message/relay/rejection events, terminal-safe output, explicit
+  capability requirements, marker-aware CHATHISTORY helpers, and the
+  cross-platform token-cache policy.
 - `ConnectionOptions` owns the transport, TLS name, registration identity, and
   an authentication enum whose variants make half-specified SASL impossible.
   A reconnecting caller can therefore reuse the exact request.
@@ -143,9 +153,11 @@ protocol behavior.
   selection; it can reuse the shared device-token storage rather than defining
   a second cache format.
 
-**Failure contract.** EOF, invalid/oversized lines, TLS/authentication failure,
-and write failure are returned. Lossy steady-state reading contains a
-non-UTF-8 server line without terminating the whole client.
+**Failure contract.** EOF, strict-handshake invalid/oversized lines,
+TLS/authentication failure, and write failure are returned. Tolerant
+steady-state reading contains a non-UTF-8 server line without terminating the
+whole client, while malformed/oversized per-line rejections remain explicit
+events callers must handle.
 
 **Evidence.** Library behavior is covered by unit tests and indirectly by CLI,
 TUI fuzz, load harness, and live server e2e tests.

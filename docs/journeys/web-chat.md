@@ -72,25 +72,33 @@ conversation, send and receive messages, and close it intentionally.
 
 **Flow.**
 
-1. The composer sends `{target, message}`; `/raw ` deliberately sends an IRC
-   line instead.
-2. The server converts normal composer input to PRIVMSG and relays it through
-   the selected driver.
-3. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
+1. The composer sends `{id, target, message}`; `/raw ` deliberately requests
+   one complete IRC line instead.
+2. The server validates the whole derived line, admits it to the selected
+   driver's bounded queue, and returns a correlated `sent` or `send-error`
+   event.
+3. Only `sent` creates local echo and sent-history. A rejection keeps the text
+   available for retry, so displayed success means server-side queue
+   admission—not merely a browser socket write.
+4. JOIN/NAMES/NICK/PART/KICK/QUIT events maintain member state and buffer
    labels.
-4. Direct messages create query buffers. Closing a query removes only the
+5. Direct messages create query buffers. Closing a query removes only the
    local view; leaving a channel sends PART and waits for the resulting state.
-5. Errors from the driver or IRC server appear in the relevant status path.
+6. Errors from the driver or IRC server appear in the relevant status path.
 
 **Visible failures and recovery.** A disconnected composer cannot display a
-false successful send. Removing the selected network detaches the WebSocket.
-Channel leave and direct-message close are different actions and remain
-different in both UI and wire behavior.
+false successful send. CR/LF/NUL input, an over-limit complete line, more than
+64 pending sends, a full driver queue, and socket replacement/closure all fail
+visibly without truncating the message into different content. Removing the
+selected network detaches the WebSocket. Channel leave and direct-message
+close are different actions and remain different in both UI and wire behavior.
 
-**Evidence.** Browser state tests cover NAMES, direct-message close, and
-channel leave. A real local IRC peer observes the Chromium composer’s exact
-PRIVMSG and sends a peer message back through the driver and `/ws/ui`; separate
-protocol tests cover detachment on network removal.
+**Evidence.** Browser state tests cover NAMES, direct-message close, channel
+leave, delayed acknowledgement, and refusal without false echo. A real local
+IRC peer observes the Chromium composer’s exact PRIVMSG after a correlated
+server acknowledgement and sends a peer message back through the driver and
+`/ws/ui`; protocol tests cover injection/length rejection, queue admission,
+and detachment on network removal.
 
 ## Navigate account and operational surfaces
 

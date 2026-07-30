@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use e6irc_client::token_cache::{default_token_path, load_token};
-use e6irc_client::{Authentication, Connection, ConnectionOptions, OwnedMessage};
+use e6irc_client::{Authentication, ClientEvent, Connection, ConnectionOptions, OwnedMessage};
 use e6irc_tui::app::{Action, App};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -66,9 +66,15 @@ struct Cli {
 /// render loop. One screenful of scrollback is generous for a 50 ms poll.
 const NET_QUEUE_DEPTH: usize = 1024;
 
+/// Lines awaiting the socket writer. Keyboard input is local, but terminal
+/// automation and paste can still outrun a stalled socket; this bound makes
+/// admission explicit and lets the UI refuse without a false local echo.
+const OUT_QUEUE_DEPTH: usize = 256;
+
 /// Events the render loop consumes.
 enum Ev {
     Net(OwnedMessage),
+    RejectedInput(String),
     Connected,
     Reconnecting(String),
     DroppedOutbound(usize),
@@ -136,8 +142,7 @@ async fn async_main(cli: Cli) -> io::Result<()> {
     // which stops reading the socket and lets TCP apply the backpressure —
     // the same shape as the daemon's SendQ, in the other direction.
     let (net_tx, mut net_rx) = mpsc::channel::<Ev>(NET_QUEUE_DEPTH);
-    // Outbound is unbounded because a human at a keyboard fills it.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUT_QUEUE_DEPTH);
 
     // Networking task: read messages up, write outbound lines down, and
     // reconnect with the same explicit transport/authentication request.
@@ -153,8 +158,8 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                     // Lossy steady-state read: one non-UTF-8 line (a Latin-1
                     // channel message any member can post) must not disconnect
                     // the session.
-                    msg = conn.next_message_lossy() => match msg {
-                        Ok(Some(m)) => {
+                    msg = conn.next_event_lossy() => match msg {
+                        Ok(Some(ClientEvent::Message(m))) => {
                             if m.command == "PING" {
                                 let token = m.params.first().cloned().unwrap_or_default();
                                 if let Err(error) = conn.send_line(&format!("PONG :{token}")).await {
@@ -167,6 +172,11 @@ async fn async_main(cli: Cli) -> io::Result<()> {
                                 &m,
                             );
                             if net_tx.send(Ev::Net(m)).await.is_err() { return; }
+                        }
+                        Ok(Some(ClientEvent::Rejected(rejected))) => {
+                            if net_tx.send(Ev::RejectedInput(rejected.to_string())).await.is_err() {
+                                return;
+                            }
                         }
                         Ok(None) => break "server closed the connection".into(),
                         Err(error) => break format!("connection read failed: {error}"),
@@ -328,7 +338,7 @@ async fn run_ui(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     net_rx: &mut mpsc::Receiver<Ev>,
-    out_tx: &mpsc::UnboundedSender<String>,
+    out_tx: &mpsc::Sender<String>,
 ) -> io::Result<()> {
     let mut dirty = true;
     loop {
@@ -337,6 +347,9 @@ async fn run_ui(
             dirty = true;
             match ev {
                 Ev::Net(m) => app.on_message(&m),
+                Ev::RejectedInput(reason) => {
+                    app.status(format!("server input rejected: {reason}"));
+                }
                 Ev::Connected => {
                     app.set_connected(true);
                     app.status("reconnected");
@@ -377,12 +390,18 @@ async fn run_ui(
                 KeyCode::Backspace => app.on_backspace(),
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Enter => {
-                    if let Action::Send(line) = app.on_enter() {
-                        // The app refuses input once it has observed a
-                        // disconnect. Surface the narrower race where the
-                        // network task has already ended.
-                        if out_tx.send(line).is_err() {
-                            app.status("not connected — message not sent");
+                    if let Action::Send(outbound) = app.on_enter() {
+                        match out_tx.try_send(outbound.line().to_owned()) {
+                            Ok(()) => app.outbound_accepted(&outbound),
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                app.outbound_refused(&outbound);
+                                app.note_outbound_full();
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                app.outbound_refused(&outbound);
+                                app.set_connected(false);
+                                app.status("not connected — message not sent");
+                            }
                         }
                     }
                 }
@@ -393,11 +412,20 @@ async fn run_ui(
     }
 }
 
-fn flush_read_marker(app: &mut App, out_tx: &mpsc::UnboundedSender<String>) {
-    if let Some(command) = app.take_read_marker_command()
-        && out_tx.send(command).is_err()
-    {
-        app.status("not connected — read marker was not sent");
+fn flush_read_marker(app: &mut App, out_tx: &mpsc::Sender<String>) {
+    let Some(command) = app.take_read_marker_command() else {
+        return;
+    };
+    match out_tx.try_send(command) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            app.requeue_read_marker_command(command);
+            app.note_outbound_full();
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            app.set_connected(false);
+            app.status("not connected — read marker was not sent");
+        }
     }
 }
 
