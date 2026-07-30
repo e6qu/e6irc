@@ -5,6 +5,47 @@ use std::process::Command;
 
 use e6irc_client::Connection;
 
+fn cli_sasl_database_name() -> String {
+    format!("e6irc_cli_sasl_login_{}", std::process::id())
+}
+
+/// Give the CLI's database journey an empty database of its own. The URL from
+/// the environment is an administrative connection, not shared test storage:
+/// other integration binaries deliberately leave real managed configuration
+/// in it while proving restart and secret-sealing behavior.
+async fn prepare_cli_sasl_database(admin_url: &str, database_name: &str) -> String {
+    let pool = sqlx::PgPool::connect(admin_url)
+        .await
+        .expect("connect to the administrative database");
+    let drop_database = format!(r#"DROP DATABASE IF EXISTS "{database_name}" WITH (FORCE)"#);
+    let create_database = format!(r#"CREATE DATABASE "{database_name}""#);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(drop_database))
+        .execute(&pool)
+        .await
+        .expect("drop the previous CLI test database");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(create_database))
+        .execute(&pool)
+        .await
+        .expect("create the CLI test database");
+    pool.close().await;
+
+    let mut url = reqwest::Url::parse(admin_url).expect("database URL");
+    url.set_path(database_name);
+    url.to_string()
+}
+
+async fn drop_cli_sasl_database(admin_url: &str, database_name: &str) {
+    let pool = sqlx::PgPool::connect(admin_url)
+        .await
+        .expect("reconnect to the administrative database");
+    let drop_database = format!(r#"DROP DATABASE "{database_name}" WITH (FORCE)"#);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(drop_database))
+        .execute(&pool)
+        .await
+        .expect("drop the CLI test database");
+    pool.close().await;
+}
+
 /// Start an e6ircd in-process on an ephemeral port and return its addr.
 async fn start_server() -> std::net::SocketAddr {
     let config = e6ircd::config::Config {
@@ -186,20 +227,12 @@ async fn cli_send_to_missing_nick_exits_nonzero() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn cli_sasl_login() {
-    let url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let admin_url = std::env::var("E6IRC_TEST_DATABASE_URL").expect("E6IRC_TEST_DATABASE_URL");
+    let database_name = cli_sasl_database_name();
+    let url = prepare_cli_sasl_database(&admin_url, &database_name).await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
-    // The e6ircd suites give each of their tests its own database because they
-    // run in parallel within one binary. This is the only database test in this
-    // binary, and cargo runs test binaries one at a time — so it can share the
-    // administrative database, provided it does not delete rows it did not
-    // write. Hence the delete-by-name rather than a TRUNCATE: a second database
-    // test added here would then still be wrong, but only about its own row.
-    sqlx::query("DELETE FROM accounts WHERE name = 'cliuser'")
-        .execute(&pool)
-        .await
-        .expect("clean");
     e6ircd::db::create_account(&pool, "cliuser", "clipass")
         .await
         .expect("create");
@@ -391,6 +424,13 @@ async fn cli_sasl_login() {
         String::from_utf8_lossy(&output.stdout)
     );
     std::fs::remove_dir_all(token_directory).unwrap();
+    drop(observer);
+    assert_eq!(
+        running.shutdown.run().await,
+        e6ircd::net::ShutdownOutcome::Flushed
+    );
+    pool.close().await;
+    drop_cli_sasl_database(&admin_url, &database_name).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

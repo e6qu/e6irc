@@ -21,8 +21,12 @@ assert.ok(issuerURL, "E6IRC_TEST_DEX_URL is required");
 const applicationOrigin = "http://127.0.0.1:18083";
 const temporaryDirectory = await mkdtemp(join(tmpdir(), "e6irc-oidc-browser-"));
 const configPath = join(temporaryDirectory, "e6irc.toml");
+const secretKeyPath = join(temporaryDirectory, "master.key");
 const serverOutput = [];
 const upstream = await startIrcUpstream();
+await writeFile(secretKeyPath, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", {
+  mode: 0o600,
+});
 await writeFile(
   configPath,
   `server_name = "irc.browser.example"
@@ -35,9 +39,13 @@ addr = "127.0.0.1:0"
 addr = "127.0.0.1:18083"
 public_url = "${applicationOrigin}"
 secure_cookies = false
+admin_accounts = ["kilgore"]
 
 [database]
 url = ${JSON.stringify(databaseURL)}
+
+[secrets]
+key_file = ${JSON.stringify(secretKeyPath)}
 
 [[oidc]]
 # dex, not Shauth: this harness proves the generic OpenID Connect relying-party
@@ -70,6 +78,7 @@ try {
   await waitForHealthyServer();
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
+  await context.grantPermissions(["notifications"], { origin: applicationOrigin });
   const page = await context.newPage();
   const browserErrors = [];
   const navigationTrace = [];
@@ -148,6 +157,140 @@ try {
   );
   assert.equal(await page.locator("#account-name").textContent(), accountName);
 
+  // Preferences are a real product workflow, not incidental localStorage.
+  // Chromium grants the origin notification permission, the controls persist
+  // typed state, and a reload applies that state before later chat events.
+  await page.getByText("Preferences", { exact: true }).click();
+  await page.locator("#theme-select").selectOption("dark");
+  assert.equal(await page.locator("html").getAttribute("data-theme"), "dark");
+  await page.getByRole("button", { name: "Desktop notifications: off" }).click();
+  assert.equal(
+    await page.getByRole("button", { name: "Desktop notifications: on" }).getAttribute(
+      "aria-pressed",
+    ),
+    "true",
+  );
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "dark", notifications: true },
+  );
+  await page.reload();
+  assert.equal(await page.locator("html").getAttribute("data-theme"), "dark");
+  await page.getByText("Preferences", { exact: true }).click();
+  await page.getByRole("button", { name: "Desktop notifications: on" }).waitFor();
+
+  // The administrator manages every scalar configuration section and all
+  // credential-bearing collections through the rendered browser controls.
+  // Secrets are deliberately conspicuous and must never reappear in the DOM.
+  assert.equal(
+    accountName,
+    "kilgore",
+    "dex mock identity drifted from the configured administrator",
+  );
+  await page.goto(`${applicationOrigin}/console/configuration`);
+  await page.getByRole("heading", { name: "Configuration", exact: true }).waitFor();
+  const settingsForm = page.locator("form.settings-form");
+  await settingsForm.getByLabel("Server hostname").fill("irc.browser-managed.example");
+  await settingsForm.getByLabel("Network name").fill("ManagedBrowserNet");
+  await settingsForm.getByLabel("Description").fill("Browser-managed server");
+  await settingsForm.getByLabel("Message of the day").fill("Managed in Chromium\nSecond line");
+  await settingsForm.getByLabel("Accept BNC client connections").check();
+  await settingsForm.getByLabel("Listen address").fill("127.0.0.1:0");
+  await settingsForm.getByLabel("Listener definitions").fill("127.0.0.1:0 | plain");
+  await settingsForm.getByLabel("Public URL").fill(applicationOrigin);
+  await settingsForm.getByLabel("Require secure session cookies").uncheck();
+  await settingsForm.getByLabel("Administrator accounts").fill("kilgore");
+  await settingsForm.getByLabel("Nickname length").fill("24");
+  await settingsForm.getByLabel("Send queue").fill("2048");
+  await settingsForm.getByLabel("Core queue").fill("32768");
+  await settingsForm.getByLabel("Hot channels").fill("4096");
+  await settingsForm.getByLabel("Connections per IP").fill("128");
+  await settingsForm.getByLabel("Command burst").fill("32");
+  await settingsForm.getByLabel("Authentication burst").fill("8");
+  await settingsForm.getByLabel("Registration burst").fill("4");
+  await settingsForm.getByLabel("Trusted proxies").fill("127.0.0.1/32");
+  await settingsForm.getByLabel("Store monitoring samples").check();
+  await settingsForm.getByLabel("Sample interval").fill("5");
+  await settingsForm.getByLabel("Retention").fill("24");
+  await settingsForm
+    .getByLabel("Allow registration before connection registration completes")
+    .check();
+  await settingsForm.getByLabel("Require an email field").check();
+  await settingsForm.getByRole("button", { name: "Save configuration" }).click();
+  await page.getByRole("status").waitFor();
+  assert.match(await page.getByRole("status").innerText(), /Configuration saved/);
+  assert.match(await page.locator("main").innerText(), /Revision 2/);
+  assert.match(await page.locator("main").innerText(), /Accepting clients on/);
+  assert.equal(
+    await settingsForm.getByLabel("Server hostname").inputValue(),
+    "irc.browser-managed.example",
+  );
+  assert.equal(await settingsForm.getByLabel("Require an email field").isChecked(), true);
+
+  const sharedNetworkSecret = "browser-shared-network-secret";
+  const serverNetworks = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "Server networks", exact: true }),
+  });
+  await serverNetworks.getByLabel("Network name").fill("shared-browser");
+  await serverNetworks.getByLabel("Address").fill(upstream.address);
+  await serverNetworks.getByLabel("Nickname / user").fill("sharedbrowser");
+  await serverNetworks.getByLabel("Autojoin").fill("#shared");
+  await serverNetworks.getByLabel("Use TLS").uncheck();
+  await serverNetworks.getByLabel("SASL account").fill("shared-account");
+  await serverNetworks.getByLabel("SASL password").fill(sharedNetworkSecret);
+  await serverNetworks.getByRole("button", { name: "Add server network" }).click();
+  await page.getByRole("status").waitFor();
+  assert.match(
+    await page.getByRole("status").innerText(),
+    /added server network shared-browser/,
+  );
+  assert.equal((await page.content()).includes(sharedNetworkSecret), false);
+
+  const operatorSecret = "browser-operator-secret";
+  const operators = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "IRC operators", exact: true }),
+  });
+  await operators.getByLabel("Operator name").fill("browserop");
+  await operators.getByLabel("New password").fill(operatorSecret);
+  await operators.getByRole("button", { name: "Add operator" }).click();
+  await page.getByRole("status").waitFor();
+  assert.match(await page.getByRole("status").innerText(), /added IRC operator browserop/);
+  assert.equal((await page.content()).includes(operatorSecret), false);
+
+  const providerSecret = "browser-provider-secret";
+  const providers = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "OpenID Connect", exact: true }),
+  });
+  await providers.getByLabel("Provider name").fill("browser-idp");
+  await providers.getByLabel("Issuer URL").fill("https://identity.example");
+  await providers.getByLabel("Client ID").fill("browser-client");
+  await providers.getByLabel("Client secret").fill(providerSecret);
+  await providers.getByLabel("Scopes").fill("openid profile");
+  await providers.getByLabel("Token authentication").selectOption("client_secret_post");
+  await providers.getByLabel("End-session endpoint").fill("https://identity.example/logout");
+  await providers.getByRole("button", { name: "Add identity provider" }).click();
+  await page.getByRole("status").waitFor();
+  assert.match(
+    await page.getByRole("status").innerText(),
+    /added OpenID Connect provider browser-idp/,
+  );
+  assert.equal((await page.content()).includes(providerSecret), false);
+
+  for (const [heading, item, outcome] of [
+    ["Server networks", "shared-browser", "removed server network shared-browser"],
+    ["IRC operators", "browserop", "removed IRC operator browserop"],
+    ["OpenID Connect", "browser-idp", "removed OpenID Connect provider browser-idp"],
+  ]) {
+    const section = page.locator("section").filter({
+      has: page.getByRole("heading", { name: heading, exact: true }),
+    });
+    const row = section.locator("article, .compact-list > div").filter({ hasText: item });
+    await row.getByRole("button", { name: "Remove" }).click();
+    await page.getByRole("status").waitFor();
+    assert.match(await page.getByRole("status").innerText(), new RegExp(outcome));
+  }
+  assert.match(await page.locator("main").innerText(), /Revision 8/);
+
   // Configure a custom IRC upstream entirely through the server-rendered UI,
   // then use the production web client and its real /ws/ui socket in both
   // directions. The local upstream is a protocol peer, not a browser route
@@ -173,6 +316,39 @@ try {
   await page.locator(".buf-name").filter({ hasText: /^#journey$/ }).waitFor();
   await upstream.sendPeerMessage("#journey", "browser receives through the real stack");
   await page.getByText("browser receives through the real stack", { exact: true }).waitFor();
+
+  // Cross the complete notification path once: real TCP upstream, IRC driver,
+  // multiplexer, /ws/ui, web-client DM selection, and Chromium's granted API.
+  await page.evaluate(() => {
+    globalThis.__e6ircRealNotifications = [];
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      value: true,
+    });
+    Object.defineProperty(globalThis, "Notification", {
+      configurable: true,
+      value: class {
+        static permission = "granted";
+        constructor(title, options) {
+          globalThis.__e6ircRealNotifications.push({
+            title,
+            body: options?.body,
+            tag: options?.tag,
+          });
+        }
+      },
+    });
+  });
+  await upstream.sendPeerMessage("webjourney", "real upstream direct notification");
+  await page.waitForFunction(() => globalThis.__e6ircRealNotifications?.length === 1);
+  assert.deepEqual(await page.evaluate(() => globalThis.__e6ircRealNotifications), [
+    {
+      title: "DM from peer",
+      body: "real upstream direct notification",
+      tag: "peer",
+    },
+  ]);
+
   await page.locator("#message").fill("browser sends through the real stack");
   await page.locator("#composer button[type=submit]").click();
   await upstream.waitForLine(
@@ -441,12 +617,130 @@ try {
   assert.equal(await page.locator("#nickcount").textContent(), "2");
   assert.equal(await page.getByText("bob", { exact: true }).count(), 0);
 
+  // Chromium owns the operating-system notification surface, but the
+  // application still has a testable contract: while backgrounded, a DM or
+  // mention must call the granted Notification API with bounded text. Record
+  // that boundary without replacing any e6irc transport or rendering code.
+  await page.evaluate(() => {
+    globalThis.__e6ircNotifications = [];
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      value: true,
+    });
+    Object.defineProperty(globalThis, "Notification", {
+      configurable: true,
+      value: class {
+        static permission = "granted";
+        static async requestPermission() {
+          return "granted";
+        }
+        constructor(title, options) {
+          globalThis.__e6ircNotifications.push({
+            title,
+            body: options?.body,
+            tag: options?.tag,
+          });
+        }
+      },
+    });
+  });
   mockSocket.send(
     JSON.stringify({
       t: "line",
       v: "@time=2026-07-28T20:00:03.000Z;msgid=dm :bob!u@h PRIVMSG webnick :private hello",
     }),
   );
+  await page.waitForFunction(() => globalThis.__e6ircNotifications?.length === 1);
+  assert.deepEqual(await page.evaluate(() => globalThis.__e6ircNotifications), [
+    { title: "DM from bob", body: "private hello", tag: "bob" },
+  ]);
+
+  // A platform notification failure must disable the preference visibly,
+  // rather than throwing out of the message handler and leaving a broken
+  // opt-in active.
+  await page.evaluate(() => {
+    Object.defineProperty(globalThis, "Notification", {
+      configurable: true,
+      value: class {
+        static permission = "granted";
+        constructor() {
+          throw new Error("synthetic notification failure");
+        }
+      },
+    });
+  });
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: "@time=2026-07-28T20:00:04.000Z;msgid=dm-failure :bob!u@h PRIVMSG webnick :second private message",
+    }),
+  );
+  await page
+    .getByText(/Could not show a desktop notification.*synthetic notification failure/)
+    .waitFor();
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "dark", notifications: false },
+  );
+  assert.equal(
+    await page.locator("#notify-toggle").getAttribute("aria-pressed"),
+    "false",
+  );
+
+  // Permission denial and an absent browser API are explicit, recoverable
+  // opt-in failures and cannot silently flip the persisted setting.
+  await page.evaluate(() => {
+    Object.defineProperty(globalThis, "Notification", {
+      configurable: true,
+      value: class {
+        static permission = "default";
+        static async requestPermission() {
+          return "denied";
+        }
+      },
+    });
+  });
+  await page.getByText("Preferences", { exact: true }).click();
+  await page.getByRole("button", { name: "Desktop notifications: off" }).click();
+  await page.locator(".buf-name").filter({ hasText: /^server$/ }).click();
+  await page.getByText("Notification permission was not granted.", { exact: true }).waitFor();
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "dark", notifications: false },
+  );
+  await page.evaluate(() => {
+    delete globalThis.Notification;
+  });
+  await page.getByRole("button", { name: "Desktop notifications: off" }).click();
+  await page
+    .getByText("This browser does not support desktop notifications.", { exact: true })
+    .waitFor();
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "dark", notifications: false },
+  );
+
+  // Restoring a working browser API lets the user opt in again and then turn
+  // notifications off deliberately; both transitions are persisted.
+  await page.evaluate(() => {
+    Object.defineProperty(globalThis, "Notification", {
+      configurable: true,
+      value: class {
+        static permission = "granted";
+        static async requestPermission() {
+          return "granted";
+        }
+        constructor() {}
+      },
+    });
+  });
+  await page.getByRole("button", { name: "Desktop notifications: off" }).click();
+  await page.getByRole("button", { name: "Desktop notifications: on" }).click();
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "dark", notifications: false },
+  );
+
   await page.locator(".buf-name").filter({ hasText: /^bob$/ }).click();
   assert.equal(await page.locator("#buffer-action").textContent(), "Close");
   await page.locator("#buffer-action").click();
@@ -575,6 +869,7 @@ async function startIrcUpstream() {
   const sockets = new Set();
   const lines = [];
   const lineWaiters = [];
+  let outboundSequence = 0;
   let joined;
   let resolveJoined;
   const joinedPromise = new Promise((resolve) => {
@@ -672,10 +967,11 @@ async function startIrcUpstream() {
       ]);
       assert.equal(connection.channel, channel);
     },
-    async sendPeerMessage(channel, text) {
+    async sendPeerMessage(target, text) {
       const connection = await joinedPromise;
+      outboundSequence += 1;
       connection.socket.write(
-        `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive :peer!user@journey PRIVMSG ${channel} :${text}\r\n`,
+        `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
       );
     },
     async waitForLine(predicate) {

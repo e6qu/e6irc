@@ -8,7 +8,9 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use e6irc_proto::casemap::CaseMapping;
 use sqlx::PgPool;
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::core::{DbReply, DbRequest, Input};
@@ -18,6 +20,8 @@ use e6irc_queue::{Receiver, Sender};
 /// Migrations are compiled into the binary; startup refuses to run on
 /// checksum drift (sqlx's default) rather than guessing.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum DbError {
@@ -80,7 +84,15 @@ impl std::fmt::Display for DbError {
 impl std::error::Error for DbError {}
 
 pub async fn connect_and_migrate(url: &str) -> Result<PgPool, DbError> {
-    let pool = PgPool::connect(url).await.map_err(DbError::Connect)?;
+    // Every caller shares this pool, including HTTP handlers and the database
+    // worker. A dependency interruption must therefore produce a bounded,
+    // typed query failure instead of parking unrelated requests on SQLx's
+    // longer default acquisition timeout.
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
+        .connect(url)
+        .await
+        .map_err(DbError::Connect)?;
     MIGRATOR.run(&pool).await.map_err(DbError::Migrate)?;
     Ok(pool)
 }

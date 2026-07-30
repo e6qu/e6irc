@@ -36,9 +36,12 @@ revisions record provenance, and successful writes create a redacted audit row
 in the same transaction.
 
 **Evidence.** Configuration validation and import/revision behavior are covered
-by unit/PostgreSQL tests; BNC listener management is HTTP/runtime-tested.
-Every configuration subsection renders and mutates through shared typed
-parsing, but there is no one browser test that edits every subsection.
+by unit/PostgreSQL tests, and BNC listener management is HTTP/runtime-tested.
+The real Chromium/PostgreSQL journey signs in as the configured administrator,
+edits representative values in every scalar subsection, checks the live BNC
+listener and retained revision, then creates and removes a server network, IRC
+operator, and OpenID Connect provider. It verifies exact revision increments
+and that write-only credentials never reappear as rendered plaintext.
 
 ## Explore accounts, channels, policy, and audit
 

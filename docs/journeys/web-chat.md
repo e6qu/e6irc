@@ -124,6 +124,62 @@ server acknowledgement and sends a peer message back through the driver and
 `/ws/ui`; protocol tests cover injection/length rejection, queue admission,
 and detachment on network removal.
 
+## Personalize web chat and desktop notifications
+
+**Actor and goal.** A web-chat user wants a readable light, dark, or
+system-matched appearance and optional operating-system notifications for
+important messages while the chat tab is hidden.
+
+**Preconditions.** The user has loaded the web application in a browser.
+Desktop notifications additionally require a browser that implements the
+Notifications API and permission from the user; neither is required to use
+chat.
+
+**Flow.**
+
+1. **Preferences** offers system, light, and dark themes. Choosing a theme
+   applies it immediately to the document and stores the typed choice in
+   browser-local preferences.
+2. Reloading the application restores the selected theme. System mode follows
+   the browser/operating-system color preference rather than freezing the
+   color observed when it was selected.
+3. Desktop notifications are off by default. Enabling them is an explicit
+   action that requests browser permission at that moment, never on page load.
+4. With permission granted and notifications enabled, a hidden tab asks the
+   browser to present a notification for a direct message or a message that
+   mentions the current nickname. Ordinary channel traffic and messages
+   received while the page is visible remain in the application only.
+5. The notification identifies the sender/conversation and contains the
+   bounded message preview. Its stable conversation tag lets the browser
+   coalesce repeated updates according to platform policy.
+6. Turning notifications off takes effect immediately and persists across
+   reloads without revoking the browser-wide permission.
+
+**Visible failures and recovery.** An unsupported Notifications API, denied
+permission, or notification-construction error leaves notifications disabled
+and explains the condition through an application alert or the server buffer.
+Unavailable or corrupt local storage does not prevent chat: the application
+uses a safe in-tab preference value, reports the storage failure, and can
+persist again when the browser facility recovers. Invalid stored preference
+shapes are rejected rather than partially applied.
+
+**Security and observability.** The application requests no notification
+permission without a user gesture and never stores a session, token, password,
+or message in preferences. Notification content is emitted only after explicit
+opt-in, only for the bounded direct-message/mention cases, and only while the
+document is hidden. The browser owns operating-system presentation, retention,
+and privacy controls; e6irc keeps notification bodies out of server logs and
+metric labels.
+
+**Evidence.** Client unit tests cover typed preference validation and
+unavailable, rejected, corrupt, or unsupported storage values. The real
+Chromium journey selects and reloads a dark theme, verifies typed persistence,
+grants permission, and records the exact notification produced by a direct
+message. It also proves that notification-construction failure disables the
+setting and surfaces an alert, while permission denial and an absent browser
+API leave the persisted opt-in false with a visible explanation. Restoring a
+working API then proves explicit opt-in and opt-out both persist.
+
 ## Navigate account and operational surfaces
 
 **Actor and goal.** A user wants chat, network configuration, channel

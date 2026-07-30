@@ -8,7 +8,7 @@ a design target rather than current behavior.
 
 | Journey | State | Strongest automated evidence | Boundary not crossed by CI |
 |---|---|---|---|
-| [Bootstrap and manage the server through the UI](administration-and-monitoring.md#bootstrap-and-manage-the-server-through-the-ui) | Partially proven | Typed configuration, revision/audit, PostgreSQL, and live BNC-listener tests | No browser mutation sweep of every subsection |
+| [Bootstrap and manage the server through the UI](administration-and-monitoring.md#bootstrap-and-manage-the-server-through-the-ui) | Proven | Chromium edits every scalar subsection and credential collection across real HTTP, PostgreSQL, audit/revision, and live BNC listener state | — |
 | [Explore accounts, channels, policy, and audit](administration-and-monitoring.md#explore-accounts-channels-policy-and-audit) | Proven | Real PostgreSQL directory/filter/action HTTP journeys | — |
 | [Inspect and terminate live connections](administration-and-monitoring.md#inspect-and-terminate-live-connections) | Proven | Real core directory plus owner/admin exact-disconnect HTTP journeys | — |
 | [Monitor traffic, connections, latency, availability, and errors](administration-and-monitoring.md#monitor-traffic-connections-latency-availability-and-errors) | Proven | Telemetry arithmetic, runtime accounting, PostgreSQL retention, console, JSON, and metrics tests | External alerting is not part of e6irc |
@@ -24,10 +24,10 @@ a design target rather than current behavior.
 | [Manage personal access tokens and read state](channels-and-account.md#manage-personal-access-tokens-and-read-state) | Proven | Token lifecycle, bearer/OAUTHBEARER, marker persistence, API, and console tests | — |
 | [Inspect and terminate sessions](channels-and-account.md#inspect-and-terminate-sessions) | Proven | Owner-scoped browser/live-session inventory and exact-revocation tests | — |
 | [Discover service identity and readiness before sign-in](deployment-and-recovery.md#discover-service-identity-and-readiness-before-sign-in) | Proven | Real public server/liveness/readiness/login/OpenAPI HTTP tests | — |
-| [First production boot](deployment-and-recovery.md#first-production-boot) | Partially proven | Configuration/migration/import/boot-load tests and inspected production image | No fresh external-host acceptance |
+| [First production boot](deployment-and-recovery.md#first-production-boot) | Proven | Actual daemon against an isolated empty PostgreSQL container proves migrations, import, readiness, and IRC traffic; CI also inspects the production image | — |
 | [Deploy a release](deployment-and-recovery.md#deploy-a-release) | Proven | Six-platform builds, deterministic package test, image shape, and publication contract | Tag publication itself runs only for a matching release tag |
 | [Restart without losing durable state](deployment-and-recovery.md#restart-without-losing-durable-state) | Proven | Chromium gracefully restarts the real daemon and proves session/network/runtime/backlog recovery | — |
-| [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Partially proven | Readiness and database failure propagation tests | No long-lived kill/restore chaos journey under mixed traffic |
+| [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Proven | Named PostgreSQL stop/start under real daemon, probe, database-backed HTTP, and hot IRC traffic proves bounded failure and recovery | — |
 | [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Secret open/seal/wrong-key startup, CLI, and write-refusal tests | Recovery is restore-or-replace, not in-place re-encryption |
 | [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate and recorded 2,000-client baselines | 100,000-client tuned-host result and production budgets are absent |
 | [Sign in with a local password](identity-and-access.md#sign-in-with-a-local-password) | Proven | Chromium adds a password, signs out, and completes real local login against e6ircd/PostgreSQL | — |
@@ -53,6 +53,7 @@ a design target rather than current behavior.
 | [Enter chat and choose a network](web-chat.md#enter-chat-and-choose-a-network) | Proven | Chromium crosses authentication, inventory, PostgreSQL, registry, driver, and `/ws/ui` | Public-network interop remains opt-in |
 | [Receive replay and live messages without gaps or duplicates](web-chat.md#receive-replay-and-live-messages-without-gaps-or-duplicates) | Proven | Deterministic Chromium edge cases plus real upstream/persistence/restart path | — |
 | [Join, converse, and leave](web-chat.md#join-converse-and-leave) | Proven | Chromium acknowledgement/refusal/lifecycle cases and real bidirectional upstream journey | — |
+| [Personalize web chat and desktop notifications](web-chat.md#personalize-web-chat-and-desktop-notifications) | Proven | Client edge-case tests plus Chromium theme reload, permission, exact notification, and opt-out over real upstream traffic | Operating-system presentation after the browser API is Chromium's responsibility |
 | [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Browser authentication/navigation plus handler-level role, page, and mutation journeys | Chromium does not click every administrator mutation |
 
 “—” means the defined journey boundary is crossed by current CI; it does not
@@ -137,6 +138,7 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `test` | all-feature workspace behavior on six OS/architecture cells |
 | `coverage` | all-feature workspace line-coverage regression floor |
 | `db-tests` | real PostgreSQL storage/all-feature HTTP bridge management/OIDC/browser/BNC/`ws_ui`/CLI journeys |
+| `postgres-recovery` | isolated empty PostgreSQL first boot plus live stop/start degradation and recovery under HTTP and IRC traffic |
 | `production-container` | deployable image and embedded web-client shape |
 | `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | deterministic archive contract plus real PTY render/message/terminal-restore journey |

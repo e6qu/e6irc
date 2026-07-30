@@ -17,7 +17,7 @@ The 2026-07-30 whole-product traceability audit is in
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
 
-Journey-contract closure (2026-07-30): all 46 shipped outcomes now use one
+Journey-contract closure (2026-07-30): all 47 shipped outcomes now use one
 complete actor/precondition/flow/failure/security/evidence structure, and the
 coverage matrix has one exact linked row per journey using only the defined
 evidence states. A dependency-free CI guard rejects missing sections,
@@ -33,6 +33,29 @@ plaintext secret is rendered or audited.
 Previously implicit visitor discovery/readiness and coordinated sign-out are
 now first-class journeys rather than clauses hidden inside monitoring and
 credential rotation.
+
+Product-evidence closure (2026-07-30): preferences and desktop notifications
+are now a first-class journey, including opt-in, hidden-tab selection, typed
+local persistence, failure recovery, and the browser/operating-system privacy
+boundary. The real Chromium journey edits every managed-configuration scalar
+section and all three write-only credential collections, verifies live and
+persisted revisions, then proves theme reload and an exact desktop
+notification caused by real upstream traffic. A separate actual-daemon
+journey boots against an isolated empty PostgreSQL container, verifies every
+migration and the initial managed import, then stops and restarts that same
+database under HTTP and live IRC traffic. Readiness now has its own two-second
+database deadline, and the shared pool has the same bounded acquisition
+contract; liveness and hot IRC remain available during interruption,
+database-backed actions fail promptly and visibly, and all recover without
+restarting e6ircd. The harness waits for PostgreSQL's final TCP listener, not
+the image entrypoint's transient initialization-only Unix socket, so first-boot
+evidence cannot race the entrypoint's deliberate stop/start. The expanded
+browser journey also exposed cross-binary test
+state: its intentionally sealed OpenID Connect secret remained in the
+administrative database and poisoned the later CLI server bootstrap. The CLI
+journey now creates a process-unique database from that administrative
+connection, shuts its daemon down cleanly, closes its pool, and drops the
+database, making browser/CLI order independent.
 
 Whole-product reliability and evidence sweep (2026-07-30): browser composer
 requests now carry a bounded correlation identifier and receive an explicit

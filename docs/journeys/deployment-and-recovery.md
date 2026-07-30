@@ -14,8 +14,8 @@ credential is required for these deliberately public endpoints.
 1. `GET /api/v1/server` returns the bounded public server/network identity and
    supported entry-point information used by clients.
 2. `GET /healthz` reports that the process and HTTP loop are alive.
-3. `GET /readyz` checks the core heartbeat and performs a real PostgreSQL query
-   when a database is configured.
+3. `GET /readyz` checks the core heartbeat and performs a real,
+   deadline-bounded PostgreSQL query when a database is configured.
 4. A human opens `/login` to discover enabled local and OpenID Connect sign-in
    choices; automation can read `/api/v1/openapi.json` before obtaining a
    token.
@@ -75,8 +75,11 @@ identify the failing startup stage without printing secrets; liveness and
 readiness distinguish process state from dependency readiness.
 
 **Evidence.** Config/migration/import/boot-load behavior is covered by
-unit/PostgreSQL tests. CI builds and inspects the production image and runs a
-real server in the database, browser, protocol, bridge, and CLI jobs.
+unit/PostgreSQL tests. A process-level CI journey starts an isolated empty
+PostgreSQL container and the actual `e6ircd` binary, then proves every ordered
+migration, the initial managed configuration import, readiness, and real IRC
+registration/channel traffic. CI also builds and inspects the production image
+and runs the real server in browser, protocol, bridge, and CLI jobs.
 
 ## Deploy a release
 
@@ -178,7 +181,8 @@ restored.
 **Flow.**
 
 - `/healthz` remains a process liveness signal.
-- `/readyz` becomes non-ready when its real database query fails.
+- `/readyz` becomes non-ready within its fixed database-query deadline when
+  the dependency cannot answer.
 - Database-dependent authentication, history, managed configuration, network
   mutation, and directory operations fail visibly.
 - Existing hot IRC state continues only where the operation does not require a
@@ -188,17 +192,25 @@ restored.
 
 **Visible failures and recovery.** Requests that require PostgreSQL return
 dependency errors and readiness remains false until a real query succeeds
-again. Retrying after recovery re-enters the normal database worker path; the
-server never reports an unwritten mutation as durable.
+again. The readiness query and shared pool acquisition each have explicit
+two-second application deadlines, so an interrupted database cannot leave the
+deployment probe or an unrelated database-backed request hanging indefinitely.
+Retrying after recovery re-enters the normal database worker path; the server
+never reports an unwritten mutation as durable.
 
 **Security and observability.** Database errors are sanitized before reaching
 clients and fixed-category telemetry; connection strings and query data are
 not exposed. Liveness, readiness, and database latency/error counters remain
 separate signals.
 
-**Evidence.** Readiness and database error propagation are covered at HTTP and
-worker levels. CI does not run a long-lived chaos test that kills and restores
-PostgreSQL under mixed traffic.
+**Evidence.** HTTP and worker tests cover readiness and database error
+propagation. A process-level CI journey additionally starts `e6ircd` against
+its own named PostgreSQL container, registers two real IRC clients, stops the
+database, and proves bounded non-readiness, continuing liveness and hot IRC
+traffic, plus a bounded, explicit database-dependent device-grant failure. It
+restarts the same database, proves readiness and device grants recover,
+exchanges more IRC traffic, and requires a clean daemon shutdown without
+logging the database password.
 
 ## Recover from secret-key loss or rotation
 
