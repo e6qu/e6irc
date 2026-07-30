@@ -49,6 +49,12 @@ pub(crate) fn handle(
             reason,
             account,
         } => disconnect_own_connection(state, connection_id, &reason, &account),
+        AdminRequest::SetAccountSuspended {
+            account,
+            suspended,
+            reason,
+            actor,
+        } => set_account_suspended(state, &account, suspended, &reason, &actor),
         AdminRequest::MutateOwnedChannel {
             channel,
             actor,
@@ -61,6 +67,41 @@ pub(crate) fn handle(
         }
     };
     let _ = reply.send(outcome);
+}
+
+fn set_account_suspended(
+    state: &mut ServerState,
+    account: &str,
+    suspended: bool,
+    reason: &str,
+    actor: &str,
+) -> AdminReply {
+    let account_key = state.account_key(account);
+    if !suspended {
+        state.suspended_accounts.remove(&account_key);
+        return AdminReply::Ok(format!("Reactivated live authentication for {account}"));
+    }
+    state.suspended_accounts.insert(account_key.clone());
+    let connections: Vec<ConnId> = state
+        .sessions
+        .iter()
+        .filter_map(|(connection, session)| {
+            session
+                .account
+                .as_deref()
+                .is_some_and(|candidate| state.account_key(candidate) == account_key)
+                .then_some(*connection)
+        })
+        .collect();
+    let mut disconnected = 0usize;
+    for connection in connections {
+        if super::oper::kill_connection(state, connection, reason, actor) {
+            disconnected += 1;
+        }
+    }
+    AdminReply::Ok(format!(
+        "Disconnected {disconnected} live connection(s) for {account}"
+    ))
 }
 
 fn begin_owned_channel_registration(

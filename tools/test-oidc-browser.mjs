@@ -209,9 +209,17 @@ try {
   await settingsForm.getByLabel("Authentication burst").fill("8");
   await settingsForm.getByLabel("Registration burst").fill("4");
   await settingsForm.getByLabel("Trusted proxies").fill("127.0.0.1/32");
-  await settingsForm.getByLabel("Store monitoring samples").check();
-  await settingsForm.getByLabel("Sample interval").fill("5");
-  await settingsForm.getByLabel("Retention").fill("24");
+  const storageSettings = settingsForm.locator("section.settings-section").filter({
+    has: page.getByRole("heading", { name: "Storage retention", exact: true }),
+  });
+  await storageSettings.getByLabel("Message history retention").fill("45");
+  await storageSettings.getByLabel("Audit retention").fill("400");
+  const monitoringSettings = settingsForm.locator("section.settings-section").filter({
+    has: page.getByRole("heading", { name: "Monitoring history", exact: true }),
+  });
+  await monitoringSettings.getByLabel("Store monitoring samples").check();
+  await monitoringSettings.getByLabel("Sample interval").fill("5");
+  await monitoringSettings.getByLabel("Retention").fill("24");
   await settingsForm
     .getByLabel("Allow registration before connection registration completes")
     .check();
@@ -226,6 +234,8 @@ try {
     "irc.browser-managed.example",
   );
   assert.equal(await settingsForm.getByLabel("Require an email field").isChecked(), true);
+  assert.equal(await storageSettings.getByLabel("Message history retention").inputValue(), "45");
+  assert.equal(await storageSettings.getByLabel("Audit retention").inputValue(), "400");
 
   const sharedNetworkSecret = "browser-shared-network-secret";
   const serverNetworks = page.locator("section").filter({

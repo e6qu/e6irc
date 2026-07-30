@@ -578,11 +578,26 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         bnc_addr = Some(controller.enable(bnc.addr).await?);
     }
     if let (Some(pool), Some(settings)) = (&pool, &managed_config) {
-        tokio::spawn(crate::observability::run_sampler(
+        let sampler = tokio::spawn(crate::observability::run_sampler(
             pool.clone(),
             telemetry.clone(),
             bnc_registry.clone(),
             settings.clone(),
+        ));
+        listeners.push(supervise_listener(
+            "observability sampler",
+            sampler,
+            critical_tx.clone(),
+        ));
+        let maintenance = tokio::spawn(crate::observability::run_storage_maintenance(
+            pool.clone(),
+            telemetry.clone(),
+            settings.clone(),
+        ));
+        listeners.push(supervise_listener(
+            "storage maintenance",
+            maintenance,
+            critical_tx.clone(),
         ));
     }
 
@@ -594,6 +609,16 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     let any_ws_listener = config.listeners.iter().any(|l| l.websocket);
     let app_state: Option<Arc<crate::http::AppState>> = if config.http.is_some() || any_ws_listener
     {
+        let bootstrap_available = if config.bootstrap.is_some() {
+            let pool = pool
+                .as_ref()
+                .expect("config validation requires database for browser bootstrap");
+            !crate::db::has_accounts(pool)
+                .await
+                .map_err(io::Error::other)?
+        } else {
+            false
+        };
         let trusted_proxies = config
             .limits
             .trusted_proxies
@@ -604,7 +629,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (public_url, secure_cookies, admin_accounts) = match &config.http {
+        let (public_url, secure_cookies, configured_admin_accounts) = match &config.http {
             Some(h) => (
                 h.public_url.clone(),
                 h.secure_cookies,
@@ -615,6 +640,14 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             ),
             None => (None, false, std::collections::HashSet::new()),
         };
+        let mut admin_accounts = configured_admin_accounts.clone();
+        if let Some(pool) = &pool {
+            admin_accounts.extend(
+                crate::db::list_admin_accounts(pool)
+                    .await
+                    .map_err(io::Error::other)?,
+            );
+        }
         Some(Arc::new(crate::http::AppState {
             server_name: config.server_name.clone(),
             network_name: config.network_name.clone(),
@@ -633,7 +666,8 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
             managed_config: managed_config.clone(),
             telemetry: telemetry.clone(),
             secret_key: secret_key.clone(),
-            admin_accounts,
+            admin_accounts: std::sync::RwLock::new(admin_accounts),
+            configured_admin_accounts,
             csrf_key: {
                 use aws_lc_rs::rand::SecureRandom;
                 let mut k = [0u8; 32];
@@ -660,6 +694,11 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .as_ref()
                 .and_then(|http| http.public_url.as_deref())
                 .is_some_and(|url| url.starts_with("https://")),
+            bootstrap_token_digest: config
+                .bootstrap
+                .as_ref()
+                .map(|bootstrap| crate::http::bootstrap_token_digest(&bootstrap.token)),
+            bootstrap_available: std::sync::atomic::AtomicBool::new(bootstrap_available),
         }))
     } else {
         None
@@ -767,6 +806,11 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 })
                 .collect(),
         );
+        core.preload_suspended_accounts(
+            crate::db::list_suspended_accounts(pool)
+                .await
+                .map_err(io::Error::other)?,
+        );
     }
     let core_worker = tokio::spawn(core_worker(core, core_rx));
 
@@ -774,7 +818,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     // PING/PONG timeout so a silent connection can't hold a session forever.
     {
         let core_tx = core_tx.clone();
-        tokio::spawn(async move {
+        let reaper = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(REAP_TICK_SECS));
             loop {
                 ticker.tick().await;
@@ -787,6 +831,11 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 }
             }
         });
+        listeners.push(supervise_listener(
+            "connection reaper",
+            reaper,
+            critical_tx.clone(),
+        ));
     }
 
     let mut addrs = Vec::new();

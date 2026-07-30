@@ -739,6 +739,56 @@ pub(crate) async fn run_sampler(
     }
 }
 
+/// Supervised database hygiene independent of whether historical monitoring is
+/// enabled. A fixed cadence plus bounded per-table batches prevents both
+/// expired credentials and durable history/audit data from growing forever,
+/// while the next tick makes saturation self-draining without a tight loop.
+pub(crate) async fn run_storage_maintenance(
+    pool: sqlx::PgPool,
+    telemetry: std::sync::Arc<Telemetry>,
+    settings: std::sync::Arc<tokio::sync::RwLock<crate::db::ManagedConfigSnapshot>>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(300));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval`'s first tick is immediate. Consume it so startup never races
+    // migrations, listener binding, or the first operator request with a
+    // six-table maintenance transaction.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let storage = settings.read().await.settings.storage.clone();
+        let started = Instant::now();
+        match crate::db::run_storage_maintenance(
+            &pool,
+            storage.history_retention_days,
+            storage.audit_retention_days,
+        )
+        .await
+        {
+            Ok(report) if report.saturated => {
+                eprintln!(
+                    "storage maintenance filled a bounded batch \
+                     (messages={}, audit_events={}, web_sessions={}, api_tokens={}, \
+                     device_grants={}, logout_tokens={}); expired rows remain eligible \
+                     for the next cycle",
+                    report.messages,
+                    report.audit_events,
+                    report.web_sessions,
+                    report.api_tokens,
+                    report.device_grants,
+                    report.logout_tokens,
+                );
+            }
+            Ok(_report) => {}
+            Err(error) => {
+                telemetry.record_error(ErrorKind::Database);
+                eprintln!("storage maintenance failed: {error}");
+            }
+        }
+        telemetry.record_database_request(started.elapsed());
+    }
+}
+
 impl Default for Telemetry {
     fn default() -> Self {
         Self::new()

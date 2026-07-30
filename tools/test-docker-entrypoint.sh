@@ -24,6 +24,7 @@ env \
   E6IRC_SERVER_NAME="irc.example.test" \
   E6IRC_PUBLIC_URL="https://irc.example.test" \
   E6IRC_DATABASE_URL="postgres://example.invalid/e6irc" \
+  E6IRC_BOOTSTRAP_TOKEN="0123456789abcdef0123456789abcdef" \
   APPLICATION_RELEASE_REVISION="0123456789ab" \
   sh "$workspace/deploy/docker-entrypoint.sh"
 
@@ -42,6 +43,7 @@ esac
 }
 grep -F 'server_name = "irc.example.test"' "$result" >/dev/null
 grep -F 'public_url = "https://irc.example.test"' "$result" >/dev/null
+grep -F 'token = "0123456789abcdef0123456789abcdef"' "$result" >/dev/null
 
 explicit="$scratch/operator.toml"
 env \

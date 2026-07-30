@@ -19,7 +19,7 @@ piece in isolation does not prove the outcome a user experiences.
 | Account holder | Web client, self-service console, IRC, BNC listener | Browser session, SASL PLAIN/OAUTHBEARER, app password, or personal access token |
 | Channel founder | IRC services, registered-channel console/API | Account authentication plus founder/access checks |
 | IRC operator | IRC operator commands | `OPER` against managed operator configuration |
-| Administrator | Operational console and `/api/v1/admin/*`, including exact live-connection control | Account in the configured administrator set |
+| Administrator | Operational console and `/api/v1/admin/*`, including account lifecycle and exact live-connection control | Account with durable administrator authority or in the configured administrator set |
 | Native-client user | `e6irc`, `e6irc-tui`, or another client using `e6irc-client` | Anonymous, SASL PLAIN, or direct/device-cached SASL OAUTHBEARER |
 | Automation/device client | REST API and RFC 8628 device authorization endpoints | Personal access token or an approved device token |
 | Bridge operator | Integrations console and managed network configuration | Administrator session |

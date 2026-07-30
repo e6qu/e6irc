@@ -52,7 +52,7 @@
           <thead>
             <tr>
               <th>ID</th><th>Account</th><th>Created (UTC)</th><th>Login methods</th>
-              <th>Active access</th><th>Resources</th>
+              <th>Status</th><th>Active access</th><th>Resources</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -67,12 +67,46 @@
                   <span class="tag">{{ entry.app_passwords }} app passwords</span>
                 </td>
                 <td class="account-posture">
+                  {% if entry.suspended %}
+                    <span class="tag">suspended</span>
+                  {% else %}
+                    <span class="tag">active</span>
+                  {% endif %}
+                  {% if entry.effective_administrator %}<span class="tag">administrator</span>{% endif %}
+                  {% if entry.administrator %}<span class="tag">durable grant</span>{% endif %}
+                  {% if entry.configured_administrator %}<span class="tag">configuration grant</span>{% endif %}
+                </td>
+                <td class="account-posture">
                   <span class="tag">{{ entry.browser_sessions }} browsers</span>
                   <span class="tag">{{ entry.api_tokens }} API tokens</span>
                 </td>
                 <td class="account-posture">
                   <span class="tag">{{ entry.networks }} networks</span>
                   <span class="tag">{{ entry.founded_channels }} channels</span>
+                </td>
+                <td>
+                  {% if !entry.current %}
+                    <form class="cell-form" method="post"
+                          action="/console/accounts/{{ entry.id }}/suspension"
+                          data-confirm="{% if entry.suspended %}Reactivate {{ entry.name }} and restart its enabled networks?{% else %}Suspend {{ entry.name }}, revoke its sessions and tokens, disconnect its clients, and stop its networks?{% endif %}">
+                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="suspended" value="{% if entry.suspended %}false{% else %}true{% endif %}" />
+                      <button class="{% if !entry.suspended %}danger{% endif %}" type="submit">
+                        {% if entry.suspended %}Reactivate{% else %}Suspend{% endif %}
+                      </button>
+                    </form>
+                    <form class="cell-form" method="post"
+                          action="/console/accounts/{{ entry.id }}/administrator"
+                          data-confirm="{% if entry.administrator %}Remove durable administrator authority from {{ entry.name }}? A configuration grant, if shown, remains effective until configuration changes and restart.{% else %}Grant durable administrator authority to {{ entry.name }}?{% endif %}">
+                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="administrator" value="{% if entry.administrator %}false{% else %}true{% endif %}" />
+                      <button class="{% if entry.administrator %}danger{% endif %}" type="submit">
+                        {% if entry.administrator %}Revoke durable admin{% else %}Grant durable admin{% endif %}
+                      </button>
+                    </form>
+                  {% else %}
+                    <span class="meta">Current account</span>
+                  {% endif %}
                 </td>
               </tr>
             {% endfor %}

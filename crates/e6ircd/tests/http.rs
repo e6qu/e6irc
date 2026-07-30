@@ -1,7 +1,9 @@
 //! e2e tests for the HTTP layer, over real sockets with a raw
 //! HTTP/1.1 client (no client library needed for these shapes).
 
-use e6ircd::config::{Config, HttpConfig, ListenerConfig, SecretsConfig};
+use e6ircd::config::{
+    BootstrapConfig, Config, DatabaseConfig, HttpConfig, ListenerConfig, SecretsConfig,
+};
 use e6ircd::net;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -92,6 +94,13 @@ fn login_state_from_html(html: &str) -> &str {
         .expect("login state in page")
 }
 
+fn bootstrap_state_from_html(html: &str) -> &str {
+    html.split("name=\"bootstrap_state\" value=\"")
+        .nth(1)
+        .and_then(|tail| tail.split('"').next())
+        .expect("bootstrap state in page")
+}
+
 fn form_value(value: &str) -> String {
     value
         .bytes()
@@ -158,6 +167,103 @@ async fn every_response_has_a_fresh_server_correlation_id_and_https_hsts() {
         response_header(&headers, "strict-transport-security").is_none(),
         "HSTS over an explicitly plain public origin would make development hosts unreachable"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn browser_bootstrap_creates_the_only_first_admin_and_closes_itself() {
+    let database_url =
+        support::test_db("browser_bootstrap_creates_the_only_first_admin_and_closes_itself").await;
+    let mut config = test_config();
+    config.database = Some(DatabaseConfig { url: database_url });
+    config.bootstrap = Some(BootstrapConfig {
+        token: "0123456789abcdef0123456789abcdef".into(),
+    });
+    let running = net::start(config).await.expect("start");
+    let http = running.http_addr.expect("HTTP bound");
+
+    let (status, _, login) = request(http, &get("/login")).await;
+    assert_eq!(status, 200);
+    assert!(login.contains("href=\"/bootstrap\""), "{login}");
+
+    let (status, bootstrap_headers, bootstrap_page) = request(http, &get("/bootstrap")).await;
+    assert_eq!(status, 200);
+    assert!(bootstrap_page.contains("Create the administrator"));
+    let bootstrap_state = bootstrap_state_from_html(&bootstrap_page);
+    let state_cookie = response_header(&bootstrap_headers, "set-cookie")
+        .expect("bootstrap state cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair");
+
+    let bad_body = format!(
+        "bootstrap_state={}&token={}&account=Alice&password={}&password_confirmation={}",
+        form_value(bootstrap_state),
+        form_value("incorrect-token-incorrect-token"),
+        form_value("correct horse battery staple"),
+        form_value("correct horse battery staple"),
+    );
+    let bad_request = format!(
+        "POST /bootstrap HTTP/1.1\r\nHost: t\r\nCookie: {state_cookie}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad_body}",
+        bad_body.len()
+    );
+    let (status, _, body) = request(http, &bad_request).await;
+    assert_eq!(status, 401);
+    assert!(body.contains("Invalid bootstrap token."));
+
+    let (_, bootstrap_headers, bootstrap_page) = request(http, &get("/bootstrap")).await;
+    let bootstrap_state = bootstrap_state_from_html(&bootstrap_page);
+    let state_cookie = response_header(&bootstrap_headers, "set-cookie")
+        .expect("replacement bootstrap state cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair");
+    let good_body = format!(
+        "bootstrap_state={}&token={}&account=Alice&password={}&password_confirmation={}",
+        form_value(bootstrap_state),
+        form_value("0123456789abcdef0123456789abcdef"),
+        form_value("correct horse battery staple"),
+        form_value("correct horse battery staple"),
+    );
+    let good_request = format!(
+        "POST /bootstrap HTTP/1.1\r\nHost: t\r\nCookie: {state_cookie}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{good_body}",
+        good_body.len()
+    );
+    let (status, headers, _) = request(http, &good_request).await;
+    assert_eq!(status, 303, "{headers}");
+    assert_eq!(response_header(&headers, "location"), Some("/console"));
+    let session = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| {
+            (name.eq_ignore_ascii_case("set-cookie") && value.trim().starts_with("e6irc_session="))
+                .then(|| {
+                    value
+                        .trim()
+                        .split(';')
+                        .next()
+                        .expect("session cookie pair")
+                        .to_string()
+                })
+        })
+        .expect("administrator session cookie");
+
+    let console_request = format!(
+        "GET /console HTTP/1.1\r\nHost: t\r\nCookie: {session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, console) = request(http, &console_request).await;
+    assert_eq!(status, 200);
+    assert!(console.contains("Alice"), "{console}");
+
+    let (status, headers, _) = request(http, &get("/bootstrap")).await;
+    assert_eq!(status, 303);
+    assert_eq!(response_header(&headers, "location"), Some("/login"));
+    let (_, _, login) = request(http, &get("/login")).await;
+    assert!(!login.contains("href=\"/bootstrap\""), "{login}");
 }
 
 #[tokio::test]
@@ -275,7 +381,7 @@ async fn app_password_requires_database() {
 
 // ---- per-account BNC network management (PG-gated) ----------------------
 
-use e6ircd::config::{BncConfig, DatabaseConfig};
+use e6ircd::config::BncConfig;
 
 /// Start a throwaway plain e6ircd to act as an upstream network.
 async fn upstream_server() -> std::net::SocketAddr {
@@ -300,6 +406,21 @@ async fn post_json(
 ) -> (u16, String) {
     let req = format!(
         "POST {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _head, body) = request(addr, &req).await;
+    (status, body)
+}
+
+async fn patch_json(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> (u16, String) {
+    let req = format!(
+        "PATCH {path} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -1424,7 +1545,8 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
          max_hot_channels=8192&bnc_enabled=on&bnc_addr=127.0.0.1%3A0&\
          listeners=127.0.0.1%3A0+%7C+plain&admin_accounts=alice&\
          observability_enabled=on&observability_sample_interval_seconds=5&\
-         observability_retention_hours=1"
+         observability_retention_hours=1&storage_history_retention_days=30&\
+         storage_audit_retention_days=365"
     );
     let post = format!(
         "POST /console/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -2755,6 +2877,13 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     );
     let alice = &exact["accounts"][0];
     assert_eq!(alice["name"], "Alice");
+    assert_eq!(
+        alice["administrator"], true,
+        "configuration-backed administrators are effective administrators too"
+    );
+    assert_eq!(alice["administrator_sources"]["durable"], false);
+    assert_eq!(alice["administrator_sources"]["configuration"], true);
+    assert_eq!(alice["suspended"], false);
     assert_eq!(alice["authentication"]["local_password"], true);
     assert_eq!(alice["authentication"]["app_passwords"], 1);
     assert_eq!(alice["authentication"]["api_tokens"], 1);
@@ -2788,6 +2917,12 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     assert_eq!(status, 200, "{alice_page}");
     assert!(alice_page.contains("local password"), "{alice_page}");
     assert!(alice_page.contains("1 OIDC"), "{alice_page}");
+    assert!(alice_page.contains("administrator"), "{alice_page}");
+    assert!(alice_page.contains("Current account"), "{alice_page}");
+    assert!(
+        !alice_page.contains("/suspension") && !alice_page.contains("/administrator"),
+        "case-only display differences must not expose self-targeting actions: {alice_page}"
+    );
 
     let (status, _, short_page) = request(
         http,
@@ -2815,6 +2950,205 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
         invalid.contains("Invalid account-directory cursor"),
         "{invalid}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
+    let url =
+        support::test_db("durable_admin_can_suspend_and_reactivate_an_account_end_to_end").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    let alice_id = e6ircd::db::bootstrap_first_admin(&pool, "Alice", "administrator password")
+        .await
+        .expect("durable administrator");
+    let bob_id = e6ircd::db::create_account(&pool, "Bob", "bob password")
+        .await
+        .expect("Bob");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "Alice", "administrator API")
+        .await
+        .expect("Alice token");
+    let bob_token = e6ircd::db::issue_api_token(&pool, "Bob", "Bob API")
+        .await
+        .expect("Bob token");
+    let bob_session = e6ircd::db::create_web_session(&pool, "Bob", None)
+        .await
+        .expect("Bob browser session");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.lifecycle.example".into(),
+        network_name: "LifecycleNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec![],
+        }),
+        database: Some(DatabaseConfig { url: url.clone() }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("HTTP");
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{bob_id}"),
+        &alice_token,
+        r#"{"suspended":true,"administrator":true}"#,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("exactly one"), "{body}");
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{bob_id}"),
+        &alice_token,
+        r#"{"suspended":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let response: serde_json::Value = serde_json::from_str(&body).expect("state JSON");
+    assert_eq!(response["account_id"], bob_id);
+    assert_eq!(response["suspended"], true);
+
+    let bob_api_request = format!(
+        "GET /api/v1/me HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {bob_token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (status, _, _) = request(http, &bob_api_request).await;
+    assert_eq!(status, 401, "suspension revokes Bob's existing API token");
+    let bob_console_request = format!(
+        "GET /console HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={bob_session}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (status, headers, _) = request(http, &bob_console_request).await;
+    assert_eq!(status, 303, "{headers}");
+    assert_eq!(response_header(&headers, "location"), Some("/login"));
+
+    let admin_directory_request = format!(
+        "GET /api/v1/admin/accounts?name=Bob HTTP/1.1\r\nHost: t\r\n\
+         Authorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &admin_directory_request).await;
+    assert_eq!(status, 200, "{body}");
+    let directory: serde_json::Value = serde_json::from_str(&body).expect("directory JSON");
+    assert_eq!(directory["accounts"][0]["suspended"], true);
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{alice_id}"),
+        &alice_token,
+        r#"{"suspended":true}"#,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("cannot suspend itself"), "{body}");
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{bob_id}"),
+        &alice_token,
+        r#"{"suspended":false}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let verification = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("reconnect");
+    assert_eq!(
+        e6ircd::db::verify_credentials(&verification, "Bob", "bob password")
+            .await
+            .expect("verify"),
+        Some("Bob".into())
+    );
+    assert_eq!(
+        e6ircd::db::api_token_account(&verification, &bob_token)
+            .await
+            .expect("old token lookup"),
+        None,
+        "reactivation never resurrects a revoked bearer"
+    );
+    let new_bob_token = e6ircd::db::issue_api_token(&verification, "Bob", "reactivated API")
+        .await
+        .expect("new Bob token");
+    drop(verification);
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{alice_id}"),
+        &new_bob_token,
+        r#"{"suspended":true}"#,
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{alice_id}"),
+        &alice_token,
+        r#"{"administrator":false}"#,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains("cannot remove its own authority"), "{body}");
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{bob_id}"),
+        &alice_token,
+        r#"{"administrator":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let bob_admin_request = format!(
+        "GET /api/v1/admin/accounts?name=Bob HTTP/1.1\r\nHost: t\r\n\
+         Authorization: Bearer {new_bob_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &bob_admin_request).await;
+    assert_eq!(status, 200, "{body}");
+    let bob_directory: serde_json::Value = serde_json::from_str(&body).expect("Bob directory JSON");
+    assert_eq!(bob_directory["accounts"][0]["administrator"], true);
+    assert_eq!(
+        bob_directory["accounts"][0]["administrator_sources"]["durable"],
+        true
+    );
+    assert_eq!(
+        bob_directory["accounts"][0]["administrator_sources"]["configuration"],
+        false
+    );
+
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{alice_id}"),
+        &new_bob_token,
+        r#"{"administrator":false}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, _, body) = request(http, &admin_directory_request).await;
+    assert_eq!(
+        status, 403,
+        "durable revocation must update the live authorization registry: {body}"
+    );
+    let (status, body) = patch_json(
+        http,
+        &format!("/api/v1/admin/accounts/{alice_id}"),
+        &new_bob_token,
+        r#"{"administrator":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

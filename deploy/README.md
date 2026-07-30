@@ -79,7 +79,16 @@ container loudly rather than starting half-configured. On the first database-bac
 operational values are imported into the revisioned `server_settings` row.
 After that, administrators manage them at `/console/configuration`; the
 database URL, secrets-key source, HTTP bind, immutable release revision, and
-initial administrator stay in bootstrap because the console depends on them.
+optional static administrator grants or the one-time first-administrator token
+stay in bootstrap because the console depends on them. On an empty account
+store, set `E6IRC_BOOTSTRAP_TOKEN`, open `/bootstrap`, and create the first
+durable administrator. The route closes permanently as soon as any account
+exists; remove the environment secret after successful initialization.
+The same page owns live history and audit retention (30 and 365 days by
+default). A supervised worker applies those limits in bounded batches and also
+removes expired browser sessions, personal access tokens, device grants, and
+consumed logout tokens; operators should alert on its fixed-category database
+errors rather than scheduling a second cleanup job.
 
 Deployments that still carry plaintext OIDC/operator credentials need a master
 key before the console can own those secrets. Until then, bootstrap credentials
@@ -96,6 +105,7 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_IRC_ADDR` | no (`127.0.0.1:6667`) | Raw IRC listener — loopback only; IRC is reached over WebSocket (`/ws/irc`) publicly |
 | `E6IRC_SECURE_COOKIES` | no (`true`) | Mark session cookies `Secure` |
 | `E6IRC_ADMIN_ACCOUNTS` | no | Comma-separated admin account names |
+| `E6IRC_BOOTSTRAP_TOKEN` | no (secret; 32–512 bytes) | One-time browser token for creating the first durable administrator on an empty account store |
 | `E6IRC_OIDC_ISSUER` | no | Shauth issuer, e.g. `https://auth.dev.e6qu.dev` (enables SSO) |
 | `E6IRC_OIDC_CLIENT_ID` | with issuer | Shauth OIDC client id, e.g. `e6irc-dev` |
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |

@@ -862,6 +862,11 @@ pub(crate) struct ServerState {
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
+    /// Durably suspended accounts. This gate lives on the same ordered core
+    /// thread as credential verdicts and administrative disconnects, so a
+    /// verification already in flight cannot re-authenticate after the
+    /// suspension event has run.
+    pub suspended_accounts: HashSet<AccountKey>,
     /// Requests to the DB worker (answered via `Input::DbReply`).
     pub db_tx: Sender<super::DbRequest>,
     /// High-water mark of simultaneously registered users (LUSERS max).
@@ -1007,6 +1012,7 @@ impl ServerState {
             nicks: HashMap::new(),
             channels: HashMap::new(),
             doomed: Vec::new(),
+            suspended_accounts: HashSet::new(),
             db_tx,
             max_users: 0,
             started_at,
@@ -1222,6 +1228,17 @@ impl ServerState {
     /// string can't reach these maps without folding.
     pub fn account_key(&self, name: &str) -> AccountKey {
         AccountKey(self.casemap.casefold(name))
+    }
+
+    pub fn preload_suspended_accounts(&mut self, accounts: Vec<String>) {
+        self.suspended_accounts = accounts
+            .into_iter()
+            .map(|account| self.account_key(&account))
+            .collect();
+    }
+
+    pub fn is_account_suspended(&self, account: &str) -> bool {
+        self.suspended_accounts.contains(&self.account_key(account))
     }
 
     /// The channel key for `target`, or `None` when it does not name a

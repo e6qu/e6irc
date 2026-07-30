@@ -10,6 +10,7 @@
 #            E6IRC_IRC_ADDR     (default 127.0.0.1:6667 — internal only)
 #            E6IRC_SECURE_COOKIES (default true)
 #            E6IRC_ADMIN_ACCOUNTS (comma-separated)
+#            E6IRC_BOOTSTRAP_TOKEN (32+ byte one-time first-admin secret)
 #            Shauth OIDC (all required together to enable SSO):
 #              E6IRC_OIDC_ISSUER  E6IRC_OIDC_CLIENT_ID  E6IRC_OIDC_CLIENT_SECRET
 #              E6IRC_OIDC_END_SESSION
@@ -59,6 +60,10 @@ fi
     printf ']\n'
   fi
   printf '\n[database]\nurl = "%s"\n' "$(toml "$E6IRC_DATABASE_URL")"
+
+  if [ -n "${E6IRC_BOOTSTRAP_TOKEN:-}" ]; then
+    printf '\n[bootstrap]\ntoken = "%s"\n' "$(toml "$E6IRC_BOOTSTRAP_TOKEN")"
+  fi
 
   if [ -n "${E6IRC_OIDC_ISSUER:-}" ]; then
     : "${E6IRC_OIDC_CLIENT_ID:?E6IRC_OIDC_CLIENT_ID is required when E6IRC_OIDC_ISSUER is set}"

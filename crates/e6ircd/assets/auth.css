@@ -133,6 +133,27 @@ h1 {
   padding: 0.85rem 1rem;
 }
 
+.auth-notice {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 1.5rem;
+  border: 1px solid var(--focus);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--focus) 8%, var(--surface));
+  padding: 0.85rem 1rem;
+}
+
+.auth-notice span,
+.section-note {
+  color: var(--muted);
+}
+
+.auth-notice a,
+.section-note a {
+  color: var(--accent);
+  font-weight: 750;
+}
+
 .auth-divider {
   display: flex;
   align-items: center;

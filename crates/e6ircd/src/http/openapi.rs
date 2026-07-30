@@ -611,6 +611,46 @@ fn document() -> serde_json::Value {
                         "400": { "description": "invalid limit, cursor, or exact account filter" },
                         "403": { "description": "not an admin account" } } }
             },
+            "/api/v1/admin/accounts/{id}": {
+                "patch": {
+                    "summary": "Change account suspension or durable administrator authority (admin only)",
+                    "description": "Exactly one desired state is accepted per request. Suspension commits credential revocation and an audit record before the live core and owned-network registry are reconciled. Self-suspension, self-demotion, and removing or suspending the last active durable administrator are rejected.",
+                    "security": bearer,
+                    "parameters": [{
+                        "name": "id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer", "minimum": 1 }
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "suspended": { "type": "boolean" },
+                                        "administrator": { "type": "boolean" }
+                                    },
+                                    "additionalProperties": false,
+                                    "oneOf": [
+                                        { "required": ["suspended"] },
+                                        { "required": ["administrator"] }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "account state and live runtime reconciled" },
+                        "400": { "description": "invalid account ID or request body" },
+                        "403": { "description": "not an admin account" },
+                        "404": { "description": "no such account" },
+                        "409": { "description": "self-targeting, last administrator, or invalid owned-network configuration" },
+                        "503": { "description": "database or live runtime unavailable" }
+                    }
+                }
+            },
             "/api/v1/admin/connections": {
                 "get": {
                     "summary": "Filter and page all live IRC connections (admin only)",

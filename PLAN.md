@@ -46,6 +46,35 @@ mode-0600 path, and has a portable entrypoint contract test. The systemd gate
 mechanically requires its stop budget to exceed the daemon's database flush
 budget.
 
+First-administrator and account-lifecycle closure (2026-07-30): an empty
+database now has a browser-complete, rate-limited, state-bound one-time
+bootstrap that atomically creates the first local account, durable
+administrator authority, and audit record. The account directory and OpenAPI
+surface expose durable/effective administrator and suspension posture.
+Administrators can suspend or reactivate a non-current account from the
+console or immutable-ID REST resource, and can grant/revoke durable
+administrator authority with self-demotion and last-active-administrator
+protection. Configured and durable authority sources remain distinguishable
+while their effective union updates live. Suspension atomically revokes browser,
+personal-access-token, and approved-device bearers; the ordered core installs a
+case-folded authentication gate and disconnects all live sessions; the
+serialized BNC registry stops every owned upstream. Reactivation retains
+credentials and definitions without reviving revoked bearers, removes the core
+gate, and restarts validated enabled networks. PostgreSQL, core race, registry,
+and real HTTP journey tests cover self/last-administrator invariants,
+late-verification races, owner scoping, revocation, and reactivation.
+
+Storage-lifecycle closure (2026-07-30): managed configuration and the browser
+console now own explicit 1–3650-day history and audit retention. A supervised
+five-minute worker prunes fixed 10,000-row batches of expired message history,
+audit events, browser sessions, personal access tokens, device grants, and
+consumed OpenID Connect logout tokens using time-order indexes and the global
+database deadlines. Batch saturation and database failure are loud, telemetry
+records the operation, and an unexpected worker exit triggers the critical
+shutdown path. PostgreSQL tests prove the two independent retention windows,
+all expired bearer families, preservation of live/new rows, and exact deletion
+counts; configuration tests prove defaults and closed bounds.
+
 Runtime-pressure and operational-browser closure (2026-07-30): the custom
 bounded queue now exposes a payload-free monitor, and the daemon registers the
 fixed core and database queues in snapshot schema v3. Their depth, capacity,
@@ -287,8 +316,8 @@ conformance suite.
 Control-plane console (2026-07-28): `/console/configuration` now owns typed,
 revisioned operational settings in PostgreSQL with redacted same-transaction
 audit entries and optimistic concurrency. The database URL, master-key source,
-HTTP bind, release revision, and initial administrator are the minimal
-bootstrap; server identity/MOTD, IRC listeners, BNC attach address,
+HTTP bind, release revision, and initial administrator authority are the
+minimal bootstrap; server identity/MOTD, IRC listeners, BNC attach address,
 registration and resource limits, proxy policy, public URL/cookies,
 administrator grants, OIDC providers, IRC operators, and server-level networks
 are UI-managed.

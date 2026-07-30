@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>e6irc — first administrator</title>
+    <link rel="stylesheet" href="/auth.css" />
+  </head>
+  <body>
+    <main class="auth-shell" id="main-content">
+      <section class="auth-card" aria-labelledby="bootstrap-title">
+        <span class="brand" aria-label="e6irc">e6irc</span>
+        <p class="eyebrow">First-run setup</p>
+        <h1 id="bootstrap-title">Create the administrator</h1>
+        <p class="lede">This one-time form closes permanently as soon as the first account is created.</p>
+        {% if let Some(message) = error %}
+          <div class="auth-error" role="alert">{{ message }}</div>
+        {% endif %}
+        <form class="login-form" method="post" action="/bootstrap">
+          <input type="hidden" name="bootstrap_state" value="{{ bootstrap_state }}" />
+          <label>
+            <span>Bootstrap token</span>
+            <input type="password" name="token" maxlength="512" autocomplete="one-time-code" required autofocus />
+          </label>
+          <label>
+            <span>Administrator account</span>
+            <input name="account" value="{{ account }}" maxlength="64" autocomplete="username" autocapitalize="none" spellcheck="false" required />
+          </label>
+          <label>
+            <span>Password</span>
+            <input type="password" name="password" maxlength="512" autocomplete="new-password" required />
+          </label>
+          <label>
+            <span>Confirm password</span>
+            <input type="password" name="password_confirmation" maxlength="512" autocomplete="new-password" required />
+          </label>
+          <button class="primary-action" type="submit">Create administrator</button>
+        </form>
+        <p class="section-note"><a href="/login">Back to sign in</a></p>
+      </section>
+    </main>
+  </body>
+</html>
