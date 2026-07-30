@@ -140,6 +140,28 @@ async fn healthz_is_public_and_ok() {
 }
 
 #[tokio::test]
+async fn bootstrap_routes_are_closed_when_not_configured() {
+    let running = net::start(test_config()).await.expect("start");
+    let http = running.http_addr.expect("HTTP bound");
+
+    let (status, headers, _) = request(http, &get("/bootstrap")).await;
+    assert_eq!(status, 303);
+    assert_eq!(response_header(&headers, "location"), Some("/login"));
+
+    let body = "token=unused";
+    let post = format!(
+        "POST /bootstrap HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, headers, body) = request(http, &post).await;
+    assert_eq!(status, 404);
+    assert!(headers.contains("application/problem+json"), "{headers}");
+    assert!(body.contains("Bootstrap unavailable"), "{body}");
+}
+
+#[tokio::test]
 async fn every_response_has_a_fresh_server_correlation_id_and_https_hsts() {
     let mut config = test_config();
     let http_config = config.http.as_mut().expect("HTTP config");

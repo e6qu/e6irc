@@ -1317,15 +1317,15 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BootstrapForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
+        let Some(expected_token) = state.bootstrap_token_digest else {
+            return problem(StatusCode::NOT_FOUND, "Bootstrap unavailable", None);
+        };
         let Some(pool) = &state.pool else {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "No database configured",
                 None,
             );
-        };
-        let Some(expected_token) = state.bootstrap_token_digest else {
-            return problem(StatusCode::NOT_FOUND, "Bootstrap unavailable", None);
         };
         if !state.bootstrap_available.load(Ordering::Acquire) {
             return problem(StatusCode::CONFLICT, "Bootstrap already complete", None);
@@ -6707,6 +6707,66 @@ mod pages {
             );
         }
         response
+    }
+
+    #[cfg(test)]
+    mod bootstrap_helper_tests {
+        use super::*;
+
+        #[test]
+        fn browser_state_cookie_is_exact_constant_time_input() {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                "other=x; state=exact-value".parse().unwrap(),
+            );
+            assert!(browser_state_matches(&headers, "state", "exact-value"));
+            assert!(!browser_state_matches(&headers, "state", "exact-valuE"));
+            assert!(!browser_state_matches(&headers, "state", "short"));
+            assert!(!browser_state_matches(&headers, "missing", "exact-value"));
+            assert_eq!(bootstrap_state_cookie_name(false), "e6irc_bootstrap_state");
+            assert_eq!(
+                bootstrap_state_cookie_name(true),
+                "__Host-e6irc_bootstrap_state"
+            );
+        }
+
+        #[test]
+        fn authenticated_redirect_sets_session_and_expires_browser_state() {
+            for secure in [false, true] {
+                let response =
+                    authenticated_redirect("session-token", "/console", "state-cookie", secure);
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                assert_eq!(
+                    response.headers().get(header::LOCATION).unwrap(),
+                    "/console"
+                );
+                let cookies: Vec<_> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .map(|value| value.to_str().unwrap())
+                    .collect();
+                assert_eq!(cookies.len(), 2);
+                assert!(cookies[0].contains("session-token"));
+                assert!(cookies[0].contains("HttpOnly"));
+                assert!(cookies[1].starts_with("state-cookie=;"));
+                assert!(cookies[1].contains("Max-Age=0"));
+                assert_eq!(cookies[0].contains("; Secure"), secure);
+                assert_eq!(cookies[1].contains("; Secure"), secure);
+            }
+        }
+
+        #[test]
+        fn bootstrap_digest_is_stable_and_token_specific() {
+            let digest = super::super::bootstrap_token_digest("one-time-secret");
+            assert_eq!(
+                digest,
+                super::super::bootstrap_token_digest("one-time-secret")
+            );
+            assert_ne!(digest, super::super::bootstrap_token_digest("other-secret"));
+            assert_eq!(digest.len(), 32);
+        }
     }
 
     #[cfg(test)]
