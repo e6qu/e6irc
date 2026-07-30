@@ -32,11 +32,11 @@ registry unavailability, upstream connection failure, and socket closure each
 produce a visible state. Retrying must create one new attachment rather than
 stacking duplicate handlers.
 
-**Evidence.** The embedded-shell, authentication, zero-network, and deliberate
-REST-failure states are browser-tested. Owner-scoped network discovery and
-authenticated WebSocket attachment are integration-tested separately. The
-browser suite currently mocks the network list and WebSocket for active chat,
-so this complete entry journey is partially proven.
+**Evidence.** The embedded-shell, authentication, zero-network, deliberate
+REST-failure, network-creation, and authenticated WebSocket states are
+browser-tested against a real daemon. Focused client-state cases use browser
+doubles; the primary entry journey uses the real network catalog and
+attachment.
 
 ## Receive replay and live messages without gaps or duplicates
 
@@ -59,11 +59,11 @@ the working live stream. Socket closure marks the connection disconnected.
 Malformed events are rejected or ignored according to their explicit protocol
 contract without corrupting other buffers.
 
-**Evidence.** Browser tests exercise the replay boundary, history race, and
-deduplication with mocked transport. PostgreSQL backlog and real `/ws/ui`
-streaming are independently proven. No CI test currently drives a real
-upstream line through persistence/multiplexer/WebSocket into Chromium, so the
-end-to-end outcome is partially proven.
+**Evidence.** Browser tests exercise replay boundaries, history races, and
+deduplication with deterministic transport. The full-stack browser case also
+drives a real upstream line through persistence, the multiplexer, and
+WebSocket into Chromium, gracefully restarts the daemon, and verifies that the
+same session can inspect the persisted line afterward.
 
 ## Join, converse, and leave
 
@@ -87,10 +87,10 @@ false successful send. Removing the selected network detaches the WebSocket.
 Channel leave and direct-message close are different actions and remain
 different in both UI and wire behavior.
 
-**Evidence.** Browser state tests cover NAMES, direct-message close, and channel
-leave. `/ws/ui` integration tests prove composer relay both ways and detachment
-on network removal. The full browser-to-real-upstream send/receive journey is
-partially proven.
+**Evidence.** Browser state tests cover NAMES, direct-message close, and
+channel leave. A real local IRC peer observes the Chromium composer’s exact
+PRIVMSG and sends a peer message back through the driver and `/ws/ui`; separate
+protocol tests cover detachment on network removal.
 
 ## Navigate account and operational surfaces
 

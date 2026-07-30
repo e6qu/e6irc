@@ -1,0 +1,35 @@
+[Unit]
+Description=e6irc server, web application, and bouncer
+Documentation=https://github.com/e6qu/e6irc/tree/main/deploy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=e6irc
+Group=e6irc
+ExecStart=/usr/local/bin/e6ircd --config /etc/e6irc/e6ircd.toml
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+LimitNOFILE=262144
+UMask=0077
+
+# The daemon persists through PostgreSQL and needs no writable host filesystem.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

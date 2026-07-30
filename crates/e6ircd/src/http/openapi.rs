@@ -2,9 +2,8 @@
 
 use super::*;
 
-/// OpenAPI 3.1 description of the REST surface. Hand-authored and kept in
-/// step with the routes above; consumers use it to generate clients.
-pub(super) async fn openapi() -> Response {
+/// Build the OpenAPI 3.1 description consumed by generated clients.
+fn document() -> serde_json::Value {
     let bearer = serde_json::json!([{ "bearer": [] }]);
     let ok_json = serde_json::json!({
         "200": { "description": "OK", "content": { "application/json": {} } }
@@ -89,7 +88,7 @@ pub(super) async fn openapi() -> Response {
                 "schema": { "type": "string", "maxLength": 300 } }),
         ]
     };
-    let spec = serde_json::json!({
+    serde_json::json!({
         "openapi": "3.1.0",
         "info": {
             "title": "e6irc REST API",
@@ -117,6 +116,15 @@ pub(super) async fn openapi() -> Response {
             },
             "/api/v1/server": {
                 "get": { "summary": "Server name, network name, version", "responses": ok_json }
+            },
+            "/api/v1/openapi.json": {
+                "get": {
+                    "summary": "This complete OpenAPI 3.1 contract",
+                    "responses": {
+                        "200": { "description": "method/path set validated against the router" },
+                        "500": { "description": "the compiled router and contract disagree" }
+                    }
+                }
             },
             "/api/v1/auth/app-passwords": {
                 "post": {
@@ -684,10 +692,72 @@ pub(super) async fn openapi() -> Response {
                         "403": { "description": "not an admin account" } } }
             }
         }
-    });
+    })
+}
+
+/// The route macro in `http::mod` is the source of truth for method/path
+/// existence; the OpenAPI document owns schemas and response semantics. Compare
+/// both complete sets so drift is a loud server error and a unit-test failure,
+/// not a representative-path assertion that can miss a newly added endpoint.
+fn validate_documented_operations(spec: &serde_json::Value) -> Result<(), String> {
+    let paths = spec
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "OpenAPI paths is not an object".to_string())?;
+    let methods = ["get", "post", "put", "patch", "delete"];
+    let actual: std::collections::BTreeSet<(&str, &str)> = paths
+        .iter()
+        .flat_map(|(path, item)| {
+            methods
+                .into_iter()
+                .filter(move |method| item.get(*method).is_some())
+                .map(move |method| (path.as_str(), method))
+        })
+        .collect();
+    let expected: std::collections::BTreeSet<(&str, &str)> =
+        super::DOCUMENTED_ROUTE_OPERATIONS.iter().copied().collect();
+    if actual == expected {
+        return Ok(());
+    }
+    let missing: Vec<String> = expected
+        .difference(&actual)
+        .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
+        .collect();
+    let extra: Vec<String> = actual
+        .difference(&expected)
+        .map(|(path, method)| format!("{} {}", method.to_ascii_uppercase(), path))
+        .collect();
+    Err(format!(
+        "OpenAPI/router operation mismatch; missing from spec: [{}]; absent from router: [{}]",
+        missing.join(", "),
+        extra.join(", ")
+    ))
+}
+
+/// Serve the validated contract. A drifted build does not hand automation a
+/// plausible but incomplete schema.
+pub(super) async fn openapi() -> Response {
+    let spec = document();
+    if let Err(error) = validate_documented_operations(&spec) {
+        eprintln!("http: {error}");
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OpenAPI contract is inconsistent",
+            Some(&error),
+        );
+    }
     (
         [(header::CONTENT_TYPE, "application/json")],
         spec.to_string(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn openapi_covers_every_documented_router_operation_exactly() {
+        let spec = super::document();
+        assert_eq!(super::validate_documented_operations(&spec), Ok(()));
+    }
 }

@@ -14,6 +14,9 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 concurrency:
   group: release-image-${{ github.ref }}
@@ -62,16 +65,50 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v7.3.0
+      - id: image
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          # Keep the architecture tags as direct image manifests. Signed
+          # provenance and SBOMs are attached as OCI referrers below, so they
+          # do not turn these tags into nested indexes.
           provenance: false
           sbom: false
           push: true
           tags: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
       - name: Verify the direct architecture image
         run: tools/verify-container-shape.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}" "${{ matrix.arch }}"
+      - name: Generate the architecture SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          image: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
+          output-file: sbom-${{ matrix.arch }}.spdx.json
+          format: spdx-json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest architecture build provenance
+        uses: actions/attest@v4.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+      - name: Attest architecture SBOM
+        uses: actions/attest@v4.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: sbom-${{ matrix.arch }}.spdx.json
+          push-to-registry: true
+      - name: Verify architecture attestations
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
+        run: |
+          gh attestation verify "oci://${IMAGE}:${TAG}" --repo "$GITHUB_REPOSITORY"
+          gh attestation verify "oci://${IMAGE}:${TAG}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --predicate-type https://spdx.dev/Document/v2.3
 
   manifest:
     needs: [metadata, build]
@@ -94,6 +131,28 @@ jobs:
             "${IMAGE}:${SHA}-arm64"
       - name: Verify the multi-architecture manifest
         run: tools/verify-container-shape.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}" manifest
+      - name: Resolve the published manifest digest
+        id: manifest-digest
+        env:
+          SHA: ${{ needs.metadata.outputs.tag }}
+        run: |
+          digest="$(docker buildx imagetools inspect --format '{{json .}}' "${IMAGE}:${SHA}" | jq -r .manifest.digest)"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid published manifest digest: $digest" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest manifest assembly provenance
+        uses: actions/attest@v4.2.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest-digest.outputs.digest }}
+          push-to-registry: true
+      - name: Verify manifest provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ needs.metadata.outputs.tag }}
+        run: gh attestation verify "oci://${IMAGE}:${SHA}" --repo "$GITHUB_REPOSITORY"
 
   prune:
     needs: [metadata, manifest]

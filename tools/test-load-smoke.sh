@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+server_bin="${E6IRC_TEST_SERVER_BINARY:-target/debug/e6ircd}"
+load_bin="${E6IRC_TEST_LOAD_BINARY:-target/debug/e6irc-load}"
+test_dir="$(mktemp -d)"
+server_pid=""
+
+cleanup() {
+  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    kill -TERM "$server_pid"
+    wait "$server_pid" || true
+  fi
+  rm -rf "$test_dir"
+}
+trap cleanup EXIT
+
+printf '%s\n' \
+  'server_name = "irc.load.test"' \
+  'network_name = "LoadTest"' \
+  '[[listeners]]' \
+  'addr = "127.0.0.1:16671"' \
+  > "$test_dir/e6ircd.toml"
+
+"$server_bin" --config "$test_dir/e6ircd.toml" \
+  >"$test_dir/server.stdout" 2>"$test_dir/server.stderr" &
+server_pid="$!"
+
+ready=false
+for _ in $(seq 1 100); do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "e6ircd exited during load-smoke startup" >&2
+    cat "$test_dir/server.stdout" "$test_dir/server.stderr" >&2
+    exit 1
+  fi
+  if (exec 3<>/dev/tcp/127.0.0.1/16671) 2>/dev/null; then
+    exec 3>&-
+    ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$ready" != true ]]; then
+  echo "e6ircd did not become ready for load smoke" >&2
+  cat "$test_dir/server.stdout" "$test_dir/server.stderr" >&2
+  exit 1
+fi
+
+"$load_bin" \
+  --addr 127.0.0.1:16671 \
+  --clients 64 \
+  --channels 8 \
+  --burst 4
+
+kill -TERM "$server_pid"
+if ! wait "$server_pid"; then
+  echo "e6ircd did not shut down cleanly after load smoke" >&2
+  cat "$test_dir/server.stdout" "$test_dir/server.stderr" >&2
+  exit 1
+fi
+server_pid=""

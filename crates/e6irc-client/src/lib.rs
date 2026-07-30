@@ -1,8 +1,9 @@
 //! Client-side connection library shared by e6irc-cli and e6irc-tui.
 //!
-//! A thin async wrapper over a TCP stream that frames IRC lines with
-//! `e6irc-proto` and drives registration. TLS and SASL layer on top in
-//! later work; this is the plaintext core the clients build against.
+//! An async wrapper over plaintext or public-CA TLS sockets that frames IRC
+//! lines with `e6irc-proto` and drives anonymous, SASL PLAIN, or SASL
+//! OAUTHBEARER registration. [`ConnectionOptions`] is the single owned request
+//! used by both native clients, including reconnects.
 
 #![deny(clippy::let_underscore_must_use)]
 
@@ -77,6 +78,108 @@ pub struct OwnedMessage {
     pub source: Option<String>,
     pub command: String,
     pub params: Vec<String>,
+}
+
+/// Authentication selected for a registered client connection.
+///
+/// Credentials are owned so a reconnecting client can reuse the exact explicit
+/// choice. There is no `Option` pair whose half-filled state could silently
+/// fall back to anonymous registration.
+#[derive(Clone, Default)]
+pub enum Authentication {
+    #[default]
+    None,
+    Plain {
+        account: String,
+        password: String,
+    },
+    OAuthBearer {
+        token: String,
+    },
+}
+
+/// Complete transport and registration request shared by native clients.
+#[derive(Clone)]
+pub struct ConnectionOptions {
+    pub address: String,
+    pub tls: bool,
+    /// Required for TLS when `address` is not a DNS name. When absent, the
+    /// syntactic host portion of `address` is used.
+    pub tls_server_name: Option<String>,
+    pub nick: String,
+    pub realname: String,
+    pub authentication: Authentication,
+}
+
+impl ConnectionOptions {
+    /// Connect, negotiate the selected transport/authentication, and return
+    /// only after the server confirms registration.
+    pub async fn connect_registered(&self) -> io::Result<Connection> {
+        let mut connection = if self.tls {
+            let name = match self.tls_server_name.as_deref() {
+                Some(name) if !name.trim().is_empty() => name,
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TLS server name cannot be empty",
+                    ));
+                }
+                None => address_host(&self.address)?,
+            };
+            Connection::connect_tls(&self.address, name, webpki_root_store()).await?
+        } else {
+            Connection::connect(&self.address).await?
+        };
+        match &self.authentication {
+            Authentication::None => {
+                connection.register(&self.nick, &self.realname).await?;
+            }
+            Authentication::Plain { account, password } => {
+                connection
+                    .register_sasl(&self.nick, &self.realname, account, password)
+                    .await?;
+            }
+            Authentication::OAuthBearer { token } => {
+                connection
+                    .register_oauthbearer(&self.nick, &self.realname, token)
+                    .await?;
+            }
+        }
+        Ok(connection)
+    }
+}
+
+/// Extract a TLS validation name from `host:port`, including bracketed IPv6.
+/// A bare IPv6 address is not a valid endpoint because its port is ambiguous.
+fn address_host(address: &str) -> io::Result<&str> {
+    if let Some(bracketed) = address.strip_prefix('[') {
+        let (host, suffix) = bracketed.split_once(']').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid bracketed server address",
+            )
+        })?;
+        if !suffix.starts_with(':') || suffix.len() == 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "server address must include a port",
+            ));
+        }
+        return Ok(host);
+    }
+    let (host, port) = address.rsplit_once(':').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server address must be host:port",
+        )
+    })?;
+    if host.is_empty() || host.contains(':') || port.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server address must be host:port (bracket IPv6 addresses)",
+        ));
+    }
+    Ok(host)
 }
 
 /// The borrowed → owned conversion. Public because [`OwnedMessage`] is: a
@@ -599,6 +702,16 @@ mod tests {
         let owned = OwnedMessage::from(&Message::parse(":irc.example 001 nick :Welcome").unwrap());
         assert_eq!(owned.source.as_deref(), Some("irc.example"));
         assert_eq!(owned.command, "001");
+    }
+
+    #[test]
+    fn tls_name_is_derived_without_misparsing_ipv6() {
+        assert_eq!(address_host("irc.example:6697").unwrap(), "irc.example");
+        assert_eq!(address_host("127.0.0.1:6697").unwrap(), "127.0.0.1");
+        assert_eq!(address_host("[2001:db8::1]:6697").unwrap(), "2001:db8::1");
+        assert!(address_host("2001:db8::1:6697").is_err());
+        assert!(address_host("missing-port").is_err());
+        assert!(address_host("[2001:db8::1]").is_err());
     }
 
     #[tokio::test]

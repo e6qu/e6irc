@@ -612,7 +612,9 @@ async fn openapi_spec_is_served() {
     assert!(head.to_lowercase().contains("application/json"), "{head}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON spec");
     assert_eq!(v["openapi"], "3.1.0");
-    // A couple of representative paths are documented.
+    // Method/path completeness is enforced mechanically by the route catalog's
+    // unit test. These assertions protect the richer request-schema contract
+    // that cannot be inferred from an axum handler.
     assert!(
         v["paths"]["/api/v1/me/networks"]["post"].is_object(),
         "{body}"

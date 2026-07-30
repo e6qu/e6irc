@@ -482,10 +482,92 @@ async fn admin_metrics(State(state): State<Arc<AppState>>, _admin: AdminAccount)
     response
 }
 
+async fn health() -> &'static str {
+    "ok"
+}
+
+// Define every OpenAPI-documented HTTP operation once. This expands to both
+// the axum routes and the method/path inventory validated by `openapi.rs`, so a
+// handler cannot be added to the public REST surface without becoming an
+// explicit specification obligation in the same edit.
+macro_rules! documented_routes {
+    ($( $path:literal => { $( $method:ident : $handler:expr ),+ $(,)? } ),+ $(,)?) => {
+        pub(super) const DOCUMENTED_ROUTE_OPERATIONS: &[(&str, &str)] = &[
+            $( $(($path, stringify!($method))),+ ),+
+        ];
+
+        fn add_documented_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+            router$(
+                .route(
+                    $path,
+                    axum::routing::MethodRouter::new()$(.$method($handler))+
+                )
+            )+
+        }
+    };
+}
+
+documented_routes! {
+    "/healthz" => { get: health },
+    "/readyz" => { get: readiness },
+    "/api/v1/server" => { get: server_info },
+    "/api/v1/openapi.json" => { get: openapi },
+    "/api/v1/auth/app-passwords" => { post: create_app_password },
+    "/api/v1/auth/oidc/{provider}/start" => { get: oidc_start },
+    "/api/v1/auth/oidc/{provider}/sso" => { get: oidc_sso_start },
+    "/api/v1/auth/oidc/{provider}/link" => { get: oidc_link_start },
+    "/api/v1/auth/oidc/{provider}/callback" => { get: oidc_callback },
+    "/api/v1/auth/oidc/backchannel-logout" => { post: oidc_backchannel_logout },
+    "/api/v1/auth/oidc/frontchannel-logout" => { get: oidc_frontchannel_logout },
+    "/api/v1/auth/logout" => { get: logout_sso, post: logout },
+    "/api/v1/auth/device/start" => { post: device_start },
+    "/api/v1/auth/device/token" => { post: device_token },
+    "/api/v1/auth/device/approve" => { post: device_approve },
+    "/api/v1/me" => { get: me },
+    "/api/v1/me/identities" => { get: me_identities },
+    "/api/v1/me/identities/{id}" => { delete: me_identity_unlink },
+    "/api/v1/me/sessions" => { get: list_browser_sessions },
+    "/api/v1/me/sessions/{id}" => { delete: revoke_browser_session },
+    "/api/v1/me/connections" => { get: me_connections },
+    "/api/v1/me/connections/{id}" => { delete: me_disconnect_connection },
+    "/api/v1/me/tokens" => { get: me_tokens_list, post: create_api_token },
+    "/api/v1/me/tokens/{id}" => { delete: me_tokens_revoke },
+    "/api/v1/me/read-markers" => { get: me_read_markers },
+    "/api/v1/me/password" => { put: change_password },
+    "/api/v1/me/channels" => { get: list_owned_channels, post: register_owned_channel },
+    "/api/v1/me/channels/{name}" => {
+        get: get_owned_channel,
+        patch: patch_owned_channel,
+        delete: delete_owned_channel,
+    },
+    "/api/v1/me/channels/{name}/access/{account}" => {
+        put: put_channel_access,
+        delete: delete_channel_access,
+    },
+    "/api/v1/me/credentials" => { get: list_credentials },
+    "/api/v1/me/credentials/{id}" => { delete: revoke_credential },
+    "/api/v1/me/networks" => { get: list_networks, post: create_network },
+    "/api/v1/me/networks/{name}" => {
+        get: get_network,
+        put: update_network,
+        patch: patch_network,
+        delete: delete_network,
+    },
+    "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
+    "/api/v1/history" => { get: history },
+    "/api/v1/admin/accounts" => { get: admin_accounts },
+    "/api/v1/admin/connections" => { get: admin_connections },
+    "/api/v1/admin/connections/{id}" => { delete: admin_disconnect_connection },
+    "/api/v1/admin/channels" => { get: admin_channels },
+    "/api/v1/admin/bans" => { get: admin_server_bans },
+    "/api/v1/admin/audit" => { get: admin_audit },
+    "/api/v1/admin/stats" => { get: admin_stats },
+    "/api/v1/admin/observability" => { get: admin_observability },
+    "/api/v1/admin/metrics" => { get: admin_metrics },
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let router = Router::new()
-        .route("/healthz", get(async || "ok"))
-        .route("/readyz", get(readiness))
         .route("/login", get(pages::login).post(pages::local_login))
         .route("/auth/signed-out", get(pages::signed_out))
         .route("/auth/validation", get(pages::validation))
@@ -651,96 +733,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
-        )
-        .route("/api/v1/server", get(server_info))
-        .route("/api/v1/openapi.json", get(openapi))
-        .route("/api/v1/auth/app-passwords", post(create_app_password))
-        .route("/api/v1/auth/oidc/{provider}/start", get(oidc_start))
-        .route("/api/v1/auth/oidc/{provider}/sso", get(oidc_sso_start))
-        .route("/api/v1/auth/oidc/{provider}/link", get(oidc_link_start))
-        .route("/api/v1/auth/oidc/{provider}/callback", get(oidc_callback))
-        .route(
-            "/api/v1/auth/oidc/backchannel-logout",
-            post(oidc_backchannel_logout),
-        )
-        .route(
-            "/api/v1/auth/oidc/frontchannel-logout",
-            get(oidc_frontchannel_logout),
-        )
-        .route("/api/v1/me/identities", get(me_identities))
-        .route(
-            "/api/v1/me/identities/{id}",
-            axum::routing::delete(me_identity_unlink),
-        )
-        .route("/api/v1/auth/logout", post(logout).get(logout_sso))
-        .route("/api/v1/auth/device/start", post(device_start))
-        .route("/api/v1/auth/device/token", post(device_token))
-        .route("/api/v1/auth/device/approve", post(device_approve))
-        .route("/api/v1/me", get(me))
-        .route("/api/v1/me/sessions", get(list_browser_sessions))
-        .route(
-            "/api/v1/me/sessions/{id}",
-            axum::routing::delete(revoke_browser_session),
-        )
-        .route("/api/v1/me/connections", get(me_connections))
-        .route(
-            "/api/v1/me/connections/{id}",
-            axum::routing::delete(me_disconnect_connection),
-        )
-        .route(
-            "/api/v1/me/tokens",
-            get(me_tokens_list).post(create_api_token),
-        )
-        .route(
-            "/api/v1/me/tokens/{id}",
-            axum::routing::delete(me_tokens_revoke),
-        )
-        .route("/api/v1/me/read-markers", get(me_read_markers))
-        .route("/api/v1/me/password", axum::routing::put(change_password))
-        .route(
-            "/api/v1/me/channels",
-            get(list_owned_channels).post(register_owned_channel),
-        )
-        .route(
-            "/api/v1/me/channels/{name}",
-            get(get_owned_channel)
-                .patch(patch_owned_channel)
-                .delete(delete_owned_channel),
-        )
-        .route(
-            "/api/v1/me/channels/{name}/access/{account}",
-            axum::routing::put(put_channel_access).delete(delete_channel_access),
-        )
-        .route("/api/v1/me/credentials", get(list_credentials))
-        .route(
-            "/api/v1/me/credentials/{id}",
-            axum::routing::delete(revoke_credential),
-        )
-        .route(
-            "/api/v1/me/networks",
-            get(list_networks).post(create_network),
-        )
-        .route(
-            "/api/v1/me/networks/{name}",
-            get(get_network)
-                .put(update_network)
-                .delete(delete_network)
-                .patch(patch_network),
-        )
-        .route("/api/v1/me/networks/{name}/buffer", get(network_buffer))
-        .route("/api/v1/history", get(history))
-        .route("/api/v1/admin/accounts", get(admin_accounts))
-        .route("/api/v1/admin/connections", get(admin_connections))
-        .route(
-            "/api/v1/admin/connections/{id}",
-            axum::routing::delete(admin_disconnect_connection),
-        )
-        .route("/api/v1/admin/channels", get(admin_channels))
-        .route("/api/v1/admin/bans", get(admin_server_bans))
-        .route("/api/v1/admin/audit", get(admin_audit))
-        .route("/api/v1/admin/stats", get(admin_stats))
-        .route("/api/v1/admin/observability", get(admin_observability))
-        .route("/api/v1/admin/metrics", get(admin_metrics))
+        );
+    let router = add_documented_routes(router)
         .route("/ws/irc", get(ws_irc))
         .route("/ws/ui", get(ws_ui));
     // With the `embed-web` feature the built web client (web/dist) is

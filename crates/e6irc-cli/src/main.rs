@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use e6irc_client::{Connection, TerminalSafe};
+use e6irc_client::{Authentication, ConnectionOptions, TerminalSafe};
 
 /// IRC numerics that mean a JOIN was refused — so a `send`/`history` client
 /// bails with a clear error instead of waiting forever for a 366 that will
@@ -132,25 +132,12 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         return run_api(method, path, base, token.clone(), body.clone()).await;
     }
 
-    let mut conn = if cli.tls {
-        let name = cli.tls_name.clone().unwrap_or_else(|| {
-            cli.server
-                .rsplit_once(':')
-                .map(|(h, _)| h.to_string())
-                .unwrap_or_else(|| cli.server.clone())
-        });
-        Connection::connect_tls(&cli.server, &name, e6irc_client::webpki_root_store()).await?
-    } else {
-        Connection::connect(&cli.server).await?
-    };
-    match (&cli.account, &cli.password) {
-        (Some(account), Some(password)) => {
-            conn.register_sasl(&cli.nick, "e6irc-cli", account, password)
-                .await?;
-        }
-        (None, None) => {
-            conn.register(&cli.nick, "e6irc-cli").await?;
-        }
+    let authentication = match (&cli.account, &cli.password) {
+        (Some(account), Some(password)) => Authentication::Plain {
+            account: account.clone(),
+            password: password.clone(),
+        },
+        (None, None) => Authentication::None,
         // One credential without the other is a mistake — registering
         // unauthenticated instead of what the user asked for would be a silent
         // fallback of a client-observable option.
@@ -160,7 +147,17 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 "--account and --password must be given together",
             ));
         }
+    };
+    let mut conn = ConnectionOptions {
+        address: cli.server.clone(),
+        tls: cli.tls,
+        tls_server_name: cli.tls_name.clone(),
+        nick: cli.nick.clone(),
+        realname: "e6irc-cli".into(),
+        authentication,
     }
+    .connect_registered()
+    .await?;
     match cli.command {
         Command::Send { target, message } => {
             // Channels are +n by default, so join before speaking and

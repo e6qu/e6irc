@@ -10,6 +10,7 @@
 //! It exercises the exact paths the server's scale target stresses
 //! (thousands of sessions, wide fan-out) without any test framework.
 
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -98,13 +99,17 @@ async fn connect(args: &Args) -> std::io::Result<Connection> {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args = parse_args();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    runtime.block_on(run(args));
+    if runtime.block_on(run(args)) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// Shared timing/counters across the client tasks.
@@ -133,7 +138,7 @@ fn pctl_us(sorted_ns: &[u64], p: f64) -> f64 {
     sorted_ns[idx] as f64 / 1000.0
 }
 
-async fn run(args: Args) {
+async fn run(args: Args) -> bool {
     let args = Arc::new(args);
     println!(
         "e6irc-load: {} clients across {} channel(s) -> {} (burst {})",
@@ -193,7 +198,7 @@ async fn run(args: Args) {
     let delivered = metrics.received.load(Ordering::Relaxed);
     // Every non-sender receives its channel sender's burst; there is one
     // sender per channel.
-    let expected = (args.burst * ok.saturating_sub(args.channels)) as u64;
+    let expected = (args.burst * (args.clients - args.channels)) as u64;
     let fanout_secs = metrics.fanout_max_ms.load(Ordering::Relaxed) as f64 / 1000.0;
     if fanout_secs > 0.0 {
         println!(
@@ -219,6 +224,10 @@ async fn run(args: Args) {
             pctl_us(&lat, 1.0),
         );
     }
+    if delivered != expected {
+        eprintln!("incomplete fan-out: received {delivered} of {expected} required deliveries");
+    }
+    failures == 0 && delivered == expected
 }
 
 /// One client: connect, register, join, sync on the barrier, then either
@@ -299,7 +308,7 @@ async fn client(
     // delivery time instead.
     let mut last_delivery_ms = 0u64;
     let mut latencies = Vec::with_capacity(args.burst);
-    let _ = tokio::time::timeout(Duration::from_secs(30), async {
+    let receive = tokio::time::timeout(Duration::from_secs(30), async {
         while count < args.burst as u64 {
             match conn.next_message().await {
                 Ok(Some(m))
@@ -326,9 +335,16 @@ async fn client(
                     last_delivery_ms = fanout_start.elapsed().as_millis() as u64;
                 }
                 Ok(Some(_)) => {}
-                _ => break,
+                Ok(None) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "server closed before complete fan-out",
+                    ));
+                }
+                Err(error) => return Err(error),
             }
         }
+        Ok::<(), std::io::Error>(())
     })
     .await;
     if count > 0 {
@@ -342,5 +358,11 @@ async fn client(
         .lock()
         .expect("latency pool poisoned")
         .extend(latencies);
-    Ok(())
+    match receive {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("fan-out timed out after {count}/{} deliveries", args.burst),
+        )),
+    }
 }

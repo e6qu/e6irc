@@ -19,6 +19,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.1
+      - run: tools/check-systemd-unit.sh
       # embed-web (pulled in by --all-features) embeds web/dist, so build
       # the frontend first. Node is preinstalled on the runners.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
@@ -162,6 +163,16 @@ jobs:
           docker cp "$container_id:/usr/local/bin/e6ircd" /tmp/e6ircd
           strings /tmp/e6ircd | grep -F "Open my account"
       - run: tools/test-prune-ghcr-versions.sh
+
+  load-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build -p e6ircd -p e6irc-load
+      - run: tools/test-load-smoke.sh
 
   shauth-sso:
     runs-on: ubuntu-24.04

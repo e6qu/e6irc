@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +22,7 @@ const applicationOrigin = "http://127.0.0.1:18083";
 const temporaryDirectory = await mkdtemp(join(tmpdir(), "e6irc-oidc-browser-"));
 const configPath = join(temporaryDirectory, "e6irc.toml");
 const serverOutput = [];
+const upstream = await startIrcUpstream();
 await writeFile(
   configPath,
   `server_name = "irc.browser.example"
@@ -51,11 +53,7 @@ client_secret = "e6irc-test-secret"
 );
 
 const binary = resolve(repositoryRoot, process.env.E6IRC_TEST_SERVER_BINARY ?? "target/debug/e6ircd");
-const server = spawn(binary, ["--config", configPath], { stdio: ["ignore", "pipe", "pipe"] });
-for (const stream of [server.stdout, server.stderr]) {
-  stream.setEncoding("utf8");
-  stream.on("data", (chunk) => serverOutput.push(chunk));
-}
+let server = startApplicationServer();
 
 // Hard watchdog: a hung browser, an unresponsive `browser.close()`, or a stuck
 // navigation must fail this test in seconds, not sit until the CI job's own
@@ -103,7 +101,8 @@ try {
   await page.waitForFunction(
     () => document.getElementById("account-name")?.textContent !== "signed in",
   );
-  assert.notEqual(await page.locator("#account-name").textContent(), "signed in");
+  const accountName = await page.locator("#account-name").textContent();
+  assert.ok(accountName && accountName !== "signed in");
   // The embedded client shell must render an honest, usable zero-network
   // state: account navigation and preferences remain available, the picker
   // distinguishes an empty collection from an API failure, and the composer
@@ -126,6 +125,96 @@ try {
     await page.getByRole("link", { name: "Registered channels", exact: true }).getAttribute("class"),
     "active",
   );
+
+  // An OpenID Connect-only account can add a local password through the real
+  // self-service form, sign out, and submit the actual local-login page in
+  // Chromium. This closes the browser boundary that the HTTP credential tests
+  // cannot cross.
+  await page.goto(`${applicationOrigin}/console/account`);
+  await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
+  await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
+  await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
+  await page.getByRole("button", { name: "Add password", exact: true }).click();
+  await page.getByRole("status").waitFor();
+  assert.match(await page.getByRole("status").innerText(), /Local password added/);
+  assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
+  await page.goto(`${applicationOrigin}/login`);
+  await page.getByLabel("Account", { exact: true }).fill(accountName);
+  await page.getByLabel("Password", { exact: true }).fill("browser-local-password");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.waitForURL(`${applicationOrigin}/`);
+  await page.waitForFunction(
+    () => document.getElementById("account-name")?.textContent !== "signed in",
+  );
+  assert.equal(await page.locator("#account-name").textContent(), accountName);
+
+  // Configure a custom IRC upstream entirely through the server-rendered UI,
+  // then use the production web client and its real /ws/ui socket in both
+  // directions. The local upstream is a protocol peer, not a browser route
+  // replacement: this crosses browser → REST/console → PostgreSQL → registry →
+  // IRC driver → TCP peer and back through the multiplexer/WebSocket.
+  await page.goto(`${applicationOrigin}/console/networks`);
+  await page.getByRole("heading", { name: "Your networks", exact: true }).waitFor();
+  assert.equal(await page.locator('select[name="preset"]').inputValue(), "libera");
+  assert.equal(await page.locator('input[name="addr"]').inputValue(), "irc.libera.chat:6697");
+  assert.equal(await page.locator('input[name="tls"]').isChecked(), true);
+  await page.locator('select[name="preset"]').selectOption("custom");
+  await page.locator('input[name="name"]').fill("journey");
+  await page.locator('input[name="addr"]').fill(upstream.address);
+  await page.locator('input[name="nick"]').fill("webjourney");
+  await page.locator('input[name="autojoin"]').fill("#journey");
+  await page.locator('input[name="tls"]').uncheck();
+  await page.getByRole("button", { name: "Add network", exact: true }).click();
+  await page.waitForURL(`${applicationOrigin}/console/networks`);
+  await page.getByRole("link", { name: "journey", exact: true }).waitFor();
+  await upstream.waitForJoin("#journey");
+
+  await page.goto(`${applicationOrigin}/?network=journey`);
+  await page.locator(".buf-name").filter({ hasText: /^#journey$/ }).waitFor();
+  await upstream.sendPeerMessage("#journey", "browser receives through the real stack");
+  await page.getByText("browser receives through the real stack", { exact: true }).waitFor();
+  await page.locator("#message").fill("browser sends through the real stack");
+  await page.locator("#composer button[type=submit]").click();
+  await upstream.waitForLine(
+    (line) => line === "PRIVMSG #journey :browser sends through the real stack",
+  );
+  await page.getByText("browser sends through the real stack", { exact: true }).waitFor();
+
+  // The owner-facing diagnostics must reflect that same live exchange rather
+  // than merely rendering the stored row.
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
+  await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
+  await page.getByText("Received from upstream", { exact: true }).waitFor();
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector("#network-operations .health-strip > div:first-child strong")
+        ?.textContent?.trim() === "connected",
+  );
+  assert.match(await page.locator("#network-operations").innerText(), /browser receives through the real stack/);
+
+  // Exercise the daemon's actual signal handler and startup preload while the
+  // same browser context, account session, network definition, upstream, and
+  // backlog all exist. Component restart tests cannot prove that these durable
+  // domains are wired together in the shipped process.
+  await page.goto("about:blank");
+  await stopApplicationServer({ requireGraceful: true });
+  server = startApplicationServer();
+  await waitForHealthyServer();
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
+  await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
+  await page.getByText("Received from upstream", { exact: true }).waitFor();
+  await page
+    .locator(".backlog code")
+    .filter({ hasText: "browser receives through the real stack" })
+    .waitFor();
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector("#network-operations .health-strip > div:first-child strong")
+        ?.textContent?.trim() === "connected",
+  );
+
   await page.goto(`${applicationOrigin}/`);
   await page.locator("#network-select").waitFor();
   await page.route(`${applicationOrigin}/api/v1/me/networks`, async (route) => {
@@ -389,12 +478,41 @@ try {
       new Promise((resolveTimeout) => setTimeout(resolveTimeout, 10_000)),
     ]);
   }
-  server.kill("SIGTERM");
-  await Promise.race([
-    new Promise((resolveExit) => server.once("exit", resolveExit)),
-    new Promise((resolveTimeout) => setTimeout(resolveTimeout, 5_000)),
-  ]);
+  await stopApplicationServer({ requireGraceful: false });
+  await upstream.close();
   await rm(temporaryDirectory, { recursive: true, force: true });
+}
+
+function startApplicationServer() {
+  const child = spawn(binary, ["--config", configPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  for (const stream of [child.stdout, child.stderr]) {
+    stream.setEncoding("utf8");
+    stream.on("data", (chunk) => serverOutput.push(chunk));
+  }
+  return child;
+}
+
+async function stopApplicationServer({ requireGraceful }) {
+  if (server.exitCode !== null || server.signalCode !== null) return;
+  const exit = new Promise((resolveExit) => {
+    server.once("exit", (code, signal) => resolveExit({ code, signal }));
+  });
+  assert.equal(server.kill("SIGTERM"), true, "failed to signal e6ircd");
+  const result = await Promise.race([
+    exit,
+    new Promise((_, rejectTimeout) =>
+      setTimeout(() => rejectTimeout(new Error("e6ircd did not stop within 5 seconds")), 5_000),
+    ),
+  ]);
+  if (requireGraceful) {
+    assert.deepEqual(
+      result,
+      { code: 0, signal: null },
+      `e6ircd did not complete graceful shutdown:\n${serverOutput.join("")}`,
+    );
+  }
 }
 
 async function waitForHealthyServer() {
@@ -416,4 +534,136 @@ async function waitForHealthyServer() {
 function sanitizeURL(value) {
   const parsed = new URL(value);
   return `${parsed.origin}${parsed.pathname}`;
+}
+
+async function startIrcUpstream() {
+  const sockets = new Set();
+  const lines = [];
+  const lineWaiters = [];
+  let joined;
+  let resolveJoined;
+  const joinedPromise = new Promise((resolve) => {
+    resolveJoined = resolve;
+  });
+
+  const publishLine = (line) => {
+    lines.push(line);
+    for (let index = lineWaiters.length - 1; index >= 0; index -= 1) {
+      const waiter = lineWaiters[index];
+      if (waiter.predicate(line)) {
+        lineWaiters.splice(index, 1);
+        clearTimeout(waiter.timeout);
+        waiter.resolve(line);
+      }
+    }
+  };
+
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.setEncoding("utf8");
+    let buffered = "";
+    let nick = "webjourney";
+    let sawUser = false;
+    let capEnded = false;
+    let welcomed = false;
+    const send = (line) => socket.write(`${line}\r\n`);
+    const welcome = () => {
+      if (welcomed || !sawUser || !capEnded) return;
+      welcomed = true;
+      send(`:journey.example 001 ${nick} :Welcome to the journey upstream`);
+      send(`:journey.example 005 ${nick} CHANTYPES=# PREFIX=(ov)@+ :supported`);
+    };
+    const names = (channel) => {
+      send(`:journey.example 353 ${nick} = ${channel} :@${nick} peer`);
+      send(`:journey.example 366 ${nick} ${channel} :End of /NAMES list`);
+    };
+    const onLine = (line) => {
+      publishLine(line);
+      const [commandRaw, ...params] = line.split(" ");
+      const command = commandRaw.toUpperCase();
+      if (command === "CAP" && params[0] === "LS") {
+        send(":journey.example CAP * LS :server-time message-tags account-tag");
+      } else if (command === "CAP" && params[0] === "REQ") {
+        send(`:journey.example CAP * ACK :${params.slice(1).join(" ").replace(/^:/, "")}`);
+      } else if (command === "CAP" && params[0] === "END") {
+        capEnded = true;
+        welcome();
+      } else if (command === "NICK" && params[0]) {
+        nick = params[0];
+      } else if (command === "USER") {
+        sawUser = true;
+        welcome();
+      } else if (command === "JOIN" && params[0]) {
+        const channel = params[0];
+        send(`:${nick}!web@journey JOIN ${channel}`);
+        names(channel);
+        if (!joined) {
+          joined = { socket, nick, channel };
+          resolveJoined(joined);
+        }
+      } else if (command === "NAMES" && params[0]) {
+        names(params[0]);
+      } else if (command === "PRIVMSG" && params[0]) {
+        send(`@time=2026-07-30T02:00:01.000Z;msgid=browser-send :${nick}!web@journey ${line}`);
+      } else if (command === "PING") {
+        send(`PONG ${params.join(" ")}`);
+      }
+    };
+    socket.on("data", (chunk) => {
+      buffered += chunk;
+      while (buffered.includes("\n")) {
+        const newline = buffered.indexOf("\n");
+        const line = buffered.slice(0, newline).replace(/\r$/, "");
+        buffered = buffered.slice(newline + 1);
+        if (line) onLine(line);
+      }
+    });
+    socket.on("close", () => sockets.delete(socket));
+  });
+
+  await new Promise((resolveListen, rejectListen) => {
+    server.once("error", rejectListen);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+
+  return {
+    address: `127.0.0.1:${address.port}`,
+    async waitForJoin(channel) {
+      const connection = await Promise.race([
+        joinedPromise,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`upstream did not observe JOIN ${channel}`)), 10_000),
+        ),
+      ]);
+      assert.equal(connection.channel, channel);
+    },
+    async sendPeerMessage(channel, text) {
+      const connection = await joinedPromise;
+      connection.socket.write(
+        `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive :peer!user@journey PRIVMSG ${channel} :${text}\r\n`,
+      );
+    },
+    async waitForLine(predicate) {
+      const existing = lines.find(predicate);
+      if (existing) return existing;
+      return new Promise((resolveLine, rejectLine) => {
+        const waiter = {
+          predicate,
+          resolve: resolveLine,
+          timeout: setTimeout(() => {
+            const index = lineWaiters.indexOf(waiter);
+            if (index >= 0) lineWaiters.splice(index, 1);
+            rejectLine(new Error(`upstream line not observed; received:\n${lines.join("\n")}`));
+          }, 10_000),
+        };
+        lineWaiters.push(waiter);
+      });
+    },
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolveClose) => server.close(resolveClose));
+    },
+  };
 }
