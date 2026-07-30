@@ -2101,6 +2101,36 @@ async fn bnc_networks_crud() {
         Some("enc:v1:abc")
     );
 
+    // Updating one owner's mutable configuration includes the sealed
+    // credentials and cannot touch another owner's same-named network.
+    let mut updated = libera.clone();
+    updated.addr = "irc.eu.libera.chat:6697".into();
+    updated.nick = "alice_new".into();
+    updated.sasl_account = Some("alice-login".into());
+    updated.sasl_password_sealed = Some("enc:v2:replacement".into());
+    assert!(
+        db::update_bnc_network(&pool, "alice", "LIBERA", &updated)
+            .await
+            .expect("update")
+    );
+    let stored = db::get_bnc_network(&pool, "alice", "libera")
+        .await
+        .expect("get updated")
+        .expect("updated network");
+    assert_eq!(stored.addr, "irc.eu.libera.chat:6697");
+    assert_eq!(stored.nick, "alice_new");
+    assert_eq!(stored.sasl_account.as_deref(), Some("alice-login"));
+    assert_eq!(
+        stored.sasl_password_sealed.as_deref(),
+        Some("enc:v2:replacement")
+    );
+    let bob = db::get_bnc_network(&pool, "bob", "libera")
+        .await
+        .expect("get bob")
+        .expect("bob network");
+    assert_eq!(bob.addr, libera.addr);
+    assert_eq!(bob.sasl_account, libera.sasl_account);
+
     // A bridge kind round-trips through the new `kind` column (the generic
     // columns carry the bridge's fields: here a Matrix homeserver/user).
     let matrix = db::BncNetworkRow {

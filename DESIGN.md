@@ -1036,9 +1036,11 @@ persisting plaintext or replacing them with redacted placeholders.
 
 The console is also the home of `/console/networks` — a per-user BNC network
 manager with add/remove/enable-disable, and **edit** of an IRC
-network's connection/identity fields (addr, tls, nick, realname, autojoin; SASL
-credentials change via delete+recreate; a bridge is edited on the Integrations
-page, so the IRC edit form refuses non-IRC kinds), available to any
+network's connection/identity fields (addr, tls, nick, realname, autojoin) and
+write-only SASL credentials (keep the encrypted password while changing its
+account, replace it, or remove both halves). The password is never rendered
+back to the browser. A bridge is configured on the Integrations page, so the
+IRC edit form refuses non-IRC kinds. The manager is available to any
 authenticated user for their own networks. The create form defaults to a
 Libera Chat preset and offers a small, provenance-dated catalog of published
 TLS endpoints (Libera, OFTC, EFnet, Snoonet) plus Custom. A preset's human label
@@ -1064,7 +1066,11 @@ runtime snapshot is held once on `NetworkHandle`, so IRC and every bridge
 driver enter the same measurement path; both raw-IRC and web attachments use
 the counted `send` funnel. A reconnecting session must return a
 `SessionOutcome::Dropped(NetworkFailure)`, making an unclassified transient
-failure a type error across IRC, local, Matrix, Discord, and Slack. Recoverable
+failure a type error across IRC, local, Matrix, Discord, and Slack. Its public
+connection event also carries that failure and lifecycle, error reason,
+timestamp, and count change under one runtime-state lock; monitoring therefore
+cannot observe a new disconnect paired with a stale or missing cause.
+Recoverable
 message-delivery and detached-backlog storage failures use the same closed
 classification-and-accounting choke point, so an error counter or timestamp
 cannot advance without a safe reason. Backlog restore failures are loud and
@@ -1259,7 +1265,9 @@ Surface (initial):
 - `me`: profile, credentials (app passwords CRUD — secret shown once),
   API tokens CRUD, OIDC identity link/list/unlink
 - `networks`: BNC network CRUD (+ enable/disable, status), buffers list,
-  read-marker get/set
+  read-marker get/set. Full IRC updates use `PUT /me/networks/{name}` with a
+  required credential action (`keep`, `set`, or `remove`), so a write-only
+  secret is never changed through an ambiguous omitted-field convention.
 - `channels`: owner-scoped registered-channel inventory and management at
   `/me/channels` (live-operator registration, retained topic, KEEPTOPIC,
   canonical MLOCK, access flags, founder transfer, unregister)

@@ -223,6 +223,17 @@ advance both per-network and server-wide error telemetry through one typed
 path. Detached-backlog restore, append, trim, and lag failures are likewise
 classified; restore no longer loses history through a silent fallback.
 
+Network mutation and snapshot completion (2026-07-30): the IRC edit page now
+manages the complete mutable network configuration, including safe write-only
+SASL operations: replace the encrypted password, change only its public account
+while preserving the exact sealed value, or remove both. The same operation is
+available as `PUT /api/v1/me/networks/{name}` with a required tagged
+`keep`/`set`/`remove` action; OpenAPI documents it and storage updates all
+mutable columns in one owner-scoped statement. Driver failure events now carry
+their credential-safe reason, while lifecycle, error reason, timestamp, and
+counter are committed under one lock. An unclassified reconnect and a
+disconnect snapshot paired with a stale cause are both unrepresentable.
+
 Browser client completion (2026-07-28): the Vite chat shell now has a persistent
 network selector, a focused preferences menu, visible account/network/history/
 storage/notification/socket errors, a disabled composer until attachment, and a
@@ -1982,9 +1993,10 @@ network's connection/identity fields (addr, tls, nick, realname, autojoin) via
 `validate_irc_upstream`/`check_upstream_bounds` — length, CR/LF/NUL injection,
 SSRF on a changed address), persisted (`db::update_bnc_network`), and the live
 driver rebuilt (`reconcile_network_driver`, extracted and now shared with the
-enable/disable path — `registry.add` stops+replaces the running driver). SASL
-credentials are intentionally out of edit (delete+recreate), avoiding
-secret-preservation complexity. Self-service (own network) with body-CSRF
+enable/disable path — `registry.add` stops+replaces the running driver). The
+follow-up credential completion adds explicit encrypted-password
+keep/replace/remove semantics instead of requiring deletion, and the REST
+`PUT` uses the same mutation core. Self-service (own network) with body-CSRF
 (`require_form_actor`, factored out of `require_admin_form_actor`); PRG on
 success, error banner on failure. Covered by a PG-gated http test
 (`console_edit_network_updates_fields`: pre-fill, update, SSRF guard, CSRF gate).
@@ -5310,7 +5322,9 @@ not built yet. Ranked by value:
    tested) and in the OpenAPI spec. `GET /me/networks` reports a live
    `connected` tri-state per network (true/false from the always-on
    driver's handle, or null when no handle is live) and an `enabled` flag;
-   **`PATCH /me/networks/{name}` `{enabled}`** pauses/resumes a network —
+   **`PUT /me/networks/{name}`** replaces mutable IRC configuration with an
+   explicit write-only credential action, while **`PATCH
+   /me/networks/{name}` `{enabled}`** pauses/resumes a network —
    persisting the flag (migration 0016), stopping or rebuilding its driver
    (skipped at boot while disabled), and opening stored secrets before the
    durable enable write so failure needs no rollback. Fixing this surfaced and repaired a latent bug:

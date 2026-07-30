@@ -526,6 +526,42 @@ pub(super) async fn openapi() -> Response {
                         "schema": { "type": "string" } }],
                     "responses": { "200": { "description": "stored configuration and runtime counters; secrets are presence booleans only" },
                         "404": { "description": "no such network" } } },
+                "put": { "summary": "Replace a BNC network's mutable IRC configuration and restart its driver",
+                    "description": "The credential action is required and explicit: `keep` preserves the write-only secret, `remove` clears the account and password, and `set` replaces the account plus an optional new password (omitting the password preserves an existing encrypted password).",
+                    "security": bearer,
+                    "parameters": [{ "name": "name", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "additionalProperties": false,
+                            "required": ["addr", "tls", "nick", "credentials"],
+                            "properties": {
+                                "addr": { "type": "string" },
+                                "tls": { "type": "boolean" },
+                                "nick": { "type": "string" },
+                                "realname": { "type": "string" },
+                                "autojoin": { "type": "array", "items": { "type": "string" } },
+                                "credentials": {
+                                    "oneOf": [
+                                        { "type": "object", "additionalProperties": false,
+                                            "required": ["action"],
+                                            "properties": { "action": { "const": "keep" } } },
+                                        { "type": "object", "additionalProperties": false,
+                                            "required": ["action"],
+                                            "properties": { "action": { "const": "remove" } } },
+                                        { "type": "object", "additionalProperties": false,
+                                            "required": ["action", "account"],
+                                            "properties": {
+                                                "action": { "const": "set" },
+                                                "account": { "type": "string" },
+                                                "password": { "type": "string" }
+                                            } }
+                                    ]
+                                }
+                            } } } } },
+                    "responses": { "204": { "description": "updated and live driver replaced" },
+                        "400": { "description": "invalid IRC configuration or credential action" },
+                        "404": { "description": "no such network" },
+                        "409": { "description": "cannot seal credentials or start replacement driver" } } },
                 "patch": { "summary": "Enable or disable a BNC network (start/stop its driver)",
                     "security": bearer,
                     "parameters": [{ "name": "name", "in": "path", "required": true,
