@@ -159,9 +159,16 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
     );
 
     // UI composer -> upstream: text up the socket reaches the peer
-    ws.send(Tung::text("PRIVMSG #lobby :from web composer"))
-        .await
-        .unwrap();
+    ws.send(Tung::text(
+        serde_json::json!({
+            "id": "integration-1",
+            "target": "#lobby",
+            "message": "from web composer",
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
     let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let m = peer.next_message().await.unwrap().unwrap();
@@ -178,6 +185,24 @@ async fn ws_ui_streams_json_events_and_relays_composer() {
         got.source.as_deref().unwrap_or("").starts_with("alicebnc!"),
         "{got:?}"
     );
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Tung::Text(text))) => {
+                    let event: serde_json::Value =
+                        serde_json::from_str(&text).expect("composer result event");
+                    if event["t"] == "sent" {
+                        return event;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => panic!("ws/ui closed before the composer acknowledgement"),
+            }
+        }
+    })
+    .await
+    .expect("composer acknowledgement timed out");
+    assert_eq!(accepted["v"], "integration-1");
 }
 
 #[tokio::test(flavor = "multi_thread")]

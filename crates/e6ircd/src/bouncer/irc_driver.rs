@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use e6irc_client::Connection;
+use e6irc_client::{Connection, RelayEvent};
 
 use super::{ConnectionEvent, DriverEnds, NetworkHandle};
 
@@ -130,7 +130,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         tokio::select! {
             // Upstream -> buffer + event.
             msg = tokio::time::timeout(KEEPALIVE_IDLE, conn.next_line_relayable()) => match msg {
-                Ok(Ok(Some((parsed, raw)))) => {
+                Ok(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
                     awaiting_keepalive = false;
                     // Keepalive filtering applies only to lines we could parse;
                     // a line that didn't parse (a non-UTF-8 body, say) is never
@@ -165,9 +165,17 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                     // is always-on regardless of attach.
                     ends.emit_line(raw);
                 }
-                // Only a genuine EOF or a real I/O error ends the session — a
-                // recoverable per-line error is now `Ok(Some((None, _)))` above,
-                // never conflated with the stream ending.
+                Ok(Ok(Some(RelayEvent::Rejected(rejected)))) => {
+                    awaiting_keepalive = false;
+                    // Keep the upstream connection alive, but make the whole-line
+                    // loss visible to attached clients and the detached buffer.
+                    // A syntactically valid local NOTICE is bounded independently
+                    // of the rejected payload and cannot itself be discarded.
+                    ends.emit_line(format!(
+                        ":e6irc NOTICE * :upstream input rejected: {rejected}"
+                    ));
+                }
+                // Only a genuine EOF or a real I/O error ends the session.
                 Ok(Ok(None)) | Ok(Err(_)) => {
                     return dropped(super::NetworkFailure::ConnectionLost);
                 }

@@ -18,8 +18,8 @@ a design target rather than current behavior.
 | Channel governance/services | Proven | Core + PostgreSQL + API/console + irctest services | — |
 | IRC operator/ban/audit | Proven | Core + PostgreSQL atomic mutation/audit + console/API | — |
 | WebSocket IRC | Proven | Real WebSocket protocol integration | Browser third-party client not driven |
-| Web chat state machine | Proven in browser with mocked transport | Chromium replay/race/NAMES/leave/query tests | Focused edge-state cases replace `/ws/ui` and upstream |
-| `/ws/ui` relay | Proven at protocol level | Real HTTP/WebSocket + upstream test | Chromium not on this path |
+| Web chat state machine | Proven in browser with mocked transport | Chromium replay/race/NAMES/leave/query plus send-acknowledgement/refusal tests | Focused edge-state cases replace `/ws/ui` and upstream |
+| `/ws/ui` relay | Proven at protocol level | Real HTTP/WebSocket + upstream test, including correlated composer acceptance | Chromium crosses this path in the full browser-chat journey |
 | Full browser chat | Proven | Chromium → console/API → PostgreSQL → registry → IRC driver → local TCP peer → `/ws/ui`, both directions | Public-network interop remains opt-in |
 | Network preset creation | Proven through UI/storage/runtime | Chromium verifies the Libera preset; custom creation crosses console/PostgreSQL/driver | Public Libera endpoint is opt-in |
 | BNC attach/auth/route | Proven | Real listener + upstream + PostgreSQL | Newly included in database CI |
@@ -31,16 +31,16 @@ a design target rather than current behavior.
 | Local bridge | Proven | In-process driver and common attach path | — |
 | IRC driver | Proven locally | Local upstream SASL/relay/reconnect/lifecycle | Live Libera is opt-in |
 | Matrix bridge | Proven | Real pinned Conduit, both directions | Other homeserver implementations |
-| Discord bridge | Externally qualified | Offline protocol/mapping/backoff tests | Live gateway/REST needs bot and guild |
-| Slack bridge | Externally qualified | Offline protocol/mapping/backoff tests | Live Socket Mode/Web API needs app/workspace |
+| Discord bridge | Partially proven | Offline protocol/mapping/backoff tests | Live gateway/REST needs bot and guild |
+| Slack bridge | Partially proven | Offline protocol/mapping/backoff tests | Live Socket Mode/Web API needs app/workspace |
 | CLI shipped commands | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON e2e | — |
-| TUI shipped behavior | Proven | Real PTY + e6ircd for registration/render/inbound/outbound/restore; duplex history/read-marker protocol plus model/fuzz tests | — |
+| TUI shipped behavior | Proven | Real PTY + e6ircd for registration/render/inbound/outbound/restore; duplex history/read-marker protocol plus bounded-composer/writer/model/fuzz tests | — |
 | REST resource families | Proven at route and family level | Exact router/OpenAPI method-path catalog + extensive real HTTP/PostgreSQL tests | Schema semantics remain hand-authored and directly tested |
 | First boot/migrations | Proven by component/integration | Config + migrations + database suites + production image | No fresh external-host acceptance script |
 | Graceful restart/durable reload | Proven | Chromium journey gracefully restarts the real daemon and recovers session, network, connection, and backlog; domain tests cover the rest | — |
 | Cross-platform source portability and native distribution | Proven | Linux/macOS/Windows × x86-64/ARM64 all-feature CI; version-tag native matrix publishes deterministic provenance-attested archives | — |
 | Multi-architecture container | Proven on every `main` merge | Native amd64/arm64 builds, shape verification, signed provenance, and SPDX SBOM attestations | — |
-| 100k single-host target | Unproven | Exact-delivery 64-client CI smoke plus manual baselines through 2,000 clients | Target architecture, budgets, thresholds, and tuned-host qualification are incomplete |
+| 100k single-host target | Unproven | Duplicate-proof exact-delivery 64-client CI gate with generous numeric thresholds plus manual baselines through 2,000 clients | Target architecture, production budgets/thresholds, and tuned-host qualification are incomplete |
 
 “—” means the defined journey boundary is crossed by current CI; it does not
 mean every possible environment or fault has been tested.
@@ -74,9 +74,10 @@ operations diagnostics, graceful daemon restart, and session recovery.
 The current core runs one worker. The sharded ownership/routing model,
 deterministic whole-core scheduler/replay, timer-wheel work, and several
 zero-copy/performance mechanisms described as target architecture in DESIGN
-are not present. The load harness is useful, but there are no numeric
-acceptance thresholds, per-connection RSS budget, CI performance regression,
-or 100k qualification result.
+are not present. The reduced CI run has numeric catastrophic-regression
+thresholds, but there are no production-host acceptance thresholds,
+per-connection RSS budget, sharded-core evidence, or 100k qualification
+result.
 
 ### Native-client product parity
 
@@ -91,9 +92,9 @@ attached network; the BNC is the cross-network multiplexer.
 ### External bridges and public networks
 
 Matrix has a self-hosted CI oracle. Discord and Slack require real commercial
-credentials; public-network probes must be respectful and opt-in. Their
-transport journeys therefore remain externally qualified while their pure
-protocol/state logic remains in normal CI.
+credentials; public-network probes must be respectful and opt-in. Their pure
+protocol/state logic is component-proven in normal CI, but their live
+transport journeys are explicitly unqualified.
 
 ### Distribution and operations
 
@@ -120,9 +121,10 @@ targeted browser/shell journeys rather than a second scenario-language stack.
 | `lint` | formatting, warnings, all-feature and per-bridge compilation, frontend unit tests/build, no-op/dead-public/duplication/no-deferral guards |
 | `deny` | licenses, advisories, bans, and dependency-source policy |
 | `test` | all-feature workspace behavior on six OS/architecture cells |
+| `coverage` | all-feature workspace line-coverage regression floor |
 | `db-tests` | real PostgreSQL storage/HTTP/OIDC/browser/BNC/`ws_ui`/CLI journeys |
 | `production-container` | deployable image and embedded web-client shape |
-| `load-smoke` | real daemon with 64 clients, eight channels, exact fan-out, and graceful shutdown |
+| `load-smoke` | real daemon with 64 clients, eight channels, duplicate-proof exact fan-out, generous numeric thresholds, and graceful shutdown |
 | `native-client-journeys` | deterministic archive contract plus real PTY render/message/terminal-restore journey |
 | `shauth-sso` | exact external single-sign-on/logout integration |
 | `irctest`, `irctest-services` | IRC and services conformance |

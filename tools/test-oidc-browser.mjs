@@ -289,7 +289,21 @@ try {
     webSocket.onMessage((frame) => {
       const value = typeof frame === "string" ? frame : frame.toString();
       clientFrames.push(value);
-      const command = JSON.parse(value).message;
+      const request = JSON.parse(value);
+      const command = request.message;
+      if (request.id && command === "accepted only after acknowledgement") {
+        setTimeout(() => {
+          webSocket.send(JSON.stringify({ t: "sent", v: request.id }));
+        }, 75);
+      } else if (request.id && command === "rejected without a false echo") {
+        webSocket.send(
+          JSON.stringify({
+            t: "send-error",
+            v: request.id,
+            message: "synthetic upstream refusal; nothing was sent",
+          }),
+        );
+      }
       if (command === "/raw NAMES #room") {
         if (!snapshotSent) namesRequestedBeforeSnapshot = true;
         webSocket.send(
@@ -387,6 +401,21 @@ try {
   assert.equal(await page.getByText("initial tagged", { exact: true }).count(), 1);
   assert.equal(await page.getByText("older context", { exact: true }).count(), 1);
   assert.equal(await page.getByText("arrived while loading", { exact: true }).count(), 1);
+
+  // Local echoes are request-correlated: socket admission alone is not
+  // success. The accepted message appears only after the server's `sent`
+  // event, while a `send-error` remains visibly refused without a false echo.
+  await page.locator("#message").fill("accepted only after acknowledgement");
+  await page.locator("#composer button[type=submit]").click();
+  assert.equal(
+    await page.getByText("accepted only after acknowledgement", { exact: true }).count(),
+    0,
+  );
+  await page.getByText("accepted only after acknowledgement", { exact: true }).waitFor();
+  await page.locator("#message").fill("rejected without a false echo");
+  await page.locator("#composer button[type=submit]").click();
+  await page.getByText("synthetic upstream refusal; nothing was sent", { exact: true }).waitFor();
+  assert.equal(await page.getByText("rejected without a false echo", { exact: true }).count(), 0);
 
   // A later NAMES snapshot is authoritative: bob and alice disappear, carol
   // appears, and the list/count cannot retain stale members.

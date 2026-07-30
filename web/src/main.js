@@ -1,9 +1,10 @@
 // e6irc web client: a small in-browser IRC client over the /ws/ui socket.
 //
-// The socket streams line, status, and replay-complete JSON events. This module
-// parses each IRC line, routes it to the right buffer (a channel, a direct
-// message, or the server buffer), keeps a per-channel member list, and renders
-// the active buffer. All rendering uses textContent / DOM APIs — never
+// The socket streams line, status, replay-complete, and correlated composer
+// result events. This module parses each IRC line, routes it to the right
+// buffer (a channel, a direct message, or the server buffer), keeps a
+// per-channel member list, and renders the active buffer. All rendering uses
+// textContent / DOM APIs — never
 // innerHTML with server text — so a hostile upstream line cannot inject markup.
 //
 // Query parameters:
@@ -59,6 +60,7 @@ const MAX_LINES = 500;
 // giant NAMES list: buffers and per-channel members can't grow without limit.
 const MAX_BUFFERS = 200;
 const MAX_NICKS = 5000;
+const MAX_PENDING_SENDS = 64;
 const SERVER = "*server*";
 
 // ---- client settings (persisted in localStorage) -----------------------
@@ -136,6 +138,53 @@ let socket = null;
 let upstreamConnected = false;
 let snapshotComplete = false;
 let memberTracking = true;
+let nextSendId = 0;
+const pendingSends = new Map();
+
+function rememberSentText(text) {
+  if (sentHistory[sentHistory.length - 1] !== text) sentHistory.push(text);
+  if (sentHistory.length > 100) sentHistory.shift();
+  historyIdx = -1;
+}
+
+function acceptPendingSend(requestId) {
+  const pending = pendingSends.get(requestId);
+  if (!pending) return false;
+  pendingSends.delete(requestId);
+  const { buffer, text } = pending;
+  if (buffer) {
+    if (text.startsWith("/me ")) {
+      addLine(buffer.display, "event", buffer.kind, null, `* ${myNick} ${text.slice(4)}`);
+    } else if (!text.startsWith("/")) {
+      addLine(buffer.display, "msg", buffer.kind, myNick, text);
+    }
+  }
+  rememberSentText(text);
+  return true;
+}
+
+function rejectPendingSend(requestId, message) {
+  const pending = pendingSends.get(requestId);
+  if (!pending) return false;
+  pendingSends.delete(requestId);
+  rememberSentText(pending.text);
+  addServer(message || "Message was not sent.");
+  showAlert("send", message || "Message was not sent.", "error");
+  return true;
+}
+
+function rejectAllPendingSends(reason) {
+  if (pendingSends.size === 0) return;
+  const count = pendingSends.size;
+  for (const pending of pendingSends.values()) rememberSentText(pending.text);
+  pendingSends.clear();
+  addServer(`${count} message(s) were not confirmed before ${reason}.`);
+  showAlert(
+    "send",
+    `${count} message(s) were not confirmed before ${reason}; use input history to retry.`,
+    "error",
+  );
+}
 
 function setStatus(text, cls) {
   statusEl.textContent = text;
@@ -828,6 +877,7 @@ function connect() {
   snapshotComplete = false;
   setComposerAvailable(false);
   setStatus(`attaching to ${network}…`, "connecting");
+  rejectAllPendingSends("the connection was replaced");
   // Drop any previous socket so overlapping connections can't both feed events.
   if (socket) {
     const previous = socket;
@@ -849,6 +899,7 @@ function connect() {
     setComposerAvailable(true);
     setStatus(`attached to ${network}`, "ok");
     clearAlert("socket");
+    clearAlert("send");
     clearAlert("socket-close");
     clearAlert("network-unavailable");
   });
@@ -863,6 +914,7 @@ function connect() {
   liveSocket.addEventListener("close", (event) => {
     if (socket !== liveSocket) return;
     socket = null;
+    rejectAllPendingSends("the live connection closed");
     upstreamConnected = false;
     setComposerAvailable(false);
     if (terminalSocket) {
@@ -887,6 +939,19 @@ function connect() {
       return;
     }
     if (event.t === "line" && typeof event.v === "string") handleLine(event.v);
+    else if (event.t === "sent" && typeof event.v === "string") {
+      if (!acceptPendingSend(event.v)) {
+        showAlert("protocol", "The server acknowledged an unknown composer request.", "error");
+      }
+    } else if (
+      event.t === "send-error"
+      && typeof event.v === "string"
+      && typeof event.message === "string"
+    ) {
+      if (!rejectPendingSend(event.v, event.message)) {
+        showAlert("protocol", "The server rejected an unknown composer request.", "error");
+      }
+    }
     else if (event.t === "status" && event.v === "connected") {
       const becameConnected = !upstreamConnected;
       upstreamConnected = true;
@@ -952,28 +1017,38 @@ composer.addEventListener("submit", (e) => {
     addServer("Not connected — your message was not sent.");
     return;
   }
-  // The server maps {target, message} (with slash-commands) to an IRC line.
+  // The server maps correlated {id, target, message} requests (including
+  // slash-commands) to one validated IRC line.
   const b = active !== SERVER ? buffers.get(active) : null;
   // In the server buffer there is no target, so plain text would be sent as a
   // raw IRC line and bounce back as "421 Unknown command". Require a /command
   // (e.g. /join #chan) there instead of emitting a bogus line.
   if (!b && !text.startsWith("/")) {
     addServer("No active channel/query — use a /command here (e.g. /join #chan) or pick a buffer.");
-    messageInput.value = "";
+    messageInput.focus();
+    return;
+  }
+  if (pendingSends.size >= MAX_PENDING_SENDS) {
+    addServer(`Not sending more than ${MAX_PENDING_SENDS} messages without server confirmation.`);
+    showAlert(
+      "send",
+      `The outbound confirmation queue is full (${MAX_PENDING_SENDS}); wait or reconnect before retrying.`,
+      "error",
+    );
     return;
   }
   const target = b ? b.display : "";
-  socket.send(JSON.stringify({ target, message: text }));
-  // Echo our own message locally (the upstream doesn't reflect it back). A
-  // plain message and a `/me` action both echo; other slash-commands don't.
-  if (b) {
-    if (text.startsWith("/me ")) addLine(b.display, "event", b.kind, null, `* ${myNick} ${text.slice(4)}`);
-    else if (!text.startsWith("/")) addLine(b.display, "msg", b.kind, myNick, text);
+  nextSendId += 1;
+  const requestId = nextSendId.toString(36);
+  pendingSends.set(requestId, { buffer: b, text });
+  try {
+    socket.send(JSON.stringify({ id: requestId, target, message: text }));
+  } catch (error) {
+    pendingSends.delete(requestId);
+    addServer("The message could not enter the live connection and was not sent.");
+    showAlert("send", errorMessage("send the message", error), "error");
+    return;
   }
-  // Record for Up/Down recall (skip a consecutive duplicate; bound the list).
-  if (sentHistory[sentHistory.length - 1] !== text) sentHistory.push(text);
-  if (sentHistory.length > 100) sentHistory.shift();
-  historyIdx = -1;
   messageInput.value = "";
   messageInput.focus();
 });

@@ -152,11 +152,12 @@ async fn driver_reconnects_after_upstream_drop() {
     assert!(disconnected, "expected a Disconnected event");
 }
 
-/// A single non-UTF-8 (or over-long, or unparseable) line from the upstream
-/// must be relayed lossily and the session kept alive — never treated as EOF
-/// and used to tear down the whole link. IRC message bodies are arbitrary bytes
-/// (Latin-1 etc. are routine), so without this any channel member could keep a
-/// victim's bouncer flapping by sending one high-byte message.
+/// A single non-UTF-8 line from the upstream must be relayed lossily, while an
+/// over-long line must produce a visible bounded rejection. Neither may be
+/// treated as EOF and used to tear down the whole link. IRC message bodies are
+/// arbitrary bytes (Latin-1 etc. are routine), so without this any channel
+/// member could keep a victim's bouncer flapping by sending one high-byte
+/// message.
 #[tokio::test(flavor = "multi_thread")]
 async fn upstream_non_utf8_line_is_relayed_not_fatal() {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -193,6 +194,14 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
             .write_all(b":speaker!s@h PRIVMSG #bnc :caf\xe9\r\n")
             .await
             .unwrap();
+        // This cannot be relayed inside the accepted server-frame bound, but
+        // its loss must remain visible and must not consume the next event from
+        // the same socket read.
+        write
+            .write_all(&vec![b'x'; e6irc_proto::message::MAX_SERVER_FRAME_LEN + 1])
+            .await
+            .unwrap();
+        write.write_all(b"\r\n").await.unwrap();
         // A following, ordinary line — its arrival on the SAME connection proves
         // the bad line did not drop the session.
         write
@@ -235,6 +244,7 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
     // Disconnected (reconnect) happened in between.
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut saw_bad_line = false;
+        let mut saw_rejection = false;
         let mut disconnected_before_after = false;
         loop {
             match events.recv().await {
@@ -242,8 +252,11 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
                     // The non-UTF-8 body was relayed, lossily decoded.
                     saw_bad_line = true;
                 }
+                Ok(DriverEvent::Line(l)) if l.contains("upstream input rejected") => {
+                    saw_rejection = true;
+                }
                 Ok(DriverEvent::Line(l)) if l.contains("after the bad line") => {
-                    return (saw_bad_line, disconnected_before_after);
+                    return (saw_bad_line, saw_rejection, disconnected_before_after);
                 }
                 Ok(DriverEvent::Disconnected) => disconnected_before_after = true,
                 Ok(_) => {}
@@ -256,7 +269,11 @@ async fn upstream_non_utf8_line_is_relayed_not_fatal() {
 
     assert!(outcome.0, "the non-UTF-8 line must be relayed, not dropped");
     assert!(
-        !outcome.1,
+        outcome.1,
+        "the over-long line must produce a visible bounded rejection"
+    );
+    assert!(
+        !outcome.2,
         "the bad line must not disconnect/reconnect the session"
     );
     drop(events);

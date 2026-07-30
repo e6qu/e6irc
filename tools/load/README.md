@@ -14,7 +14,11 @@ target/release/e6irc-load --addr 127.0.0.1:6667 --clients 1000 --burst 20
 Flags: `--addr host:port` (default `127.0.0.1:6667`), `--clients N`
 (default 100), `--channels C` (default 1 — spread clients across C
 channels), `--channel PREFIX` (default `#load`; actual channel is
-`PREFIX{index}`), `--burst K` (default 10), `--tls`.
+`PREFIX{index}`), `--burst K` (default 10), `--tls`,
+`--minimum-connect-rate N`, `--minimum-fanout-rate N`, and
+`--maximum-p99-ms N`. The optional thresholds turn the measurement into an
+acceptance gate: missing exact deliveries or violating any supplied threshold
+exits nonzero.
 
 **Use `--channels` for realistic numbers.** One giant channel makes the
 join phase O(N²) — each join sends a NAMES list of every current member
@@ -39,8 +43,11 @@ fan-out: 19980/19980 messages in 0.31s (64451 msg/s)
 latency (µs): p50 4210.0  p90 8800.5  p99 12030.1  max 13990.2
 ```
 
-`fan-out` counts `burst × (clients − 1)` deliveries (every non-sender
-receives each burst message once). The latency line is true end-to-end
+`fan-out` verifies the exact sequence set for all
+`burst × (clients − channels)` deliveries (every non-sender receives its
+channel sender's burst once). A same-sender post-burst marker fences every
+delivery in wire order; a duplicate, missing,
+out-of-range, or malformed sequence fails the run. The latency line is true end-to-end
 per delivery (sender stamps each message's send time; receivers subtract
 it), so the tail reflects real queue time under burst, not a mean.
 Any failed client, timeout, socket error, or missing delivery makes the harness
@@ -70,13 +77,19 @@ The harness and the server both need OS headroom well above defaults:
 Run `sweep.sh` to walk client counts and tabulate the results:
 
 ```
-tools/load/sweep.sh 127.0.0.1:6667 "100 500 1000 5000 20000"
+tools/load/sweep.sh 127.0.0.1:6667 "100 500 1000 5000 20000" 20 \
+  --minimum-connect-rate 100 --minimum-fanout-rate 1000 --maximum-p99-ms 500
 ```
 
+Arguments after the burst are passed to every `e6irc-load` invocation, so one
+sweep can enforce thresholds chosen for that controlled host.
+
 CI runs 64 clients across eight channels with a four-message burst against a
-real debug daemon, requiring exact fan-out and graceful shutdown. This is a
-correctness regression, not a performance baseline. The full 100k run,
-fan-out/latency performance targets, timer-wheel scheduling, core sharding,
-and a per-connection memory budget remain outside the current qualification
+real debug daemon, requiring exact fan-out, at least 10 connections/second,
+at least 100 deliveries/second, P99 below five seconds, and graceful shutdown.
+Those deliberately generous shared-runner limits catch catastrophic regressions
+without pretending to be a production-host baseline. The full 100k run,
+production fan-out/latency targets, timer-wheel scheduling, core sharding, and
+a per-connection memory budget remain outside the current qualification
 evidence. This harness is the measurement instrument, not proof that the target
 has been met; see `docs/journeys/coverage.md`.

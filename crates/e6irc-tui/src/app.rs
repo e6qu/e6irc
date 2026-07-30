@@ -125,6 +125,12 @@ const SCROLLBACK_LINES: usize = 5_000;
 /// what a remote party can make the client allocate.
 const MAX_BUFFERS: usize = 256;
 
+/// A client line excludes its trailing CRLF from the traditional 512-byte IRC
+/// limit. The composer is bounded at the same protocol edge so a pasted line
+/// cannot grow without limit or be rendered locally and then rejected only
+/// after it reaches the socket.
+const MAX_WIRE_LINE_BYTES: usize = e6irc_proto::message::MAX_LINE_LEN - 2;
+
 pub struct App {
     pub nick: String,
     pub buffers: Vec<Buffer>,
@@ -136,14 +142,38 @@ pub struct App {
     invalid_time_reported: bool,
     /// The buffer cap has been reported to the user; say it once, not per line.
     buffer_limit_reported: bool,
+    input_limit_reported: bool,
+    outbound_limit_reported: bool,
 }
 
 /// A command the UI wants the network layer to perform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Send(String),
+    Send(Outbound),
     Quit,
     None,
+}
+
+/// One line awaiting admission to the bounded socket-writer queue. A local
+/// echo is data attached to the request, not a mutation performed in advance:
+/// the UI adds it only after the queue accepts the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outbound {
+    line: String,
+    input: String,
+    local_echo: Option<LocalEcho>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalEcho {
+    target: String,
+    text: String,
+}
+
+impl Outbound {
+    pub fn line(&self) -> &str {
+        &self.line
+    }
 }
 
 impl App {
@@ -158,6 +188,8 @@ impl App {
             pending_read_marker: None,
             invalid_time_reported: false,
             buffer_limit_reported: false,
+            input_limit_reported: false,
+            outbound_limit_reported: false,
         }
     }
 
@@ -348,6 +380,48 @@ impl App {
         self.pending_read_marker.take()
     }
 
+    /// Put back a coalesced marker that could not enter the bounded outbound
+    /// queue. A newer marker already waiting wins because read positions are
+    /// monotonic.
+    pub fn requeue_read_marker_command(&mut self, command: String) {
+        if self.pending_read_marker.is_none() {
+            self.pending_read_marker = Some(command);
+        }
+    }
+
+    /// Commit the local presentation of a message only after its wire line has
+    /// entered the bounded writer queue.
+    pub fn outbound_accepted(&mut self, outbound: &Outbound) {
+        self.outbound_limit_reported = false;
+        let Some(echo) = &outbound.local_echo else {
+            return;
+        };
+        let Some(index) = self.buffer_index(&echo.target) else {
+            return;
+        };
+        let from = self.nick.clone();
+        self.buffers[index].push(LogLine::new(&from, &echo.text));
+    }
+
+    /// Restore editor text when the bounded writer refuses admission. The
+    /// request owns the exact original input so queue pressure cannot turn a
+    /// visible refusal into data loss.
+    pub fn outbound_refused(&mut self, outbound: &Outbound) {
+        if self.input.is_empty() {
+            self.input = outbound.input.clone();
+        }
+    }
+
+    /// Say once that the local writer queue is saturated. Repeated read-marker
+    /// retries must not flood the buffer with the same notice.
+    pub fn note_outbound_full(&mut self) {
+        if self.outbound_limit_reported {
+            return;
+        }
+        self.outbound_limit_reported = true;
+        self.status("outbound queue is full — input retained; try again");
+    }
+
     /// Say once that the buffer limit stopped a new buffer from opening. Said
     /// once rather than per message, because the condition that triggers it is
     /// exactly the one that would flood the notice.
@@ -367,11 +441,24 @@ impl App {
     }
 
     pub fn on_char(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        if self.input.len() + c.len_utf8() > MAX_WIRE_LINE_BYTES {
+            if !self.input_limit_reported {
+                self.input_limit_reported = true;
+                self.status(format!(
+                    "input is limited to {MAX_WIRE_LINE_BYTES} bytes by the IRC wire limit"
+                ));
+            }
+            return;
+        }
         self.input.push(c);
     }
 
     pub fn on_backspace(&mut self) {
         self.input.pop();
+        self.input_limit_reported = false;
     }
 
     /// Handle Enter: produce an Action and clear the input.
@@ -379,6 +466,7 @@ impl App {
     /// buffer name) switches; anything else is sent to the current buffer.
     pub fn on_enter(&mut self) -> Action {
         let line = std::mem::take(&mut self.input);
+        self.input_limit_reported = false;
         if line.is_empty() {
             return Action::None;
         }
@@ -389,7 +477,17 @@ impl App {
         if let Some(chan) = line.strip_prefix("/join ").map(str::trim) {
             if !chan.is_empty() {
                 if !self.connected {
+                    self.input = line;
                     self.status("not connected — JOIN not sent");
+                    return Action::None;
+                }
+                let wire = format!("JOIN {chan}");
+                if wire.len() > MAX_WIRE_LINE_BYTES {
+                    self.input = line;
+                    self.status(format!(
+                        "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
+                        wire.len()
+                    ));
                     return Action::None;
                 }
                 // The user's own /join is refused the same way as a
@@ -401,7 +499,11 @@ impl App {
                 };
                 self.current = idx;
                 self.focus_current();
-                return Action::Send(format!("JOIN {chan}"));
+                return Action::Send(Outbound {
+                    line: wire,
+                    input: line,
+                    local_echo: None,
+                });
             }
             return Action::None;
         }
@@ -421,13 +523,34 @@ impl App {
             return Action::None;
         }
         if !self.connected {
+            self.input = line;
             self.status("not connected — message not sent");
             return Action::None;
         }
         let target = self.current().name.clone();
-        let from = self.nick.clone();
-        self.current_mut().push(LogLine::new(&from, &line));
-        Action::Send(format!("PRIVMSG {target} :{line}"))
+        let wire = format!("PRIVMSG {target} :{line}");
+        self.outbound_or_restore(line.clone(), wire, Some(LocalEcho { target, text: line }))
+    }
+
+    fn outbound_or_restore(
+        &mut self,
+        input: String,
+        line: String,
+        local_echo: Option<LocalEcho>,
+    ) -> Action {
+        if line.len() > MAX_WIRE_LINE_BYTES {
+            self.input = input;
+            self.status(format!(
+                "message is too long for the IRC wire limit ({}/{MAX_WIRE_LINE_BYTES} bytes)",
+                line.len()
+            ));
+            return Action::None;
+        }
+        Action::Send(Outbound {
+            line,
+            input,
+            local_echo,
+        })
     }
 }
 
@@ -558,7 +681,12 @@ mod tests {
         for ch in "ho".chars() {
             app.on_char(ch);
         }
-        assert_eq!(app.on_enter(), Action::Send("PRIVMSG #c :ho".into()));
+        let Action::Send(outbound) = app.on_enter() else {
+            panic!("message should be queued");
+        };
+        assert_eq!(outbound.line(), "PRIVMSG #c :ho");
+        assert!(app.current().log.is_empty(), "no echo before admission");
+        app.outbound_accepted(&outbound);
         assert_eq!(app.current().log.last().unwrap().text, "ho");
     }
 
@@ -575,13 +703,16 @@ mod tests {
             app.current().log[0].text,
             "not connected — message not sent"
         );
+        assert_eq!(app.input, "unsent");
 
+        app.input.clear();
         for character in "/join #lost".chars() {
             app.on_char(character);
         }
         assert_eq!(app.on_enter(), Action::None);
         assert_eq!(app.buffers.len(), 1);
         assert_eq!(app.current().log[1].text, "not connected — JOIN not sent");
+        assert_eq!(app.input, "/join #lost");
     }
 
     #[test]
@@ -590,9 +721,66 @@ mod tests {
         for ch in "/join #rust".chars() {
             app.on_char(ch);
         }
-        assert_eq!(app.on_enter(), Action::Send("JOIN #rust".into()));
+        let Action::Send(outbound) = app.on_enter() else {
+            panic!("JOIN should be queued");
+        };
+        assert_eq!(outbound.line(), "JOIN #rust");
         assert_eq!(app.current().name, "#rust");
         assert_eq!(app.buffers.len(), 2);
+    }
+
+    #[test]
+    fn composer_and_wire_line_are_bounded_without_truncating() {
+        let mut app = App::new("#channel".into(), "me".into());
+        for _ in 0..MAX_WIRE_LINE_BYTES + 20 {
+            app.on_char('x');
+        }
+        assert_eq!(app.input.len(), MAX_WIRE_LINE_BYTES);
+        assert_eq!(
+            app.current()
+                .log
+                .iter()
+                .filter(|line| line.text.as_str().contains("input is limited"))
+                .count(),
+            1
+        );
+
+        assert_eq!(app.on_enter(), Action::None);
+        assert_eq!(app.input.len(), MAX_WIRE_LINE_BYTES);
+        assert!(
+            app.current()
+                .log
+                .last()
+                .is_some_and(|line| line.text.as_str().contains("message is too long"))
+        );
+    }
+
+    #[test]
+    fn outbound_refusal_never_creates_a_false_echo_and_is_reported_once() {
+        let mut app = App::new("#c".into(), "me".into());
+        app.input = "unsent".into();
+        let Action::Send(outbound) = app.on_enter() else {
+            panic!("message should reach queue admission");
+        };
+        assert_eq!(outbound.line(), "PRIVMSG #c :unsent");
+        app.outbound_refused(&outbound);
+        app.note_outbound_full();
+        app.note_outbound_full();
+        assert_eq!(app.input, "unsent");
+        assert_eq!(
+            app.current()
+                .log
+                .iter()
+                .filter(|line| line.text.as_str().contains("outbound queue is full"))
+                .count(),
+            1
+        );
+        assert!(
+            app.current()
+                .log
+                .iter()
+                .all(|line| line.text.as_str() != "unsent")
+        );
     }
 
     #[test]

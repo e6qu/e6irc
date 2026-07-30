@@ -30,6 +30,9 @@ struct Args {
     channels: usize,
     burst: usize,
     tls: bool,
+    minimum_connect_rate: Option<f64>,
+    minimum_fanout_rate: Option<f64>,
+    maximum_p99_ms: Option<f64>,
 }
 
 impl Args {
@@ -43,7 +46,11 @@ impl Args {
     }
 }
 
-fn parse_args() -> Args {
+fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         addr: "127.0.0.1:6667".to_string(),
         clients: 100,
@@ -51,34 +58,96 @@ fn parse_args() -> Args {
         channels: 1,
         burst: 10,
         tls: false,
+        minimum_connect_rate: None,
+        minimum_fanout_rate: None,
+        maximum_p99_ms: None,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = arguments.into_iter();
     while let Some(flag) = it.next() {
         match flag.as_str() {
-            "--addr" => args.addr = it.next().unwrap_or_else(|| die("--addr needs a value")),
-            "--clients" => args.clients = parse_num(&it.next().unwrap_or_default(), "--clients"),
-            "--channel" => {
-                args.channel = it.next().unwrap_or_else(|| die("--channel needs a value"))
+            "--addr" => {
+                args.addr = it
+                    .next()
+                    .ok_or_else(|| "--addr needs a value".to_string())?
             }
-            "--channels" => args.channels = parse_num(&it.next().unwrap_or_default(), "--channels"),
-            "--burst" => args.burst = parse_num(&it.next().unwrap_or_default(), "--burst"),
+            "--clients" => {
+                args.clients = parse_num(
+                    &it.next()
+                        .ok_or_else(|| "--clients needs a value".to_string())?,
+                    "--clients",
+                )?
+            }
+            "--channel" => {
+                args.channel = it
+                    .next()
+                    .ok_or_else(|| "--channel needs a value".to_string())?
+            }
+            "--channels" => {
+                args.channels = parse_num(
+                    &it.next()
+                        .ok_or_else(|| "--channels needs a value".to_string())?,
+                    "--channels",
+                )?
+            }
+            "--burst" => {
+                args.burst = parse_num(
+                    &it.next()
+                        .ok_or_else(|| "--burst needs a value".to_string())?,
+                    "--burst",
+                )?
+            }
             "--tls" => args.tls = true,
-            other => die(&format!("unknown argument: {other}")),
+            "--minimum-connect-rate" => {
+                args.minimum_connect_rate = Some(parse_positive_float(
+                    &it.next()
+                        .ok_or_else(|| "--minimum-connect-rate needs a value".to_string())?,
+                    "--minimum-connect-rate",
+                )?);
+            }
+            "--minimum-fanout-rate" => {
+                args.minimum_fanout_rate = Some(parse_positive_float(
+                    &it.next()
+                        .ok_or_else(|| "--minimum-fanout-rate needs a value".to_string())?,
+                    "--minimum-fanout-rate",
+                )?);
+            }
+            "--maximum-p99-ms" => {
+                args.maximum_p99_ms = Some(parse_positive_float(
+                    &it.next()
+                        .ok_or_else(|| "--maximum-p99-ms needs a value".to_string())?,
+                    "--maximum-p99-ms",
+                )?);
+            }
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
     if args.channels < 1 {
-        die("--channels must be at least 1");
+        return Err("--channels must be at least 1".into());
+    }
+    if args.burst < 1 {
+        return Err("--burst must be at least 1".into());
     }
     // Each channel needs its sender plus at least one receiver.
     if args.clients <= args.channels {
-        die("--clients must exceed --channels (each channel needs a sender + a receiver)");
+        return Err(
+            "--clients must exceed --channels (each channel needs a sender + a receiver)".into(),
+        );
     }
-    args
+    Ok(args)
 }
 
-fn parse_num(s: &str, flag: &str) -> usize {
-    s.parse()
-        .unwrap_or_else(|_| die(&format!("{flag} needs a number")))
+fn parse_num(s: &str, flag: &str) -> Result<usize, String> {
+    s.parse().map_err(|_| format!("{flag} needs a number"))
+}
+
+fn parse_positive_float(s: &str, flag: &str) -> Result<f64, String> {
+    let value: f64 = s
+        .parse()
+        .map_err(|_| format!("{flag} needs a positive number"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{flag} needs a positive finite number"));
+    }
+    Ok(value)
 }
 
 fn die(msg: &str) -> ! {
@@ -100,7 +169,7 @@ async fn connect(args: &Args) -> std::io::Result<Connection> {
 }
 
 fn main() -> ExitCode {
-    let args = parse_args();
+    let args = parse_args().unwrap_or_else(|error| die(&error));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -114,12 +183,12 @@ fn main() -> ExitCode {
 
 /// Shared timing/counters across the client tasks.
 struct Metrics {
-    /// Wall time (ms since `run_start`) when the last client finished
+    /// Wall time (ns since `run_start`) when the last client finished
     /// connect+register+join.
-    connect_max_ms: AtomicU64,
-    /// Longest per-receiver fan-out duration (ms from barrier release to
+    connect_max_ns: AtomicU64,
+    /// Longest per-receiver fan-out duration (ns from barrier release to
     /// having counted its whole share).
-    fanout_max_ms: AtomicU64,
+    fanout_max_ns: AtomicU64,
     /// Total burst messages delivered across all receivers.
     received: AtomicU64,
     /// Send time (ns since `run_start`) of each burst message, indexed by
@@ -138,6 +207,37 @@ fn pctl_us(sorted_ns: &[u64], p: f64) -> f64 {
     sorted_ns[idx] as f64 / 1000.0
 }
 
+fn elapsed_nanos(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min((u64::MAX - 1) as u128) as u64
+}
+
+struct DeliverySet {
+    seen: Vec<bool>,
+}
+
+impl DeliverySet {
+    fn new(expected: usize) -> Self {
+        Self {
+            seen: vec![false; expected],
+        }
+    }
+
+    fn accept(&mut self, sequence: usize) -> std::io::Result<()> {
+        let Some(seen) = self.seen.get_mut(sequence) else {
+            return Err(std::io::Error::other(format!(
+                "matching load message carried out-of-range sequence {sequence}"
+            )));
+        };
+        if *seen {
+            return Err(std::io::Error::other(format!(
+                "duplicate delivery for sequence {sequence}"
+            )));
+        }
+        *seen = true;
+        Ok(())
+    }
+}
+
 async fn run(args: Args) -> bool {
     let args = Arc::new(args);
     println!(
@@ -148,8 +248,8 @@ async fn run(args: Args) -> bool {
     let run_start = Instant::now();
     let ready = Arc::new(Barrier::new(args.clients));
     let metrics = Arc::new(Metrics {
-        connect_max_ms: AtomicU64::new(0),
-        fanout_max_ms: AtomicU64::new(0),
+        connect_max_ns: AtomicU64::new(0),
+        fanout_max_ns: AtomicU64::new(0),
         received: AtomicU64::new(0),
         // One send-time slot per (channel, seq).
         sent_ns: (0..args.channels * args.burst)
@@ -185,11 +285,11 @@ async fn run(args: Args) -> bool {
     }
 
     let ok = args.clients - failures;
-    let connect_secs = metrics.connect_max_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+    let connect_secs = metrics.connect_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+    let connect_rate = ok as f64 / connect_secs.max(1e-9);
     println!(
         "connect+register+join: {ok}/{} in {connect_secs:.2}s ({:.0} clients/s)",
-        args.clients,
-        ok as f64 / connect_secs.max(1e-9),
+        args.clients, connect_rate,
     );
     if failures > 0 {
         println!("{failures} client(s) failed");
@@ -199,11 +299,12 @@ async fn run(args: Args) -> bool {
     // Every non-sender receives its channel sender's burst; there is one
     // sender per channel.
     let expected = (args.burst * (args.clients - args.channels)) as u64;
-    let fanout_secs = metrics.fanout_max_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+    let fanout_secs = metrics.fanout_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
+    let fanout_rate = delivered as f64 / fanout_secs.max(1e-9);
     if fanout_secs > 0.0 {
         println!(
             "fan-out: {delivered}/{expected} messages in {fanout_secs:.3}s ({:.0} msg/s)",
-            delivered as f64 / fanout_secs,
+            fanout_rate,
         );
     } else {
         println!("fan-out: {delivered}/{expected} messages delivered");
@@ -214,20 +315,53 @@ async fn run(args: Args) -> bool {
         .lock()
         .expect("latency pool poisoned")
         .clone();
-    if !lat.is_empty() {
+    let p99_us = if lat.is_empty() {
+        None
+    } else {
         lat.sort_unstable();
+        let p99_us = pctl_us(&lat, 0.99);
         println!(
             "latency (µs): p50 {:.1}  p90 {:.1}  p99 {:.1}  max {:.1}",
             pctl_us(&lat, 0.50),
             pctl_us(&lat, 0.90),
-            pctl_us(&lat, 0.99),
+            p99_us,
             pctl_us(&lat, 1.0),
         );
-    }
+        Some(p99_us)
+    };
     if delivered != expected {
         eprintln!("incomplete fan-out: received {delivered} of {expected} required deliveries");
     }
-    failures == 0 && delivered == expected
+    let mut thresholds_met = true;
+    if let Some(minimum) = args.minimum_connect_rate
+        && connect_rate < minimum
+    {
+        thresholds_met = false;
+        eprintln!("connect-rate threshold failed: {connect_rate:.1} < {minimum:.1} clients/s");
+    }
+    if let Some(minimum) = args.minimum_fanout_rate
+        && fanout_rate < minimum
+    {
+        thresholds_met = false;
+        eprintln!("fan-out threshold failed: {fanout_rate:.1} < {minimum:.1} messages/s");
+    }
+    if let Some(maximum_ms) = args.maximum_p99_ms {
+        match p99_us {
+            Some(observed_us) if observed_us <= maximum_ms * 1000.0 => {}
+            Some(observed_us) => {
+                thresholds_met = false;
+                eprintln!(
+                    "latency threshold failed: p99 {:.3} ms > {maximum_ms:.3} ms",
+                    observed_us / 1000.0
+                );
+            }
+            None => {
+                thresholds_met = false;
+                eprintln!("latency threshold failed: no deliveries were timed");
+            }
+        }
+    }
+    failures == 0 && delivered == expected && thresholds_met
 }
 
 /// One client: connect, register, join, sync on the barrier, then either
@@ -260,8 +394,8 @@ async fn client(
             }
         }
         metrics
-            .connect_max_ms
-            .fetch_max(run_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            .connect_max_ns
+            .fetch_max(elapsed_nanos(run_start), Ordering::Relaxed);
         Ok::<_, std::io::Error>(conn)
     };
     let setup = match tokio::time::timeout(Duration::from_secs(30), setup).await {
@@ -287,11 +421,15 @@ async fn client(
         for n in 0..args.burst {
             // Stamp the send time before emitting so receivers can
             // compute end-to-end latency for this (channel, seq).
-            metrics.sent_ns[base + n]
-                .store(run_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            metrics.sent_ns[base + n].store(elapsed_nanos(run_start) + 1, Ordering::Relaxed);
             conn.send_line(&format!("PRIVMSG {channel} :load {n}"))
                 .await?;
         }
+        // Same-sender ordering makes this a fan-out fence: every receiver sees
+        // all burst deliveries (including any erroneous duplicates) before
+        // this marker. A receiver validates its exact set only at the marker.
+        conn.send_line(&format!("PRIVMSG {channel} :load-complete"))
+            .await?;
         return Ok(());
     }
 
@@ -306,10 +444,11 @@ async fn client(
     // across receivers) to ~30s and understate msg/s — exactly in the
     // near-capacity regime the harness exists to measure. This tracks the real
     // delivery time instead.
-    let mut last_delivery_ms = 0u64;
+    let mut last_delivery_ns = 0u64;
     let mut latencies = Vec::with_capacity(args.burst);
+    let mut deliveries = DeliverySet::new(args.burst);
     let receive = tokio::time::timeout(Duration::from_secs(30), async {
-        while count < args.burst as u64 {
+        loop {
             match conn.next_message().await {
                 Ok(Some(m))
                     if m.command == "PRIVMSG"
@@ -318,21 +457,41 @@ async fn client(
                             .as_deref()
                             .is_some_and(|s| s.starts_with(&sender_prefix)) =>
                 {
-                    let recv_ns = run_start.elapsed().as_nanos() as u64;
-                    if let Some(seq) = m
-                        .params
-                        .get(1)
-                        .and_then(|b| b.strip_prefix("load "))
-                        .and_then(|n| n.parse::<usize>().ok())
-                        && let Some(slot) = metrics.sent_ns.get(base + seq)
-                    {
-                        let sent = slot.load(Ordering::Relaxed);
-                        if sent > 0 && recv_ns >= sent {
-                            latencies.push(recv_ns - sent);
+                    let recv_ns = elapsed_nanos(run_start);
+                    let body = m.params.get(1).map(String::as_str).unwrap_or("");
+                    if body == "load-complete" {
+                        if count != args.burst as u64 {
+                            return Err(std::io::Error::other(format!(
+                                "incomplete sequence set at sender fence: received {count} of {}",
+                                args.burst
+                            )));
                         }
+                        break;
                     }
+                    let seq = body
+                        .strip_prefix("load ")
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .ok_or_else(|| {
+                            std::io::Error::other(
+                                "matching load message carried no numeric sequence",
+                            )
+                        })?;
+                    deliveries.accept(seq)?;
+                    let sent_plus_one = metrics.sent_ns[base + seq].load(Ordering::Relaxed);
+                    if sent_plus_one == 0 {
+                        return Err(std::io::Error::other(format!(
+                            "delivery for sequence {seq} arrived without a send timestamp"
+                        )));
+                    }
+                    let sent = sent_plus_one - 1;
+                    if recv_ns < sent {
+                        return Err(std::io::Error::other(
+                            "monotonic delivery timestamp preceded its send",
+                        ));
+                    }
+                    latencies.push(recv_ns - sent);
                     count += 1;
-                    last_delivery_ms = fanout_start.elapsed().as_millis() as u64;
+                    last_delivery_ns = elapsed_nanos(fanout_start);
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -349,8 +508,8 @@ async fn client(
     .await;
     if count > 0 {
         metrics
-            .fanout_max_ms
-            .fetch_max(last_delivery_ms, Ordering::Relaxed);
+            .fanout_max_ns
+            .fetch_max(last_delivery_ns, Ordering::Relaxed);
     }
     metrics.received.fetch_add(count, Ordering::Relaxed);
     metrics
@@ -364,5 +523,70 @@ async fn client(
             std::io::ErrorKind::TimedOut,
             format!("fan-out timed out after {count}/{} deliveries", args.burst),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Result<Args, String> {
+        parse_args_from(values.iter().map(|value| (*value).to_owned()))
+    }
+
+    #[test]
+    fn arguments_reject_vacuous_runs_and_invalid_thresholds() {
+        assert!(args(&["--burst", "0"]).is_err());
+        assert!(args(&["--clients", "8", "--channels", "8"]).is_err());
+        assert!(args(&["--minimum-connect-rate", "0"]).is_err());
+        assert!(args(&["--maximum-p99-ms", "NaN"]).is_err());
+        let parsed = args(&[
+            "--clients",
+            "64",
+            "--channels",
+            "8",
+            "--burst",
+            "4",
+            "--minimum-connect-rate",
+            "10",
+            "--minimum-fanout-rate",
+            "100",
+            "--maximum-p99-ms",
+            "5000",
+        ])
+        .unwrap();
+        assert_eq!(parsed.clients, 64);
+        assert_eq!(parsed.minimum_connect_rate, Some(10.0));
+        assert_eq!(parsed.minimum_fanout_rate, Some(100.0));
+        assert_eq!(parsed.maximum_p99_ms, Some(5000.0));
+    }
+
+    #[test]
+    fn delivery_set_refuses_duplicates_and_out_of_range_sequences() {
+        let mut deliveries = DeliverySet::new(3);
+        deliveries.accept(2).unwrap();
+        deliveries.accept(0).unwrap();
+        assert!(
+            deliveries
+                .accept(2)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        assert!(
+            deliveries
+                .accept(3)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-range")
+        );
+    }
+
+    #[test]
+    fn percentile_uses_nearest_rank_over_sorted_nanoseconds() {
+        let samples = [1_000, 2_000, 3_000, 4_000, 5_000];
+        assert_eq!(pctl_us(&samples, 0.50), 3.0);
+        assert_eq!(pctl_us(&samples, 0.99), 5.0);
+        assert_eq!(pctl_us(&[], 0.99), 0.0);
     }
 }

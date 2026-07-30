@@ -701,11 +701,14 @@ tracking. Any nontrivial optimization lands with evidence that proves it:
   evaluated in the scale-hardening phase; allocator swap
   (mimalloc/jemalloc) decided by benchmark behind a feature flag, not by
   fashion.
-- **Measured, always (target)**: microbenchmarks live beside hot modules;
-  `tools/load` macrobenchmarks track fan-out latency and throughput under a
-  controlled environment. Today the load harness reports
-  p50/p90/p99/max and has manual baselines through 2,000 clients; it is not a
-  per-PR CI gate.
+- **Measured, always**: microbenchmarks live beside hot modules; `tools/load`
+  macrobenchmarks track connect rate, exact fan-out sequence membership, and
+  p50/p90/p99/max latency under a controlled environment. The harness accepts
+  explicit minimum-rate/maximum-P99 thresholds and treats missing, duplicate,
+  out-of-range, and malformed deliveries as failures. Every pull request runs
+  a deliberately generous 64-client regression gate; manual baselines reach
+  2,000 clients. Production-host budgets and the 100k qualification remain a
+  target boundary, not a shipped performance claim.
 
 ### 7.5 IRCv3 capabilities
 
@@ -1368,10 +1371,15 @@ DOM APIs, never `innerHTML` on server text, so a hostile upstream line can't
 inject markup). The replay boundary precedes live traffic; only after it does
 the client request authoritative NAMES snapshots, preventing stale detached
 replay from overwriting current membership. The composer sends
-`{target, message}` (with
-slash-commands) up the same socket, which the server maps to an IRC line. This
-keeps the web client on the exact same multiplexer attach path as an IRC client
-— the web client *is* an attached client of the user's networks.
+`{id, target, message}` (with slash-commands) up the same socket, which the
+server validates as one complete IRC line and maps to the driver. CR/LF/NUL
+injection and an over-limit derived line reject the whole request; they are
+never cleaned or truncated into a different message. At most 64 sends await a
+result. The browser appends local echo and sent-history only after the server
+returns the matching `sent` event; `send-error`, queue refusal, replacement,
+and socket closure retain retryable text and cannot produce a false successful
+echo. This keeps the web client on the exact same multiplexer attach path as an
+IRC client — the web client *is* an attached client of the user's networks.
 Fetching persisted history prepends it without replacing live lines or local
 echoes that arrived while the request was in flight. Only matching non-empty
 `msgid` values are deduplicated; content equality is not identity because
@@ -1431,6 +1439,9 @@ Non-interactive, pipe-friendly: `e6irc send '#chan' 'msg'`,
 IRC commands support plaintext or public-CA TLS and anonymous, paired SASL
 PLAIN, or SASL OAUTHBEARER registration. `tail --json` emits one complete JSON
 object per message, including structured tags, for safe automation.
+Every authentication mode requests the same optional server-time,
+message-tags, and account-tag metadata capabilities, so changing credentials
+cannot silently reduce the information delivered to the caller.
 
 `e6irc login` implements the RFC 8628 device flow: it prints the verification
 URI and user code, honors the server's polling interval/slow-down/expiry
@@ -1455,6 +1466,11 @@ uses, rejoins every channel confirmed for the client, loads bounded
 CHATHISTORY after the server's marker (or the latest bounded window), and
 coalesces shared read-marker writes as buffer focus advances. Unread counts are
 visible and history/live overlap is deduplicated by stable message ID.
+The composer and socket-writer queue are both bounded. A message is locally
+echoed only after bounded-queue admission; a full queue, disconnected socket,
+or over-limit complete IRC line leaves the input available and reports the
+refusal. A read-marker update that meets a full writer queue remains pending
+instead of being lost.
 Capability refusal fails visibly rather than degrading into a different
 experience. A pseudo-terminal journey drives the real full-screen binary
 against e6ircd and proves inbound rendering, outbound delivery, clean exit,
@@ -1472,7 +1488,10 @@ buffer count are capped, the socket→render queue is bounded (a full queue stop
 the reader and lets TCP push back, exactly as SendQ does outbound), and the
 `e6irc api` response read is bounded with an error rather than a truncation.
 Hitting a cap is reported to the user, once — a silent cap reads as the network
-going quiet, which is the client-side form of a silent no-op (§2).
+going quiet, which is the client-side form of a silent no-op (§2). The shared
+client's steady-state read therefore returns typed message/relay/rejected-line
+events: malformed or over-limit remote input can keep the connection alive,
+but the CLI, TUI, and BNC must surface the rejection.
 
 ---
 
@@ -1575,6 +1594,10 @@ Layers, bottom to top:
    command streams, and arbitrary server output into the TUI model.
    `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive, but the
    seeded whole-core scheduler/replay described in §7.3 is not implemented.
+   A separate all-feature coverage job runs the workspace suite and rejects
+   line coverage below 55%; the floor is a regression ratchet, while dedicated
+   PostgreSQL/browser jobs supply environment-dependent acceptance evidence
+   outside that percentage.
 3. **irctest** (progval/irctest) run in CI against `e6ircd` — the same
    suite Solanum/Ergo use.
 4. **Compatibility** (§7.7): the vendored Libera-snapshot ISUPPORT
@@ -1602,11 +1625,14 @@ Layers, bottom to top:
    inspects operations data, then gracefully restarts the daemon and proves
    session/network/backlog recovery.
 9. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
-   exact fan-out delivery, and latency percentiles; any client or delivery loss
-   is a nonzero process exit. CI exercises 64 clients across eight channels
-   against a real daemon. Recorded manual baselines reach 2,000 clients;
-   numeric performance thresholds and RSS/connection budget are not set, and
-   the 100k run is not qualified.
+   duplicate-proof exact fan-out sequence delivery, and latency percentiles;
+   any client, socket, malformed sequence, missing/duplicate delivery, or
+   supplied-threshold failure is a nonzero process exit. CI exercises 64
+   clients across eight channels against a real daemon with generous
+   catastrophic-regression floors (10 connects/s, 100 deliveries/s, P99 below
+   five seconds). Recorded manual baselines reach 2,000 clients; production
+   performance thresholds and an RSS/connection budget are not set, and the
+   100k run is not qualified.
 
 ---
 

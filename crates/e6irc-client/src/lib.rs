@@ -19,6 +19,13 @@ use tokio::net::TcpStream;
 type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
+/// Metadata capabilities every registration mode asks for. They are optional
+/// because this client also connects to older third-party servers, but the
+/// request itself is not optional: anonymous, password, and bearer
+/// authentication must produce the same message metadata when the server
+/// supports it.
+const METADATA_CAPABILITIES: [&str; 3] = ["server-time", "message-tags", "account-tag"];
+
 /// Server-supplied text with every terminal control byte neutralized — the only
 /// form untrusted text may take once it reaches the user's terminal.
 ///
@@ -67,8 +74,10 @@ pub struct Connection {
     reader: BoxRead,
     writer: BoxWrite,
     framing: LineBuffer,
-    /// Complete lines already parsed out of the read buffer.
-    pending: std::collections::VecDeque<Vec<u8>>,
+    /// Framing events already parsed out of the read buffer. Rejections share
+    /// the same queue as lines so returning one event can never discard later
+    /// events from the same socket read.
+    pending: std::collections::VecDeque<LineEvent>,
     read_buf: Vec<u8>,
 }
 
@@ -80,6 +89,53 @@ pub struct OwnedMessage {
     pub source: Option<String>,
     pub command: String,
     pub params: Vec<String>,
+}
+
+/// A recoverable server-line rejection.
+///
+/// These are deliberately distinct from I/O errors: one hostile or malformed
+/// line must not disconnect an otherwise healthy interactive or bouncer
+/// session, but dropping it without an observable event would make data loss
+/// silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectedLine {
+    /// The peer exceeded the accepted IRC server-frame limit (including its
+    /// larger message-tag allowance). The framing layer discarded the entire
+    /// line, so there is no safe partial value to relay.
+    TooLong,
+    /// Lossy UTF-8 decoding still did not produce a syntactically valid IRC
+    /// message. Relays receive the raw lossy text instead; interactive clients
+    /// receive this rejection because they cannot safely act on it.
+    Unparseable,
+}
+
+impl std::fmt::Display for RejectedLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong => f.write_str("server line exceeds the accepted IRC frame limit"),
+            Self::Unparseable => f.write_str("server line is not valid IRC syntax"),
+        }
+    }
+}
+
+/// One steady-state event for a relay.
+#[derive(Debug, Clone)]
+pub enum RelayEvent {
+    /// A line that can be relayed exactly as decoded. `message` is absent when
+    /// the relay must forward it but must not act on its syntax.
+    Line {
+        message: Option<OwnedMessage>,
+        raw: String,
+    },
+    /// A whole line that could not be retained safely.
+    Rejected(RejectedLine),
+}
+
+/// One steady-state event for an interactive client.
+#[derive(Debug, Clone)]
+pub enum ClientEvent {
+    Message(OwnedMessage),
+    Rejected(RejectedLine),
 }
 
 impl OwnedMessage {
@@ -312,7 +368,7 @@ impl Connection {
     /// that still fails to parse means the peer is not speaking IRC — skipping it
     /// would silently drop protocol traffic with no observable trace. This strict
     /// contract is for the handshake and command/response flows; an interactive
-    /// steady-state loop should use [`Connection::next_message_lossy`] so one bad
+    /// steady-state loop should use [`Connection::next_event_lossy`] so one bad
     /// line can't end the session.
     pub async fn next_message(&mut self) -> io::Result<Option<OwnedMessage>> {
         Ok(self.next_message_with_line().await?.map(|(msg, _)| msg))
@@ -328,29 +384,23 @@ impl Connection {
     /// bytes that arrived.
     pub async fn next_message_with_line(&mut self) -> io::Result<Option<(OwnedMessage, String)>> {
         loop {
-            if let Some(line) = self.pending.pop_front() {
-                let text = std::str::from_utf8(&line).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "server sent a non-UTF-8 line")
-                })?;
-                let msg = Message::parse(text).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("server sent an unparseable line: {e:?}"),
-                    )
-                })?;
-                return Ok(Some((OwnedMessage::from(&msg), text.to_string())));
-            }
-            let n = self.reader.read(&mut self.read_buf).await?;
-            if n == 0 {
-                return Ok(None);
-            }
-            let mut events = Vec::new();
-            self.framing.feed(&self.read_buf[..n], &mut events);
-            for event in events {
+            if let Some(event) = self.pending.pop_front() {
                 match event {
-                    LineEvent::Line(line) => self.pending.push_back(line),
-                    // The framing layer's contract (framing.rs) is that the
-                    // caller must handle overflow loudly, never drop it.
+                    LineEvent::Line(line) => {
+                        let text = std::str::from_utf8(&line).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "server sent a non-UTF-8 line",
+                            )
+                        })?;
+                        let msg = Message::parse(text).map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("server sent an unparseable line: {e:?}"),
+                            )
+                        })?;
+                        return Ok(Some((OwnedMessage::from(&msg), text.to_string())));
+                    }
                     LineEvent::TooLong => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -359,6 +409,13 @@ impl Connection {
                     }
                 }
             }
+            let n = self.reader.read(&mut self.read_buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let mut events = Vec::new();
+            self.framing.feed(&self.read_buf[..n], &mut events);
+            self.pending.extend(events);
         }
     }
 
@@ -372,25 +429,33 @@ impl Connection {
     /// message must not disconnect the whole session — which any channel member
     /// could then use to keep a victim's bouncer flapping.
     ///
-    /// The distinct outcomes make the "a recoverable per-line error is a fatal
-    /// stream error" conflation unrepresentable at the call site: `Ok(Some(_))`
-    /// is always a line to relay (parsed or not), `Ok(None)` is a genuine EOF,
-    /// and `Err` is a real I/O error — only the last two end the stream. An
-    /// over-long line, which cannot be relayed within the wire limit anyway, is
-    /// skipped (the framing layer has already discarded its tail) without ending
-    /// the stream. Kept separate from [`Connection::next_message_with_line`],
-    /// whose strict error-on-bad-line contract the handshake relies on.
-    pub async fn next_line_relayable(
-        &mut self,
-    ) -> io::Result<Option<(Option<OwnedMessage>, String)>> {
+    /// The distinct outcomes make both "a recoverable per-line error is fatal"
+    /// and "a recoverable per-line error vanishes" unrepresentable at the call
+    /// site: [`RelayEvent::Line`] is relayable, [`RelayEvent::Rejected`] must be
+    /// surfaced, `Ok(None)` is genuine EOF, and `Err` is an I/O error. Kept
+    /// separate from [`Connection::next_message_with_line`], whose strict
+    /// error-on-bad-line contract the handshake relies on.
+    pub async fn next_line_relayable(&mut self) -> io::Result<Option<RelayEvent>> {
         loop {
-            if let Some(line) = self.pending.pop_front() {
-                // Lossy: an invalid byte sequence becomes U+FFFD instead of
-                // failing the whole read (mirrors the in-process local driver).
-                let text = String::from_utf8_lossy(&line).into_owned();
-                // Best-effort parse; `None` means "relay only, don't act on it".
-                let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
-                return Ok(Some((parsed, text)));
+            if let Some(event) = self.pending.pop_front() {
+                match event {
+                    LineEvent::Line(line) => {
+                        // Lossy: an invalid byte sequence becomes U+FFFD
+                        // instead of failing the whole read (mirrors the
+                        // in-process local driver).
+                        let text = String::from_utf8_lossy(&line).into_owned();
+                        // Best-effort parse; `None` means "relay only, don't
+                        // act on it".
+                        let parsed = Message::parse(&text).ok().map(|m| OwnedMessage::from(&m));
+                        return Ok(Some(RelayEvent::Line {
+                            message: parsed,
+                            raw: text,
+                        }));
+                    }
+                    LineEvent::TooLong => {
+                        return Ok(Some(RelayEvent::Rejected(RejectedLine::TooLong)));
+                    }
+                }
             }
             let n = self.reader.read(&mut self.read_buf).await?;
             if n == 0 {
@@ -398,35 +463,30 @@ impl Connection {
             }
             let mut events = Vec::new();
             self.framing.feed(&self.read_buf[..n], &mut events);
-            for event in events {
-                match event {
-                    LineEvent::Line(line) => self.pending.push_back(line),
-                    // Un-relayable within the wire limit; the framing already
-                    // dropped its tail, so skip it and keep the link — never
-                    // drop the whole connection over one over-long line.
-                    LineEvent::TooLong => {}
-                }
-            }
+            self.pending.extend(events);
         }
     }
 
-    /// Steady-state read for an *interactive* client (the TUI, `tail`): tolerant
-    /// of a single bad line, so a hostile or merely-noisy server cannot end the
-    /// session with one. A non-UTF-8 line is lossily decoded (invalid bytes →
-    /// U+FFFD) and parsed — IRC bodies carry arbitrary bytes (Latin-1/Shift-JIS
-    /// are routine), so a high-byte channel message any member can post must not
-    /// disconnect the victim. A line that still won't parse after lossy decoding
-    /// is skipped (kept off the acted-on path) rather than tearing down the link.
-    /// Distinct from [`Connection::next_message`], whose strict error-on-bad-line
-    /// contract the handshake deliberately relies on.
-    pub async fn next_message_lossy(&mut self) -> io::Result<Option<OwnedMessage>> {
-        loop {
-            match self.next_line_relayable().await? {
-                None => return Ok(None),
-                Some((Some(msg), _)) => return Ok(Some(msg)),
-                // Lossy-decoded but unparseable: skip and keep the link alive.
-                Some((None, _)) => continue,
+    /// Steady-state read for an *interactive* client (the TUI, `tail`):
+    /// tolerant of a single bad line without hiding it. A non-UTF-8 line is
+    /// lossily decoded (invalid bytes → U+FFFD) and parsed — IRC bodies carry
+    /// arbitrary bytes (Latin-1/Shift-JIS are routine), so a high-byte channel
+    /// message any member can post must not disconnect the victim. A line that
+    /// still will not parse becomes [`ClientEvent::Rejected`] rather than ending
+    /// the connection or disappearing. Distinct from
+    /// [`Connection::next_message`], whose strict handshake contract rejects
+    /// malformed input as an I/O error.
+    pub async fn next_event_lossy(&mut self) -> io::Result<Option<ClientEvent>> {
+        match self.next_line_relayable().await? {
+            None => Ok(None),
+            Some(RelayEvent::Line {
+                message: Some(message),
+                ..
+            }) => Ok(Some(ClientEvent::Message(message))),
+            Some(RelayEvent::Line { message: None, .. }) => {
+                Ok(Some(ClientEvent::Rejected(RejectedLine::Unparseable)))
             }
+            Some(RelayEvent::Rejected(rejected)) => Ok(Some(ClientEvent::Rejected(rejected))),
         }
     }
 
@@ -478,6 +538,16 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Ask for the optional metadata capabilities shared by every registration
+    /// mode. Request each separately so one unsupported capability cannot NAK
+    /// the others as part of an atomic request.
+    async fn request_metadata_capabilities(&mut self) -> io::Result<()> {
+        for capability in METADATA_CAPABILITIES {
+            self.send_line(&format!("CAP REQ :{capability}")).await?;
+        }
+        Ok(())
     }
 
     /// Wait for the server's empty `AUTHENTICATE +` challenge after a mechanism
@@ -577,14 +647,7 @@ impl Connection {
         password: &str,
     ) -> io::Result<String> {
         self.negotiate_sasl_cap().await?;
-        // Best-effort: request the message-tag caps so the bouncer receives
-        // server-time/msgid/account and can preserve them in backlog. Each is
-        // requested separately (an atomic multi-cap REQ would lose all on one
-        // NAK); a NAK just means that cap isn't enabled. The ACK/NAK replies
-        // are ignored below — the server enables the ACKed caps regardless.
-        for cap in ["server-time", "message-tags", "account-tag"] {
-            self.send_line(&format!("CAP REQ :{cap}")).await?;
-        }
+        self.request_metadata_capabilities().await?;
         self.send_line("AUTHENTICATE PLAIN").await?;
         self.await_authenticate_challenge().await?;
         let payload = {
@@ -611,6 +674,7 @@ impl Connection {
         token: &str,
     ) -> io::Result<String> {
         self.negotiate_sasl_cap().await?;
+        self.request_metadata_capabilities().await?;
         self.send_line("AUTHENTICATE OAUTHBEARER").await?;
         self.await_authenticate_challenge().await?;
         // RFC 7628 client response: gs2 header, then the bearer credential.
@@ -626,13 +690,8 @@ impl Connection {
     /// Register with a nick and realname, answering PINGs, until the
     /// welcome (001) arrives. Returns the confirmed nick.
     pub async fn register(&mut self, nick: &str, realname: &str) -> io::Result<String> {
-        // Negotiate message-tag caps (best-effort) so an IRC upstream sends
-        // server-time/msgid/account for backlog preservation, then register.
-        // ACK/NAK replies are ignored below; the server enables the ACKed caps.
         self.send_line("CAP LS 302").await?;
-        for cap in ["server-time", "message-tags", "account-tag"] {
-            self.send_line(&format!("CAP REQ :{cap}")).await?;
-        }
+        self.request_metadata_capabilities().await?;
         self.send_line(&format!("NICK {nick}")).await?;
         self.send_line(&format!("USER {nick} 0 * :{realname}"))
             .await?;
@@ -910,7 +969,7 @@ mod tests {
         // failure numeric and holds the socket open. Without the terminal-numeric
         // handling in `await_authenticate_challenge`, this loops forever; with it,
         // register_sasl returns an error promptly.
-        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let (cr, cw) = tokio::io::split(client_io);
         let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
 
@@ -949,6 +1008,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_registration_requests_the_same_metadata_as_other_modes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let (cr, cw) = tokio::io::split(client_io);
+        let mut connection = Connection::from_halves(Box::new(cr), Box::new(cw));
+        let server = tokio::spawn(async move {
+            let (sr, mut sw) = tokio::io::split(server_io);
+            let mut lines = tokio::io::BufReader::new(sr).lines();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP LS 302");
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP REQ :sasl");
+            sw.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+            for capability in METADATA_CAPABILITIES {
+                assert_eq!(
+                    lines.next_line().await.unwrap().unwrap(),
+                    format!("CAP REQ :{capability}")
+                );
+            }
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                "AUTHENTICATE OAUTHBEARER"
+            );
+            sw.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "NICK nick");
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                "USER nick 0 * :real"
+            );
+            assert!(
+                lines
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .starts_with("AUTHENTICATE ")
+            );
+            sw.write_all(b":srv 903 nick :SASL authentication successful\r\n")
+                .await
+                .unwrap();
+            assert_eq!(lines.next_line().await.unwrap().unwrap(), "CAP END");
+            sw.write_all(b":srv 001 nick :Welcome\r\n").await.unwrap();
+        });
+
+        assert_eq!(
+            connection
+                .register_oauthbearer("nick", "real", "token")
+                .await
+                .unwrap(),
+            "nick"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn send_line_neutralizes_injected_crlf_and_nul() {
         use tokio::io::AsyncReadExt;
         // A value carrying embedded CR/LF/NUL — the classic command-injection
@@ -976,12 +1089,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_message_lossy_survives_non_utf8_line() {
+    async fn next_event_lossy_survives_non_utf8_line_and_surfaces_rejections() {
         use tokio::io::AsyncWriteExt;
         // A Latin-1 body (0xE9 = 'é') any channel member can post is not valid
         // UTF-8. Strict `next_message` errors on it (the handshake wants that);
         // the interactive steady-state read must lossily decode and keep going.
-        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
         let (cr, cw) = tokio::io::split(client_io);
         let mut conn = Connection::from_halves(Box::new(cr), Box::new(cw));
 
@@ -989,14 +1102,25 @@ mod tests {
         sw.write_all(b":nick PRIVMSG #c :caf\xe9\r\n")
             .await
             .unwrap();
-        sw.write_all(b":nick PRIVMSG #c :ok\r\n").await.unwrap();
+        sw.write_all(&vec![b'x'; e6irc_proto::message::MAX_SERVER_FRAME_LEN + 1])
+            .await
+            .unwrap();
+        sw.write_all(b"\r\n:nick PRIVMSG #c :ok\r\n").await.unwrap();
 
         // The high-byte line comes back lossily decoded (é -> U+FFFD), not as an
         // error that would tear down the session.
-        let first = conn.next_message_lossy().await.unwrap().unwrap();
+        let ClientEvent::Message(first) = conn.next_event_lossy().await.unwrap().unwrap() else {
+            panic!("valid lossy-decoded message was rejected");
+        };
         assert_eq!(first.command, "PRIVMSG");
         assert_eq!(first.params.get(1).map(String::as_str), Some("caf\u{fffd}"));
-        let second = conn.next_message_lossy().await.unwrap().unwrap();
+        assert!(matches!(
+            conn.next_event_lossy().await.unwrap().unwrap(),
+            ClientEvent::Rejected(RejectedLine::TooLong)
+        ));
+        let ClientEvent::Message(second) = conn.next_event_lossy().await.unwrap().unwrap() else {
+            panic!("valid message after rejected line was not delivered");
+        };
         assert_eq!(second.params.get(1).map(String::as_str), Some("ok"));
 
         drop(conn);
