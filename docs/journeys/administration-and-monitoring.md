@@ -5,6 +5,10 @@
 **Actor and goal.** A deployer supplies only secrets/boot-critical values; an
 administrator then configures the service through **Configuration**.
 
+**Preconditions.** PostgreSQL and the HTTP listener can start from bootstrap
+configuration, the initial administrator account exists or can be created, and
+the deployment supplies a stable master key before importing credentials.
+
 **Flow.**
 
 1. Bootstrap TOML/environment supplies PostgreSQL, secret-key source, initial
@@ -26,6 +30,11 @@ missing secrets, stale revisions, listener bind errors, provider validation
 errors, and database errors fail explicitly. A failed stale write creates no
 audit row. A failed BNC rebind preserves the working listener.
 
+**Security and observability.** The page is administrator-only and every form
+is session-CSRF protected. Credential fields are sealed and write-only,
+revisions record provenance, and successful writes create a redacted audit row
+in the same transaction.
+
 **Evidence.** Configuration validation and import/revision behavior are covered
 by unit/PostgreSQL tests; BNC listener management is HTTP/runtime-tested.
 Every configuration subsection renders and mutates through shared typed
@@ -35,6 +44,10 @@ parsing, but there is no one browser test that edits every subsection.
 
 **Actor and goal.** An administrator wants bounded, searchable operational
 directories rather than database access.
+
+**Preconditions.** The caller is a configured administrator with a valid
+session or bearer token, and PostgreSQL is available for durable directory and
+audit state.
 
 **Flow.**
 
@@ -53,6 +66,11 @@ handler/API. Filter sizes, page sizes, and cursor shapes are bounded and
 validated. User strings are escaped in HTML and never become metric labels.
 Database failure is an error state, not an empty directory.
 
+**Security and observability.** Administrator extraction is part of every
+handler signature; state-changing forms additionally require CSRF. Directory
+projections omit secrets, escape user strings, bound filters/pages, and emit
+redacted audit records for mutations.
+
 **Evidence.** Proven by PostgreSQL cursor/filter/posture tests and
 administrator-only API/console integration tests, including escaping and
 mutation actions.
@@ -61,6 +79,9 @@ mutation actions.
 
 **Actor and goal.** An administrator wants to investigate load or abuse and
 disconnect the exact connection involved.
+
+**Preconditions.** The caller is an administrator and the target is a currently
+registered live connection represented by the core’s opaque identifier.
 
 **Flow.**
 
@@ -73,10 +94,15 @@ disconnect the exact connection involved.
    mutable nickname.
 5. The core closes that session and updates monitoring/account directories.
 
-**Failure contract.** Role checks are repeated on mutation; self-service
+**Visible failures and recovery.** Role checks are repeated on mutation; self-service
 connection endpoints separately enforce account ownership.
 Stale/unknown IDs report absence. Directory capacity is bounded; saturation is
 observable rather than silently dropping arbitrary live entries.
+
+**Security and observability.** Opaque random identifiers prevent nickname
+reuse and restart collisions from targeting a different session. Disconnect
+uses the shared audited core close path; list output contains safe posture, not
+credentials or raw authentication material.
 
 **Evidence.** Proven by admin/owner and self-scoped connection integration
 tests.
@@ -85,6 +111,10 @@ tests.
 
 **Actor and goal.** An administrator wants to answer “is the service healthy,
 what is busy, and where is time/failure accumulating?” from e6irc itself.
+
+**Preconditions.** The process is running; historical views additionally
+require PostgreSQL and enabled sampling, while administrator JSON/metrics and
+console views require an administrator session.
 
 **Flow.**
 
@@ -109,6 +139,11 @@ Sampling/storage failure is logged and counted without making liveness depend
 on the metrics database. Metric dimensions are fixed; account/network/channel
 names and secrets cannot create unbounded cardinality or disclosure.
 
+**Security and observability.** Liveness/readiness disclose only dependency
+state; detailed JSON, metrics, and console history are administrator-only and
+non-cacheable. Series and error reasons use closed dimensions, and historical
+retention is bounded and pruned transactionally.
+
 **Evidence.** Telemetry arithmetic/formatting and runtime network accounting
 are unit-tested. Readiness, metrics/observability authorization, persistence,
 retention, monitoring page/panel, and per-network operations are covered by
@@ -120,6 +155,9 @@ Prometheus is an export surface.
 **Actor and goal.** An administrator wants to attribute security- and
 configuration-sensitive actions.
 
+**Preconditions.** PostgreSQL is ready and the initiating actor has the
+operator, founder, owner, or administrator authority required by the mutation.
+
 **Flow.**
 
 - IRC operator actions record the operator/account provenance.
@@ -129,9 +167,14 @@ configuration-sensitive actions.
 - Administrator console actions record exact targets.
 - The audit explorer/API supports bounded filters and cursor pagination.
 
-**Failure contract.** Secret material is redacted before storage. A mutation
+**Visible failures and recovery.** Secret material is redacted before storage. A mutation
 whose contract requires audit does not commit without its audit record.
 Failed/stale configuration writes do not claim an action occurred.
+
+**Security and observability.** Audit reads are administrator-only, bounded,
+filterable, and non-cacheable. Actor/action/target/time are retained while
+passwords, tokens, cookies, sealed ciphertext, and raw provider payloads are
+excluded before persistence.
 
 **Evidence.** Proven by core audit events, PostgreSQL transaction tests, and
 the audit explorer/API tests.

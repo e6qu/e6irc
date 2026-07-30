@@ -5,6 +5,10 @@
 **Actor and goal.** An authenticated account holder wants durable ownership
 and policy for an IRC channel.
 
+**Preconditions.** PostgreSQL is ready, the caller is authenticated, and
+registration requires the live channel privilege or founder authority required
+by the selected control plane.
+
 **Flow.**
 
 1. Register through ChanServ or **Registered channels**. The channel name is
@@ -25,6 +29,11 @@ state. Transfer to an absent account, invalid channel/mode/access values,
 duplicate registration, and persistence failure return explicit errors. The
 console re-renders safely with escaped values; forms require CSRF.
 
+**Security and observability.** Founder/access checks are repeated in the core
+for console, REST, and services requests. Collections and inputs are bounded,
+and durable privileged changes create redacted audit evidence without topic or
+credential leakage.
+
 **Evidence.** Proven by core services/mode tests, PostgreSQL topic/KEEPTOPIC/
 MLOCK/access/founder tests, and the complete owner-scoped API and console
 integration tests.
@@ -34,6 +43,10 @@ integration tests.
 **Actor and goal.** A founder expects durable policy to return when an empty
 channel is created again.
 
+**Preconditions.** The channel is registered with persisted founder, access,
+topic, KEEPTOPIC, and/or mode-lock state, and PostgreSQL state was successfully
+loaded at boot.
+
 **Flow.**
 
 1. Registered ownership, topic, KEEPTOPIC, MLOCK, and access rows load before
@@ -42,9 +55,14 @@ channel is created again.
 3. Founder operator status, retained topic, and mode lock are applied.
 4. Later joins and mutations use the same registered access state.
 
-**Failure contract.** The server does not claim registered behavior if its
+**Visible failures and recovery.** The server does not claim registered behavior if its
 database-backed state could not be loaded. A failed persistence mutation does
 not update only the hot state.
+
+**Security and observability.** Recreated state is selected by canonical
+channel identity and re-authorized on later mutations. Boot/load and
+persistence failures are explicit; unauthorized visibility queries cannot use
+the durable registry to disclose private channel state.
 
 **Evidence.** Proven by core registered-channel recreation tests and
 PostgreSQL boot-load/persistence tests.
@@ -54,6 +72,10 @@ PostgreSQL boot-load/persistence tests.
 **Actor and goal.** An account holder wants separate, revocable credentials for
 clients and BNC attachment.
 
+**Preconditions.** The caller has an authenticated browser/API session and
+PostgreSQL is ready. Primary-password rotation additionally requires the
+current primary password unless the account has none.
+
 **Flow.**
 
 - View secret-free credential posture: kind, label, created/last-used state.
@@ -62,10 +84,15 @@ clients and BNC attachment.
 - Revoke an exact app-password credential.
 - Use either primary or app password through SASL PLAIN.
 
-**Failure contract.** Passwords are never listable after creation. The generic
+**Visible failures and recovery.** Passwords are never listable after creation. The generic
 delete path cannot delete the primary password. Partial credential input,
 wrong current password, duplicate/cap exhaustion, and storage errors are
 visible.
+
+**Security and observability.** Plaintext is accepted only on bounded
+credential forms, hashed before storage, rendered once for app passwords, and
+excluded from logs, audit details, and metrics. Forms use session CSRF and
+every list/revoke operation is owner-scoped.
 
 **Evidence.** Proven by credential DB tests, real-socket SASL tests, HTTP API,
 and `account_console_manages_credentials_tokens_and_identities`.
@@ -74,6 +101,10 @@ and `account_console_manages_credentials_tokens_and_identities`.
 
 **Actor and goal.** A user wants API/OAUTHBEARER access and an inspectable
 multi-device read position.
+
+**Preconditions.** The account has an authenticated browser/API session,
+PostgreSQL is ready, and marker targets refer to a conversation the account may
+access.
 
 **Flow.**
 
@@ -84,9 +115,14 @@ multi-device read position.
   `/api/v1/me/read-markers`.
 - Update positions over IRC MARKREAD.
 
-**Failure contract.** Token caps are enforced transactionally. Revoked tokens
+**Visible failures and recovery.** Token caps are enforced transactionally. Revoked tokens
 fail authentication. Token strings never appear in listings, HTML, audit
 details, or metrics.
+
+**Security and observability.** Tokens are random, shown once, hashed at rest,
+and owner-scoped on list/revoke. Marker queries cannot enumerate another
+account’s conversations; message bodies and target names are excluded from
+metric labels.
 
 **Evidence.** Proven by token cap/list/revoke, bearer authentication,
 OAUTHBEARER socket, marker persistence/restart, API, and console tests.
@@ -95,6 +131,10 @@ OAUTHBEARER socket, marker persistence/restart, API, and console tests.
 
 **Actor and goal.** A user wants to see where the account is active and end an
 exact session.
+
+**Preconditions.** The caller has a valid browser session. Live IRC entries
+exist only for authenticated registered connections, while browser-session
+inventory requires PostgreSQL.
 
 **Flow.**
 
@@ -108,9 +148,14 @@ exact session.
 5. A revoked browser session loses HTTP and WebSocket access; a disconnected
    IRC session receives the normal close path.
 
-**Failure contract.** IDs are owner-scoped; another account’s resources remain
+**Visible failures and recovery.** IDs are owner-scoped; another account’s resources remain
 invisible. The “other sessions” action preserves the current session by
 identity rather than timestamp guesswork.
+
+**Security and observability.** Resource identifiers are unpredictable and
+serialized without JavaScript precision loss. Exact-resource mutation repeats
+ownership checks, forms are CSRF-protected, and the inventory exposes bounded
+posture but never cookies, token hashes, or credentials.
 
 **Evidence.** Proven by HTTP/PostgreSQL owner-scoping tests and real core
 connection-directory/disconnect tests.

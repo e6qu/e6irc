@@ -17,6 +17,23 @@ The 2026-07-30 whole-product traceability audit is in
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
 
+Journey-contract closure (2026-07-30): all 46 shipped outcomes now use one
+complete actor/precondition/flow/failure/security/evidence structure, and the
+coverage matrix has one exact linked row per journey using only the defined
+evidence states. A dependency-free CI guard rejects missing sections,
+uncatalogued files, stale heading links, duplicate/missing coverage, and
+invented status vocabulary. The audit corrected stale claims that browser
+local login and CLI device authorization were absent even though both are
+executable acceptance paths. It also found that the credential-bearing
+Configuration collections had handlers but no end-to-end form evidence; a
+real PostgreSQL journey now creates and removes an IRC operator, OpenID Connect
+provider, and account-owned server network, verifies revision/audit provenance,
+opens every sealed secret under the configuration context, and proves no
+plaintext secret is rendered or audited.
+Previously implicit visitor discovery/readiness and coordinated sign-out are
+now first-class journeys rather than clauses hidden inside monitoring and
+credential rotation.
+
 Whole-product reliability and evidence sweep (2026-07-30): browser composer
 requests now carry a bounded correlation identifier and receive an explicit
 `sent`/`send-error` result. The server rejects CR/LF/NUL and over-limit derived

@@ -39,8 +39,9 @@ metrics use fixed categories, not account names.
 **Evidence.** Proven at HTTP/PostgreSQL level by
 `local_login_is_browser_bound_and_accepts_only_the_primary_password`,
 `concurrent_browser_session_issuance_enforces_the_active_cap`, and the browser
-session inventory tests. Browser-driven local login is not part of the current
-Playwright suite.
+session inventory tests. `tools/test-oidc-browser.mjs` adds a primary password
+to an OpenID Connect-provisioned account, signs out, and completes the real
+local-login form in Chromium.
 
 ## Sign in with OpenID Connect
 
@@ -86,6 +87,10 @@ also exercised by the `shauth-sso` CI job.
 **Actor and goal.** A signed-in account holder wants another provider identity
 to authenticate the same account, or wants to remove an existing link.
 
+**Preconditions.** The account has a valid browser session, the target provider
+is enabled and reachable, and at least one credential or identity will remain
+after an unlink.
+
 **Flow.**
 
 1. **Account & access** lists linked identities without provider secrets.
@@ -101,15 +106,67 @@ is a conflict, never a move. Unlinking an identity outside the caller’s accoun
 is indistinguishable from absence. The server refuses a mutation that would
 violate the account’s access invariants.
 
+**Security and observability.** Link state and PKCE are bound to the initiating
+session. The callback trusts only validated issuer/subject identity, unlink is
+CSRF-protected and owner-scoped, and neither provider tokens nor claims are
+written to audit details.
+
 **Evidence.** Proven at real Dex/PostgreSQL level by
 `oidc_identity_link_flow_and_conflict` and
 `oidc_identity_link_list_and_conflict`; console rendering/mutation is covered
 by `account_console_manages_credentials_tokens_and_identities`.
 
+## Sign out locally and across an identity provider
+
+**Actor and goal.** A signed-in user wants the current e6irc browser session
+ended and, when applicable, the upstream single-sign-on session coordinated
+without being logged straight back in.
+
+**Preconditions.** The browser has a valid session. Coordinated logout
+additionally requires retained provider/session metadata and a valid configured
+end-session endpoint, front-channel callback, or back-channel signing keys.
+
+**Flow.**
+
+1. Local/API sign-out revokes the exact server-side session and clears its
+   cookie.
+2. Browser sign-out for an OpenID Connect session validates the session-bound
+   CSRF value, retains local state until the provider redirect is constructible,
+   and starts relying-party-initiated logout with the required hints.
+3. The provider may revoke correlated sessions through signed back-channel or
+   issuer/session-bound front-channel logout.
+4. The provider returns to `/auth/signed-out`, a public non-cacheable page that
+   does not immediately start silent authentication again.
+5. The user deliberately chooses the route back to authentication.
+
+**Visible failures and recovery.** Missing/invalid CSRF, provider metadata,
+end-session endpoint, logout-token signature/claims, replayed token, or
+database failure fails closed. A local session is not silently discarded when
+the requested coordinated flow could not start; the user can retry or revoke
+the exact session from **Your sessions**.
+
+**Security and observability.** Cookies are cleared only with matching
+server-side revocation. Back-channel tokens require signature, issuer,
+audience, event, time, session/subject, and replay checks; front-channel
+requests correlate only opaque provider session identifiers. Tokens, cookies,
+subjects, and logout hints are excluded from logs, audit text, and metric
+labels.
+
+**Evidence.** `rp_initiated_logout_redirects_to_provider`,
+`oidc_logout_without_end_session_configuration_fails_closed`, front/back
+channel claim/replay tests, and browser session revocation tests prove the
+generic paths. `tools/test-shauth-sso.mjs` drives exact Shauth login, relying-
+party logout, global session revocation, signed-out landing, and deliberate
+re-entry in Chromium.
+
 ## Authorize an input-constrained device
 
 **Actor and goal.** A client that cannot complete browser login wants a bearer
 token through the OAuth 2.0 device authorization grant.
+
+**Preconditions.** The HTTP public URL is correct, PostgreSQL is ready, the
+device can make HTTPS requests, and the approving user can open an
+authenticated browser session.
 
 **Flow.**
 
@@ -127,16 +184,26 @@ token through the OAuth 2.0 device authorization grant.
 consumed, or unapproved codes receive their specified error. Polling and start
 are rate-limited; live grants are bounded and stale grants are pruned.
 
+**Security and observability.** Device and user codes are random, bounded,
+short-lived, and stored separately from the resulting token. Approval is
+session-authenticated and CSRF-protected; polling metrics use fixed outcomes
+without codes, tokens, or account names.
+
 **Evidence.** Proven at HTTP/PostgreSQL level by
 `device_authorization_grant_flow`,
 `approved_device_grant_polls_to_a_working_token_then_is_consumed`, and the
-device-page HTTP coverage. No shipped CLI currently orchestrates this flow; it
-is a server/API capability.
+device-page HTTP coverage. `e6irc login` drives the real start, polling,
+approval/consume, private-cache, and authenticated API path in
+`crates/e6irc-cli/tests/e2e.rs`.
 
 ## Authenticate an IRC or BNC client
 
 **Actor and goal.** A client wants an authenticated IRC session or wants to
 attach to an owned BNC network.
+
+**Preconditions.** The selected listener is reachable, the account has a
+primary password, app password, or personal access token accepted by that
+listener, and a BNC network exists when using `account/network`.
 
 **Flow.**
 
@@ -155,6 +222,11 @@ revoked credentials produce SASL failure and no registered/attached session.
 Network-name matching is IRC-case-insensitive; another account’s network
 remains invisible.
 
+**Security and observability.** Credentials are length-bounded before hashing,
+never logged, and checked before owner-scoped network selection. Authentication
+and attachment counters use fixed result categories, while exact live
+connections remain visible only to their owner or an administrator.
+
 **Evidence.** Proven over real sockets/PostgreSQL by `sasl_over_real_socket`,
 `sasl_oauthbearer_with_api_token`,
 `bnc_listener_authenticates_and_routes_client_to_network`,
@@ -165,6 +237,10 @@ SASL test.
 
 **Actor and goal.** An account holder wants to reduce or terminate access
 without deleting the account.
+
+**Preconditions.** The account holder has a current browser session and, for
+primary-password rotation, the current primary credential unless no primary
+credential exists yet.
 
 **Flow.**
 
@@ -182,6 +258,11 @@ without deleting the account.
 An app password cannot rotate the primary password. The primary credential
 cannot be deleted through generic revocation. Exact-resource deletes are
 owner-scoped and idempotent only where the API contract says so.
+
+**Security and observability.** New app passwords and tokens are rendered once;
+only hashes and secret-free posture remain. Rotation and revocation are
+CSRF-protected, owner-scoped, and audited where privileged; secret material is
+excluded from pages, logs, metrics, and audit records.
 
 **Evidence.** Proven through the database, HTTP API, and server-rendered console
 by the credential, token, password-rotation, browser-session, live-connection,

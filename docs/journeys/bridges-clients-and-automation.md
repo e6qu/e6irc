@@ -5,6 +5,10 @@
 **Actor and goal.** An administrator wants an external chat system represented
 as an always-on e6irc network.
 
+**Preconditions.** PostgreSQL, a stable master key, and the matching compiled
+bridge feature are available. The administrator has valid platform
+credentials/endpoints and owns the configured bridge network.
+
 **Flow.**
 
 1. Build `e6ircd` with the required bridge feature (`matrix`, `discord`, or
@@ -30,7 +34,12 @@ configuration changes rather than retried forever. Network/transient failures
 use bounded backoff and visible error categories. Inbound identities/channel
 names are sanitized and validated before entering IRC state.
 
-**Evidence by driver.**
+**Security and observability.** Integration forms are administrator-only and
+CSRF-protected; platform credentials are sealed, write-only, and excluded from
+audit/log/metrics output. Driver lifecycle, traffic, latency, attachments, and
+closed failure categories use the common network snapshot.
+
+**Evidence.** Evidence differs by driver:
 
 - **Local:** proven in-process through the common driver conformance and BNC
   path.
@@ -56,7 +65,11 @@ database CI lane compiles this journey with every bridge feature.
 **Actor and goal.** A shell script or person wants one bounded IRC/API action
 with a meaningful exit status.
 
-**Shipped flow.**
+**Preconditions.** The target IRC or HTTP endpoint is reachable, required TLS
+trust is installed, and the caller supplies one complete authentication mode
+or deliberately chooses anonymous IRC.
+
+**Flow.**
 
 - `e6irc send TARGET MESSAGE` connects, optionally authenticates with SASL
   PLAIN, joins a channel when needed, sends, drains the server response, and
@@ -86,6 +99,12 @@ rather than falling back to anonymous. Device denial, expiry, an unknown
 device error, or invalid server polling bounds fail explicitly. Server output
 is terminal-sanitized and JSON output is serializer-escaped.
 
+**Security and observability.** Secrets may come from explicit arguments,
+environment, or the private origin-bound cache but are never printed. All
+input/output is bounded and terminal-sanitized; process exit status is the
+automation-facing outcome while the server records normal fixed-category
+connection/API telemetry.
+
 **Evidence.** Real-socket/API tests cover send, delivery failure, PLAIN and
 OAUTHBEARER, credential-shape rejection, history, structured tail, TLS, and
 REST. The database job drives the actual binary through e6ircd's device
@@ -96,7 +115,11 @@ uses its cached origin/token against `/api/v1/me`.
 
 **Actor and goal.** A person wants a lightweight interactive IRC terminal.
 
-**Shipped flow.**
+**Preconditions.** The terminal supports the alternate screen, the selected
+IRC/BNC endpoint is reachable, and any direct or cached credential is valid and
+private to the current user.
+
+**Flow.**
 
 1. Connect to one `host:port` with a nick and initial channel, using plaintext
    or public-CA TLS with an optional certificate-name override.
@@ -123,6 +146,16 @@ uses its cached origin/token against `/api/v1/me`.
    is echoed only after queue admission, and a read-marker write remains
    pending when admission is temporarily unavailable.
 
+**Visible failures and recovery.** Transport, TLS, SASL, capability, history,
+writer-queue, line-limit, and server-protocol failures are visible in the
+interface. Reconnect is bounded and reuses the same request; terminal teardown
+restores the screen even after failure.
+
+**Security and observability.** Server text is converted to terminal-safe
+types, buffers and both input queues are bounded, and cache permission/origin
+checks match the CLI. Credentials never enter rendered buffers; the server sees
+the ordinary authenticated connection and traffic telemetry.
+
 **Evidence.** The terminal-independent application state is unit-tested and
 fuzzed with arbitrary server messages; authentication/transport argument
 shapes, disconnect refusal, transport failure, and bounded queue/scrollback
@@ -146,6 +179,10 @@ cross-network multiplexing.
 **Actor and goal.** A Rust application wants shared, tested IRC transport and
 protocol behavior.
 
+**Preconditions.** The application uses the supported Rust toolchain and
+constructs an owned `ConnectionOptions` value with a reachable address, valid
+TLS name where applicable, and one explicit authentication variant.
+
 **Flow.**
 
 - `e6irc-client` provides plaintext/public-CA TLS connection, framing through
@@ -161,11 +198,16 @@ protocol behavior.
   selection; it can reuse the shared device-token storage rather than defining
   a second cache format.
 
-**Failure contract.** EOF, strict-handshake invalid/oversized lines,
+**Visible failures and recovery.** EOF, strict-handshake invalid/oversized lines,
 TLS/authentication failure, and write failure are returned. Tolerant
 steady-state reading contains a non-UTF-8 server line without terminating the
 whole client, while malformed/oversized per-line rejections remain explicit
 events callers must handle.
+
+**Security and observability.** Authentication variants make partial SASL
+unrepresentable, token-cache reads enforce provenance and permissions, and all
+framing/queues are bounded. The library returns typed outcomes so its caller
+can report failures without logging credentials or raw hostile terminal text.
 
 **Evidence.** Library behavior is covered by unit tests and indirectly by CLI,
 TUI fuzz, load harness, and live server e2e tests.
@@ -174,6 +216,10 @@ TUI fuzz, load harness, and live server e2e tests.
 
 **Actor and goal.** A program wants versioned, owner-scoped management without
 HTML.
+
+**Preconditions.** The HTTP API is reachable, the caller has a valid personal
+access token or approved device token, and administrator endpoints additionally
+name that account in managed administrator configuration.
 
 **Flow.**
 
@@ -191,6 +237,11 @@ HTML.
 Authentication, role, owner scope, validation, conflict, stale state,
 dependency, and rate-limit failures retain distinct status/problem behavior.
 List endpoints never return secret plaintext.
+
+**Security and observability.** Bearer tokens are bounded, hashed at rest, and
+owner/role checked at each resource boundary. Sensitive responses are
+non-cacheable, inputs and pages are bounded, and audit/metrics expose fixed
+safe fields rather than tokens, passwords, cookies, or unbounded user labels.
 
 **Evidence.** One route catalog constructs the Axum API method routers and the
 complete method/path inventory; the hand-authored OpenAPI semantics must match

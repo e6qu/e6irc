@@ -8,6 +8,10 @@ authenticated gateway to always-on external/bridge networks; its journey is in
 
 **Actor and goal.** An IRC client wants a usable local-network session.
 
+**Preconditions.** At least one compatible IRC listener is enabled and
+reachable. The client has any credential required by registration policy and
+trusts the configured TLS endpoint when TLS is used.
+
 **Flow.**
 
 1. Open a configured plaintext or TLS listener. A trusted load balancer may
@@ -23,10 +27,15 @@ authenticated gateway to always-on external/bridge networks; its journey is in
 6. Respond to server PINGs until QUIT, timeout, operator disconnect, SendQ
    overflow, or shutdown.
 
-**Failure contract.** Unsupported capabilities are rejected explicitly.
+**Visible failures and recovery.** Unsupported capabilities are rejected explicitly.
 Nickname collision, bad registration sequence, authentication failure, ban,
 flooding, timeout, and SendQ overflow produce the appropriate numeric/ERROR and
 close when required. Input and output queues remain bounded.
+
+**Security and observability.** PROXY metadata is accepted only from configured
+trusted peers, credentials are never logged, and registration policy is
+applied before the session becomes visible. Connection lifecycle, traffic,
+latency, and fixed failure categories feed the live directories and metrics.
 
 **Evidence.** Proven over real sockets across core/e2e/DB tests, TLS tests,
 irctest, persistence-backed irctest services, property tests, and stateful
@@ -36,6 +45,10 @@ fuzzing.
 
 **Actor and goal.** A registered client wants to discover, join, and converse
 in a channel.
+
+**Preconditions.** The client has completed registration, and the requested
+channel name and any key/invitation/access state satisfy the server’s channel
+policy.
 
 **Flow.**
 
@@ -51,10 +64,15 @@ in a channel.
    privilege.
 6. PART, KICK, QUIT, or disconnect updates membership and visibility.
 
-**Failure contract.** Admission and send failures return specific numerics;
+**Visible failures and recovery.** Admission and send failures return specific numerics;
 there is no join-and-drop or send-and-discard success. Secret/private channel
 state is not disclosed to unauthorized queries. A slow recipient is
 disconnected rather than making fan-out memory unbounded.
+
+**Security and observability.** Channel visibility and every mutation are
+checked against current membership and privilege. Messages and member lists are
+bounded by protocol and SendQ limits; connection, traffic, and moderation
+events remain available to authorized operators without exposing secret keys.
 
 **Evidence.** Broadly proven by core integration tests and both irctest jobs,
 including channel admission, modes, STATUSMSG, visibility, multiline/batch,
@@ -64,6 +82,10 @@ and services behavior.
 
 **Actor and goal.** One registered client wants to message another nick and
 later recover the conversation.
+
+**Preconditions.** Both live participants are registered for immediate
+delivery. Durable recovery additionally requires authenticated accounts and
+PostgreSQL history storage.
 
 **Flow.**
 
@@ -75,9 +97,14 @@ later recover the conversation.
 4. REST history and CHATHISTORY expose only conversations the requesting
    account participated in.
 
-**Failure contract.** A missing nick or prohibited send returns a numeric.
+**Visible failures and recovery.** A missing nick or prohibited send returns a numeric.
 Offline history resolution does not make an unauthenticated peer’s messages
 globally readable. Message identifiers are scoped to their target.
+
+**Security and observability.** History authorization is participant-scoped at
+both request and storage boundaries. Message text and peer names never become
+metric labels; delivery and persistence failures use bounded categories and do
+not fabricate a durable success.
 
 **Evidence.** Proven by direct-message core tests and PostgreSQL tests for
 offline correspondents, target enumeration, authorization, and pagination.
@@ -86,6 +113,10 @@ offline correspondents, target enumeration, authorization, and pagination.
 
 **Actor and goal.** A user reconnecting on another device wants bounded,
 ordered history and a shared read position.
+
+**Preconditions.** The account is authenticated, the requested capabilities
+are negotiated, and PostgreSQL is configured for restart-spanning history and
+read markers.
 
 **Flow.**
 
@@ -100,9 +131,14 @@ ordered history and a shared read position.
 5. Pagination pivots remain within the requested target and stable even when
    multiple messages share a timestamp.
 
-**Failure contract.** Invalid selectors, unsupported ranges, unauthorized
+**Visible failures and recovery.** Invalid selectors, unsupported ranges, unauthorized
 targets, and database failures return protocol/API errors. A database miss
 does not silently become an incomplete “success.”
+
+**Security and observability.** Target enumeration and every page are
+account-authorized. Limits are clamped before allocation, selectors cannot
+cross targets, and database failure is recorded without message content or
+account names in metric labels.
 
 **Evidence.** Proven by core history tests, extensive PostgreSQL selector and
 restart tests, persistence-backed irctest CHATHISTORY, REST history, and read
@@ -115,6 +151,10 @@ unread state, and history/live overlap.
 **Actor and goal.** A client wants an IRC-native account and channel-governance
 workflow.
 
+**Preconditions.** PostgreSQL is ready, services are enabled through the
+account store, and the client has the authentication or channel privilege
+required by the requested NickServ or ChanServ command.
+
 **Flow.**
 
 - NickServ supports REGISTER, IDENTIFY, GHOST, LOGOUT, and HELP.
@@ -126,9 +166,14 @@ workflow.
 - The console/API offers the same channel-governance outcomes through typed,
   owner-scoped operations.
 
-**Failure contract.** Commands require the correct account/founder/access
+**Visible failures and recovery.** Commands require the correct account/founder/access
 state and return NOTICE/FAIL on denial or persistence failure. `SET GUARD` is
 explicitly declined rather than accepted as a no-op.
+
+**Security and observability.** Password commands share the bounded credential
+verification path. Founder/access checks are repeated in the core, durable
+mutations cross the database worker, and privileged outcomes are recorded
+without credential or private-channel leakage.
 
 **Evidence.** Proven by core services tests, persistence-backed irctest account
 registration, PostgreSQL persistence tests, and console/API channel tests.
@@ -137,6 +182,10 @@ registration, PostgreSQL persistence tests, and console/API channel tests.
 
 **Actor and goal.** An authorized operator wants to intervene in live network
 state.
+
+**Preconditions.** A named operator credential is present in managed
+configuration, the client is registered, and the target connection or policy
+resource exists where the command requires one.
 
 **Flow.**
 
@@ -147,9 +196,14 @@ state.
 4. Each privileged action records actor, action, target, detail, and time in
    the audit log.
 
-**Failure contract.** Non-operators receive an explicit denial. Database-backed
+**Visible failures and recovery.** Non-operators receive an explicit denial. Database-backed
 ban mutation and audit are atomic; the server does not enforce an unaudited
 write or report a persisted ban that was not stored.
+
+**Security and observability.** Operator elevation and every privileged command
+are authorized in the core. Audit records contain actor, action, target,
+redacted detail, and time; operator credentials and connection-private data do
+not enter metrics or audit text.
 
 **Evidence.** Proven by core operator/ban tests and real-PostgreSQL atomicity,
 boot-load, directory, and audit tests.
@@ -158,6 +212,10 @@ boot-load, directory, and audit tests.
 
 **Actor and goal.** A third-party web IRC client wants the normal IRC protocol
 over WebSocket.
+
+**Preconditions.** The HTTP `/ws/irc` route or dedicated WebSocket listener is
+reachable, the browser’s Origin is accepted where required, and the client can
+speak one of the IRCv3 WebSocket framing modes.
 
 **Flow.**
 
@@ -168,6 +226,16 @@ over WebSocket.
    per line.
 3. IRC registration and all later commands follow the same core path as TCP.
 4. Close, invalid framing, or backpressure terminates the connection visibly.
+
+**Visible failures and recovery.** Unsupported upgrades, invalid frames,
+oversized IRC lines, authentication/registration failures, and SendQ overflow
+close or reject the connection explicitly. Reconnection starts a new IRC
+session rather than silently resuming an unauthenticated transport.
+
+**Security and observability.** The upgrade applies the HTTP origin policy and
+then uses the same bounded parser, authentication, connection identifiers,
+traffic accounting, and close reasons as TCP. Browser-controlled text is never
+trusted as HTML.
 
 **Evidence.** Proven by `crates/e6ircd/tests/ws_irc.rs` and included in
 cross-platform workspace testing.

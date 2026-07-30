@@ -29,14 +29,14 @@ piece in isolation does not prove the outcome a user experiences.
 
 | Area | Journeys |
 |---|---|
-| [Identity and access](identity-and-access.md) | local login, OpenID Connect login and linking, device authorization, logout, password/token/session lifecycle |
+| [Identity and access](identity-and-access.md) | local login, OpenID Connect login/linking/logout, device authorization, password/token/session lifecycle |
 | [IRC and services](irc-and-services.md) | registration, capability negotiation, channel and direct chat, history, read markers, services, operator actions, WebSocket IRC |
 | [Web chat](web-chat.md) | enter the application, choose a network, live chat, replay/history, membership state, disconnect and recovery |
 | [Networks and BNC](networks-and-bouncer.md) | enable the registry/listener, add a preset or custom network, connect and diagnose, attach an IRC client, persist/replay, edit/pause/delete |
 | [Channels and account self-service](channels-and-account.md) | register and govern a channel, manage credentials/identities, inspect and terminate sessions |
 | [Administration and monitoring](administration-and-monitoring.md) | bootstrap and managed configuration, directories and policy, traffic/latency/error monitoring, audit, readiness |
 | [Bridges, clients, and automation](bridges-clients-and-automation.md) | local/Matrix/Discord/Slack networks, CLI, TUI, client library, REST automation |
-| [Deployment and recovery](deployment-and-recovery.md) | first boot, migration, container release, restart, shutdown, secret loss, dependency failure |
+| [Deployment and recovery](deployment-and-recovery.md) | public service/readiness discovery, first boot, migration, container release, restart, shutdown, secret loss, dependency failure |
 | [Coverage and product boundaries](coverage.md) | journey-to-test traceability, test layers, external qualification, and claims that are targets rather than shipped behavior |
 
 ## Status vocabulary
@@ -87,6 +87,15 @@ When behavior changes, update the corresponding journey and its row in
 command family, client command, bridge kind, or deployment mode is incomplete
 until its actor, success result, failure contract, and test evidence are
 represented here.
+
+Every second-level journey heading is a stable catalog entry. Its section must
+contain explicit **Actor and goal**, **Preconditions**, **Flow**, **Visible
+failures and recovery**, **Security and observability**, and **Evidence**
+blocks. `coverage.md` links each heading exactly once and uses only the four
+evidence states above. `tools/check-journeys.py` enforces that structure,
+catalog membership, link/heading agreement, and evidence vocabulary in CI; a
+renamed, undocumented, or unclassified journey therefore fails the repository
+gate.
 
 Historical implementation detail remains in `PLAN.md`; it is not a substitute
 for this current-state map.
