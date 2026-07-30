@@ -147,9 +147,11 @@ same-sender ordered fence that catches duplicates, uses nanosecond timestamps, r
 malformed/out-of-range delivery identifiers, and supports explicit connect,
 fan-out, and P99 acceptance thresholds. The real-daemon CI smoke applies
 generous catastrophic-regression floors. A separate all-feature coverage job
-ratchets workspace line coverage at 55%. The journey matrix now distinguishes
-component-proven Discord/Slack logic from their unqualified live transports
-and records these composer, native-client, load, and coverage contracts.
+combines the portable workspace suite with the real PostgreSQL database and
+HTTP lifecycle suites before ratcheting production line coverage at 80%. The
+journey matrix now distinguishes component-proven Discord/Slack logic from
+their unqualified live transports and records these composer, native-client,
+load, and coverage contracts.
 
 Native-client and distribution closure (2026-07-30): `e6irc login` now drives
 the device authorization grant into a private, atomic, origin-bound token

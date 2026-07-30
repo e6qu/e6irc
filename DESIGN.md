@@ -1789,10 +1789,11 @@ Layers, bottom to top:
    command streams, and arbitrary server output into the TUI model.
    `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive, but the
    seeded whole-core scheduler/replay described in §7.3 is not implemented.
-   A separate all-feature coverage job runs the workspace suite and rejects
-   line coverage below 55%; the floor is a regression ratchet, while dedicated
-   PostgreSQL/browser jobs supply environment-dependent acceptance evidence
-   outside that percentage.
+   A separate all-feature coverage job combines the portable workspace suite
+   with the real PostgreSQL database and HTTP lifecycle suites, then rejects
+   line coverage below 80%; the floor is a regression ratchet. Provider/browser
+   jobs supply their environment-dependent acceptance evidence outside that
+   percentage.
 3. **irctest** (progval/irctest) run in CI against `e6ircd` — the same
    suite Solanum/Ergo use.
 4. **Compatibility** (§7.7): the vendored Libera-snapshot ISUPPORT

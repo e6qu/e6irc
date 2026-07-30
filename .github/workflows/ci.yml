@@ -95,12 +95,25 @@ jobs:
       - run: cargo test --workspace --all-features --target ${{ matrix.target }}
 
   # Coverage is a ratchet, not a claim that one percentage proves the product.
-  # Database/provider/browser journeys run in their dedicated jobs below; this
-  # job measures the portable all-feature suite and prevents newly added
-  # production paths from silently landing without executable evidence.
+  # Combine the portable all-feature suite with the real PostgreSQL database
+  # and HTTP lifecycle suites before enforcing it; otherwise production paths
+  # whose tests require storage count only in the denominator. Provider/browser
+  # journeys still run in their dedicated jobs below.
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: e6irc_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready --username postgres --dbname e6irc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -109,8 +122,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
       - run: cargo install cargo-llvm-cov --version 0.8.4 --locked
-      - name: Enforce portable production-line coverage ratchet
-        run: cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines 55
+      - name: Measure portable and PostgreSQL-backed production paths
+        env:
+          E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
+        run: |
+          cargo llvm-cov --workspace --all-features --no-report
+          cargo llvm-cov --no-clean -p e6ircd --all-features --test db -- --ignored --test-threads=1
+          cargo llvm-cov --no-clean -p e6ircd --all-features --test http -- --ignored --test-threads=1
+      - name: Enforce production-line coverage ratchet
+        run: cargo llvm-cov report --summary-only --fail-under-lines 80
 
   db-tests:
     runs-on: ubuntu-24.04
