@@ -47,7 +47,10 @@ database under HTTP and live IRC traffic. Readiness now has its own two-second
 database deadline, and the shared pool has the same bounded acquisition
 contract; liveness and hot IRC remain available during interruption,
 database-backed actions fail promptly and visibly, and all recover without
-restarting e6ircd. The expanded browser journey also exposed cross-binary test
+restarting e6ircd. The harness waits for PostgreSQL's final TCP listener, not
+the image entrypoint's transient initialization-only Unix socket, so first-boot
+evidence cannot race the entrypoint's deliberate stop/start. The expanded
+browser journey also exposed cross-binary test
 state: its intentionally sealed OpenID Connect secret remained in the
 administrative database and poisoned the later CLI server bootstrap. The CLI
 journey now creates a process-unique database from that administrative
