@@ -16,7 +16,11 @@ Flags: `--addr host:port` (default `127.0.0.1:6667`), `--clients N`
 channels), `--channel PREFIX` (default `#load`; actual channel is
 `PREFIX{index}`), `--burst K` (default 10), `--tls`,
 `--minimum-connect-rate N`, `--minimum-fanout-rate N`, and
-`--maximum-p99-ms N`. The optional thresholds turn the measurement into an
+`--maximum-p99-ms N`. On the tuned Linux qualification host,
+`--server-pid PID` additionally samples e6ircd's resident set from `/proc`;
+`--maximum-server-rss-per-connection-bytes N` turns the incremental peak
+(above the pre-run server baseline, divided by requested clients) into another
+acceptance threshold. The optional thresholds turn the measurement into an
 acceptance gate: missing exact deliveries or violating any supplied threshold
 exits nonzero.
 
@@ -70,9 +74,11 @@ The harness and the server both need OS headroom well above defaults:
 - **Backlog & buffers** — raise `net.core.somaxconn` and the listen backlog;
   watch `net.ipv4.tcp_mem` / socket buffer pressure.
 - **Server sizing** — `core_queue`, `sendq`, and `max_hot_channels` in the
-  server config govern memory under load. A 100k qualification must first set
-  and enforce a per-connection memory budget; no such budget is part of the
-  current release contract.
+  server config govern memory under load. Queue bounds allocate lazily, so an
+  empty per-connection SendQ does not reserve its maximum 1,024 envelopes.
+  Pass the server process ID and a host-specific
+  `--maximum-server-rss-per-connection-bytes` value to enforce the chosen
+  incremental resident-memory budget.
 
 Run `sweep.sh` to walk client counts and tabulate the results:
 
@@ -87,9 +93,9 @@ sweep can enforce thresholds chosen for that controlled host.
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,
 at least 100 deliveries/second, P99 below five seconds, and graceful shutdown.
-Those deliberately generous shared-runner limits catch catastrophic regressions
-without pretending to be a production-host baseline. The full 100k run,
-production fan-out/latency targets, timer-wheel scheduling, core sharding, and
-a per-connection memory budget remain outside the current qualification
-evidence. This harness is the measurement instrument, not proof that the target
-has been met; see `docs/journeys/coverage.md`.
+On Linux it also samples the daemon and rejects more than 1 MiB of incremental
+peak RSS per requested connection. Those deliberately generous shared-runner
+limits catch catastrophic regressions without pretending to be a
+production-host baseline. A tuned-host run supplies its own stricter RSS,
+fan-out, and latency budgets. This harness is the measurement instrument, not
+proof that the target has been met; see `docs/journeys/coverage.md`.

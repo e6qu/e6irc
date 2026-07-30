@@ -51,6 +51,9 @@ jobs:
       # Journey guard: every user-facing outcome carries the same complete
       # contract and has exactly one row using the defined evidence vocabulary.
       - run: python3 tools/check-journeys.py
+      # Structural server-rendered accessibility: every data table keeps an
+      # accessible caption and every navigation landmark keeps a name.
+      - run: python3 tools/check-template-accessibility.py
       # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
       # file-it-for-later idiom may be added to PLAN.md. The checkout is
       # shallow, so fetch main to diff the PLAN.md additions against; the guard

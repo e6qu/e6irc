@@ -208,7 +208,7 @@ fn document() -> serde_json::Value {
                         "204": { "description": "account deleted and browser cookie cleared" },
                         "400": { "description": "confirmation does not match" },
                         "401": { "description": "browser session required" },
-                        "409": { "description": "account founds channels or is the final durable administrator" },
+                        "409": { "description": "account founds channels or is the final effective administrator" },
                         "503": { "description": "database or live runtime unavailable" }
                     }
                 }
@@ -767,7 +767,7 @@ fn document() -> serde_json::Value {
             "/api/v1/admin/accounts/{id}": {
                 "patch": {
                     "summary": "Change account suspension or durable administrator authority (admin only)",
-                    "description": "Exactly one desired state is accepted per request. Suspension commits credential revocation and an audit record before the live core and owned-network registry are reconciled. Self-suspension, self-demotion, and removing or suspending the last active durable administrator are rejected.",
+                    "description": "Exactly one desired state is accepted per request. Suspension commits credential revocation and an audit record before the live core and owned-network registry are reconciled. Self-suspension, self-demotion, and removing or suspending the last active effective durable-or-configured administrator are rejected.",
                     "security": authenticated,
                     "parameters": [{
                         "name": "id",
@@ -805,7 +805,7 @@ fn document() -> serde_json::Value {
                 },
                 "delete": {
                     "summary": "Permanently delete an account (admin only)",
-                    "description": "Requires the exact display-cased account name. Self-deletion must use the self-service route. Founded channels must be transferred or dropped first; the final active durable administrator is protected. Successful deletion revokes live access, purges account-owned data, stops networks, and retires the name.",
+                    "description": "Requires the exact display-cased account name. Self-deletion must use the self-service route. Founded channels must be transferred or dropped first; the final active effective durable-or-configured administrator is protected. Successful deletion revokes live access, purges account-owned data, stops networks, and retires the name.",
                     "security": authenticated,
                     "parameters": [{
                         "name": "id", "in": "path", "required": true,
@@ -823,7 +823,7 @@ fn document() -> serde_json::Value {
                         "200": { "description": "account deleted and live resources stopped" },
                         "400": { "description": "confirmation does not match" },
                         "404": { "description": "no such account" },
-                        "409": { "description": "self target, founded channels, or final durable administrator" },
+                        "409": { "description": "self target, founded channels, or final effective administrator" },
                         "503": { "description": "database or live runtime unavailable" }
                     }
                 }

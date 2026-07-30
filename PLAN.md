@@ -5469,14 +5469,21 @@ Done:
   release, macOS: 1 channel gave 290 connects/s + 59k msg/s at 131 ms
   p50; 200 channels gave 6042 connects/s + 122k msg/s at 37 ms p50.
   Numbers recorded in tools/load/README.md.
+- Empty bounded queues allocate lazily rather than reserving their full
+  admission limit, removing the default SendQ's eager 1,024-envelope cost from
+  every idle connection. The Linux load harness samples the server PID's
+  pre-run and peak resident set, reports incremental bytes per requested
+  connection, and can fail on a supplied ceiling. The real-daemon CI smoke
+  enforces a generous 1 MiB/connection catastrophic-regression bound alongside
+  its delivery, throughput, latency, and shutdown gates.
 Qualification boundary:
 - The 100k-connection run itself needs a tuned Linux host (fd limits,
   ephemeral-port range, socket buffers — macOS caps loopback hard). The
   harness is the instrument; the run is a hosting task.
-- Production-host fan-out/latency acceptance numbers and the per-connection
-  memory budget are unset; the reduced-scale CI gate checks exact delivery and
-  deliberately generous catastrophic-regression thresholds without making a
-  host-performance claim. The runtime has one core worker; sharding,
+- Production-host fan-out/latency/RSS acceptance numbers are unset; the
+  reduced-scale CI gate checks exact delivery and deliberately generous
+  catastrophic-regression thresholds without making a host-performance claim.
+  The runtime has one core worker; sharding,
   timer-wheel scheduling, and whole-core deterministic replay are target
   architecture rather than shipped behavior. (DESIGN §7.3–7.4, §17;
   `docs/journeys/coverage.md`)
@@ -5505,6 +5512,9 @@ Qualification boundary:
   invariants, real-socket HTTP journey, two-context Chromium onboarding/export/
   deletion journey, DESIGN model, and user-journey traceability all describe
   the same lifecycle.
+- Every server-rendered data table now has a screen-reader caption and every
+  navigation landmark has an accessible name. A dependency-free template guard
+  enforces both structural contracts in CI.
 
 ## Known remaining scope (audit 2026-07-19)
 

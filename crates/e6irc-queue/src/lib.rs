@@ -151,7 +151,11 @@ pub fn queue<T>(config: Config) -> (Sender<T>, Receiver<T>) {
             mode_switches: AtomicU64::new(0),
         }),
         state: Mutex::new(State {
-            buf: VecDeque::with_capacity(config.capacity),
+            // `capacity` is an admission bound, not an allocation request.
+            // SendQs use this queue per connection; eagerly reserving the
+            // default 1,024 output envelopes here would consume gigabytes of
+            // idle memory at the server's target connection count.
+            buf: VecDeque::new(),
             next_seq: 0,
             mode: Mode::Fifo,
             mode_switches: 0,
@@ -528,6 +532,20 @@ impl<T> Drop for Receiver<T> {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn construction_does_not_preallocate_the_admission_limit() {
+        let (sender, _receiver) = queue::<[u8; 128]>(Config {
+            name: "lazy-allocation",
+            capacity: 65_536,
+            policy: Policy::Fifo,
+        });
+        assert_eq!(
+            sender.shared.lock().buf.capacity(),
+            0,
+            "a queue bound must not become an eager per-queue allocation"
+        );
+    }
     use std::future::Future;
     use std::pin::pin;
     use std::sync::Arc as StdArc;

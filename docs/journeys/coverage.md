@@ -32,7 +32,7 @@ a design target rather than current behavior.
 | [Restart without losing durable state](deployment-and-recovery.md#restart-without-losing-durable-state) | Proven | Chromium gracefully restarts the real daemon and proves session/network/runtime/backlog recovery | — |
 | [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Proven | Named PostgreSQL stop/start under real daemon, probe, database-backed HTTP, and hot IRC traffic proves bounded failure and recovery | — |
 | [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Secret open/seal/wrong-key startup, CLI, and write-refusal tests | Recovery is restore-or-replace, not in-place re-encryption |
-| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate and recorded 2,000-client baselines | 100,000-client tuned-host result and production budgets are absent |
+| [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate, daemon RSS/connection threshold, lazy SendQ allocation, and recorded 2,000-client baselines | 100,000-client tuned-host result, sharded core, and production thresholds are absent |
 | [Sign in with a local password](identity-and-access.md#sign-in-with-a-local-password) | Proven | Chromium adds a password, signs out, and completes real local login against e6ircd/PostgreSQL | — |
 | [Sign in with OpenID Connect](identity-and-access.md#sign-in-with-openid-connect) | Proven | Real e6ircd, PostgreSQL, Dex, and Chromium plus exact Shauth journey | Provider diversity beyond Dex/Shauth |
 | [Link or unlink an OpenID Connect identity](identity-and-access.md#link-or-unlink-an-openid-connect-identity) | Proven | Real Dex/PostgreSQL conflict and console/API lifecycle tests | — |
@@ -96,8 +96,10 @@ deterministic whole-core scheduler/replay, timer-wheel work, and several
 zero-copy/performance mechanisms described as target architecture in DESIGN
 are not present. The reduced CI run has numeric catastrophic-regression
 thresholds, but there are no production-host acceptance thresholds,
-per-connection RSS budget, sharded-core evidence, or 100k qualification
-result.
+production-qualified per-connection RSS budget, sharded-core evidence, or
+100k qualification result. The Linux smoke does enforce a deliberately
+generous incremental RSS/connection regression ceiling, and the load harness
+accepts stricter host-qualified memory, throughput, and latency limits.
 
 ### Native-client product parity
 

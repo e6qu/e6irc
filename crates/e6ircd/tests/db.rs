@@ -5021,7 +5021,7 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
             .expect("approve device")
     );
 
-    let change = db::set_account_suspended(&pool, bob_id, true, "Alice")
+    let change = db::set_account_suspended(&pool, bob_id, true, "Alice", &[])
         .await
         .expect("suspend")
         .expect("Bob exists");
@@ -5079,7 +5079,7 @@ async fn suspension_revokes_every_bearer_and_blocks_new_credential_issuance() {
         Err(db::DbError::BadCredentials)
     ));
 
-    db::set_account_suspended(&pool, bob_id, false, "Alice")
+    db::set_account_suspended(&pool, bob_id, false, "Alice", &[])
         .await
         .expect("reactivate")
         .expect("Bob exists");
@@ -5118,11 +5118,14 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
     let bob_id = db::create_account(&pool, "Bob", "second administrator password")
         .await
         .expect("Bob");
+    let carol_id = db::create_account(&pool, "Carol", "configured administrator password")
+        .await
+        .expect("Carol");
     assert!(matches!(
-        db::set_account_administrator(&pool, alice_id, false, "Alice").await,
+        db::set_account_administrator(&pool, alice_id, false, "Alice", &[]).await,
         Err(db::DbError::CannotDemoteSelf)
     ));
-    db::set_account_administrator(&pool, bob_id, true, "Alice")
+    db::set_account_administrator(&pool, bob_id, true, "Alice", &[])
         .await
         .expect("grant Bob")
         .expect("Bob");
@@ -5134,30 +5137,30 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
     );
 
     assert!(matches!(
-        db::set_account_suspended(&pool, alice_id, true, "ALICE").await,
+        db::set_account_suspended(&pool, alice_id, true, "ALICE", &[]).await,
         Err(db::DbError::CannotSuspendSelf)
     ));
-    db::set_account_suspended(&pool, alice_id, true, "Bob")
+    db::set_account_suspended(&pool, alice_id, true, "Bob", &[])
         .await
         .expect("Bob suspends Alice")
         .expect("Alice");
     assert!(matches!(
-        db::set_account_suspended(&pool, bob_id, true, "Alice").await,
+        db::set_account_suspended(&pool, bob_id, true, "Alice", &[]).await,
         Err(db::DbError::LastAdministrator)
     ));
     assert!(matches!(
-        db::set_account_administrator(&pool, bob_id, false, "Alice").await,
+        db::set_account_administrator(&pool, bob_id, false, "Alice", &[]).await,
         Err(db::DbError::LastAdministrator)
     ));
-    db::set_account_suspended(&pool, alice_id, false, "Bob")
+    db::set_account_suspended(&pool, alice_id, false, "Bob", &[])
         .await
         .expect("reactivate Alice")
         .expect("Alice");
-    db::set_account_suspended(&pool, bob_id, true, "Alice")
+    db::set_account_suspended(&pool, bob_id, true, "Alice", &[])
         .await
         .expect("Alice can now suspend Bob")
         .expect("Bob");
-    db::set_account_administrator(&pool, bob_id, false, "Alice")
+    db::set_account_administrator(&pool, bob_id, false, "Alice", &[])
         .await
         .expect("Alice can revoke Bob")
         .expect("Bob");
@@ -5167,6 +5170,33 @@ async fn suspension_preserves_an_active_administrator_and_rejects_self_targeting
             .expect("administrators"),
         ["alice"]
     );
+    let configured = ["carol".to_string()];
+    db::set_account_suspended(&pool, alice_id, true, "Bob", &configured)
+        .await
+        .expect("configured Carol preserves effective authority")
+        .expect("Alice");
+    db::set_account_administrator(&pool, alice_id, false, "Bob", &configured)
+        .await
+        .expect("configured Carol permits durable succession")
+        .expect("Alice");
+    assert!(
+        db::list_admin_accounts(&pool)
+            .await
+            .expect("durable administrators")
+            .is_empty()
+    );
+    assert!(matches!(
+        db::set_account_suspended(&pool, carol_id, true, "Bob", &configured).await,
+        Err(db::DbError::LastAdministrator)
+    ));
+    db::set_account_administrator(&pool, carol_id, true, "Bob", &configured)
+        .await
+        .expect("grant Carol durable authority")
+        .expect("Carol");
+    db::set_account_administrator(&pool, carol_id, false, "Bob", &configured)
+        .await
+        .expect("configuration keeps Carol effective after durable revocation")
+        .expect("Carol");
     let actions: Vec<String> = sqlx::query_scalar(
         "SELECT action FROM audit_log
          WHERE target = 'bob'

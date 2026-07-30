@@ -65,7 +65,7 @@ pub enum DbError {
     CannotSuspendSelf,
     /// An administrator attempted to remove its own durable authority.
     CannotDemoteSelf,
-    /// At least one active durable administrator must remain.
+    /// At least one active effective durable-or-configured administrator must remain.
     LastAdministrator,
     /// An account must transfer every founded channel before deletion.
     AccountOwnsChannels(usize),
@@ -1291,16 +1291,18 @@ async fn lock_account_state(
 async fn require_other_active_administrator(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
+    configured_administrators: &[String],
 ) -> Result<(), DbError> {
     let other_active_administrators: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM accounts
          WHERE id <> $1
-           AND (flags & $2) = $2
-           AND (flags & $3) = 0",
+           AND (flags & $3) = 0
+           AND ((flags & $2) = $2 OR name_folded = ANY($4))",
     )
     .bind(account_id)
     .bind(ACCOUNT_FLAG_ADMIN)
     .bind(ACCOUNT_FLAG_SUSPENDED)
+    .bind(configured_administrators)
     .fetch_one(&mut **transaction)
     .await
     .map_err(DbError::Query)?;
@@ -1325,13 +1327,15 @@ async fn write_account_flags(
 }
 
 /// Grant or revoke durable administrator authority by immutable account ID.
-/// The actor cannot demote itself and the final active durable administrator
-/// cannot be removed, so every committed state retains a recovery path.
+/// The actor cannot demote itself and the final active effective
+/// durable-or-configured administrator cannot be removed, so every committed
+/// state retains a recovery path.
 pub async fn set_account_administrator(
     pool: &PgPool,
     account_id: i64,
     administrator: bool,
     actor: &str,
+    configured_administrators: &[String],
 ) -> Result<Option<AccountAuthorityChange>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
@@ -1342,8 +1346,12 @@ pub async fn set_account_administrator(
     if !administrator && folded == actor_folded {
         return Err(DbError::CannotDemoteSelf);
     }
-    if !administrator && flags & ACCOUNT_FLAG_ADMIN != 0 {
-        require_other_active_administrator(&mut transaction, account_id).await?;
+    if !administrator
+        && flags & ACCOUNT_FLAG_ADMIN != 0
+        && !configured_administrators.contains(&folded)
+    {
+        require_other_active_administrator(&mut transaction, account_id, configured_administrators)
+            .await?;
     }
     let next_flags = if administrator {
         flags | ACCOUNT_FLAG_ADMIN
@@ -1373,6 +1381,7 @@ pub async fn set_account_suspended(
     account_id: i64,
     suspended: bool,
     actor: &str,
+    configured_administrators: &[String],
 ) -> Result<Option<AccountStateChange>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
@@ -1383,8 +1392,10 @@ pub async fn set_account_suspended(
     if suspended && folded == actor_folded {
         return Err(DbError::CannotSuspendSelf);
     }
-    if suspended && flags & ACCOUNT_FLAG_ADMIN != 0 {
-        require_other_active_administrator(&mut transaction, account_id).await?;
+    if suspended && (flags & ACCOUNT_FLAG_ADMIN != 0 || configured_administrators.contains(&folded))
+    {
+        require_other_active_administrator(&mut transaction, account_id, configured_administrators)
+            .await?;
     }
     let next_flags = if suspended {
         flags | ACCOUNT_FLAG_SUSPENDED

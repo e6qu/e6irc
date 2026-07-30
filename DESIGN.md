@@ -614,7 +614,9 @@ which gives:
 driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
 
 - Bounded MPSC ring buffer; accepted envelopes carry a per-queue monotonic
-  sequence number.
+  sequence number. The bound is an admission limit, not an eager allocation:
+  storage grows only with admitted envelopes, which prevents every empty
+  per-connection SendQ from reserving its maximum capacity.
 - **No silent loss**: `try_push` returns `Err(Full(event))` — the
   producer decides (kill the slow consumer's connection, exert
   backpressure, or shed *with accounting*). Delivered-or-returned is an
@@ -706,9 +708,12 @@ tracking. Any nontrivial optimization lands with evidence that proves it:
   p50/p90/p99/max latency under a controlled environment. The harness accepts
   explicit minimum-rate/maximum-P99 thresholds and treats missing, duplicate,
   out-of-range, and malformed deliveries as failures. Every pull request runs
-  a deliberately generous 64-client regression gate; manual baselines reach
-  2,000 clients. Production-host budgets and the 100k qualification remain a
-  target boundary, not a shipped performance claim.
+  a deliberately generous 64-client regression gate, including Linux daemon
+  resident-memory sampling and a 1 MiB incremental RSS/connection ceiling;
+  manual baselines reach 2,000 clients. The harness accepts a stricter
+  host-specific RSS ceiling alongside throughput and latency thresholds.
+  Production-host budgets and the 100k qualification remain a target boundary,
+  not a shipped performance claim.
 
 ### 7.5 IRCv3 capabilities
 
@@ -968,11 +973,12 @@ choke point rejects suspended accounts.
 
 Durable administrator authority is independently grantable/revocable by
 immutable account ID. The acting administrator cannot demote itself, and the
-last active durable administrator cannot be demoted. Configured administrator
-grants remain a distinct restart-scoped authority source; the directory shows
-both sources, and revoking a durable grant cannot falsely remove a still-active
-configuration grant. Every durable authority transition is audited and updates
-the live HTTP authorization registry immediately.
+last active effective durable-or-configured administrator cannot be suspended
+or removed. Configured administrator grants remain a distinct restart-scoped
+authority source; the directory shows both sources, and revoking a durable
+grant cannot falsely remove a still-active configuration grant. Every durable
+authority transition is audited and updates the live HTTP authorization
+registry immediately.
 
 Administrators can also provision a local account immediately or issue a
 1–30-day single-use invitation. Invitation issuance validates the same account
@@ -1211,6 +1217,12 @@ rendered back. Existing
 plaintext bootstrap credentials remain authoritative until a master key is
 supplied; that next start atomically seals and imports them rather than either
 persisting plaintext or replacing them with redacted placeholders.
+
+Server-rendered data tables carry screen-reader captions, and navigation
+landmarks carry accessible names. `tools/check-template-accessibility.py`
+checks those structural contracts across the complete Askama template
+directory in CI so a newly added operational table cannot silently regress to
+an unnamed grid.
 
 The console is also the home of `/console/networks` — a per-user BNC network
 manager with add/remove/enable-disable, and **edit** of an IRC
@@ -1822,9 +1834,11 @@ Layers, bottom to top:
    supplied-threshold failure is a nonzero process exit. CI exercises 64
    clients across eight channels against a real daemon with generous
    catastrophic-regression floors (10 connects/s, 100 deliveries/s, P99 below
-   five seconds). Recorded manual baselines reach 2,000 clients; production
-   performance thresholds and an RSS/connection budget are not set, and the
-   100k run is not qualified.
+   five seconds). The Linux smoke also samples the daemon's pre-run and peak
+   resident set and rejects incremental growth above 1 MiB per requested
+   connection; controlled hosts can supply a stricter bytes/connection
+   ceiling. Recorded manual baselines reach 2,000 clients; production
+   performance thresholds and the 100k run are not qualified.
 
 ---
 

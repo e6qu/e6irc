@@ -98,6 +98,7 @@
       {% else %}
         <div class="scroll">
           <table>
+            <caption class="sr-only">IRC credentials</caption>
             <thead><tr><th>Kind</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
             <tbody>
               {% for credential in credentials %}
@@ -162,6 +163,7 @@
       {% else %}
         <div class="scroll">
           <table>
+            <caption class="sr-only">Personal access tokens</caption>
             <thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
             <tbody>
               {% for token in tokens %}

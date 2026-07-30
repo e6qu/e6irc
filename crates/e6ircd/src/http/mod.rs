@@ -404,21 +404,29 @@ pub(super) async fn mutate_account_suspension(
         prepared
     };
 
-    let change = crate::db::set_account_suspended(pool, account_id, suspended, actor)
-        .await
-        .map_err(|error| match error {
-            crate::db::DbError::CannotSuspendSelf | crate::db::DbError::LastAdministrator => {
-                (StatusCode::CONFLICT, error.to_string())
-            }
-            _ => {
-                eprintln!("account lifecycle mutation failed: {error}");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable".into(),
-                )
-            }
-        })?
-        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+    let configured_administrators: Vec<String> =
+        state.configured_admin_accounts.iter().cloned().collect();
+    let change = crate::db::set_account_suspended(
+        pool,
+        account_id,
+        suspended,
+        actor,
+        &configured_administrators,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::db::DbError::CannotSuspendSelf | crate::db::DbError::LastAdministrator => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        _ => {
+            eprintln!("account lifecycle mutation failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    })?
+    .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
         let stopped_networks = registry.remove_owner(&change.folded);
@@ -479,21 +487,29 @@ pub(super) async fn mutate_account_administrator(
     administrator: bool,
 ) -> Result<String, (StatusCode, String)> {
     let pool = account_mutation_pool(state, account_id)?;
-    let change = crate::db::set_account_administrator(pool, account_id, administrator, actor)
-        .await
-        .map_err(|error| match error {
-            crate::db::DbError::CannotDemoteSelf | crate::db::DbError::LastAdministrator => {
-                (StatusCode::CONFLICT, error.to_string())
-            }
-            _ => {
-                eprintln!("account authority mutation failed: {error}");
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable".into(),
-                )
-            }
-        })?
-        .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
+    let configured_administrators: Vec<String> =
+        state.configured_admin_accounts.iter().cloned().collect();
+    let change = crate::db::set_account_administrator(
+        pool,
+        account_id,
+        administrator,
+        actor,
+        &configured_administrators,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::db::DbError::CannotDemoteSelf | crate::db::DbError::LastAdministrator => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
+        _ => {
+            eprintln!("account authority mutation failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    })?
+    .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
     let configured = state.configured_admin_accounts.contains(&change.folded);
     let mut effective = state
         .admin_accounts
