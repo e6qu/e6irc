@@ -47,7 +47,12 @@ database under HTTP and live IRC traffic. Readiness now has its own two-second
 database deadline, and the shared pool has the same bounded acquisition
 contract; liveness and hot IRC remain available during interruption,
 database-backed actions fail promptly and visibly, and all recover without
-restarting e6ircd.
+restarting e6ircd. The expanded browser journey also exposed cross-binary test
+state: its intentionally sealed OpenID Connect secret remained in the
+administrative database and poisoned the later CLI server bootstrap. The CLI
+journey now creates a process-unique database from that administrative
+connection, shuts its daemon down cleanly, closes its pool, and drops the
+database, making browser/CLI order independent.
 
 Whole-product reliability and evidence sweep (2026-07-30): browser composer
 requests now carry a bounded correlation identifier and receive an explicit

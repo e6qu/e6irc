@@ -1627,10 +1627,13 @@ Layers, bottom to top:
    (reconnect, SASL, playback); OIDC flows against dockerized Dex; the Matrix
    bridge against pinned Conduit. The PostgreSQL job explicitly runs the
    ignored database, HTTP, OIDC, BNC, `/ws/ui`, and CLI suites with their
-   required environment. A separate actual-daemon journey owns an isolated
-   empty PostgreSQL container so it can prove first-boot migrations/import and
-   stop/start recovery under simultaneous readiness, database-backed HTTP, and
-   hot IRC traffic.
+   required environment. The URL supplied to Rust suites is administrative:
+   each test owns an empty database, including the CLI journey that follows the
+   browser's intentional persisted configuration, so suite order cannot leak
+   accounts or sealed secrets into another server bootstrap. A separate
+   actual-daemon journey owns an isolated empty PostgreSQL container so it can
+   prove first-boot migrations/import and stop/start recovery under simultaneous
+   readiness, database-backed HTTP, and hot IRC traffic.
 6. **Journey acceptance**: the scenarios in `docs/journeys/` map outcomes to
    direct real-server integration tests. The matrix identifies partial
    journeys where adjacent layers are proven separately.

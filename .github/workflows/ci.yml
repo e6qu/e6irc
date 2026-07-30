@@ -128,7 +128,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web build
-      # single-threaded: the tests share one database and TRUNCATE it
+      # Each Rust test owns a database created through this administrative URL.
+      # Serial binaries keep the service load predictable; the browser may
+      # intentionally persist managed state, so the later CLI suite is isolated.
       - run: cargo test -p e6ircd --test db -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
