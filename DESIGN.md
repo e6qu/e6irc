@@ -635,8 +635,8 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   queues whose consumers tolerate reordering (envelopes carry seq
   numbers, so downstream can restore order or detect staleness); queues
   whose ordering is semantic — e.g. a shard's command stream — stay
-  strict FIFO. The queue exposes its mode-switch counter; exporting it into
-  process telemetry is separate wiring.
+  strict FIFO. Fixed runtime queues export their depth, capacity, mode, and
+  mode-switch counter through the process telemetry contract.
 - **Verified**: loom model-checks the concurrency core (push/pop/wake
   under all interleavings); property tests pin FIFO-per-producer,
   bounded-memory, and delivered-or-returned invariants.
@@ -1549,13 +1549,18 @@ telemetry records the machine-readable side of the same failures without
 putting untrusted values or secrets in labels. One process-wide snapshot
 contains connection state and lifecycle totals, IRC and BNC line/byte traffic,
 HTTP and database operation totals, SendQ kills, fixed error categories, BNC
-driver up/down state, authenticated raw-IRC and web attachment gauges, and
+driver up/down state, authenticated raw-IRC and web attachment gauges,
+core/database queue depth, capacity, FIFO/LIFO mode and mode-switch totals, and
 cumulative core/database/HTTP latency histograms. The attachment guard belongs
 to the resolved network handle, so both client transports enter and leave the
 same counter only after authentication; accepted but unauthenticated sockets
 cannot inflate it. This semantic correction is snapshot schema version 2; the
 console does not plot version-1 raw-socket gauges as authenticated attachment
 history, while unaffected version-1 counters remain usable.
+Queue pressure is snapshot schema version 3. Schema-v2 samples deserialize
+with an empty queue map, so an upgrade preserves the rest of their history.
+Only the statically registered `core` and `db` queues become Prometheus labels;
+per-connection SendQs remain aggregated through bounded kill/error counters.
 Each running BNC handle additionally keeps owner-scoped per-network counters
 and lifecycle timing. Those values are deliberately not process-wide metric
 labels: account and network names are unbounded label cardinality. They are
@@ -1566,14 +1571,15 @@ The snapshot is the sole source for:
 - `/console/monitoring`, an administrator-only server-rendered view refreshed
   every ten seconds by `/console.js`, with selectable 1-hour, 6-hour, 24-hour,
   and 7-day windows across IRC/BNC traffic, live IRC/BNC connections, upstream
-  availability, new errors, and P95 core/database/HTTP latency; current
-  percentile tables and the error ledger remain alongside the trends, and
+  availability, core/database queue pressure, new errors, and P95
+  core/database/HTTP latency; current queue/percentile tables and the error
+  ledger remain alongside the trends, and
   refresh failures remain visibly actionable;
 - `/api/v1/admin/observability`, authenticated JSON with the current snapshot
   and at most 1,000 bounded historical points over an explicit 1-minute to
   7-day range; invalid ranges fail with HTTP 400 rather than being clamped;
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
-  fixed `state`/`kind` labels;
+  fixed `state`/`kind`/`queue`/`mode` labels;
 - `/readyz`, which fails when the single core worker's heartbeat is stale or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
   query deadline.
@@ -1647,8 +1653,9 @@ Layers, bottom to top:
    proves persisted themes and the desktop-notification boundary, creates a
    network through the console, crosses real PostgreSQL, registry, IRC-driver,
    local TCP-upstream, and `/ws/ui` paths in both directions, inspects
-   operations data, then gracefully restarts the daemon and proves
-   session/network/backlog recovery.
+   operations data, visits every administrator directory, mutates and audits a
+   server ban, verifies queue monitoring in HTML and JSON, then gracefully
+   restarts the daemon and proves session/network/backlog recovery.
 9. **Load**: `e6irc-load` and `tools/load/sweep.sh` measure connection rate,
    duplicate-proof exact fan-out sequence delivery, and latency percentiles;
    any client, socket, malformed sequence, missing/duplicate delivery, or

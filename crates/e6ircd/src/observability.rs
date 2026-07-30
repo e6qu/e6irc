@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 const LATENCY_BUCKETS_US: [u64; 15] = [
     100,
@@ -221,6 +221,8 @@ pub(crate) struct Snapshot {
     pub database_requests_total: u64,
     pub bnc_networks: u64,
     pub bnc_connected: u64,
+    #[serde(default)]
+    pub queues: BTreeMap<String, QueueSnapshot>,
     pub errors: BTreeMap<String, u64>,
     pub error_last_seen_ms: BTreeMap<String, u64>,
     pub core_latency: LatencySnapshot,
@@ -228,8 +230,33 @@ pub(crate) struct Snapshot {
     pub http_latency: LatencySnapshot,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct QueueSnapshot {
+    pub depth: u64,
+    pub capacity: u64,
+    pub mode: QueueMode,
+    pub mode_switches: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum QueueMode {
+    Fifo,
+    Lifo,
+}
+
+impl QueueMode {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Fifo => "fifo",
+            Self::Lifo => "lifo",
+        }
+    }
+}
+
 pub(crate) struct Telemetry {
     started: Instant,
+    queue_monitors: Vec<e6irc_queue::QueueMonitor>,
     active_connections: AtomicU64,
     registered_connections: AtomicU64,
     unregistered_connections: AtomicU64,
@@ -274,6 +301,7 @@ impl Telemetry {
     pub(crate) fn new() -> Self {
         Self {
             started: Instant::now(),
+            queue_monitors: Vec::new(),
             active_connections: AtomicU64::new(0),
             registered_connections: AtomicU64::new(0),
             unregistered_connections: AtomicU64::new(0),
@@ -301,6 +329,15 @@ impl Telemetry {
             error_last_seen_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             latency: std::array::from_fn(|_| LatencyHistogram::new()),
         }
+    }
+
+    pub(crate) fn observing_queues(
+        core: e6irc_queue::QueueMonitor,
+        database: e6irc_queue::QueueMonitor,
+    ) -> Self {
+        let mut telemetry = Self::new();
+        telemetry.queue_monitors = vec![core, database];
+        telemetry
     }
 
     pub(crate) fn record_connection_opened(&self) {
@@ -424,6 +461,25 @@ impl Telemetry {
                 )
             })
             .collect();
+        let queues = self
+            .queue_monitors
+            .iter()
+            .map(|monitor| {
+                let snapshot = monitor.snapshot();
+                (
+                    snapshot.name.to_string(),
+                    QueueSnapshot {
+                        depth: snapshot.depth as u64,
+                        capacity: snapshot.capacity as u64,
+                        mode: match snapshot.mode {
+                            e6irc_queue::Mode::Fifo => QueueMode::Fifo,
+                            e6irc_queue::Mode::Lifo => QueueMode::Lifo,
+                        },
+                        mode_switches: snapshot.mode_switches,
+                    },
+                )
+            })
+            .collect();
         Snapshot {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             sampled_at_ms: epoch_millis(),
@@ -455,6 +511,7 @@ impl Telemetry {
             database_requests_total: self.database_requests_total.load(Ordering::Relaxed),
             bnc_networks,
             bnc_connected,
+            queues,
             errors,
             error_last_seen_ms,
             core_latency: self.latency[LatencyKind::Core.index()].snapshot(),
@@ -589,6 +646,7 @@ impl Telemetry {
             "gauge",
             snapshot.bnc_client_connections,
         );
+        render_queues(&mut out, &snapshot.queues);
         out.push_str("# HELP e6irc_errors_total Operational errors by fixed subsystem.\n");
         out.push_str("# TYPE e6irc_errors_total counter\n");
         for kind in ErrorKind::ALL {
@@ -606,6 +664,38 @@ impl Telemetry {
             render_histogram(&mut out, kind, latency);
         }
         out
+    }
+}
+
+fn render_queues(out: &mut String, queues: &BTreeMap<String, QueueSnapshot>) {
+    out.push_str("# HELP e6irc_queue_depth Events currently waiting in a runtime queue.\n");
+    out.push_str("# TYPE e6irc_queue_depth gauge\n");
+    out.push_str("# HELP e6irc_queue_capacity Maximum events accepted by a runtime queue.\n");
+    out.push_str("# TYPE e6irc_queue_capacity gauge\n");
+    out.push_str("# HELP e6irc_queue_mode Current runtime queue delivery mode.\n");
+    out.push_str("# TYPE e6irc_queue_mode gauge\n");
+    out.push_str("# HELP e6irc_queue_mode_switches_total Runtime queue FIFO/LIFO transitions.\n");
+    out.push_str("# TYPE e6irc_queue_mode_switches_total counter\n");
+    for (name, queue) in queues {
+        out.push_str(&format!(
+            "e6irc_queue_depth{{queue=\"{name}\"}} {}\n",
+            queue.depth
+        ));
+        out.push_str(&format!(
+            "e6irc_queue_capacity{{queue=\"{name}\"}} {}\n",
+            queue.capacity
+        ));
+        for mode in [QueueMode::Fifo, QueueMode::Lifo] {
+            out.push_str(&format!(
+                "e6irc_queue_mode{{queue=\"{name}\",mode=\"{}\"}} {}\n",
+                mode.label(),
+                u8::from(queue.mode == mode)
+            ));
+        }
+        out.push_str(&format!(
+            "e6irc_queue_mode_switches_total{{queue=\"{name}\"}} {}\n",
+            queue.mode_switches
+        ));
     }
 }
 
@@ -743,6 +833,47 @@ mod tests {
         assert!(output.contains("e6irc_connections{state=\"registered\"}"));
         assert!(output.contains("e6irc_errors_total{kind=\"http\"} 1"));
         assert!(output.contains("e6irc_http_latency_seconds_bucket{le=\"+Inf\"} 1"));
+    }
+
+    #[test]
+    fn queue_pressure_reaches_snapshots_and_prometheus() {
+        let (core_tx, _core_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
+            name: "core",
+            capacity: 4,
+            policy: e6irc_queue::Policy::Fifo,
+        });
+        let (database_tx, _database_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
+            name: "db",
+            capacity: 8,
+            policy: e6irc_queue::Policy::Fifo,
+        });
+        let telemetry = Telemetry::observing_queues(core_tx.monitor(), database_tx.monitor());
+        core_tx.try_push(1).unwrap();
+        core_tx.try_push(2).unwrap();
+
+        let snapshot = telemetry.snapshot(0, 0);
+        assert_eq!(snapshot.queues["core"].depth, 2);
+        assert_eq!(snapshot.queues["core"].capacity, 4);
+        assert_eq!(snapshot.queues["core"].mode, QueueMode::Fifo);
+        assert_eq!(snapshot.queues["db"].depth, 0);
+
+        let output = telemetry.prometheus(0, 0);
+        assert!(output.contains("e6irc_queue_depth{queue=\"core\"} 2"));
+        assert!(output.contains("e6irc_queue_capacity{queue=\"db\"} 8"));
+        assert!(output.contains("e6irc_queue_mode{queue=\"core\",mode=\"fifo\"} 1"));
+        assert!(output.contains("e6irc_queue_mode_switches_total{queue=\"core\"} 0"));
+    }
+
+    #[test]
+    fn version_two_history_without_queue_data_remains_readable() {
+        let mut encoded = serde_json::to_value(Telemetry::new().snapshot(0, 0)).unwrap();
+        let object = encoded.as_object_mut().unwrap();
+        object.insert("schema_version".into(), 2.into());
+        object.remove("queues");
+
+        let decoded: Snapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.schema_version, 2);
+        assert!(decoded.queues.is_empty());
     }
 
     #[test]

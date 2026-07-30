@@ -291,6 +291,62 @@ try {
   }
   assert.match(await page.locator("main").innerText(), /Revision 8/);
 
+  // The operational console is part of the browser acceptance boundary, not
+  // merely a collection of HTTP handlers. Visit every administrator directory,
+  // prove queue pressure crosses the live JSON/UI boundary, and perform a
+  // durable policy mutation through the rendered controls.
+  for (const [path, heading] of [
+    ["/console/accounts", "Account directory"],
+    ["/console/admin/channels", "Registered-channel directory"],
+    ["/console/sessions", "Live connections"],
+    ["/console/integrations", "Integrations"],
+    ["/console/audit", "Audit log"],
+  ]) {
+    await page.goto(`${applicationOrigin}${path}`);
+    await page.getByRole("heading", { name: heading, exact: true }).waitFor();
+  }
+
+  await page.goto(`${applicationOrigin}/console/monitoring`);
+  await page.getByRole("heading", { name: "Monitoring", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Queue pressure", exact: true }).waitFor();
+  const runtimeQueues = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "Runtime queues", exact: true }),
+  });
+  assert.match(await runtimeQueues.innerText(), /IRC core/);
+  assert.match(await runtimeQueues.innerText(), /Database worker/);
+  assert.match(await runtimeQueues.innerText(), /FIFO/);
+  const observability = await context.request.get(
+    `${applicationOrigin}/api/v1/admin/observability?minutes=60`,
+  );
+  assert.equal(observability.status(), 200);
+  const observabilityBody = await observability.json();
+  assert.equal(observabilityBody.current.schema_version, 3);
+  // Queue allocation is restart-required. Telemetry must describe the
+  // capacity actually enforcing backpressure now, not the next-start value.
+  assert.equal(observabilityBody.current.queues.core.capacity, 65_536);
+  assert.equal(observabilityBody.current.queues.db.capacity, 1_024);
+
+  await page.goto(`${applicationOrigin}/console/bans`);
+  await page.getByRole("heading", { name: "Server bans", exact: true }).waitFor();
+  const addBan = page.locator("section").filter({
+    has: page.getByRole("heading", { name: "Add server ban", exact: true }),
+  });
+  await addBan.getByLabel("Policy kind").selectOption("kline");
+  await addBan.getByLabel("Mask").fill("*@browser-policy.example");
+  await addBan.getByLabel("Reason").fill("browser journey policy");
+  await addBan.getByRole("button", { name: "Add and enforce ban" }).click();
+  await page.getByText("*@browser-policy.example", { exact: true }).waitFor();
+  const banRow = page.locator("tbody tr").filter({ hasText: "*@browser-policy.example" });
+  page.once("dialog", (dialog) => dialog.accept());
+  await banRow.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByText("*@browser-policy.example", { exact: true }).waitFor({ state: "detached" });
+
+  await page.goto(`${applicationOrigin}/console/audit`);
+  await page.getByRole("heading", { name: "Audit log", exact: true }).waitFor();
+  assert.match(await page.locator("main").innerText(), /browser-policy\.example/);
+  assert.match(await page.locator("main").innerText(), /KLINE/);
+  assert.match(await page.locator("main").innerText(), /UNKLINE/);
+
   // Configure a custom IRC upstream entirely through the server-rendered UI,
   // then use the production web client and its real /ws/ui socket in both
   // directions. The local upstream is a protocol peer, not a browser route
@@ -396,6 +452,11 @@ try {
         .querySelector("#network-operations .health-strip > div:first-child strong")
         ?.textContent?.trim() === "connected",
   );
+  const restartedObservability = await context.request.get(
+    `${applicationOrigin}/api/v1/admin/observability?minutes=60`,
+  );
+  assert.equal(restartedObservability.status(), 200);
+  assert.equal((await restartedObservability.json()).current.queues.core.capacity, 32_768);
 
   await page.goto(`${applicationOrigin}/`);
   await page.locator("#network-select").waitFor();

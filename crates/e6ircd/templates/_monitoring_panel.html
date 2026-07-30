@@ -166,6 +166,36 @@
   </section>
 
   <section class="panel monitoring-chart">
+    <div class="panel-head">
+      <div><h2>Queue pressure</h2><p>Capacity used · IRC core blue, PostgreSQL amber</p></div>
+      <span class="count">{{ view.window_label }}</span>
+    </div>
+    <div class="bar-chart" aria-label="Runtime queue pressure history">
+      {% for bar in view.queue_bars %}
+        <div class="bar-pair" title="{{ bar.title }}">
+          <i class="bar-core" style="height: {{ bar.core_height }}%"></i>
+          <i class="bar-database" style="height: {{ bar.database_height }}%"></i>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel monitoring-chart">
+    <div class="panel-head"><div><h2>Runtime queues</h2><p>Live bounded-queue state and overload-mode transitions</p></div></div>
+    <div class="latency-table">
+      <div class="latency-head"><span>Queue</span><span>Pressure</span><span>Mode</span><span>Switches</span></div>
+      {% for queue in view.queues %}
+        <div>
+          <strong>{{ queue.label }}</strong>
+          <span>{{ queue.depth }} / {{ queue.capacity }} ({{ queue.pressure }}%)</span>
+          <span>{{ queue.mode }}</span>
+          <span>{{ queue.mode_switches }}</span>
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel monitoring-chart">
     <div class="panel-head"><div><h2>Latency</h2><p>Cumulative process histograms</p></div></div>
     <div class="latency-table">
       <div class="latency-head"><span>Path</span><span>P50</span><span>P95</span><span>P99</span></div>
