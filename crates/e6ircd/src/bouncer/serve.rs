@@ -50,6 +50,11 @@ impl NetworkKey {
 /// start.
 pub struct Registry {
     networks: Mutex<HashMap<NetworkKey, Slot>>,
+    /// Serializes durable runtime mutations with their registry side effect.
+    /// A database update and `add`/`remove` are one logical transition: without
+    /// this gate, a concurrent delete could remove the row, then lose a race to
+    /// an older edit adding its driver back as an untracked live network.
+    mutations: tokio::sync::Mutex<()>,
     pool: Option<PgPool>,
     telemetry: Option<Arc<crate::observability::Telemetry>>,
 }
@@ -123,6 +128,7 @@ impl Registry {
         use crate::config::NetworkKind;
         let registry = Self {
             networks: Mutex::new(HashMap::new()),
+            mutations: tokio::sync::Mutex::new(()),
             pool,
             telemetry,
         };
@@ -158,6 +164,12 @@ impl Registry {
             registry.add(e.owner.as_deref(), &e.name, driver);
         }
         Ok(registry)
+    }
+
+    /// Enter the one serialized control-plane mutation path. Callers hold this
+    /// guard across the database write and the matching registry transition.
+    pub(crate) async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutations.lock().await
     }
 
     /// Start a driver for `(owner, name)` and register it, replacing any

@@ -14,10 +14,14 @@ as an always-on e6irc network.
 3. Create a bridge with platform-specific endpoint/credential/channel fields.
    The shared network mutation path validates sizes, endpoint policy, feature
    availability, and secret-key availability before sealing credentials.
-4. The bridge starts as a normal `NetworkDriver`; web/BNC attachments,
+4. Edit the bridge from **Integrations** when its endpoint, Matrix user,
+   channels, or credentials change. Stored secrets are shown only as presence:
+   blank inputs preserve them, Matrix/Discord replace their single
+   password/token, and Slack can rotate either token independently.
+5. The bridge starts as a normal `NetworkDriver`; web/BNC attachments,
    buffering, lifecycle, traffic, latency, and error monitoring use the same
    owner/network model as IRC.
-5. Pause/resume/delete from **Integrations**; inspect detailed runtime state
+6. Pause/resume/delete from **Integrations**; inspect detailed runtime state
    through the corresponding network.
 
 **Visible failures and recovery.** A driver not compiled into the binary is
@@ -39,9 +43,13 @@ names are sanitized and validated before entering IRC state.
   Socket Mode/Web API journey requires a real app/workspace and remains
   unqualified.
 
-The integrations console creates/toggles/deletes bridges; editing a bridge’s
-fields uses the general network API only where that driver’s request shape is
-supported. There is no dedicated bridge edit form.
+The integrations console creates/edits/toggles/deletes bridges through a
+dedicated platform-aware form and the same general network API mutation core.
+The real PostgreSQL HTTP journey creates stored Matrix,
+Discord, and Slack rows, opens the edit UI without exposing their plaintext,
+updates every request shape, proves partial Slack rotation preserves the other
+ciphertext, and proves malformed endpoints cannot change durable state. The
+database CI lane compiles this journey with every bridge feature.
 
 ## Use the scripting CLI
 

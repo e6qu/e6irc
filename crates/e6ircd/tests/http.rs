@@ -3965,6 +3965,295 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
     assert_eq!(status, 403);
 }
 
+/// The all-feature database lane proves the complete bridge management
+/// contract: the console never renders tokens, edits each platform with its
+/// exact field shape, partial Slack replacement preserves the other ciphertext,
+/// and the REST surface uses the same validation and storage transition.
+#[cfg(all(
+    feature = "matrix",
+    feature = "discord",
+    feature = "slack",
+    feature = "embed-web"
+))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets() {
+    let url =
+        support::test_db("bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets")
+            .await;
+    let secret_key = e6ircd::secret::SecretKey::generate();
+    let key_path = temporary_path("bridge-edit-key");
+    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
+    let _key_file = TemporaryFile(key_path.clone());
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    let api_token = e6ircd::db::issue_api_token(&pool, "alice", "bridge-edit")
+        .await
+        .expect("API token");
+    let context = e6ircd::bouncer::bnc_secret_context("alice");
+    let matrix_password = secret_key.seal("matrix-old-password", &context);
+    let discord_token = secret_key.seal("discord-old-token", &context);
+    let slack_bot_token = secret_key.seal("slack-old-bot", &context);
+    let slack_app_token = secret_key.seal("slack-old-app", &context);
+    for row in [
+        e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Matrix,
+            name: "matrix-main".into(),
+            addr: "https://matrix.old.example".into(),
+            tls: true,
+            nick: "@alice:old.example".into(),
+            realname: None,
+            autojoin: vec!["!old:example".into()],
+            sasl_account: None,
+            sasl_password_sealed: Some(matrix_password),
+            enabled: false,
+        },
+        e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Discord,
+            name: "discord-main".into(),
+            addr: String::new(),
+            tls: true,
+            nick: String::new(),
+            realname: None,
+            autojoin: vec!["100".into()],
+            sasl_account: None,
+            sasl_password_sealed: Some(discord_token),
+            enabled: false,
+        },
+        e6ircd::db::BncNetworkRow {
+            kind: e6ircd::config::NetworkKind::Slack,
+            name: "slack-main".into(),
+            addr: String::new(),
+            tls: true,
+            nick: String::new(),
+            realname: None,
+            autojoin: vec!["C100".into()],
+            sasl_account: Some(slack_bot_token.clone()),
+            sasl_password_sealed: Some(slack_app_token),
+            enabled: false,
+        },
+    ] {
+        e6ircd::db::create_bnc_network(&pool, "alice", &row)
+            .await
+            .expect("create bridge fixture");
+    }
+    drop(pool);
+
+    let running = net::start(Config {
+        server_name: "irc.bridge-edit.example".into(),
+        network_name: "BridgeEditNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url: url.clone() }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        secrets: Some(SecretsConfig { key_file: key_path }),
+        ..Config::default()
+    })
+    .await
+    .expect("start");
+    let http = running.http_addr.expect("http");
+    let cookie = |path: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    let (status, _, integrations) = request(http, &cookie("/console/integrations")).await;
+    assert_eq!(status, 200, "{integrations}");
+    for name in ["matrix-main", "discord-main", "slack-main"] {
+        assert!(
+            integrations.contains(&format!("/console/integrations/{name}/edit")),
+            "{integrations}"
+        );
+    }
+
+    let (status, _, matrix_form) =
+        request(http, &cookie("/console/integrations/matrix-main/edit")).await;
+    assert_eq!(status, 200, "{matrix_form}");
+    assert!(matrix_form.contains("https://matrix.old.example"));
+    assert!(matrix_form.contains("@alice:old.example"));
+    assert!(matrix_form.contains("A secret is stored"));
+    assert!(!matrix_form.contains("matrix-old-password"));
+
+    let (_, _, account_page) = request(http, &cookie("/console/account")).await;
+    let csrf = csrf_from_html(&account_page).to_string();
+    let matrix_fields = format!(
+        "csrf={csrf}&addr={}&nick={}&autojoin={}&sasl_password=matrix-new-password",
+        form_value("https://matrix.new.example"),
+        form_value("@alice:new.example"),
+        form_value("!one:new.example, !two:new.example"),
+    );
+    let matrix_post = format!(
+        "POST /console/integrations/matrix-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{matrix_fields}",
+        matrix_fields.len()
+    );
+    let (status, headers, body) = request(http, &matrix_post).await;
+    assert_eq!(status, 303, "{headers}\n{body}");
+    assert!(!body.contains("matrix-new-password"));
+
+    let discord_json = serde_json::json!({
+        "addr": "https://discord-api.example/v10/",
+        "tls": true,
+        "nick": "",
+        "autojoin": ["200", "201"],
+        "credentials": { "action": "set", "password": "discord-new-token" }
+    })
+    .to_string();
+    let discord_put = format!(
+        "PUT /api/v1/me/networks/discord-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{discord_json}",
+        discord_json.len()
+    );
+    let (status, headers, body) = request(http, &discord_put).await;
+    assert_eq!(status, 204, "{headers}\n{body}");
+
+    // Only the Slack app token is replaced. The bot-token ciphertext must stay
+    // byte-for-byte identical, proving omission means keep rather than reseal.
+    let slack_fields =
+        format!("csrf={csrf}&addr=&nick=&autojoin=C200%2CC201&sasl_password=slack-new-app");
+    let slack_post = format!(
+        "POST /console/integrations/slack-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{slack_fields}",
+        slack_fields.len()
+    );
+    let (status, headers, body) = request(http, &slack_post).await;
+    assert_eq!(status, 303, "{headers}\n{body}");
+
+    let verification = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("verification connection");
+    let matrix = e6ircd::db::get_bnc_network(&verification, "alice", "matrix-main")
+        .await
+        .expect("matrix read")
+        .expect("matrix row");
+    assert_eq!(matrix.addr, "https://matrix.new.example");
+    assert_eq!(matrix.nick, "@alice:new.example");
+    assert_eq!(matrix.autojoin, ["!one:new.example", "!two:new.example"]);
+    assert_eq!(
+        secret_key
+            .open(
+                matrix
+                    .sasl_password_sealed
+                    .as_deref()
+                    .expect("matrix secret"),
+                &context,
+            )
+            .expect("open matrix secret"),
+        "matrix-new-password"
+    );
+    let discord = e6ircd::db::get_bnc_network(&verification, "alice", "discord-main")
+        .await
+        .expect("discord read")
+        .expect("discord row");
+    assert_eq!(discord.addr, "https://discord-api.example/v10/");
+    assert_eq!(discord.autojoin, ["200", "201"]);
+    assert_eq!(
+        secret_key
+            .open(
+                discord
+                    .sasl_password_sealed
+                    .as_deref()
+                    .expect("discord token"),
+                &context,
+            )
+            .expect("open Discord token"),
+        "discord-new-token"
+    );
+    let slack = e6ircd::db::get_bnc_network(&verification, "alice", "slack-main")
+        .await
+        .expect("slack read")
+        .expect("slack row");
+    assert_eq!(
+        slack.sasl_account.as_deref(),
+        Some(slack_bot_token.as_str())
+    );
+    assert_eq!(slack.autojoin, ["C200", "C201"]);
+    assert_eq!(
+        secret_key
+            .open(
+                slack
+                    .sasl_password_sealed
+                    .as_deref()
+                    .expect("Slack app token"),
+                &context,
+            )
+            .expect("open Slack app token"),
+        "slack-new-app"
+    );
+
+    // A malformed replacement is rendered next to the submitted non-secret
+    // fields, never echoes its submitted token, and cannot alter durable state.
+    let invalid_fields = format!(
+        "csrf={csrf}&addr={}&nick={}&autojoin=&sasl_password=do-not-echo",
+        form_value("ftp://matrix.invalid"),
+        form_value("@alice:new.example"),
+    );
+    let invalid_post = format!(
+        "POST /console/integrations/matrix-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid_fields}",
+        invalid_fields.len()
+    );
+    let (status, _, body) = request(http, &invalid_post).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("Invalid bridge endpoint"), "{body}");
+    assert!(!body.contains("do-not-echo"), "{body}");
+    let unchanged = e6ircd::db::get_bnc_network(&verification, "alice", "matrix-main")
+        .await
+        .expect("unchanged read")
+        .expect("unchanged row");
+    assert_eq!(unchanged.addr, "https://matrix.new.example");
+
+    // The bridge-specific delete route cannot be used to delete an IRC row.
+    let irc = e6ircd::db::BncNetworkRow {
+        kind: e6ircd::config::NetworkKind::Irc,
+        name: "irc-main".into(),
+        addr: "irc.example:6697".into(),
+        tls: true,
+        nick: "alice".into(),
+        realname: None,
+        autojoin: vec![],
+        sasl_account: None,
+        sasl_password_sealed: None,
+        enabled: false,
+    };
+    e6ircd::db::create_bnc_network(&verification, "alice", &irc)
+        .await
+        .expect("IRC fixture");
+    let delete_fields = format!("csrf={csrf}&name=irc-main");
+    let delete_post = format!(
+        "POST /console/integrations/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{delete_fields}",
+        delete_fields.len()
+    );
+    let (status, _, body) = request(http, &delete_post).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("Wrong network editor"), "{body}");
+    assert!(
+        e6ircd::db::get_bnc_network(&verification, "alice", "irc-main")
+            .await
+            .expect("IRC read")
+            .is_some()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn account_console_manages_credentials_tokens_and_identities() {

@@ -44,12 +44,70 @@ pub fn bnc_secret_context(owner: &str) -> Vec<u8> {
     format!("bnc:{folded}").into_bytes()
 }
 
-/// Build a driver config from a stored network row (owned by `owner`), decrypting
-/// its sealed upstream SASL password with the master key under the owner's
-/// context. Fails loudly if a sealed secret is present but no key is configured,
-/// it won't open, or it was sealed for a different owner.
 /// Default backlog buffer capacity for a runtime-created (DB-backed) network.
 const DB_NETWORK_BUFFER_CAP: usize = 1000;
+
+/// The one credential-field shape accepted by config, HTTP, stored-row driver
+/// construction, and runtime edits.
+pub(crate) fn validate_network_credential(value: &str, maximum: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > maximum
+        || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        Err(format!(
+            "credentials must be non-empty, at most {maximum} bytes, and contain no CR, LF or NUL"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate the HTTP endpoint column used by a bridge driver. Matrix requires
+/// one; Discord and Slack use their provider default when it is empty. Keeping
+/// this at the driver-factory boundary means config, database boot, and runtime
+/// mutations cannot disagree about which URL shapes are constructible.
+pub(crate) fn validate_bridge_base(
+    kind: crate::config::NetworkKind,
+    value: &str,
+) -> Result<(), String> {
+    use crate::config::NetworkKind;
+    let required = match kind {
+        NetworkKind::Matrix => true,
+        NetworkKind::Discord | NetworkKind::Slack => false,
+        NetworkKind::Irc | NetworkKind::Local => {
+            return Err(format!("kind={} is not an HTTP bridge", kind.as_db_str()));
+        }
+    };
+    if value.is_empty() {
+        return if required {
+            Err(format!(
+                "kind={} requires a homeserver URL",
+                kind.as_db_str()
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let parsed = openidconnect::url::Url::parse(value).map_err(|_| {
+        format!(
+            "kind={} requires a valid HTTP(S) base URL",
+            kind.as_db_str()
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!(
+            "kind={} base URL must be absolute HTTP(S), without credentials, query, or fragment",
+            kind.as_db_str()
+        ));
+    }
+    Ok(())
+}
 
 /// Build the driver for a network of `kind` from its *plaintext* fields — the
 /// one feature-gated factory that maps the generic network fields onto each
@@ -70,13 +128,33 @@ pub fn build_driver(
     sasl_password: Option<String>,
 ) -> Result<Box<dyn NetworkDriver>, String> {
     use crate::config::NetworkKind;
+    let required_field = |value: String, field: &str, maximum: usize| {
+        validate_network_credential(&value, maximum)
+            .map(|()| value)
+            .map_err(|error| format!("kind={} has invalid {field}: {error}", kind.as_db_str()))
+    };
+    let required_secret = |value: Option<String>, field: &str, maximum: usize| {
+        required_field(
+            value.ok_or_else(|| format!("kind={} requires {field}", kind.as_db_str()))?,
+            field,
+            maximum,
+        )
+    };
     match kind {
         // The Irc arm uses every parameter, so they are never "unused" even in a
         // build with no bridge features — the bridge arms below just don't run.
         NetworkKind::Irc => {
             let sasl = match (sasl_account, sasl_password) {
-                (Some(a), Some(p)) => Some((a, p)),
-                _ => None,
+                (Some(account), Some(password)) => Some((
+                    required_field(account, "SASL account", 255)?,
+                    required_field(password, "SASL password", 512)?,
+                )),
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "kind=irc requires both a SASL account and password, or neither".into(),
+                    );
+                }
             };
             Ok(Box::new(IrcDriver::new(NetworkConfig {
                 addr,
@@ -92,26 +170,49 @@ pub fn build_driver(
             Err("kind=local is an in-process network, not creatable as a bouncer network".into())
         }
         NetworkKind::Matrix => {
+            validate_bridge_base(kind, &addr)?;
+            if !tls {
+                return Err("kind=matrix requires tls=true as its HTTP transport marker".into());
+            }
+            if nick.is_empty() {
+                return Err("kind=matrix requires a user".into());
+            }
+            if sasl_account.is_some() {
+                return Err("kind=matrix does not accept a SASL account field".into());
+            }
+            let password = required_secret(sasl_password, "a login password", 512)?;
             #[cfg(feature = "matrix")]
             {
                 Ok(Box::new(MatrixDriver::new(MatrixConfig {
                     homeserver: addr,
                     user: nick,
-                    password: sasl_password.unwrap_or_default(),
+                    password,
                     rooms: autojoin,
                     buffer_cap,
                 })))
             }
             #[cfg(not(feature = "matrix"))]
             {
+                drop(password);
                 Err("kind=matrix but this binary was built without the `matrix` feature".into())
             }
         }
         NetworkKind::Discord => {
+            validate_bridge_base(kind, &addr)?;
+            if !tls {
+                return Err("kind=discord requires tls=true as its HTTP transport marker".into());
+            }
+            if !nick.is_empty() {
+                return Err("kind=discord does not accept a nick field".into());
+            }
+            if sasl_account.is_some() {
+                return Err("kind=discord does not accept a SASL account field".into());
+            }
+            let token = required_secret(sasl_password, "a bot token", 512)?;
             #[cfg(feature = "discord")]
             {
                 Ok(Box::new(DiscordDriver::new(DiscordConfig {
-                    token: sasl_password.unwrap_or_default(),
+                    token,
                     api_base: addr,
                     channels: autojoin,
                     buffer_cap,
@@ -119,15 +220,25 @@ pub fn build_driver(
             }
             #[cfg(not(feature = "discord"))]
             {
+                drop(token);
                 Err("kind=discord but this binary was built without the `discord` feature".into())
             }
         }
         NetworkKind::Slack => {
+            validate_bridge_base(kind, &addr)?;
+            if !tls {
+                return Err("kind=slack requires tls=true as its HTTP transport marker".into());
+            }
+            if !nick.is_empty() {
+                return Err("kind=slack does not accept a nick field".into());
+            }
+            let bot_token = required_secret(sasl_account, "a bot token", 255)?;
+            let app_token = required_secret(sasl_password, "an app token", 512)?;
             #[cfg(feature = "slack")]
             {
                 Ok(Box::new(SlackDriver::new(SlackConfig {
-                    bot_token: sasl_account.unwrap_or_default(),
-                    app_token: sasl_password.unwrap_or_default(),
+                    bot_token,
+                    app_token,
                     api_base: addr,
                     channels: autojoin,
                     buffer_cap,
@@ -135,6 +246,7 @@ pub fn build_driver(
             }
             #[cfg(not(feature = "slack"))]
             {
+                drop((bot_token, app_token));
                 Err("kind=slack but this binary was built without the `slack` feature".into())
             }
         }
@@ -150,6 +262,12 @@ pub fn driver_from_row(
     key: Option<&crate::secret::SecretKey>,
     owner: &str,
 ) -> Result<Box<dyn NetworkDriver>, String> {
+    if row.kind.is_bridge() && row.realname.is_some() {
+        return Err(format!(
+            "kind={} does not accept a real name field",
+            row.kind.as_db_str()
+        ));
+    }
     let context = bnc_secret_context(owner);
     let unseal = |blob: &str| -> Result<String, String> {
         let key = key.ok_or("stored upstream secret present but no master key is configured")?;
@@ -1798,6 +1916,111 @@ pub mod fuzz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn driver_factory_error(
+        kind: crate::config::NetworkKind,
+        addr: &str,
+        nick: &str,
+        account: Option<&str>,
+        password: Option<&str>,
+    ) -> String {
+        build_driver(
+            kind,
+            addr.into(),
+            true,
+            nick.into(),
+            nick.into(),
+            vec![],
+            16,
+            account.map(str::to_string),
+            password.map(str::to_string),
+        )
+        .err()
+        .expect("invalid driver configuration should be rejected")
+    }
+
+    #[test]
+    fn driver_factory_rejects_incomplete_credentials_before_any_connection() {
+        use crate::config::NetworkKind;
+        assert!(
+            driver_factory_error(
+                NetworkKind::Irc,
+                "irc.example:6697",
+                "nick",
+                Some("account"),
+                None
+            )
+            .contains("both a SASL account and password")
+        );
+        assert!(
+            driver_factory_error(
+                NetworkKind::Matrix,
+                "https://matrix.example",
+                "@user:example",
+                None,
+                None,
+            )
+            .contains("login password")
+        );
+        assert!(
+            driver_factory_error(NetworkKind::Discord, "", "", None, None).contains("bot token")
+        );
+        assert!(
+            driver_factory_error(NetworkKind::Slack, "", "", Some("xoxb-token"), None)
+                .contains("app token")
+        );
+    }
+
+    #[test]
+    fn driver_factory_rejects_malformed_bridge_bases_before_feature_gating() {
+        use crate::config::NetworkKind;
+        let invalid = [
+            "ftp://matrix.example",
+            "https://user@matrix.example",
+            "https://matrix.example?tenant=one",
+            "matrix.example",
+        ];
+        for addr in invalid {
+            let error = driver_factory_error(
+                NetworkKind::Matrix,
+                addr,
+                "@user:example",
+                None,
+                Some("secret"),
+            );
+            assert!(error.contains("base URL"), "{addr}: {error}");
+        }
+        assert!(
+            driver_factory_error(
+                NetworkKind::Matrix,
+                "",
+                "@user:example",
+                None,
+                Some("secret")
+            )
+            .contains("homeserver URL")
+        );
+    }
+
+    #[test]
+    fn stored_bridge_factory_rejects_noncanonical_realname_before_secrets() {
+        let row = crate::db::BncNetworkRow {
+            kind: crate::config::NetworkKind::Discord,
+            name: "discord".into(),
+            addr: String::new(),
+            tls: true,
+            nick: String::new(),
+            realname: Some("silently ignored before this invariant".into()),
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: Some("sealed-but-no-key".into()),
+            enabled: false,
+        };
+        let error = driver_from_row(&row, None, "owner")
+            .err()
+            .expect("noncanonical stored bridge should be rejected");
+        assert!(error.contains("real name field"), "{error}");
+    }
 
     #[test]
     fn runtime_snapshot_tracks_lifecycle_traffic_buffers_and_attachments() {

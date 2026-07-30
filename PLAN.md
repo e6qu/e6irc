@@ -2083,6 +2083,18 @@ duplication ratchet *below* its prior level. Client: unread total now shows in
 the tab title. (The earlier browser-console 404 fix — `list_networks` returning
 an empty collection when the bouncer is off — shipped in the prior PR.)
 
+Bridge management completion (2026-07-30): Integrations now edits Matrix,
+Discord, and Slack endpoint/channel/identity fields and rotates write-only
+credentials without rendering stored values; Slack tokens can be replaced
+independently. REST `PUT /api/v1/me/networks/{name}` follows the same
+kind-specific contract and OpenAPI describes it. The common driver factory
+rejects absent credentials, partial IRC SASL, and malformed HTTP(S) provider
+bases before feature gating or durable mutation. Every runtime network mutation
+is serialized across its PostgreSQL and live-registry transitions, closing
+delete/edit/toggle resurrection races. The real PostgreSQL HTTP CI invocation
+uses all features and proves all three bridge edit shapes, partial token
+preservation, endpoint rejection, and secret non-disclosure.
+
 Web-UI sweep — client usability + console error surfacing (2026-07-27):
 an audit-driven pass over the whole web UI (in-browser IRC client + the
 htmx/askama console). One flagged "bug" (incoming CTCP ACTION rendering) was a
@@ -5411,8 +5423,8 @@ not built yet. Ranked by value:
    tested) and in the OpenAPI spec. `GET /me/networks` reports a live
    `connected` tri-state per network (true/false from the always-on
    driver's handle, or null when no handle is live) and an `enabled` flag;
-   **`PUT /me/networks/{name}`** replaces mutable IRC configuration with an
-   explicit write-only credential action, while **`PATCH
+   **`PUT /me/networks/{name}`** replaces mutable kind-specific IRC or bridge
+   configuration with an explicit write-only credential action, while **`PATCH
    /me/networks/{name}` `{enabled}`** pauses/resumes a network —
    persisting the flag (migration 0016), stopping or rebuilding its driver
    (skipped at boot while disabled), and opening stored secrets before the
