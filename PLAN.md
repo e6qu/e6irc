@@ -5636,3 +5636,16 @@ KEEPTOPIC, MLOCK, with GUARD declined for a documented reason). The later
 whole-product audit supersedes the “two verifications” conclusion that once
 followed here: current user-journey and qualification boundaries are recorded
 in `docs/journeys/coverage.md`.
+
+## Chromium browser boundary correction (2026-07-31)
+
+The complete OpenID Connect browser journey now launches Playwright's full
+Chromium channel in new-headless mode. The default stripped headless shell
+accepts a notification permission grant while permanently reporting the
+permission as denied, so it cannot prove the native browser contract. Chromium
+must expose the granted permission; Firefox and WebKit retain their
+engine-specific boundary adapters. Browser diagnostics are origin-qualified and
+record the method, status, and URL of every first-party HTTP failure, preventing
+an identity provider's resource noise from being misreported as an e6irc
+failure. The embedded client also declares a content-hashed SVG icon, and the
+journey verifies its MIME type and immutable cache policy.

@@ -18,8 +18,7 @@ assert.ok(
   `E6IRC_TEST_BROWSER must be chromium, firefox, or webkit; got ${browserName}`,
 );
 const browserType = playwright[browserName];
-const requireNativeNotificationPermission =
-  process.env.E6IRC_REQUIRE_NATIVE_NOTIFICATION_PERMISSION === "1";
+const requireNativeNotificationPermission = browserName === "chromium";
 
 async function clickAndWaitForURL(page, locator, expectedURL) {
   const navigation = page.waitForEvent("framenavigated", (frame) =>
@@ -92,20 +91,45 @@ const watchdog = setTimeout(() => {
 let browser;
 try {
   await waitForHealthyServer();
-  browser = await browserType.launch({ headless: true });
+  // Playwright's default Chromium headless shell accepts a notification
+  // permission grant but can only report it as denied because the shell omits
+  // the native notification service. The full Chromium channel uses the same
+  // new-headless engine as production Chromium and exposes the permission
+  // boundary this journey is meant to prove.
+  browser = await browserType.launch({
+    headless: true,
+    ...(browserName === "chromium" ? { channel: "chromium" } : {}),
+  });
   const context = await browser.newContext();
   await context.grantPermissions(["notifications"], { origin: applicationOrigin });
   const page = await context.newPage();
-  const browserErrors = [];
+  const applicationErrors = [];
   const navigationTrace = [];
   page.on("request", (request) => {
     if (request.isNavigationRequest()) navigationTrace.push(`request ${request.method()} ${sanitizeURL(request.url())}`);
   });
   page.on("console", (message) => {
-    if (message.type() === "error") browserErrors.push(message.text());
+    const sourceURL = message.location().url || page.url();
+    if (
+      message.type() === "error"
+      && isApplicationURL(sourceURL)
+      && !message.text().startsWith("Failed to load resource:")
+    ) {
+      applicationErrors.push(message.text());
+    }
   });
-  page.on("pageerror", (error) => browserErrors.push(error.message));
+  page.on("response", (response) => {
+    if (response.status() >= 400 && isApplicationURL(response.url())) {
+      applicationErrors.push(
+        `${response.status()} ${response.request().method()} ${sanitizeURL(response.url())}`,
+      );
+    }
+  });
+  page.on("pageerror", (error) => {
+    if (isApplicationURL(page.url())) applicationErrors.push(error.message);
+  });
   page.on("requestfailed", (request) => {
+    if (!isApplicationURL(request.url())) return;
     const errorText = request.failure()?.errorText ?? "request failed";
     // A request cancelled in flight when the page is torn down or navigates
     // (e.g. the client's on-load /api/v1/me/networks fetch) reports ERR_ABORTED;
@@ -115,7 +139,7 @@ try {
       || errorText.includes("NS_BINDING_ABORTED")
       || errorText.toLowerCase().includes("cancel")
     ) return;
-    browserErrors.push(`${request.url()}: ${errorText}`);
+    applicationErrors.push(`${request.url()}: ${errorText}`);
   });
 
   // The Shauth catalog launches this exact same-origin starter. A real dex
@@ -132,6 +156,15 @@ try {
   );
   const accountName = await page.locator("#account-name").textContent();
   assert.ok(accountName && accountName !== "signed in");
+  const iconHref = await page.locator('link[rel="icon"]').getAttribute("href");
+  assert.match(iconHref, /^\.\/assets\/favicon-[A-Za-z0-9_-]+\.svg$/);
+  const iconResponse = await context.request.get(new URL(iconHref, applicationOrigin).href);
+  assert.equal(iconResponse.status(), 200);
+  assert.match(iconResponse.headers()["content-type"], /^image\/svg\+xml\b/);
+  assert.equal(
+    iconResponse.headers()["cache-control"],
+    "public, max-age=31536000, immutable",
+  );
   // The embedded client shell must render an honest, usable zero-network
   // state: account navigation and preferences remain available, the picker
   // distinguishes an empty collection from an API failure, and the composer
@@ -181,10 +214,10 @@ try {
   assert.equal(await page.locator("#account-name").textContent(), accountName);
 
   // Preferences are a real product workflow, not incidental localStorage.
-  // Headless builds differ in whether they expose a granted Notification
-  // permission after context.grantPermissions. CI keeps Chromium's native
-  // grant as a required boundary; where an engine does not expose that
-  // platform surface, provide exactly the granted boundary. The later
+  // Headless engines differ in whether they expose a granted Notification
+  // permission after context.grantPermissions. Chromium's full headless
+  // channel is a required native boundary; where another engine does not expose
+  // that platform surface, provide exactly the granted boundary. The later
   // real-stack DM assertion supplies and inspects the constructor independently.
   await page.getByText("Preferences", { exact: true }).click();
   await page.locator("#theme-select").selectOption("dark");
@@ -612,7 +645,7 @@ try {
       body: JSON.stringify({ status: 503, title: "Database unavailable" }),
     });
   });
-  const deliberateFailureErrorStart = browserErrors.length;
+  const deliberateFailureErrorStart = applicationErrors.length;
   const deliberateFailureResponse = page.waitForResponse(
     (response) =>
       response.url() === `${applicationOrigin}/api/v1/me/networks` &&
@@ -627,12 +660,11 @@ try {
     await page.locator("#network-select option").first().textContent(),
     "Networks unavailable",
   );
-  const deliberateFailureErrors = browserErrors.splice(deliberateFailureErrorStart);
-  // Chromium/WebKit may add a browser-generated resource diagnostic for each
-  // handled fetch 503; Firefox does not. The application contract above is
-  // identical, and any console output is still restricted to that exact
-  // engine message and bounded by intercepted requests rather than broadly
-  // ignored.
+  const deliberateFailureErrors = applicationErrors.splice(deliberateFailureErrorStart);
+  // Every engine records the handled fetch 503 through the first-party
+  // response diagnostic as method, status, and URL; the application contract
+  // above is identical, and the output is still bounded by intercepted
+  // requests rather than broadly ignored.
   assert.ok(
     deliberateFailureRequests >= 1 && deliberateFailureRequests <= 2,
     `the deliberate 503 route saw ${deliberateFailureRequests} requests`,
@@ -642,10 +674,7 @@ try {
     `the deliberate 503 produced unexpected browser errors: ${deliberateFailureErrors.join("; ")}`,
   );
   for (const error of deliberateFailureErrors) {
-    assert.match(
-      error,
-      /^Failed to load resource: the server responded with a status of 503 \(Service Unavailable\)$/,
-    );
+    assert.equal(error, `503 GET ${applicationOrigin}/api/v1/me/networks`);
   }
   await page.unroute(`${applicationOrigin}/api/v1/me/networks`);
   await page.reload();
@@ -1014,7 +1043,7 @@ try {
     navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
   );
-  assert.deepEqual(browserErrors, []);
+  assert.deepEqual(applicationErrors, []);
 } finally {
   clearTimeout(watchdog);
   // `browser.close()` can itself hang on a wedged engine; bound it so teardown
@@ -1081,6 +1110,10 @@ async function waitForHealthyServer() {
 function sanitizeURL(value) {
   const parsed = new URL(value);
   return `${parsed.origin}${parsed.pathname}`;
+}
+
+function isApplicationURL(value) {
+  return new URL(value).origin === applicationOrigin;
 }
 
 async function startIrcUpstream() {
