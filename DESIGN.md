@@ -877,7 +877,8 @@ Principal tables (columns abridged):
 - `bnc_networks` (account_id, name, addr, tls, nick, realname, autojoin,
   sasl_account, `sasl_password_sealed` — **sealed** (`enc:v1:`) with the
   server master key (§15), enabled)
-- `bnc_buffer` (id, owner, network, line, created_at) — persisted
+- `bnc_buffer` (id, owner, network, line, created_at, target, msgid,
+  sent_at) — persisted
   detached-buffer lines replayed on attach after a restart; `owner` is `*`
   for a shared/server-level network; `owner` is the RFC1459-casefolded account,
   matching the registry key. The `/network` selector is likewise folded for
@@ -885,6 +886,10 @@ Principal tables (columns abridged):
   `bnc_networks`, migration 0034), so selection is case-insensitive like every
   other IRC identifier and a case-mismatched attach cannot fall through to an
   operator's shared network of the same name (§2); display casing is preserved.
+  `target` is the conversation the line belongs to, `msgid` the upstream
+  `msgid=` tag when present, and `sent_at` the effective ISO-8601 instant
+  (the `time=` tag verbatim, else bouncer arrival time) — the three columns
+  the attach listener's CHATHISTORY paging and TARGETS scan over.
   Both ways into a network's buffer — a live line
   from a driver and restored backlog from this table — neutralize embedded
   CR/LF/NUL, so a line replayed to an attaching client cannot become two
@@ -897,6 +902,10 @@ Principal tables (columns abridged):
   `BNC_TRIM_INTERVAL`. The count belongs to that task, not to the table's `id`
   sequence — one sequence is shared by every network, so triggering off it
   makes retention depend on the interleaving between them
+- `bnc_read_markers` (account_id, network, target, timestamp) — per-account,
+  per-BNC-network read position, the source for `draft/read-marker` on the
+  attach listener. Distinct from `read_markers` below, which tracks the
+  core's local-server targets.
 - `read_markers` (account_id, target, marker_ts) — per-account read
   position, the source for `draft/read-marker`. Updates are monotonic
   (`GREATEST`) and the returned committed value drives the core mirror and
@@ -1321,13 +1330,16 @@ above the trait, provides for every network kind:
   originator receives its echo only when it negotiated `echo-message` on
   attach, the same contract a real server has.
 - **Detached buffering**: events accumulate in a per-network ring persisted
-  to PostgreSQL. Read markers are the ircd core's per-account markers (§11),
-  exposed over `MARKREAD` and REST; the BNC attach path replays the full
-  ring rather than tracking per-client playback positions.
+  to PostgreSQL. The BNC attach listener also keeps per-account, per-target
+  read markers (`bnc_read_markers`, served over `MARKREAD`); they are
+  separate from the ircd core's per-account markers (§11) because a BNC
+  target lives on an external network the core knows nothing about.
 - **Playback**: attaching clients receive the full detached ring,
   tag-filtered by their negotiated caps. `CHATHISTORY` paging is served by
-  the ircd core (§11) for the local network; the BNC attach listener does
-  not speak it.
+  the ircd core (§11) for the local network; on the BNC attach listener it
+  pages the persisted `bnc_buffer` ring directly (LATEST/BEFORE/AFTER by
+  `msgid=` or `timestamp=` selector, plus TARGETS), intercepted on attach
+  and never forwarded upstream.
 - **Operations**: `NetworkHandle` owns a typed lifecycle snapshot plus
   connection attempts/errors, connect latency, attached-client count,
   line/byte traffic, last-activity times, and buffer occupancy. Driver endpoints
