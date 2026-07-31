@@ -31,28 +31,31 @@ fn config_path(args: &[String]) -> Result<PathBuf, ()> {
     }
 }
 
+/// Resolve the config path and load the config, or print a diagnostic and
+/// return `FAILURE`. `context` is the error prefix (`"e6ircd"` for the main
+/// command, `"e6ircd rotate-secrets"` for the subcommand).
+fn load_config_or_fail(args: &[String], context: &str) -> Result<Config, ExitCode> {
+    let config_path = match config_path(args) {
+        Ok(path) => path,
+        Err(()) => {
+            eprintln!("{USAGE}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    Config::load(&config_path).map_err(|e| {
+        eprintln!("{context}: {e} ({})", config_path.display());
+        ExitCode::FAILURE
+    })
+}
+
 /// Atomically re-seal every database-owned credential with the configured
 /// primary key. The deployment config must already name the new primary and
 /// retain the old key under `previous_key_files`, so both ciphertext
 /// generations remain readable before, during, and after the transaction.
 fn rotate_secrets(args: &[String]) -> ExitCode {
-    let config_path = match config_path(args) {
-        Ok(path) => path,
-        Err(()) => {
-            eprintln!("{USAGE}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let config = match Config::load(&config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!(
-                "e6ircd rotate-secrets: {} ({})",
-                error,
-                config_path.display()
-            );
-            return ExitCode::FAILURE;
-        }
+    let config = match load_config_or_fail(args, "e6ircd rotate-secrets") {
+        Ok(c) => c,
+        Err(code) => return code,
     };
     let keys = match config.secret_keyring() {
         Ok(Some(keys)) if keys.key_count() >= 2 => keys,
@@ -147,19 +150,9 @@ fn load_seal_key(args: &[String]) -> Result<SecretKey, String> {
 }
 
 fn run(args: &[String]) -> ExitCode {
-    let config_path = match config_path(args) {
-        Ok(path) => path,
-        Err(()) => {
-            eprintln!("{USAGE}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let config = match Config::load(&config_path) {
+    let config = match load_config_or_fail(args, "e6ircd") {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("e6ircd: {} ({})", e, config_path.display());
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
