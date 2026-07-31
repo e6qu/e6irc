@@ -130,5 +130,5 @@
         <div class="scroll" id="network-rows" data-refresh-url="/console/networks/rows" data-refresh-seconds="10" data-refresh-status="network-rows-status">
             {% include "console_network_rows.html" %}
         </div>
-        <p id="network-rows-status" class="sr-only" role="status"></p>
+        <p id="network-rows-status" class="refresh-status sr-only" aria-live="polite">Refreshes every ten seconds.</p>
 {% endblock %}
