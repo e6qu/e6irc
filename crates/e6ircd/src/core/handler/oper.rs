@@ -6,12 +6,7 @@ use super::*;
 
 pub(super) fn cmd_oper(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (Some(&name), Some(&password)) = (p.first(), p.get(1)) else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["OPER"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "OPER");
         return;
     };
     // Always run the constant-time compare — against a dummy secret when the
@@ -78,22 +73,12 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let Some(&target) = p.first() else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["KILL"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "KILL");
         return;
     };
     let key = state.nick_key(target);
     if !state.nicks.contains_key(&key) {
-        state.numeric(
-            conn,
-            ERR_NOSUCHNICK,
-            &[target],
-            Some("No such nick/channel"),
-        );
+        state.err_nosuchnick(conn, target);
         return;
     }
     let comment = p.get(1).copied().unwrap_or("Killed");
@@ -798,12 +783,7 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let (Some(&nick), Some(&newhost)) = (p.first(), p.get(1)) else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["SETHOST"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "SETHOST");
         return;
     };
     let server = state.config.server_name.clone();
@@ -824,12 +804,7 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     let nk = state.nick_key(nick);
     let Some(target) = state.registered_peer(&nk) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHNICK,
-            &[clip_echo(nick)],
-            Some("No such nick/channel"),
-        );
+        state.err_nosuchnick(conn, clip_echo(nick));
         return;
     };
     let (user, old_prefix) = {
@@ -871,12 +846,7 @@ pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Empty text (`WALLOPS :`) is ERR_NEEDMOREPARAMS, not an empty broadcast to
     // every +w oper.
     let Some(&text) = p.first().filter(|t| !t.is_empty()) else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["WALLOPS"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "WALLOPS");
         return;
     };
     let prefix = state.sessions[&conn].prefix();

@@ -6,6 +6,17 @@ use super::*;
 
 pub(super) const MONITOR_LIMIT: usize = 100;
 
+/// Remove `conn` from the watcher set for `key`, dropping the set if it
+/// becomes empty. Shared by MONITOR − and MONITOR C.
+fn unmonitor(state: &mut ServerState, conn: ConnId, key: &crate::core::state::NickKey) {
+    if let Some(watchers) = state.monitors.get_mut(key) {
+        watchers.remove(&conn);
+        if watchers.is_empty() {
+            state.monitors.remove(key);
+        }
+    }
+}
+
 /// Notify everyone monitoring `nick` that it is now (`online`) or no
 /// longer (`offline`) present. `subject` is the full prefix when
 /// online, the bare nick when offline (per the monitor spec).
@@ -115,23 +126,13 @@ pub(super) fn monitor_status(
 
 pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&sub) = p.first() else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["MONITOR"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "MONITOR");
         return;
     };
     match sub {
         "+" => {
             let Some(&list) = p.get(1) else {
-                state.numeric(
-                    conn,
-                    ERR_NEEDMOREPARAMS,
-                    &["MONITOR"],
-                    Some("Not enough parameters"),
-                );
+                state.err_needmoreparams(conn, "MONITOR");
                 return;
             };
             let mut added = Vec::new();
@@ -177,12 +178,7 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         "-" => {
             let Some(&list) = p.get(1) else {
-                state.numeric(
-                    conn,
-                    ERR_NEEDMOREPARAMS,
-                    &["MONITOR"],
-                    Some("Not enough parameters"),
-                );
+                state.err_needmoreparams(conn, "MONITOR");
                 return;
             };
             for nick in list.split(',').filter(|n| !n.is_empty()) {
@@ -193,23 +189,13 @@ pub(super) fn cmd_monitor(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     .expect("checked")
                     .monitoring
                     .remove(&key);
-                if let Some(watchers) = state.monitors.get_mut(&key) {
-                    watchers.remove(&conn);
-                    if watchers.is_empty() {
-                        state.monitors.remove(&key);
-                    }
-                }
+                unmonitor(state, conn, &key);
             }
         }
         "C" | "c" => {
             let keys: Vec<_> = state.sessions[&conn].monitoring.keys().cloned().collect();
             for key in keys {
-                if let Some(watchers) = state.monitors.get_mut(&key) {
-                    watchers.remove(&conn);
-                    if watchers.is_empty() {
-                        state.monitors.remove(&key);
-                    }
-                }
+                unmonitor(state, conn, &key);
             }
             state
                 .sessions

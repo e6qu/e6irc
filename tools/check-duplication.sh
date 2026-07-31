@@ -51,14 +51,20 @@ cd "$(dirname "$0")/.."
 # `take_register_label`) → 3.0% (sweep 32: config test `ListenerConfig`
 # boilerplate became `listener()`, the ChanServ `*_unavailable` notices
 # became `chanserv_deferred_notice`, and the main/subcommand config-load
-# became `load_config_or_fail`).
+# became `load_config_or_fail`) → 2.8% (sweep 33: the four most-repeated
+# IRC numerics became `ServerState` convenience methods —
+# `err_needmoreparams`/`err_nosuchnick`/`err_nosuchchannel`/`err_notonchannel`
+# (43 call sites across 9 handler files); the bouncer client's
+# read-feed-extend loop became `fill()`; the MONITOR watcher-removal loop
+# became `unmonitor()`; and the cross-file contact-email validation became
+# `parse_optional_contact_email()`).
 #
 # What is left is mostly sqlx builder chains — `.bind().execute().await
 # .map_err()` — and per-route response shaping. Those are plumbing: abstracting
 # them would read worse than the repetition, so the number is expected to sit
 # here rather than keep falling. Lower it only when a real shared concept is
 # found, not by wrapping boilerplate to move a metric.
-THRESHOLD=3.0
+THRESHOLD=2.9
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."

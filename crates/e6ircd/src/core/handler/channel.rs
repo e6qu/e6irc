@@ -136,12 +136,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // both the missing and the empty/degenerate forms reply.
     let targets = p.first().copied().unwrap_or("");
     if targets.split(',').all(str::is_empty) {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["JOIN"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "JOIN");
         return;
     }
     // Modern IRC: "JOIN 0" is a special form meaning "part every channel".
@@ -171,12 +166,7 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<&str>) {
     if !crate::sanitize::valid_channel_name(name) {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(name)],
-            Some("No such channel"),
-        );
+        state.err_nosuchchannel(conn, clip_echo(name));
         return;
     }
     let key = state.chan_key(name);
@@ -397,12 +387,7 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // not a silent no-op — see cmd_join.
     let targets = p.first().copied().unwrap_or("");
     if targets.split(',').all(str::is_empty) {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["PART"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "PART");
         return;
     }
     let reason = p.get(1).map(|r| r.to_string());
@@ -413,12 +398,7 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             .get(&key)
             .is_some_and(|c| c.members.contains_key(&conn));
         if !on_channel {
-            state.numeric(
-                conn,
-                ERR_NOTONCHANNEL,
-                &[target],
-                Some("You're not on that channel"),
-            );
+            state.err_notonchannel(conn, target);
             continue;
         }
         let display = state.channels[&key].name.clone();
@@ -651,22 +631,12 @@ pub(super) fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d:
 
 pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
     let Some(&target) = p.first() else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["TOPIC"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "TOPIC");
         return;
     };
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+        state.err_nosuchchannel(conn, clip_echo(target));
         return;
     };
     let display = chan.name.clone();
@@ -701,12 +671,7 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
 
     let member = chan.members.get(&conn);
     let Some(member) = member else {
-        state.numeric(
-            conn,
-            ERR_NOTONCHANNEL,
-            &[target],
-            Some("You're not on that channel"),
-        );
+        state.err_notonchannel(conn, target);
         return;
     };
     if chan.modes.topic_ops_only && !member.op {
@@ -922,12 +887,7 @@ pub(super) fn cmd_mode(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // ERR_USERSDONTMATCH the empty string would otherwise trip in user_mode
     // (`nick_key("") != own`). Treat empty as absent.
     let Some(&target) = p.first().filter(|t| !t.is_empty()) else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["MODE"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "MODE");
         return;
     };
     if target.starts_with('#') {
@@ -1155,12 +1115,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     let casemap = state.casemap;
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+        state.err_nosuchchannel(conn, clip_echo(target));
         return;
     };
     let display = chan.name.clone();
@@ -1276,12 +1231,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 let chan = state.channels.get_mut(&key).expect("checked");
                 if adding {
                     let Some(&k) = args.next() else {
-                        state.numeric(
-                            conn,
-                            ERR_NEEDMOREPARAMS,
-                            &["MODE"],
-                            Some("Not enough parameters"),
-                        );
+                        state.err_needmoreparams(conn, "MODE");
                         // Skip this mode but keep processing the string —
                         // `break`ing would also drop any *param-less* mode after
                         // it (`+ki` with no key silently lost the `+i`), an
@@ -1333,12 +1283,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 let chan = state.channels.get_mut(&key).expect("checked");
                 if adding {
                     let Some(&l) = args.next() else {
-                        state.numeric(
-                            conn,
-                            ERR_NEEDMOREPARAMS,
-                            &["MODE"],
-                            Some("Not enough parameters"),
-                        );
+                        state.err_needmoreparams(conn, "MODE");
                         // Skip, don't `break` — a later param-less mode must
                         // still apply (see the `+k` arm).
                         continue;
@@ -1457,24 +1402,14 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             }
             'o' | 'v' => {
                 let Some(&who) = args.next() else {
-                    state.numeric(
-                        conn,
-                        ERR_NEEDMOREPARAMS,
-                        &["MODE"],
-                        Some("Not enough parameters"),
-                    );
+                    state.err_needmoreparams(conn, "MODE");
                     // Skip, don't `break` — a later param-less mode must still
                     // apply (see the `+k` arm).
                     continue;
                 };
                 let nick_key = state.nick_key(who);
                 let Some(&member_conn) = state.nicks.get(&nick_key) else {
-                    state.numeric(
-                        conn,
-                        ERR_NOSUCHNICK,
-                        &[clip_echo(who)],
-                        Some("No such nick/channel"),
-                    );
+                    state.err_nosuchnick(conn, clip_echo(who));
                     continue;
                 };
                 // Echo the target's canonical nick, not the raw input casing, so

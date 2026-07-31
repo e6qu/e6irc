@@ -6,12 +6,7 @@ use super::*;
 
 pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (Some(&channels_param), Some(&users_param)) = (p.first(), p.get(1)) else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["KICK"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "KICK");
         return;
     };
     let reason = p.get(2).copied();
@@ -21,12 +16,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .collect();
     let users: Vec<&str> = users_param.split(',').filter(|u| !u.is_empty()).collect();
     if channels.is_empty() || users.is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["KICK"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "KICK");
         return;
     }
     // Pair channels with users per the RFC2812/Modern KICK grammar: one channel
@@ -95,22 +85,12 @@ fn kick_pair(
 ) {
     let key = state.chan_key(channel);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(channel)],
-            Some("No such channel"),
-        );
+        state.err_nosuchchannel(conn, clip_echo(channel));
         return;
     };
     let display = chan.name.clone();
     if !chan.members.contains_key(&conn) {
-        state.numeric(
-            conn,
-            ERR_NOTONCHANNEL,
-            &[channel],
-            Some("You're not on that channel"),
-        );
+        state.err_notonchannel(conn, channel);
         return;
     }
     if !chan.members[&conn].op {
@@ -200,12 +180,7 @@ fn resolve_channel(
 ) -> Option<(ChanKey, String)> {
     let key = state.chan_key(target);
     let Some(chan) = state.channels.get(&key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+        state.err_nosuchchannel(conn, clip_echo(target));
         return None;
     };
     Some((key, chan.name.clone()))
@@ -213,24 +188,14 @@ fn resolve_channel(
 
 pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (Some(&who), Some(&target)) = (p.first(), p.get(1)) else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["INVITE"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "INVITE");
         return;
     };
     let Some((key, display)) = resolve_channel(state, conn, target) else {
         return;
     };
     if !state.channels[&key].members.contains_key(&conn) {
-        state.numeric(
-            conn,
-            ERR_NOTONCHANNEL,
-            &[target],
-            Some("You're not on that channel"),
-        );
+        state.err_notonchannel(conn, target);
         return;
     }
     let is_op = state.channels[&key]
@@ -248,12 +213,7 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     let who_key = state.nick_key(who);
     let Some(invitee) = state.registered_peer(&who_key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHNICK,
-            &[clip_echo(who)],
-            Some("No such nick/channel"),
-        );
+        state.err_nosuchnick(conn, clip_echo(who));
         return;
     };
     if state.channels[&key].members.contains_key(&invitee) {
@@ -445,12 +405,7 @@ pub(super) fn userhost_entries(state: &ServerState, p: &[&str]) -> Vec<String> {
 
 pub(super) fn cmd_userhost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if p.is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["USERHOST"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "USERHOST");
         return;
     }
     let entries = userhost_entries(state, p);
@@ -480,12 +435,7 @@ fn pack_userhost_entries(
 
 pub(super) fn cmd_userip(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if p.is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["USERIP"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "USERIP");
         return;
     }
     let entries = userhost_entries(state, p);
@@ -510,12 +460,7 @@ pub(super) fn cmd_links(state: &mut ServerState, conn: ConnId) {
 
 pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&letter) = p.first() else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["STATS"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "STATS");
         return;
     };
     // Only the STATS letter's first char is significant. Take it on a char
@@ -550,12 +495,7 @@ pub(super) fn cmd_stats(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 
 pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&target) = p.first() else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["KNOCK"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "KNOCK");
         return;
     };
     let Some((key, display)) = resolve_channel(state, conn, target) else {

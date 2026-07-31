@@ -198,12 +198,7 @@ pub(super) fn deny_hidden(
     target: &str,
     _proof: crate::core::state::Hidden,
 ) {
-    state.numeric(
-        conn,
-        ERR_NOSUCHCHANNEL,
-        &[clip_echo(target)],
-        Some("No such channel"),
-    );
+    state.err_nosuchchannel(conn, clip_echo(target));
 }
 
 /// Inject a tag into the front of an already-serialized wire line

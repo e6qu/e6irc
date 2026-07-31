@@ -374,6 +374,19 @@ impl Connection {
         Ok(self.next_message_with_line().await?.map(|(msg, _)| msg))
     }
 
+    /// Read from the transport and feed complete lines into `self.pending`.
+    /// Returns `false` on EOF so the caller can return `Ok(None)`.
+    async fn fill(&mut self) -> io::Result<bool> {
+        let n = self.reader.read(&mut self.read_buf).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let mut events = Vec::new();
+        self.framing.feed(&self.read_buf[..n], &mut events);
+        self.pending.extend(events);
+        Ok(true)
+    }
+
     /// As [`Connection::next_message`], but also returns the line exactly as
     /// the server sent it (CRLF stripped).
     ///
@@ -409,13 +422,9 @@ impl Connection {
                     }
                 }
             }
-            let n = self.reader.read(&mut self.read_buf).await?;
-            if n == 0 {
+            if !self.fill().await? {
                 return Ok(None);
             }
-            let mut events = Vec::new();
-            self.framing.feed(&self.read_buf[..n], &mut events);
-            self.pending.extend(events);
         }
     }
 
@@ -457,13 +466,9 @@ impl Connection {
                     }
                 }
             }
-            let n = self.reader.read(&mut self.read_buf).await?;
-            if n == 0 {
+            if !self.fill().await? {
                 return Ok(None);
             }
-            let mut events = Vec::new();
-            self.framing.feed(&self.read_buf[..n], &mut events);
-            self.pending.extend(events);
         }
     }
 
