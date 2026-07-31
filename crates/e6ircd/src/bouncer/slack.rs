@@ -10,10 +10,11 @@
 //! PRIVMSG text. Bot messages (which carry `bot_id`) are dropped so the
 //! bridge does not echo its own posts into a loop.
 //!
-//! There is no self-hostable Slack server to test against, so the pure
-//! mapping/parse/route logic is unit-tested offline and the end-to-end
-//! path is covered by a live-gated integration test needing real workspace
-//! tokens. This module is NOT verified against live Slack in CI.
+//! There is no self-hostable Slack server. CI therefore drives the complete
+//! HTTP/WebSocket transport against a strict in-process protocol oracle
+//! (authorization, channel/user lookup, Socket Mode open/event/ACK, inbound
+//! mapping, and outbound Web API), while live provider qualification remains
+//! credential-gated.
 
 use super::BoundedJson;
 use std::collections::HashMap;
@@ -95,43 +96,22 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     };
     let base = api_base(config);
 
-    // Resolve each configured channel id to its #name once.
-    let mut id_to_channel: HashMap<String, String> = HashMap::new();
-    let mut channel_to_id: HashMap<String, String> = HashMap::new();
-    for id in &config.channels {
-        match fetch_channel_name(&http, &base, &config.bot_token, id).await {
-            Ok(name) => {
-                let channel = format!("#{name}");
-                // The gateway (or a self-hosted API-compatible endpoint) supplies
-                // this name; it lands in a PRIVMSG middle parameter, so a space or
-                // `:` in it would forge extra params. Refuse it loudly rather than
-                // ever putting an unsafe target on the wire.
-                if !crate::sanitize::valid_channel_name(&channel) {
-                    eprintln!(
-                        "slack: channel {id} has an unsafe name {name:?}; refusing to bridge it"
-                    );
-                    return Dropped(NetworkFailure::ChannelMappingFailed);
-                }
-                // Two Slack channels whose IRC names collide *under the
-                // casemapping* derive one IRC channel and would silently
-                // overwrite the mapping; the forward map is folded-keyed so a
-                // case variant is caught here and routed correctly.
-                let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
-                if channel_to_id.contains_key(&folded) {
-                    eprintln!(
-                        "slack: channel {id} name {name:?} collides with an already-bridged \
-                         channel {channel:?}; refusing to bridge it"
-                    );
-                    return Dropped(NetworkFailure::ChannelMappingFailed);
-                }
-                id_to_channel.insert(id.clone(), channel.clone());
-                channel_to_id.insert(folded, id.clone());
-            }
-            Err(e) => {
-                return slack_failure(&format!("channel {id} lookup failed"), &e);
-            }
-        }
-    }
+    let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
+        "slack",
+        &config.channels,
+        |id| {
+            let http = &http;
+            let base = &base;
+            let token = &config.bot_token;
+            async move { fetch_channel_name(http, base, token, &id).await }
+        },
+        |id, error| slack_failure(&format!("channel {id} lookup failed"), error),
+    )
+    .await
+    {
+        Ok(maps) => maps,
+        Err(outcome) => return outcome,
+    };
 
     let ws_url = match open_socket(&http, &base, &config.app_token).await {
         Ok(u) => u,
@@ -590,5 +570,33 @@ mod tests {
         assert_eq!(api_base(&c), DEFAULT_API);
         c.api_base = "http://localhost:9/".into();
         assert_eq!(api_base(&c), "http://localhost:9");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "discord")]
+    async fn real_http_and_websocket_transport_bridge_both_directions() {
+        use crate::bouncer::NetworkHandle;
+        use crate::bouncer::bridge_oracle::Provider;
+
+        let mut oracle = crate::bouncer::bridge_oracle::start(Provider::Slack).await;
+        let config = SlackConfig {
+            bot_token: "xoxb-token".into(),
+            app_token: "xapp-token".into(),
+            api_base: oracle.api_base.clone(),
+            channels: vec!["C1".into()],
+            buffer_cap: 10,
+        };
+        let (handle, mut ends) = NetworkHandle::channels(10);
+        let driver_events = handle.subscribe();
+        let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
+
+        crate::bouncer::bridge_oracle::verify_round_trip(
+            Provider::Slack,
+            handle,
+            driver_events,
+            session,
+            &mut oracle,
+        )
+        .await;
     }
 }

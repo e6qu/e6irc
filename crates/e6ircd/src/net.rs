@@ -418,7 +418,10 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     install_crypto_provider();
     // Resolve once and reuse for the control-plane import plus BNC secrets.
     // UI-managed OIDC/operator credentials are always sealed in PostgreSQL.
-    let secret_key = config.secret_key().map_err(io::Error::other)?.map(Arc::new);
+    let secret_key = config
+        .secret_keyring()
+        .map_err(io::Error::other)?
+        .map(Arc::new);
     // Load persisted settings before constructing anything that consumes
     // them. In particular, a queue's capacity cannot be changed after the
     // queue exists; loading `core_queue` later would make that console setting
@@ -1211,13 +1214,14 @@ where
             drop(write_half.shutdown().await);
             return "Connection closed";
         };
-        // Coalesce everything currently queued into one syscall.
-        let mut batch: Vec<u8> = Vec::new();
-        batch.extend_from_slice(&envelope.payload.0);
+        // Drain everything currently queued and present the shared Bytes as
+        // vectored slices. Fan-out already serialized each capability variant
+        // once; concatenating here copied every recipient's wire bytes again.
+        let mut batch = vec![envelope.payload.0];
         while let Some(e) = rx.try_pop() {
-            batch.extend_from_slice(&e.payload.0);
+            batch.push(e.payload.0);
         }
-        if write_half.write_all(&batch).await.is_err() {
+        if write_all_vectored(&mut write_half, &batch).await.is_err() {
             telemetry.record_error(ErrorKind::Write);
             return "Write error"; // broken pipe / RST: the session is still live
         }
@@ -1228,12 +1232,134 @@ where
     }
 }
 
+/// Write every byte from `chunks`, correctly advancing across partial vectored
+/// writes. At most 64 slices are offered per call, staying below every
+/// supported platform's scatter/gather limit while still amortizing a full
+/// SendQ drain. Writers without native vectored support consume the first slice
+/// through their default implementation and remain correct.
+async fn write_all_vectored<W>(writer: &mut W, chunks: &[bytes::Bytes]) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    const MAX_SLICES: usize = 64;
+    let mut index = 0usize;
+    let mut offset = 0usize;
+    while index < chunks.len() {
+        if offset == chunks[index].len() {
+            index += 1;
+            offset = 0;
+            continue;
+        }
+        let slices: Vec<std::io::IoSlice<'_>> =
+            std::iter::once(std::io::IoSlice::new(&chunks[index][offset..]))
+                .chain(
+                    chunks[index + 1..]
+                        .iter()
+                        .take(MAX_SLICES - 1)
+                        .map(|chunk| std::io::IoSlice::new(chunk)),
+                )
+                .collect();
+        let written = writer.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "failed to write queued IRC output",
+            ));
+        }
+        let mut remaining = written;
+        while index < chunks.len() {
+            let available = chunks[index].len() - offset;
+            if remaining < available {
+                offset += remaining;
+                break;
+            }
+            remaining -= available;
+            index += 1;
+            offset = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::Input;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct PartialVectoredSink {
+        bytes: Vec<u8>,
+        maximum_per_write: usize,
+        vectored_calls: usize,
+    }
+
+    impl AsyncWrite for PartialVectoredSink {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let amount = buffer.len().min(self.maximum_per_write);
+            self.bytes.extend_from_slice(&buffer[..amount]);
+            Poll::Ready(Ok(amount))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffers: &[std::io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.vectored_calls += 1;
+            let mut remaining = self.maximum_per_write;
+            let mut written = 0usize;
+            for buffer in buffers {
+                let amount = buffer.len().min(remaining);
+                self.bytes.extend_from_slice(&buffer[..amount]);
+                written += amount;
+                remaining -= amount;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_writer_advances_across_partial_chunk_boundaries() {
+        let mut writer = PartialVectoredSink {
+            maximum_per_write: 5,
+            ..PartialVectoredSink::default()
+        };
+        write_all_vectored(
+            &mut writer,
+            &[
+                bytes::Bytes::from_static(b"abc"),
+                bytes::Bytes::from_static(b"defg"),
+                bytes::Bytes::from_static(b"h"),
+            ],
+        )
+        .await
+        .expect("vectored write");
+        assert_eq!(writer.bytes, b"abcdefgh");
+        assert_eq!(
+            writer.vectored_calls, 2,
+            "partial progress should resume at the exact byte, not rewrite a chunk"
+        );
+    }
 
     #[tokio::test]
     async fn critical_task_outcomes_preserve_exit_and_panic_provenance() {

@@ -128,6 +128,7 @@ pub(super) fn irc_network_preset(id: &str) -> Option<IrcNetworkPreset> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CreateNetwork {
     /// Driver kind; defaults to `irc`. A bridge kind requires its build feature.
     #[serde(default)]
@@ -147,6 +148,32 @@ pub(super) struct CreateNetwork {
     pub(super) sasl_account: Option<String>,
     #[serde(default)]
     pub(super) sasl_password: Option<String>,
+}
+
+/// An ephemeral qualification request. It intentionally omits the durable
+/// network name and autojoin list: preflight proves the transport,
+/// authentication, and registration boundary without persisting anything or
+/// producing channel traffic.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PreflightNetwork {
+    pub(super) addr: String,
+    #[serde(default)]
+    pub(super) tls: bool,
+    pub(super) nick: String,
+    #[serde(default)]
+    pub(super) realname: Option<String>,
+    #[serde(default)]
+    pub(super) sasl_account: Option<String>,
+    #[serde(default)]
+    pub(super) sasl_password: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct PreflightNetworkResponse {
+    ok: bool,
+    #[serde(flatten)]
+    result: crate::bouncer::IrcPreflight,
 }
 
 fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json::Value {
@@ -307,6 +334,61 @@ pub(super) async fn create_network(
             .into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+/// Resolve, connect, negotiate TLS, and register against an IRC upstream using
+/// the exact production driver path. No row is written and no reconnecting
+/// driver survives the response.
+pub(super) async fn preflight_network(
+    Authenticated(_account): Authenticated,
+    JsonBody(req): JsonBody<PreflightNetwork>,
+) -> Response {
+    match preflight_network_core(req).await {
+        Ok(result) => axum::Json(PreflightNetworkResponse { ok: true, result }).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+pub(super) async fn preflight_network_core(
+    req: PreflightNetwork,
+) -> Result<crate::bouncer::IrcPreflight, NetworkMutationError> {
+    validate_irc_upstream(&req.addr, &req.nick, req.realname.as_deref(), &[])?;
+    if let Some(account) = req.sasl_account.as_deref()
+        && let Err(error) = validate_credential_field(account, 255)
+    {
+        return Err(error);
+    }
+    if let Some(password) = req.sasl_password.as_deref()
+        && let Err(error) = validate_credential_field(password, 512)
+    {
+        return Err(error);
+    }
+    if req.sasl_account.is_some() != req.sasl_password.is_some() {
+        return Err(network_error(
+            StatusCode::BAD_REQUEST,
+            "Incomplete upstream SASL",
+            Some("provide both sasl_account and sasl_password, or neither"),
+        ));
+    }
+
+    let config = crate::bouncer::NetworkConfig {
+        addr: req.addr,
+        tls: req.tls,
+        nick: req.nick,
+        realname: req.realname.unwrap_or_else(|| "e6irc preflight".into()),
+        autojoin: Vec::new(),
+        buffer_cap: 1,
+        sasl: req.sasl_account.zip(req.sasl_password),
+    };
+    crate::bouncer::preflight_irc(&config)
+        .await
+        .map_err(|failure| {
+            network_error(
+                StatusCode::BAD_GATEWAY,
+                "IRC network preflight failed",
+                Some(&format!("{} ({})", failure.summary(), failure.code())),
+            )
+        })
 }
 
 /// Whether `addr` has an IP-literal host that points at a target that is never a
@@ -1049,6 +1131,7 @@ pub(super) async fn network_buffer(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PatchNetwork {
     pub(super) enabled: bool,
 }

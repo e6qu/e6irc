@@ -57,11 +57,17 @@ credentials are supplied.
    values.
 3. Supply nickname, optional real name and comma-separated autojoin channels,
    and optional upstream SASL account/password.
-4. Submit the CSRF-protected form. The server validates all sizes and syntax,
+4. Choose **Test connection** before saving. The owner-scoped preflight applies
+   the same server-side preset and validation rules, then uses the production
+   resolver, prohibited-address vetting, TCP/TLS connector, optional SASL, and
+   IRC registration path. It renders DNS, connect, and registration timings,
+   the confirmed nickname, and vetted address count without inserting a row,
+   starting a reconnect loop, or joining channels.
+5. Submit the CSRF-protected form. The server validates all sizes and syntax,
    blocks prohibited IP literals, seals any password, constructs the driver,
    inserts the owner-scoped row, and starts the driver immediately. Each DNS
    result is vetted again at dial time.
-5. The result redirects to the network list. Status comes from the live
+6. The result redirects to the network list. Status comes from the live
    runtime snapshot, including connected state, attempts, timestamps,
    latency, traffic, attachments, and fixed-category errors.
 
@@ -73,11 +79,12 @@ credentials are supplied.
   values preserved.
 - Missing secret key refuses a supplied password before persistence.
 - Duplicate owner/network names conflict under IRC casemapping.
-- DNS rebinding/address policy, TLS verification, upstream SASL rejection,
-  nickname collision, and connection loss happen asynchronously after a valid
-  configuration is stored. They appear in live operations and leave the
-  network configured for retry/edit; a stored row is not misreported as
-  connected.
+- DNS/address policy, TCP/TLS failure, upstream SASL rejection, nickname
+  collision, and registration timeout return a closed preflight failure code
+  before storage when **Test connection** is used. The same conditions can
+  still happen asynchronously after saving (or later during reconnect); they
+  appear in live operations and leave the network configured for retry/edit.
+  A stored row is not misreported as connected.
 - A synchronous driver-construction failure happens before insertion. Once
   storage succeeds, registry insertion owns the running/retrying driver.
 
@@ -88,11 +95,16 @@ traffic, latency, attempts, and closed error codes identify the result without
 exposing the password or raw provider text.
 
 **Evidence.** Preset integrity and server-side application have unit tests.
-`console_add_and_delete_network_via_the_console` proves console creation and
-deletion with PostgreSQL; `bnc_network_management_lifecycle` proves API
-mutation, live driver start, BNC attach, update/toggle/delete, and secret
-handling. The live public-network probe in `irc_driver.rs` is opt-in, so real
-Libera DNS/TLS/SASL behavior is externally qualified rather than CI-proven.
+The production IRC-driver preflight has a real local registration oracle.
+`console_add_and_delete_network_via_the_console` proves the non-mutating
+console qualification plus creation/deletion with PostgreSQL; Chromium,
+Firefox, and WebKit each repeat that qualification-before-create journey
+through the rendered controls and local live upstream;
+`bnc_network_management_lifecycle` proves the REST qualification contract,
+empty-registry invariant, mutation, live driver start, BNC attach,
+update/toggle/delete, and secret handling. The live public-network probe in
+`irc_driver.rs` is opt-in, so real Libera DNS/TLS/SASL behavior is externally
+qualified rather than CI-proven.
 
 ## Diagnose an upstream connection
 

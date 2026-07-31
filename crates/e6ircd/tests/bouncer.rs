@@ -2,7 +2,9 @@
 //! as the "external network" and verify it registers, relays, and
 //! buffers upstream traffic.
 
-use e6ircd::bouncer::{DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle, SendOutcome};
+use e6ircd::bouncer::{
+    DriverEvent, IrcNetwork, NetworkConfig, NetworkHandle, SendOutcome, preflight_irc,
+};
 use e6ircd::config::{Config, ListenerConfig};
 use e6ircd::net;
 
@@ -52,6 +54,25 @@ async fn wait_connected(
     })
     .await
     .expect("driver did not connect");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn preflight_uses_the_real_driver_registration_path_without_starting_a_network() {
+    let addr = upstream().await;
+    let result = preflight_irc(&NetworkConfig {
+        addr: addr.to_string(),
+        nick: "preflight".into(),
+        realname: "preflight qualification".into(),
+        ..NetworkConfig::default()
+    })
+    .await
+    .expect("local upstream qualifies");
+
+    assert_eq!(result.resolved_addresses, 1);
+    assert_eq!(result.confirmed_nick, "preflight");
+    // Timings are allowed to be zero on a fast local clock, but every stage is
+    // represented independently rather than one opaque total.
+    let _stage_timings = (result.dns_ms, result.connect_ms, result.registration_ms);
 }
 
 #[tokio::test(flavor = "multi_thread")]

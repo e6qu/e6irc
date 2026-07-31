@@ -40,6 +40,18 @@ def docker(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[s
     )
 
 
+def docker_bytes(
+    *arguments: str, input_bytes: bytes | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["docker", *arguments],
+        check=True,
+        input=input_bytes,
+        capture_output=True,
+        timeout=TIMEOUT,
+    )
+
+
 def wait_for_postgres(container: str) -> None:
     deadline = time.monotonic() + TIMEOUT
     last_error = ""
@@ -313,6 +325,102 @@ def main() -> None:
                 server.send_signal(signal.SIGTERM)
                 assert server.wait(timeout=10) == 0
 
+            # Back up after real migrations, managed import, traffic, and a
+            # device grant. Destroy two durable proof families, transactionally
+            # restore the custom archive, and boot the daemon from it.
+            expected_grants = int(
+                docker(
+                    "exec",
+                    container,
+                    "psql",
+                    "--username",
+                    "postgres",
+                    "--dbname",
+                    "e6irc_recovery",
+                    "--tuples-only",
+                    "--no-align",
+                    "--command",
+                    "SELECT count(*) FROM device_grants",
+                ).stdout.strip()
+            )
+            assert expected_grants >= 1, expected_grants
+            archive = docker_bytes(
+                "exec",
+                container,
+                "pg_dump",
+                "--username",
+                "postgres",
+                "--dbname",
+                "e6irc_recovery",
+                "--format=custom",
+                "--no-owner",
+                "--no-privileges",
+            ).stdout
+            assert len(archive) > 1024, len(archive)
+            docker_bytes(
+                "exec",
+                "--interactive",
+                container,
+                "pg_restore",
+                "--list",
+                input_bytes=archive,
+            )
+            docker(
+                "exec",
+                container,
+                "psql",
+                "--username",
+                "postgres",
+                "--dbname",
+                "e6irc_recovery",
+                "--command",
+                "DELETE FROM device_grants; DELETE FROM server_settings",
+            )
+            docker_bytes(
+                "exec",
+                "--interactive",
+                container,
+                "pg_restore",
+                "--exit-on-error",
+                "--single-transaction",
+                "--clean",
+                "--if-exists",
+                "--no-owner",
+                "--no-privileges",
+                "--username",
+                "postgres",
+                "--dbname",
+                "e6irc_recovery",
+                input_bytes=archive,
+            )
+            restored = docker(
+                "exec",
+                container,
+                "psql",
+                "--username",
+                "postgres",
+                "--dbname",
+                "e6irc_recovery",
+                "--tuples-only",
+                "--no-align",
+                "--command",
+                "SELECT (SELECT count(*) FROM server_settings), "
+                "(SELECT count(*) FROM device_grants)",
+            ).stdout.strip()
+            assert restored == f"1|{expected_grants}", restored
+
+            with server_log_path.open("ab") as server_log:
+                server = subprocess.Popen(
+                    [str(SERVER), "--config", str(config)],
+                    cwd=ROOT,
+                    stdout=server_log,
+                    stderr=subprocess.STDOUT,
+                )
+                restored_body, _ = wait_for_http(origin, "/readyz", 200)
+                assert json.loads(restored_body)["database"] == "ready"
+                server.send_signal(signal.SIGTERM)
+                assert server.wait(timeout=10) == 0
+
             server_output = server_log_path.read_text(encoding="utf-8", errors="replace")
             assert POSTGRES_PASSWORD not in server_output, (
                 "database password leaked into daemon output"
@@ -320,7 +428,8 @@ def main() -> None:
             print(
                 "PostgreSQL recovery journey passed: fresh boot, migrations, "
                 "bounded readiness, hot IRC traffic, visible dependency failure, "
-                "recovery, and graceful shutdown"
+                "recovery, graceful shutdown, custom backup, transactional restore, "
+                "and restored boot"
             )
         except Exception:
             if server_log_path.exists():

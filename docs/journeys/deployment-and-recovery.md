@@ -232,35 +232,101 @@ restarts the same database, proves readiness and device grants recover,
 exchanges more IRC traffic, and requires a clean daemon shutdown without
 logging the database password.
 
+## Back up and restore PostgreSQL
+
+**Actor and goal.** An operator wants a verifiable recovery copy of every
+durable e6irc row and a guarded way to replace a damaged database from it.
+
+**Preconditions.** PostgreSQL client tools compatible with the server are on
+`PATH`; `E6IRC_DATABASE_URL` reaches the intended database; the external
+master-key files are backed up separately. e6ircd must be stopped before a
+restore so no process can write post-backup state into the replacement.
+
+**Flow.**
+
+1. Run `tools/backup-postgres.sh /var/backups/e6irc.dump`. It uses a
+   custom-format `pg_dump`, excludes ownership/privilege coupling, validates
+   the archive with `pg_restore --list`, and atomically publishes a private
+   dump plus a SHA-256 sidecar without overwriting an existing backup.
+2. Store the dump, sidecar, deployment configuration, and external secret
+   keyring in the backup system. Database ciphertext is intentionally useless
+   without that separately protected key material.
+3. Stop e6ircd and select the restore target. Read the connected database name
+   rather than inferring it from a URL.
+4. Set `E6IRC_RESTORE_CONFIRM` to that exact name and run
+   `tools/restore-postgres.sh e6irc.dump DATABASE`. The tool checks the sidecar
+   filename and digest, validates the archive, verifies the live database name,
+   then performs a clean, fail-fast, ownership-neutral restore in one
+   PostgreSQL transaction.
+5. Start e6ircd. Normal migration checksum checks, managed-configuration load,
+   sealed-secret opening, readiness, and durable-state journeys qualify the
+   restored store before traffic resumes.
+
+**Visible failures and recovery.** Existing backup paths, a missing sidecar,
+checksum mismatch, invalid archive, wrong explicit confirmation, different
+connected database name, or any `pg_dump`/`pg_restore` failure exits nonzero.
+Restore uses one transaction, so a failed archive application does not leave a
+half-restored schema. Keep the source database and backup unchanged, correct
+the named failure, and retry while e6ircd remains stopped.
+
+**Security and observability.** The database URL is passed through the
+`PGDATABASE` environment rather than command arguments; scripts use a private
+umask and never print the URL. Backups contain sealed credentials and personal
+data and therefore require the same access controls as the database. The
+restore requires two matching pieces of operator intent—the expected database
+argument and confirmation environment value—before issuing `--clean`.
+
+**Evidence.** A portable shell contract test proves no-overwrite, checksum,
+confirmation, live-name, archive-validation, and single-transaction command
+construction. The process-level PostgreSQL recovery journey creates a real
+custom archive after traffic and migrations, destroys durable proof rows,
+restores the archive, and boots the daemon against the recovered store.
+
 ## Recover from secret-key loss or rotation
 
 **Actor and goal.** An operator wants to understand the consequence of the key
 that seals upstream credentials.
 
 **Preconditions.** Credential-bearing network/operator/provider configuration
-exists, and the operator has either the original external master key or an
-explicit plan to replace every affected secret.
+exists and the operator still has the current external primary key. Key loss
+without a backup is recoverable only by explicitly replacing each affected
+credential.
 
 **Flow.**
 
-- A sealed `enc:v1:` credential requires the configured external key.
+- New context-bound credentials use `enc:v2:`; legacy `enc:v1:` values remain
+  readable so the same rotation upgrades them.
 - Missing or wrong key is a startup/load error for data that must be opened;
   the server never treats ciphertext as plaintext or silently drops SASL.
 - The console disables new password storage when no key is available.
 - `e6ircd genkey` and `e6ircd seal` create keys/ciphertext; secrets remain
   outside the managed configuration and audit output.
+- To rotate, generate a new key, make it the primary `key_file`, move the old
+  path into `previous_key_files`, and restart. Both ciphertext generations are
+  then readable while every new write uses the new primary.
+- Run `e6ircd rotate-secrets --config /path/to/e6ircd.toml`. One PostgreSQL
+  transaction locks the managed settings and account-network rows, proves
+  every non-empty credential decryptable, re-seals all of them with the
+  primary, increments the managed revision, and writes one redacted audit
+  event. After it succeeds, remove the old fallback and restart.
 
-**Visible failures and recovery.** Restore the original key from the deployment’s secret
-backup, or explicitly replace/remove each affected upstream credential. There
-is no automatic key rotation/re-encryption workflow.
+**Visible failures and recovery.** A missing fallback, wrong key, malformed
+ciphertext, unexpected plaintext database value, missing database/control
+plane, or concurrent storage failure makes the command nonzero and rolls back
+the entire transaction. The pre-rotation keyring continues to open the
+unchanged rows. Restore a lost original key from the deployment’s secret
+backup, or explicitly replace/remove each affected upstream credential.
 
 **Security and observability.** Authenticated encryption rejects wrong or
 modified ciphertext. Key bytes, plaintext credentials, and ciphertext are
 excluded from rendered configuration, audit details, logs, and metrics;
 startup names only the affected configuration boundary.
 
-**Evidence.** Secret open/seal, missing/wrong-key startup, CLI tooling, and
-console/API password refusal are tested.
+**Evidence.** Secret open/seal/context/tamper behavior, primary/fallback
+selection, missing/wrong-key startup, CLI tooling, and console/API password
+refusal are tested. Real PostgreSQL tests prove all managed and account-network
+secret classes are re-sealed, the old key stops opening them, audit data is
+redacted, and one corrupt later row rolls the earlier settings update back.
 
 ## Qualify high scale
 

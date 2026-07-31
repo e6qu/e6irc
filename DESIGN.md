@@ -667,12 +667,13 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
 
 The following is the performance target and review checklist, not a claim that
 every mechanism is present. Shipped foundations include borrowed IRC parsing,
-`Cow` tag/ISUPPORT unescaping, shared `Bytes` output, bounded queues, and
-release LTO. The server does not currently have capability-variant
-serialize-once fan-out, vectored SendQ writes, Arc-swapped configuration,
-copy-on-write recipient snapshots, slab/generation session IDs, buffer pools,
-batched accepts, timer wheels, Criterion microbenchmarks, or per-PR load
-tracking. Any nontrivial optimization lands with evidence that proves it:
+`Cow` tag/ISUPPORT unescaping, bounded queues, capability-variant
+serialize-once fan-out in shared `Bytes`, and partial-write-correct vectored
+SendQ draining capped below platform scatter/gather limits, plus release LTO.
+The server does not currently have Arc-swapped configuration, copy-on-write
+recipient snapshots, slab/generation session IDs, buffer pools, batched
+accepts, timer wheels, Criterion microbenchmarks, or per-PR load tracking. Any
+nontrivial optimization lands with evidence that proves it:
 
 - **Zero-copy end-to-end**: parsing borrows from the receive buffer
   (§7.1); a routed message is serialized once per capability variant and
@@ -1679,17 +1680,24 @@ but the CLI, TUI, and BNC must surface the rejection.
   minimum), constant-time verification; app passwords are 32 random bytes,
   base64-shown once.
 - Upstream BNC secrets (SASL passwords, bridge tokens) sealable at rest
-  under a **server master key** provided via `[secrets].key_file` or the
-  `E6IRC_SECRET_KEY` env var (32 bytes, base64). Sealed values are
-  written in config as `enc:v1:<base64(nonce‖ciphertext‖tag)>`, decrypted
-  at load; a sealed value with no/wrong key is a hard startup error, and
-  plaintext values pass through (file-protected, like oper passwords).
+  under a **server master keyring** provided via `[secrets].key_file` plus
+  optional `previous_key_files`, or the `E6IRC_SECRET_KEY` plus optional
+  comma-separated `E6IRC_PREVIOUS_SECRET_KEYS` environment variables (each
+  key is 32 bytes, base64). Sealed values are written as
+  `enc:v2:<base64(nonce‖ciphertext‖tag)>`, with authenticated context binding;
+  legacy context-free `enc:v1:` remains read-only compatible. A sealed value
+  with no/wrong key is a hard startup error, and plaintext bootstrap values
+  pass through until the managed control plane imports them sealed.
   AEAD is **ChaCha20-Poly1305** via the in-tree aws-lc-rs (already pulled
   by rustls) — chosen over XChaCha20-Poly1305 to avoid a new crypto
   dependency; the fresh-random 96-bit nonce per value makes reuse
-  negligible at config-secret volumes. `e6ircd genkey` mints a key;
-  `e6ircd seal` encrypts stdin. (Key rotation re-seals values with a new
-  key; a versioned `enc:vN:` prefix leaves room for an XChaCha upgrade.)
+  negligible at config-secret volumes. `e6ircd genkey` mints a key and
+  `e6ircd seal` encrypts stdin. Rotation first installs a new primary while
+  retaining the old key as a read-only fallback; `e6ircd rotate-secrets`
+  locks and re-seals managed configuration plus every account-network secret
+  in one PostgreSQL transaction, with a redacted audit record. The old key is
+  removed only after that command commits. A corrupt, plaintext, or unreadable
+  value rolls the entire operation back.
 - TLS ≥ 1.2 everywhere (rustls); responses carry HSTS whenever the validated
   public origin is HTTPS (and never on an explicitly plain development
   origin); WS upgrades check Origin.
@@ -1819,8 +1827,9 @@ Layers, bottom to top:
 7. **e2e (API & network)**: REST `/api/v1` exercised over HTTP against a
    running `e6ircd` + Postgres (docker-composed in CI); IRC flows exercised
    over real sockets, including TLS.
-8. **UI tests**: Playwright drives real OIDC/Shauth and local-password
-   authentication in Chromium. Focused replay/race/membership cases use
+8. **UI tests**: Playwright drives real OIDC and local-password authentication
+   through Chromium, Firefox, and WebKit; exact Shauth qualification uses
+   Chromium. Focused replay/race/membership cases use
    browser-side network/history/WebSocket doubles. A separate full-stack case
    edits every managed-configuration subsection and credential collection,
    proves persisted themes and the desktop-notification boundary, creates a

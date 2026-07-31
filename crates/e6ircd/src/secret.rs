@@ -34,6 +34,15 @@ pub const CONFIG_CONTEXT: &[u8] = b"config";
 /// A 256-bit key that seals and opens config secrets.
 pub struct SecretKey([u8; KEY_LEN]);
 
+/// An ordered key set used during rotation. New values are always sealed with
+/// `primary`; reads try it first and then the explicitly configured previous
+/// keys. This makes the deployment transition crash-safe: either generation of
+/// ciphertext remains readable while a database-wide re-seal is in flight.
+pub struct SecretKeyring {
+    primary: SecretKey,
+    previous: Vec<SecretKey>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SecretError {
     /// The key material was not 32 base64-decoded bytes.
@@ -44,6 +53,8 @@ pub enum SecretError {
     Corrupt,
     /// Authentication failed: wrong key or tampered ciphertext.
     Decrypt,
+    /// The same key appeared more than once in a keyring.
+    DuplicateKey,
 }
 
 impl std::fmt::Display for SecretError {
@@ -53,6 +64,62 @@ impl std::fmt::Display for SecretError {
             Self::NotSealed => write!(f, "value is not a sealed secret (enc:v1:/enc:v2:)"),
             Self::Corrupt => write!(f, "sealed secret is malformed"),
             Self::Decrypt => write!(f, "wrong key or tampered secret"),
+            Self::DuplicateKey => write!(f, "a secret key is configured more than once"),
+        }
+    }
+}
+
+impl SecretKeyring {
+    /// Construct a keyring with no rotation fallback.
+    pub fn single(primary: SecretKey) -> Self {
+        Self {
+            primary,
+            previous: Vec::new(),
+        }
+    }
+
+    /// Construct an ordered rotation keyring, rejecting duplicate key
+    /// material instead of silently making an operator's fallback list
+    /// ambiguous.
+    pub fn new(primary: SecretKey, previous: Vec<SecretKey>) -> Result<Self, SecretError> {
+        let mut seen = vec![primary.0];
+        for key in &previous {
+            if seen.contains(&key.0) {
+                return Err(SecretError::DuplicateKey);
+            }
+            seen.push(key.0);
+        }
+        Ok(Self { primary, previous })
+    }
+
+    /// Number of explicitly configured keys, useful for redacted operator
+    /// posture without exposing key material or fingerprints.
+    pub fn key_count(&self) -> usize {
+        1 + self.previous.len()
+    }
+
+    /// Seal with the primary key. Fallback keys are read-only.
+    pub fn seal(&self, plaintext: &str, context: &[u8]) -> String {
+        self.primary.seal(plaintext, context)
+    }
+
+    /// Open with the primary key, then each explicit previous key. Malformed
+    /// or unsealed values fail immediately; only an authentication mismatch
+    /// can mean that another configured key owns the blob.
+    pub fn open(&self, blob: &str, context: &[u8]) -> Result<String, SecretError> {
+        match self.primary.open(blob, context) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(SecretError::Decrypt) => {
+                for key in &self.previous {
+                    match key.open(blob, context) {
+                        Ok(plaintext) => return Ok(plaintext),
+                        Err(SecretError::Decrypt) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(SecretError::Decrypt)
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -249,5 +316,28 @@ mod tests {
             SecretKey::from_base64(&e6irc_proto::base64::encode(&[0u8; 16])).err(),
             Some(SecretError::BadKey)
         );
+    }
+
+    #[test]
+    fn keyring_reads_previous_but_always_seals_with_primary() {
+        let old = SecretKey::generate();
+        let old_blob = old.seal("before", CTX);
+        let primary = SecretKey::generate();
+        let primary_copy = SecretKey::from_base64(&primary.to_base64()).unwrap();
+        let ring = SecretKeyring::new(primary, vec![old]).unwrap();
+
+        assert_eq!(ring.open(&old_blob, CTX).unwrap(), "before");
+        let new_blob = ring.seal("after", CTX);
+        assert_eq!(primary_copy.open(&new_blob, CTX).unwrap(), "after");
+    }
+
+    #[test]
+    fn keyring_rejects_duplicate_material() {
+        let key = SecretKey::generate();
+        let duplicate = SecretKey::from_base64(&key.to_base64()).unwrap();
+        assert!(matches!(
+            SecretKeyring::new(key, vec![duplicate]),
+            Err(SecretError::DuplicateKey)
+        ));
     }
 }

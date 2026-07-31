@@ -13,7 +13,7 @@ a design target rather than current behavior.
 | [Inspect and terminate live connections](administration-and-monitoring.md#inspect-and-terminate-live-connections) | Proven | Real core directory plus owner/admin exact-disconnect HTTP journeys | — |
 | [Monitor traffic, connections, queue pressure, latency, availability, and errors](administration-and-monitoring.md#monitor-traffic-connections-queue-pressure-latency-availability-and-errors) | Proven | Queue/runtime telemetry, schema compatibility, PostgreSQL monitoring/history/audit/expired-bearer retention, console/JSON/Prometheus tests, and live Chromium inspection | External alerting is not part of e6irc |
 | [Audit privileged changes](administration-and-monitoring.md#audit-privileged-changes) | Proven | Core audit events and atomic PostgreSQL mutation/audit tests | — |
-| [Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge) | Partially proven | All-feature management journey and live pinned Matrix oracle | Discord and Slack require commercial credentials |
+| [Add and operate a bridge](bridges-clients-and-automation.md#add-and-operate-a-bridge) | Partially proven | All-feature management journey, live pinned Matrix oracle, and real-socket Discord/Slack HTTP+WebSocket protocol oracles in both directions | Live Discord/Slack provider qualification requires commercial credentials |
 | [Use the scripting CLI](bridges-clients-and-automation.md#use-the-scripting-cli) | Proven | Real server/API/TLS/PLAIN/OAuth/device-cache/JSON executable journeys | — |
 | [Use the terminal UI](bridges-clients-and-automation.md#use-the-terminal-ui) | Proven | Real pseudo-terminal/e6ircd journey plus duplex protocol, model, and fuzz tests | — |
 | [Build another native client](bridges-clients-and-automation.md#build-another-native-client) | Proven | Shared-client tests plus CLI, TUI, load, TLS, and live-server consumers | — |
@@ -31,7 +31,8 @@ a design target rather than current behavior.
 | [Deploy a release](deployment-and-recovery.md#deploy-a-release) | Proven | Six-platform builds, deterministic package test, image shape, and publication contract | Tag publication itself runs only for a matching release tag |
 | [Restart without losing durable state](deployment-and-recovery.md#restart-without-losing-durable-state) | Proven | Chromium gracefully restarts the real daemon and proves session/network/runtime/backlog recovery | — |
 | [Recover from PostgreSQL interruption](deployment-and-recovery.md#recover-from-postgresql-interruption) | Proven | Named PostgreSQL stop/start under real daemon, probe, database-backed HTTP, and hot IRC traffic proves bounded failure and recovery | — |
-| [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Secret open/seal/wrong-key startup, CLI, and write-refusal tests | Recovery is restore-or-replace, not in-place re-encryption |
+| [Back up and restore PostgreSQL](deployment-and-recovery.md#back-up-and-restore-postgresql) | Proven | Guarded shell contract plus real custom-format PostgreSQL archive, destructive proof mutation, transactional restore, and daemon reboot journey | External master-key/config backup storage remains the operator’s responsibility |
+| [Recover from secret-key loss or rotation](deployment-and-recovery.md#recover-from-secret-key-loss-or-rotation) | Proven | Keyring/open/seal/wrong-key startup and CLI tests plus atomic PostgreSQL all-secret rotation/rollback/audit proof | Irrecoverable key loss still requires a key backup or explicit credential replacement |
 | [Qualify high scale](deployment-and-recovery.md#qualify-high-scale) | Unproven | Exact-delivery 64-client CI gate, daemon RSS/connection threshold, lazy SendQ allocation, and recorded 2,000-client baselines | 100,000-client tuned-host result, sharded core, and production thresholds are absent |
 | [Sign in with a local password](identity-and-access.md#sign-in-with-a-local-password) | Proven | Chromium adds a password, signs out, and completes real local login against e6ircd/PostgreSQL | — |
 | [Sign in with OpenID Connect](identity-and-access.md#sign-in-with-openid-connect) | Proven | Real e6ircd, PostgreSQL, Dex, and Chromium plus exact Shauth journey | Provider diversity beyond Dex/Shauth |
@@ -49,16 +50,16 @@ a design target rather than current behavior.
 | [Operate and protect the network through IRC](irc-and-services.md#operate-and-protect-the-network-through-irc) | Proven | Core operator/ban tests and atomic PostgreSQL policy/audit tests | — |
 | [Connect through IRC-over-WebSocket](irc-and-services.md#connect-through-irc-over-websocket) | Proven | Real WebSocket protocol integration across supported framing modes | A third-party browser client is not driven |
 | [Make network management available](networks-and-bouncer.md#make-network-management-available) | Proven | Configuration validation and live runtime listener management tests | — |
-| [Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network](networks-and-bouncer.md#add-libera-chat-oftc-efnet-snoonet-or-a-custom-irc-network) | Externally qualified | Chromium verifies safe preset defaults; console/API crosses PostgreSQL and a local live driver | Public Libera DNS/TLS/SASL uses the opt-in probe |
-| [Diagnose an upstream connection](networks-and-bouncer.md#diagnose-an-upstream-connection) | Proven | Runtime snapshot/error-ledger tests and real Chromium operations inspection | — |
+| [Add Libera Chat, OFTC, EFnet, Snoonet, or a custom IRC network](networks-and-bouncer.md#add-libera-chat-oftc-efnet-snoonet-or-a-custom-irc-network) | Externally qualified | Chromium, Firefox, and WebKit verify safe preset defaults, non-persistent qualification, PostgreSQL creation, and a local live driver | Public Libera DNS/TLS/SASL uses the opt-in probe |
+| [Diagnose an upstream connection](networks-and-bouncer.md#diagnose-an-upstream-connection) | Proven | Runtime snapshot/error-ledger tests and three-engine operations inspection | — |
 | [Attach any IRC client to an owned network](networks-and-bouncer.md#attach-any-irc-client-to-an-owned-network) | Proven | Real listener/upstream/PostgreSQL authentication, routing, and refusal tests | — |
 | [Persist and replay while detached or across restart](networks-and-bouncer.md#persist-and-replay-while-detached-or-across-restart) | Proven | Real PostgreSQL restart, trim, deletion, and wire-form tests | — |
 | [Edit, pause, resume, or delete a network](networks-and-bouncer.md#edit-pause-resume-or-delete-a-network) | Proven | Console/API lifecycle, registry, race, and WebSocket detachment tests | — |
-| [Enter chat and choose a network](web-chat.md#enter-chat-and-choose-a-network) | Proven | Chromium crosses authentication, inventory, PostgreSQL, registry, driver, and `/ws/ui` | Public-network interop remains opt-in |
-| [Receive replay and live messages without gaps or duplicates](web-chat.md#receive-replay-and-live-messages-without-gaps-or-duplicates) | Proven | Deterministic Chromium edge cases plus real upstream/persistence/restart path | — |
-| [Join, converse, and leave](web-chat.md#join-converse-and-leave) | Proven | Chromium acknowledgement/refusal/lifecycle cases and real bidirectional upstream journey | — |
-| [Personalize web chat and desktop notifications](web-chat.md#personalize-web-chat-and-desktop-notifications) | Proven | Client edge-case tests plus Chromium theme reload, permission, exact notification, and opt-out over real upstream traffic | Operating-system presentation after the browser API is Chromium's responsibility |
-| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Chromium visits every administrator directory and performs configuration, credential, network, policy, monitoring, audit, and sign-out workflows; focused HTTP covers remaining mutations | — |
+| [Enter chat and choose a network](web-chat.md#enter-chat-and-choose-a-network) | Proven | Chromium, Firefox, and WebKit cross authentication, inventory, PostgreSQL, registry, driver, and `/ws/ui` | Public-network interop remains opt-in |
+| [Receive replay and live messages without gaps or duplicates](web-chat.md#receive-replay-and-live-messages-without-gaps-or-duplicates) | Proven | Deterministic three-engine edge cases plus real upstream/persistence/restart path | — |
+| [Join, converse, and leave](web-chat.md#join-converse-and-leave) | Proven | Three-engine acknowledgement/refusal/lifecycle cases and real bidirectional upstream journey | — |
+| [Personalize web chat and desktop notifications](web-chat.md#personalize-web-chat-and-desktop-notifications) | Proven | Client edge-case tests plus three-engine theme reload, explicit granted-permission boundary, exact notification, and opt-out over real upstream traffic | Operating-system presentation after the browser API is the platform’s responsibility |
+| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Three engines visit every administrator directory and perform configuration, credential, network, policy, monitoring, audit, and sign-out workflows; focused HTTP covers remaining mutations | — |
 
 “—” means the defined journey boundary is crossed by current CI; it does not
 mean every possible environment or fault has been tested.
@@ -82,12 +83,15 @@ mean every possible environment or fault has been tested.
 
 ### Browser-to-network acceptance
 
-The Chromium suite contains both layers: deterministic browser-side
+The Playwright suite contains both layers: deterministic browser-side
 REST/history/WebSocket replacements for replay races and membership edge
 states, and one complete local acceptance path through real console forms,
 administrator directories and policy/audit actions, queue monitoring,
 PostgreSQL, the registry, an IRC driver, a TCP upstream, `/ws/ui`, persistence,
 operations diagnostics, graceful daemon restart, and session recovery.
+Chromium, Firefox, and WebKit each run that complete path in isolated
+PostgreSQL/Dex jobs; engine-specific request-cancellation text is normalized
+without suppressing other console, page, or transport failures.
 
 ### Target-scale architecture
 
@@ -113,10 +117,10 @@ attached network; the BNC is the cross-network multiplexer.
 
 ### External bridges and public networks
 
-Matrix has a self-hosted CI oracle. Discord and Slack require real commercial
-credentials; public-network probes must be respectful and opt-in. Their pure
-protocol/state logic is component-proven in normal CI, but their live
-transport journeys are explicitly unqualified.
+Matrix has a self-hosted CI oracle. Discord and Slack have strict local
+provider oracles that exercise their production HTTP/WebSocket clients in both
+directions, but qualification against the commercial services still requires
+real credentials. Public-network probes must be respectful and opt-in.
 
 ### Distribution and operations
 

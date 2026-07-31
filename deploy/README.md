@@ -100,6 +100,8 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_SERVER_NAME` | yes | IRC server name, e.g. `e6irc.dev.e6qu.dev` |
 | `E6IRC_PUBLIC_URL` | yes | External base URL; OIDC redirect + post-logout base |
 | `E6IRC_DATABASE_URL` | yes (secret) | PostgreSQL URL (`fck-rds` tenant) |
+| `E6IRC_SECRET_KEY` | for credential storage (secret) | Base64 32-byte primary key; new managed and account-network credentials are sealed with it |
+| `E6IRC_PREVIOUS_SECRET_KEYS` | only during rotation (secret) | Comma-separated old keys accepted for reads until `e6ircd rotate-secrets` commits |
 | `E6IRC_NETWORK_NAME` | no (`e6qu`) | IRC network name |
 | `E6IRC_HTTP_ADDR` | no (`0.0.0.0:8080`) | HTTP/REST/WebSocket listen address |
 | `E6IRC_IRC_ADDR` | no (`127.0.0.1:6667`) | Raw IRC listener — loopback only; IRC is reached over WebSocket (`/ws/irc`) publicly |
@@ -111,6 +113,22 @@ configured, the next start seals and imports them atomically.
 | `E6IRC_OIDC_CLIENT_SECRET` | with issuer (secret) | Shauth OIDC client secret |
 | `E6IRC_OIDC_NAME` | no (`shauth`) | Provider name (URL segment) |
 | `E6IRC_OIDC_END_SESSION` | with issuer | RP-initiated logout endpoint, e.g. `https://auth.dev.e6qu.dev/oauth2/sessions/logout` |
+
+### Rotate the credential key
+
+Install a newly generated key as `E6IRC_SECRET_KEY`, retain the old value in
+`E6IRC_PREVIOUS_SECRET_KEYS`, and restart the service. The new process can read
+both generations but writes only with the new primary. With the same
+environment and generated config, run:
+
+```sh
+e6ircd rotate-secrets --config "$E6IRC_CONFIG_PATH"
+```
+
+The command re-seals managed configuration and every account-network
+credential in one PostgreSQL transaction and writes a redacted audit record.
+It exits nonzero and rolls the whole transaction back if any value cannot be
+proven readable. After success, remove `E6IRC_PREVIOUS_SECRET_KEYS` and restart.
 
 ## SSO endpoints (served by e6ircd)
 
