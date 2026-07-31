@@ -111,12 +111,7 @@ pub(super) fn cmd_user(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     // An empty realname is "not enough parameters" per Modern IRC.
     if p.len() < 4 || p[0].is_empty() || p[3].is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["USER"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "USER");
         return;
     }
     let session = state

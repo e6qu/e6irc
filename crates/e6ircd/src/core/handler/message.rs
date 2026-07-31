@@ -248,12 +248,7 @@ pub(super) fn resolve_message_target(
         let key = state.nick_key(target);
         let Some(peer) = state.registered_peer(&key) else {
             if loud {
-                state.numeric(
-                    conn,
-                    ERR_NOSUCHNICK,
-                    &[target],
-                    Some("No such nick/channel"),
-                );
+                state.err_nosuchnick(conn, target);
             }
             return None;
         };
@@ -265,12 +260,7 @@ pub(super) fn resolve_message_target(
     let key = state.chan_key(chan_target);
     let Some(chan) = state.channels.get(&key) else {
         if loud {
-            state.numeric(
-                conn,
-                ERR_NOSUCHCHANNEL,
-                &[clip_echo(target)],
-                Some("No such channel"),
-            );
+            state.err_nosuchchannel(conn, clip_echo(target));
         }
         return None;
     };
@@ -588,12 +578,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     let recipients: Vec<ConnId> = if chan_target.starts_with('#') {
         let key = state.chan_key(chan_target);
         let Some(chan) = state.channels.get(&key) else {
-            state.numeric(
-                conn,
-                ERR_NOSUCHCHANNEL,
-                &[clip_echo(target)],
-                Some("No such channel"),
-            );
+            state.err_nosuchchannel(conn, clip_echo(target));
             return;
         };
         // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't
@@ -615,12 +600,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
     } else {
         let key = state.nick_key(target);
         let Some(peer) = state.registered_peer(&key) else {
-            state.numeric(
-                conn,
-                ERR_NOSUCHNICK,
-                &[target],
-                Some("No such nick/channel"),
-            );
+            state.err_nosuchnick(conn, target);
             return;
         };
         vec![peer]

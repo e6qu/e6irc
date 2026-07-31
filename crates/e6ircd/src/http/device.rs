@@ -469,18 +469,9 @@ pub(super) async fn admin_create_account_invitation(
             Some("The account must be a valid IRC nickname of at most 64 bytes."),
         );
     }
-    let contact_email = match body.contact_email.as_deref() {
-        Some(contact_email) => match crate::identity::ContactEmail::parse(contact_email) {
-            Ok(contact_email) => Some(contact_email),
-            Err(error) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid contact email",
-                    Some(&error.to_string()),
-                );
-            }
-        },
-        None => None,
+    let contact_email = match super::parse_optional_contact_email(body.contact_email.as_deref()) {
+        Ok(ce) => ce,
+        Err(msg) => return problem(StatusCode::BAD_REQUEST, "Invalid contact email", Some(&msg)),
     };
     let Some(lifetime) = crate::identity::AccountInvitationLifetimeDays::new(body.expires_in_days)
     else {

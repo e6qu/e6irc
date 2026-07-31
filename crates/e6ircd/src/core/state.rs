@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
+use e6irc_proto::numerics::{
+    ERR_NEEDMOREPARAMS, ERR_NOSUCHCHANNEL, ERR_NOSUCHNICK, ERR_NOTONCHANNEL,
+};
 use e6irc_queue::Sender;
 
 use super::{Output, WireLine, deliver};
@@ -1888,6 +1891,36 @@ impl ServerState {
             line.push_str(e6irc_proto::message::truncate_on_char_boundary(t, budget));
         }
         self.send(conn, &line);
+    }
+
+    /// `ERR_NEEDMOREPARAMS (<cmd>) :Not enough parameters`.
+    pub fn err_needmoreparams(&mut self, conn: ConnId, cmd: &str) {
+        self.numeric(
+            conn,
+            ERR_NEEDMOREPARAMS,
+            &[cmd],
+            Some("Not enough parameters"),
+        );
+    }
+
+    /// `ERR_NOSUCHNICK (<nick>) :No such nick/channel`.
+    pub fn err_nosuchnick(&mut self, conn: ConnId, nick: &str) {
+        self.numeric(conn, ERR_NOSUCHNICK, &[nick], Some("No such nick/channel"));
+    }
+
+    /// `ERR_NOSUCHCHANNEL (<chan>) :No such channel`.
+    pub fn err_nosuchchannel(&mut self, conn: ConnId, chan: &str) {
+        self.numeric(conn, ERR_NOSUCHCHANNEL, &[chan], Some("No such channel"));
+    }
+
+    /// `ERR_NOTONCHANNEL (<chan>) :You're not on that channel`.
+    pub fn err_notonchannel(&mut self, conn: ConnId, chan: &str) {
+        self.numeric(
+            conn,
+            ERR_NOTONCHANNEL,
+            &[chan],
+            Some("You're not on that channel"),
+        );
     }
 
     /// Emit `code` one or more times, packing `items` into the trailing

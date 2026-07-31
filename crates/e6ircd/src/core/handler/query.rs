@@ -371,7 +371,7 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             // `target` is raw client input; clip_echo keeps an empty or
             // ':'-leading value from breaking the echo's framing.
             let shown = clip_echo(target);
-            state.numeric(conn, ERR_NOSUCHNICK, &[shown], Some("No such nick/channel"));
+            state.err_nosuchnick(conn, shown);
             state.numeric(conn, RPL_ENDOFWHOIS, &[shown], Some("End of /WHOIS list"));
         }
     }
@@ -581,12 +581,7 @@ pub(super) fn cmd_admin(state: &mut ServerState, conn: ConnId) {
 
 pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if p.is_empty() {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["ISON"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "ISON");
         return;
     }
     // ISON takes a space-separated nick list (as many middle params, or one

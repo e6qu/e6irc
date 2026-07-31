@@ -297,6 +297,19 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         .into_response()
 }
 
+/// Parse an optional contact-email field, or return a `BAD_REQUEST` problem
+/// response for an invalid one. Shared by the profile and invitation handlers.
+pub(super) fn parse_optional_contact_email(
+    raw: Option<&str>,
+) -> Result<Option<crate::identity::ContactEmail>, String> {
+    match raw {
+        Some(email) => crate::identity::ContactEmail::parse(email)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
 /// Run one HTTP control-plane mutation on the core and await its typed outcome.
 /// The core owns live-state ordering and the database verdict; HTTP handlers do
 /// not write durable/live state along a second path.

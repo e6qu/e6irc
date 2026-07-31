@@ -127,12 +127,7 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
         return;
     }
     let Some(&arg) = p.first() else {
-        state.numeric(
-            conn,
-            ERR_NEEDMOREPARAMS,
-            &["AUTHENTICATE"],
-            Some("Not enough parameters"),
-        );
+        state.err_needmoreparams(conn, "AUTHENTICATE");
         return;
     };
     if arg == "*" {
