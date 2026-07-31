@@ -58,6 +58,30 @@ fn network_error(
     NetworkMutationError::new(status, title, detail)
 }
 
+/// Record one network mutation in the audit trail. The mutation itself is
+/// already committed (audit is a trail, not a gate), so a failed insert
+/// cannot roll it back — but it is logged, never silently lost.
+async fn audit_network_mutation(
+    state: &AppState,
+    actor: &str,
+    action: &'static str,
+    account: &str,
+    name: &str,
+    detail: &str,
+) {
+    if let Err(error) = crate::db::insert_audit_log(
+        pool_of(state),
+        actor,
+        action,
+        &format!("{account}/{name}"),
+        detail,
+    )
+    .await
+    {
+        eprintln!("http: network {action} audit for {account}/{name}: {error}");
+    }
+}
+
 /// Normalize the shared result contract of owner-scoped network updates. This
 /// keeps "missing row" and database failure semantics identical across edit
 /// and enable/disable mutations.
@@ -197,6 +221,12 @@ pub(super) fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> 
     serde_json::json!({
         "state": runtime.lifecycle.as_str(),
         "state_changed_at": e6irc_proto::time::server_time(runtime.state_changed_at),
+        "next_retry_at": timestamp(runtime.next_retry_at),
+        "recent_failures": runtime.recent_failures.iter().map(|record| serde_json::json!({
+            "at": e6irc_proto::time::server_time(record.at),
+            "code": record.code(),
+            "summary": record.summary(),
+        })).collect::<Vec<_>>(),
         "connected_at": timestamp(runtime.connected_at),
         "last_input_at": timestamp(runtime.last_input_at),
         "last_output_at": timestamp(runtime.last_output_at),
@@ -894,6 +924,15 @@ pub(super) async fn update_network_core(
     if let Some(driver) = driver {
         registry.add(Some(account), name, driver);
     }
+    audit_network_mutation(
+        state,
+        account,
+        "NETWORK_UPDATE",
+        account,
+        name,
+        row.kind.as_db_str(),
+    )
+    .await;
     Ok(())
 }
 
@@ -1103,6 +1142,15 @@ pub(super) async fn create_network_core(
         }
     }
     registry.add(Some(account), &req.name, driver);
+    audit_network_mutation(
+        state,
+        account,
+        "NETWORK_CREATE",
+        account,
+        &req.name,
+        kind.as_db_str(),
+    )
+    .await;
     Ok(())
 }
 
@@ -1256,6 +1304,7 @@ pub(super) async fn update_network(
 pub(super) async fn set_network_enabled_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
+    actor: &str,
     account: &str,
     name: &str,
     enabled: bool,
@@ -1296,6 +1345,15 @@ pub(super) async fn set_network_enabled_core(
     } else {
         registry.remove(Some(account), name);
     }
+    audit_network_mutation(
+        state,
+        actor,
+        "NETWORK_TOGGLE",
+        account,
+        name,
+        if enabled { "enabled" } else { "disabled" },
+    )
+    .await;
     Ok(())
 }
 
@@ -1316,6 +1374,7 @@ pub(super) async fn delete_network_core(
         "delete failed",
     )?;
     registry.remove(Some(account), name);
+    audit_network_mutation(state, account, "NETWORK_DELETE", account, name, "").await;
     Ok(())
 }
 
@@ -1331,7 +1390,7 @@ pub(super) async fn patch_network(
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
     if let Err(error) =
-        set_network_enabled_core(&state, registry, &account, &name, req.enabled).await
+        set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await
     {
         return error.into_response();
     }

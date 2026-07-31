@@ -523,6 +523,17 @@ impl Telemetry {
     pub(crate) fn prometheus(&self, bnc_networks: u64, bnc_connected: u64) -> String {
         let snapshot = self.snapshot(bnc_networks, bnc_connected);
         let mut out = String::new();
+        // Build identity as an info gauge, so a scraped fleet can answer
+        // "which version/revision is running where" without a side channel.
+        out.push_str(
+            "# HELP e6irc_build_info Build and revision of the running binary.\n\
+             # TYPE e6irc_build_info gauge\n",
+        );
+        out.push_str(&format!(
+            "e6irc_build_info{{version=\"{}\",revision=\"{}\"}} 1\n",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("E6IRC_BUILD_REVISION").unwrap_or("unknown"),
+        ));
         one_metric(
             &mut out,
             "e6irc_uptime_seconds",

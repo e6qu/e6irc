@@ -413,17 +413,10 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .expect("checked")
         .set_realname(new_name.to_string());
     let line = format!(":{prefix} SETNAME :{new_name}");
+    // SETNAME echoes to the originator (its own client sees the change), then
+    // to the channel-peer / extended-monitor fan-out.
     state.send_timed(conn, &line);
-    let peers: std::collections::HashSet<ConnId> = state.channel_peers(conn).into_iter().collect();
-    for peer in &peers {
-        if state.sessions.get(peer).is_some_and(|s| s.caps.setname) {
-            state.send_timed(*peer, &line);
-        }
-    }
-    let nick = state.sessions[&conn].nick().map(String::from);
-    if let Some(nick) = nick {
-        monitor_event(state, &nick, &line, |c| c.setname, &peers);
-    }
+    notify_event(state, conn, &line, |c| c.setname, false);
 }
 
 // ---- WHOWAS -------------------------------------------------------------

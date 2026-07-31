@@ -121,8 +121,11 @@ monitoring; live runtime diagnosis remains tied to the registry.
    driver kind, upstream, attached clients, and error count.
 2. **Inspect** shows configuration without returning the stored secret.
 3. **Operations** refreshes the live snapshot: attempt/success/disconnect
-   timestamps, connection duration, latest connect latency, bytes/lines in and
-   out, attached clients, backlog length, and the bounded error ledger.
+   timestamps, the scheduled time of the next reconnect attempt while the
+   driver is waiting to retry, connection duration, latest connect latency,
+   bytes/lines in and out, attached clients, backlog length, the bounded
+   error ledger, and a bounded newest-last failure history so a flap pattern
+   is visible as a sequence, not just the last error.
 4. Recent persisted detached backlog is shown oldest-first and remains
    available while the network is paused.
 5. Global **Monitoring** aggregates upstream traffic, availability, error

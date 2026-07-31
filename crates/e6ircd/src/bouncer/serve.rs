@@ -41,6 +41,12 @@ impl NetworkKey {
             name: fold(name),
         }
     }
+
+    /// The owner half for log lines: a shared (server-configured) network
+    /// reads as `*` — matching the persistence key — rather than vanishing.
+    fn display_owner(&self) -> &str {
+        self.owner.as_deref().unwrap_or("*")
+    }
 }
 
 /// All active networks, each running an always-on driver, keyed by
@@ -181,6 +187,7 @@ impl Registry {
         // Capture the kind before `start()` consumes the driver.
         let kind = driver.kind();
         let handle = Arc::new(driver.start());
+        handle.set_label(format!("{}/{}", key.display_owner(), name));
         if let Some(telemetry) = &self.telemetry {
             handle.set_telemetry(telemetry.clone());
         }
@@ -559,6 +566,15 @@ where
                                 awaiting_payload = false;
                                 let payload = std::mem::take(&mut sasl_buf);
                                 match verify_plain(pool, &payload).await {
+                                    None => {
+                                        // A failed attach authentication is a
+                                        // security event; one bounded line per
+                                        // rejection, without the credential.
+                                        eprintln!(
+                                            "bnc: SASL authentication failed on the attach listener"
+                                        );
+                                        reject_sasl(write, server_name).await?;
+                                    }
                                     Some(acct) => {
                                         write
                                             .write_all(
@@ -571,7 +587,6 @@ where
                                             .await?;
                                         account = Some(acct);
                                     }
-                                    None => reject_sasl(write, server_name).await?,
                                 }
                             }
                             // else: 400-char chunk, keep awaiting_payload = true

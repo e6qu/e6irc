@@ -1936,6 +1936,9 @@ mod pages {
             match crate::db::verify_local_password(pool, &form.account, &form.password).await {
                 Ok(Some(account)) => account,
                 Ok(None) => {
+                    // A failed web login is a security event; one bounded line
+                    // per denial, without the password.
+                    eprintln!("web: login failed for account {}", form.account);
                     return login_response(
                         &state,
                         form.account,
@@ -4723,23 +4726,13 @@ mod pages {
         let Some(enabled) = toggle_target(&f.enabled) else {
             return invalid_toggle_response();
         };
-        if let Err(error) = set_network_enabled_core(&state, registry, &owner, &name, enabled).await
+        // The admin is the actor here (the owner is only the target), and the
+        // core audits every toggle — an administrator touching another
+        // account's network is unmistakably attributed.
+        if let Err(error) =
+            set_network_enabled_core(&state, registry, &admin, &owner, &name, enabled).await
         {
             return error.into_response();
-        }
-        // The owner's own toggle is unaudited self-service; an administrator
-        // changing another account's network is privileged and must leave a
-        // trail. An audit failure is logged, never hidden behind the redirect.
-        if let Err(error) = crate::db::insert_audit_log(
-            pool_of(&state),
-            &admin,
-            "NETWORK_TOGGLE",
-            &format!("{owner}/{name}"),
-            if enabled { "enabled" } else { "disabled" },
-        )
-        .await
-        {
-            eprintln!("console: admin network toggle audit: {error}");
         }
         Redirect::to("/console/admin/networks").into_response()
     }
@@ -5977,6 +5970,8 @@ mod pages {
         state: String,
         connected: bool,
         state_changed: String,
+        next_retry: String,
+        recent_failures: Vec<String>,
         connected_since: String,
         last_input: String,
         last_output: String,
@@ -6139,14 +6134,17 @@ mod pages {
             .unwrap_or_else(|| "never".into())
     }
 
-    fn runtime_age(value: Option<e6irc_proto::time::Millis>) -> String {
-        let now = std::time::SystemTime::now()
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_millis()
-            .min(u64::MAX as u128) as u64;
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn runtime_age(value: Option<e6irc_proto::time::Millis>) -> String {
         value
-            .map(|at| format_age(now, at.as_millis()))
+            .map(|at| format_age(now_millis(), at.as_millis()))
             .unwrap_or_else(|| "never".into())
     }
 
@@ -6199,6 +6197,37 @@ mod pages {
                 .as_ref()
                 .map(|runtime| e6irc_proto::time::server_time(runtime.state_changed_at))
                 .unwrap_or_else(|| "not available".into()),
+            next_retry: runtime
+                .as_ref()
+                .and_then(|runtime| runtime.next_retry_at)
+                .map(|at| {
+                    format!(
+                        "{} (in {})",
+                        e6irc_proto::time::server_time(at),
+                        format_latency(
+                            at.as_millis()
+                                .saturating_sub(now_millis())
+                                .saturating_mul(1_000)
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| "not scheduled".into()),
+            recent_failures: runtime
+                .as_ref()
+                .map(|runtime| {
+                    runtime
+                        .recent_failures
+                        .iter()
+                        .map(|record| {
+                            format!(
+                                "{} — {}",
+                                e6irc_proto::time::server_time(record.at),
+                                record.summary(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             connected_since: runtime_age(runtime.as_ref().and_then(|runtime| runtime.connected_at)),
             last_input: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_input_at)),
             last_output: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_output_at)),
@@ -6587,7 +6616,7 @@ mod pages {
             return invalid_toggle_response();
         };
         if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &name, enabled).await
+            set_network_enabled_core(&state, registry, &account, &account, &name, enabled).await
         {
             return error.into_response();
         }
@@ -7856,7 +7885,8 @@ mod pages {
             return invalid_toggle_response();
         };
         if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &form.name, enabled).await
+            set_network_enabled_core(&state, registry, &account, &account, &form.name, enabled)
+                .await
         {
             return console_integrations_error(&state, &headers, account, error.message()).await;
         }

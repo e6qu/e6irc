@@ -263,7 +263,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - run: docker build --tag e6irc:ci .
+      - run: docker build --build-arg E6IRC_BUILD_REVISION="${{ github.sha }}" --tag e6irc:ci .
       - name: Verify the fully baked web client
         run: |
           container_id="$(docker create e6irc:ci)"

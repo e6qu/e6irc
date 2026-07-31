@@ -382,6 +382,20 @@ impl Backoff {
         }
     }
 
+    /// The delay the next [`Backoff::wait`] will sleep, computed exactly as
+    /// `wait` computes it. Exposed so the runtime snapshot can say *when* the
+    /// next attempt fires, not just that the driver is reconnecting.
+    pub(crate) fn next_delay(&self, session_ran: std::time::Duration) -> std::time::Duration {
+        let base = if session_ran >= std::time::Duration::from_secs(10) {
+            std::time::Duration::from_millis(200)
+        } else {
+            self.current
+        };
+        let jitter =
+            std::time::Duration::from_millis((base.as_millis() as u64 + self.jitter_offset) % 97);
+        base + jitter
+    }
+
     /// Sleep before the next reconnect attempt, given how long the session that
     /// just ended lasted, then grow the delay for the attempt after this one.
     pub(crate) async fn wait(&mut self, session_ran: std::time::Duration) {
@@ -527,6 +541,7 @@ async fn wait_for_reconnect(
     failure: NetworkFailure,
 ) -> bool {
     ends.emit(ConnectionEvent::Reconnecting(failure));
+    ends.schedule_retry(backoff.next_delay(attempt_elapsed));
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
@@ -1068,6 +1083,26 @@ impl NetworkFailure {
     }
 }
 
+/// One classified failure with when it happened — the unit of the bounded
+/// per-network failure history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureRecord {
+    pub at: e6irc_proto::time::Millis,
+    failure: NetworkFailure,
+}
+
+impl FailureRecord {
+    /// The closed failure code (see [`NetworkFailure::code`]).
+    pub fn code(&self) -> &'static str {
+        self.failure.code()
+    }
+
+    /// The operator-safe summary (see [`NetworkFailure::summary`]).
+    pub fn summary(&self) -> &'static str {
+        self.failure.summary()
+    }
+}
+
 /// Owner-safe operational data for one network. It contains counters and
 /// timestamps plus a closed, credential-safe failure classification—never raw
 /// errors that could echo a provider response containing secrets.
@@ -1075,6 +1110,11 @@ impl NetworkFailure {
 pub struct NetworkRuntimeSnapshot {
     pub lifecycle: NetworkLifecycle,
     pub state_changed_at: e6irc_proto::time::Millis,
+    /// When the next reconnect attempt fires, while the driver is waiting
+    /// to retry; `None` when connected or parked.
+    pub next_retry_at: Option<e6irc_proto::time::Millis>,
+    /// The bounded newest-last failure history (see [`FailureRecord`]).
+    pub recent_failures: Vec<FailureRecord>,
     pub connected_at: Option<e6irc_proto::time::Millis>,
     pub last_input_at: Option<e6irc_proto::time::Millis>,
     pub last_output_at: Option<e6irc_proto::time::Millis>,
@@ -1094,6 +1134,13 @@ pub struct NetworkRuntimeSnapshot {
 
 struct NetworkRuntimeState {
     lifecycle: NetworkLifecycle,
+    /// When the next reconnect attempt fires (while reconnecting; `None`
+    /// once a session connects or the driver parks).
+    next_retry_at: Option<e6irc_proto::time::Millis>,
+    /// The last few classified failures, newest last — a flap pattern is a
+    /// sequence, and "last error" alone hides it. Bounded; runtime state is
+    /// restart-ephemeral by design.
+    recent_failures: std::collections::VecDeque<FailureRecord>,
     state_changed_at: e6irc_proto::time::Millis,
     connected_at: Option<e6irc_proto::time::Millis>,
     attempt_started: std::time::Instant,
@@ -1106,6 +1153,10 @@ struct NetworkRuntimeState {
 
 struct NetworkRuntime {
     state: std::sync::Mutex<NetworkRuntimeState>,
+    /// The registry's owner/name label, assigned once when the network is
+    /// registered so lifecycle log lines say *which* network transitioned
+    /// (a bare "disconnected" across a fleet of upstreams is undiagnosable).
+    label: std::sync::Mutex<Option<String>>,
     attached_clients: std::sync::atomic::AtomicU64,
     lines_in: std::sync::atomic::AtomicU64,
     bytes_in: std::sync::atomic::AtomicU64,
@@ -1116,10 +1167,22 @@ struct NetworkRuntime {
 }
 
 impl NetworkRuntime {
+    /// The registry label for log lines, or the network kind placeholder
+    /// before registration assigns one.
+    fn label(&self) -> String {
+        self.label
+            .lock()
+            .expect("network label poisoned")
+            .clone()
+            .unwrap_or_else(|| "unregistered network".to_string())
+    }
+
     fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(NetworkRuntimeState {
                 lifecycle: NetworkLifecycle::Connecting,
+                next_retry_at: None,
+                recent_failures: std::collections::VecDeque::new(),
                 state_changed_at: epoch_millis(),
                 connected_at: None,
                 attempt_started: std::time::Instant::now(),
@@ -1129,6 +1192,7 @@ impl NetworkRuntime {
                 last_error_at: None,
                 last_error: None,
             }),
+            label: std::sync::Mutex::new(None),
             attached_clients: std::sync::atomic::AtomicU64::new(0),
             lines_in: std::sync::atomic::AtomicU64::new(0),
             bytes_in: std::sync::atomic::AtomicU64::new(0),
@@ -1139,8 +1203,17 @@ impl NetworkRuntime {
         }
     }
 
+    fn schedule_retry(&self, delay: std::time::Duration) {
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        let at = epoch_millis()
+            .as_millis()
+            .saturating_add(delay.as_millis() as u64);
+        state.next_retry_at = Some(e6irc_proto::time::Millis::from_millis(at));
+    }
+
     fn begin_attempt(&self) {
         let mut state = self.state.lock().expect("network runtime poisoned");
+        state.next_retry_at = None;
         state.lifecycle = if state.connection_attempts == 0 {
             NetworkLifecycle::Connecting
         } else {
@@ -1160,6 +1233,7 @@ impl NetworkRuntime {
         state.lifecycle = NetworkLifecycle::Connected;
         state.state_changed_at = now;
         state.connected_at = Some(now);
+        state.next_retry_at = None;
         state.connect_latency_ms = Some(
             state
                 .attempt_started
@@ -1184,6 +1258,9 @@ impl NetworkRuntime {
         Self::set_error(&mut state, now, failure);
     }
 
+    /// How many classified failures the per-network history retains.
+    const FAILURE_HISTORY: usize = 8;
+
     fn set_error(
         state: &mut NetworkRuntimeState,
         now: e6irc_proto::time::Millis,
@@ -1192,6 +1269,12 @@ impl NetworkRuntime {
         state.errors = state.errors.saturating_add(1);
         state.last_error_at = Some(now);
         state.last_error = Some(failure);
+        state
+            .recent_failures
+            .push_back(FailureRecord { at: now, failure });
+        while state.recent_failures.len() > Self::FAILURE_HISTORY {
+            state.recent_failures.pop_front();
+        }
     }
 
     fn record_input(&self, bytes: usize) {
@@ -1520,6 +1603,8 @@ impl NetworkHandle {
         NetworkRuntimeSnapshot {
             lifecycle: state.lifecycle,
             state_changed_at: state.state_changed_at,
+            next_retry_at: state.next_retry_at,
+            recent_failures: state.recent_failures.iter().copied().collect(),
             connected_at: state.connected_at,
             last_input_at: atomic_millis(&self.runtime.last_input_at),
             last_output_at: atomic_millis(&self.runtime.last_output_at),
@@ -1557,6 +1642,8 @@ impl NetworkHandle {
         let state = self.runtime.state.lock().expect("network runtime poisoned");
         NetworkRuntimeState {
             lifecycle: state.lifecycle,
+            next_retry_at: state.next_retry_at,
+            recent_failures: state.recent_failures.clone(),
             state_changed_at: state.state_changed_at,
             connected_at: state.connected_at,
             attempt_started: state.attempt_started,
@@ -1618,6 +1705,11 @@ impl NetworkHandle {
 
     pub(crate) fn set_telemetry(&self, telemetry: std::sync::Arc<crate::observability::Telemetry>) {
         *self.telemetry.lock().expect("telemetry hook poisoned") = Some(telemetry);
+    }
+
+    /// Assign the registry's owner/name label for lifecycle log lines.
+    pub(crate) fn set_label(&self, label: String) {
+        *self.runtime.label.lock().expect("network label poisoned") = Some(label);
     }
 
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
@@ -1702,6 +1794,10 @@ impl DriverEnds {
         let broadcast = match event {
             ConnectionEvent::Connected => {
                 self.runtime.connected();
+                // One line per transition, labeled: an upstream flap on an
+                // IRC network must be as visible in the log as a bridge's
+                // (bridges already log their own connect failures).
+                eprintln!("bnc: {} connected", self.runtime.label());
                 DriverEvent::Connected
             }
             failure_event => {
@@ -1728,6 +1824,19 @@ impl DriverEnds {
                 {
                     telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                 }
+                match terminal {
+                    Some(lifecycle) => eprintln!(
+                        "bnc: {} parked ({}): {}",
+                        self.runtime.label(),
+                        lifecycle.as_str(),
+                        failure.summary(),
+                    ),
+                    None => eprintln!(
+                        "bnc: {} disconnected ({}); reconnecting",
+                        self.runtime.label(),
+                        failure.code(),
+                    ),
+                }
                 DriverEvent::Disconnected
             }
         };
@@ -1738,6 +1847,12 @@ impl DriverEnds {
 
     fn begin_attempt(&self) {
         self.runtime.begin_attempt();
+    }
+
+    /// Record when the next reconnect attempt fires (visible in the runtime
+    /// snapshot as `next_retry_at`), then cleared when a session connects.
+    fn schedule_retry(&self, delay: std::time::Duration) {
+        self.runtime.schedule_retry(delay);
     }
 
     /// Await the next downstream command; `None` when every handle is dropped

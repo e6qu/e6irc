@@ -64,6 +64,34 @@ pub(crate) fn monitor_event(
     }
 }
 
+/// The shared fan-out for a user-state event (AWAY, ACCOUNT, SETNAME,
+/// CHGHOST): deliver `line` to the subject's channel peers holding
+/// `event_cap`, then to extended-monitor watchers of the subject's nick —
+/// deduplicated against those peers. `include_self` echoes the line to the
+/// subject itself (SETHOST, which the renamed user must see); identity events
+/// that the client already originated skip it.
+pub(crate) fn notify_event(
+    state: &mut ServerState,
+    subject: ConnId,
+    line: &str,
+    event_cap: fn(&crate::core::state::Caps) -> bool,
+    include_self: bool,
+) {
+    let mut recipients: std::collections::HashSet<ConnId> =
+        state.channel_peers(subject).into_iter().collect();
+    if include_self {
+        recipients.insert(subject);
+    }
+    for peer in &recipients {
+        if state.sessions.get(peer).is_some_and(|s| event_cap(&s.caps)) {
+            state.send_timed(*peer, line);
+        }
+    }
+    if let Some(nick) = state.sessions[&subject].nick().map(String::from) {
+        monitor_event(state, &nick, line, event_cap, &recipients);
+    }
+}
+
 pub(super) fn monitor_status(
     state: &mut ServerState,
     conn: ConnId,

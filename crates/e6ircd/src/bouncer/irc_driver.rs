@@ -237,6 +237,58 @@ struct SharedDriver {
     joined: std::sync::Arc<JoinedChannels>,
 }
 
+/// The typed outcome of a timed-out registration attempt. Shared between the
+/// first attempt and the 433-retry so the two paths cannot diverge on what
+/// each `io::ErrorKind` means.
+enum RegistrationResult {
+    Ok(String),
+    AuthRejected,
+    /// 433 — nickname in use. Earns one replacement-nick retry without SASL.
+    NickInUse,
+    /// 432 / unsupported capability / etc.
+    RegistrationRejected,
+    Failed,
+    TimedOut,
+}
+
+fn classify_registration(
+    result: Result<Result<String, std::io::Error>, tokio::time::error::Elapsed>,
+) -> RegistrationResult {
+    match result {
+        Ok(Ok(nick)) => RegistrationResult::Ok(nick),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            RegistrationResult::AuthRejected
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            RegistrationResult::NickInUse
+        }
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Other | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            RegistrationResult::RegistrationRejected
+        }
+        Ok(Err(_)) => RegistrationResult::Failed,
+        Err(_) => RegistrationResult::TimedOut,
+    }
+}
+
+/// Map a [`RegistrationResult`] to the session-loop's terminal outcome when
+/// the caller is *not* taking the 433-retry branch.
+fn into_outcome(result: RegistrationResult) -> Result<String, super::SessionOutcome> {
+    match result {
+        RegistrationResult::Ok(nick) => Ok(nick),
+        RegistrationResult::AuthRejected => Err(super::SessionOutcome::AuthRejected),
+        RegistrationResult::NickInUse | RegistrationResult::RegistrationRejected => {
+            Err(super::SessionOutcome::RegistrationRejected)
+        }
+        RegistrationResult::Failed => Err(dropped(super::NetworkFailure::RegistrationFailed)),
+        RegistrationResult::TimedOut => Err(dropped(super::NetworkFailure::RegistrationTimedOut)),
+    }
+}
+
 async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::SessionOutcome {
     let config = &shared.config;
     // Bound connect + registration: an upstream that accepts the TCP handshake
@@ -265,55 +317,28 @@ async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::Se
             None => conn.register(&config.nick, &config.realname).await,
         }
     };
-    let mut current_nick = match tokio::time::timeout(Duration::from_secs(30), register_fut).await {
-        Ok(Ok(confirmed)) => confirmed,
-        // 433 without SASL: a lingering ghost of our own previous session
-        // (not yet timed out upstream) holds the nick. Offer one replacement
-        // rather than parking a healthy network until an operator intervenes;
-        // if the replacement is refused too, the rejection path below parks
-        // as before. SASL registrations skip the retry: their conflict means
-        // the account's nick is genuinely claimed elsewhere, and silently
-        // renaming would mask that — the repeated-rejection park surfaces it.
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists && config.sasl.is_none() => {
+    let mut current_nick = match classify_registration(
+        tokio::time::timeout(Duration::from_secs(30), register_fut).await,
+    ) {
+        RegistrationResult::NickInUse if config.sasl.is_none() => {
+            // A lingering ghost of our own previous session (not yet timed out
+            // upstream) holds the nick. Offer one replacement rather than
+            // parking a healthy network until an operator intervenes. SASL
+            // registrations skip the retry: their conflict means the account's
+            // nick is genuinely claimed elsewhere, and silently renaming would
+            // mask that.
             let alt = format!("{}_", config.nick);
-            match tokio::time::timeout(Duration::from_secs(30), conn.retry_nick(&alt)).await {
-                Ok(Ok(confirmed)) => confirmed,
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    return super::SessionOutcome::AuthRejected;
-                }
-                Ok(Err(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::AlreadyExists
-                            | std::io::ErrorKind::Other
-                            | std::io::ErrorKind::Unsupported
-                    ) =>
-                {
-                    return super::SessionOutcome::RegistrationRejected;
-                }
-                Ok(Err(_)) => return dropped(super::NetworkFailure::RegistrationFailed),
-                Err(_) => return dropped(super::NetworkFailure::RegistrationTimedOut),
+            match into_outcome(classify_registration(
+                tokio::time::timeout(Duration::from_secs(30), conn.retry_nick(&alt)).await,
+            )) {
+                Ok(nick) => nick,
+                Err(outcome) => return outcome,
             }
         }
-        // A terminal auth/registration refusal (bad password, banned) surfaces
-        // as `PermissionDenied` from the client — distinct from a transient
-        // connection error, so the reconnect loop can stop re-dialing rather
-        // than hammer the upstream with the same rejected credentials forever.
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return super::SessionOutcome::AuthRejected;
-        }
-        Ok(Err(e))
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::AlreadyExists
-                    | std::io::ErrorKind::Other
-                    | std::io::ErrorKind::Unsupported
-            ) =>
-        {
-            return super::SessionOutcome::RegistrationRejected;
-        }
-        Ok(Err(_)) => return dropped(super::NetworkFailure::RegistrationFailed),
-        Err(_) => return dropped(super::NetworkFailure::RegistrationTimedOut),
+        result => match into_outcome(result) {
+            Ok(nick) => nick,
+            Err(outcome) => return outcome,
+        },
     };
     // Join the configured autojoin plus every channel the upstream confirmed
     // us in before the drop (runtime joins are tracked in `shared.joined`).

@@ -111,8 +111,9 @@ when archives are requested.
   bridge driver.
 - Environment bootstrap renders to an unpredictable mode-`0600` file unless
   an operator explicitly supplies the path.
-- `deploy/` supplies the Terraform/ECS example, its deployment contract, and a
-  hardened systemd service for native Linux installation.
+- `deploy/` documents the environment-variable deployment contract and ships
+  a hardened systemd service for native Linux installation. The Terraform/ECS
+  example lives in the separate `e6qu/infra` repository, not in this one.
 - A tag exactly equal to `v` plus the workspace version builds `e6ircd`,
   `e6irc`, and `e6irc-tui` natively for Linux, macOS, and Windows on x86-64
   and ARM64. The six deterministic archives include documentation/license and
