@@ -45,14 +45,17 @@ cd "$(dirname "$0")/.."
 # largest files) → 3.6% (sweep 27: HTTP prologues became extractors, ChanServ's
 # founder gate became one function) → 3.5% (sweep 29: the four bridge
 # connect-retry loops became one `run_with_backoff`) → 3.3% (sweep 30: the
-# CHATHISTORY column list became one `history_select!`/`history_window!`).
+# CHATHISTORY column list became one `history_select!`/`history_window!`) →
+# 3.1% (sweep 31: the oper-only command gate became `require_oper`, and the
+# SASL IDENTIFY/REGISTER label-takes became `take_identify_label`/
+# `take_register_label`).
 #
 # What is left is mostly sqlx builder chains — `.bind().execute().await
 # .map_err()` — and per-route response shaping. Those are plumbing: abstracting
 # them would read worse than the repetition, so the number is expected to sit
 # here rather than keep falling. Lower it only when a real shared concept is
 # found, not by wrapping boilerplate to move a metric.
-THRESHOLD=3.3
+THRESHOLD=3.2
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."

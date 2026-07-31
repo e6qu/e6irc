@@ -41,13 +41,7 @@ fn verify_denied(
             // else: stale reply for an aborted SASL attempt — drop it.
         }
         crate::core::CredentialOrigin::NickServIdentify => {
-            let Some(label) = state
-                .sessions
-                .get_mut(&conn)
-                .expect("checked")
-                .pending_identify
-                .take()
-            else {
+            let Some(label) = take_identify_label(state, conn) else {
                 return; // stale IDENTIFY reply (superseded/aborted)
             };
             let text = if unavailable {
@@ -96,6 +90,30 @@ pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bo
         return false;
     }
     true
+}
+
+/// Take the in-flight NickServ IDENTIFY label, draining the session slot.
+/// `None` means no IDENTIFY was pending (a stale reply for one already
+/// superseded or aborted) — the caller drops it.
+fn take_identify_label(state: &mut ServerState, conn: ConnId) -> Option<Option<String>> {
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .pending_identify
+        .take()
+}
+
+/// Take the in-flight REGISTER label and flatten it: the outer Option is "a
+/// registration is pending", the inner the client's correlation label.
+fn take_register_label(state: &mut ServerState, conn: ConnId) -> Option<String> {
+    state
+        .sessions
+        .get_mut(&conn)
+        .expect("checked")
+        .pending_register
+        .take()
+        .flatten()
 }
 
 /// Upper bound on a reassembled SASL response (across 400-byte continuation
@@ -415,13 +433,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             account,
             origin: crate::core::CredentialOrigin::NickServIdentify,
         } => {
-            let Some(label) = state
-                .sessions
-                .get_mut(&conn)
-                .expect("checked")
-                .pending_identify
-                .take()
-            else {
+            let Some(label) = take_identify_label(state, conn) else {
                 return; // stale IDENTIFY reply (superseded/aborted)
             };
             state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
@@ -455,13 +467,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     "Services are temporarily unavailable. Try again later.",
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
-                    let label = state
-                        .sessions
-                        .get_mut(&conn)
-                        .expect("checked")
-                        .pending_register
-                        .take()
-                        .flatten();
+                    let label = take_register_label(state, conn);
                     let nick = state.sessions[&conn]
                         .nick()
                         .map(String::from)
@@ -500,13 +506,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     &format!("\x02{account}\x02 is now registered to your connection."),
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
-                    let label = state
-                        .sessions
-                        .get_mut(&conn)
-                        .expect("checked")
-                        .pending_register
-                        .take()
-                        .flatten();
+                    let label = take_register_label(state, conn);
                     let server = state.config.server_name.clone();
                     let account = account.clone();
                     state.emit_deferred_labeled(conn, label, move |state| {
@@ -534,13 +534,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     &format!("\x02{nick}\x02 is already registered."),
                 ),
                 crate::core::AccountOrigin::RegisterCommand => {
-                    let label = state
-                        .sessions
-                        .get_mut(&conn)
-                        .expect("checked")
-                        .pending_register
-                        .take()
-                        .flatten();
+                    let label = take_register_label(state, conn);
                     state.emit_deferred_labeled(conn, label, |state| {
                         register_fail(
                             state,

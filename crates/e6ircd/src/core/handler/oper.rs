@@ -56,16 +56,25 @@ pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     aws_lc_rs::constant_time::verify_slices_are_equal(da.as_ref(), db.as_ref()).is_ok()
 }
 
+/// Gate an oper-only command: reply `ERR_NOPRIVILEGES` and report `false`
+/// when the connection is not an IRC operator.
+fn require_oper(state: &mut ServerState, conn: ConnId) -> bool {
+    if state.sessions[&conn].oper {
+        return true;
+    }
+    state.numeric(
+        conn,
+        ERR_NOPRIVILEGES,
+        &[],
+        Some("Permission Denied- You're not an IRC operator"),
+    );
+    false
+}
+
 // ---- KILL ---------------------------------------------------------------
 
 pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    if !state.sessions[&conn].oper {
-        state.numeric(
-            conn,
-            ERR_NOPRIVILEGES,
-            &[],
-            Some("Permission Denied- You're not an IRC operator"),
-        );
+    if !require_oper(state, conn) {
         return;
     }
     let Some(&target) = p.first() else {
@@ -325,13 +334,7 @@ pub(super) fn cmd_add_ban(
     p: &[&str],
     has_trailing: bool,
 ) {
-    if !state.sessions[&conn].oper {
-        state.numeric(
-            conn,
-            ERR_NOPRIVILEGES,
-            &[],
-            Some("Permission Denied- You're not an IRC operator"),
-        );
+    if !require_oper(state, conn) {
         return;
     }
     let label = kind.label();
@@ -724,13 +727,7 @@ fn finish_admin_server_ban(
 /// UNKLINE/UNDLINE/UNXLINE <mask> — oper-only. Remove a server ban of the
 /// given kind.
 pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKind, p: &[&str]) {
-    if !state.sessions[&conn].oper {
-        state.numeric(
-            conn,
-            ERR_NOPRIVILEGES,
-            &[],
-            Some("Permission Denied- You're not an IRC operator"),
-        );
+    if !require_oper(state, conn) {
         return;
     }
     let label = kind.label();
@@ -797,13 +794,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
 /// (cloak) and announce it via CHGHOST to capable peers. This is the
 /// host-change trigger the chghost cap needs.
 pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    if !state.sessions[&conn].oper {
-        state.numeric(
-            conn,
-            ERR_NOPRIVILEGES,
-            &[],
-            Some("Permission Denied- You're not an IRC operator"),
-        );
+    if !require_oper(state, conn) {
         return;
     }
     let (Some(&nick), Some(&newhost)) = (p.first(), p.get(1)) else {
@@ -874,13 +865,7 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 // ---- WALLOPS ------------------------------------------------------------
 
 pub(super) fn cmd_wallops(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    if !state.sessions[&conn].oper {
-        state.numeric(
-            conn,
-            ERR_NOPRIVILEGES,
-            &[],
-            Some("Permission Denied- You're not an IRC operator"),
-        );
+    if !require_oper(state, conn) {
         return;
     }
     // Empty text (`WALLOPS :`) is ERR_NEEDMOREPARAMS, not an empty broadcast to
