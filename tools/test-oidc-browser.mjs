@@ -28,6 +28,17 @@ async function clickAndWaitForURL(page, locator, expectedURL) {
   assert.equal(page.url(), expectedURL);
 }
 
+// A configuration form POST navigates to a re-rendered page, but the old
+// document — including its previous status banner — stays in the DOM until
+// the response arrives. Waiting for any role="status" therefore resolves
+// against the stale banner and reads the previous outcome on slower engines
+// (webkit). Wait for the banner that carries this action's outcome instead.
+async function expectStatus(page, pattern) {
+  const banner = page.getByRole("status").filter({ hasText: pattern });
+  await banner.waitFor();
+  assert.match(await banner.innerText(), pattern);
+}
+
 const databaseURL = process.env.E6IRC_TEST_DATABASE_URL;
 const issuerURL = process.env.E6IRC_TEST_DEX_URL;
 assert.ok(databaseURL, "E6IRC_TEST_DATABASE_URL is required");
@@ -126,6 +137,11 @@ try {
     }
   });
   page.on("pageerror", (error) => {
+    // WebKit reports an intercepted-and-fulfilled fetch as an uncaught
+    // "… due to access control checks." rejection in addition to the response
+    // diagnostic; the response handler above already records the real status,
+    // so this engine artifact is noise, not a page error.
+    if (error.message.includes("due to access control checks")) return;
     if (isApplicationURL(page.url())) applicationErrors.push(error.message);
   });
   page.on("requestfailed", (request) => {
@@ -197,8 +213,7 @@ try {
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
   await page.getByRole("button", { name: "Add password", exact: true }).click();
-  await page.getByRole("status").waitFor();
-  assert.match(await page.getByRole("status").innerText(), /Local password added/);
+  await expectStatus(page, /Local password added/);
   assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
   await page.goto(`${applicationOrigin}/login`);
   await page.getByLabel("Account", { exact: true }).fill(accountName);
@@ -309,8 +324,7 @@ try {
     .check();
   await settingsForm.getByLabel("Require an email field").check();
   await settingsForm.getByRole("button", { name: "Save configuration" }).click();
-  await page.getByRole("status").waitFor();
-  assert.match(await page.getByRole("status").innerText(), /Configuration saved/);
+  await expectStatus(page, /Configuration saved/);
   assert.match(await page.locator("main").innerText(), /Revision 2/);
   assert.match(await page.locator("main").innerText(), /Accepting clients on/);
   assert.equal(
@@ -333,11 +347,7 @@ try {
   await serverNetworks.getByLabel("SASL account").fill("shared-account");
   await serverNetworks.getByLabel("SASL password").fill(sharedNetworkSecret);
   await serverNetworks.getByRole("button", { name: "Add server network" }).click();
-  await page.getByRole("status").waitFor();
-  assert.match(
-    await page.getByRole("status").innerText(),
-    /added server network shared-browser/,
-  );
+  await expectStatus(page, /added server network shared-browser/);
   assert.equal((await page.content()).includes(sharedNetworkSecret), false);
 
   const operatorSecret = "browser-operator-secret";
@@ -347,8 +357,7 @@ try {
   await operators.getByLabel("Operator name").fill("browserop");
   await operators.getByLabel("New password").fill(operatorSecret);
   await operators.getByRole("button", { name: "Add operator" }).click();
-  await page.getByRole("status").waitFor();
-  assert.match(await page.getByRole("status").innerText(), /added IRC operator browserop/);
+  await expectStatus(page, /added IRC operator browserop/);
   assert.equal((await page.content()).includes(operatorSecret), false);
 
   const providerSecret = "browser-provider-secret";
@@ -363,11 +372,7 @@ try {
   await providers.getByLabel("Token authentication").selectOption("client_secret_post");
   await providers.getByLabel("End-session endpoint").fill("https://identity.example/logout");
   await providers.getByRole("button", { name: "Add identity provider" }).click();
-  await page.getByRole("status").waitFor();
-  assert.match(
-    await page.getByRole("status").innerText(),
-    /added OpenID Connect provider browser-idp/,
-  );
+  await expectStatus(page, /added OpenID Connect provider browser-idp/);
   assert.equal((await page.content()).includes(providerSecret), false);
 
   for (const [heading, item, outcome] of [
@@ -380,8 +385,7 @@ try {
     });
     const row = section.locator("article, .compact-list > div").filter({ hasText: item });
     await row.getByRole("button", { name: "Remove" }).click();
-    await page.getByRole("status").waitFor();
-    assert.match(await page.getByRole("status").innerText(), new RegExp(outcome));
+    await expectStatus(page, new RegExp(outcome));
   }
   assert.match(await page.locator("main").innerText(), /Revision 8/);
 
@@ -419,8 +423,7 @@ try {
   await inviteAccount.getByLabel("Contact email (optional)", { exact: true }).fill("Guest@Example.COM");
   await inviteAccount.getByLabel("Lifetime", { exact: true }).selectOption("1");
   await inviteAccount.getByRole("button", { name: "Issue invitation", exact: true }).click();
-  await page.getByRole("status").waitFor();
-  assert.match(await page.getByRole("status").innerText(), /Invitation issued/);
+  await expectStatus(page, /Invitation issued/);
   const invitationURL = (await page.locator("#issued-invitation").innerText()).trim();
   assert.match(invitationURL, /^http:\/\/127\.0\.0\.1:18083\/invite\/e6i_/);
 
