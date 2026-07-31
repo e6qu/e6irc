@@ -408,6 +408,18 @@ const VALUE_CAPS: &[ValueCap] = &[
     },
 ];
 
+/// Mark a connection as mid-CAP-negotiation (which holds registration) unless
+/// it is already registered — shared by CAP LS and CAP REQ.
+fn mark_negotiating(state: &mut ServerState, conn: ConnId) {
+    if !state.sessions[&conn].is_registered() {
+        state
+            .sessions
+            .get_mut(&conn)
+            .expect("checked")
+            .cap_negotiating = true;
+    }
+}
+
 pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let server = state.config.server_name.clone();
     let target = cap_target(state, conn);
@@ -417,13 +429,7 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .unwrap_or_default();
     match sub.as_str() {
         "LS" => {
-            if !state.sessions[&conn].is_registered() {
-                state
-                    .sessions
-                    .get_mut(&conn)
-                    .expect("checked")
-                    .cap_negotiating = true;
-            }
+            mark_negotiating(state, conn);
             let v302 = p.get(1).is_some_and(|v| *v == "302");
             let mut names: Vec<String> = CAP_NAMES.iter().map(|(n, _)| n.to_string()).collect();
             // The value-carrying caps advertise from the shared registry, so LS
@@ -461,13 +467,7 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         }
         "REQ" => {
             let request = p.get(1).copied().unwrap_or("");
-            if !state.sessions[&conn].is_registered() {
-                state
-                    .sessions
-                    .get_mut(&conn)
-                    .expect("checked")
-                    .cap_negotiating = true;
-            }
+            mark_negotiating(state, conn);
             // All-or-nothing: apply to a copy, commit only if every
             // token is known.
             let mut caps = state.sessions[&conn].caps;

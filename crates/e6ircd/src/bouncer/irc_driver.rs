@@ -491,6 +491,13 @@ fn track_membership(
         .and_then(|source| source.split(['!', '@']).next());
     let is_us =
         |candidate: Option<&str>| candidate.is_some_and(|nick| casemap.eq(nick, current_nick));
+    let untrack = |chan: &String| {
+        joined
+            .0
+            .lock()
+            .expect("joined set poisoned")
+            .remove(&casemap.casefold(chan));
+    };
     match m.command.as_str() {
         "NICK" if is_us(prefix_nick) => {
             if let Some(new_nick) = m.params.first() {
@@ -508,21 +515,13 @@ fn track_membership(
         }
         "PART" if is_us(prefix_nick) => {
             if let Some(chan) = m.params.first() {
-                joined
-                    .0
-                    .lock()
-                    .expect("joined set poisoned")
-                    .remove(&casemap.casefold(chan));
+                untrack(chan);
             }
         }
         // Being kicked from a channel ends membership exactly like a PART.
         "KICK" if is_us(m.params.get(1).map(String::as_str)) => {
             if let Some(chan) = m.params.first() {
-                joined
-                    .0
-                    .lock()
-                    .expect("joined set poisoned")
-                    .remove(&casemap.casefold(chan));
+                untrack(chan);
             }
         }
         _ => {}

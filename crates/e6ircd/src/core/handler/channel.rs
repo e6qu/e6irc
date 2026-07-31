@@ -805,13 +805,7 @@ pub(super) fn channel_topic_set(
         label,
     } = applied;
     let key = state.chan_key(&channel);
-    if state
-        .pending_channel_topics
-        .get(&key)
-        .is_some_and(|(pending_revision, _)| *pending_revision == revision)
-    {
-        state.pending_channel_topics.remove(&key);
-    }
+    clear_pending_topic(state, &key, revision);
     let new_topic = topic.map(|(text, set_by, set_at_secs)| Topic {
         text,
         set_by,
@@ -843,6 +837,19 @@ pub(super) fn channel_topic_set(
     }
 }
 
+/// Drop a pending topic write only if it is still the one this reply
+/// resolves (a newer request superseded it otherwise) — shared by the applied
+/// and failed paths.
+fn clear_pending_topic(state: &mut ServerState, key: &crate::core::state::ChanKey, revision: u64) {
+    if state
+        .pending_channel_topics
+        .get(key)
+        .is_some_and(|(pending_revision, _)| *pending_revision == revision)
+    {
+        state.pending_channel_topics.remove(key);
+    }
+}
+
 pub(super) fn channel_topic_failed(
     state: &mut ServerState,
     conn: ConnId,
@@ -853,13 +860,7 @@ pub(super) fn channel_topic_failed(
     failure: crate::core::ChannelTopicFailure,
 ) {
     let key = state.chan_key(&channel);
-    if state
-        .pending_channel_topics
-        .get(&key)
-        .is_some_and(|(pending_revision, _)| *pending_revision == revision)
-    {
-        state.pending_channel_topics.remove(&key);
-    }
+    clear_pending_topic(state, &key, revision);
     if state.sessions.contains_key(&conn) {
         let server = state.config.server_name.clone();
         let (code, message) = match failure {

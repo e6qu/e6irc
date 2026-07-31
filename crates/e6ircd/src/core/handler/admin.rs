@@ -567,6 +567,12 @@ fn disconnect_own_connection(
     }
 }
 
+fn err_unknown_ban_kind(kind_in: &str) -> AdminReply {
+    AdminReply::Err(format!(
+        "unknown ban kind '{kind_in}' (want kline, dline or xline)"
+    ))
+}
+
 fn begin_add_ban(
     state: &mut ServerState,
     mask_in: &str,
@@ -576,9 +582,7 @@ fn begin_add_ban(
     reply: tokio::sync::oneshot::Sender<AdminReply>,
 ) {
     let Some(kind) = BanKind::from_token(kind_in) else {
-        let _ = reply.send(AdminReply::Err(format!(
-            "unknown ban kind '{kind_in}' (want kline, dline or xline)"
-        )));
+        let _ = reply.send(err_unknown_ban_kind(kind_in));
         return;
     };
     // Reuse the oper mask normalization + netban ("matches everyone") refusal so
@@ -619,13 +623,8 @@ fn begin_add_ban(
         )));
         return;
     }
-    let mutation = crate::core::ServerBanMutation::Add {
-        mask: mask.folded().to_string(),
-        mask_display: mask.as_str().to_string(),
-        reason: reason.to_string(),
-        set_by: actor.clone(),
-        kind: kind.as_str().to_string(),
-    };
+    let mutation =
+        crate::core::ServerBanMutation::add(&mask, kind, reason.to_string(), actor.clone());
     queue_admin_server_ban(state, kind, mutation, actor, reply);
 }
 
@@ -637,9 +636,7 @@ fn begin_remove_ban(
     reply: tokio::sync::oneshot::Sender<AdminReply>,
 ) {
     let Some(kind) = BanKind::from_token(kind_in) else {
-        let _ = reply.send(AdminReply::Err(format!(
-            "unknown ban kind '{kind_in}' (want kline, dline or xline)"
-        )));
+        let _ = reply.send(err_unknown_ban_kind(kind_in));
         return;
     };
     // Fold like enforcement (mirror cmd_remove_ban) so a differently-cased
@@ -666,12 +663,7 @@ fn begin_remove_ban(
         )));
         return;
     }
-    let mutation = crate::core::ServerBanMutation::Remove {
-        mask: mask.folded().to_string(),
-        mask_display: mask.as_str().to_string(),
-        kind: kind.as_str().to_string(),
-        actor: actor.clone(),
-    };
+    let mutation = crate::core::ServerBanMutation::remove(&mask, kind, actor.clone());
     queue_admin_server_ban(state, kind, mutation, actor, reply);
 }
 

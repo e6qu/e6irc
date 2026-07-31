@@ -399,13 +399,7 @@ pub(super) fn cmd_add_ban(
         apply_server_ban_hot(state, mask, kind, &reason, &nick, label);
         return;
     }
-    let mutation = crate::core::ServerBanMutation::Add {
-        mask: mask.folded().to_string(),
-        mask_display: mask.as_str().to_string(),
-        reason,
-        set_by: nick,
-        kind: kind.as_str().to_string(),
-    };
+    let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick);
     begin_oper_server_ban(state, conn, label, &mask, mutation);
 }
 
@@ -766,12 +760,7 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         );
         return;
     }
-    let mutation = crate::core::ServerBanMutation::Remove {
-        mask: mask.folded().to_string(),
-        mask_display: mask.as_str().to_string(),
-        kind: kind.as_str().to_string(),
-        actor: nick,
-    };
+    let mutation = crate::core::ServerBanMutation::remove(&mask, kind, nick);
     begin_oper_server_ban(state, conn, label, &mask, mutation);
 }
 

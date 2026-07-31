@@ -937,18 +937,20 @@ fn chanserv_deferred_notice(
     }
 }
 
-pub(super) fn channel_keeptopic_unavailable(
+/// A channel-field update (KEEPTOPIC, MLOCK) whose services round-trip failed.
+pub(super) fn channel_field_unavailable(
     state: &mut ServerState,
     conn: ConnId,
     display: String,
     label: Option<String>,
+    field: &str,
 ) {
     chanserv_deferred_notice(
         state,
         conn,
         label,
         format!(
-            "Could not update KEEPTOPIC for \x02{display}\x02 — services are temporarily \
+            "Could not update {field} for \x02{display}\x02 — services are temporarily \
              unavailable."
         ),
     );
@@ -1017,23 +1019,6 @@ pub(super) fn channel_mlock_set(
             }
         });
     }
-}
-
-pub(super) fn channel_mlock_unavailable(
-    state: &mut ServerState,
-    conn: ConnId,
-    display: String,
-    label: Option<String>,
-) {
-    chanserv_deferred_notice(
-        state,
-        conn,
-        label,
-        format!(
-            "Could not update MLOCK for \x02{display}\x02 — services are temporarily \
-             unavailable."
-        ),
-    );
 }
 
 pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {

@@ -87,6 +87,18 @@ pub(super) async fn discover_client(
     .set_auth_type(auth_type))
 }
 
+/// Discover the client, or answer `BAD_GATEWAY` when the IdP is unreachable —
+/// the shared failure shape of the start and callback handlers.
+async fn discover_client_or_bad_gateway(
+    state: &AppState,
+    provider: &OidcProviderConfig,
+) -> Result<OidcClient, Response> {
+    discover_client(state, provider).await.map_err(|e| {
+        eprintln!("oidc: {e}");
+        problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None)
+    })
+}
+
 /// TTL for a cached OIDC discovery document (and its JWKS). Bounds outbound
 /// fetches so an unauthenticated flood of login/logout requests can't amplify
 /// into one IdP round-trip each.
@@ -203,12 +215,9 @@ pub(super) async fn oidc_authorize(
     else {
         return problem(StatusCode::NOT_FOUND, "Unknown OIDC provider", None);
     };
-    let client = match discover_client(state, &provider).await {
+    let client = match discover_client_or_bad_gateway(state, &provider).await {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("oidc: {e}");
-            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
-        }
+        Err(resp) => return resp,
     };
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     let mut request = client
@@ -382,12 +391,9 @@ pub(super) async fn oidc_callback(
         .find(|p| p.name == provider_name)
         .cloned()
         .expect("pending auth references a configured provider");
-    let client = match discover_client(&state, &provider).await {
+    let client = match discover_client_or_bad_gateway(&state, &provider).await {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("oidc: {e}");
-            return problem(StatusCode::BAD_GATEWAY, "OIDC provider unreachable", None);
-        }
+        Err(resp) => return resp,
     };
     let token_response = match client
         .exchange_code(AuthorizationCode::new(code))
@@ -759,13 +765,7 @@ pub(super) async fn oidc_backchannel_logout(
     State(state): State<Arc<AppState>>,
     form: Result<Form<BackchannelLogoutForm>, axum::extract::rejection::FormRejection>,
 ) -> Response {
-    let Some(pool) = &state.pool else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured",
-            None,
-        );
-    };
+    let pool = require_pool!(state);
     let Form(form) = match form {
         Ok(value) => value,
         Err(_) => return problem(StatusCode::BAD_REQUEST, "Invalid logout token", None),
@@ -836,13 +836,7 @@ pub(super) async fn oidc_frontchannel_logout(
     _rl: RateLimited,
     Query(query): Query<FrontchannelLogoutQuery>,
 ) -> Response {
-    let Some(pool) = &state.pool else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured",
-            None,
-        );
-    };
+    let pool = require_pool!(state);
     if query.sid.trim().is_empty()
         || !state
             .oidc_providers
