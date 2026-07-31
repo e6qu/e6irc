@@ -1347,11 +1347,7 @@ mod tests {
 
     fn listening_config() -> Config {
         Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             ..Config::default()
         }
     }
@@ -1705,6 +1701,17 @@ mod tests {
         })
     }
 
+    /// The plain-TCP test listener shared by every config-construction test —
+    /// one loopback address, no TLS, no websocket. Extracted because every
+    /// `Config { .. }` in this module repeated it verbatim.
+    fn listener() -> ListenerConfig {
+        ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }
+    }
+
     #[test]
     fn irc_network_address_requires_host_and_nonzero_numeric_port() {
         for addr in [
@@ -1716,11 +1723,7 @@ mod tests {
             let mut network = net("custom", None);
             network.addr = addr.into();
             let cfg = Config {
-                listeners: vec![ListenerConfig {
-                    addr: "127.0.0.1:0".parse().unwrap(),
-                    tls: None,
-                    websocket: false,
-                }],
+                listeners: vec![listener()],
                 networks: vec![network],
                 bnc: bnc(),
                 database: db(),
@@ -1733,11 +1736,7 @@ mod tests {
         let mut network = net("ipv6", None);
         network.addr = "[2001:db8::1]:6697".into();
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![network],
             bnc: bnc(),
             database: db(),
@@ -1749,11 +1748,7 @@ mod tests {
     #[test]
     fn bridge_config_uses_the_same_canonical_shapes_as_the_driver_factory() {
         let bridge_config = |network| Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![network],
             bnc: bnc(),
             database: db(),
@@ -1802,11 +1797,7 @@ mod tests {
     #[test]
     fn configured_network_credentials_are_complete_nonempty_and_bounded() {
         let config = |network| Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![network],
             bnc: bnc(),
             database: db(),
@@ -1841,11 +1832,7 @@ mod tests {
     #[test]
     fn same_network_name_across_distinct_owners_is_ok() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![net("libera", Some("alice")), net("libera", Some("bob"))],
             bnc: bnc(),
             database: db(),
@@ -1876,11 +1863,7 @@ mod tests {
     #[test]
     fn duplicate_owner_and_name_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![net("Libera", Some("Alice")), net("libera", Some("alice"))],
             bnc: bnc(),
             database: db(),
@@ -1892,11 +1875,7 @@ mod tests {
     #[test]
     fn name_both_shared_and_owned_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![net("Libera", None), net("libera", Some("alice"))],
             bnc: bnc(),
             database: db(),
@@ -1909,11 +1888,7 @@ mod tests {
     #[test]
     fn networks_without_database_are_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![net("libera", None)],
             ..Config::default()
         };
@@ -1924,11 +1899,7 @@ mod tests {
     #[test]
     fn database_networks_do_not_require_raw_attach_listener() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             networks: vec![net("libera", None)],
             database: db(),
             ..Config::default()
@@ -1939,11 +1910,7 @@ mod tests {
     #[test]
     fn zero_command_burst_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             limits: LimitsConfig {
                 command_burst: Some(0),
                 ..LimitsConfig::default()
@@ -1959,11 +1926,7 @@ mod tests {
     #[test]
     fn zero_registration_burst_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             limits: LimitsConfig {
                 registration_burst: Some(0),
                 ..LimitsConfig::default()
@@ -1981,13 +1944,8 @@ mod tests {
         let bootstrap = Some(BootstrapConfig {
             token: "0123456789abcdef0123456789abcdef".into(),
         });
-        let listener = ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-            websocket: false,
-        };
         let mut config = Config {
-            listeners: vec![listener],
+            listeners: vec![listener()],
             bootstrap: bootstrap.clone(),
             ..Config::default()
         };
@@ -2021,11 +1979,7 @@ mod tests {
         // `count >= 0` is always true, so a max of 0 refuses every connection —
         // the server would boot and silently reject all traffic.
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             limits: LimitsConfig {
                 max_connections_per_ip: Some(0),
                 ..LimitsConfig::default()
@@ -2041,11 +1995,7 @@ mod tests {
     #[test]
     fn oversized_nicklen_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             nicklen: 500,
             ..Config::default()
         };
@@ -2058,11 +2008,7 @@ mod tests {
     #[test]
     fn registration_without_database_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             registration: RegistrationConfig {
                 before_connect: true,
                 ..RegistrationConfig::default()
@@ -2079,11 +2025,7 @@ mod tests {
     #[test]
     fn zero_max_hot_channels_is_rejected() {
         let cfg = Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             max_hot_channels: 0,
             ..Config::default()
         };
@@ -2095,11 +2037,7 @@ mod tests {
 
     fn oidc_config(name: &str, issuer: &str, end_session: Option<&str>) -> Config {
         Config {
-            listeners: vec![ListenerConfig {
-                addr: "127.0.0.1:0".parse().unwrap(),
-                tls: None,
-                websocket: false,
-            }],
+            listeners: vec![listener()],
             http: Some(HttpConfig {
                 addr: "127.0.0.1:0".parse().unwrap(),
                 public_url: Some("https://chat.example".into()),

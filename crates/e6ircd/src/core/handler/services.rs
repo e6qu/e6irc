@@ -922,24 +922,36 @@ pub(super) fn channel_keeptopic_set(
     }
 }
 
+/// Emit a deferred, labeled ChanServ NOTICE to the connection if it is still
+/// present — the shared shape of the per-field `*_unavailable` replies.
+fn chanserv_deferred_notice(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<String>,
+    text: String,
+) {
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, move |state| {
+            state.service_notice(conn, "ChanServ", &text);
+        });
+    }
+}
+
 pub(super) fn channel_keeptopic_unavailable(
     state: &mut ServerState,
     conn: ConnId,
     display: String,
     label: Option<String>,
 ) {
-    if state.sessions.contains_key(&conn) {
-        state.emit_deferred_labeled(conn, label, |state| {
-            state.service_notice(
-                conn,
-                "ChanServ",
-                &format!(
-                    "Could not update KEEPTOPIC for \x02{display}\x02 — services are \
-                     temporarily unavailable."
-                ),
-            );
-        });
-    }
+    chanserv_deferred_notice(
+        state,
+        conn,
+        label,
+        format!(
+            "Could not update KEEPTOPIC for \x02{display}\x02 — services are temporarily \
+             unavailable."
+        ),
+    );
 }
 
 pub(super) fn channel_mlock_set(
@@ -1013,18 +1025,15 @@ pub(super) fn channel_mlock_unavailable(
     display: String,
     label: Option<String>,
 ) {
-    if state.sessions.contains_key(&conn) {
-        state.emit_deferred_labeled(conn, label, |state| {
-            state.service_notice(
-                conn,
-                "ChanServ",
-                &format!(
-                    "Could not update MLOCK for \x02{display}\x02 — services are temporarily \
-                     unavailable."
-                ),
-            );
-        });
-    }
+    chanserv_deferred_notice(
+        state,
+        conn,
+        label,
+        format!(
+            "Could not update MLOCK for \x02{display}\x02 — services are temporarily \
+             unavailable."
+        ),
+    );
 }
 
 pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId) {

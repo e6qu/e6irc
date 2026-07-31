@@ -48,14 +48,17 @@ cd "$(dirname "$0")/.."
 # CHATHISTORY column list became one `history_select!`/`history_window!`) →
 # 3.1% (sweep 31: the oper-only command gate became `require_oper`, and the
 # SASL IDENTIFY/REGISTER label-takes became `take_identify_label`/
-# `take_register_label`).
+# `take_register_label`) → 3.0% (sweep 32: config test `ListenerConfig`
+# boilerplate became `listener()`, the ChanServ `*_unavailable` notices
+# became `chanserv_deferred_notice`, and the main/subcommand config-load
+# became `load_config_or_fail`).
 #
 # What is left is mostly sqlx builder chains — `.bind().execute().await
 # .map_err()` — and per-route response shaping. Those are plumbing: abstracting
 # them would read worse than the repetition, so the number is expected to sit
 # here rather than keep falling. Lower it only when a real shared concept is
 # found, not by wrapping boilerplate to move a metric.
-THRESHOLD=3.2
+THRESHOLD=3.0
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."
