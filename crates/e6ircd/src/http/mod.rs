@@ -109,7 +109,7 @@ pub struct AppState {
     /// Master key for sealing upstream secrets at rest; `None` when no
     /// key is configured (then networks with an upstream password are
     /// refused rather than stored in the clear).
-    pub secret_key: Option<std::sync::Arc<crate::secret::SecretKey>>,
+    pub secret_key: Option<std::sync::Arc<crate::secret::SecretKeyring>>,
     /// Accounts permitted to use the `/api/v1/admin` endpoints (rfc1459
     /// casefolded at startup). Empty = admin disabled.
     pub admin_accounts: std::sync::RwLock<std::collections::HashSet<String>>,
@@ -999,6 +999,7 @@ documented_routes! {
     "/api/v1/me/credentials" => { get: list_credentials },
     "/api/v1/me/credentials/{id}" => { delete: revoke_credential },
     "/api/v1/me/networks" => { get: list_networks, post: create_network },
+    "/api/v1/me/networks/preflight" => { post: preflight_network },
     "/api/v1/me/networks/{name}" => {
         get: get_network,
         put: update_network,
@@ -1175,6 +1176,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/console/networks/{name}/delete",
             post(pages::console_delete_network),
+        )
+        .route(
+            "/console/networks/preflight",
+            post(pages::console_preflight_network),
         )
         .route(
             "/console/networks/{name}/toggle",
@@ -4720,6 +4725,7 @@ mod pages {
         slack_built: bool,
         http_bind: String,
         has_master_key: bool,
+        master_key_count: usize,
         release_revision: String,
         outcome: Option<String>,
         success: bool,
@@ -5057,6 +5063,7 @@ mod pages {
                 .map(|address| address.to_string())
                 .unwrap_or_else(|| "dedicated WebSocket listener only".into()),
             has_master_key: state.secret_key.is_some(),
+            master_key_count: state.secret_key.as_ref().map_or(0, |keys| keys.key_count()),
             release_revision: state
                 .application_release_revision
                 .clone()
@@ -5723,6 +5730,14 @@ mod pages {
         error: Option<String>,
     }
 
+    struct NetworkPreflightView {
+        confirmed_nick: String,
+        resolved_addresses: usize,
+        dns_ms: u64,
+        connect_ms: u64,
+        registration_ms: u64,
+    }
+
     #[derive(Template)]
     #[template(path = "console_networks.html")]
     struct ConsoleNetworks {
@@ -5735,6 +5750,7 @@ mod pages {
         presets: &'static [IrcNetworkPreset],
         form: NetworkFormView,
         error: Option<String>,
+        success: Option<NetworkPreflightView>,
         can_store_secrets: bool,
     }
 
@@ -6117,6 +6133,7 @@ mod pages {
         csrf: String,
         form: NetworkFormView,
         error: Option<String>,
+        success: Option<NetworkPreflightView>,
     ) -> Response {
         let is_admin = is_admin_account(state, &account);
         let networks = match console_network_views(state, &account).await {
@@ -6137,6 +6154,7 @@ mod pages {
             presets: IRC_NETWORK_PRESETS,
             form,
             error,
+            success,
             can_store_secrets: state.secret_key.is_some(),
         })
     }
@@ -6155,7 +6173,7 @@ mod pages {
             .map(|session| state.csrf_token(&session))
             .unwrap_or_default();
         let form = NetworkFormView::libera(&account);
-        console_networks_page(&state, account, csrf, form, None).await
+        console_networks_page(&state, account, csrf, form, None, None).await
     }
 
     /// Add a network from the console and return to the canonical list.
@@ -6185,6 +6203,7 @@ mod pages {
                 csrf,
                 form_view,
                 Some("The network registry is not available on this server.".into()),
+                None,
             )
             .await;
         };
@@ -6197,15 +6216,89 @@ mod pages {
                     csrf,
                     form_view,
                     Some(error.message()),
+                    None,
                 )
                 .await;
             }
         };
         if let Err(error) = create_network_core(&state, registry, &account, &req).await {
-            return console_networks_page(&state, account, csrf, form_view, Some(error.message()))
-                .await;
+            return console_networks_page(
+                &state,
+                account,
+                csrf,
+                form_view,
+                Some(error.message()),
+                None,
+            )
+            .await;
         }
         Redirect::to("/console/networks").into_response()
+    }
+
+    /// Exercise the exact production IRC dial and registration path while
+    /// retaining the form for a subsequent create. The preflight has no
+    /// durable side effect and never starts a reconnect loop.
+    pub async fn console_preflight_network(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let mut fields = match parse_form(form) {
+            Ok(fields) => fields,
+            Err(response) => return response,
+        };
+        let account = match require_form_actor(&state, &headers, &fields.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        if let Err(error) = fields.apply_preset() {
+            let form_view = NetworkFormView::submitted(&fields);
+            return console_networks_page(
+                &state,
+                account,
+                csrf,
+                form_view,
+                Some(error.message()),
+                None,
+            )
+            .await;
+        }
+        let form_view = NetworkFormView::submitted(&fields);
+        let create = fields.into_resolved_create();
+        let request = PreflightNetwork {
+            addr: create.addr,
+            tls: create.tls,
+            nick: create.nick,
+            realname: create.realname,
+            sasl_account: create.sasl_account,
+            sasl_password: create.sasl_password,
+        };
+        match preflight_network_core(request).await {
+            Ok(result) => {
+                let view = NetworkPreflightView {
+                    confirmed_nick: result.confirmed_nick,
+                    resolved_addresses: result.resolved_addresses,
+                    dns_ms: result.dns_ms,
+                    connect_ms: result.connect_ms,
+                    registration_ms: result.registration_ms,
+                };
+                console_networks_page(&state, account, csrf, form_view, None, Some(view)).await
+            }
+            Err(error) => {
+                console_networks_page(
+                    &state,
+                    account,
+                    csrf,
+                    form_view,
+                    Some(error.message()),
+                    None,
+                )
+                .await
+            }
+        }
     }
 
     /// Delete an owner-scoped network and stop its live driver.
@@ -7677,7 +7770,7 @@ mod pages {
             no_store(headers);
             headers.insert(
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+                "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
                     .parse()
                     .expect("static header"),
             );
@@ -7700,7 +7793,7 @@ mod pages {
             no_store(headers);
             headers.insert(
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+                "default-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
                     .parse()
                     .expect("static header"),
             );

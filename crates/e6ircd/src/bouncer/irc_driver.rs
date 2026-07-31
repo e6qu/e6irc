@@ -4,6 +4,7 @@
 //! emits [`DriverEvent`]s and accepts raw command lines.
 
 use std::time::Duration;
+use std::time::Instant;
 
 use e6irc_client::{Connection, RelayEvent};
 
@@ -51,6 +52,154 @@ impl IrcNetwork {
         tokio::spawn(run(config, ends));
         handle
     }
+}
+
+/// A successful, side-effect-free IRC upstream qualification. The connection
+/// is closed after registration and no channels are joined. Timings are split
+/// at the same boundaries operators must diagnose: name resolution, transport
+/// establishment (including TLS), and IRC registration (including SASL).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IrcPreflight {
+    pub resolved_addresses: usize,
+    pub dns_ms: u64,
+    pub connect_ms: u64,
+    pub registration_ms: u64,
+    pub confirmed_nick: String,
+}
+
+/// Closed failure taxonomy for an IRC preflight. Raw resolver, TLS, and server
+/// errors stay in the server log; the API exposes only these actionable,
+/// non-secret stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrcPreflightFailure {
+    InvalidAddress,
+    NameResolutionFailed,
+    AddressBlocked,
+    ConnectionFailed,
+    SecureConnectionFailed,
+    ConnectionTimedOut,
+    AuthenticationRejected,
+    RegistrationRejected,
+    RegistrationFailed,
+    RegistrationTimedOut,
+}
+
+impl IrcPreflightFailure {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidAddress => "invalid_address",
+            Self::NameResolutionFailed => "name_resolution_failed",
+            Self::AddressBlocked => "address_blocked",
+            Self::ConnectionFailed => "connection_failed",
+            Self::SecureConnectionFailed => "secure_connection_failed",
+            Self::ConnectionTimedOut => "connection_timed_out",
+            Self::AuthenticationRejected => "authentication_rejected",
+            Self::RegistrationRejected => "registration_rejected",
+            Self::RegistrationFailed => "registration_failed",
+            Self::RegistrationTimedOut => "registration_timed_out",
+        }
+    }
+
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::InvalidAddress => "The upstream address is not a valid host and port.",
+            Self::NameResolutionFailed => "The upstream hostname could not be resolved.",
+            Self::AddressBlocked => {
+                "The hostname resolves only to addresses blocked by the upstream safety policy."
+            }
+            Self::ConnectionFailed => "A TCP connection to the upstream could not be established.",
+            Self::SecureConnectionFailed => {
+                "The TLS connection or certificate verification failed."
+            }
+            Self::ConnectionTimedOut => "Connecting to the upstream timed out.",
+            Self::AuthenticationRejected => "The upstream rejected the SASL credentials.",
+            Self::RegistrationRejected => "The upstream rejected IRC registration.",
+            Self::RegistrationFailed => "IRC registration failed before a welcome was received.",
+            Self::RegistrationTimedOut => "IRC registration timed out.",
+        }
+    }
+}
+
+/// Resolve, connect, and register exactly as the always-on IRC driver does,
+/// without persisting configuration or starting a reconnect loop.
+pub async fn preflight_irc(config: &NetworkConfig) -> Result<IrcPreflight, IrcPreflightFailure> {
+    if upstream_host(&config.addr).is_err() {
+        return Err(IrcPreflightFailure::InvalidAddress);
+    }
+
+    let dns_started = Instant::now();
+    let addresses = tokio::time::timeout(Duration::from_secs(10), resolve_vetted(&config.addr))
+        .await
+        .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
+        .map_err(|error| {
+            eprintln!("irc preflight: name resolution failed: {error}");
+            IrcPreflightFailure::NameResolutionFailed
+        })?;
+    if addresses.is_empty() {
+        return Err(IrcPreflightFailure::AddressBlocked);
+    }
+    let dns_ms = elapsed_millis(dns_started.elapsed());
+    let resolved_addresses = addresses.len();
+
+    let connect_started = Instant::now();
+    let mut connection =
+        tokio::time::timeout(Duration::from_secs(30), connect_resolved(config, addresses))
+            .await
+            .map_err(|_| IrcPreflightFailure::ConnectionTimedOut)?
+            .map_err(|error| {
+                eprintln!("irc preflight: transport failed: {error}");
+                if config.tls {
+                    IrcPreflightFailure::SecureConnectionFailed
+                } else {
+                    IrcPreflightFailure::ConnectionFailed
+                }
+            })?;
+    let connect_ms = elapsed_millis(connect_started.elapsed());
+
+    let registration_started = Instant::now();
+    let registration = async {
+        match &config.sasl {
+            Some((account, password)) => {
+                connection
+                    .register_sasl(&config.nick, &config.realname, account, password)
+                    .await
+            }
+            None => connection.register(&config.nick, &config.realname).await,
+        }
+    };
+    let confirmed_nick = match tokio::time::timeout(Duration::from_secs(30), registration).await {
+        Ok(Ok(confirmed_nick)) => confirmed_nick,
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(IrcPreflightFailure::AuthenticationRejected);
+        }
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::Other
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            return Err(IrcPreflightFailure::RegistrationRejected);
+        }
+        Ok(Err(error)) => {
+            eprintln!("irc preflight: registration failed: {error}");
+            return Err(IrcPreflightFailure::RegistrationFailed);
+        }
+        Err(_) => return Err(IrcPreflightFailure::RegistrationTimedOut),
+    };
+
+    Ok(IrcPreflight {
+        resolved_addresses,
+        dns_ms,
+        connect_ms,
+        registration_ms: elapsed_millis(registration_started.elapsed()),
+        confirmed_nick,
+    })
+}
+
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u64::MAX as u128) as u64
 }
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
@@ -222,19 +371,29 @@ async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     // `169.254.169.254` (or a DNS rebind between creation and now) would reach an
     // internal target. Connecting to the specific vetted socket address closes
     // both: resolution can't differ between the check and the connect.
-    let vetted = interleave_address_families(
-        tokio::net::lookup_host(&config.addr)
-            .await?
-            .filter(|address| !crate::http::networks::is_blocked_upstream_ip(address.ip()))
-            .collect(),
-    );
+    let vetted = resolve_vetted(&config.addr).await?;
     if vetted.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "upstream address resolves only to blocked/internal targets",
         ));
     }
+    connect_resolved(config, vetted).await
+}
 
+async fn resolve_vetted(addr: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    Ok(interleave_address_families(
+        tokio::net::lookup_host(addr)
+            .await?
+            .filter(|address| !crate::http::networks::is_blocked_upstream_ip(address.ip()))
+            .collect(),
+    ))
+}
+
+async fn connect_resolved(
+    config: &NetworkConfig,
+    vetted: Vec<std::net::SocketAddr>,
+) -> std::io::Result<Connection> {
     // Try every vetted result. Public round robins commonly return both IPv6
     // and IPv4; selecting only the first made a host without working IPv6 retry
     // the same unreachable address forever instead of reaching the IPv4 peer.

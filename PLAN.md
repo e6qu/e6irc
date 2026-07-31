@@ -129,6 +129,19 @@ journey now creates a process-unique database from that administrative
 connection, shuts its daemon down cleanly, closes its pool, and drops the
 database, making browser/CLI order independent.
 
+Cross-browser evidence closure (2026-07-31): the complete Dex/PostgreSQL/
+console/network/IRC-driver/TCP-upstream/`/ws/ui`/restart browser journey now
+runs independently in Chromium, Firefox, and WebKit. Each engine gets an
+isolated database and provider, while cancellation normalization is restricted
+to each engine's known navigation-abort text so real request failures remain
+fatal. The shared journey registers navigation observers before form
+submission, reads selected option text through the DOM instead of
+engine-specific rendered text, bounds only the exact browser-generated
+diagnostics for an intentionally handled 503, and drives the non-persistent
+IRC qualification UI before creation. Private/auth content security policy
+remains deny-by-default while allowing its same-origin/data image boundary, so
+Firefox no longer reports automatic favicon requests as application failures.
+
 Whole-product reliability and evidence sweep (2026-07-30): browser composer
 requests now carry a bounded correlation identifier and receive an explicit
 `sent`/`send-error` result. The server rejects CR/LF/NUL and over-limit derived
@@ -5427,14 +5440,16 @@ configured channel id → `#name` via a one-time REST lookup; author
 username ⇄ nick; the bot's own messages dropped). The reverse direction
 posts via the REST API. Config: `kind=discord` [[network]]
 (`sasl_password` = bot token, `autojoin` = channel ids, `addr` = optional
-API base). The pure parse/map/route logic is unit-tested offline.
+API base). Pure parse/map/route coverage is supplemented by a real-socket
+HTTP/WebSocket provider oracle: it verifies authorization, channel lookup,
+gateway discovery, HELLO/IDENTIFY/READY, inbound dispatch, and outbound REST
+through the production clients.
 
 **Not verified against live Discord.** There is no self-hostable Discord
-server (Spacebar, the only reimplementation, SIGSEGVs on its current
-image — tested 2026-07-19), so the gateway/REST path can only be verified
-against the live API, which needs a real bot token + a guild. That live
-integration test is the remaining step; it is gated on credentials, not
-run in CI. (DESIGN §10.5)
+server, so commercial-provider qualification needs a real bot token and
+guild. CI proves the exact transport contract e6irc consumes against its
+deterministic oracle without claiming broader provider behavior. (DESIGN
+§10.5)
 
 ## Phase 12 — Slack bridge 🔶 code-complete; live-verification-gated (2026-07-19)
 `slack` NetworkDriver (behind the `slack` feature): opens a Socket Mode
@@ -5443,13 +5458,14 @@ channel `message` events ⇄ IRC PRIVMSG (channel id → `#name` via
 `conversations.info`; `user` ⇄ nick; bot messages dropped to avoid echo
 loops). The reverse direction posts via `chat.postMessage`. Config:
 `kind=slack` [[network]] (`sasl_account` = bot token, `sasl_password` =
-app-level token, `autojoin` = channel ids). Parse/map/route unit-tested
-offline.
+app-level token, `autojoin` = channel ids). A real-socket provider oracle
+drives token placement, channel/user lookup, Socket Mode open/event/ACK,
+inbound mapping, and outbound Web API through the production clients.
 
-**Not verified against live Slack.** Slack is not self-hostable; the
-faithful oracle is the live Web/Socket-Mode API, needing a real workspace
-+ app. That live integration test is the remaining step, gated on
-credentials. (DESIGN §10.5)
+**Not verified against live Slack.** Slack is not self-hostable; commercial
+provider qualification needs a real workspace and app. CI proves the exact
+transport contract e6irc consumes against its deterministic oracle without
+claiming broader provider behavior. (DESIGN §10.5)
 
 ## Phase 13 — Scale hardening 🔶 harness complete; target architecture and qualification incomplete (audited 2026-07-30)
 Done:
@@ -5478,6 +5494,10 @@ Done:
   connection, and can fail on a supplied ceiling. The real-daemon CI smoke
   enforces a generous 1 MiB/connection catastrophic-regression bound alongside
   its delivery, throughput, latency, and shutdown gates.
+- Channel fan-out serializes once per server-time capability variant into
+  shared `Bytes`. SendQ draining preserves those allocations as bounded
+  scatter/gather slices instead of concatenating/copying every queued line;
+  partial vectored writes have exact boundary tests.
 Qualification boundary:
 - The 100k-connection run itself needs a tuned Linux host (fd limits,
   ephemeral-port range, socket buffers — macOS caps loopback hard). The

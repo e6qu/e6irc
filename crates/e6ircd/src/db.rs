@@ -17,6 +17,9 @@ use crate::core::{DbReply, DbRequest, Input};
 use crate::observability::Telemetry;
 use e6irc_queue::{Receiver, Sender};
 
+mod secret_rotation;
+pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
+
 /// Migrations are compiled into the binary; startup refuses to run on
 /// checksum drift (sqlx's default) rather than guessing.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -40,6 +43,8 @@ pub enum DbError {
     InvalidNetworkKind(String),
     /// Persisted server settings do not decode into the closed typed schema.
     InvalidServerSettings(String),
+    /// A database-wide secret re-seal could not prove every value readable.
+    SecretRotation(String),
     /// Persisted token scopes are outside the closed authorization model.
     InvalidApiTokenScopes(String),
     /// A console write was based on an older settings revision.
@@ -90,6 +95,7 @@ impl std::fmt::Display for DbError {
             Self::InvalidServerSettings(error) => {
                 write!(f, "invalid persisted server settings: {error}")
             }
+            Self::SecretRotation(error) => write!(f, "secret rotation failed: {error}"),
             Self::InvalidApiTokenScopes(error) => {
                 write!(f, "invalid persisted personal access token scopes: {error}")
             }

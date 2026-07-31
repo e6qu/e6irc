@@ -332,7 +332,7 @@ async fn signed_out_page_is_public_reload_safe_and_accessible() {
             "attempt {attempt}: {headers}"
         );
         assert!(
-            headers.contains("content-security-policy: default-src 'none'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+            headers.contains("content-security-policy: default-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
             "attempt {attempt}: {headers}"
         );
         assert!(body.contains("aria-label=\"e6irc\">e6irc</span>"), "{body}");
@@ -498,6 +498,51 @@ async fn bnc_network_management_lifecycle() {
     let http = running.http_addr.expect("http bound");
     let bnc = running.bnc_addr.expect("bnc bound");
 
+    // Qualifying a network uses the production resolver, transport, and IRC
+    // registration path, but does not persist or start it.
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks/preflight",
+        &token,
+        &format!(r#"{{"addr":"{up}","nick":"probe"}}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let qualified: serde_json::Value = serde_json::from_str(&body).expect("preflight json");
+    assert_eq!(qualified["ok"], true, "{body}");
+    assert_eq!(qualified["confirmed_nick"], "probe", "{body}");
+    assert_eq!(qualified["resolved_addresses"], 1, "{body}");
+    for stage in ["dns_ms", "connect_ms", "registration_ms"] {
+        assert!(qualified[stage].is_u64(), "missing {stage}: {body}");
+    }
+
+    let (status, body) = post_json(
+        http,
+        "/api/v1/me/networks/preflight",
+        &token,
+        &format!(r#"{{"addr":"{up}","nick":"probe","sasl_account":"alice"}}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).expect("problem json");
+    assert_eq!(problem["status"], 400, "{body}");
+    assert_eq!(problem["title"], "Incomplete upstream SASL", "{body}");
+    assert_eq!(
+        problem["detail"], "provide both sasl_account and sasl_password, or neither",
+        "{body}"
+    );
+
+    let list_req = format!(
+        "GET /api/v1/me/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &list_req).await;
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert!(
+        v["networks"].as_array().is_some_and(Vec::is_empty),
+        "{body}"
+    );
+
     // create a network pointing at the upstream
     let (status, _) = post_json(
         http,
@@ -533,9 +578,6 @@ async fn bnc_network_management_lifecycle() {
     assert_eq!(status, 400, "NUL in sasl_account must be refused");
 
     // it appears in the list
-    let list_req = format!(
-        "GET /api/v1/me/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
-    );
     let (status, _, body) = request(http, &list_req).await;
     assert_eq!(status, 200);
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -1259,6 +1301,7 @@ async fn console_add_and_delete_network_via_the_console() {
         .await
         .expect("session");
     drop(pool);
+    let upstream = upstream_server().await;
 
     let config = Config {
         server_name: "irc.console.example".into(),
@@ -1305,6 +1348,34 @@ async fn console_add_and_delete_network_via_the_console() {
     }
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
+
+    // Test connection is a non-mutating operation that renders the measured
+    // DNS, connect, and registration stages inline.
+    let body = format!("csrf={csrf}&name=probe&addr={upstream}&nick=alice_");
+    let preflight = format!(
+        "POST /console/networks/preflight HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _, qualified) = request(http, &preflight).await;
+    assert_eq!(status, 200, "{qualified}");
+    for needle in [
+        "Connection qualified",
+        "DNS",
+        "connect",
+        "Registration",
+        "value=\"probe\"",
+    ] {
+        assert!(
+            qualified.contains(needle),
+            "qualification result missing {needle:?}: {qualified}"
+        );
+    }
+    assert!(
+        qualified.contains("No networks yet"),
+        "preflight unexpectedly persisted the candidate: {qualified}"
+    );
 
     // Add a network with body CSRF -> redirect back to the canonical list.
     let body =
@@ -1710,7 +1781,10 @@ async fn console_configuration_manages_every_credential_collection() {
             admin_accounts: vec!["alice".into()],
         }),
         database: Some(e6ircd::config::DatabaseConfig { url: url.clone() }),
-        secrets: Some(SecretsConfig { key_file: key_path }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path,
+            previous_key_files: Vec::new(),
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -1926,7 +2000,10 @@ async fn console_edit_network_updates_fields() {
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
-        secrets: Some(SecretsConfig { key_file: key_path }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path,
+            previous_key_files: Vec::new(),
+        }),
         ..Config::default()
     };
     let running = net::start(config).await.expect("start");
@@ -4961,7 +5038,10 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         bnc: Some(BncConfig {
             addr: "127.0.0.1:0".parse().unwrap(),
         }),
-        secrets: Some(SecretsConfig { key_file: key_path }),
+        secrets: Some(SecretsConfig {
+            key_file: key_path,
+            previous_key_files: Vec::new(),
+        }),
         ..Config::default()
     })
     .await

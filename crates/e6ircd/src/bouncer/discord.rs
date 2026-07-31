@@ -10,13 +10,14 @@
 //! nick; message `content` ⇄ PRIVMSG text. The bot's own messages and
 //! non-message events are dropped.
 //!
-//! There is no self-hostable Discord server to test against (Spacebar, the
-//! only reimplementation, does not run — SIGSEGV on its current image), so
-//! the pure mapping/parse/route logic below is unit-tested offline and the
-//! end-to-end path is covered by a live-gated integration test that needs a
-//! real bot token. This module is NOT verified against live Discord in CI.
+//! There is no self-hostable Discord server to test against. CI therefore
+//! drives the complete HTTP/WebSocket transport against a strict in-process
+//! protocol oracle (authorization, gateway discovery, HELLO/IDENTIFY/READY,
+//! inbound dispatch, and outbound REST), while live provider qualification
+//! remains credential-gated.
 
 use super::BoundedJson;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -98,44 +99,25 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     };
     let base = api_base(config);
 
-    // Resolve each configured channel id to its #name once.
-    let mut id_to_channel: HashMap<String, String> = HashMap::new();
-    let mut channel_to_id: HashMap<String, String> = HashMap::new();
-    for id in &config.channels {
-        match fetch_channel_name(&http, &base, &config.token, id).await {
-            Ok(name) => {
-                let channel = format!("#{name}");
-                // The gateway (or a self-hosted API-compatible endpoint) supplies
-                // this name; it lands in a PRIVMSG middle parameter, so a space or
-                // `:` in it would forge extra params. Refuse it loudly rather than
-                // ever putting an unsafe target on the wire.
-                if !crate::sanitize::valid_channel_name(&channel) {
-                    eprintln!(
-                        "discord: channel {id} has an unsafe name {name:?}; refusing to bridge it"
-                    );
-                    return Dropped(NetworkFailure::ChannelMappingFailed);
-                }
-                // Two Discord channels whose IRC names collide *under the
-                // casemapping* derive one IRC channel and would silently
-                // overwrite the mapping; the forward map is folded-keyed so a
-                // case variant is caught here and routed correctly.
-                let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
-                if channel_to_id.contains_key(&folded) {
-                    eprintln!(
-                        "discord: channel {id} name {name:?} collides with an already-bridged \
-                         channel {channel:?}; refusing to bridge it"
-                    );
-                    return Dropped(NetworkFailure::ChannelMappingFailed);
-                }
-                id_to_channel.insert(id.clone(), channel.clone());
-                channel_to_id.insert(folded, id.clone());
-            }
-            Err(e) => {
-                eprintln!("discord: channel {id} lookup failed: {e}");
-                return Dropped(NetworkFailure::UpstreamRequestFailed);
-            }
-        }
-    }
+    let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
+        "discord",
+        &config.channels,
+        |id| {
+            let http = &http;
+            let base = &base;
+            let token = &config.token;
+            async move { fetch_channel_name(http, base, token, &id).await }
+        },
+        |id, error| {
+            eprintln!("discord: channel {id} lookup failed: {error}");
+            Dropped(NetworkFailure::UpstreamRequestFailed)
+        },
+    )
+    .await
+    {
+        Ok(maps) => maps,
+        Err(outcome) => return outcome,
+    };
 
     let gateway = match gateway_url(&http, &base).await {
         Ok(u) => u,
@@ -650,5 +632,32 @@ mod tests {
         assert_eq!(api_base(&c), DEFAULT_API);
         c.api_base = "http://localhost:8080/".into();
         assert_eq!(api_base(&c), "http://localhost:8080");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "slack")]
+    async fn real_http_and_websocket_transport_bridge_both_directions() {
+        use crate::bouncer::NetworkHandle;
+        use crate::bouncer::bridge_oracle::Provider;
+
+        let mut oracle = crate::bouncer::bridge_oracle::start(Provider::Discord).await;
+        let config = DiscordConfig {
+            token: "discord-token".into(),
+            api_base: oracle.api_base.clone(),
+            channels: vec!["42".into()],
+            buffer_cap: 10,
+        };
+        let (handle, mut ends) = NetworkHandle::channels(10);
+        let driver_events = handle.subscribe();
+        let session = tokio::spawn(async move { session_once(&config, &mut ends).await });
+
+        crate::bouncer::bridge_oracle::verify_round_trip(
+            Provider::Discord,
+            handle,
+            driver_events,
+            session,
+            &mut oracle,
+        )
+        .await;
     }
 }

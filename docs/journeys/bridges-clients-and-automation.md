@@ -46,11 +46,15 @@ closed failure categories use the common network snapshot.
 - **IRC:** proven against a local upstream for connect, SASL, relay, reconnect,
   buffering, and lifecycle; live Libera is opt-in.
 - **Matrix:** proven both ways in CI against pinned Conduit.
-- **Discord:** parsing/mapping/routing/backoff is CI-proven offline; the actual
-  gateway/REST journey requires a real bot/guild and remains unqualified.
-- **Slack:** parsing/mapping/routing/backoff is CI-proven offline; the actual
-  Socket Mode/Web API journey requires a real app/workspace and remains
-  unqualified.
+- **Discord:** parsing/mapping/routing/backoff and the real HTTP/WebSocket
+  client transport are CI-proven against a strict provider oracle, including
+  authorization, discovery, HELLO/IDENTIFY/READY, inbound dispatch, and
+  outbound REST. A real Discord bot/guild remains externally qualified.
+- **Slack:** parsing/mapping/routing/backoff and the real HTTP/WebSocket client
+  transport are CI-proven against the same oracle framework, including token
+  placement, channel/user lookup, Socket Mode open/event/ACK, inbound mapping,
+  and outbound Web API. A real Slack app/workspace remains externally
+  qualified.
 
 The integrations console creates/edits/toggles/deletes bridges through a
 dedicated platform-aware form and the same general network API mutation core.

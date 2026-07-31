@@ -173,12 +173,16 @@ metric labels.
 
 **Evidence.** Client unit tests cover typed preference validation and
 unavailable, rejected, corrupt, or unsupported storage values. The real
-Chromium journey selects and reloads a dark theme, verifies typed persistence,
-grants permission, and records the exact notification produced by a direct
-message. It also proves that notification-construction failure disables the
-setting and surfaces an alert, while permission denial and an absent browser
-API leave the persisted opt-in false with a visible explanation. Restoring a
-working API then proves explicit opt-in and opt-out both persist.
+Chromium, Firefox, and WebKit journeys select and reload a dark theme, verify
+typed persistence, cross an explicit granted-permission boundary, and record
+the exact notification produced by a direct message. The Chromium CI journey
+additionally requires the engine to honor Playwright’s native permission
+grant; headless engines that do not expose that platform surface receive only
+the controlled granted boundary. The suite also proves that notification-
+construction failure disables the setting and surfaces an alert, while
+permission denial and an absent browser API leave the persisted opt-in false
+with a visible explanation. Restoring a working API then proves explicit
+opt-in and opt-out both persist.
 
 ## Navigate account and operational surfaces
 

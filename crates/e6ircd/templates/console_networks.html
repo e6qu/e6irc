@@ -26,6 +26,24 @@
         {% if let Some(err) = error %}
           <p class="banner-error" role="alert">{{ err }}</p>
         {% endif %}
+        {% if let Some(result) = success %}
+          <section class="qualification-result" role="status" aria-labelledby="qualification-title">
+            <div class="qualification-head">
+              <div>
+                <span class="status-label"><span class="dot on"></span>Connection qualified</span>
+                <h2 id="qualification-title">Registered as {{ result.confirmed_nick }}</h2>
+              </div>
+              <span class="tag">Not saved yet</span>
+            </div>
+            <div class="metric-grid">
+              <article class="metric-card"><span class="metric-label">DNS</span><strong>{{ result.dns_ms }} ms</strong><small>Resolution and address policy</small></article>
+              <article class="metric-card"><span class="metric-label">Connect</span><strong>{{ result.connect_ms }} ms</strong><small>TCP and optional TLS</small></article>
+              <article class="metric-card"><span class="metric-label">Registration</span><strong>{{ result.registration_ms }} ms</strong><small>Capabilities and authentication</small></article>
+              <article class="metric-card"><span class="metric-label">Vetted addresses</span><strong>{{ result.resolved_addresses }}</strong><small>Permitted DNS results</small></article>
+            </div>
+            <p>The candidate was closed without joining channels or changing your saved networks. Review it below, then choose <strong>Add network</strong>.</p>
+          </section>
+        {% endif %}
 
         <section class="panel">
           <div class="panel-head">
@@ -87,6 +105,7 @@
             <span><strong>Use TLS</strong><small>Recommended for public IRC networks.</small></span>
           </label>
           <div class="form-actions field-wide">
+            <button type="submit" formaction="/console/networks/preflight">Test connection</button>
             <button class="primary" type="submit">Add network</button>
           </div>
         </form>

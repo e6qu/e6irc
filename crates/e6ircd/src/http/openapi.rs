@@ -660,6 +660,44 @@ fn document() -> serde_json::Value {
                     "responses": { "201": { "description": "created" },
                         "409": { "description": "duplicate name, or upstream secret with no master key" } } }
             },
+            "/api/v1/me/networks/preflight": {
+                "post": {
+                    "summary": "Qualify an IRC upstream without saving it",
+                    "description": "Uses the production DNS-vetting, TCP/TLS, capability negotiation, and optional SASL registration path. The connection closes after the welcome and no channels are joined.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "additionalProperties": false,
+                            "required": ["addr", "nick"],
+                            "properties": {
+                                "addr": { "type": "string", "minLength": 1, "maxLength": 255 },
+                                "tls": { "type": "boolean" },
+                                "nick": { "type": "string", "minLength": 1, "maxLength": 64 },
+                                "realname": { "type": "string", "maxLength": 128 },
+                                "sasl_account": { "type": "string", "minLength": 1, "maxLength": 255, "writeOnly": true },
+                                "sasl_password": { "type": "string", "minLength": 1, "maxLength": 512, "writeOnly": true }
+                            } } } } },
+                    "responses": {
+                        "200": {
+                            "description": "DNS, transport, and registration timings plus the server-confirmed nickname",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["ok", "resolved_addresses", "dns_ms", "connect_ms", "registration_ms", "confirmed_nick"],
+                                "properties": {
+                                    "ok": { "const": true },
+                                    "resolved_addresses": { "type": "integer", "minimum": 1 },
+                                    "dns_ms": { "type": "integer", "format": "int64", "minimum": 0 },
+                                    "connect_ms": { "type": "integer", "format": "int64", "minimum": 0 },
+                                    "registration_ms": { "type": "integer", "format": "int64", "minimum": 0 },
+                                    "confirmed_nick": { "type": "string", "minLength": 1, "maxLength": 64 }
+                                }
+                            } } }
+                        },
+                        "400": { "description": "invalid address, identity, or incomplete credentials" },
+                        "502": { "description": "typed upstream DNS, transport, TLS, authentication, or registration failure" }
+                    }
+                }
+            },
             "/api/v1/me/networks/{name}": {
                 "get": { "summary": "Read one BNC network and its live runtime diagnostics",
                     "security": authenticated,

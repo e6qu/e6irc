@@ -9,14 +9,92 @@ use e6ircd::secret::SecretKey;
 const USAGE: &str = "usage:\n  \
     e6ircd [--config <path>]        run the server\n  \
     e6ircd genkey                   print a new base64 master key\n  \
-    e6ircd seal [--key-file <path>] seal stdin into an enc:v1: blob";
+    e6ircd seal [--key-file <path>] seal stdin into an enc:v2: blob\n  \
+    e6ircd rotate-secrets [--config <path>]\n  \
+                                     atomically re-seal database secrets";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("genkey") => genkey(),
         Some("seal") => seal(&args[1..]),
+        Some("rotate-secrets") => rotate_secrets(&args[1..]),
         _ => run(&args),
+    }
+}
+
+fn config_path(args: &[String]) -> Result<PathBuf, ()> {
+    match args {
+        [] => Ok(PathBuf::from("e6irc.toml")),
+        [flag, path] if flag == "--config" => Ok(PathBuf::from(path)),
+        _ => Err(()),
+    }
+}
+
+/// Atomically re-seal every database-owned credential with the configured
+/// primary key. The deployment config must already name the new primary and
+/// retain the old key under `previous_key_files`, so both ciphertext
+/// generations remain readable before, during, and after the transaction.
+fn rotate_secrets(args: &[String]) -> ExitCode {
+    let config_path = match config_path(args) {
+        Ok(path) => path,
+        Err(()) => {
+            eprintln!("{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match Config::load(&config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "e6ircd rotate-secrets: {} ({})",
+                error,
+                config_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let keys = match config.secret_keyring() {
+        Ok(Some(keys)) if keys.key_count() >= 2 => keys,
+        Ok(Some(_)) => {
+            eprintln!(
+                "e6ircd rotate-secrets: configure the new key_file primary and \
+                 at least one previous_key_files entry before rotating"
+            );
+            return ExitCode::FAILURE;
+        }
+        Ok(None) => {
+            eprintln!("e6ircd rotate-secrets: no secret keyring is configured");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("e6ircd rotate-secrets: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(database) = config.database else {
+        eprintln!("e6ircd rotate-secrets: [database] is required");
+        return ExitCode::FAILURE;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match runtime.block_on(async {
+        let pool = e6ircd::db::connect_and_migrate(&database.url).await?;
+        e6ircd::db::rotate_database_secrets(&pool, &keys, "rotate-secrets").await
+    }) {
+        Ok(report) => {
+            println!(
+                "re-sealed {} managed and {} account-network secrets",
+                report.managed_config_secrets, report.account_network_secrets
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("e6ircd rotate-secrets: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -69,10 +147,9 @@ fn load_seal_key(args: &[String]) -> Result<SecretKey, String> {
 }
 
 fn run(args: &[String]) -> ExitCode {
-    let config_path = match args {
-        [] => PathBuf::from("e6irc.toml"),
-        [flag, path] if flag == "--config" => PathBuf::from(path),
-        _ => {
+    let config_path = match config_path(args) {
+        Ok(path) => path,
+        Err(()) => {
             eprintln!("{USAGE}");
             return ExitCode::FAILURE;
         }

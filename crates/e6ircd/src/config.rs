@@ -255,7 +255,7 @@ pub struct ManagedConfig {
 impl ManagedConfig {
     pub fn from_config(
         config: &Config,
-        key: Option<&crate::secret::SecretKey>,
+        key: Option<&crate::secret::SecretKeyring>,
     ) -> Result<Self, ConfigError> {
         let network_has_secret = config.networks.iter().any(|network| {
             network.sasl_password.is_some()
@@ -374,8 +374,13 @@ impl ManagedConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
-    /// Path to a file holding the base64-encoded 32-byte master key.
+    /// Path to a file holding the base64-encoded 32-byte primary key. New
+    /// ciphertext is always sealed with this key.
     pub key_file: PathBuf,
+    /// Read-only fallback keys retained during a rotation. Remove them after
+    /// every stored secret has been re-sealed with the primary key.
+    #[serde(default)]
+    pub previous_key_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -654,7 +659,10 @@ impl std::error::Error for ConfigError {}
 
 /// Open one config secret: decrypt if sealed (requiring a key), else
 /// pass the plaintext through. Fails loudly on the mismatches.
-fn open_secret(value: &str, key: Option<&crate::secret::SecretKey>) -> Result<String, ConfigError> {
+fn open_secret(
+    value: &str,
+    key: Option<&crate::secret::SecretKeyring>,
+) -> Result<String, ConfigError> {
     if !crate::secret::is_sealed(value) {
         return Ok(value.to_string());
     }
@@ -680,11 +688,12 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolve the master key from `[secrets].key_file`, else from the
-    /// `E6IRC_SECRET_KEY` env var, else none. The order is fixed and the
-    /// file — when configured — is authoritative.
-    pub fn secret_key(&self) -> Result<Option<crate::secret::SecretKey>, ConfigError> {
-        use crate::secret::SecretKey;
+    /// Resolve the primary and rotation fallback keys. `[secrets]` is
+    /// authoritative when present; otherwise `E6IRC_SECRET_KEY` supplies the
+    /// primary and comma-separated `E6IRC_PREVIOUS_SECRET_KEYS` supplies
+    /// read-only fallbacks.
+    pub fn secret_keyring(&self) -> Result<Option<crate::secret::SecretKeyring>, ConfigError> {
+        use crate::secret::{SecretKey, SecretKeyring};
         if let Some(s) = &self.secrets {
             let raw = std::fs::read_to_string(&s.key_file).map_err(|e| {
                 ConfigError::Invalid(format!(
@@ -692,32 +701,84 @@ impl Config {
                     s.key_file.display()
                 ))
             })?;
-            return SecretKey::from_base64(&raw)
+            let primary = SecretKey::from_base64(&raw)
+                .map_err(|e| ConfigError::Invalid(format!("secrets key_file: {e}")))?;
+            let mut previous = Vec::with_capacity(s.previous_key_files.len());
+            for path in &s.previous_key_files {
+                let raw = std::fs::read_to_string(path).map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "cannot read secrets previous_key_file {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                previous.push(SecretKey::from_base64(&raw).map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "secrets previous_key_file {}: {e}",
+                        path.display()
+                    ))
+                })?);
+            }
+            return SecretKeyring::new(primary, previous)
                 .map(Some)
-                .map_err(|e| ConfigError::Invalid(format!("secrets key_file: {e}")));
+                .map_err(|e| ConfigError::Invalid(format!("secrets keyring: {e}")));
         }
-        match std::env::var("E6IRC_SECRET_KEY") {
-            Ok(v) => SecretKey::from_base64(&v)
+        let primary = match std::env::var("E6IRC_SECRET_KEY") {
+            Ok(value) => Some(
+                SecretKey::from_base64(&value)
+                    .map_err(|e| ConfigError::Invalid(format!("E6IRC_SECRET_KEY: {e}")))?,
+            ),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::Invalid(
+                    "E6IRC_SECRET_KEY is not valid UTF-8".into(),
+                ));
+            }
+        };
+        let previous = match std::env::var("E6IRC_PREVIOUS_SECRET_KEYS") {
+            Ok(value) => {
+                if value.split(',').any(|part| part.trim().is_empty()) {
+                    return Err(ConfigError::Invalid(
+                        "E6IRC_PREVIOUS_SECRET_KEYS contains an empty key".into(),
+                    ));
+                }
+                value
+                    .split(',')
+                    .map(|part| {
+                        SecretKey::from_base64(part).map_err(|e| {
+                            ConfigError::Invalid(format!("E6IRC_PREVIOUS_SECRET_KEYS: {e}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Err(std::env::VarError::NotPresent) => Vec::new(),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::Invalid(
+                    "E6IRC_PREVIOUS_SECRET_KEYS is not valid UTF-8".into(),
+                ));
+            }
+        };
+        match primary {
+            Some(primary) => SecretKeyring::new(primary, previous)
                 .map(Some)
-                .map_err(|e| ConfigError::Invalid(format!("E6IRC_SECRET_KEY: {e}"))),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::Invalid(
-                "E6IRC_SECRET_KEY is not valid UTF-8".into(),
+                .map_err(|e| ConfigError::Invalid(format!("secret keyring: {e}"))),
+            None if previous.is_empty() => Ok(None),
+            None => Err(ConfigError::Invalid(
+                "E6IRC_PREVIOUS_SECRET_KEYS is set but E6IRC_SECRET_KEY is unset".into(),
             )),
         }
     }
 
-    /// Decrypt every sealed (`enc:v1:`) secret field in place. Plaintext
+    /// Decrypt every sealed (`enc:v1:`/`enc:v2:`) secret field in place. Plaintext
     /// values pass through unchanged; a sealed value with no key, or one
     /// that fails to decrypt, is a hard startup error.
     fn resolve_secrets(&mut self) -> Result<(), ConfigError> {
-        let key = self.secret_key()?;
+        let key = self.secret_keyring()?;
         self.resolve_secrets_with_key(key.as_ref())
     }
 
     pub(crate) fn resolve_secrets_with_key(
         &mut self,
-        key: Option<&crate::secret::SecretKey>,
+        key: Option<&crate::secret::SecretKeyring>,
     ) -> Result<(), ConfigError> {
         for net in &mut self.networks {
             if let Some(pw) = net.sasl_password.take() {
@@ -1498,7 +1559,7 @@ mod tests {
     #[test]
     fn plaintext_secret_passes_through() {
         assert_eq!(open_secret("hunter2", None).unwrap(), "hunter2");
-        let key = crate::secret::SecretKey::generate();
+        let key = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
         assert_eq!(open_secret("hunter2", Some(&key)).unwrap(), "hunter2");
     }
 
@@ -1506,7 +1567,8 @@ mod tests {
     fn sealed_secret_decrypts_with_key() {
         let key = crate::secret::SecretKey::generate();
         let sealed = key.seal("s3cr3t", crate::secret::CONFIG_CONTEXT);
-        assert_eq!(open_secret(&sealed, Some(&key)).unwrap(), "s3cr3t");
+        let ring = crate::secret::SecretKeyring::single(key);
+        assert_eq!(open_secret(&sealed, Some(&ring)).unwrap(), "s3cr3t");
     }
 
     #[test]
@@ -1521,7 +1583,7 @@ mod tests {
     fn sealed_secret_with_wrong_key_is_rejected() {
         let sealed =
             crate::secret::SecretKey::generate().seal("s3cr3t", crate::secret::CONFIG_CONTEXT);
-        let other = crate::secret::SecretKey::generate();
+        let other = crate::secret::SecretKeyring::single(crate::secret::SecretKey::generate());
         assert!(open_secret(&sealed, Some(&other)).is_err());
     }
 
@@ -1552,6 +1614,7 @@ mod tests {
             }],
             secrets: Some(SecretsConfig {
                 key_file: path.clone(),
+                previous_key_files: Vec::new(),
             }),
             ..Config::default()
         };
@@ -1565,6 +1628,48 @@ mod tests {
             cfg.networks[0].sasl_account.as_deref(),
             Some("xoxb-secret-token"),
             "a sealed sasl_account (Slack bot token) must be unsealed too"
+        );
+    }
+
+    #[test]
+    fn keyring_opens_previous_ciphertext_and_seals_with_primary() {
+        let old = crate::secret::SecretKey::generate();
+        let old_blob = old.seal("before-rotation", crate::secret::CONFIG_CONTEXT);
+        let new = crate::secret::SecretKey::generate();
+        let new_copy = crate::secret::SecretKey::from_base64(&new.to_base64()).unwrap();
+        let directory = std::env::temp_dir();
+        let primary_path = directory.join(format!("e6irc-primary-key-{}.b64", std::process::id()));
+        let previous_path =
+            directory.join(format!("e6irc-previous-key-{}.b64", std::process::id()));
+        std::fs::write(&primary_path, new.to_base64()).unwrap();
+        std::fs::write(&previous_path, old.to_base64()).unwrap();
+
+        let config = Config {
+            secrets: Some(SecretsConfig {
+                key_file: primary_path.clone(),
+                previous_key_files: vec![previous_path.clone()],
+            }),
+            ..Config::default()
+        };
+        let keys = config
+            .secret_keyring()
+            .expect("read keyring")
+            .expect("configured");
+        std::fs::remove_file(primary_path).ok();
+        std::fs::remove_file(previous_path).ok();
+
+        assert_eq!(
+            keys.open(&old_blob, crate::secret::CONFIG_CONTEXT).unwrap(),
+            "before-rotation"
+        );
+        assert_eq!(
+            new_copy
+                .open(
+                    &keys.seal("after-rotation", crate::secret::CONFIG_CONTEXT),
+                    crate::secret::CONFIG_CONTEXT,
+                )
+                .unwrap(),
+            "after-rotation"
         );
     }
 
@@ -2246,6 +2351,7 @@ allowed_email_domains = ["Example.COM", "subsidiary.example"]
             }],
             secrets: Some(SecretsConfig {
                 key_file: path.clone(),
+                previous_key_files: Vec::new(),
             }),
             ..Config::default()
         };

@@ -12,6 +12,13 @@
 
 #![deny(clippy::let_underscore_must_use)]
 
+#[cfg(any(feature = "discord", feature = "slack"))]
+use std::collections::HashMap;
+#[cfg(any(feature = "discord", feature = "slack"))]
+use std::future::Future;
+
+#[cfg(all(test, feature = "discord", feature = "slack"))]
+mod bridge_oracle;
 #[cfg(feature = "discord")]
 mod discord;
 mod irc_driver;
@@ -25,7 +32,7 @@ mod slack;
 #[cfg(feature = "discord")]
 pub use discord::{DiscordConfig, DiscordDriver};
 pub(crate) use irc_driver::validate_irc_upstream_addr;
-pub use irc_driver::{IrcNetwork, NetworkConfig};
+pub use irc_driver::{IrcNetwork, IrcPreflight, IrcPreflightFailure, NetworkConfig, preflight_irc};
 pub use local_driver::{CoreHandles, LocalDriver};
 #[cfg(feature = "matrix")]
 pub use matrix::{MatrixConfig, MatrixDriver};
@@ -60,6 +67,54 @@ pub(crate) fn validate_network_credential(value: &str, maximum: usize) -> Result
     } else {
         Ok(())
     }
+}
+
+/// Resolve provider channel ids into the two maps every chat bridge needs,
+/// enforcing IRC target safety and RFC1459-casefold uniqueness once. Provider
+/// drivers supply only their lookup request and failure classification, so
+/// Discord and Slack cannot drift on the mapping invariants.
+#[cfg(any(feature = "discord", feature = "slack"))]
+async fn resolve_bridge_channels<F, Fut, E>(
+    provider: &str,
+    ids: &[String],
+    mut fetch_name: F,
+    classify_lookup_error: E,
+) -> Result<(HashMap<String, String>, HashMap<String, String>), SessionOutcome>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+    E: Fn(&str, &str) -> SessionOutcome,
+{
+    let mut id_to_channel = HashMap::new();
+    let mut channel_to_id = HashMap::new();
+    for id in ids {
+        let name = match fetch_name(id.clone()).await {
+            Ok(name) => name,
+            Err(error) => return Err(classify_lookup_error(id, &error)),
+        };
+        let channel = format!("#{name}");
+        if !crate::sanitize::valid_channel_name(&channel) {
+            eprintln!(
+                "{provider}: channel {id} has an unsafe name {name:?}; refusing to bridge it"
+            );
+            return Err(SessionOutcome::Dropped(
+                NetworkFailure::ChannelMappingFailed,
+            ));
+        }
+        let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&channel);
+        if channel_to_id.contains_key(&folded) {
+            eprintln!(
+                "{provider}: channel {id} name {name:?} collides with an already-bridged \
+                 channel {channel:?}; refusing to bridge it"
+            );
+            return Err(SessionOutcome::Dropped(
+                NetworkFailure::ChannelMappingFailed,
+            ));
+        }
+        id_to_channel.insert(id.clone(), channel);
+        channel_to_id.insert(folded, id.clone());
+    }
+    Ok((id_to_channel, channel_to_id))
 }
 
 /// Validate the HTTP endpoint column used by a bridge driver. Matrix requires
@@ -259,7 +314,7 @@ pub fn build_driver(
 /// sealed too — an IRC `sasl_account` is a public name and stays plaintext.
 pub fn driver_from_row(
     row: &crate::db::BncNetworkRow,
-    key: Option<&crate::secret::SecretKey>,
+    key: Option<&crate::secret::SecretKeyring>,
     owner: &str,
 ) -> Result<Box<dyn NetworkDriver>, String> {
     if row.kind.is_bridge() && row.realname.is_some() {

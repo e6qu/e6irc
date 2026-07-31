@@ -21,9 +21,9 @@
   <section class="bootstrap-card">
     <div><span>PostgreSQL</span><strong><span class="dot on"></span>Connected</strong></div>
     <div><span>HTTP bind</span><strong><code>{{ http_bind }}</code></strong></div>
-    <div><span>Master key</span><strong>{% if has_master_key %}<span class="dot on"></span>Available{% else %}<span class="dot off"></span>Not configured{% endif %}</strong></div>
+    <div><span>Master keyring</span><strong>{% if has_master_key %}<span class="dot on"></span>{{ master_key_count }} key{% if master_key_count != 1 %}s{% endif %}{% else %}<span class="dot off"></span>Not configured{% endif %}</strong></div>
     <div><span>Release revision</span><strong><code>{{ release_revision }}</code></strong></div>
-    <p>These bootstrap values must exist before the console can start. Their effective state is shown here; operational configuration below is UI-managed.</p>
+    <p>These bootstrap values must exist before the console can start. Their effective state is shown here; more than one key means a credential rotation window is active. Operational configuration below is UI-managed.</p>
   </section>
 
   <form class="settings-form" method="post" action="/console/configuration">

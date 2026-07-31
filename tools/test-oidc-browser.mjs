@@ -11,7 +11,23 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const require = createRequire(new URL("../web/package.json", import.meta.url));
-const { chromium } = require("playwright");
+const playwright = require("playwright");
+const browserName = process.env.E6IRC_TEST_BROWSER ?? "chromium";
+assert.ok(
+  ["chromium", "firefox", "webkit"].includes(browserName),
+  `E6IRC_TEST_BROWSER must be chromium, firefox, or webkit; got ${browserName}`,
+);
+const browserType = playwright[browserName];
+const requireNativeNotificationPermission =
+  process.env.E6IRC_REQUIRE_NATIVE_NOTIFICATION_PERMISSION === "1";
+
+async function clickAndWaitForURL(page, locator, expectedURL) {
+  const navigation = page.waitForEvent("framenavigated", (frame) =>
+    frame === page.mainFrame() && frame.url() === expectedURL
+  );
+  await Promise.all([navigation, locator.click()]);
+  assert.equal(page.url(), expectedURL);
+}
 
 const databaseURL = process.env.E6IRC_TEST_DATABASE_URL;
 const issuerURL = process.env.E6IRC_TEST_DEX_URL;
@@ -76,7 +92,7 @@ const watchdog = setTimeout(() => {
 let browser;
 try {
   await waitForHealthyServer();
-  browser = await chromium.launch({ headless: true });
+  browser = await browserType.launch({ headless: true });
   const context = await browser.newContext();
   await context.grantPermissions(["notifications"], { origin: applicationOrigin });
   const page = await context.newPage();
@@ -94,7 +110,11 @@ try {
     // A request cancelled in flight when the page is torn down or navigates
     // (e.g. the client's on-load /api/v1/me/networks fetch) reports ERR_ABORTED;
     // that is a teardown artifact, not a page error.
-    if (errorText === "net::ERR_ABORTED") return;
+    if (
+      errorText === "net::ERR_ABORTED"
+      || errorText.includes("NS_BINDING_ABORTED")
+      || errorText.toLowerCase().includes("cancel")
+    ) return;
     browserErrors.push(`${request.url()}: ${errorText}`);
   });
 
@@ -102,7 +122,7 @@ try {
   // authorization-code + PKCE flow provisions the account and returns to the
   // baked e6irc application.
   await page.goto(`${applicationOrigin}/api/v1/auth/oidc/dex/start`);
-  await page.waitForURL(`${applicationOrigin}/`);
+  assert.equal(page.url(), `${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
   // The client fills #account-name from an async /api/v1/me fetch on boot, so
   // wait for it to be populated rather than racing the placeholder — the
@@ -150,19 +170,50 @@ try {
   await page.goto(`${applicationOrigin}/login`);
   await page.getByLabel("Account", { exact: true }).fill(accountName);
   await page.getByLabel("Password", { exact: true }).fill("browser-local-password");
-  await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page.waitForURL(`${applicationOrigin}/`);
+  await clickAndWaitForURL(
+    page,
+    page.getByRole("button", { name: "Sign in", exact: true }),
+    `${applicationOrigin}/`,
+  );
   await page.waitForFunction(
     () => document.getElementById("account-name")?.textContent !== "signed in",
   );
   assert.equal(await page.locator("#account-name").textContent(), accountName);
 
   // Preferences are a real product workflow, not incidental localStorage.
-  // Chromium grants the origin notification permission, the controls persist
-  // typed state, and a reload applies that state before later chat events.
+  // Headless builds differ in whether they expose a granted Notification
+  // permission after context.grantPermissions. CI keeps Chromium's native
+  // grant as a required boundary; where an engine does not expose that
+  // platform surface, provide exactly the granted boundary. The later
+  // real-stack DM assertion supplies and inspects the constructor independently.
   await page.getByText("Preferences", { exact: true }).click();
   await page.locator("#theme-select").selectOption("dark");
   assert.equal(await page.locator("html").getAttribute("data-theme"), "dark");
+  const notificationPermission = await page.evaluate(
+    () => globalThis.Notification?.permission ?? "unsupported",
+  );
+  if (notificationPermission !== "granted") {
+    assert.ok(
+      ["default", "denied", "unsupported"].includes(notificationPermission),
+      `unexpected Notification permission state: ${notificationPermission}`,
+    );
+    assert.equal(
+      requireNativeNotificationPermission,
+      false,
+      `the browser did not honor the granted Notification permission: ${notificationPermission}`,
+    );
+    await page.evaluate(() => {
+      Object.defineProperty(globalThis, "Notification", {
+        configurable: true,
+        value: class {
+          static permission = "granted";
+          static requestPermission() {
+            return Promise.resolve("granted");
+          }
+        },
+      });
+    });
+  }
   await page.getByRole("button", { name: "Desktop notifications: off" }).click();
   assert.equal(
     await page.getByRole("button", { name: "Desktop notifications: on" }).getAttribute(
@@ -347,8 +398,11 @@ try {
     await guest.getByRole("heading", { name: "Create browserguest", exact: true }).waitFor();
     await guest.getByLabel("Password", { exact: true }).fill("browser-guest-password");
     await guest.getByLabel("Confirm password", { exact: true }).fill("browser-guest-password");
-    await guest.getByRole("button", { name: "Create account", exact: true }).click();
-    await guest.waitForURL(`${applicationOrigin}/console`);
+    await clickAndWaitForURL(
+      guest,
+      guest.getByRole("button", { name: "Create account", exact: true }),
+      `${applicationOrigin}/console`,
+    );
 
     await guest.goto(`${applicationOrigin}/console/account`);
     await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
@@ -368,10 +422,14 @@ try {
     });
     await deleteAccount.getByLabel("Type browserguest to confirm", { exact: true }).fill("browserguest");
     guest.once("dialog", (dialog) => dialog.accept());
-    await deleteAccount
-      .getByRole("button", { name: "Delete my account permanently", exact: true })
-      .click();
-    await guest.waitForURL(`${applicationOrigin}/login`);
+    await clickAndWaitForURL(
+      guest,
+      deleteAccount.getByRole("button", {
+        name: "Delete my account permanently",
+        exact: true,
+      }),
+      `${applicationOrigin}/login`,
+    );
     assert.equal((await guestContext.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   } finally {
     await guestContext.close();
@@ -434,8 +492,22 @@ try {
   await page.locator('input[name="nick"]').fill("webjourney");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
-  await page.getByRole("button", { name: "Add network", exact: true }).click();
-  await page.waitForURL(`${applicationOrigin}/console/networks`);
+  await clickAndWaitForURL(
+    page,
+    page.getByRole("button", { name: "Test connection", exact: true }),
+    `${applicationOrigin}/console/networks/preflight`,
+  );
+  await page
+    .getByRole("heading", { name: "Registered as webjourney", exact: true })
+    .waitFor();
+  assert.match(await page.getByRole("status").innerText(), /Not saved yet/);
+  assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
+  assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
+  await clickAndWaitForURL(
+    page,
+    page.getByRole("button", { name: "Add network", exact: true }),
+    `${applicationOrigin}/console/networks`,
+  );
   await page.getByRole("link", { name: "journey", exact: true }).waitFor();
   await upstream.waitForJoin("#journey");
 
@@ -531,7 +603,9 @@ try {
 
   await page.goto(`${applicationOrigin}/`);
   await page.locator("#network-select").waitFor();
+  let deliberateFailureRequests = 0;
   await page.route(`${applicationOrigin}/api/v1/me/networks`, async (route) => {
+    deliberateFailureRequests += 1;
     await route.fulfill({
       status: 503,
       contentType: "application/problem+json",
@@ -554,15 +628,25 @@ try {
     "Networks unavailable",
   );
   const deliberateFailureErrors = browserErrors.splice(deliberateFailureErrorStart);
-  assert.equal(
-    deliberateFailureErrors.length,
-    1,
+  // Chromium/WebKit may add a browser-generated resource diagnostic for each
+  // handled fetch 503; Firefox does not. The application contract above is
+  // identical, and any console output is still restricted to that exact
+  // engine message and bounded by intercepted requests rather than broadly
+  // ignored.
+  assert.ok(
+    deliberateFailureRequests >= 1 && deliberateFailureRequests <= 2,
+    `the deliberate 503 route saw ${deliberateFailureRequests} requests`,
+  );
+  assert.ok(
+    deliberateFailureErrors.length <= deliberateFailureRequests,
     `the deliberate 503 produced unexpected browser errors: ${deliberateFailureErrors.join("; ")}`,
   );
-  assert.match(
-    deliberateFailureErrors[0],
-    /^Failed to load resource: the server responded with a status of 503 \(Service Unavailable\)$/,
-  );
+  for (const error of deliberateFailureErrors) {
+    assert.match(
+      error,
+      /^Failed to load resource: the server responded with a status of 503 \(Service Unavailable\)$/,
+    );
+  }
   await page.unroute(`${applicationOrigin}/api/v1/me/networks`);
   await page.reload();
   await page.waitForFunction(
@@ -675,7 +759,10 @@ try {
   );
   assert.equal(await page.locator("#nickcount").textContent(), "3");
   assert.equal(namesRequestedBeforeSnapshot, false, "NAMES was requested before replay completed");
-  assert.match(await page.locator("#network-select").innerText(), /reconnect backoff/);
+  assert.match(
+    await page.locator("#network-select option:checked").textContent(),
+    /reconnect backoff/,
+  );
   const expectedTaggedTime = await page.evaluate(() => {
     const date = new Date("2026-07-28T20:00:00.000Z");
     return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
@@ -903,7 +990,7 @@ try {
   assert.equal((await context.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   const directTraceStart = navigationTrace.length;
   await page.goto(`${applicationOrigin}/`);
-  await page.waitForURL(`${applicationOrigin}/`);
+  assert.equal(page.url(), `${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
   assert.ok(
     navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
@@ -922,8 +1009,7 @@ try {
   signIn = page.getByRole("link", { name: "Sign in with dex" });
   assert.equal(await signIn.getAttribute("href"), "/api/v1/auth/oidc/dex/start");
   const recoveryTraceStart = navigationTrace.length;
-  await signIn.click();
-  await page.waitForURL(`${applicationOrigin}/`);
+  await clickAndWaitForURL(page, signIn, `${applicationOrigin}/`);
   assert.ok(
     navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
@@ -931,7 +1017,7 @@ try {
   assert.deepEqual(browserErrors, []);
 } finally {
   clearTimeout(watchdog);
-  // `browser.close()` can itself hang on a wedged chromium; bound it so teardown
+  // `browser.close()` can itself hang on a wedged engine; bound it so teardown
   // never becomes the thing that hangs the run.
   if (browser) {
     await Promise.race([

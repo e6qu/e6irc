@@ -4241,6 +4241,194 @@ async fn managed_configuration_rejects_stale_writes_without_auditing_them() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn secret_rotation_reseals_every_database_secret_atomically() {
+    use e6ircd::config::{NetworkEntry, NetworkKind, OidcProviderConfig, OperConfig};
+    use e6ircd::secret::{CONFIG_CONTEXT, SecretKey, SecretKeyring};
+
+    let pool = db::connect_and_migrate(
+        &support::test_db("secret_rotation_reseals_every_database_secret_atomically").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("account");
+
+    let old = SecretKey::generate();
+    let old_base64 = old.to_base64();
+    let old_verifier = SecretKey::from_base64(&old_base64).unwrap();
+    let mut managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None).unwrap();
+    managed.opers.push(OperConfig {
+        name: "root".into(),
+        password: old.seal("oper-password", CONFIG_CONTEXT),
+    });
+    managed.oidc_providers.push(OidcProviderConfig {
+        name: "corp".into(),
+        issuer_url: "https://issuer.example".into(),
+        client_id: "e6irc".into(),
+        client_secret: old.seal("oidc-secret", CONFIG_CONTEXT),
+        scopes: vec!["openid".into()],
+        allowed_email_domains: Vec::new(),
+        end_session_endpoint: None,
+        token_endpoint_auth_method: Default::default(),
+    });
+    managed.networks.push(NetworkEntry {
+        name: "workspace".into(),
+        kind: NetworkKind::Slack,
+        owner: None,
+        addr: "https://slack.com/api".into(),
+        tls: true,
+        nick: String::new(),
+        realname: None,
+        autojoin: vec!["C123".into()],
+        buffer_cap: 100,
+        sasl_account: Some(old.seal("xoxb-old", CONFIG_CONTEXT)),
+        sasl_password: Some(old.seal("xapp-old", CONFIG_CONTEXT)),
+    });
+    db::load_or_initialize_managed_config(&pool, &managed)
+        .await
+        .expect("managed settings");
+
+    let owner_context = e6ircd::bouncer::bnc_secret_context("alice");
+    let account_network = db::BncNetworkRow {
+        kind: NetworkKind::Slack,
+        name: "team".into(),
+        addr: "https://slack.com/api".into(),
+        tls: true,
+        nick: String::new(),
+        realname: None,
+        autojoin: vec!["C456".into()],
+        sasl_account: Some(old.seal("xoxb-account", &owner_context)),
+        sasl_password_sealed: Some(old.seal("xapp-account", &owner_context)),
+        enabled: false,
+    };
+    db::create_bnc_network(&pool, "alice", &account_network)
+        .await
+        .expect("account network");
+
+    let new = SecretKey::generate();
+    let new_base64 = new.to_base64();
+    let keys = SecretKeyring::new(new, vec![old]).unwrap();
+    let report = db::rotate_database_secrets(&pool, &keys, "operator")
+        .await
+        .expect("rotate");
+    assert_eq!(
+        report,
+        db::SecretRotationReport {
+            managed_config_secrets: 4,
+            account_network_secrets: 2,
+        }
+    );
+
+    let new_verifier = SecretKey::from_base64(&new_base64).unwrap();
+    let rotated = db::load_managed_config(&pool).await.expect("settings");
+    assert_eq!(rotated.updated_by, "operator");
+    assert_eq!(
+        new_verifier
+            .open(&rotated.settings.opers[0].password, CONFIG_CONTEXT)
+            .unwrap(),
+        "oper-password"
+    );
+    assert!(
+        old_verifier
+            .open(&rotated.settings.opers[0].password, CONFIG_CONTEXT)
+            .is_err(),
+        "old key still opened a rotated managed secret"
+    );
+    let rotated_network = db::get_bnc_network(&pool, "alice", "team")
+        .await
+        .expect("network query")
+        .expect("network");
+    assert_eq!(
+        new_verifier
+            .open(
+                rotated_network.sasl_password_sealed.as_deref().unwrap(),
+                &owner_context,
+            )
+            .unwrap(),
+        "xapp-account"
+    );
+    assert!(
+        old_verifier
+            .open(
+                rotated_network.sasl_password_sealed.as_deref().unwrap(),
+                &owner_context,
+            )
+            .is_err(),
+        "old key still opened a rotated account-network secret"
+    );
+    let audit = db::list_audit_log(&pool, audit_page_size(10))
+        .await
+        .expect("audit");
+    assert_eq!(audit[0].action, "SECRET_ROTATE");
+    assert!(!audit[0].detail.contains("xox"), "{:?}", audit[0].detail);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn unreadable_secret_rolls_back_the_entire_rotation() {
+    use e6ircd::config::{NetworkKind, OperConfig};
+    use e6ircd::secret::{CONFIG_CONTEXT, SecretKey, SecretKeyring};
+
+    let pool = db::connect_and_migrate(
+        &support::test_db("unreadable_secret_rolls_back_the_entire_rotation").await,
+    )
+    .await
+    .expect("connect");
+    db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("account");
+    let old = SecretKey::generate();
+    let mut managed = e6ircd::config::ManagedConfig::from_config(&Config::default(), None).unwrap();
+    managed.opers.push(OperConfig {
+        name: "root".into(),
+        password: old.seal("still-old", CONFIG_CONTEXT),
+    });
+    let initial = db::load_or_initialize_managed_config(&pool, &managed)
+        .await
+        .expect("settings");
+    db::create_bnc_network(
+        &pool,
+        "alice",
+        &db::BncNetworkRow {
+            kind: NetworkKind::Irc,
+            name: "broken".into(),
+            addr: "irc.example:6697".into(),
+            tls: true,
+            nick: "alice".into(),
+            realname: None,
+            autojoin: Vec::new(),
+            sasl_account: Some("alice".into()),
+            sasl_password_sealed: Some("enc:v2:not-base64".into()),
+            enabled: false,
+        },
+    )
+    .await
+    .expect("broken row");
+
+    let keys = SecretKeyring::new(SecretKey::generate(), vec![old]).unwrap();
+    let error = db::rotate_database_secrets(&pool, &keys, "operator")
+        .await
+        .expect_err("corrupt row must abort rotation");
+    assert!(error.to_string().contains("cannot be decrypted"), "{error}");
+
+    let after = db::load_managed_config(&pool).await.expect("settings");
+    assert_eq!(after.revision, initial.revision);
+    assert_eq!(
+        after.settings.opers[0].password, initial.settings.opers[0].password,
+        "the earlier settings update escaped the failed transaction"
+    );
+    assert!(
+        db::list_audit_log(&pool, audit_page_size(10))
+            .await
+            .expect("audit")
+            .is_empty(),
+        "a rolled-back rotation left an audit success"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
 async fn oidc_identity_link_list_and_conflict() {
     use e6ircd::db::LinkOutcome;
     let pool =
