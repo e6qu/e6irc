@@ -1450,3 +1450,240 @@ async fn self_echo_is_persisted_to_the_backlog() {
     );
     drop(running);
 }
+
+/// Attach to the BNC listener negotiating the backlog-paging caps the default
+/// `register_sasl` helper does not: `batch`, `draft/chathistory`, and
+/// `draft/read-marker` (plus `server-time`/`message-tags` so stored lines keep
+/// their tags). Drives the handshake manually, one message at a time.
+async fn bnc_attach_with_history(
+    bnc: std::net::SocketAddr,
+    nick: &str,
+    account: &str,
+    password: &str,
+) -> e6irc_client::Connection {
+    let mut client = e6irc_client::Connection::connect(&bnc.to_string())
+        .await
+        .expect("bnc connect");
+    client.send_line("CAP LS 302").await.expect("CAP LS");
+    let ls = client.next_message().await.unwrap().expect("CAP LS reply");
+    assert_eq!(ls.command, "CAP", "{ls:?}");
+    client
+        .send_line(
+            "CAP REQ :sasl server-time message-tags batch draft/chathistory draft/read-marker",
+        )
+        .await
+        .expect("CAP REQ");
+    let ack = client.next_message().await.unwrap().expect("CAP ACK");
+    assert_eq!(ack.command, "CAP", "{ack:?}");
+    client
+        .send_line("AUTHENTICATE PLAIN")
+        .await
+        .expect("AUTHENTICATE");
+    let challenge = client
+        .next_message()
+        .await
+        .unwrap()
+        .expect("SASL challenge");
+    assert_eq!(challenge.command, "AUTHENTICATE", "{challenge:?}");
+    client
+        .send_line(&format!("NICK {nick}"))
+        .await
+        .expect("NICK");
+    client
+        .send_line(&format!("USER {nick} 0 * :Me"))
+        .await
+        .expect("USER");
+    let payload = e6irc_proto::base64::encode(format!("\0{account}\0{password}").as_bytes());
+    client
+        .send_line(&format!("AUTHENTICATE {payload}"))
+        .await
+        .expect("SASL payload");
+    // 900 (logged in as) then 903 (success).
+    let _logged_in = client.next_message().await.unwrap().expect("900");
+    let success = client.next_message().await.unwrap().expect("903");
+    assert_eq!(success.command, "903", "{success:?}");
+    client.send_line("CAP END").await.expect("CAP END");
+    let welcome = client.next_message().await.unwrap().expect("001");
+    assert_eq!(welcome.command, "001", "{welcome:?}");
+    // End-of-MOTD numeric closes the registration burst.
+    let motd = client.next_message().await.unwrap().expect("422");
+    assert_eq!(motd.command, "422", "{motd:?}");
+    client
+}
+
+/// CHATHISTORY pages the PG backlog on the attach listener, MARKREAD keeps and
+/// returns a per-target position, and the two compose (a client can resume a
+/// target from its marker with `CHATHISTORY AFTER ... timestamp=`).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn bnc_listener_serves_chathistory_and_markread() {
+    let url = bnc_account_db(
+        "bnc_listener_serves_chathistory_and_markread",
+        "alice",
+        "s3cr3t",
+    )
+    .await;
+    let up = upstream().await;
+    let running = net::start(bnc_config(up, url)).await.expect("start");
+    let bnc = running.bnc_addr.expect("bnc bound");
+    // give the driver a moment to connect + join upstream
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let mut peer = e6irc_client::Connection::connect(&up.to_string())
+        .await
+        .unwrap();
+    peer.register("uppeer", "peer").await.unwrap();
+    peer.send_line("JOIN #lobby").await.unwrap();
+    loop {
+        if peer.next_message().await.unwrap().unwrap().command == "366" {
+            break;
+        }
+    }
+    // A handful of messages to page over.
+    for i in 0..5 {
+        peer.send_line(&format!("PRIVMSG #lobby :buffered msg {i}"))
+            .await
+            .unwrap();
+    }
+    // Let the persistence task drain the backlog before paging.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let mut client = bnc_attach_with_history(bnc, "alice/up", "alice", "s3cr3t").await;
+
+    // The driver's upstream registration burst (003/004/005/... numerics) and
+    // connection-state NOTICEs relay through attach; drain everything until the
+    // stream is quiet so none of it interleaves with the batched paging below.
+    loop {
+        let quiet =
+            tokio::time::timeout(std::time::Duration::from_millis(300), client.next_message())
+                .await;
+        match quiet {
+            Ok(Ok(Some(_))) => continue,
+            _ => break,
+        }
+    }
+
+    // CHATHISTORY LATEST, batched, newest first on the wire.
+    client
+        .send_line("CHATHISTORY LATEST #lobby * 10")
+        .await
+        .unwrap();
+    let open = client.next_message().await.unwrap().expect("batch open");
+    assert_eq!(open.command, "BATCH", "{open:?}");
+    assert!(
+        open.params
+            .first()
+            .map(String::as_str)
+            .unwrap_or("")
+            .starts_with('+'),
+        "{open:?}"
+    );
+    let mut msgs = Vec::new();
+    loop {
+        let m = client.next_message().await.unwrap().expect("batch body");
+        if m.command == "BATCH" {
+            assert!(
+                m.params
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .starts_with('-'),
+                "{m:?}"
+            );
+            break;
+        }
+        msgs.push(m);
+    }
+    assert_eq!(msgs.len(), 5, "expected the five buffered messages");
+    assert_eq!(msgs[0].command, "PRIVMSG", "{:?}", msgs[0]);
+    assert_eq!(
+        msgs[0].params.first().map(String::as_str),
+        Some("#lobby"),
+        "{:?}",
+        msgs[0]
+    );
+
+    // MARKREAD set then query: the position round-trips.
+    client
+        .send_line("MARKREAD #lobby timestamp=2024-01-01T00:00:00.000Z")
+        .await
+        .unwrap();
+    let ack = client.next_message().await.unwrap().expect("MARKREAD ack");
+    assert_eq!(ack.command, "MARKREAD", "{ack:?}");
+    assert_eq!(
+        ack.params.get(1).map(String::as_str),
+        Some("2024-01-01T00:00:00.000Z"),
+        "{ack:?}"
+    );
+    client.send_line("MARKREAD #lobby").await.unwrap();
+    let query = client
+        .next_message()
+        .await
+        .unwrap()
+        .expect("MARKREAD query");
+    assert_eq!(query.command, "MARKREAD", "{query:?}");
+    assert_eq!(
+        query.params.get(1).map(String::as_str),
+        Some("2024-01-01T00:00:00.000Z"),
+        "{query:?}"
+    );
+
+    // The marker composes with paging: AFTER that instant returns only the
+    // messages newer than it. Every stored message is newer than 2024, so all
+    // five come back (id > 0 = from the very start of the target's history).
+    client
+        .send_line("CHATHISTORY AFTER #lobby timestamp=2024-01-01T00:00:00.000Z 100")
+        .await
+        .unwrap();
+    let open = client.next_message().await.unwrap().expect("batch open");
+    assert_eq!(open.command, "BATCH", "{open:?}");
+    let mut after = Vec::new();
+    loop {
+        let m = client.next_message().await.unwrap().expect("batch body");
+        if m.command == "BATCH" {
+            break;
+        }
+        after.push(m);
+    }
+    assert_eq!(after.len(), 5, "AFTER the 2024 marker returns everything");
+
+    // An unknown msgid selector is an empty page, not an error.
+    client
+        .send_line("CHATHISTORY BEFORE #lobby msgid=doesnotexist 10")
+        .await
+        .unwrap();
+    let open = client.next_message().await.unwrap().expect("batch open");
+    assert_eq!(open.command, "BATCH", "{open:?}");
+    let empty = client
+        .next_message()
+        .await
+        .unwrap()
+        .expect("empty batch body");
+    assert_eq!(empty.command, "BATCH", "{empty:?}");
+
+    // TARGETS lists #lobby with a timestamp.
+    client.send_line("CHATHISTORY TARGETS * 50").await.unwrap();
+    let open = client
+        .next_message()
+        .await
+        .unwrap()
+        .expect("targets batch open");
+    assert_eq!(open.command, "BATCH", "{open:?}");
+    let target_line = client.next_message().await.unwrap().expect("targets body");
+    assert_eq!(target_line.command, "CHATHISTORY", "{target_line:?}");
+    assert_eq!(
+        target_line.params.first().map(String::as_str),
+        Some("TARGETS"),
+        "{target_line:?}"
+    );
+    assert_eq!(
+        target_line.params.get(1).map(String::as_str),
+        Some("#lobby"),
+        "{target_line:?}"
+    );
+    assert!(
+        target_line.params.get(2).is_some(),
+        "targets carry a resume timestamp: {target_line:?}"
+    );
+    drop(running);
+}

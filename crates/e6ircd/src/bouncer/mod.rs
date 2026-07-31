@@ -19,6 +19,7 @@ use std::future::Future;
 
 #[cfg(all(test, feature = "discord", feature = "slack"))]
 mod bridge_oracle;
+mod chathistory;
 #[cfg(feature = "discord")]
 mod discord;
 mod irc_driver;
@@ -870,6 +871,13 @@ pub struct AttachCaps {
     /// (synthesized by the driver — the upstream is never asked for
     /// echo-message, so there is exactly one echo, never two).
     pub echo_message: bool,
+    /// batch: the client can receive BATCH-wrapped responses (CHATHISTORY).
+    pub batch: bool,
+    /// draft/chathistory: the client wants to page backlog via CHATHISTORY.
+    pub chathistory: bool,
+    /// draft/read-marker: the client wants to set/query per-target read
+    /// positions via MARKREAD.
+    pub read_marker: bool,
 }
 
 /// Strip from a serialized line any message tags the recipient did not
@@ -974,8 +982,21 @@ pub struct NetworkHandle {
     buffer: std::sync::Arc<std::sync::Mutex<Buffer>>,
     /// Runtime state and per-network counters, shared with the driver endpoint.
     runtime: std::sync::Arc<NetworkRuntime>,
+    /// PG-backed history context for CHATHISTORY/MARKREAD on the attach
+    /// listener, set when the network is registered with a database.
+    history: std::sync::Arc<std::sync::Mutex<Option<NetworkHistory>>>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
+}
+
+/// The database context a BNC attach needs to serve CHATHISTORY and MARKREAD:
+/// the pool plus the owner/network keys under which this network's backlog
+/// and markers are stored.
+#[derive(Clone)]
+pub struct NetworkHistory {
+    pub pool: sqlx::PgPool,
+    pub owner: String,
+    pub network: String,
 }
 
 /// The lifecycle state of one running network driver.
@@ -1671,11 +1692,13 @@ impl NetworkHandle {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Buffer::new(buffer_cap)));
         let runtime = std::sync::Arc::new(NetworkRuntime::new());
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let history = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
             attach_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             shutdown: shutdown_tx,
+            history: history.clone(),
             buffer: buffer.clone(),
             runtime: runtime.clone(),
             telemetry: telemetry.clone(),
@@ -1710,6 +1733,24 @@ impl NetworkHandle {
     /// Assign the registry's owner/name label for lifecycle log lines.
     pub(crate) fn set_label(&self, label: String) {
         *self.runtime.label.lock().expect("network label poisoned") = Some(label);
+    }
+
+    /// Assign the PG history context (pool + owner/network keys) so the
+    /// attach listener can serve CHATHISTORY and MARKREAD.
+    pub(crate) fn set_history(&self, pool: sqlx::PgPool, owner: Option<String>, network: String) {
+        *self.history.lock().expect("history context poisoned") = Some(NetworkHistory {
+            pool,
+            owner: owner.unwrap_or_else(|| "*".to_string()),
+            network,
+        });
+    }
+
+    /// The PG history context, if this network has a database backing it.
+    pub fn history(&self) -> Option<NetworkHistory> {
+        self.history
+            .lock()
+            .expect("history context poisoned")
+            .clone()
     }
 
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
@@ -1961,7 +2002,15 @@ impl NetworkDriver for LoopbackDriver {
 /// client and client lines to the upstream. Returns when either side
 /// closes. This is the session multiplexer's core operation, serving
 /// every driver kind (`irc`, `local`, and the bridges) uniformly.
-pub async fn attach<S>(stream: S, handle: &NetworkHandle, caps: AttachCaps) -> std::io::Result<()>
+///
+/// `account` is the authenticated account, used to key the BNC-local
+/// per-target read markers (shared networks keep per-account positions).
+pub async fn attach<S>(
+    stream: S,
+    handle: &NetworkHandle,
+    caps: AttachCaps,
+    account: &str,
+) -> std::io::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -2077,24 +2126,55 @@ where
                     for event in parsed.drain(..) {
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => match handle.send_from(attach_id, &text) {
-                                    SendOutcome::Sent => {}
-                                    // Full: the upstream is congested/reconnecting.
-                                    // Drop this line loudly rather than block —
-                                    // blocking here would stall every other client
-                                    // sharing this network's queue. Never silent.
-                                    SendOutcome::Full => {
-                                        write
-                                            .write_all(
-                                                b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
+                                Ok(text) => {
+                                    // BNC-local commands never reach the
+                                    // upstream: CHATHISTORY and MARKREAD are
+                                    // served from the PG backlog, and only
+                                    // when the client negotiated the cap (a
+                                    // non-negotiated CHATHISTORY is not ours
+                                    // to intercept).
+                                    let mut handled = false;
+                                    if (caps.chathistory || caps.read_marker)
+                                        && let Ok(msg) =
+                                            e6irc_proto::message::Message::parse(&text)
+                                    {
+                                        let cmd = msg.command.to_ascii_uppercase();
+                                        let params: Vec<&str> = msg.params.to_vec();
+                                        if cmd == "CHATHISTORY" && caps.chathistory {
+                                            chathistory::handle_chathistory(
+                                                handle, &mut write, caps, &params,
                                             )
                                             .await?;
-                                        write.flush().await?;
+                                            handled = true;
+                                        } else if cmd == "MARKREAD" && caps.read_marker {
+                                            chathistory::handle_markread(
+                                                handle, &mut write, account, &params,
+                                            )
+                                            .await?;
+                                            handled = true;
+                                        }
                                     }
-                                    SendOutcome::Closed => {
-                                        return Ok(()); // driver gone
+                                    if !handled {
+                                        match handle.send_from(attach_id, &text) {
+                                            SendOutcome::Sent => {}
+                                            // Full: the upstream is congested/reconnecting.
+                                            // Drop this line loudly rather than block —
+                                            // blocking here would stall every other client
+                                            // sharing this network's queue. Never silent.
+                                            SendOutcome::Full => {
+                                                write
+                                                    .write_all(
+                                                        b":*bnc* NOTICE * :upstream busy; line not sent, try again\r\n",
+                                                    )
+                                                    .await?;
+                                                write.flush().await?;
+                                            }
+                                            SendOutcome::Closed => {
+                                                return Ok(()); // driver gone
+                                            }
+                                        }
                                     }
-                                },
+                                }
                                 // This relay is UTF-8, like the core ingest
                                 // path; reject a non-UTF-8 line loudly rather
                                 // than swallowing it.
@@ -2368,7 +2448,7 @@ mod tests {
         // attach must RETURN (not hang) even though the broadcast never closes.
         let attached = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            attach(server_side, &handle, AttachCaps::default()),
+            attach(server_side, &handle, AttachCaps::default(), "testuser"),
         )
         .await;
         assert!(
@@ -2664,7 +2744,7 @@ mod tests {
                 server_time: true,
                 message_tags: true,
                 account_tag: true,
-                echo_message: false,
+                ..Default::default()
             },
         );
         assert_eq!(all, line);
