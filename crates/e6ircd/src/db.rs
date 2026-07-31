@@ -5075,7 +5075,8 @@ impl BncBufferKey {
     }
 }
 
-/// Append one upstream line to a network's persisted buffer.
+/// Append one upstream line to a network's persisted buffer, extracting the
+/// conversation target for CHATHISTORY queries.
 pub async fn persist_bnc_line(
     pool: &PgPool,
     owner: &str,
@@ -5083,14 +5084,70 @@ pub async fn persist_bnc_line(
     line: &str,
 ) -> Result<(), DbError> {
     let key = BncBufferKey::new(owner, network);
-    sqlx::query("INSERT INTO bnc_buffer (owner, network, line) VALUES ($1, $2, $3)")
-        .bind(&key.owner)
-        .bind(&key.network)
-        .bind(line)
-        .execute(pool)
-        .await
-        .map_err(DbError::Query)?;
+    let target = bnc_line_target(line);
+    let msgid = bnc_line_msgid(line);
+    let sent_at = bnc_line_sent_at(line);
+    sqlx::query(
+        "INSERT INTO bnc_buffer (owner, network, line, target, msgid, sent_at)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(line)
+    .bind(target)
+    .bind(msgid)
+    .bind(sent_at)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
     Ok(())
+}
+
+/// The conversation target of a stored raw IRC line, for CHATHISTORY paging:
+/// the channel or nick a PRIVMSG/NOTICE/TAGMSG was addressed to. Non-message
+/// lines (JOIN, NICK, numerics) return `None` so they are excluded from
+/// target-filtered history without an extra predicate.
+fn bnc_line_target(line: &str) -> Option<String> {
+    let msg = e6irc_proto::message::Message::parse(line).ok()?;
+    match msg.command.to_ascii_uppercase().as_str() {
+        "PRIVMSG" | "NOTICE" | "TAGMSG" => msg.params.first().map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+/// The `msgid` tag of a stored raw IRC line, for CHATHISTORY selector paging
+/// (`CHATHISTORY BEFORE #chan msgid=X limit`). Only a tag-carrying line can
+/// have one, and then only if the upstream sent it; lines without one return
+/// `None` so they store NULL.
+fn bnc_line_msgid(line: &str) -> Option<String> {
+    let rest = line.strip_prefix('@')?;
+    let (tags, _body) = rest.split_once(' ')?;
+    tags.split(';')
+        .find_map(|t| t.strip_prefix("msgid="))
+        .map(String::from)
+}
+
+/// The effective message timestamp of a stored raw IRC line: the `time=` tag
+/// verbatim when the upstream sent one, else the bouncer's arrival time as
+/// ISO-8601 UTC. Both forms are `YYYY-MM-DDThh:mm:ss.sssZ`, so they compare
+/// lexically — which is exactly how CHATHISTORY timestamp selectors and
+/// MARKREAD positions use them.
+fn bnc_line_sent_at(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix('@')
+        && let Some((tags, _body)) = rest.split_once(' ')
+    {
+        for t in tags.split(';') {
+            if let Some(ts) = t.strip_prefix("time=") {
+                return ts.to_string();
+            }
+        }
+    }
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(millis))
 }
 
 /// Drop all but the newest [`BNC_BUFFER_CAP`] lines of one network's buffer,
@@ -5140,7 +5197,274 @@ pub async fn recent_bnc_lines(
     Ok(rows)
 }
 
-/// Stored backlog size and activity bounds for one network.
+// ---- BNC CHATHISTORY queries ---------------------------------------------
+
+/// The `SELECT id, line FROM bnc_buffer ` prefix shared by every CHATHISTORY
+/// paging query; the argument is the WHERE/ORDER/LIMIT tail (history_select!
+/// precedent above).
+macro_rules! bnc_history_select {
+    ($rest:literal) => {
+        concat!("SELECT id, line FROM bnc_buffer ", $rest)
+    };
+}
+
+/// Normalize a newest-first DESC fetch into oldest-first [`BncHistoryLine`]s.
+fn into_history_rows_desc(mut rows: Vec<(i64, String)>) -> Vec<BncHistoryLine> {
+    rows.reverse();
+    into_history_rows(rows)
+}
+
+/// Map raw `(id, line)` rows to [`BncHistoryLine`]s.
+fn into_history_rows(rows: Vec<(i64, String)>) -> Vec<BncHistoryLine> {
+    rows.into_iter()
+        .map(|(id, line)| BncHistoryLine { id, line })
+        .collect()
+}
+
+/// One stored backlog line with its row id, for CHATHISTORY paging.
+pub struct BncHistoryLine {
+    pub id: i64,
+    pub line: String,
+}
+
+/// The newest `limit` lines for one target in one network, oldest-first.
+/// `at_id` bounds the window inclusively (id ≤ at_id): the `*` selector passes
+/// `None`, a `timestamp=` selector the newest id at or before that instant,
+/// and a `msgid=` selector the id of that exact message.
+pub async fn bnc_history_latest(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    at_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<BncHistoryLine>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let folded = CaseMapping::Rfc1459.casefold(target);
+    // A NULL bound means "no upper bound" (the `*` selector); the shared
+    // predicate below folds both cases into one statement.
+    let rows: Vec<(i64, String)> = sqlx::query_as(bnc_history_select!(
+        "WHERE owner = $1 AND network = $2 AND lower(target) = lower($3) \
+         AND ($4 IS NULL OR id <= $4) ORDER BY id DESC LIMIT $5"
+    ))
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(&folded)
+    .bind(at_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(into_history_rows_desc(rows))
+}
+
+/// `limit` lines for one target with id strictly less than `before_id`,
+/// oldest-first (CHATHISTORY BEFORE).
+pub async fn bnc_history_before(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    before_id: i64,
+    limit: i64,
+) -> Result<Vec<BncHistoryLine>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let folded = CaseMapping::Rfc1459.casefold(target);
+    let rows: Vec<(i64, String)> = sqlx::query_as(bnc_history_select!(
+        "WHERE owner = $1 AND network = $2 AND lower(target) = lower($3) AND id < $4 \
+         ORDER BY id DESC LIMIT $5"
+    ))
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(&folded)
+    .bind(before_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(into_history_rows_desc(rows))
+}
+
+/// `limit` lines for one target with id strictly greater than `after_id`,
+/// oldest-first (CHATHISTORY AFTER).
+pub async fn bnc_history_after(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    after_id: i64,
+    limit: i64,
+) -> Result<Vec<BncHistoryLine>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let folded = CaseMapping::Rfc1459.casefold(target);
+    let rows: Vec<(i64, String)> = sqlx::query_as(bnc_history_select!(
+        "WHERE owner = $1 AND network = $2 AND lower(target) = lower($3) AND id > $4 \
+         ORDER BY id ASC LIMIT $5"
+    ))
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(&folded)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(into_history_rows(rows))
+}
+
+/// Resolve a `msgid=X` CHATHISTORY selector to the row id of that message in
+/// one owner/network, if it is still in the backlog.
+pub async fn bnc_history_msgid_row(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    msgid: &str,
+) -> Result<Option<i64>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    sqlx::query_scalar(
+        "SELECT id FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND msgid = $3
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(msgid)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Resolve a `timestamp=X` CHATHISTORY selector to the newest row id whose
+/// `sent_at` is at or before that instant, if the backlog reaches that far.
+/// ISO-8601 UTC compares lexically, so no instant parsing is needed.
+pub async fn bnc_history_timestamp_row(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    target: &str,
+    timestamp: &str,
+) -> Result<Option<i64>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    let folded = CaseMapping::Rfc1459.casefold(target);
+    sqlx::query_scalar(
+        "SELECT id FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND lower(target) = lower($3)
+           AND sent_at <= $4
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(&folded)
+    .bind(timestamp)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// The distinct conversation targets that still have backlog for one network,
+/// newest-active first, with each target's newest `sent_at` (CHATHISTORY
+/// TARGETS; the timestamp lets a client resume each target from its end).
+/// `cutoff` limits the result to targets with activity at or after that
+/// ISO-8601 instant; `None` lists everything.
+pub async fn bnc_history_targets(
+    pool: &PgPool,
+    owner: &str,
+    network: &str,
+    cutoff: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(String, String)>, DbError> {
+    let key = BncBufferKey::new(owner, network);
+    // A NULL cutoff means "no cutoff": `HAVING ($3::text IS NULL OR ...)`
+    // folds both arms into one statement.
+    sqlx::query_as(
+        "SELECT target, max(sent_at)
+         FROM bnc_buffer
+         WHERE owner = $1 AND network = $2 AND target IS NOT NULL
+         GROUP BY target
+         HAVING ($3::text IS NULL OR max(sent_at) >= $3)
+         ORDER BY max(id) DESC
+         LIMIT $4",
+    )
+    .bind(&key.owner)
+    .bind(&key.network)
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+// ---- BNC read markers -----------------------------------------------------
+
+/// Get one per-network, per-target read marker, or `None` if unset.
+pub async fn get_bnc_read_marker(
+    pool: &PgPool,
+    account: &str,
+    network: &str,
+    target: &str,
+) -> Result<Option<String>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let net_folded = CaseMapping::Rfc1459.casefold(network);
+    let target_folded = CaseMapping::Rfc1459.casefold(target);
+    sqlx::query_scalar(
+        "SELECT timestamp FROM bnc_read_markers
+         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
+           AND network = $2 AND target = $3",
+    )
+    .bind(&folded)
+    .bind(&net_folded)
+    .bind(&target_folded)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)
+}
+
+/// Set (upsert) one per-network, per-target read marker.
+pub async fn set_bnc_read_marker(
+    pool: &PgPool,
+    account: &str,
+    network: &str,
+    target: &str,
+    timestamp: &str,
+) -> Result<(), DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let net_folded = CaseMapping::Rfc1459.casefold(network);
+    let target_folded = CaseMapping::Rfc1459.casefold(target);
+    sqlx::query(
+        "INSERT INTO bnc_read_markers (account_id, network, target, timestamp)
+         VALUES ((SELECT id FROM accounts WHERE name_folded = $1), $2, $3, $4)
+         ON CONFLICT (account_id, network, target)
+         DO UPDATE SET timestamp = EXCLUDED.timestamp",
+    )
+    .bind(&folded)
+    .bind(&net_folded)
+    .bind(&target_folded)
+    .bind(timestamp)
+    .execute(pool)
+    .await
+    .map_err(DbError::Query)?;
+    Ok(())
+}
+
+/// All read markers for one account/network, as `(target, timestamp)`.
+pub async fn list_bnc_read_markers(
+    pool: &PgPool,
+    account: &str,
+    network: &str,
+) -> Result<Vec<(String, String)>, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let net_folded = CaseMapping::Rfc1459.casefold(network);
+    sqlx::query_as(
+        "SELECT target, timestamp FROM bnc_read_markers
+         WHERE account_id = (SELECT id FROM accounts WHERE name_folded = $1)
+           AND network = $2",
+    )
+    .bind(&folded)
+    .bind(&net_folded)
+    .fetch_all(pool)
+    .await
+    .map_err(DbError::Query)
+}
 pub struct BncBufferSummary {
     pub lines: i64,
     pub oldest_at: Option<e6irc_proto::time::Millis>,

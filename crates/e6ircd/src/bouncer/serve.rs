@@ -195,6 +195,7 @@ impl Registry {
         // owner the registry uses, so a buffer cannot be written under one
         // spelling and looked up under another.
         let persistence = self.pool.clone().map(|pool| {
+            handle.set_history(pool.clone(), key.owner.clone(), key.name.clone());
             spawn_persistence(pool, key.owner.clone(), key.name.clone(), handle.clone())
         });
         let slot = Slot {
@@ -478,7 +479,7 @@ where
     write.flush().await?;
 
     let joined = read.unsplit(write);
-    attach(joined, &handle, caps).await
+    attach(joined, &handle, caps, &account).await
 }
 
 /// Drive registration to a `Registered` verdict. Requires a successful
@@ -646,11 +647,20 @@ where
 {
     // `server-time`/`message-tags`/`account-tag` gate which tags a client is
     // sent from the (fully-tagged) backlog; `sasl` authenticates the attach;
-    // `echo-message` opts the client into receiving its own synthesized echo.
+    // `echo-message` opts the client into receiving its own synthesized echo;
+    // `batch`/`draft/chathistory`/`draft/read-marker` enable backlog paging
+    // and per-target read positions on the attach listener.
     let known = |c: &str| {
         matches!(
             c,
-            "sasl" | "server-time" | "message-tags" | "account-tag" | "echo-message"
+            "sasl"
+                | "server-time"
+                | "message-tags"
+                | "account-tag"
+                | "echo-message"
+                | "batch"
+                | "draft/chathistory"
+                | "draft/read-marker"
         )
     };
     match msg
@@ -663,7 +673,7 @@ where
             write
                 .write_all(
                     format!(
-                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag echo-message\r\n"
+                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag echo-message batch draft/chathistory draft/read-marker\r\n"
                     )
                     .as_bytes(),
                 )
@@ -680,6 +690,9 @@ where
                         "message-tags" => caps.message_tags = true,
                         "account-tag" => caps.account_tag = true,
                         "echo-message" => caps.echo_message = true,
+                        "batch" => caps.batch = true,
+                        "draft/chathistory" => caps.chathistory = true,
+                        "draft/read-marker" => caps.read_marker = true,
                         _ => {}
                     }
                 }
