@@ -120,8 +120,13 @@ pub(crate) async fn handle_markread(
             let timestamp = match normalize_timestamp(raw) {
                 Some(ts) => ts,
                 None => {
-                    return fail_command(write, "MARKREAD", "INVALID_PARAMS", "malformed timestamp")
-                        .await;
+                    return fail_command(
+                        write,
+                        "MARKREAD",
+                        "INVALID_PARAMS",
+                        "malformed timestamp",
+                    )
+                    .await;
                 }
             };
             if let Err(e) =
