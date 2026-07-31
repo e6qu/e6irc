@@ -283,23 +283,44 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .insert(invitee);
     state.numeric(conn, RPL_INVITING, &[&invitee_nick, &display], None);
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} INVITE {invitee_nick} :{display}");
-    state.send_timed(invitee, &line);
-    // invite-notify: other members with the cap see the invite too.
+    let sender_account = state.sessions[&conn].account.clone();
+    let body = format!(":{prefix} INVITE {invitee_nick} :{display}");
+    // The invitee always sees the invite; invite-notify adds the channel's
+    // other cap-holding members. Both honor the recipient's server-time and
+    // account-tag caps: the IRCv3 account-tag spec covers INVITE from an
+    // identified sender, and irctest's AccountTag suite asserts it.
+    let mut recipients = vec![invitee];
     let watchers: Vec<ConnId> = state.channels[&key]
         .members
         .keys()
         .copied()
         .filter(|c| *c != conn && *c != invitee)
+        .filter(|c| state.sessions.get(c).is_some_and(|s| s.caps.invite_notify))
         .collect();
-    for watcher in watchers {
-        if state
-            .sessions
-            .get(&watcher)
-            .is_some_and(|s| s.caps.invite_notify)
-        {
-            state.send_timed(watcher, &line);
+    recipients.extend(watchers);
+    for recipient in recipients {
+        let Some(session) = state.sessions.get(&recipient) else {
+            continue;
+        };
+        let caps = session.caps;
+        let mut tags: Vec<String> = Vec::new();
+        if caps.server_time {
+            tags.push(format!("time={}", state.time_tag()));
         }
+        if caps.account_tag
+            && let Some(account) = &sender_account
+        {
+            tags.push(format!(
+                "account={}",
+                e6irc_proto::message::escape_tag_value(account)
+            ));
+        }
+        let line = if tags.is_empty() {
+            body.clone()
+        } else {
+            format!("@{} {body}", tags.join(";"))
+        };
+        state.send(recipient, &line);
     }
 }
 
@@ -341,14 +362,15 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if !changed {
         return;
     }
-    for peer in state.channel_peers(conn) {
-        if state
-            .sessions
-            .get(&peer)
-            .is_some_and(|s| s.caps.away_notify)
-        {
-            state.send_timed(peer, &notify);
+    let peers: std::collections::HashSet<ConnId> = state.channel_peers(conn).into_iter().collect();
+    for peer in &peers {
+        if state.sessions.get(peer).is_some_and(|s| s.caps.away_notify) {
+            state.send_timed(*peer, &notify);
         }
+    }
+    let nick = state.sessions[&conn].nick().map(String::from);
+    if let Some(nick) = nick {
+        monitor_event(state, &nick, &notify, |c| c.away_notify, &peers);
     }
 }
 

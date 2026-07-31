@@ -414,10 +414,15 @@ pub(super) fn cmd_setname(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .set_realname(new_name.to_string());
     let line = format!(":{prefix} SETNAME :{new_name}");
     state.send_timed(conn, &line);
-    for peer in state.channel_peers(conn) {
-        if state.sessions.get(&peer).is_some_and(|s| s.caps.setname) {
-            state.send_timed(peer, &line);
+    let peers: std::collections::HashSet<ConnId> = state.channel_peers(conn).into_iter().collect();
+    for peer in &peers {
+        if state.sessions.get(peer).is_some_and(|s| s.caps.setname) {
+            state.send_timed(*peer, &line);
         }
+    }
+    let nick = state.sessions[&conn].nick().map(String::from);
+    if let Some(nick) = nick {
+        monitor_event(state, &nick, &line, |c| c.setname, &peers);
     }
 }
 
@@ -621,4 +626,484 @@ pub(super) fn cmd_ison(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     .len();
     let shown = crate::core::handler::pack_trailing_list(&online, head_len);
     state.numeric(conn, RPL_ISON, &[], Some(&shown));
+}
+
+// ---- HELP / HELPOP (Modern 704/705/706) ------------------------------------
+
+/// One help topic. The no-argument index is generated from this same table,
+/// so the index and the per-topic answers can never disagree about which
+/// commands exist.
+pub(super) struct HelpTopic {
+    pub(super) name: &'static str,
+    /// Oper-only commands are listed by HELPOP but not by HELP.
+    pub(super) oper: bool,
+    pub(super) lines: &'static [&'static str],
+}
+
+pub(super) const HELP_TOPICS: &[HelpTopic] = &[
+    HelpTopic {
+        name: "NICK",
+        oper: false,
+        lines: &["NICK <nickname>", "Change your nickname."],
+    },
+    HelpTopic {
+        name: "USER",
+        oper: false,
+        lines: &[
+            "USER <username> <unused> <unused> :<realname>",
+            "Supply your identity at registration (clients normally send this for you).",
+        ],
+    },
+    HelpTopic {
+        name: "PING",
+        oper: false,
+        lines: &[
+            "PING <token>",
+            "Liveness check; the server answers PONG with the same token.",
+        ],
+    },
+    HelpTopic {
+        name: "PONG",
+        oper: false,
+        lines: &[
+            "PONG <token>",
+            "Answer a server PING; keeps the connection from being reaped as idle.",
+        ],
+    },
+    HelpTopic {
+        name: "QUIT",
+        oper: false,
+        lines: &[
+            "QUIT [:<message>]",
+            "Disconnect, optionally leaving a parting message.",
+        ],
+    },
+    HelpTopic {
+        name: "REGISTER",
+        oper: false,
+        lines: &[
+            "REGISTER <account> [email] <password>",
+            "Create an account before connecting (draft/account-registration), when the server policy allows it.",
+        ],
+    },
+    HelpTopic {
+        name: "CAP",
+        oper: false,
+        lines: &[
+            "CAP <LS|LIST|REQ|END> [<capabilities>]",
+            "Negotiate IRCv3 capabilities during registration.",
+        ],
+    },
+    HelpTopic {
+        name: "AUTHENTICATE",
+        oper: false,
+        lines: &[
+            "AUTHENTICATE <mechanism|data>",
+            "SASL authentication exchange (PLAIN and OAUTHBEARER when the account store is enabled).",
+        ],
+    },
+    HelpTopic {
+        name: "JOIN",
+        oper: false,
+        lines: &[
+            "JOIN <channel>{,<channel>} [<key>{,<key>}]",
+            "Enter one or more channels, creating them if they do not exist.",
+        ],
+    },
+    HelpTopic {
+        name: "PART",
+        oper: false,
+        lines: &[
+            "PART <channel>{,<channel>} [:<message>]",
+            "Leave one or more channels.",
+        ],
+    },
+    HelpTopic {
+        name: "BATCH",
+        oper: false,
+        lines: &[
+            "BATCH <+ref|-ref> <type> [<parameters>]",
+            "Open or close a client-initiated message batch (requires the batch capability).",
+        ],
+    },
+    HelpTopic {
+        name: "PRIVMSG",
+        oper: false,
+        lines: &[
+            "PRIVMSG <target>{,<target>} :<text>",
+            "Send a message to a channel or user. Targets are channels, nicks, STATUSMSG-prefixed channels (@#chan/+#chan), or the services NickServ/ChanServ.",
+        ],
+    },
+    HelpTopic {
+        name: "NOTICE",
+        oper: false,
+        lines: &[
+            "NOTICE <target>{,<target>} :<text>",
+            "Like PRIVMSG, but automated replies must not answer a NOTICE.",
+        ],
+    },
+    HelpTopic {
+        name: "TAGMSG",
+        oper: false,
+        lines: &[
+            "TAGMSG <target>",
+            "Send client-only message tags with no text (typing indicators, reactions; requires message-tags).",
+        ],
+    },
+    HelpTopic {
+        name: "TOPIC",
+        oper: false,
+        lines: &[
+            "TOPIC <channel> [:<topic>]",
+            "Show or set a channel's topic.",
+        ],
+    },
+    HelpTopic {
+        name: "NAMES",
+        oper: false,
+        lines: &[
+            "NAMES [<channel>{,<channel>}]",
+            "List the visible members of channels.",
+        ],
+    },
+    HelpTopic {
+        name: "MODE",
+        oper: false,
+        lines: &[
+            "MODE <target> [<modes> [<parameters>]]",
+            "Query or change channel modes (bqeI lists, k/l parameters, imnstC flags, o/v prefixes) or your user modes (iwB).",
+        ],
+    },
+    HelpTopic {
+        name: "WHO",
+        oper: false,
+        lines: &[
+            "WHO <mask> [%<fields>[,<token>]] [o]",
+            "List users matching a channel or mask; the % form is the WHOX field selector.",
+        ],
+    },
+    HelpTopic {
+        name: "WHOIS",
+        oper: false,
+        lines: &[
+            "WHOIS <nick>",
+            "Show a user's identity, account, channels, idle time, and server.",
+        ],
+    },
+    HelpTopic {
+        name: "WHOWAS",
+        oper: false,
+        lines: &[
+            "WHOWAS <nick> [<count>]",
+            "Show identity information for a nick that recently disconnected.",
+        ],
+    },
+    HelpTopic {
+        name: "KICK",
+        oper: false,
+        lines: &[
+            "KICK <channel> <user> [:<reason>]",
+            "Remove a user from a channel (requires channel operator).",
+        ],
+    },
+    HelpTopic {
+        name: "INVITE",
+        oper: false,
+        lines: &[
+            "INVITE <nick> <channel>",
+            "Invite a user to a channel; on an invite-only channel only operators may invite.",
+        ],
+    },
+    HelpTopic {
+        name: "AWAY",
+        oper: false,
+        lines: &[
+            "AWAY [:<message>]",
+            "Mark yourself away with a message, or clear your away state.",
+        ],
+    },
+    HelpTopic {
+        name: "LIST",
+        oper: false,
+        lines: &[
+            "LIST [<channel>{,<channel>}]",
+            "List visible channels, their membership counts, and topics.",
+        ],
+    },
+    HelpTopic {
+        name: "USERHOST",
+        oper: false,
+        lines: &[
+            "USERHOST <nick> [<nick> ...]",
+            "Reply with nick[*]=[+|-]user@host for up to five online users.",
+        ],
+    },
+    HelpTopic {
+        name: "USERIP",
+        oper: false,
+        lines: &[
+            "USERIP <nick> [<nick> ...]",
+            "Like USERHOST; IP addresses are never exposed, so the host form is returned.",
+        ],
+    },
+    HelpTopic {
+        name: "CHATHISTORY",
+        oper: false,
+        lines: &[
+            "CHATHISTORY <LATEST|BEFORE|AFTER|AROUND|BETWEEN|TARGETS> <target> <selector> <limit>",
+            "Page persisted channel and direct-message history (draft/chathistory).",
+        ],
+    },
+    HelpTopic {
+        name: "MONITOR",
+        oper: false,
+        lines: &[
+            "MONITOR <+|-|C|L|S> [<nick>{,<nick>}]",
+            "Track nick presence: add, remove, clear, list, or query your watch list.",
+        ],
+    },
+    HelpTopic {
+        name: "MARKREAD",
+        oper: false,
+        lines: &[
+            "MARKREAD <target> [timestamp=<ts>]",
+            "Set or query your per-target read marker (draft/read-marker); stored for identified users.",
+        ],
+    },
+    HelpTopic {
+        name: "SETNAME",
+        oper: false,
+        lines: &[
+            "SETNAME :<realname>",
+            "Change your displayed realname (requires the setname capability).",
+        ],
+    },
+    HelpTopic {
+        name: "MOTD",
+        oper: false,
+        lines: &["MOTD", "Show the server's message of the day."],
+    },
+    HelpTopic {
+        name: "LUSERS",
+        oper: false,
+        lines: &["LUSERS", "Show connection and channel counts."],
+    },
+    HelpTopic {
+        name: "TIME",
+        oper: false,
+        lines: &["TIME", "Show the server's local time."],
+    },
+    HelpTopic {
+        name: "INFO",
+        oper: false,
+        lines: &["INFO", "Show server software information."],
+    },
+    HelpTopic {
+        name: "VERSION",
+        oper: false,
+        lines: &["VERSION", "Show the server software version."],
+    },
+    HelpTopic {
+        name: "ADMIN",
+        oper: false,
+        lines: &["ADMIN", "Show administrative contact information."],
+    },
+    HelpTopic {
+        name: "ISON",
+        oper: false,
+        lines: &[
+            "ISON <nick> [<nick> ...]",
+            "Report which of the listed nicks are currently online.",
+        ],
+    },
+    HelpTopic {
+        name: "LINKS",
+        oper: false,
+        lines: &[
+            "LINKS",
+            "List the servers in the network (this is a single-server network).",
+        ],
+    },
+    HelpTopic {
+        name: "STATS",
+        oper: false,
+        lines: &[
+            "STATS <letter>",
+            "Server statistics query (letters are documented in the reply to an unknown letter).",
+        ],
+    },
+    HelpTopic {
+        name: "KNOCK",
+        oper: false,
+        lines: &[
+            "KNOCK <channel>",
+            "Request an invitation to an invite-only channel.",
+        ],
+    },
+    HelpTopic {
+        name: "OPER",
+        oper: false,
+        lines: &["OPER <name> <password>", "Authenticate as an IRC operator."],
+    },
+    HelpTopic {
+        name: "HELP",
+        oper: false,
+        lines: &[
+            "HELP [<subject>]",
+            "List help topics or show help on one command.",
+        ],
+    },
+    HelpTopic {
+        name: "HELPOP",
+        oper: false,
+        lines: &[
+            "HELPOP [<subject>]",
+            "Like HELP, including operator-only commands in the index.",
+        ],
+    },
+    HelpTopic {
+        name: "NICKSERV",
+        oper: false,
+        lines: &[
+            "/msg NickServ <command>",
+            "Account service: REGISTER, IDENTIFY, GHOST, LOGOUT, HELP.",
+        ],
+    },
+    HelpTopic {
+        name: "CHANSERV",
+        oper: false,
+        lines: &[
+            "/msg ChanServ <command>",
+            "Channel registration service: REGISTER, DROP, FLAGS, OP, SET (FOUNDER, KEEPTOPIC, MLOCK), HELP.",
+        ],
+    },
+    HelpTopic {
+        name: "KILL",
+        oper: true,
+        lines: &[
+            "KILL <nick> :<reason>",
+            "Forcibly disconnect a user (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "KLINE",
+        oper: true,
+        lines: &[
+            "KLINE <user@host-mask> :<reason>",
+            "Ban a user@host mask from the server (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "UNKLINE",
+        oper: true,
+        lines: &[
+            "UNKLINE <user@host-mask>",
+            "Remove a K-line (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "DLINE",
+        oper: true,
+        lines: &[
+            "DLINE <host-mask> :<reason>",
+            "Ban a host or IP mask from the server (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "UNDLINE",
+        oper: true,
+        lines: &[
+            "UNDLINE <host-mask>",
+            "Remove a D-line (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "XLINE",
+        oper: true,
+        lines: &[
+            "XLINE <realname-mask> :<reason>",
+            "Ban a realname (gecos) mask from the server (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "UNXLINE",
+        oper: true,
+        lines: &[
+            "UNXLINE <realname-mask>",
+            "Remove an X-line (oper only); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "SETHOST",
+        oper: true,
+        lines: &[
+            "SETHOST <nick> <host>",
+            "Set a user's visible host (oper only, chghost); audited.",
+        ],
+    },
+    HelpTopic {
+        name: "WALLOPS",
+        oper: true,
+        lines: &[
+            "WALLOPS :<message>",
+            "Send a message to all operators and +w users (oper only).",
+        ],
+    },
+];
+
+pub(super) fn send_help(state: &mut ServerState, conn: ConnId, subject: &str, lines: &[&str]) {
+    let (first, rest) = lines.split_first().expect("topics are non-empty");
+    state.numeric(conn, RPL_HELPSTART, &[subject], Some(first));
+    for line in rest {
+        state.numeric(conn, RPL_HELPTXT, &[subject], Some(line));
+    }
+    state.numeric(conn, RPL_ENDOFHELP, &[subject], Some("End of help"));
+}
+
+pub(super) fn cmd_help(state: &mut ServerState, conn: ConnId, p: &[&str], oper_view: bool) {
+    let visible = |t: &&HelpTopic| oper_view || !t.oper;
+    match p.first().filter(|s| !s.is_empty()) {
+        Some(subject) => {
+            match HELP_TOPICS
+                .iter()
+                .find(|t| visible(t) && t.name.eq_ignore_ascii_case(subject))
+            {
+                Some(topic) => send_help(state, conn, topic.name, topic.lines),
+                None => state.numeric(
+                    conn,
+                    ERR_HELPNOTFOUND,
+                    &[clip_echo(subject)],
+                    Some("No help available on this topic"),
+                ),
+            }
+        }
+        None => {
+            state.numeric(
+                conn,
+                RPL_HELPSTART,
+                &["index"],
+                Some(if oper_view {
+                    "Available commands (including oper-only)"
+                } else {
+                    "Available commands"
+                }),
+            );
+            let names: Vec<String> = HELP_TOPICS
+                .iter()
+                .filter(visible)
+                .map(|t| t.name.to_string())
+                .collect();
+            let target = state.sessions[&conn].nick().unwrap_or("*");
+            let head_len = format!(
+                ":{} {} {} index :",
+                state.config.server_name,
+                e6irc_proto::numerics::code_str(RPL_HELPTXT),
+                target,
+            )
+            .len();
+            let packed = pack_trailing_list(&names, head_len);
+            state.numeric(conn, RPL_HELPTXT, &["index"], Some(&packed));
+            state.numeric(conn, RPL_ENDOFHELP, &["index"], Some("End of help"));
+        }
+    }
 }

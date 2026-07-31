@@ -193,6 +193,15 @@ pub(crate) struct Caps {
     pub labeled_response: bool,
     /// chghost: receive CHGHOST when a user's host changes (SETHOST).
     pub chghost: bool,
+    /// extended-monitor: MONITOR watchers also receive AWAY, ACCOUNT,
+    /// SETNAME, and CHGHOST for monitored nicks (each still gated on the
+    /// watcher holding that event's own cap).
+    pub extended_monitor: bool,
+    /// standard-replies: the client opted into the FAIL/WARN/NOTE reply
+    /// framework. The server already emits FAIL lines for the error
+    /// conditions that define them; the flag exists so CAP negotiation is
+    /// explicit about the contract.
+    pub standard_replies: bool,
     /// Not in [`CAP_NAMES`]: advertised conditionally (`sasl_enabled`).
     pub sasl: bool,
     /// Not in [`CAP_NAMES`] either: advertised conditionally, with a value
@@ -224,6 +233,10 @@ pub(crate) const CAP_NAMES: &[(&str, CapAccessor)] = &[
     ("draft/read-marker", |c| &mut c.read_marker),
     ("labeled-response", |c| &mut c.labeled_response),
     ("chghost", |c| &mut c.chghost),
+    ("extended-monitor", |c| &mut c.extended_monitor),
+    ("standard-replies", |c| &mut c.standard_replies),
+    // The ratified name aliases the draft: same command, same negotiation.
+    ("chathistory", |c| &mut c.chathistory),
 ];
 
 /// A connection's registration state. Held as a sum type rather than a

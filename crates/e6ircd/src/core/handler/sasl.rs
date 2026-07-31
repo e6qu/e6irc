@@ -805,13 +805,18 @@ pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, accou
     }
     let prefix = state.sessions[&conn].prefix();
     let line = format!(":{prefix} ACCOUNT {account}");
-    for peer in state.channel_peers(conn) {
+    let peers: std::collections::HashSet<ConnId> = state.channel_peers(conn).into_iter().collect();
+    for peer in &peers {
         if state
             .sessions
-            .get(&peer)
+            .get(peer)
             .is_some_and(|s| s.caps.account_notify)
         {
-            state.send_timed(peer, &line);
+            state.send_timed(*peer, &line);
         }
+    }
+    let nick = state.sessions[&conn].nick().map(String::from);
+    if let Some(nick) = nick {
+        monitor_event(state, &nick, &line, |c| c.account_notify, &peers);
     }
 }

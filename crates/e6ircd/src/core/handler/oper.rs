@@ -850,12 +850,17 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Announce with the old prefix so clients can match, to every
     // chghost-capable peer (including the target).
     let chghost = format!(":{old_prefix} CHGHOST {user} {newhost}");
-    let mut recipients = state.channel_peers(target);
-    recipients.push(target);
-    for peer in recipients {
-        if state.sessions.get(&peer).is_some_and(|s| s.caps.chghost) {
-            state.send_timed(peer, &chghost);
+    let mut recipients: std::collections::HashSet<ConnId> =
+        state.channel_peers(target).into_iter().collect();
+    recipients.insert(target);
+    for peer in &recipients {
+        if state.sessions.get(peer).is_some_and(|s| s.caps.chghost) {
+            state.send_timed(*peer, &chghost);
         }
+    }
+    let target_nick = state.sessions[&target].nick().map(String::from);
+    if let Some(nick) = target_nick {
+        monitor_event(state, &nick, &chghost, |c| c.chghost, &recipients);
     }
     // A chghost-capable target learned of the change from the CHGHOST above; a
     // client without the cap would otherwise never be told its own host moved.

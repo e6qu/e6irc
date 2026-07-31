@@ -435,6 +435,8 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
         "UNXLINE" => cmd_remove_ban(state, conn, BanKind::Xline, p),
         "SETHOST" => cmd_sethost(state, conn, p),
         "WALLOPS" => cmd_wallops(state, conn, p),
+        "HELP" => cmd_help(state, conn, p, false),
+        "HELPOP" => cmd_help(state, conn, p, true),
         _ => state.numeric(
             conn,
             ERR_UNKNOWNCOMMAND,
