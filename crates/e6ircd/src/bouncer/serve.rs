@@ -41,6 +41,12 @@ impl NetworkKey {
             name: fold(name),
         }
     }
+
+    /// The owner half for log lines: a shared (server-configured) network
+    /// reads as `*` — matching the persistence key — rather than vanishing.
+    fn display_owner(&self) -> &str {
+        self.owner.as_deref().unwrap_or("*")
+    }
 }
 
 /// All active networks, each running an always-on driver, keyed by
@@ -145,6 +151,7 @@ impl Registry {
                     autojoin: e.autojoin.clone(),
                     buffer_cap: e.buffer_cap,
                     sasl: None,
+                    keepalive_idle: super::KEEPALIVE_IDLE,
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
@@ -180,6 +187,7 @@ impl Registry {
         // Capture the kind before `start()` consumes the driver.
         let kind = driver.kind();
         let handle = Arc::new(driver.start());
+        handle.set_label(format!("{}/{}", key.display_owner(), name));
         if let Some(telemetry) = &self.telemetry {
             handle.set_telemetry(telemetry.clone());
         }
@@ -315,7 +323,10 @@ fn spawn_persistence(
         let mut since_trim = 0u64;
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Line(line)) => {
+                // A synthesized self-echo is part of the conversation record:
+                // persist it like an upstream line so a reattached client sees
+                // both sides after a restart.
+                Ok(DriverEvent::Line(line)) | Ok(DriverEvent::Echo { line, .. }) => {
                     if let Err(e) =
                         crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
                     {
@@ -555,6 +566,15 @@ where
                                 awaiting_payload = false;
                                 let payload = std::mem::take(&mut sasl_buf);
                                 match verify_plain(pool, &payload).await {
+                                    None => {
+                                        // A failed attach authentication is a
+                                        // security event; one bounded line per
+                                        // rejection, without the credential.
+                                        eprintln!(
+                                            "bnc: SASL authentication failed on the attach listener"
+                                        );
+                                        reject_sasl(write, server_name).await?;
+                                    }
                                     Some(acct) => {
                                         write
                                             .write_all(
@@ -567,7 +587,6 @@ where
                                             .await?;
                                         account = Some(acct);
                                     }
-                                    None => reject_sasl(write, server_name).await?,
                                 }
                             }
                             // else: 400-char chunk, keep awaiting_payload = true
@@ -626,8 +645,14 @@ where
     W: AsyncWrite + Unpin,
 {
     // `server-time`/`message-tags`/`account-tag` gate which tags a client is
-    // sent from the (fully-tagged) backlog; `sasl` authenticates the attach.
-    let known = |c: &str| matches!(c, "sasl" | "server-time" | "message-tags" | "account-tag");
+    // sent from the (fully-tagged) backlog; `sasl` authenticates the attach;
+    // `echo-message` opts the client into receiving its own synthesized echo.
+    let known = |c: &str| {
+        matches!(
+            c,
+            "sasl" | "server-time" | "message-tags" | "account-tag" | "echo-message"
+        )
+    };
     match msg
         .params
         .first()
@@ -638,7 +663,7 @@ where
             write
                 .write_all(
                     format!(
-                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag\r\n"
+                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag echo-message\r\n"
                     )
                     .as_bytes(),
                 )
@@ -654,6 +679,7 @@ where
                         "server-time" => caps.server_time = true,
                         "message-tags" => caps.message_tags = true,
                         "account-tag" => caps.account_tag = true,
+                        "echo-message" => caps.echo_message = true,
                         _ => {}
                     }
                 }

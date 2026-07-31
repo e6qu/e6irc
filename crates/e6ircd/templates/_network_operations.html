@@ -31,6 +31,7 @@
   </div>
   <div class="network-summary">
     <div><span>Connected since</span><strong>{{ view.connected_since }}</strong></div>
+    <div><span>Next reconnect attempt</span><strong>{{ view.next_retry }}</strong></div>
     <div><span>Last received</span><strong>{{ view.last_input }}</strong></div>
     <div><span>Last sent</span><strong>{{ view.last_output }}</strong></div>
     <div><span>Last error</span><strong>{{ view.last_error }}</strong></div>
@@ -38,6 +39,16 @@
     <div><span>Oldest stored line</span><strong>{{ view.stored_oldest }}</strong></div>
     <div><span>Newest stored line</span><strong>{{ view.stored_newest }}</strong></div>
   </div>
+  {% if !view.recent_failures.is_empty() %}
+    <div class="network-summary">
+      <div>
+        <span>Recent failures</span>
+        <ul class="failure-history">
+          {% for failure in view.recent_failures %}<li>{{ failure }}</li>{% endfor %}
+        </ul>
+      </div>
+    </div>
+  {% endif %}
 </section>
 
 <section class="panel">

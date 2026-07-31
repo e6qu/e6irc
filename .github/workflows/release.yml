@@ -78,6 +78,8 @@ jobs:
           provenance: false
           sbom: false
           push: true
+          build-args: |
+            E6IRC_BUILD_REVISION=${{ github.sha }}
           tags: ${{ env.IMAGE }}:${{ needs.metadata.outputs.tag }}-${{ matrix.arch }}
       - name: Verify the direct architecture image
         run: tools/verify-container-shape.sh "${IMAGE}:${{ needs.metadata.outputs.tag }}" "${{ matrix.arch }}"

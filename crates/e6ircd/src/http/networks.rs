@@ -12,6 +12,11 @@ pub(super) struct NetworkMutationError {
     status: StatusCode,
     title: &'static str,
     detail: Option<String>,
+    /// The form field the failure belongs to, when it has one. Server-rendered
+    /// forms render the message inline at that field (and mark it
+    /// `aria-invalid`) instead of leaving the user to map a top-of-page banner
+    /// to the offending input; fieldless failures keep the banner.
+    field: Option<&'static str>,
 }
 
 impl NetworkMutationError {
@@ -20,7 +25,17 @@ impl NetworkMutationError {
             status,
             title,
             detail: detail.map(str::to_string),
+            field: None,
         }
+    }
+
+    pub(super) fn with_field(mut self, field: &'static str) -> Self {
+        self.field = Some(field);
+        self
+    }
+
+    pub(super) fn field(&self) -> Option<&'static str> {
+        self.field
     }
 
     pub(super) fn message(&self) -> String {
@@ -41,6 +56,30 @@ fn network_error(
     detail: Option<&str>,
 ) -> NetworkMutationError {
     NetworkMutationError::new(status, title, detail)
+}
+
+/// Record one network mutation in the audit trail. The mutation itself is
+/// already committed (audit is a trail, not a gate), so a failed insert
+/// cannot roll it back — but it is logged, never silently lost.
+async fn audit_network_mutation(
+    state: &AppState,
+    actor: &str,
+    action: &'static str,
+    account: &str,
+    name: &str,
+    detail: &str,
+) {
+    if let Err(error) = crate::db::insert_audit_log(
+        pool_of(state),
+        actor,
+        action,
+        &format!("{account}/{name}"),
+        detail,
+    )
+    .await
+    {
+        eprintln!("http: network {action} audit for {account}/{name}: {error}");
+    }
 }
 
 /// Normalize the shared result contract of owner-scoped network updates. This
@@ -176,12 +215,18 @@ struct PreflightNetworkResponse {
     result: crate::bouncer::IrcPreflight,
 }
 
-fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json::Value {
+pub(super) fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json::Value {
     let timestamp =
         |value: Option<e6irc_proto::time::Millis>| value.map(e6irc_proto::time::server_time);
     serde_json::json!({
         "state": runtime.lifecycle.as_str(),
         "state_changed_at": e6irc_proto::time::server_time(runtime.state_changed_at),
+        "next_retry_at": timestamp(runtime.next_retry_at),
+        "recent_failures": runtime.recent_failures.iter().map(|record| serde_json::json!({
+            "at": e6irc_proto::time::server_time(record.at),
+            "code": record.code(),
+            "summary": record.summary(),
+        })).collect::<Vec<_>>(),
         "connected_at": timestamp(runtime.connected_at),
         "last_input_at": timestamp(runtime.last_input_at),
         "last_output_at": timestamp(runtime.last_output_at),
@@ -207,7 +252,7 @@ fn runtime_json(runtime: &crate::bouncer::NetworkRuntimeSnapshot) -> serde_json:
     })
 }
 
-fn network_json(
+pub(super) fn network_json(
     network: crate::db::BncNetworkRow,
     runtime: Option<&crate::bouncer::NetworkRuntimeSnapshot>,
 ) -> serde_json::Value {
@@ -379,6 +424,7 @@ pub(super) async fn preflight_network_core(
         autojoin: Vec::new(),
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
+        keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
     };
     crate::bouncer::preflight_irc(&config)
         .await
@@ -482,29 +528,42 @@ pub(super) fn check_upstream_bounds(
     realname: Option<&str>,
     autojoin: &[String],
 ) -> Result<(), NetworkMutationError> {
-    if addr.len() > 255
-        || nick.len() > 64
-        || realname.is_some_and(|r| r.len() > 128)
-        || autojoin.len() > 64
-        || autojoin.iter().any(|c| c.len() > 64)
-    {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Field too long",
-            Some("network fields exceed their length bounds"),
-        ));
+    let overlong = if addr.len() > 255 {
+        Some(("addr", "addr is limited to 255 bytes"))
+    } else if nick.len() > 64 {
+        Some(("nick", "nick is limited to 64 bytes"))
+    } else if realname.is_some_and(|r| r.len() > 128) {
+        Some(("realname", "realname is limited to 128 bytes"))
+    } else if autojoin.len() > 64 || autojoin.iter().any(|c| c.len() > 64) {
+        Some(("autojoin", "autojoin is limited to 64 channels of 64 bytes"))
+    } else {
+        None
+    };
+    if let Some((field, detail)) = overlong {
+        return Err(
+            network_error(StatusCode::BAD_REQUEST, "Field too long", Some(detail))
+                .with_field(field),
+        );
     }
     let has_control = |s: &str| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
-    if has_control(addr)
-        || has_control(nick)
-        || realname.is_some_and(has_control)
-        || autojoin.iter().any(|c| has_control(c))
-    {
+    let controlled = if has_control(addr) {
+        Some("addr")
+    } else if has_control(nick) {
+        Some("nick")
+    } else if realname.is_some_and(has_control) {
+        Some("realname")
+    } else if autojoin.iter().any(|c| has_control(c)) {
+        Some("autojoin")
+    } else {
+        None
+    };
+    if let Some(field) = controlled {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Invalid character",
-            Some("addr, nick, realname and autojoin must not contain CR, LF or NUL"),
-        ));
+            Some("connection fields must not contain CR, LF or NUL"),
+        )
+        .with_field(field));
     }
     if upstream_addr_is_internal(addr) {
         return Err(network_error(
@@ -513,7 +572,8 @@ pub(super) fn check_upstream_bounds(
             Some(
                 "addr must not be a link-local, unspecified, multicast, broadcast, or documentation IP",
             ),
-        ));
+        )
+        .with_field("addr"));
     }
     Ok(())
 }
@@ -530,15 +590,21 @@ pub(super) fn validate_irc_upstream(
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Missing required fields",
-            Some("addr and nick are required"),
-        ));
+            Some(if addr.is_empty() {
+                "addr is required"
+            } else {
+                "nick is required"
+            }),
+        )
+        .with_field(if addr.is_empty() { "addr" } else { "nick" }));
     }
     if !crate::bouncer::validate_irc_upstream_addr(addr) {
         return Err(network_error(
             StatusCode::BAD_REQUEST,
             "Invalid upstream address",
             Some("addr must be host:port with a nonzero numeric port; bracket IPv6 addresses"),
-        ));
+        )
+        .with_field("addr"));
     }
     check_upstream_bounds(addr, nick, realname, autojoin)
 }
@@ -858,6 +924,15 @@ pub(super) async fn update_network_core(
     if let Some(driver) = driver {
         registry.add(Some(account), name, driver);
     }
+    audit_network_mutation(
+        state,
+        account,
+        "NETWORK_UPDATE",
+        account,
+        name,
+        row.kind.as_db_str(),
+    )
+    .await;
     Ok(())
 }
 
@@ -875,7 +950,8 @@ pub(super) async fn create_network_core(
             Some(
                 "name must be non-empty, not '.'/'..', and use only letters, digits, '-', '_' or '.'",
             ),
-        ));
+        )
+        .with_field("name"));
     }
     use crate::config::NetworkKind;
     let kind = req.kind;
@@ -917,7 +993,13 @@ pub(super) async fn create_network_core(
                 }
                 _ => "addr and nick are required",
             }),
-        ));
+        )
+        .with_field(match kind {
+            NetworkKind::Irc if req.addr.is_empty() => "addr",
+            NetworkKind::Irc => "nick",
+            NetworkKind::Slack if req.sasl_account.is_none() => "sasl_account",
+            _ => "sasl_password",
+        }));
     }
     // Bound + injection-check + SSRF-check the connection/identity fields (the
     // subset shared with the edit path). `addr`/`nick`/`realname`/`autojoin` are
@@ -943,13 +1025,14 @@ pub(super) async fn create_network_core(
             StatusCode::BAD_REQUEST,
             "Field too long",
             Some("network names are limited to 64 bytes"),
-        ));
+        )
+        .with_field("name"));
     }
     if let Some(account) = req.sasl_account.as_deref() {
-        validate_credential_field(account, 255)?;
+        validate_credential_field(account, 255).map_err(|e| e.with_field("sasl_account"))?;
     }
     if let Some(password) = req.sasl_password.as_deref() {
-        validate_credential_field(password, 512)?;
+        validate_credential_field(password, 512).map_err(|e| e.with_field("sasl_password"))?;
     }
     // For IRC the SASL pair is both-or-neither (account = login name, password =
     // secret). Bridges don't follow that rule — their required fields are checked
@@ -959,7 +1042,8 @@ pub(super) async fn create_network_core(
             StatusCode::BAD_REQUEST,
             "Incomplete upstream SASL",
             Some("provide both sasl_account and sasl_password, or neither"),
-        ));
+        )
+        .with_field("sasl_password"));
     }
     if matches!(kind, NetworkKind::Matrix | NetworkKind::Discord) && req.sasl_account.is_some() {
         return Err(network_error(
@@ -1058,6 +1142,15 @@ pub(super) async fn create_network_core(
         }
     }
     registry.add(Some(account), &req.name, driver);
+    audit_network_mutation(
+        state,
+        account,
+        "NETWORK_CREATE",
+        account,
+        &req.name,
+        kind.as_db_str(),
+    )
+    .await;
     Ok(())
 }
 
@@ -1211,6 +1304,7 @@ pub(super) async fn update_network(
 pub(super) async fn set_network_enabled_core(
     state: &AppState,
     registry: &crate::bouncer::Registry,
+    actor: &str,
     account: &str,
     name: &str,
     enabled: bool,
@@ -1251,6 +1345,15 @@ pub(super) async fn set_network_enabled_core(
     } else {
         registry.remove(Some(account), name);
     }
+    audit_network_mutation(
+        state,
+        actor,
+        "NETWORK_TOGGLE",
+        account,
+        name,
+        if enabled { "enabled" } else { "disabled" },
+    )
+    .await;
     Ok(())
 }
 
@@ -1271,6 +1374,7 @@ pub(super) async fn delete_network_core(
         "delete failed",
     )?;
     registry.remove(Some(account), name);
+    audit_network_mutation(state, account, "NETWORK_DELETE", account, name, "").await;
     Ok(())
 }
 
@@ -1286,7 +1390,7 @@ pub(super) async fn patch_network(
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
     if let Err(error) =
-        set_network_enabled_core(&state, registry, &account, &name, req.enabled).await
+        set_network_enabled_core(&state, registry, &account, &account, &name, req.enabled).await
     {
         return error.into_response();
     }

@@ -848,15 +848,10 @@ pub(super) fn cmd_sethost(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     state.sessions.get_mut(&target).expect("checked").host = newhost.to_string();
 
     // Announce with the old prefix so clients can match, to every
-    // chghost-capable peer (including the target).
+    // chghost-capable peer (including the target), then to extended-monitor
+    // watchers of the target's nick.
     let chghost = format!(":{old_prefix} CHGHOST {user} {newhost}");
-    let mut recipients = state.channel_peers(target);
-    recipients.push(target);
-    for peer in recipients {
-        if state.sessions.get(&peer).is_some_and(|s| s.caps.chghost) {
-            state.send_timed(peer, &chghost);
-        }
-    }
+    notify_event(state, target, &chghost, |c| c.chghost, true);
     // A chghost-capable target learned of the change from the CHGHOST above; a
     // client without the cap would otherwise never be told its own host moved.
     // Fill that gap with RPL_VISIBLEHOST so every target learns its new visible

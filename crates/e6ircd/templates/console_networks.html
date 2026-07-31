@@ -24,7 +24,9 @@
         {% endif %}
 
         {% if let Some(err) = error %}
-          <p class="banner-error" role="alert">{{ err }}</p>
+          {% if err.field.is_none() %}
+            <p class="banner-error" role="alert">{{ err.message }}</p>
+          {% endif %}
         {% endif %}
         {% if let Some(result) = success %}
           <section class="qualification-result" role="status" aria-labelledby="qualification-title">
@@ -66,33 +68,40 @@
           </label>
           <label class="field">
             <span>Network ID</span>
-            <input name="name" autocomplete="off" value="{{ form.name }}" maxlength="64" pattern="[A-Za-z0-9._\-]+" data-network-name required />
+            <input name="name" autocomplete="off" value="{{ form.name }}" maxlength="64" pattern="[A-Za-z0-9._\-]+" data-network-name{% if let Some(err) = error %}{% if err.field == Some("name") %} aria-invalid="true"{% endif %}{% endif %} required />
             <small>Stable client selector; letters, digits, dot, underscore, and hyphen only.</small>
+            {% if let Some(err) = error %}{% if err.field == Some("name") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           <label class="field">
             <span>Server and port</span>
-            <input name="addr" autocomplete="off" value="{{ form.addr }}" maxlength="255" data-network-addr required />
+            <input name="addr" autocomplete="off" value="{{ form.addr }}" maxlength="255" data-network-addr{% if let Some(err) = error %}{% if err.field == Some("addr") %} aria-invalid="true"{% endif %}{% endif %} required />
+            {% if let Some(err) = error %}{% if err.field == Some("addr") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           <label class="field">
             <span>Nickname</span>
-            <input name="nick" autocomplete="nickname" value="{{ form.nick }}" maxlength="64" required />
+            <input name="nick" autocomplete="nickname" value="{{ form.nick }}" maxlength="64"{% if let Some(err) = error %}{% if err.field == Some("nick") %} aria-invalid="true"{% endif %}{% endif %} required />
+            {% if let Some(err) = error %}{% if err.field == Some("nick") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           <label class="field">
             <span>Real name <em>optional</em></span>
-            <input name="realname" autocomplete="name" value="{{ form.realname }}" maxlength="128" />
+            <input name="realname" autocomplete="name" value="{{ form.realname }}" maxlength="128"{% if let Some(err) = error %}{% if err.field == Some("realname") %} aria-invalid="true"{% endif %}{% endif %} />
+            {% if let Some(err) = error %}{% if err.field == Some("realname") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           <label class="field field-wide">
             <span>Channels to join <em>optional</em></span>
-            <input name="autojoin" autocomplete="off" value="{{ form.autojoin }}" placeholder="#e6irc, #rust" />
+            <input name="autojoin" autocomplete="off" value="{{ form.autojoin }}" placeholder="#e6irc, #rust"{% if let Some(err) = error %}{% if err.field == Some("autojoin") %} aria-invalid="true"{% endif %}{% endif %} />
             <small>Comma-separated channel names.</small>
+            {% if let Some(err) = error %}{% if err.field == Some("autojoin") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           <label class="field">
             <span>Upstream SASL account <em>optional</em></span>
-            <input name="sasl_account" autocomplete="username" value="{{ form.sasl_account }}" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
+            <input name="sasl_account" autocomplete="username" value="{{ form.sasl_account }}" maxlength="255"{% if let Some(err) = error %}{% if err.field == Some("sasl_account") %} aria-invalid="true"{% endif %}{% endif %} {% if !can_store_secrets %}disabled{% endif %} />
+            {% if let Some(err) = error %}{% if err.field == Some("sasl_account") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           <label class="field">
             <span>Upstream SASL password <em>optional</em></span>
-            <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" {% if !can_store_secrets %}disabled{% endif %} />
+            <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512"{% if let Some(err) = error %}{% if err.field == Some("sasl_password") %} aria-invalid="true"{% endif %}{% endif %} {% if !can_store_secrets %}disabled{% endif %} />
+            {% if let Some(err) = error %}{% if err.field == Some("sasl_password") %}<small class="field-error" role="alert">{{ err.message }}</small>{% endif %}{% endif %}
           </label>
           {% if !can_store_secrets %}
             <div class="banner-info field-wide">
@@ -118,13 +127,8 @@
           </div>
           <span class="count">{{ networks.len() }}</span>
         </div>
-        <div class="scroll">
-          <table>
-            <caption class="sr-only">Configured networks</caption>
-            <thead>
-              <tr><th>Status</th><th>Name</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th></th></tr>
-            </thead>
+        <div class="scroll" id="network-rows" data-refresh-url="/console/networks/rows" data-refresh-seconds="10" data-refresh-status="network-rows-status">
             {% include "console_network_rows.html" %}
-          </table>
         </div>
+        <p id="network-rows-status" class="refresh-status sr-only" aria-live="polite">Refreshes every ten seconds.</p>
 {% endblock %}

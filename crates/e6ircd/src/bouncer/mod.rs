@@ -31,6 +31,7 @@ mod slack;
 
 #[cfg(feature = "discord")]
 pub use discord::{DiscordConfig, DiscordDriver};
+pub(crate) use irc_driver::KEEPALIVE_IDLE;
 pub(crate) use irc_driver::validate_irc_upstream_addr;
 pub use irc_driver::{IrcNetwork, IrcPreflight, IrcPreflightFailure, NetworkConfig, preflight_irc};
 pub use local_driver::{CoreHandles, LocalDriver};
@@ -219,6 +220,7 @@ pub fn build_driver(
                 autojoin,
                 buffer_cap,
                 sasl,
+                keepalive_idle: KEEPALIVE_IDLE,
             })))
         }
         NetworkKind::Local => {
@@ -380,6 +382,20 @@ impl Backoff {
         }
     }
 
+    /// The delay the next [`Backoff::wait`] will sleep, computed exactly as
+    /// `wait` computes it. Exposed so the runtime snapshot can say *when* the
+    /// next attempt fires, not just that the driver is reconnecting.
+    pub(crate) fn next_delay(&self, session_ran: std::time::Duration) -> std::time::Duration {
+        let base = if session_ran >= std::time::Duration::from_secs(10) {
+            std::time::Duration::from_millis(200)
+        } else {
+            self.current
+        };
+        let jitter =
+            std::time::Duration::from_millis((base.as_millis() as u64 + self.jitter_offset) % 97);
+        base + jitter
+    }
+
     /// Sleep before the next reconnect attempt, given how long the session that
     /// just ended lasted, then grow the delay for the attempt after this one.
     pub(crate) async fn wait(&mut self, session_ran: std::time::Duration) {
@@ -525,6 +541,7 @@ async fn wait_for_reconnect(
     failure: NetworkFailure,
 ) -> bool {
     ends.emit(ConnectionEvent::Reconnecting(failure));
+    ends.schedule_retry(backoff.next_delay(attempt_elapsed));
     tokio::select! {
         biased;
         _ = ends.shutdown_signalled() => false,
@@ -849,6 +866,10 @@ pub struct AttachCaps {
     pub server_time: bool,
     pub message_tags: bool,
     pub account_tag: bool,
+    /// echo-message: the attaching client wants its own messages echoed back
+    /// (synthesized by the driver — the upstream is never asked for
+    /// echo-message, so there is exactly one echo, never two).
+    pub echo_message: bool,
 }
 
 /// Strip from a serialized line any message tags the recipient did not
@@ -891,8 +912,25 @@ pub enum DriverEvent {
     Connected,
     /// One line received from upstream (CRLF stripped).
     Line(String),
+    /// A synthesized copy of a line an attached client sent. IRC servers do
+    /// not echo a sender's own messages unless echo-message was negotiated —
+    /// and the driver never negotiates it — so without this the detached
+    /// buffer and the account's *other* sessions would only ever record one
+    /// side of the conversation. `origin` identifies the sending attachment:
+    /// the originator itself is excluded unless it negotiated echo-message on
+    /// attach, mirroring how a real server treats that capability.
+    Echo { line: String, origin: u64 },
     /// The upstream connection dropped; the driver will retry.
     Disconnected,
+}
+
+/// A downstream line queued for the upstream, tagged with the attachment
+/// that sent it so a synthesized [`DriverEvent::Echo`] can exclude its
+/// originator. Origin 0 is the untracked/internal sender (no exclusion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCommand {
+    pub origin: u64,
+    pub line: String,
 }
 
 /// A connection-state change a driver reports through [`DriverEnds::emit`].
@@ -921,7 +959,10 @@ pub enum ConnectionEvent {
 /// driver keeps running while zero are attached.
 pub struct NetworkHandle {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
-    commands: mpsc::Sender<String>,
+    commands: mpsc::Sender<ClientCommand>,
+    /// Per-network attachment id sequence; each attach takes one so its own
+    /// synthesized echoes can be excluded unless it opted into echo-message.
+    attach_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Authoritative stop signal. The registry (and only the registry) holds
     /// the `Sender`; `attach` clones `commands` but never this, so removing or
     /// replacing a network stops its driver even while a client is attached —
@@ -1042,6 +1083,26 @@ impl NetworkFailure {
     }
 }
 
+/// One classified failure with when it happened — the unit of the bounded
+/// per-network failure history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureRecord {
+    pub at: e6irc_proto::time::Millis,
+    failure: NetworkFailure,
+}
+
+impl FailureRecord {
+    /// The closed failure code (see [`NetworkFailure::code`]).
+    pub fn code(&self) -> &'static str {
+        self.failure.code()
+    }
+
+    /// The operator-safe summary (see [`NetworkFailure::summary`]).
+    pub fn summary(&self) -> &'static str {
+        self.failure.summary()
+    }
+}
+
 /// Owner-safe operational data for one network. It contains counters and
 /// timestamps plus a closed, credential-safe failure classification—never raw
 /// errors that could echo a provider response containing secrets.
@@ -1049,6 +1110,11 @@ impl NetworkFailure {
 pub struct NetworkRuntimeSnapshot {
     pub lifecycle: NetworkLifecycle,
     pub state_changed_at: e6irc_proto::time::Millis,
+    /// When the next reconnect attempt fires, while the driver is waiting
+    /// to retry; `None` when connected or parked.
+    pub next_retry_at: Option<e6irc_proto::time::Millis>,
+    /// The bounded newest-last failure history (see [`FailureRecord`]).
+    pub recent_failures: Vec<FailureRecord>,
     pub connected_at: Option<e6irc_proto::time::Millis>,
     pub last_input_at: Option<e6irc_proto::time::Millis>,
     pub last_output_at: Option<e6irc_proto::time::Millis>,
@@ -1068,6 +1134,13 @@ pub struct NetworkRuntimeSnapshot {
 
 struct NetworkRuntimeState {
     lifecycle: NetworkLifecycle,
+    /// When the next reconnect attempt fires (while reconnecting; `None`
+    /// once a session connects or the driver parks).
+    next_retry_at: Option<e6irc_proto::time::Millis>,
+    /// The last few classified failures, newest last — a flap pattern is a
+    /// sequence, and "last error" alone hides it. Bounded; runtime state is
+    /// restart-ephemeral by design.
+    recent_failures: std::collections::VecDeque<FailureRecord>,
     state_changed_at: e6irc_proto::time::Millis,
     connected_at: Option<e6irc_proto::time::Millis>,
     attempt_started: std::time::Instant,
@@ -1080,6 +1153,10 @@ struct NetworkRuntimeState {
 
 struct NetworkRuntime {
     state: std::sync::Mutex<NetworkRuntimeState>,
+    /// The registry's owner/name label, assigned once when the network is
+    /// registered so lifecycle log lines say *which* network transitioned
+    /// (a bare "disconnected" across a fleet of upstreams is undiagnosable).
+    label: std::sync::Mutex<Option<String>>,
     attached_clients: std::sync::atomic::AtomicU64,
     lines_in: std::sync::atomic::AtomicU64,
     bytes_in: std::sync::atomic::AtomicU64,
@@ -1090,10 +1167,22 @@ struct NetworkRuntime {
 }
 
 impl NetworkRuntime {
+    /// The registry label for log lines, or the network kind placeholder
+    /// before registration assigns one.
+    fn label(&self) -> String {
+        self.label
+            .lock()
+            .expect("network label poisoned")
+            .clone()
+            .unwrap_or_else(|| "unregistered network".to_string())
+    }
+
     fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(NetworkRuntimeState {
                 lifecycle: NetworkLifecycle::Connecting,
+                next_retry_at: None,
+                recent_failures: std::collections::VecDeque::new(),
                 state_changed_at: epoch_millis(),
                 connected_at: None,
                 attempt_started: std::time::Instant::now(),
@@ -1103,6 +1192,7 @@ impl NetworkRuntime {
                 last_error_at: None,
                 last_error: None,
             }),
+            label: std::sync::Mutex::new(None),
             attached_clients: std::sync::atomic::AtomicU64::new(0),
             lines_in: std::sync::atomic::AtomicU64::new(0),
             bytes_in: std::sync::atomic::AtomicU64::new(0),
@@ -1113,8 +1203,17 @@ impl NetworkRuntime {
         }
     }
 
+    fn schedule_retry(&self, delay: std::time::Duration) {
+        let mut state = self.state.lock().expect("network runtime poisoned");
+        let at = epoch_millis()
+            .as_millis()
+            .saturating_add(delay.as_millis() as u64);
+        state.next_retry_at = Some(e6irc_proto::time::Millis::from_millis(at));
+    }
+
     fn begin_attempt(&self) {
         let mut state = self.state.lock().expect("network runtime poisoned");
+        state.next_retry_at = None;
         state.lifecycle = if state.connection_attempts == 0 {
             NetworkLifecycle::Connecting
         } else {
@@ -1134,6 +1233,7 @@ impl NetworkRuntime {
         state.lifecycle = NetworkLifecycle::Connected;
         state.state_changed_at = now;
         state.connected_at = Some(now);
+        state.next_retry_at = None;
         state.connect_latency_ms = Some(
             state
                 .attempt_started
@@ -1158,6 +1258,9 @@ impl NetworkRuntime {
         Self::set_error(&mut state, now, failure);
     }
 
+    /// How many classified failures the per-network history retains.
+    const FAILURE_HISTORY: usize = 8;
+
     fn set_error(
         state: &mut NetworkRuntimeState,
         now: e6irc_proto::time::Millis,
@@ -1166,6 +1269,12 @@ impl NetworkRuntime {
         state.errors = state.errors.saturating_add(1);
         state.last_error_at = Some(now);
         state.last_error = Some(failure);
+        state
+            .recent_failures
+            .push_back(FailureRecord { at: now, failure });
+        while state.recent_failures.len() > Self::FAILURE_HISTORY {
+            state.recent_failures.pop_front();
+        }
     }
 
     fn record_input(&self, bytes: usize) {
@@ -1381,7 +1490,16 @@ impl NetworkHandle {
     /// and the caller surfaces it to the client loudly (the same discipline the
     /// core's SendQ uses — bound, then act, never silently block or drop).
     pub fn send(&self, line: &str) -> SendOutcome {
-        match self.commands.try_send(line.to_string()) {
+        self.send_from(0, line)
+    }
+
+    /// As [`NetworkHandle::send`], but the command carries the sending
+    /// attachment's id so its synthesized echo can be routed correctly.
+    pub fn send_from(&self, origin: u64, line: &str) -> SendOutcome {
+        match self.commands.try_send(ClientCommand {
+            origin,
+            line: line.to_string(),
+        }) {
             Ok(()) => {
                 self.runtime.record_output(line.len());
                 if let Some(telemetry) = self
@@ -1403,6 +1521,12 @@ impl NetworkHandle {
                 SendOutcome::Closed
             }
         }
+    }
+
+    /// Allocate the attachment id an interactive attach uses for its sends.
+    pub fn next_attachment_id(&self) -> u64 {
+        self.attach_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A copy of the current detached buffer (for attach playback).
@@ -1479,6 +1603,8 @@ impl NetworkHandle {
         NetworkRuntimeSnapshot {
             lifecycle: state.lifecycle,
             state_changed_at: state.state_changed_at,
+            next_retry_at: state.next_retry_at,
+            recent_failures: state.recent_failures.iter().copied().collect(),
             connected_at: state.connected_at,
             last_input_at: atomic_millis(&self.runtime.last_input_at),
             last_output_at: atomic_millis(&self.runtime.last_output_at),
@@ -1516,6 +1642,8 @@ impl NetworkHandle {
         let state = self.runtime.state.lock().expect("network runtime poisoned");
         NetworkRuntimeState {
             lifecycle: state.lifecycle,
+            next_retry_at: state.next_retry_at,
+            recent_failures: state.recent_failures.clone(),
             state_changed_at: state.state_changed_at,
             connected_at: state.connected_at,
             attempt_started: state.attempt_started,
@@ -1546,6 +1674,7 @@ impl NetworkHandle {
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
+            attach_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             shutdown: shutdown_tx,
             buffer: buffer.clone(),
             runtime: runtime.clone(),
@@ -1578,6 +1707,11 @@ impl NetworkHandle {
         *self.telemetry.lock().expect("telemetry hook poisoned") = Some(telemetry);
     }
 
+    /// Assign the registry's owner/name label for lifecycle log lines.
+    pub(crate) fn set_label(&self, label: String) {
+        *self.runtime.label.lock().expect("network label poisoned") = Some(label);
+    }
+
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
         record_network_error(&self.runtime, &self.telemetry, failure);
     }
@@ -1588,7 +1722,7 @@ impl NetworkHandle {
 /// upstream lines to the detached buffer, and broadcasts live events.
 pub struct DriverEnds {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
-    commands: mpsc::Receiver<String>,
+    commands: mpsc::Receiver<ClientCommand>,
     /// Fires (or its sender drops) when the network is stopped; the driver
     /// observes it in `next_command` and `run_with_backoff` so it tears down
     /// promptly on removal, not when the last client happens to detach.
@@ -1637,6 +1771,21 @@ impl DriverEnds {
         drop(self.events.send(DriverEvent::Line(line)));
     }
 
+    /// Record a synthesized self-echo: a copy of a line an attached client
+    /// just sent, prefixed as the upstream identity would present it. Buffered
+    /// and persisted exactly like an upstream line (the backlog must hold both
+    /// sides of the conversation), but broadcast as [`DriverEvent::Echo`] so
+    /// the originator can be excluded unless it negotiated echo-message.
+    pub fn emit_echo(&self, line: String, origin: u64) {
+        let line = crate::sanitize::upstream_line(line);
+        self.runtime.record_input(line.len());
+        self.buffer
+            .lock()
+            .expect("buffer poisoned")
+            .push(line.clone());
+        drop(self.events.send(DriverEvent::Echo { line, origin }));
+    }
+
     /// Report a connection-state change, updating the sticky connection state
     /// so late subscribers can still read it. Lines have their own entry point
     /// ([`DriverEnds::emit_line`]) because they need sanitizing and buffering;
@@ -1645,6 +1794,10 @@ impl DriverEnds {
         let broadcast = match event {
             ConnectionEvent::Connected => {
                 self.runtime.connected();
+                // One line per transition, labeled: an upstream flap on an
+                // IRC network must be as visible in the log as a bridge's
+                // (bridges already log their own connect failures).
+                eprintln!("bnc: {} connected", self.runtime.label());
                 DriverEvent::Connected
             }
             failure_event => {
@@ -1671,6 +1824,19 @@ impl DriverEnds {
                 {
                     telemetry.record_error(crate::observability::ErrorKind::Bouncer);
                 }
+                match terminal {
+                    Some(lifecycle) => eprintln!(
+                        "bnc: {} parked ({}): {}",
+                        self.runtime.label(),
+                        lifecycle.as_str(),
+                        failure.summary(),
+                    ),
+                    None => eprintln!(
+                        "bnc: {} disconnected ({}); reconnecting",
+                        self.runtime.label(),
+                        failure.code(),
+                    ),
+                }
                 DriverEvent::Disconnected
             }
         };
@@ -1683,11 +1849,17 @@ impl DriverEnds {
         self.runtime.begin_attempt();
     }
 
+    /// Record when the next reconnect attempt fires (visible in the runtime
+    /// snapshot as `next_retry_at`), then cleared when a session connects.
+    fn schedule_retry(&self, delay: std::time::Duration) {
+        self.runtime.schedule_retry(delay);
+    }
+
     /// Await the next downstream command; `None` when every handle is dropped
     /// **or** the network is shut down. Every driver's session loop selects on
     /// this, so an authoritative stop from the registry reaches all of them
     /// without each having to grow its own shutdown branch.
-    pub async fn next_command(&mut self) -> Option<String> {
+    pub async fn next_command(&mut self) -> Option<ClientCommand> {
         tokio::select! {
             biased;
             // `changed()` resolves when the registry sends `true`, or errors if
@@ -1776,8 +1948,8 @@ impl NetworkDriver for LoopbackDriver {
         let (handle, mut ends) = NetworkHandle::channels(self.buffer_cap);
         tokio::spawn(async move {
             ends.emit(ConnectionEvent::Connected);
-            while let Some(line) = ends.next_command().await {
-                ends.emit_line(line);
+            while let Some(cmd) = ends.next_command().await {
+                ends.emit_line(cmd.line);
             }
         });
         handle
@@ -1822,6 +1994,7 @@ where
         return Ok(());
     }
     let _attachment = handle.track_attachment();
+    let attach_id = handle.next_attachment_id();
 
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
@@ -1865,6 +2038,16 @@ where
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
                 }
+                Ok(DriverEvent::Echo { line, origin }) => {
+                    // The originator's own echo reaches it only when it
+                    // negotiated echo-message — the same contract a real
+                    // server has. Every other attached client always gets it.
+                    if origin != attach_id || caps.echo_message {
+                        write.write_all(filter_tags(&line, caps).as_bytes()).await?;
+                        write.write_all(b"\r\n").await?;
+                        write.flush().await?;
+                    }
+                }
                 Ok(DriverEvent::Connected) => {
                     write.write_all(b":*bnc* NOTICE * :upstream connected\r\n").await?;
                     write.flush().await?;
@@ -1894,7 +2077,7 @@ where
                     for event in parsed.drain(..) {
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => match handle.send(&text) {
+                                Ok(text) => match handle.send_from(attach_id, &text) {
                                     SendOutcome::Sent => {}
                                     // Full: the upstream is congested/reconnecting.
                                     // Drop this line loudly rather than block —
@@ -2481,6 +2664,7 @@ mod tests {
                 server_time: true,
                 message_tags: true,
                 account_tag: true,
+                echo_message: false,
             },
         );
         assert_eq!(all, line);

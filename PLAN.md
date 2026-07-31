@@ -5649,3 +5649,47 @@ record the method, status, and URL of every first-party HTTP failure, preventing
 an identity provider's resource noise from being misreported as an e6irc
 failure. The embedded client also declares a content-hashed SVG icon, and the
 journey verifies its MIME type and immutable cache policy.
+
+## IRC daemon and bouncer completion (2026-07-31)
+
+**Daemon conformance.** The persistence-backed irctest job now runs the
+suites whose services-marked classes previously executed nowhere
+(extended_join, account_tag, monitor, read_marker, who, whois); running
+them exposed that INVITE never stamped the sender's account tag (fixed,
+per-recipient like PRIVMSG/NOTICE/TAGMSG). `extended-monitor` watchers
+receive a monitored nick's AWAY/ACCOUNT/SETNAME/CHGHOST, deduplicated
+against channel-peer fan-out. HELP/HELPOP answer with the Modern
+704/705/706 envelope from one topic table that also generates the index,
+with a loud 524 for unknown subjects. `standard-replies` and the ratified
+`chathistory` cap name are advertised. The two Ergo always-on multiclient
+read-marker tests are deselected with the reason written down: same-nick
+session resume belongs to the BNC layer, and core MARKREAD already
+propagates by account across distinct-nick sessions.
+
+**Bouncer.** The driver synthesizes self-echoes (never requesting
+echo-message upstream, so exactly one echo exists): own messages are
+buffered, persisted, and broadcast to the account's other sessions, while
+the originator is excluded unless it negotiated echo-message on attach —
+now advertised on the BNC listener. The irc driver tracks its upstream
+identity (433 earns one alt-nick retry without SASL; forced NICK renames
+are followed) and its confirmed channel membership, so a reconnect rejoins
+runtime-joined channels alongside the configured autojoin. Keepalive is a
+config field (120s production), enabling a real-time silent-upstream test;
+the park-after-five-rejections, eviction-at-capacity, and
+echo-persistence paths are now covered end to end.
+
+**Operations UI.** Network lists live-refresh; the web chat status line
+carries the classified failure reason from `/ws/ui`; the message stream is
+a polite aria-live log; console network forms render per-field errors with
+aria-invalid; `GET /api/v1/admin/networks` plus `/console/admin/networks`
+give operators the fleet-wide view with an audited enable/disable lever.
+
+**Monitoring.** Every network mutation (create/replace/toggle/delete) is
+audited with the true actor. Driver lifecycle transitions are labeled log
+lines (`owner/network connected/disconnected/parked`), IRC SASL failures
+log nick+host, and BNC-listener and web login failures log one bounded
+line each. The runtime snapshot exposes the scheduled next retry and a
+bounded failure history (console operations page, owner JSON); Prometheus
+gains `e6irc_build_info{version,revision}`, with the revision wired
+through the release image build. The journeys claim about Terraform/ECS in
+`deploy/` was corrected (it lives in e6qu/infra).

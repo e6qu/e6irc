@@ -592,6 +592,36 @@ pub(super) fn admin_db_error(what: &str, e: impl std::fmt::Display) -> Response 
 }
 
 /// Aggregate server counts (admin only).
+/// Every account's BNC networks with their live driver state (admin only):
+/// the fleet-wide view an operator needs to spot a misbehaving upstream
+/// without suspending the whole account. Runtime data comes from the same
+/// registry snapshots the owner-scoped endpoints serve.
+pub(super) async fn admin_networks(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAccount,
+) -> Response {
+    let pool = pool_of(&state);
+    match crate::db::list_bnc_network_inventory(pool).await {
+        Ok(rows) => {
+            let networks: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|row| {
+                    let runtime = state
+                        .bnc_registry
+                        .as_ref()
+                        .and_then(|r| r.get_owned(&row.owner, &row.network.name))
+                        .map(|h| h.runtime_snapshot());
+                    let mut value = super::networks::network_json(row.network, runtime.as_ref());
+                    value["owner"] = serde_json::json!(row.owner);
+                    value
+                })
+                .collect();
+            admin_json(serde_json::json!({ "networks": networks }))
+        }
+        Err(e) => admin_db_error("network inventory", e),
+    }
+}
+
 pub(super) async fn admin_stats(
     State(state): State<Arc<AppState>>,
     _admin: AdminAccount,

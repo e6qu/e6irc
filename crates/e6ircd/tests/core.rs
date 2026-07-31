@@ -4484,6 +4484,150 @@ fn monitor_nick_change_notifies_both_ways() {
     assert!(has_numeric(&out, "730"), "new nick online: {out:#?}");
 }
 
+// ---- extended-monitor ---------------------------------------------------
+
+/// extended-monitor watchers see a monitored nick's AWAY even without a
+/// shared channel, gated on the watcher holding away-notify too.
+#[test]
+fn extended_monitor_forwards_away() {
+    let mut s = TestServer::new();
+    let watcher = register_with_caps(&mut s, 1, "alice", "extended-monitor away-notify");
+    let bob = s.register(2, "bob");
+    s.line(watcher, "MONITOR + bob");
+    s.drain(watcher);
+    s.line(bob, "AWAY :afk");
+    s.drain(bob);
+    assert_eq!(s.drain(watcher), vec![":bob!bob@host2.example AWAY :afk"]);
+    s.line(bob, "AWAY");
+    s.drain(bob);
+    assert_eq!(s.drain(watcher), vec![":bob!bob@host2.example AWAY"]);
+}
+
+/// Without the event's own cap the watcher gets nothing; without
+/// extended-monitor the MONITOR subscription alone forwards nothing.
+#[test]
+fn extended_monitor_requires_both_caps() {
+    let mut s = TestServer::new();
+    let no_event_cap = register_with_caps(&mut s, 1, "alice", "extended-monitor");
+    let no_monitor_cap = register_with_caps(&mut s, 2, "carol", "away-notify");
+    let bob = s.register(3, "bob");
+    for w in [no_event_cap, no_monitor_cap] {
+        s.line(w, "MONITOR + bob");
+        s.drain(w);
+    }
+    s.line(bob, "AWAY :afk");
+    s.drain(bob);
+    assert_eq!(s.drain(no_event_cap), Vec::<String>::new());
+    assert_eq!(s.drain(no_monitor_cap), Vec::<String>::new());
+}
+
+/// A watcher who also shares a channel with the subject receives the AWAY
+/// once — the channel fan-out and the monitor fan-out must not duplicate.
+#[test]
+fn extended_monitor_does_not_duplicate_channel_peers() {
+    let mut s = TestServer::new();
+    let watcher = register_with_caps(&mut s, 1, "alice", "extended-monitor away-notify");
+    let bob = s.register(2, "bob");
+    for c in [watcher, bob] {
+        s.line(c, "JOIN #em");
+        s.drain(c);
+    }
+    s.drain(watcher);
+    s.line(watcher, "MONITOR + bob");
+    s.drain(watcher);
+    s.line(bob, "AWAY :afk");
+    s.drain(bob);
+    assert_eq!(s.drain(watcher), vec![":bob!bob@host2.example AWAY :afk"]);
+}
+
+/// SETNAME reaches extended-monitor watchers holding setname; ACCOUNT
+/// reaches those holding account-notify.
+#[test]
+fn extended_monitor_forwards_setname_and_account() {
+    let mut s = TestServer::new();
+    let watcher = register_with_caps(
+        &mut s,
+        1,
+        "alice",
+        "extended-monitor setname account-notify",
+    );
+    let bob = register_with_caps(&mut s, 2, "bob", "setname");
+    s.line(watcher, "MONITOR + bob");
+    s.drain(watcher);
+    s.line(bob, "SETNAME :Robert Example");
+    s.drain(bob);
+    assert_eq!(
+        s.drain(watcher),
+        vec![":bob!bob@host2.example SETNAME :Robert Example"]
+    );
+    identify(&mut s, bob, "bob");
+    assert_eq!(s.drain(watcher), vec![":bob!bob@host2.example ACCOUNT bob"]);
+}
+
+// ---- INVITE account-tag ---------------------------------------------------
+
+/// The account-tag contract covers INVITE: an identified inviter's INVITE
+/// carries their account to recipients holding the cap (irctest's
+/// AccountTagTestCase::testInvite asserts exactly this).
+#[test]
+fn invite_carries_account_tag() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "account-tag");
+    let bob = s.register(2, "bob");
+    s.line(bob, "JOIN #inv");
+    s.drain(bob);
+    identify(&mut s, bob, "bob");
+    s.line(bob, "INVITE alice #inv");
+    assert!(has_numeric(&s.drain(bob), "341"), "RPL_INVITING");
+    assert_eq!(
+        s.drain(alice),
+        vec!["@account=bob :bob!bob@host2.example INVITE alice :#inv"]
+    );
+}
+
+// ---- HELP / HELPOP --------------------------------------------------------
+
+#[test]
+fn help_index_topic_and_unknown_subject() {
+    let mut s = TestServer::new();
+    let alice = s.register(1, "alice");
+    // No argument: a 704/705/706 envelope whose body lists commands.
+    s.line(alice, "HELP");
+    let out = s.drain(alice);
+    assert!(has_numeric(&out, "704"), "HELPSTART: {out:#?}");
+    assert!(has_numeric(&out, "705"), "HELPTXT: {out:#?}");
+    assert!(has_numeric(&out, "706"), "ENDOFHELP: {out:#?}");
+    let index = out.iter().find(|l| l.contains(" 705 ")).expect("705");
+    assert!(index.contains("PRIVMSG"), "index lists commands: {index}");
+    assert!(
+        !index.contains("KILL"),
+        "HELP hides oper-only topics: {index}"
+    );
+
+    // A known subject, case-insensitively.
+    s.line(alice, "HELP privmsg");
+    let out = s.drain(alice);
+    assert!(
+        has_numeric(&out, "704") && has_numeric(&out, "706"),
+        "{out:#?}"
+    );
+    assert!(
+        out.iter().any(|l| l.contains("PRIVMSG <target>")),
+        "topic body: {out:#?}"
+    );
+
+    // An unknown subject is a loud 524, never a silent no-op.
+    s.line(alice, "HELP THISISNOTACOMMAND");
+    let out = s.drain(alice);
+    assert!(has_numeric(&out, "524"), "ERR_HELPNOTFOUND: {out:#?}");
+
+    // HELPOP includes the oper-only topics in its index.
+    s.line(alice, "HELPOP");
+    let out = s.drain(alice);
+    let index = out.iter().find(|l| l.contains(" 705 ")).expect("705");
+    assert!(index.contains("KILL"), "HELPOP lists oper topics: {index}");
+}
+
 // ---- read-marker (MARKREAD) ---------------------------------------------
 
 #[test]

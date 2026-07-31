@@ -157,6 +157,43 @@ credentials or raw authentication material.
 **Evidence.** Proven by admin/owner and self-scoped connection integration
 tests.
 
+## Operate the network fleet
+
+**Actor and goal.** An administrator wants to see every account's always-on
+networks in one place and stop a single misbehaving upstream without
+suspending the owning account.
+
+**Preconditions.** The caller is an administrator; PostgreSQL holds the
+network inventory and the registry holds live drivers.
+
+**Flow.**
+
+1. **Networks** (admin section) lists every account's networks with owner,
+   driver kind, upstream, enabled state, live lifecycle, attached clients,
+   error count, and the last classified failure.
+2. `GET /api/v1/admin/networks` returns the same fleet inventory as
+   authenticated JSON with stored credentials shown only as presence
+   booleans.
+3. A CSRF-protected toggle disables (or re-enables) one network: the flag
+   persists, the driver stops (or starts) under the shared mutation lane,
+   and the action is audited with the administrator as actor.
+
+**Visible failures and recovery.** A network with no live driver reads as not
+running, a disabled one as disabled; a flapping upstream shows its error
+count, last classified failure, and (on the owner's detail page) the
+scheduled next retry and bounded failure history. Driver lifecycle
+transitions are labeled log lines (`owner/network`), so an IRC upstream
+flap is as visible in the server log as a bridge's.
+
+**Security and observability.** The page and API are administrator-gated and
+non-cacheable; the toggle repeats role checks and CSRF; credentials never
+leave the sealed store (presence booleans only); the audit row records
+actor, `owner/network` target, and enabled/disabled detail.
+
+**Evidence.** Proven by the PostgreSQL admin fleet integration test: gating
+(401/403/200), inventory shape, CSRF toggle, persisted flag flip, and the
+`NETWORK_TOGGLE` audit row.
+
 ## Monitor traffic, connections, queue pressure, latency, availability, and errors
 
 **Actor and goal.** An administrator wants to answer “is the service healthy,
@@ -237,6 +274,9 @@ operator, founder, owner, or administrator authority required by the mutation.
 - Managed configuration writes include actor, revision, and redacted change
   detail.
 - Administrator console actions record exact targets.
+- Every BNC network mutation — create, replace, enable/disable, delete —
+  records the acting account (an administrator toggling another account's
+  network is attributed to the administrator, not the owner).
 - The audit explorer/API supports bounded filters and cursor pagination.
 
 **Visible failures and recovery.** Secret material is redacted before storage. A mutation

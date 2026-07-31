@@ -10,6 +10,11 @@ PYTHON=$2
 shift 2
 REPO_ROOT=$(cd -- "$(dirname -- "$0")/../../.." && pwd)
 MARKERS='not implementation-specific and not deprecated and not strict and not services'
+# extended_join.py and account_tag.py are deliberately absent here: both
+# files consist solely of `services`-marked classes, so under this job's
+# `not services` filter they collect zero tests. They run in the
+# persistence-backed job (the irctest-services workflow), where the account
+# store exists.
 GREEN_TESTS=(
     irctest/server_tests/connection_registration.py
     irctest/server_tests/pingpong.py
@@ -25,10 +30,8 @@ GREEN_TESTS=(
     irctest/server_tests/away.py
     irctest/server_tests/list.py
     irctest/server_tests/away_notify.py
-    irctest/server_tests/extended_join.py
     irctest/server_tests/multi_prefix.py
     irctest/server_tests/setname.py
-    irctest/server_tests/account_tag.py
     irctest/server_tests/message_tags.py
     irctest/server_tests/echo_message.py
     irctest/server_tests/monitor.py

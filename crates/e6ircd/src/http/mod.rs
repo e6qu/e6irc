@@ -1021,6 +1021,7 @@ documented_routes! {
     "/api/v1/admin/connections" => { get: admin_connections },
     "/api/v1/admin/connections/{id}" => { delete: admin_disconnect_connection },
     "/api/v1/admin/channels" => { get: admin_channels },
+    "/api/v1/admin/networks" => { get: admin_networks },
     "/api/v1/admin/bans" => { get: admin_server_bans },
     "/api/v1/admin/audit" => { get: admin_audit },
     "/api/v1/admin/stats" => { get: admin_stats },
@@ -1074,6 +1075,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/console/admin/channels",
             get(pages::console_admin_channels),
+        )
+        .route(
+            "/console/admin/networks",
+            get(pages::console_admin_networks),
+        )
+        .route(
+            "/console/admin/networks/{owner}/{name}/toggle",
+            post(pages::console_admin_network_toggle),
         )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
@@ -1173,6 +1182,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/networks",
             get(pages::console_networks).post(pages::console_add_network),
         )
+        .route("/console/networks/rows", get(pages::console_network_rows))
         .route(
             "/console/networks/{name}/delete",
             post(pages::console_delete_network),
@@ -1926,6 +1936,9 @@ mod pages {
             match crate::db::verify_local_password(pool, &form.account, &form.password).await {
                 Ok(Some(account)) => account,
                 Ok(None) => {
+                    // A failed web login is a security event; one bounded line
+                    // per denial, without the password.
+                    eprintln!("web: login failed for account {}", form.account);
                     return login_response(
                         &state,
                         form.account,
@@ -2130,6 +2143,30 @@ mod pages {
     }
 
     #[derive(Clone)]
+    /// A form failure plus the field it belongs to, when it has one. Field
+    /// errors render inline at the offending input; fieldless failures render
+    /// as the page banner.
+    struct FormFieldError {
+        message: String,
+        field: Option<&'static str>,
+    }
+
+    impl FormFieldError {
+        fn banner(message: impl Into<String>) -> Self {
+            Self {
+                message: message.into(),
+                field: None,
+            }
+        }
+
+        fn from_mutation(error: &crate::http::networks::NetworkMutationError) -> Self {
+            Self {
+                message: error.message(),
+                field: error.field(),
+            }
+        }
+    }
+
     struct NetworkFormView {
         preset: String,
         name: String,
@@ -3470,6 +3507,32 @@ mod pages {
         error: Option<String>,
     }
 
+    /// One row of the admin fleet view: a network of any account with its
+    /// live driver state.
+    struct ConsoleAdminNetworkView {
+        owner: String,
+        name: String,
+        kind: String,
+        addr: String,
+        tls: bool,
+        enabled: bool,
+        connected: bool,
+        state: String,
+        attached_clients: u64,
+        errors: u64,
+        last_error: Option<String>,
+    }
+
+    #[derive(Template)]
+    #[template(path = "console_admin_networks.html")]
+    struct ConsoleAdminNetworks {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+        networks: Vec<ConsoleAdminNetworkView>,
+    }
+
     #[derive(Template)]
     #[template(path = "console_bans.html")]
     struct ConsoleServerBans {
@@ -4574,6 +4637,104 @@ mod pages {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
+    }
+
+    /// The fleet-wide BNC view: every account's networks with live driver
+    /// state, so an operator can spot (and stop) a single misbehaving
+    /// upstream without suspending the whole account.
+    pub async fn console_admin_networks(
+        State(state): State<Arc<AppState>>,
+        AdminPageActor { account, csrf }: AdminPageActor,
+    ) -> Response {
+        let rows = match crate::db::list_bnc_network_inventory(pool_of(&state)).await {
+            Ok(rows) => rows,
+            Err(error) => return super::device::admin_db_error("network inventory", error),
+        };
+        let networks = rows
+            .into_iter()
+            .map(|row| {
+                let runtime = state
+                    .bnc_registry
+                    .as_ref()
+                    .and_then(|r| r.get_owned(&row.owner, &row.network.name))
+                    .map(|h| h.runtime_snapshot());
+                let connected = runtime.as_ref().is_some_and(|runtime| {
+                    runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
+                });
+                let state_label = if row.network.enabled {
+                    runtime
+                        .as_ref()
+                        .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
+                        .unwrap_or_else(|| "not running".into())
+                } else {
+                    "disabled".into()
+                };
+                ConsoleAdminNetworkView {
+                    owner: row.owner,
+                    name: row.network.name,
+                    kind: row.network.kind.as_db_str().to_string(),
+                    addr: row.network.addr,
+                    tls: row.network.tls,
+                    enabled: row.network.enabled,
+                    connected,
+                    state: state_label,
+                    attached_clients: runtime
+                        .as_ref()
+                        .map_or(0, |runtime| runtime.attached_clients),
+                    errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
+                    last_error: runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.last_error)
+                        .map(|failure| failure.summary().to_string()),
+                }
+            })
+            .collect();
+        render_private(ConsoleAdminNetworks {
+            account,
+            csrf,
+            is_admin: true,
+            active: "admin-networks",
+            networks,
+        })
+    }
+
+    /// Enable or disable one network of any account (admin lever for a
+    /// misbehaving upstream). Privileged and audited as such.
+    pub async fn console_admin_network_toggle(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+        Path((owner, name)): Path<(String, String)>,
+        form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
+    ) -> Response {
+        let Some(registry) = &state.bnc_registry else {
+            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+        };
+        let axum::Form(f) = match form {
+            Ok(f) => f,
+            Err(e) => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid form",
+                    Some(&e.to_string()),
+                );
+            }
+        };
+        let admin = match require_admin_form_actor(&state, &headers, &f.csrf).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let Some(enabled) = toggle_target(&f.enabled) else {
+            return invalid_toggle_response();
+        };
+        // The admin is the actor here (the owner is only the target), and the
+        // core audits every toggle — an administrator touching another
+        // account's network is unmistakably attributed.
+        if let Err(error) =
+            set_network_enabled_core(&state, registry, &admin, &owner, &name, enabled).await
+        {
+            return error.into_response();
+        }
+        Redirect::to("/console/admin/networks").into_response()
     }
 
     async fn console_server_bans_build(
@@ -5749,9 +5910,19 @@ mod pages {
         attach_addr: Option<std::net::SocketAddr>,
         presets: &'static [IrcNetworkPreset],
         form: NetworkFormView,
-        error: Option<String>,
+        error: Option<FormFieldError>,
         success: Option<NetworkPreflightView>,
         can_store_secrets: bool,
+    }
+
+    /// The networks table as a standalone fragment: the list page's live
+    /// refresh swaps it in whole (the same discipline as the monitoring
+    /// panel), so reconnecting upstreams update without a full page reload.
+    #[derive(Template)]
+    #[template(path = "console_network_rows.html")]
+    struct ConsoleNetworkRows {
+        networks: Vec<ConsoleNetView>,
+        csrf: String,
     }
 
     #[derive(Template)]
@@ -5799,6 +5970,8 @@ mod pages {
         state: String,
         connected: bool,
         state_changed: String,
+        next_retry: String,
+        recent_failures: Vec<String>,
         connected_since: String,
         last_input: String,
         last_output: String,
@@ -5961,14 +6134,17 @@ mod pages {
             .unwrap_or_else(|| "never".into())
     }
 
-    fn runtime_age(value: Option<e6irc_proto::time::Millis>) -> String {
-        let now = std::time::SystemTime::now()
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before Unix epoch")
             .as_millis()
-            .min(u64::MAX as u128) as u64;
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn runtime_age(value: Option<e6irc_proto::time::Millis>) -> String {
         value
-            .map(|at| format_age(now, at.as_millis()))
+            .map(|at| format_age(now_millis(), at.as_millis()))
             .unwrap_or_else(|| "never".into())
     }
 
@@ -6021,6 +6197,37 @@ mod pages {
                 .as_ref()
                 .map(|runtime| e6irc_proto::time::server_time(runtime.state_changed_at))
                 .unwrap_or_else(|| "not available".into()),
+            next_retry: runtime
+                .as_ref()
+                .and_then(|runtime| runtime.next_retry_at)
+                .map(|at| {
+                    format!(
+                        "{} (in {})",
+                        e6irc_proto::time::server_time(at),
+                        format_latency(
+                            at.as_millis()
+                                .saturating_sub(now_millis())
+                                .saturating_mul(1_000)
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| "not scheduled".into()),
+            recent_failures: runtime
+                .as_ref()
+                .map(|runtime| {
+                    runtime
+                        .recent_failures
+                        .iter()
+                        .map(|record| {
+                            format!(
+                                "{} — {}",
+                                e6irc_proto::time::server_time(record.at),
+                                record.summary(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             connected_since: runtime_age(runtime.as_ref().and_then(|runtime| runtime.connected_at)),
             last_input: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_input_at)),
             last_output: runtime_age(runtime.as_ref().and_then(|runtime| runtime.last_output_at)),
@@ -6132,7 +6339,7 @@ mod pages {
         account: String,
         csrf: String,
         form: NetworkFormView,
-        error: Option<String>,
+        error: Option<FormFieldError>,
         success: Option<NetworkPreflightView>,
     ) -> Response {
         let is_admin = is_admin_account(state, &account);
@@ -6176,6 +6383,24 @@ mod pages {
         console_networks_page(&state, account, csrf, form, None, None).await
     }
 
+    /// The live-refresh fragment backing `/console/networks`' table.
+    pub async fn console_network_rows(
+        State(state): State<Arc<AppState>>,
+        headers: axum::http::HeaderMap,
+    ) -> Response {
+        let Ok(account) = authenticate(&state, &headers).await else {
+            return Redirect::to("/login").into_response();
+        };
+        let csrf = session_token(&headers, state.secure_cookies)
+            .map(|session| state.csrf_token(&session))
+            .unwrap_or_default();
+        let networks = match console_network_views(&state, &account).await {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        render_private(ConsoleNetworkRows { networks, csrf })
+    }
+
     /// Add a network from the console and return to the canonical list.
     pub async fn console_add_network(
         State(state): State<Arc<AppState>>,
@@ -6202,7 +6427,9 @@ mod pages {
                 account,
                 csrf,
                 form_view,
-                Some("The network registry is not available on this server.".into()),
+                Some(FormFieldError::banner(
+                    "The network registry is not available on this server.",
+                )),
                 None,
             )
             .await;
@@ -6215,7 +6442,7 @@ mod pages {
                     account,
                     csrf,
                     form_view,
-                    Some(error.message()),
+                    Some(FormFieldError::from_mutation(&error)),
                     None,
                 )
                 .await;
@@ -6227,7 +6454,7 @@ mod pages {
                 account,
                 csrf,
                 form_view,
-                Some(error.message()),
+                Some(FormFieldError::from_mutation(&error)),
                 None,
             )
             .await;
@@ -6261,7 +6488,7 @@ mod pages {
                 account,
                 csrf,
                 form_view,
-                Some(error.message()),
+                Some(FormFieldError::from_mutation(&error)),
                 None,
             )
             .await;
@@ -6293,7 +6520,7 @@ mod pages {
                     account,
                     csrf,
                     form_view,
-                    Some(error.message()),
+                    Some(FormFieldError::banner(error.message())),
                     None,
                 )
                 .await
@@ -6389,7 +6616,7 @@ mod pages {
             return invalid_toggle_response();
         };
         if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &name, enabled).await
+            set_network_enabled_core(&state, registry, &account, &account, &name, enabled).await
         {
             return error.into_response();
         }
@@ -7658,7 +7885,8 @@ mod pages {
             return invalid_toggle_response();
         };
         if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &form.name, enabled).await
+            set_network_enabled_core(&state, registry, &account, &account, &form.name, enabled)
+                .await
         {
             return console_integrations_error(&state, &headers, account, error.message()).await;
         }

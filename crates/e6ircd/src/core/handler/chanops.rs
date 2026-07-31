@@ -190,6 +190,27 @@ fn kick_one_user(
         .remove(key);
 }
 
+/// Resolve a channel by name, answering NOSUCHCHANNEL and returning the
+/// key + display name. The display is cloned so the caller is free to mutate
+/// state without holding the channels borrow.
+fn resolve_channel(
+    state: &mut ServerState,
+    conn: ConnId,
+    target: &str,
+) -> Option<(ChanKey, String)> {
+    let key = state.chan_key(target);
+    let Some(chan) = state.channels.get(&key) else {
+        state.numeric(
+            conn,
+            ERR_NOSUCHCHANNEL,
+            &[clip_echo(target)],
+            Some("No such channel"),
+        );
+        return None;
+    };
+    Some((key, chan.name.clone()))
+}
+
 pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (Some(&who), Some(&target)) = (p.first(), p.get(1)) else {
         state.numeric(
@@ -200,18 +221,10 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+    let Some((key, display)) = resolve_channel(state, conn, target) else {
         return;
     };
-    let display = chan.name.clone();
-    let Some(member) = chan.members.get(&conn) else {
+    if !state.channels[&key].members.contains_key(&conn) {
         state.numeric(
             conn,
             ERR_NOTONCHANNEL,
@@ -219,8 +232,12 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             Some("You're not on that channel"),
         );
         return;
-    };
-    if chan.modes.invite_only && !member.op {
+    }
+    let is_op = state.channels[&key]
+        .members
+        .get(&conn)
+        .is_some_and(|m| m.op);
+    if state.channels[&key].modes.invite_only && !is_op {
         state.numeric(
             conn,
             ERR_CHANOPRIVSNEEDED,
@@ -283,23 +300,44 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .insert(invitee);
     state.numeric(conn, RPL_INVITING, &[&invitee_nick, &display], None);
     let prefix = state.sessions[&conn].prefix();
-    let line = format!(":{prefix} INVITE {invitee_nick} :{display}");
-    state.send_timed(invitee, &line);
-    // invite-notify: other members with the cap see the invite too.
+    let sender_account = state.sessions[&conn].account.clone();
+    let body = format!(":{prefix} INVITE {invitee_nick} :{display}");
+    // The invitee always sees the invite; invite-notify adds the channel's
+    // other cap-holding members. Both honor the recipient's server-time and
+    // account-tag caps: the IRCv3 account-tag spec covers INVITE from an
+    // identified sender, and irctest's AccountTag suite asserts it.
+    let mut recipients = vec![invitee];
     let watchers: Vec<ConnId> = state.channels[&key]
         .members
         .keys()
         .copied()
         .filter(|c| *c != conn && *c != invitee)
+        .filter(|c| state.sessions.get(c).is_some_and(|s| s.caps.invite_notify))
         .collect();
-    for watcher in watchers {
-        if state
-            .sessions
-            .get(&watcher)
-            .is_some_and(|s| s.caps.invite_notify)
-        {
-            state.send_timed(watcher, &line);
+    recipients.extend(watchers);
+    for recipient in recipients {
+        let Some(session) = state.sessions.get(&recipient) else {
+            continue;
+        };
+        let caps = session.caps;
+        let mut tags: Vec<String> = Vec::new();
+        if caps.server_time {
+            tags.push(format!("time={}", state.time_tag()));
         }
+        if caps.account_tag
+            && let Some(account) = &sender_account
+        {
+            tags.push(format!(
+                "account={}",
+                e6irc_proto::message::escape_tag_value(account)
+            ));
+        }
+        let line = if tags.is_empty() {
+            body.clone()
+        } else {
+            format!("@{} {body}", tags.join(";"))
+        };
+        state.send(recipient, &line);
     }
 }
 
@@ -341,15 +379,7 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if !changed {
         return;
     }
-    for peer in state.channel_peers(conn) {
-        if state
-            .sessions
-            .get(&peer)
-            .is_some_and(|s| s.caps.away_notify)
-        {
-            state.send_timed(peer, &notify);
-        }
-    }
+    notify_event(state, conn, &notify, |c| c.away_notify, false);
 }
 
 pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -528,23 +558,15 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
-        state.numeric(
-            conn,
-            ERR_NOSUCHCHANNEL,
-            &[clip_echo(target)],
-            Some("No such channel"),
-        );
+    let Some((key, display)) = resolve_channel(state, conn, target) else {
         return;
     };
-    let display = chan.name.clone();
     // A secret channel is hidden: look non-existent to a non-member.
-    if let Some(proof) = chan.hidden_from(conn) {
+    if let Some(proof) = state.channels[&key].hidden_from(conn) {
         super::deny_hidden(state, conn, target, proof);
         return;
     }
-    if chan.members.contains_key(&conn) {
+    if state.channels[&key].members.contains_key(&conn) {
         state.numeric(
             conn,
             ERR_KNOCKONCHAN,
@@ -553,7 +575,7 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    if !chan.modes.invite_only {
+    if !state.channels[&key].modes.invite_only {
         state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"));
         return;
     }
@@ -562,7 +584,7 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // requests they can't act on.
     let casemap = state.casemap;
     let user_prefix = state.sessions[&conn].prefix();
-    if chan.is_banned(casemap, &user_prefix) {
+    if state.channels[&key].is_banned(casemap, &user_prefix) {
         state.numeric(
             conn,
             ERR_CANNOTSENDTOCHAN,
@@ -572,7 +594,7 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     // Deliver the knock to the channel's operators, then confirm to the knocker.
-    let ops: Vec<ConnId> = chan
+    let ops: Vec<ConnId> = state.channels[&key]
         .members
         .iter()
         .filter(|(_, m)| m.op)

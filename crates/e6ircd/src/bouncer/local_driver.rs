@@ -187,11 +187,11 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
             },
             // Downstream command -> core.
             cmd = ends.next_command() => match cmd {
-                Some(line) => {
+                Some(cmd) => {
                     if session
                         .core
                         .core_tx
-                        .push(Input::Line { conn, line: line.into_bytes() })
+                        .push(Input::Line { conn, line: cmd.line.into_bytes() })
                         .await
                         .is_err()
                     {

@@ -6,6 +6,18 @@ use super::*;
 
 pub(super) fn sasl_fail(state: &mut ServerState, conn: ConnId) {
     state.sessions.get_mut(&conn).expect("checked").sasl = crate::core::state::SaslState::Idle;
+    // A failed authentication is a security event, not chatter: one bounded
+    // line per denial (the per-connection attempt budget caps how many a
+    // single socket can produce), naming the nick and host so brute-force
+    // patterns are visible in the log rather than only in client numerics.
+    let (nick, host) = {
+        let session = &state.sessions[&conn];
+        (
+            session.nick().unwrap_or("*").to_string(),
+            session.host.clone(),
+        )
+    };
+    eprintln!("ircd: SASL authentication failed for {nick} from {host}");
     state.numeric(conn, ERR_SASLFAIL, &[], Some("SASL authentication failed"));
 }
 
@@ -805,13 +817,5 @@ pub(super) fn notify_account_change(state: &mut ServerState, conn: ConnId, accou
     }
     let prefix = state.sessions[&conn].prefix();
     let line = format!(":{prefix} ACCOUNT {account}");
-    for peer in state.channel_peers(conn) {
-        if state
-            .sessions
-            .get(&peer)
-            .is_some_and(|s| s.caps.account_notify)
-        {
-            state.send_timed(peer, &line);
-        }
-    }
+    notify_event(state, conn, &line, |c| c.account_notify, false);
 }

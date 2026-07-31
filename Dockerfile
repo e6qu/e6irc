@@ -14,6 +14,11 @@ RUN pnpm build
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
+# The running binary reports this as e6irc_build_info's revision label; the
+# build arg keeps the image's provenance honest without baking the whole
+# repository state into the runtime stage.
+ARG E6IRC_BUILD_REVISION=unknown
+ENV E6IRC_BUILD_REVISION=$E6IRC_BUILD_REVISION
 COPY . .
 COPY --from=web-build /src/web/dist ./web/dist
 RUN cargo build --release -p e6ircd --all-features

@@ -121,8 +121,11 @@ monitoring; live runtime diagnosis remains tied to the registry.
    driver kind, upstream, attached clients, and error count.
 2. **Inspect** shows configuration without returning the stored secret.
 3. **Operations** refreshes the live snapshot: attempt/success/disconnect
-   timestamps, connection duration, latest connect latency, bytes/lines in and
-   out, attached clients, backlog length, and the bounded error ledger.
+   timestamps, the scheduled time of the next reconnect attempt while the
+   driver is waiting to retry, connection duration, latest connect latency,
+   bytes/lines in and out, attached clients, backlog length, the bounded
+   error ledger, and a bounded newest-last failure history so a flap pattern
+   is visible as a sequence, not just the last error.
 4. Recent persisted detached backlog is shown oldest-first and remains
    available while the network is paused.
 5. Global **Monitoring** aggregates upstream traffic, availability, error
@@ -160,7 +163,11 @@ PLAIN.
 4. The listener resolves the account first, then selects only that account’s
    case-insensitive network name (or an eligible shared network).
 5. The client receives buffered lines and live driver output; commands are
-   relayed back to the same driver.
+   relayed back to the same driver. The driver synthesizes the sender's own
+   messages into the stream (the upstream is never asked for
+   `echo-message`): the account's other attached sessions and the detached
+   buffer always see them, and the sender itself sees its echo exactly when
+   it negotiated `echo-message` on attach.
 6. Disconnecting the client decrements attachments but leaves the driver and
    upstream session running.
 
@@ -189,7 +196,10 @@ driver receives upstream lines while no BNC or web client is attached.
 
 **Flow.**
 
-1. Every driver emits upstream lines into a bounded in-memory buffer.
+1. Every driver emits upstream lines into a bounded in-memory buffer; the
+   `irc` driver additionally synthesizes the account's own sent messages
+   (prefixed with its current upstream identity) so the backlog holds both
+   sides of the conversation.
 2. With PostgreSQL, a persistence task stores wire-preserving lines under the
    owner/network key and trims the network’s history to its cap.
 3. On driver start, recent rows preload oldest-first into the bounded buffer.
