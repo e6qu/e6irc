@@ -1315,12 +1315,19 @@ above the trait, provides for every network kind:
 - **Always-on presence**: driver stays up while zero clients are attached.
 - **Multi-client attach/detach**: any number of the user's IRC connections
   (native clients, web client, TUI) attach to a network; joins/parts/msgs
-  are mirrored to all attached clients (self-echo via `echo-message`).
-- **Detached buffering**: events accumulate per buffer with per-client read
-  markers (`read-marker` cap; web and TUI clients consume the same position).
-- **Playback**: modern clients pull via `CHATHISTORY`; legacy clients get
-  timestamp-prefixed backlog replay on attach (soju-style, configurable
-  per client).
+  are mirrored to all attached clients. A sender's own messages are
+  synthesized into the stream by the driver (the upstream is never asked
+  for `echo-message`, so there is exactly one echo, never two); the
+  originator receives its echo only when it negotiated `echo-message` on
+  attach, the same contract a real server has.
+- **Detached buffering**: events accumulate in a per-network ring persisted
+  to PostgreSQL. Read markers are the ircd core's per-account markers (§11),
+  exposed over `MARKREAD` and REST; the BNC attach path replays the full
+  ring rather than tracking per-client playback positions.
+- **Playback**: attaching clients receive the full detached ring,
+  tag-filtered by their negotiated caps. `CHATHISTORY` paging is served by
+  the ircd core (§11) for the local network; the BNC attach listener does
+  not speak it.
 - **Operations**: `NetworkHandle` owns a typed lifecycle snapshot plus
   connection attempts/errors, connect latency, attached-client count,
   line/byte traffic, last-activity times, and buffer occupancy. Driver endpoints
@@ -1337,17 +1344,23 @@ one implementation shared with the external-network path.
 ### 10.3 `irc` driver — external networks (ZNC/soju-style)
 
 - Full IRCv3 *client* implementation reusing `e6irc-proto` + the same SASL
-  machinery; requests `server-time`, `message-tags`, `away-notify`, etc.
-  from upstream when available (Libera: yes).
+  machinery; requests `server-time`, `message-tags`, and `account-tag`
+  from upstream when available (Libera: yes). It deliberately does not
+  request `echo-message`: the driver synthesizes self-echoes itself
+  (§10.1), and requesting it would produce every echo twice.
 - Auto-reconnect with exponential backoff + jitter, bounded so repeatedly
   rejected credentials or IRC registration settings stop re-dialing rather
   than hammering the upstream forever; authentication and registration
   rejection have distinct terminal lifecycle states. On reconnect the driver
-  re-registers and re-joins the
-  *configured* autojoin channels under the configured nick. A JOIN or NICK
-  issued by an attached client changes only the current upstream session;
-  persistent reconnect behavior is edited explicitly in the network's stored
-  configuration. Upstream SASL PLAIN uses credentials stored encrypted (§15).
+  re-registers under the configured nick — a 433 without SASL earns one
+  replacement-nick retry (`nick_`), since the common cause is a lingering
+  ghost of our own previous session — and re-joins the *configured*
+  autojoin channels plus every channel the upstream confirmed membership in
+  before the drop (runtime JOIN/PART/KICK are tracked as they are
+  acknowledged upstream; a forced upstream NICK renames the tracked
+  identity). A process restart falls back to the configured autojoin, which
+  is the operator-declared floor. Upstream SASL PLAIN uses credentials
+  stored encrypted (§15).
 - Every registration, auto-join, command, heartbeat, and protocol PONG emission
   is part of the session outcome: a failed upstream transport write drops and
   reconnects, while a closed in-process core queue stops the `local` driver

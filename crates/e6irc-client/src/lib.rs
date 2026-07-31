@@ -699,6 +699,15 @@ impl Connection {
         self.await_welcome(nick).await
     }
 
+    /// Offer a replacement nick after the server refused the requested one
+    /// (433) during registration. The connection is still pre-registration —
+    /// the server holds it open after a 433 — so a fresh NICK is legal here;
+    /// the welcome is awaited exactly as in [`Connection::register`].
+    pub async fn retry_nick(&mut self, nick: &str) -> io::Result<String> {
+        self.send_line(&format!("NICK {nick}")).await?;
+        self.await_welcome(nick).await
+    }
+
     /// Require an atomic set of capabilities on an already registered
     /// connection. A server NAK is a visible feature error, never a silent
     /// downgrade.

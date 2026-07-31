@@ -379,6 +379,7 @@ pub(super) async fn preflight_network_core(
         autojoin: Vec::new(),
         buffer_cap: 1,
         sasl: req.sasl_account.zip(req.sasl_password),
+        keepalive_idle: crate::bouncer::KEEPALIVE_IDLE,
     };
     crate::bouncer::preflight_irc(&config)
         .await

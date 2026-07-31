@@ -145,6 +145,7 @@ impl Registry {
                     autojoin: e.autojoin.clone(),
                     buffer_cap: e.buffer_cap,
                     sasl: None,
+                    keepalive_idle: super::KEEPALIVE_IDLE,
                 };
                 Box::new(super::LocalDriver::new(core.clone(), config))
             } else {
@@ -315,7 +316,10 @@ fn spawn_persistence(
         let mut since_trim = 0u64;
         loop {
             match events.recv().await {
-                Ok(DriverEvent::Line(line)) => {
+                // A synthesized self-echo is part of the conversation record:
+                // persist it like an upstream line so a reattached client sees
+                // both sides after a restart.
+                Ok(DriverEvent::Line(line)) | Ok(DriverEvent::Echo { line, .. }) => {
                     if let Err(e) =
                         crate::db::persist_bnc_line(&pool, &owner_key, &network, &line).await
                     {
@@ -626,8 +630,14 @@ where
     W: AsyncWrite + Unpin,
 {
     // `server-time`/`message-tags`/`account-tag` gate which tags a client is
-    // sent from the (fully-tagged) backlog; `sasl` authenticates the attach.
-    let known = |c: &str| matches!(c, "sasl" | "server-time" | "message-tags" | "account-tag");
+    // sent from the (fully-tagged) backlog; `sasl` authenticates the attach;
+    // `echo-message` opts the client into receiving its own synthesized echo.
+    let known = |c: &str| {
+        matches!(
+            c,
+            "sasl" | "server-time" | "message-tags" | "account-tag" | "echo-message"
+        )
+    };
     match msg
         .params
         .first()
@@ -638,7 +648,7 @@ where
             write
                 .write_all(
                     format!(
-                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag\r\n"
+                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag echo-message\r\n"
                     )
                     .as_bytes(),
                 )
@@ -654,6 +664,7 @@ where
                         "server-time" => caps.server_time = true,
                         "message-tags" => caps.message_tags = true,
                         "account-tag" => caps.account_tag = true,
+                        "echo-message" => caps.echo_message = true,
                         _ => {}
                     }
                 }

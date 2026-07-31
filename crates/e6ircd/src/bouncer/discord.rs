@@ -306,8 +306,8 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
             cmd = ends.next_command() => match cmd {
                 // One line may resolve to several targets (a comma list); each
                 // target's outcome is surfaced independently by `relay_routed`.
-                Some(line) => {
-                    let routed = super::route_privmsg(&line, &channel_to_id);
+                Some(cmd) => {
+                    let routed = super::route_privmsg(&cmd.line, &channel_to_id);
                     super::relay_routed(ends, routed, "Discord", "channel", |id, text| {
                         let http = http.clone();
                         let base = base.clone();

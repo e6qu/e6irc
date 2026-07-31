@@ -25,6 +25,10 @@ pub struct NetworkConfig {
     pub buffer_cap: usize,
     /// SASL PLAIN credentials for the upstream, when it requires auth.
     pub sasl: Option<(String, String)>,
+    /// Idle gap before the driver sends its own keepalive PING (and again
+    /// before it declares a silent upstream dead). 120s in production; tests
+    /// shrink it to exercise the half-open-upstream path in real time.
+    pub keepalive_idle: Duration,
 }
 
 impl Default for NetworkConfig {
@@ -37,6 +41,7 @@ impl Default for NetworkConfig {
             autojoin: Vec::new(),
             buffer_cap: 1000,
             sasl: None,
+            keepalive_idle: KEEPALIVE_IDLE,
         }
     }
 }
@@ -44,6 +49,17 @@ impl Default for NetworkConfig {
 /// A started `irc` network. Dropping the returned [`NetworkHandle`]
 /// (its command sender) tells the driver task to stop.
 pub struct IrcNetwork;
+
+/// State that survives one driver's reconnects: the set of channels the
+/// upstream has confirmed us in, keyed by RFC1459-folded name with the
+/// server's canonical casing as the value. `connect_once` joins the
+/// configured autojoin plus everything here, so channels joined at runtime
+/// (not just the static config) are restored after a drop — the behaviour
+/// ZNC/soju users rely on. In-memory only: a process restart legitimately
+/// falls back to the configured autojoin, which is the operator-declared
+/// floor.
+#[derive(Debug, Default)]
+pub struct JoinedChannels(std::sync::Mutex<std::collections::HashMap<String, String>>);
 
 impl IrcNetwork {
     /// Start the driver task and return a handle to it.
@@ -204,13 +220,25 @@ fn elapsed_millis(elapsed: Duration) -> u64 {
 
 async fn run(config: NetworkConfig, mut ends: DriverEnds) {
     // Clean stop: the command channel closed (handle dropped).
-    super::run_with_backoff(config, &mut ends, |config, ends| {
-        Box::pin(connect_once(config, ends))
+    let shared = SharedDriver {
+        config,
+        joined: std::sync::Arc::new(JoinedChannels::default()),
+    };
+    super::run_with_backoff(shared, &mut ends, |shared, ends| {
+        Box::pin(connect_once(shared, ends))
     })
     .await;
 }
 
-async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
+/// The per-driver value shared across reconnect attempts: static config plus
+/// the runtime joined-channel set.
+struct SharedDriver {
+    config: NetworkConfig,
+    joined: std::sync::Arc<JoinedChannels>,
+}
+
+async fn connect_once(shared: &SharedDriver, ends: &mut DriverEnds) -> super::SessionOutcome {
+    let config = &shared.config;
     // Bound connect + registration: an upstream that accepts the TCP handshake
     // but never sends 001 (firewall dropping data, half-open peer) must not
     // wedge the driver forever — that would starve the reconnect loop, the
@@ -237,8 +265,36 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
             None => conn.register(&config.nick, &config.realname).await,
         }
     };
-    match tokio::time::timeout(Duration::from_secs(30), register_fut).await {
-        Ok(Ok(_)) => {}
+    let mut current_nick = match tokio::time::timeout(Duration::from_secs(30), register_fut).await {
+        Ok(Ok(confirmed)) => confirmed,
+        // 433 without SASL: a lingering ghost of our own previous session
+        // (not yet timed out upstream) holds the nick. Offer one replacement
+        // rather than parking a healthy network until an operator intervenes;
+        // if the replacement is refused too, the rejection path below parks
+        // as before. SASL registrations skip the retry: their conflict means
+        // the account's nick is genuinely claimed elsewhere, and silently
+        // renaming would mask that — the repeated-rejection park surfaces it.
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists && config.sasl.is_none() => {
+            let alt = format!("{}_", config.nick);
+            match tokio::time::timeout(Duration::from_secs(30), conn.retry_nick(&alt)).await {
+                Ok(Ok(confirmed)) => confirmed,
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return super::SessionOutcome::AuthRejected;
+                }
+                Ok(Err(e))
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::AlreadyExists
+                            | std::io::ErrorKind::Other
+                            | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    return super::SessionOutcome::RegistrationRejected;
+                }
+                Ok(Err(_)) => return dropped(super::NetworkFailure::RegistrationFailed),
+                Err(_) => return dropped(super::NetworkFailure::RegistrationTimedOut),
+            }
+        }
         // A terminal auth/registration refusal (bad password, banned) surfaces
         // as `PermissionDenied` from the client — distinct from a transient
         // connection error, so the reconnect loop can stop re-dialing rather
@@ -258,8 +314,31 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
         }
         Ok(Err(_)) => return dropped(super::NetworkFailure::RegistrationFailed),
         Err(_) => return dropped(super::NetworkFailure::RegistrationTimedOut),
-    }
-    for chan in &config.autojoin {
+    };
+    // Join the configured autojoin plus every channel the upstream confirmed
+    // us in before the drop (runtime joins are tracked in `shared.joined`).
+    // Autojoin wins on a fold-collision: its casing is the operator's.
+    let rejoin: Vec<String> = {
+        let mut list = config.autojoin.clone();
+        let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+        let folded: std::collections::HashSet<String> = config
+            .autojoin
+            .iter()
+            .map(|c| casemap.casefold(c))
+            .collect();
+        let extras: Vec<String> = shared
+            .joined
+            .0
+            .lock()
+            .expect("joined set poisoned")
+            .iter()
+            .filter(|(key, _)| !folded.contains(*key))
+            .map(|(_, display)| display.clone())
+            .collect();
+        list.extend(extras);
+        list
+    };
+    for chan in &rejoin {
         if conn.send_line(&format!("JOIN {chan}")).await.is_err() {
             return dropped(super::NetworkFailure::AutojoinFailed);
         }
@@ -275,10 +354,14 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
     // the link is dead — drop and reconnect. A live server's own PINGs (which
     // we answer) keep a quiet-but-alive connection from ever tripping this.
     let mut awaiting_keepalive = false;
+    // The host half of synthesized self-echo prefixes.
+    let upstream = upstream_host(&config.addr)
+        .unwrap_or(config.addr.as_str())
+        .to_string();
     loop {
         tokio::select! {
             // Upstream -> buffer + event.
-            msg = tokio::time::timeout(KEEPALIVE_IDLE, conn.next_line_relayable()) => match msg {
+            msg = tokio::time::timeout(config.keepalive_idle, conn.next_line_relayable()) => match msg {
                 Ok(Ok(Some(RelayEvent::Line { message: parsed, raw }))) => {
                     awaiting_keepalive = false;
                     // Keepalive filtering applies only to lines we could parse;
@@ -305,6 +388,7 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
                         {
                             continue;
                         }
+                        track_membership(m, &mut current_nick, &shared.joined);
                     }
                     // The upstream's own line: attached clients and the detached
                     // buffer get what the network sent, tags and all. `attach`
@@ -341,9 +425,18 @@ async fn connect_once(config: &NetworkConfig, ends: &mut DriverEnds) -> super::S
             },
             // Downstream command -> upstream.
             cmd = ends.next_command() => match cmd {
-                Some(line) => {
-                    if conn.send_line(&line).await.is_err() {
+                Some(cmd) => {
+                    if conn.send_line(&cmd.line).await.is_err() {
                         return dropped(super::NetworkFailure::UpstreamWriteFailed);
+                    }
+                    // The upstream never echoes our own messages (we do not
+                    // request echo-message — one synthesized echo beats two
+                    // sources), so manufacture it: the detached buffer and the
+                    // account's other sessions must see both sides of the
+                    // conversation, and the originator sees it exactly when it
+                    // negotiated echo-message on attach.
+                    if let Some(echo) = self_echo(&cmd.line, &current_nick, &config.nick, &upstream) {
+                        ends.emit_echo(echo, cmd.origin);
                     }
                 }
                 None => return super::SessionOutcome::Stopped, // handle dropped
@@ -356,11 +449,99 @@ fn dropped(failure: super::NetworkFailure) -> super::SessionOutcome {
     super::SessionOutcome::Dropped(failure)
 }
 
+/// Follow our own identity and channel membership as the upstream reports
+/// it: a forced NICK (collision resolution, oper SETHOST-style renames,
+/// services GHOST/REGAIN) changes who we are; our JOIN/PART and being KICKed
+/// change what a reconnect must restore. Comparisons fold with RFC1459
+/// casemapping, the same rule the upstream applies.
+fn track_membership(
+    m: &e6irc_client::OwnedMessage,
+    current_nick: &mut String,
+    joined: &JoinedChannels,
+) {
+    let casemap = e6irc_proto::casemap::CaseMapping::Rfc1459;
+    let prefix_nick = m
+        .source
+        .as_deref()
+        .and_then(|source| source.split(['!', '@']).next());
+    let is_us =
+        |candidate: Option<&str>| candidate.is_some_and(|nick| casemap.eq(nick, current_nick));
+    match m.command.as_str() {
+        "NICK" if is_us(prefix_nick) => {
+            if let Some(new_nick) = m.params.first() {
+                *current_nick = new_nick.clone();
+            }
+        }
+        "JOIN" if is_us(prefix_nick) => {
+            if let Some(chan) = m.params.first() {
+                joined
+                    .0
+                    .lock()
+                    .expect("joined set poisoned")
+                    .insert(casemap.casefold(chan), chan.clone());
+            }
+        }
+        "PART" if is_us(prefix_nick) => {
+            if let Some(chan) = m.params.first() {
+                joined
+                    .0
+                    .lock()
+                    .expect("joined set poisoned")
+                    .remove(&casemap.casefold(chan));
+            }
+        }
+        // Being kicked from a channel ends membership exactly like a PART.
+        "KICK" if is_us(m.params.get(1).map(String::as_str)) => {
+            if let Some(chan) = m.params.first() {
+                joined
+                    .0
+                    .lock()
+                    .expect("joined set poisoned")
+                    .remove(&casemap.casefold(chan));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build the self-echo line for a client command, or `None` when the command
+/// is not a message an upstream would echo. The prefix is our current
+/// upstream identity (`nick!~ident@host`; `~` because no identd answered),
+/// the client's own tags ride along exactly as a real echo-message would
+/// return them, and a fresh `time=` tag stamps when the bouncer accepted the
+/// line so backlog playback orders it against upstream traffic.
+fn self_echo(line: &str, nick: &str, ident: &str, host: &str) -> Option<String> {
+    let (tags, body) = match line.strip_prefix('@') {
+        Some(rest) => match rest.split_once(' ') {
+            Some((t, b)) => (Some(t), b),
+            None => return None,
+        },
+        None => (None, line),
+    };
+    let command = body.split(' ').next()?;
+    if !command.eq_ignore_ascii_case("PRIVMSG")
+        && !command.eq_ignore_ascii_case("NOTICE")
+        && !command.eq_ignore_ascii_case("TAGMSG")
+    {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_millis() as u64;
+    let time = e6irc_proto::time::server_time(e6irc_proto::time::Millis::from_millis(now));
+    let all_tags = match tags {
+        Some(t) if !t.is_empty() => format!("time={time};{t}"),
+        _ => format!("time={time}"),
+    };
+    Some(format!("@{all_tags} :{nick}!~{ident}@{host} {body}"))
+}
+
 /// Idle gap before the driver sends a keepalive PING (and again before it
 /// declares a silent upstream dead). A live server PINGs well within this, so a
 /// quiet-but-alive connection never trips it; a half-open one is caught within
 /// `2 × KEEPALIVE_IDLE`.
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
+pub(crate) const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
 
 async fn connect(config: &NetworkConfig) -> std::io::Result<Connection> {
     // SSRF control: resolve the upstream address ourselves and dial a *vetted*

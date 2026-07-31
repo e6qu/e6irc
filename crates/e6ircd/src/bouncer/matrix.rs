@@ -118,7 +118,7 @@ async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::Se
                 }
             },
             cmd = ends.next_command() => match cmd {
-                Some(line) => handle_command(&mut session, ends, &line).await,
+                Some(cmd) => handle_command(&mut session, ends, &cmd.line).await,
                 None => return super::SessionOutcome::Stopped, // every handle dropped
             },
         }

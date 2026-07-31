@@ -202,3 +202,146 @@ async fn two_clients_attach_to_one_always_on_network() {
         assert!(got.contains("PRIVMSG #multi"), "{got}");
     }
 }
+
+/// Attach one downstream client over an in-memory duplex; returns the read
+/// half (buffered), the write half, and the join handle of the attach task.
+fn attach_client(
+    handle: &std::sync::Arc<NetworkHandle>,
+    caps: e6ircd::bouncer::AttachCaps,
+) -> (
+    BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let attach_handle = handle.clone();
+    let task = tokio::spawn(async move {
+        let _ = attach(server_side, &attach_handle, caps).await;
+    });
+    let (cr, cw) = tokio::io::split(client_side);
+    (BufReader::new(cr), cw, task)
+}
+
+/// Read until a line containing `needle` arrives.
+async fn read_until(
+    br: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    needle: &str,
+) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            br.read_line(&mut line).await.unwrap();
+            if line.contains(needle) {
+                return line;
+            }
+        }
+    })
+    .await
+    .expect("read_until timeout")
+}
+
+/// A client that sends a message must not receive its own echo unless it
+/// negotiated echo-message — but the account's *other* sessions and the
+/// detached buffer must (they would otherwise see one-sided conversations).
+#[tokio::test(flavor = "multi_thread")]
+async fn self_echo_excluded_for_originator_but_reaches_others_and_buffer() {
+    let addr = upstream().await;
+    let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "echobot".into(),
+        autojoin: vec!["#echo".into()],
+        ..NetworkConfig::default()
+    }));
+    wait_connected(&handle).await;
+
+    // originator: no echo-message; observer: none either (it still gets the
+    // echo — only the originator is ever excluded).
+    let (mut a_reader, mut a_writer, _a) = attach_client(&handle, Default::default());
+    let (mut b_reader, _b_writer, _b) = attach_client(&handle, Default::default());
+    // Attach status notices.
+    read_until(&mut a_reader, "upstream connected").await;
+    read_until(&mut b_reader, "upstream connected").await;
+
+    a_writer
+        .write_all(b"PRIVMSG #echo :both sides now\r\n")
+        .await
+        .unwrap();
+
+    // The observer receives the synthesized echo, prefixed as the driver's
+    // upstream identity.
+    let echoed = read_until(&mut b_reader, "both sides now").await;
+    assert!(
+        echoed.contains(":echobot!~echobot@"),
+        "echo carries the upstream identity: {echoed}"
+    );
+    assert!(echoed.contains("PRIVMSG #echo"), "{echoed}");
+
+    // The originator does not receive its own line back. Give the stream a
+    // moment: any such line would arrive promptly.
+    let own = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+        loop {
+            let mut line = String::new();
+            a_reader.read_line(&mut line).await.unwrap();
+            if line.contains("both sides now") {
+                return line;
+            }
+        }
+    })
+    .await;
+    assert!(own.is_err(), "originator must not be echoed: {own:?}");
+
+    // The detached buffer records it (playback holds both sides).
+    let buffered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = handle.buffer_snapshot();
+            if let Some(line) = snapshot.iter().find(|l| l.contains("both sides now")) {
+                return line.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("echo not buffered");
+    assert!(buffered.contains(":echobot!~echobot@"), "{buffered}");
+}
+
+/// With echo-message negotiated on attach, the originator receives exactly
+/// one copy of its own message (synthesized — the upstream is never asked
+/// for echo-message, so no second echo can arrive).
+#[tokio::test(flavor = "multi_thread")]
+async fn self_echo_delivered_once_when_negotiated() {
+    let addr = upstream().await;
+    let handle = std::sync::Arc::new(IrcNetwork::start(NetworkConfig {
+        addr: addr.to_string(),
+        nick: "echobot".into(),
+        autojoin: vec!["#echo".into()],
+        ..NetworkConfig::default()
+    }));
+    wait_connected(&handle).await;
+
+    let caps = e6ircd::bouncer::AttachCaps {
+        echo_message: true,
+        ..Default::default()
+    };
+    let (mut reader, mut writer, _task) = attach_client(&handle, caps);
+    read_until(&mut reader, "upstream connected").await;
+
+    writer
+        .write_all(b"PRIVMSG #echo :my own words\r\n")
+        .await
+        .unwrap();
+    let first = read_until(&mut reader, "my own words").await;
+    assert!(first.contains(":echobot!~echobot@"), "{first}");
+    // No second copy follows.
+    let second = tokio::time::timeout(std::time::Duration::from_millis(400), async {
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if line.contains("my own words") {
+                return line;
+            }
+        }
+    })
+    .await;
+    assert!(second.is_err(), "exactly one echo: {second:?}");
+}

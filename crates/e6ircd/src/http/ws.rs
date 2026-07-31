@@ -294,6 +294,7 @@ pub(super) async fn ws_ui_conn(
         return;
     }
     let _attachment = handle.track_attachment();
+    let attach_id = handle.next_attachment_id();
 
     // Send the current connection status up front: a driver is always-on, so a
     // client attaching to an already-connected network would otherwise see no
@@ -353,6 +354,20 @@ pub(super) async fn ws_ui_conn(
                         break;
                     }
                 }
+                Ok(DriverEvent::Echo { line, origin }) => {
+                    // This socket already rendered its own line optimistically
+                    // with the correlated `sent` acknowledgement; an echo of it
+                    // would double-render. Echoes from the account's *other*
+                    // sessions are real conversation and render normally.
+                    if origin != attach_id
+                        && socket
+                            .send(WsMessage::text(line_event(&line)))
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
                 Ok(DriverEvent::Connected) => {
                     if socket
                         .send(WsMessage::text(status_event(ConnStatus::Connected)))
@@ -405,7 +420,7 @@ pub(super) async fn ws_ui_conn(
                             continue;
                         }
                     };
-                    match handle.send(&request.line) {
+                    match handle.send_from(attach_id, &request.line) {
                         crate::bouncer::SendOutcome::Sent => {
                             if let Some(request_id) = request.request_id
                                 && socket

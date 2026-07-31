@@ -216,10 +216,10 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
             }
             cmd = ends.next_command() => match cmd {
                 // One line may resolve to several targets (a comma list).
-                Some(line) => {
+                Some(cmd) => {
                     // One line may resolve to several targets (a comma list); each
                     // target's outcome is surfaced independently by `relay_routed`.
-                    let routed = super::route_privmsg(&line, &channel_to_id);
+                    let routed = super::route_privmsg(&cmd.line, &channel_to_id);
                     super::relay_routed(ends, routed, "Slack", "channel", |id, text| {
                         let http = http.clone();
                         let base = base.clone();

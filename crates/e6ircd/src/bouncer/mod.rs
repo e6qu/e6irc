@@ -31,6 +31,7 @@ mod slack;
 
 #[cfg(feature = "discord")]
 pub use discord::{DiscordConfig, DiscordDriver};
+pub(crate) use irc_driver::KEEPALIVE_IDLE;
 pub(crate) use irc_driver::validate_irc_upstream_addr;
 pub use irc_driver::{IrcNetwork, IrcPreflight, IrcPreflightFailure, NetworkConfig, preflight_irc};
 pub use local_driver::{CoreHandles, LocalDriver};
@@ -219,6 +220,7 @@ pub fn build_driver(
                 autojoin,
                 buffer_cap,
                 sasl,
+                keepalive_idle: KEEPALIVE_IDLE,
             })))
         }
         NetworkKind::Local => {
@@ -849,6 +851,10 @@ pub struct AttachCaps {
     pub server_time: bool,
     pub message_tags: bool,
     pub account_tag: bool,
+    /// echo-message: the attaching client wants its own messages echoed back
+    /// (synthesized by the driver — the upstream is never asked for
+    /// echo-message, so there is exactly one echo, never two).
+    pub echo_message: bool,
 }
 
 /// Strip from a serialized line any message tags the recipient did not
@@ -891,8 +897,25 @@ pub enum DriverEvent {
     Connected,
     /// One line received from upstream (CRLF stripped).
     Line(String),
+    /// A synthesized copy of a line an attached client sent. IRC servers do
+    /// not echo a sender's own messages unless echo-message was negotiated —
+    /// and the driver never negotiates it — so without this the detached
+    /// buffer and the account's *other* sessions would only ever record one
+    /// side of the conversation. `origin` identifies the sending attachment:
+    /// the originator itself is excluded unless it negotiated echo-message on
+    /// attach, mirroring how a real server treats that capability.
+    Echo { line: String, origin: u64 },
     /// The upstream connection dropped; the driver will retry.
     Disconnected,
+}
+
+/// A downstream line queued for the upstream, tagged with the attachment
+/// that sent it so a synthesized [`DriverEvent::Echo`] can exclude its
+/// originator. Origin 0 is the untracked/internal sender (no exclusion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCommand {
+    pub origin: u64,
+    pub line: String,
 }
 
 /// A connection-state change a driver reports through [`DriverEnds::emit`].
@@ -921,7 +944,10 @@ pub enum ConnectionEvent {
 /// driver keeps running while zero are attached.
 pub struct NetworkHandle {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
-    commands: mpsc::Sender<String>,
+    commands: mpsc::Sender<ClientCommand>,
+    /// Per-network attachment id sequence; each attach takes one so its own
+    /// synthesized echoes can be excluded unless it opted into echo-message.
+    attach_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Authoritative stop signal. The registry (and only the registry) holds
     /// the `Sender`; `attach` clones `commands` but never this, so removing or
     /// replacing a network stops its driver even while a client is attached —
@@ -1381,7 +1407,16 @@ impl NetworkHandle {
     /// and the caller surfaces it to the client loudly (the same discipline the
     /// core's SendQ uses — bound, then act, never silently block or drop).
     pub fn send(&self, line: &str) -> SendOutcome {
-        match self.commands.try_send(line.to_string()) {
+        self.send_from(0, line)
+    }
+
+    /// As [`NetworkHandle::send`], but the command carries the sending
+    /// attachment's id so its synthesized echo can be routed correctly.
+    pub fn send_from(&self, origin: u64, line: &str) -> SendOutcome {
+        match self.commands.try_send(ClientCommand {
+            origin,
+            line: line.to_string(),
+        }) {
             Ok(()) => {
                 self.runtime.record_output(line.len());
                 if let Some(telemetry) = self
@@ -1403,6 +1438,12 @@ impl NetworkHandle {
                 SendOutcome::Closed
             }
         }
+    }
+
+    /// Allocate the attachment id an interactive attach uses for its sends.
+    pub fn next_attachment_id(&self) -> u64 {
+        self.attach_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A copy of the current detached buffer (for attach playback).
@@ -1546,6 +1587,7 @@ impl NetworkHandle {
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
+            attach_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             shutdown: shutdown_tx,
             buffer: buffer.clone(),
             runtime: runtime.clone(),
@@ -1588,7 +1630,7 @@ impl NetworkHandle {
 /// upstream lines to the detached buffer, and broadcasts live events.
 pub struct DriverEnds {
     events: tokio::sync::broadcast::Sender<DriverEvent>,
-    commands: mpsc::Receiver<String>,
+    commands: mpsc::Receiver<ClientCommand>,
     /// Fires (or its sender drops) when the network is stopped; the driver
     /// observes it in `next_command` and `run_with_backoff` so it tears down
     /// promptly on removal, not when the last client happens to detach.
@@ -1635,6 +1677,21 @@ impl DriverEnds {
         // A detached network legitimately has no live subscribers; the line is
         // still retained in the buffer above.
         drop(self.events.send(DriverEvent::Line(line)));
+    }
+
+    /// Record a synthesized self-echo: a copy of a line an attached client
+    /// just sent, prefixed as the upstream identity would present it. Buffered
+    /// and persisted exactly like an upstream line (the backlog must hold both
+    /// sides of the conversation), but broadcast as [`DriverEvent::Echo`] so
+    /// the originator can be excluded unless it negotiated echo-message.
+    pub fn emit_echo(&self, line: String, origin: u64) {
+        let line = crate::sanitize::upstream_line(line);
+        self.runtime.record_input(line.len());
+        self.buffer
+            .lock()
+            .expect("buffer poisoned")
+            .push(line.clone());
+        drop(self.events.send(DriverEvent::Echo { line, origin }));
     }
 
     /// Report a connection-state change, updating the sticky connection state
@@ -1687,7 +1744,7 @@ impl DriverEnds {
     /// **or** the network is shut down. Every driver's session loop selects on
     /// this, so an authoritative stop from the registry reaches all of them
     /// without each having to grow its own shutdown branch.
-    pub async fn next_command(&mut self) -> Option<String> {
+    pub async fn next_command(&mut self) -> Option<ClientCommand> {
         tokio::select! {
             biased;
             // `changed()` resolves when the registry sends `true`, or errors if
@@ -1776,8 +1833,8 @@ impl NetworkDriver for LoopbackDriver {
         let (handle, mut ends) = NetworkHandle::channels(self.buffer_cap);
         tokio::spawn(async move {
             ends.emit(ConnectionEvent::Connected);
-            while let Some(line) = ends.next_command().await {
-                ends.emit_line(line);
+            while let Some(cmd) = ends.next_command().await {
+                ends.emit_line(cmd.line);
             }
         });
         handle
@@ -1822,6 +1879,7 @@ where
         return Ok(());
     }
     let _attachment = handle.track_attachment();
+    let attach_id = handle.next_attachment_id();
 
     // Send the current upstream connection status up front, so a client that
     // attaches to an already-connected (or still-reconnecting) network learns the
@@ -1865,6 +1923,16 @@ where
                     write.write_all(b"\r\n").await?;
                     write.flush().await?;
                 }
+                Ok(DriverEvent::Echo { line, origin }) => {
+                    // The originator's own echo reaches it only when it
+                    // negotiated echo-message — the same contract a real
+                    // server has. Every other attached client always gets it.
+                    if origin != attach_id || caps.echo_message {
+                        write.write_all(filter_tags(&line, caps).as_bytes()).await?;
+                        write.write_all(b"\r\n").await?;
+                        write.flush().await?;
+                    }
+                }
                 Ok(DriverEvent::Connected) => {
                     write.write_all(b":*bnc* NOTICE * :upstream connected\r\n").await?;
                     write.flush().await?;
@@ -1894,7 +1962,7 @@ where
                     for event in parsed.drain(..) {
                         match event {
                             LineEvent::Line(line) => match String::from_utf8(line) {
-                                Ok(text) => match handle.send(&text) {
+                                Ok(text) => match handle.send_from(attach_id, &text) {
                                     SendOutcome::Sent => {}
                                     // Full: the upstream is congested/reconnecting.
                                     // Drop this line loudly rather than block —
@@ -2481,6 +2549,7 @@ mod tests {
                 server_time: true,
                 message_tags: true,
                 account_tag: true,
+                echo_message: false,
             },
         );
         assert_eq!(all, line);
