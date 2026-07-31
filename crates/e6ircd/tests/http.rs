@@ -6587,3 +6587,137 @@ async fn oidc_logout_without_end_session_configuration_fails_closed() {
         "logout failure must preserve the local session"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
+async fn admin_networks_fleet_view_and_toggle() {
+    let url = support::test_db("admin_networks_fleet_view_and_toggle").await;
+    let pool = e6ircd::db::connect_and_migrate(&url)
+        .await
+        .expect("connect");
+    e6ircd::db::create_account(&pool, "alice", "pw")
+        .await
+        .expect("alice");
+    e6ircd::db::create_account(&pool, "bob", "pw")
+        .await
+        .expect("bob");
+    let alice_token = e6ircd::db::issue_api_token(&pool, "alice", "t")
+        .await
+        .expect("tok");
+    let bob_token = e6ircd::db::issue_api_token(&pool, "bob", "t")
+        .await
+        .expect("tok");
+    let session = e6ircd::db::create_web_session(&pool, "alice", None)
+        .await
+        .expect("session");
+    // Bob owns an enabled network; its driver cannot dial 127.0.0.1:1, which
+    // is exactly the "misbehaving upstream" the admin lever exists for.
+    e6ircd::db::create_bnc_network(
+        &pool,
+        "bob",
+        &e6ircd::db::BncNetworkRow {
+            kind: Default::default(),
+            name: "work".into(),
+            addr: "127.0.0.1:1".into(),
+            tls: false,
+            nick: "bob_".into(),
+            realname: None,
+            autojoin: vec![],
+            sasl_account: None,
+            sasl_password_sealed: None,
+            enabled: true,
+        },
+    )
+    .await
+    .expect("create bob's network");
+    drop(pool);
+
+    let config = Config {
+        server_name: "irc.admin.example".into(),
+        network_name: "AdminNet".into(),
+        listeners: vec![ListenerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            tls: None,
+            websocket: false,
+        }],
+        http: Some(HttpConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            public_url: None,
+            secure_cookies: false,
+            admin_accounts: vec!["alice".into()],
+        }),
+        database: Some(DatabaseConfig { url: url.clone() }),
+        bnc: Some(BncConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        }),
+        ..Config::default()
+    };
+    let http = net::start(config)
+        .await
+        .expect("start")
+        .http_addr
+        .expect("http");
+
+    let bearer = |token: &str| {
+        format!(
+            "GET /api/v1/admin/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        )
+    };
+    // no auth -> 401, non-admin -> 403
+    let (status, _, _) = request(http, &get("/api/v1/admin/networks")).await;
+    assert_eq!(status, 401);
+    let (status, _, _) = request(http, &bearer(&bob_token)).await;
+    assert_eq!(status, 403);
+    // admin -> the fleet row, credentials as booleans only
+    let (status, _, body) = request(http, &bearer(&alice_token)).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let networks = v["networks"].as_array().expect("networks array");
+    assert_eq!(networks.len(), 1, "{body}");
+    assert_eq!(networks[0]["owner"], "bob", "{body}");
+    assert_eq!(networks[0]["name"], "work", "{body}");
+    assert_eq!(networks[0]["enabled"], true, "{body}");
+
+    // The console page lists it for the admin with a CSRF-bearing toggle.
+    let page_req = format!(
+        "GET /console/admin/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, page) = request(http, &page_req).await;
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("bob") && page.contains("work"), "{page}");
+    let csrf = page
+        .split("name=\"csrf\" value=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("csrf token in admin networks page")
+        .to_string();
+
+    // Admin disables the misbehaving network -> redirect, row flipped,
+    // privileged action audited.
+    let body = format!("csrf={csrf}&enabled=false");
+    let toggle = format!(
+        "POST /console/admin/networks/bob/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (status, _, _) = request(http, &toggle).await;
+    assert!(status == 302 || status == 303, "{status}");
+
+    let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
+    let row = e6ircd::db::get_bnc_network(&pool, "bob", "work")
+        .await
+        .expect("lookup")
+        .expect("row");
+    assert!(!row.enabled, "the admin toggle must disable the network");
+    let detail: Option<String> = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE actor = 'alice' AND action = 'NETWORK_TOGGLE' AND target = 'bob/work'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("audit query");
+    assert_eq!(
+        detail.as_deref(),
+        Some("disabled"),
+        "toggle must be audited"
+    );
+}

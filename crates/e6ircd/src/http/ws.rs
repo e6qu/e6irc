@@ -306,7 +306,10 @@ pub(super) async fn ws_ui_conn(
         ConnStatus::Disconnected
     };
     if socket
-        .send(WsMessage::text(status_event(status)))
+        .send(WsMessage::text(status_event(
+            status,
+            disconnect_reason(&handle),
+        )))
         .await
         .is_err()
     {
@@ -370,7 +373,7 @@ pub(super) async fn ws_ui_conn(
                 }
                 Ok(DriverEvent::Connected) => {
                     if socket
-                        .send(WsMessage::text(status_event(ConnStatus::Connected)))
+                        .send(WsMessage::text(status_event(ConnStatus::Connected, None)))
                         .await
                         .is_err()
                     {
@@ -379,7 +382,10 @@ pub(super) async fn ws_ui_conn(
                 }
                 Ok(DriverEvent::Disconnected) => {
                     if socket
-                        .send(WsMessage::text(status_event(ConnStatus::Disconnected)))
+                        .send(WsMessage::text(status_event(
+                            ConnStatus::Disconnected,
+                            disconnect_reason(&handle),
+                        )))
                         .await
                         .is_err()
                     {
@@ -466,7 +472,7 @@ async fn send_unavailable(socket: &mut WebSocket) {
     // detached, so there is no second observer to notify.
     drop(
         socket
-            .send(WsMessage::text(status_event(ConnStatus::Unavailable)))
+            .send(WsMessage::text(status_event(ConnStatus::Unavailable, None)))
             .await,
     );
 }
@@ -624,9 +630,33 @@ impl ConnStatus {
     }
 }
 
-/// A connection-status change as a JSON event: `{"t":"status","v":"connected"}`.
-pub(super) fn status_event(status: ConnStatus) -> String {
-    serde_json::json!({ "t": "status", "v": status.label() }).to_string()
+/// The operator-safe summary of the driver's classified last failure, when
+/// the network is currently disconnected. The taxonomy is closed and the
+/// summaries are static strings, so this can never carry untrusted text into
+/// the event stream.
+fn disconnect_reason(
+    handle: &std::sync::Arc<crate::bouncer::NetworkHandle>,
+) -> Option<&'static str> {
+    if handle.is_connected() {
+        return None;
+    }
+    handle
+        .runtime_snapshot()
+        .last_error
+        .map(|failure| failure.summary())
+}
+
+/// A connection-status change as a JSON event:
+/// `{"t":"status","v":"disconnected","reason":"…"}`. The optional reason is
+/// the classified failure summary, so the chat UI can say *why* the upstream
+/// is reconnecting instead of leaving the user to guess.
+pub(super) fn status_event(status: ConnStatus, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => {
+            serde_json::json!({ "t": "status", "v": status.label(), "reason": reason }).to_string()
+        }
+        None => serde_json::json!({ "t": "status", "v": status.label() }).to_string(),
+    }
 }
 
 #[cfg(test)]

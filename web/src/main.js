@@ -959,7 +959,10 @@ function connect() {
       if (becameConnected && snapshotComplete) resyncMemberships();
     } else if (event.t === "status" && event.v === "disconnected") {
       upstreamConnected = false;
-      setStatus(`${network}: upstream reconnecting`, "error");
+      // The server includes the classified failure summary when it knows why
+      // the upstream dropped — say it, don't leave the user guessing.
+      const why = typeof event.reason === "string" && event.reason ? ` — ${event.reason}` : "";
+      setStatus(`${network}: upstream reconnecting${why}`, "error");
     } else if (event.t === "snapshot" && event.v === "complete") {
       snapshotComplete = true;
       if (upstreamConnected) resyncMemberships();

@@ -1,3 +1,8 @@
+<table>
+  <caption class="sr-only">Configured networks</caption>
+  <thead>
+    <tr><th>Status</th><th>Name</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th></th></tr>
+  </thead>
 {% if networks.is_empty() %}
   <tbody id="cnetworks"><tr><td colspan="7" class="empty">No networks yet. Add one above.</td></tr></tbody>
 {% else %}
@@ -28,3 +33,4 @@
     {% endfor %}
   </tbody>
 {% endif %}
+</table>

@@ -984,6 +984,13 @@ fn document() -> serde_json::Value {
                     "responses": { "200": { "description": "counts" },
                         "403": { "description": "not an admin account" } } }
             },
+            "/api/v1/admin/networks": {
+                "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
+                    "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
+                    "security": authenticated,
+                    "responses": { "200": { "description": "networks with runtime snapshots" },
+                        "403": { "description": "not an admin account" } } }
+            },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
                     "security": authenticated,

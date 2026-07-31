@@ -126,6 +126,8 @@
         font-size: 0.83rem; font-weight: 650; }
       .field em { color: var(--muted); font-style: normal; font-weight: 400; }
       .field small, .check small { display: block; color: var(--muted); font-weight: 400; line-height: 1.4; }
+      .field small.field-error { color: var(--off); }
+      .field input[aria-invalid="true"] { border-color: var(--off); }
       .field input, .field textarea, .field select { width: 100%; border: 1px solid var(--border);
         border-radius: 0.5rem; background: var(--panel-subtle); color: var(--fg); font: inherit;
         padding: 0.62rem 0.72rem; min-height: 2.55rem; }
@@ -349,6 +351,7 @@
           <a href="/console"{% if active == "overview" %} class="active"{% endif %}>Overview</a>
           <a href="/console/accounts"{% if active == "accounts" %} class="active"{% endif %}>Accounts</a>
           <a href="/console/admin/channels"{% if active == "admin-channels" %} class="active"{% endif %}>Channel registry</a>
+          <a href="/console/admin/networks"{% if active == "admin-networks" %} class="active"{% endif %}>Networks</a>
           <a href="/console/bans"{% if active == "bans" %} class="active"{% endif %}>Server bans</a>
           <a href="/console/monitoring"{% if active == "monitoring" %} class="active"{% endif %}>Monitoring</a>
           <a href="/console/audit"{% if active == "audit" %} class="active"{% endif %}>Audit log</a>
