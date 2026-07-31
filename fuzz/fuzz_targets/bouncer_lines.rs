@@ -30,6 +30,9 @@ fuzz_target!(|data: &[u8]| {
         message_tags: sel & 2 != 0,
         account_tag: sel & 4 != 0,
         echo_message: false,
+        batch: false,
+        chathistory: false,
+        read_marker: false,
     };
     let raw = String::from_utf8_lossy(data.get(1..).unwrap_or(&[])).into_owned();
 
