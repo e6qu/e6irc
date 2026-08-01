@@ -757,6 +757,180 @@ pub(crate) fn bridge_http_client(timeout: std::time::Duration) -> reqwest::Resul
         .build()
 }
 
+/// A bridge's effective API base URL: the configured one (trailing slash
+/// stripped), or the provider default when unset. Shared so the two
+/// token-based bridges apply the same override rule.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) fn bridge_api_base(configured: &str, default: &str) -> String {
+    if configured.is_empty() {
+        default.to_string()
+    } else {
+        configured.trim_end_matches('/').to_string()
+    }
+}
+
+/// Build the bridge HTTP client, mapping a build failure to the session
+/// outcome. Shared so both WebSocket bridges log and fail the same way when
+/// the vetted-resolver client can't be built.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) fn bridge_http_or_outcome(
+    tag: &str,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, SessionOutcome> {
+    bridge_http_client(timeout).map_err(|e| {
+        eprintln!("{tag}: http client build failed: {e}");
+        SessionOutcome::Dropped(NetworkFailure::UpstreamRequestFailed)
+    })
+}
+
+/// The gateway WebSocket stream type both WebSocket bridges run over.
+#[cfg(any(feature = "discord", feature = "slack"))]
+type BridgeWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open a bridge gateway WebSocket with a bounded handshake, mapping failure
+/// to the session outcome. Shared so both WebSocket bridges apply the same
+/// handshake bound and error vocabulary.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn bridge_ws_open(
+    url: &str,
+    tag: &str,
+    transport: &str,
+) -> Result<BridgeWs, SessionOutcome> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        bridge_ws_connect(url, bridge_ws_config()),
+    )
+    .await
+    {
+        Ok(Ok(ws)) => Ok(ws),
+        Ok(Err(e)) => {
+            eprintln!("{tag}: {transport} connect failed: {e}");
+            Err(SessionOutcome::Dropped(NetworkFailure::ConnectionFailed))
+        }
+        Err(_) => {
+            eprintln!("{tag}: {transport} connect timed out");
+            Err(SessionOutcome::Dropped(NetworkFailure::ConnectionTimedOut))
+        }
+    }
+}
+
+/// One frame's outcome from a bridge gateway socket, after the shared
+/// handling (idle timeout, ping/pong, non-text frames).
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) enum BridgeRead {
+    /// A text frame to parse and dispatch.
+    Text(String),
+    /// Nothing to dispatch — a ping was answered or a non-text frame arrived.
+    Skip,
+    /// The socket went idle past the read timeout (logged).
+    Idle,
+    /// The peer sent a Close frame (`Some` code) or the stream ended (`None`).
+    Closed(Option<u16>),
+    /// A socket read error (logged).
+    ReadFailed,
+    /// Answering a ping failed — the socket is dead on write.
+    WriteFailed,
+}
+
+/// Read the next frame from a bridge gateway socket: answer pings, skip
+/// non-text frames, and bound idle time. Shared by the two WebSocket bridges
+/// so the ping/idle discipline is written once, not kept in step by hand.
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn next_bridge_frame(
+    read: &mut futures_util::stream::SplitStream<BridgeWs>,
+    write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
+    read_timeout: std::time::Duration,
+    tag: &str,
+    transport: &str,
+) -> BridgeRead {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+    let frame = match tokio::time::timeout(read_timeout, read.next()).await {
+        Ok(frame) => frame,
+        Err(_) => {
+            eprintln!("{tag}: {transport} idle past timeout; reconnecting");
+            return BridgeRead::Idle;
+        }
+    };
+    match frame {
+        Some(Ok(Ws::Text(t))) => BridgeRead::Text(t.as_str().to_string()),
+        Some(Ok(Ws::Ping(p))) => {
+            if write.send(Ws::Pong(p)).await.is_err() {
+                BridgeRead::WriteFailed
+            } else {
+                BridgeRead::Skip
+            }
+        }
+        Some(Ok(Ws::Close(frame))) => BridgeRead::Closed(frame.as_ref().map(|f| u16::from(f.code))),
+        None => BridgeRead::Closed(None),
+        Some(Ok(_)) => BridgeRead::Skip,
+        Some(Err(e)) => {
+            eprintln!("{tag}: {transport} read error: {e}");
+            BridgeRead::ReadFailed
+        }
+    }
+}
+
+/// Read the next text frame from a bridge gateway socket, mapping the
+/// terminal outcomes (idle, close, read/write failure) to the session
+/// outcome. `on_close` decides what a protocol close code means for the
+/// provider (Discord's fatal auth/intents codes; Slack treats every close as
+/// a plain drop).
+#[cfg(any(feature = "discord", feature = "slack"))]
+pub(crate) async fn next_bridge_text(
+    read: &mut futures_util::stream::SplitStream<BridgeWs>,
+    write: &mut futures_util::stream::SplitSink<BridgeWs, tokio_tungstenite::tungstenite::Message>,
+    read_timeout: std::time::Duration,
+    tag: &str,
+    transport: &str,
+    on_close: impl FnOnce(Option<u16>) -> SessionOutcome,
+) -> Result<Option<String>, SessionOutcome> {
+    match next_bridge_frame(read, write, read_timeout, tag, transport).await {
+        BridgeRead::Text(t) => Ok(Some(t)),
+        BridgeRead::Skip => Ok(None),
+        BridgeRead::Idle => Err(SessionOutcome::Dropped(NetworkFailure::KeepaliveTimedOut)),
+        BridgeRead::WriteFailed => {
+            Err(SessionOutcome::Dropped(NetworkFailure::UpstreamWriteFailed))
+        }
+        BridgeRead::ReadFailed => Err(SessionOutcome::Dropped(NetworkFailure::ConnectionLost)),
+        BridgeRead::Closed(code) => Err(on_close(code)),
+    }
+}
+
+/// `start` for a bridge driver: build the buffer channel and spawn the
+/// reconnecting run loop. Byte-identical for every bridge; the file's `run`
+/// (below) carries the provider specifics.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+macro_rules! bridge_start {
+    () => {
+        fn start(self: Box<Self>) -> NetworkHandle {
+            let (handle, ends) = NetworkHandle::channels(self.config.buffer_cap);
+            tokio::spawn(run(self.config, ends));
+            handle
+        }
+    };
+}
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) use bridge_start;
+
+/// The `run` loop for a bridge driver: reconnect from scratch with backoff on
+/// any session drop rather than dying and silently dropping all later
+/// messages; only a dropped handle stops the driver.
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+macro_rules! bridge_run {
+    ($config:ty) => {
+        async fn run(config: $config, mut ends: DriverEnds) {
+            super::run_with_backoff(config, &mut ends, |config, ends| {
+                Box::pin(session_once(config, ends))
+            })
+            .await;
+        }
+    };
+}
+#[cfg(any(feature = "matrix", feature = "discord", feature = "slack"))]
+pub(crate) use bridge_run;
+
 /// Open a bridge gateway WebSocket to `url`, vetting the resolved IP the same way
 /// [`VettingResolver`] vets HTTP dials. The gateway URL comes from an upstream
 /// REST response, so a hostile/compromised provider could point it at an internal

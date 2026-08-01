@@ -580,6 +580,25 @@ fn with_label(label: Option<&str>, line: String) -> String {
     }
 }
 
+/// Emit the store-fault FAIL for a CHATHISTORY page: a store fault answers
+/// with a FAIL, never an empty batch — an empty page is indistinguishable
+/// from "no history", so paging a faulting store must be loud.
+fn chathistory_store_fault(
+    state: &mut ServerState,
+    conn: ConnId,
+    label: Option<&str>,
+    middle: &str,
+) {
+    let line = with_label(
+        label,
+        format!(
+            ":{} FAIL CHATHISTORY MESSAGE_ERROR {middle} :History temporarily unavailable",
+            state.config.server_name,
+        ),
+    );
+    state.send(conn, &line);
+}
+
 /// Emit a `draft/chathistory-targets` batch: one `CHATHISTORY TARGETS
 /// <target> <time>` line per buffer, ordered by last activity oldest-first (so
 /// a `limit` keeps the oldest buffers — the ones a reconnecting client is most
@@ -595,17 +614,7 @@ pub(crate) fn targets_page(
     // for the reasoning (an empty page is indistinguishable from "no buffers").
     let targets = match targets {
         Ok(targets) => targets,
-        Err(()) => {
-            let line = with_label(
-                label,
-                format!(
-                    ":{} FAIL CHATHISTORY MESSAGE_ERROR TARGETS :History temporarily unavailable",
-                    state.config.server_name,
-                ),
-            );
-            state.send(conn, &line);
-            return;
-        }
+        Err(()) => return chathistory_store_fault(state, conn, label, "TARGETS"),
     };
     let server = state.config.server_name.clone();
     // `label` is set only on the async DB path (produced outside the
@@ -826,16 +835,12 @@ pub(crate) fn history_page(
     let rows = match rows {
         Ok(rows) => rows,
         Err(()) => {
-            let line = with_label(
+            return chathistory_store_fault(
+                state,
+                conn,
                 label,
-                format!(
-                    ":{} FAIL CHATHISTORY MESSAGE_ERROR {} :History temporarily unavailable",
-                    state.config.server_name,
-                    crate::core::handler::clip_echo(display),
-                ),
+                crate::core::handler::clip_echo(display),
             );
-            state.send(conn, &line);
-            return;
         }
     };
     let server = state.config.server_name.clone();

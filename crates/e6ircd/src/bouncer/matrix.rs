@@ -41,11 +41,7 @@ impl NetworkDriver for MatrixDriver {
         "matrix"
     }
 
-    fn start(self: Box<Self>) -> NetworkHandle {
-        let (handle, ends) = NetworkHandle::channels(self.config.buffer_cap);
-        tokio::spawn(run(self.config, ends));
-        handle
-    }
+    super::bridge_start!();
 }
 
 /// Session state after login.
@@ -61,15 +57,10 @@ struct Session {
     txn: u64,
 }
 
-async fn run(config: MatrixConfig, mut ends: DriverEnds) {
-    // Always-on: a transient failure reconnects with backoff rather than
-    // permanently killing the network (which would silently drop every later
-    // upstream message). Only a dropped handle stops the driver.
-    super::run_with_backoff(config, &mut ends, |config, ends| {
-        Box::pin(session_once(config, ends))
-    })
-    .await;
-}
+// Always-on: a transient failure reconnects with backoff rather than
+// permanently killing the network (which would silently drop every later
+// upstream message). Only a dropped handle stops the driver.
+super::bridge_run!(MatrixConfig);
 
 async fn session_once(config: &MatrixConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     let mut session = match connect(config).await {
@@ -320,14 +311,7 @@ async fn sync(s: &Session, since: Option<&str>) -> Result<(String, Vec<Incoming>
     if let Some(since) = since {
         req = req.query(&[("since", since)]);
     }
-    let body: SyncResponse = req
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .bounded_json()
-        .await?;
+    let body: SyncResponse = super::bridge_send(req).await?.bounded_json().await?;
     collect_sync_messages(body)
 }
 

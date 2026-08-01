@@ -515,6 +515,33 @@ async fn insert_primary_password(
     .map_err(DbError::Query)
 }
 
+/// Insert the account row inside a transaction, returning its id — or `None`
+/// when the folded name is already taken (`ON CONFLICT DO NOTHING`). Shared by
+/// direct registration and invitation acceptance so the flags/insert shape
+/// cannot drift between the two ways an account comes into being.
+async fn insert_account(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    folded: &str,
+    contact_email: Option<&str>,
+    administrator: bool,
+) -> Result<Option<i64>, DbError> {
+    let flags = if administrator { ACCOUNT_FLAG_ADMIN } else { 0 };
+    sqlx::query_scalar(
+        "INSERT INTO accounts (name, name_folded, contact_email, flags)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (name_folded) DO NOTHING
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(folded)
+    .bind(contact_email)
+    .bind(flags)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Query)
+}
+
 const ACCOUNT_NAME_ADVISORY_LOCK_NAMESPACE: i64 = 0x6536_6972_6300_0001;
 
 async fn lock_account_name(
@@ -601,20 +628,14 @@ pub async fn create_account_by_administrator(
     if account_name_is_retired(&mut transaction, &folded).await? {
         return Err(DbError::DuplicateAccount(name.to_string()));
     }
-    let flags = if administrator { ACCOUNT_FLAG_ADMIN } else { 0 };
-    let account_id: i64 = sqlx::query_scalar(
-        "INSERT INTO accounts (name, name_folded, contact_email, flags)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (name_folded) DO NOTHING
-         RETURNING id",
+    let account_id: i64 = insert_account(
+        &mut transaction,
+        name,
+        &folded,
+        contact_email.map(crate::identity::ContactEmail::as_str),
+        administrator,
     )
-    .bind(name)
-    .bind(&folded)
-    .bind(contact_email.map(crate::identity::ContactEmail::as_str))
-    .bind(flags)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?
+    .await?
     .ok_or_else(|| DbError::DuplicateAccount(name.to_string()))?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     insert_audit_log_with(
@@ -892,20 +913,14 @@ pub async fn accept_account_invitation(
     if account_name_is_retired(&mut transaction, &folded).await? {
         return Err(DbError::InvitationUnavailable);
     }
-    let flags = if administrator { ACCOUNT_FLAG_ADMIN } else { 0 };
-    let account_id: i64 = sqlx::query_scalar(
-        "INSERT INTO accounts (name, name_folded, contact_email, flags)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (name_folded) DO NOTHING
-         RETURNING id",
+    let account_id: i64 = insert_account(
+        &mut transaction,
+        &name,
+        &folded,
+        contact_email.as_deref(),
+        administrator,
     )
-    .bind(&name)
-    .bind(&folded)
-    .bind(contact_email)
-    .bind(flags)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?
+    .await?
     .ok_or(DbError::InvitationUnavailable)?;
     insert_primary_password(&mut transaction, account_id, &hash).await?;
     sqlx::query(
@@ -1621,6 +1636,37 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
     run_worker_inner(pool, &mut rx, core_tx, None).await;
 }
 
+/// Spawn one offloaded DB request: run `work` against the pool, time it into
+/// telemetry (recording an error when the reply reports the store
+/// unavailable), and push the reply to the core. Offloaded requests (argon2
+/// verify/hash) run off the serial worker loop so a burst can't
+/// head-of-line-block queued reads behind one serial argon2 at a time.
+fn spawn_db_offload<F>(
+    pool: &PgPool,
+    core_tx: &Sender<Input>,
+    telemetry: &Option<std::sync::Arc<Telemetry>>,
+    conn: crate::core::ConnId,
+    work: impl FnOnce(PgPool) -> F + Send + 'static,
+) where
+    F: std::future::Future<Output = (DbReply, bool)> + Send + 'static,
+{
+    let pool = pool.clone();
+    let core_tx = core_tx.clone();
+    let telemetry = telemetry.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let (reply, unavailable) = work(pool).await;
+        if let Some(telemetry) = telemetry {
+            telemetry.record_database_request(started.elapsed());
+            if unavailable {
+                telemetry.record_error(crate::observability::ErrorKind::Database);
+            }
+        }
+        // The core being gone (push fails) just means shutdown.
+        let _ = core_tx.push(Input::DbReply { conn, reply }).await;
+    });
+}
+
 pub(crate) async fn run_worker_observed(
     pool: PgPool,
     mut rx: Receiver<DbRequest>,
@@ -1657,22 +1703,10 @@ async fn run_worker_inner(
                     password,
                     origin,
                 } => {
-                    let pool = pool.clone();
-                    let core_tx = core_tx.clone();
-                    let telemetry = telemetry.clone();
-                    tokio::spawn(async move {
-                        let started = Instant::now();
+                    spawn_db_offload(&pool, &core_tx, &telemetry, conn, move |pool| async move {
                         let outcome = handle_verify(&pool, &account, &password).await;
                         let unavailable = matches!(&outcome, VerifyOutcome::Unavailable);
-                        let reply = outcome.into_reply(origin);
-                        if let Some(telemetry) = telemetry {
-                            telemetry.record_database_request(started.elapsed());
-                            if unavailable {
-                                telemetry.record_error(crate::observability::ErrorKind::Database);
-                            }
-                        }
-                        // The core being gone (push fails) just means shutdown.
-                        let _ = core_tx.push(Input::DbReply { conn, reply }).await;
+                        (outcome.into_reply(origin), unavailable)
                     });
                 }
                 // Account creation carries the same ~100ms argon2 hash as a
@@ -1700,11 +1734,7 @@ async fn run_worker_inner(
                     password,
                     origin,
                 } => {
-                    let pool = pool.clone();
-                    let core_tx = core_tx.clone();
-                    let telemetry = telemetry.clone();
-                    tokio::spawn(async move {
-                        let started = Instant::now();
+                    spawn_db_offload(&pool, &core_tx, &telemetry, conn, move |pool| async move {
                         let reply = handle_create_account(
                             &pool,
                             name,
@@ -1715,13 +1745,7 @@ async fn run_worker_inner(
                         .await;
                         let unavailable =
                             matches!(&reply, DbReply::AccountRegisterUnavailable { .. });
-                        if let Some(telemetry) = telemetry {
-                            telemetry.record_database_request(started.elapsed());
-                            if unavailable {
-                                telemetry.record_error(crate::observability::ErrorKind::Database);
-                            }
-                        }
-                        let _ = core_tx.push(Input::DbReply { conn, reply }).await;
+                        (reply, unavailable)
                     });
                 }
                 request => {
@@ -6324,25 +6348,40 @@ async fn commit_credential_revocation(
 /// Revoke one of `account`'s PATs by id. Returns whether a row was deleted
 /// (false = not found / not owned).
 pub async fn delete_api_token(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let result = sqlx::query(
+    delete_scoped_credential(
+        pool,
+        account,
+        id,
         "DELETE FROM api_tokens t USING accounts a
          WHERE t.account_id = a.id AND a.name_folded = $1 AND t.id = $2",
-    )
-    .bind(&folded)
-    .bind(id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    commit_credential_revocation(
-        transaction,
-        &folded,
-        result,
         "ACCOUNT_TOKEN_REVOKE",
         "personal access token revoked",
     )
     .await
+}
+
+/// Delete one account-scoped credential row (by folded account + row id) and
+/// commit the revocation with its audit entry. `delete_sql` scopes the DELETE
+/// itself (the token table, the app-password kind), so the two revocation
+/// paths share the transaction/audit shape but cannot widen each other's
+/// scope.
+async fn delete_scoped_credential(
+    pool: &PgPool,
+    account: &str,
+    id: i64,
+    delete_sql: &'static str,
+    action: &str,
+    message: &str,
+) -> Result<bool, DbError> {
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
+    let result = sqlx::query(delete_sql)
+        .bind(&folded)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    commit_credential_revocation(transaction, &folded, result, action, message).await
 }
 
 // ---- credential management ----------------------------------------------
@@ -6377,23 +6416,14 @@ pub async fn list_credentials(pool: &PgPool, account: &str) -> Result<Vec<Creden
 /// passwords only. `list_credentials` still shows the primary for display, but
 /// it is not revocable here.
 pub async fn revoke_credential(pool: &PgPool, account: &str, id: i64) -> Result<bool, DbError> {
-    let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let result = sqlx::query(
+    delete_scoped_credential(
+        pool,
+        account,
+        id,
         "DELETE FROM account_credentials c
          USING accounts a
          WHERE c.account_id = a.id AND a.name_folded = $1 AND c.id = $2
            AND c.kind = 'app_password'",
-    )
-    .bind(&folded)
-    .bind(id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    commit_credential_revocation(
-        transaction,
-        &folded,
-        result,
         "ACCOUNT_APP_PASSWORD_REVOKE",
         "app password revoked",
     )

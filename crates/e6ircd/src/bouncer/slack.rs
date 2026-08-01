@@ -56,45 +56,25 @@ impl NetworkDriver for SlackDriver {
         "slack"
     }
 
-    fn start(self: Box<Self>) -> NetworkHandle {
-        let (handle, ends) = NetworkHandle::channels(self.config.buffer_cap);
-        tokio::spawn(run(self.config, ends));
-        handle
-    }
+    super::bridge_start!();
 }
 
-fn api_base(config: &SlackConfig) -> String {
-    if config.api_base.is_empty() {
-        DEFAULT_API.to_string()
-    } else {
-        config.api_base.trim_end_matches('/').to_string()
-    }
-}
-
-async fn run(config: SlackConfig, mut ends: DriverEnds) {
-    // Always-on: reconnect (from scratch) with backoff on any socket drop —
-    // including Slack's routine `disconnect` envelope, which expects a
-    // reconnect — rather than dying and silently dropping all later messages.
-    // Only a dropped handle stops the driver.
-    super::run_with_backoff(config, &mut ends, |config, ends| {
-        Box::pin(session_once(config, ends))
-    })
-    .await;
-}
+// Always-on: reconnect (from scratch) with backoff on any socket drop —
+// including Slack's routine `disconnect` envelope, which expects a
+// reconnect — rather than dying and silently dropping all later messages.
+// Only a dropped handle stops the driver.
+super::bridge_run!(SlackConfig);
 
 async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
     // Bound REST calls so a hung request can't stall the socket loop; vet every
     // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
-    let http = match super::bridge_http_client(Duration::from_secs(30)) {
+    let http = match super::bridge_http_or_outcome("slack", Duration::from_secs(30)) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("slack: http client build failed: {e}");
-            return Dropped(NetworkFailure::UpstreamRequestFailed);
-        }
+        Err(outcome) => return outcome,
     };
-    let base = api_base(config);
+    let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
 
     let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
         "slack",
@@ -120,21 +100,9 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
         }
     };
     // Bound the WS handshake so a black-holed socket can't wedge the driver.
-    let ws = match tokio::time::timeout(
-        Duration::from_secs(30),
-        super::bridge_ws_connect(&ws_url, super::bridge_ws_config()),
-    )
-    .await
-    {
-        Ok(Ok(ws)) => ws,
-        Ok(Err(e)) => {
-            eprintln!("slack: socket connect failed: {e}");
-            return Dropped(NetworkFailure::ConnectionFailed);
-        }
-        Err(_) => {
-            eprintln!("slack: socket connect timed out");
-            return Dropped(NetworkFailure::ConnectionTimedOut);
-        }
+    let ws = match super::bridge_ws_open(&ws_url, "slack", "socket").await {
+        Ok(ws) => ws,
+        Err(outcome) => return outcome,
     };
     let (mut write, mut read) = ws.split();
     ends.emit(ConnectionEvent::Connected);
@@ -147,27 +115,13 @@ async fn session_once(config: &SlackConfig, ends: &mut DriverEnds) -> super::Ses
     let read_timeout = Duration::from_secs(90);
     loop {
         tokio::select! {
-            frame = tokio::time::timeout(read_timeout, read.next()) => {
-                let Ok(frame) = frame else {
-                    eprintln!("slack: socket idle past timeout; reconnecting");
-                    return Dropped(NetworkFailure::KeepaliveTimedOut);
-                };
-                let text = match frame {
-                    Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
-                    Some(Ok(Ws::Ping(p))) => {
-                        if write.send(Ws::Pong(p)).await.is_err() {
-                            return Dropped(NetworkFailure::UpstreamWriteFailed);
-                        }
-                        continue;
-                    }
-                    Some(Ok(Ws::Close(_))) | None => {
-                        return Dropped(NetworkFailure::ConnectionLost);
-                    }
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => {
-                        eprintln!("slack: socket read error: {e}");
-                        return Dropped(NetworkFailure::ConnectionLost);
-                    }
+            text = super::next_bridge_text(&mut read, &mut write, read_timeout, "slack", "socket", |_| {
+                Dropped(NetworkFailure::ConnectionLost)
+            }) => {
+                let text = match text {
+                    Ok(Some(t)) => t,
+                    Ok(None) => continue,
+                    Err(outcome) => return outcome,
                 };
                 let envelope = match parse_envelope(&text) {
                     Ok(envelope) => envelope,
@@ -384,20 +338,41 @@ async fn fetch_channel_name(
     bot_token: &str,
     id: &str,
 ) -> Result<String, String> {
+    let v = slack_get_json(
+        http,
+        base,
+        bot_token,
+        "conversations.info",
+        &[("channel", id)],
+    )
+    .await?;
+    v["channel"]["name"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("conversations.info for {id} had no name"))
+}
+
+/// Call a Slack Web API GET method with the bearer token and return its JSON
+/// body, checking the `ok` flag. Shared by the `*.info` lookups so the
+/// request/error shape can't drift.
+async fn slack_get_json(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    method: &str,
+    query: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
     let v: serde_json::Value = http
-        .get(format!("{base}/conversations.info"))
-        .header("Authorization", format!("Bearer {bot_token}"))
-        .query(&[("channel", id)])
+        .get(format!("{base}/{method}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .query(query)
         .send()
         .await
         .map_err(|e| e.to_string())?
         .bounded_json()
         .await?;
     check_ok(&v)?;
-    v["channel"]["name"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| format!("conversations.info for {id} had no name"))
+    Ok(v)
 }
 
 /// Resolve a Slack user id (`U12345678`) to a human display name via
@@ -411,16 +386,7 @@ async fn fetch_user_name(
     bot_token: &str,
     id: &str,
 ) -> Result<String, String> {
-    let v: serde_json::Value = http
-        .get(format!("{base}/users.info"))
-        .header("Authorization", format!("Bearer {bot_token}"))
-        .query(&[("user", id)])
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .bounded_json()
-        .await?;
-    check_ok(&v)?;
+    let v = slack_get_json(http, base, bot_token, "users.info", &[("user", id)]).await?;
     let u = &v["user"];
     ["profile.display_name", "profile.real_name"]
         .iter()
@@ -567,9 +533,15 @@ mod tests {
             channels: vec![],
             buffer_cap: 10,
         };
-        assert_eq!(api_base(&c), DEFAULT_API);
+        assert_eq!(
+            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
+            DEFAULT_API
+        );
         c.api_base = "http://localhost:9/".into();
-        assert_eq!(api_base(&c), "http://localhost:9");
+        assert_eq!(
+            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
+            "http://localhost:9"
+        );
     }
 
     #[tokio::test]
