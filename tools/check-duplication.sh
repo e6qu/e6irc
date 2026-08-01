@@ -57,14 +57,21 @@ cd "$(dirname "$0")/.."
 # (43 call sites across 9 handler files); the bouncer client's
 # read-feed-extend loop became `fill()`; the MONITOR watcher-removal loop
 # became `unmonitor()`; and the cross-file contact-email validation became
-# `parse_optional_contact_email()`).
+# `parse_optional_contact_email()`) → 2.6% (sweep 34: the unauthenticated
+# HTTP pool guard became `require_pool!` (10 sites), ban mutations became
+# `ServerBanMutation::add`/`remove` constructors, CAP negotiation marking
+# became `mark_negotiating`, SASL payload guards became
+# `require_cred_payload`, the labeled FAIL/BATCH prefix became
+# `with_label`, the JSON+no-store response became `json_no_store`,
+# OIDC client discovery became `discover_client_or_bad_gateway`, and the
+# pending-topic cleanup became `clear_pending_topic`).
 #
 # What is left is mostly sqlx builder chains — `.bind().execute().await
 # .map_err()` — and per-route response shaping. Those are plumbing: abstracting
 # them would read worse than the repetition, so the number is expected to sit
 # here rather than keep falling. Lower it only when a real shared concept is
 # found, not by wrapping boilerplate to move a metric.
-THRESHOLD=2.9
+THRESHOLD=2.6
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."

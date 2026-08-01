@@ -571,6 +571,15 @@ pub(super) fn chathistory_targets(state: &mut ServerState, conn: ConnId, p: &[&s
     targets_page(state, conn, &batch_ref, Ok(targets), None);
 }
 
+/// Prefix a line with the `@label` tag when a label is in flight on the async
+/// DB path (the synchronous labeled-response capture labels its own output).
+fn with_label(label: Option<&str>, line: String) -> String {
+    match label {
+        Some(label) => format!("@label={label} {line}"),
+        None => line,
+    }
+}
+
 /// Emit a `draft/chathistory-targets` batch: one `CHATHISTORY TARGETS
 /// <target> <time>` line per buffer, ordered by last activity oldest-first (so
 /// a `limit` keeps the oldest buffers — the ones a reconnecting client is most
@@ -587,16 +596,13 @@ pub(crate) fn targets_page(
     let targets = match targets {
         Ok(targets) => targets,
         Err(()) => {
-            let line = match label {
-                Some(label) => format!(
-                    "@label={label} :{} FAIL CHATHISTORY MESSAGE_ERROR TARGETS :History temporarily unavailable",
-                    state.config.server_name,
-                ),
-                None => format!(
+            let line = with_label(
+                label,
+                format!(
                     ":{} FAIL CHATHISTORY MESSAGE_ERROR TARGETS :History temporarily unavailable",
                     state.config.server_name,
                 ),
-            };
+            );
             state.send(conn, &line);
             return;
         }
@@ -606,12 +612,10 @@ pub(crate) fn targets_page(
     // synchronous labeled-response capture), so it labels its own BATCH open;
     // the in-memory path runs under capture with `None` and is framed by
     // frame_labeled instead — mirroring history_page.
-    let open = match label {
-        Some(label) => {
-            format!("@label={label} :{server} BATCH +{batch_ref} draft/chathistory-targets")
-        }
-        None => format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
-    };
+    let open = with_label(
+        label,
+        format!(":{server} BATCH +{batch_ref} draft/chathistory-targets"),
+    );
     state.send(conn, &open);
     for (target, ts) in targets {
         // A channel target: prefer its live display name. Anything else is a DM
@@ -822,27 +826,23 @@ pub(crate) fn history_page(
     let rows = match rows {
         Ok(rows) => rows,
         Err(()) => {
-            let line = match label {
-                Some(label) => format!(
-                    "@label={label} :{} FAIL CHATHISTORY MESSAGE_ERROR {} :History temporarily unavailable",
-                    state.config.server_name,
-                    crate::core::handler::clip_echo(display),
-                ),
-                None => format!(
+            let line = with_label(
+                label,
+                format!(
                     ":{} FAIL CHATHISTORY MESSAGE_ERROR {} :History temporarily unavailable",
                     state.config.server_name,
                     crate::core::handler::clip_echo(display),
                 ),
-            };
+            );
             state.send(conn, &line);
             return;
         }
     };
     let server = state.config.server_name.clone();
-    let open = match label {
-        Some(label) => format!("@label={label} :{server} BATCH +{batch_ref} chathistory {display}"),
-        None => format!(":{server} BATCH +{batch_ref} chathistory {display}"),
-    };
+    let open = with_label(
+        label,
+        format!(":{server} BATCH +{batch_ref} chathistory {display}"),
+    );
     state.send(conn, &open);
     // A channel message was addressed to the channel, so every replayed row
     // carries the same target. A direct message was addressed to a *person*,

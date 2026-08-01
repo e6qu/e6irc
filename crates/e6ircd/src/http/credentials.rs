@@ -12,19 +12,10 @@ pub(super) async fn me_profile(
     Authenticated(account): Authenticated,
 ) -> Response {
     match crate::db::account_contact_email(pool_of(&state), &account).await {
-        Ok(contact_email) => {
-            let mut response = (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({
-                    "account": account,
-                    "contact_email": contact_email,
-                })
-                .to_string(),
-            )
-                .into_response();
-            no_store(response.headers_mut());
-            response
-        }
+        Ok(contact_email) => json_no_store(serde_json::json!({
+            "account": account,
+            "contact_email": contact_email,
+        })),
         Err(error) => database_unavailable("profile read", error),
     }
 }
@@ -111,28 +102,19 @@ pub(super) async fn me_security_activity(
     )
     .await
     {
-        Ok(page) => {
-            let mut response = (
-                [(header::CONTENT_TYPE, "application/json")],
+        Ok(page) => json_no_store(serde_json::json!({
+            "activity": page.entries.into_iter().map(|entry| {
                 serde_json::json!({
-                    "activity": page.entries.into_iter().map(|entry| {
-                        serde_json::json!({
-                            "id": entry.id,
-                            "actor": entry.actor,
-                            "action": entry.action,
-                            "target": entry.target,
-                            "detail": entry.detail,
-                            "at": entry.created_at,
-                        })
-                    }).collect::<Vec<_>>(),
-                    "next_before_id": page.next_before_id,
+                    "id": entry.id,
+                    "actor": entry.actor,
+                    "action": entry.action,
+                    "target": entry.target,
+                    "detail": entry.detail,
+                    "at": entry.created_at,
                 })
-                .to_string(),
-            )
-                .into_response();
-            no_store(response.headers_mut());
-            response
-        }
+            }).collect::<Vec<_>>(),
+            "next_before_id": page.next_before_id,
+        })),
         Err(error) => database_unavailable("security activity", error),
     }
 }

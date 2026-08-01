@@ -9,13 +9,7 @@ use super::*;
 /// minutes — `RateLimited` caps the per-IP rate so an anonymous flood can't
 /// accumulate rows unboundedly.
 pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLimited) -> Response {
-    let Some(pool) = &state.pool else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured",
-            None,
-        );
-    };
+    let pool = require_pool!(state);
     match crate::db::create_device_grant(pool).await {
         Ok((device_code, user_code)) => {
             let verification_uri = format!(
@@ -64,13 +58,7 @@ pub(super) async fn device_token(
     _rl: RateLimited,
     JsonBody(req): JsonBody<DeviceTokenReq>,
 ) -> Response {
-    let Some(pool) = &state.pool else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured",
-            None,
-        );
-    };
+    let pool = require_pool!(state);
     let oauth_err = |code: &str| {
         (
             StatusCode::BAD_REQUEST,
@@ -1262,13 +1250,7 @@ pub(super) async fn logout(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(pool) = &state.pool else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured",
-            None,
-        );
-    };
+    let pool = require_pool!(state);
     if let Some(token) = session_token(&headers, state.secure_cookies)
         && let Err(e) = crate::db::delete_web_session(pool, &token).await
     {
@@ -1309,13 +1291,7 @@ pub(super) async fn logout_sso(
     Query(query): Query<LogoutQuery>,
 ) -> Response {
     let clear = clear_session_cookie(state.secure_cookies);
-    let Some(pool) = &state.pool else {
-        return problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No database configured",
-            None,
-        );
-    };
+    let pool = require_pool!(state);
     let Some(token) = session_token(&headers, state.secure_cookies) else {
         return (
             StatusCode::SEE_OTHER,

@@ -186,6 +186,10 @@ try {
   // distinguishes an empty collection from an API failure, and the composer
   // cannot accept a message with no attached network.
   await page.locator("#network-select").waitFor();
+  // The zero-network state is rendered only after the boot-time networks fetch
+  // resolves; reading #messages before then races the fetch (and loses on
+  // slower runners), so wait for the render itself.
+  await page.locator("#messages").getByText("No networks are configured").waitFor();
   assert.equal(await page.locator("#network-select").inputValue(), "");
   assert.equal(await page.locator("#message").isDisabled(), true);
   assert.equal(await page.locator("#composer button").isDisabled(), true);

@@ -37,6 +37,25 @@ use openapi::*;
 use sessions::*;
 use ws::*;
 
+/// The database pool for an unauthenticated endpoint, or a 503 problem
+/// response when the server runs without one. (Authenticated endpoints use
+/// [`pool_of`], which relies on `authenticate`'s fail-closed pool check.)
+macro_rules! require_pool {
+    ($state:expr) => {
+        match &$state.pool {
+            Some(pool) => pool,
+            None => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No database configured",
+                    None,
+                )
+            }
+        }
+    };
+}
+pub(crate) use require_pool;
+
 /// A URL-encoded form body whose extraction failures use the API's problem
 /// response contract instead of Axum's default text rejection.
 pub(crate) struct FormBody<T>(pub(crate) T);
@@ -295,6 +314,14 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// A JSON response with `no-store` cache control — the shared shape for
+/// private, per-account API payloads that must never be cached.
+fn json_no_store(value: impl serde::Serialize) -> Response {
+    let mut response = axum::Json(value).into_response();
+    no_store(response.headers_mut());
+    response
 }
 
 /// Parse an optional contact-email field, or return a `BAD_REQUEST` problem
@@ -908,10 +935,7 @@ async fn admin_observability(
     {
         Ok(history) => {
             state.telemetry.record_database_request(started.elapsed());
-            let mut response =
-                axum::Json(ObservabilityResponse { current, history }).into_response();
-            no_store(response.headers_mut());
-            response
+            json_no_store(ObservabilityResponse { current, history })
         }
         Err(error) => {
             state.telemetry.record_database_request(started.elapsed());
@@ -1594,13 +1618,7 @@ mod pages {
         let Some(expected_token) = state.bootstrap_token_digest else {
             return problem(StatusCode::NOT_FOUND, "Bootstrap unavailable", None);
         };
-        let Some(pool) = &state.pool else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No database configured",
-                None,
-            );
-        };
+        let pool = require_pool!(state);
         if !state.bootstrap_available.load(Ordering::Acquire) {
             return problem(StatusCode::CONFLICT, "Bootstrap already complete", None);
         }
@@ -1762,13 +1780,7 @@ mod pages {
         if !valid_invitation_token(&token) {
             return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
         }
-        let Some(pool) = &state.pool else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No database configured",
-                None,
-            );
-        };
+        let pool = require_pool!(state);
         match crate::db::account_invitation_preview(pool, &token).await {
             Ok(Some(preview)) => invitation_response(&state, token, preview, None, StatusCode::OK),
             Ok(None) => problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
@@ -1803,13 +1815,7 @@ mod pages {
         if !valid_invitation_token(&token) {
             return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None);
         }
-        let Some(pool) = &state.pool else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No database configured",
-                None,
-            );
-        };
+        let pool = require_pool!(state);
         let preview = match crate::db::account_invitation_preview(pool, &token).await {
             Ok(Some(preview)) => preview,
             Ok(None) => return problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
@@ -2007,13 +2013,7 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Some(pool) = &state.pool else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No database configured",
-                None,
-            );
-        };
+        let pool = require_pool!(state);
         let Some(token) = session_token(&headers, state.secure_cookies) else {
             return validation_signed_out();
         };

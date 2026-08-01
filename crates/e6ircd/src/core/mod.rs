@@ -437,6 +437,34 @@ impl ServerBanMutation {
             Self::Add { mask, kind, .. } | Self::Remove { mask, kind, .. } => (kind, mask),
         }
     }
+
+    /// An `Add` mutation from a validated mask and its context. Every
+    /// construction — oper KLINE and the admin console alike — serializes the
+    /// folded/display mask and kind the same way, so they cannot drift.
+    pub fn add(
+        mask: &state::MaskKey,
+        kind: state::BanKind,
+        reason: String,
+        set_by: String,
+    ) -> Self {
+        Self::Add {
+            mask: mask.folded().to_string(),
+            mask_display: mask.as_str().to_string(),
+            reason,
+            set_by,
+            kind: kind.as_str().to_string(),
+        }
+    }
+
+    /// A `Remove` mutation from a validated mask and the acting identity.
+    pub fn remove(mask: &state::MaskKey, kind: state::BanKind, actor: String) -> Self {
+        Self::Remove {
+            mask: mask.folded().to_string(),
+            mask_display: mask.as_str().to_string(),
+            kind: kind.as_str().to_string(),
+            actor,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

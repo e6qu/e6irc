@@ -1608,10 +1608,7 @@ mod tests {
                 sasl_account: Some(sealed_account),
                 sasl_password: Some(sealed),
             }],
-            secrets: Some(SecretsConfig {
-                key_file: path.clone(),
-                previous_key_files: Vec::new(),
-            }),
+            secrets: secrets_at(&path),
             ..Config::default()
         };
         cfg.resolve_secrets().expect("resolve");
@@ -1710,6 +1707,15 @@ mod tests {
             tls: None,
             websocket: false,
         }
+    }
+
+    /// A `[secrets]` block keyed on `path` with no rotation history — shared
+    /// by the resolve-secrets tests.
+    fn secrets_at(path: &std::path::Path) -> Option<SecretsConfig> {
+        Some(SecretsConfig {
+            key_file: path.to_path_buf(),
+            previous_key_files: Vec::new(),
+        })
     }
 
     #[test]
@@ -2287,10 +2293,7 @@ allowed_email_domains = ["Example.COM", "subsidiary.example"]
                 end_session_endpoint: None,
                 token_endpoint_auth_method: Default::default(),
             }],
-            secrets: Some(SecretsConfig {
-                key_file: path.clone(),
-                previous_key_files: Vec::new(),
-            }),
+            secrets: secrets_at(&path),
             ..Config::default()
         };
         cfg.resolve_secrets().expect("resolve");

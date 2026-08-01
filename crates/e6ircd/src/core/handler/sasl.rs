@@ -120,6 +120,20 @@ fn take_register_label(state: &mut ServerState, conn: ConnId) -> Option<String> 
 /// chunks). Generous for a bearer JWT, but bounds client-driven buffering.
 pub(super) const SASL_MAX: usize = 8192;
 
+/// Take a parsed SASL credential payload: fail the attempt when it is
+/// malformed, and charge the credential-attempt budget either way. Shared by
+/// the PLAIN and OAUTHBEARER arms, which differ only in how they parse.
+fn require_cred_payload<T>(parsed: Option<T>, state: &mut ServerState, conn: ConnId) -> Option<T> {
+    let parsed = match parsed {
+        Some(p) => p,
+        None => {
+            sasl_fail(state, conn);
+            return None;
+        }
+    };
+    credential_attempt_ok(state, conn).then_some(parsed)
+}
+
 pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     use crate::core::state::SaslState;
     if !state.config.sasl_enabled || !state.sessions[&conn].caps.sasl {
@@ -232,13 +246,9 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                     }
                     Some((authcid, password))
                 });
-                let Some((account, password)) = parsed else {
-                    sasl_fail(state, conn);
+                let Some((account, password)) = require_cred_payload(parsed, state, conn) else {
                     return;
                 };
-                if !credential_attempt_ok(state, conn) {
-                    return;
-                }
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = crate::core::DbRequest::VerifyPassword {
                     conn,
@@ -276,13 +286,9 @@ pub(super) fn cmd_authenticate(state: &mut ServerState, conn: ConnId, p: &[&str]
                             .map(str::to_string)
                     })
                 });
-                let Some(token) = token else {
-                    sasl_fail(state, conn);
+                let Some(token) = require_cred_payload(token, state, conn) else {
                     return;
                 };
-                if !credential_attempt_ok(state, conn) {
-                    return;
-                }
                 state.sessions.get_mut(&conn).expect("checked").sasl = SaslState::Verifying;
                 let request = crate::core::DbRequest::VerifyToken { conn, token };
                 if state.db_tx.try_push(request).is_err() {
@@ -642,7 +648,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             );
         }
         crate::core::DbReply::ChannelKeeptopicUnavailable { display, label } => {
-            super::services::channel_keeptopic_unavailable(state, conn, display, label);
+            super::services::channel_field_unavailable(state, conn, display, label, "KEEPTOPIC");
         }
         crate::core::DbReply::ChannelMlockSet {
             channel,
@@ -656,7 +662,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             );
         }
         crate::core::DbReply::ChannelMlockUnavailable { display, label } => {
-            super::services::channel_mlock_unavailable(state, conn, display, label);
+            super::services::channel_field_unavailable(state, conn, display, label, "MLOCK");
         }
         crate::core::DbReply::FounderChanged { channel, account } => {
             // Update the hot ownership map so the new founder is re-opped.

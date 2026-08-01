@@ -24,10 +24,7 @@ pub(super) async fn list_browser_sessions(
                     })
                 })
                 .collect::<Vec<_>>();
-            let mut response =
-                axum::Json(serde_json::json!({ "sessions": sessions })).into_response();
-            no_store(response.headers_mut());
-            response
+            json_no_store(serde_json::json!({ "sessions": sessions }))
         }
         Err(error) => {
             eprintln!("http: browser session list failed: {error}");
@@ -244,13 +241,10 @@ async fn connection_page(
 }
 
 fn live_connection_page_response(page: crate::core::LiveConnectionPage) -> Response {
-    let mut response = axum::Json(serde_json::json!({
+    json_no_store(serde_json::json!({
         "connections": page.entries.into_iter().map(live_connection_json).collect::<Vec<_>>(),
         "next_before_id": page.next_before_id.map(|id| id.to_string()),
     }))
-    .into_response();
-    no_store(response.headers_mut());
-    response
 }
 
 pub(super) async fn admin_connections(
