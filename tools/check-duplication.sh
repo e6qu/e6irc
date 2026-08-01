@@ -64,14 +64,26 @@ cd "$(dirname "$0")/.."
 # `require_cred_payload`, the labeled FAIL/BATCH prefix became
 # `with_label`, the JSON+no-store response became `json_no_store`,
 # OIDC client discovery became `discover_client_or_bad_gateway`, and the
-# pending-topic cleanup became `clear_pending_topic`).
+# pending-topic cleanup became `clear_pending_topic`) → 2.1% (sweep 35:
+# the bridge drivers' `start`/`run`/ws-open/frame-read/http-client
+# scaffolding became shared `bridge_*` helpers and macros, the console
+# form parse+actor prologues became `account_form_actor`/`admin_form_actor`
+# over a macro-generated `AccountForm` impl set, the BNC registry and
+# managed-config guards became `require_registry!`/`require_managed_config!`,
+# the network/audit/OIDC JSON builders became shared fragments, the account
+# INSERT became `insert_account`, the credential-revocation transactions
+# became `delete_scoped_credential`, the DB offload spawns became
+# `spawn_db_offload`, the ChanServ registered gate split out of the founder
+# gate, the message Delivery/HistoryEntry construction hoisted out of the
+# channel/DM branch, and the OpenAPI cursor/confirmation fragments became
+# shared values).
 #
 # What is left is mostly sqlx builder chains — `.bind().execute().await
 # .map_err()` — and per-route response shaping. Those are plumbing: abstracting
 # them would read worse than the repetition, so the number is expected to sit
 # here rather than keep falling. Lower it only when a real shared concept is
 # found, not by wrapping boilerplate to move a metric.
-THRESHOLD=2.6
+THRESHOLD=2.1
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."

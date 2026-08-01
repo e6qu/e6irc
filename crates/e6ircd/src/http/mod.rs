@@ -56,6 +56,35 @@ macro_rules! require_pool {
 }
 pub(crate) use require_pool;
 
+/// The UI-managed configuration handle for a console configuration handler,
+/// or a 503 problem when the server runs without PostgreSQL-backed
+/// configuration.
+macro_rules! require_managed_config {
+    ($state:expr) => {
+        match &$state.managed_config {
+            Some(config) => config,
+            None => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Configuration unavailable",
+                    Some("PostgreSQL is required for UI-managed configuration."),
+                )
+            }
+        }
+    };
+}
+
+/// The BNC registry for a console network/bridge handler, or a 404 problem
+/// when the server runs without the bouncer enabled.
+macro_rules! require_registry {
+    ($state:expr) => {
+        match &$state.bnc_registry {
+            Some(registry) => registry,
+            None => return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None),
+        }
+    };
+}
+
 /// A URL-encoded form body whose extraction failures use the API's problem
 /// response contract instead of Axum's default text rejection.
 pub(crate) struct FormBody<T>(pub(crate) T);
@@ -321,6 +350,20 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
 fn json_no_store(value: impl serde::Serialize) -> Response {
     let mut response = axum::Json(value).into_response();
     no_store(response.headers_mut());
+    response
+}
+
+/// Redirect to `/login` while clearing the browser session cookie — the
+/// shared tail of the "this session is gone now" flows (account deletion,
+/// revoking one's own current browser session).
+fn redirect_signed_out(state: &AppState) -> Response {
+    let mut response = Redirect::to("/login").into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        clear_session_cookie(state.secure_cookies)
+            .parse()
+            .expect("session clear cookie is valid"),
+    );
     response
 }
 
@@ -2345,14 +2388,7 @@ mod pages {
         .map_err(|e| super::device::admin_db_error("security activity", e))?
         .entries
         .into_iter()
-        .map(|entry| AuditRow {
-            id: entry.id,
-            at: entry.created_at,
-            actor: entry.actor,
-            action: entry.action,
-            target: entry.target,
-            detail: entry.detail,
-        })
+        .map(AuditRow::from)
         .collect();
         let is_admin = is_admin_account(state, &account);
         let link_providers = state
@@ -2525,16 +2561,7 @@ mod pages {
             Err(error) => return super::device::admin_db_error("account deletion target", error),
         };
         match delete_account_lifecycle(&state, &account, account_id, true).await {
-            Ok(_) => {
-                let mut response = Redirect::to("/login").into_response();
-                response.headers_mut().insert(
-                    header::SET_COOKIE,
-                    clear_session_cookie(state.secure_cookies)
-                        .parse()
-                        .expect("session clear cookie is valid"),
-                );
-                response
-            }
+            Ok(_) => redirect_signed_out(&state),
             Err((status, detail)) => {
                 account_result(
                     &state,
@@ -2599,41 +2626,33 @@ mod pages {
         fn csrf(&self) -> &str;
     }
 
-    impl AccountForm for AccountLabelForm {
-        fn csrf(&self) -> &str {
-            &self.csrf
-        }
+    /// Every form type carrying a `csrf` field implements [`AccountForm`] the
+    /// same way — one macro so the mapping can't drift (or grow a copy that
+    /// points at the wrong field).
+    macro_rules! account_form {
+        ($($t:ty),* $(,)?) => {
+            $(impl AccountForm for $t {
+                fn csrf(&self) -> &str {
+                    &self.csrf
+                }
+            })*
+        };
     }
-
-    impl AccountForm for AccountTokenForm {
-        fn csrf(&self) -> &str {
-            &self.csrf
-        }
-    }
-
-    impl AccountForm for AccountContactForm {
-        fn csrf(&self) -> &str {
-            &self.csrf
-        }
-    }
-
-    impl AccountForm for AccountDeleteForm {
-        fn csrf(&self) -> &str {
-            &self.csrf
-        }
-    }
-
-    impl AccountForm for AccountPermanentDeleteForm {
-        fn csrf(&self) -> &str {
-            &self.csrf
-        }
-    }
-
-    impl AccountForm for AccountPasswordForm {
-        fn csrf(&self) -> &str {
-            &self.csrf
-        }
-    }
+    account_form!(
+        AccountLabelForm,
+        AccountTokenForm,
+        AccountContactForm,
+        AccountDeleteForm,
+        AccountPermanentDeleteForm,
+        AccountPasswordForm,
+        ToggleFields,
+        NetworkFormFields,
+        NetworkEditForm,
+        BridgeToggleFields,
+        BridgeDeleteFields,
+        BridgeFormFields,
+        BridgeEditFormFields,
+    );
 
     async fn account_form_actor<T: AccountForm>(
         state: &AppState,
@@ -2642,6 +2661,18 @@ mod pages {
     ) -> Result<(String, T), Response> {
         let fields = parse_form(form)?;
         let account = require_form_actor(state, headers, fields.csrf()).await?;
+        Ok((account, fields))
+    }
+
+    /// Parse a console form and authenticate its actor as an administrator —
+    /// the admin-gated sibling of [`account_form_actor`].
+    async fn admin_form_actor<T: AccountForm>(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
+    ) -> Result<(String, T), Response> {
+        let fields = parse_form(form)?;
+        let account = require_admin_form_actor(state, headers, fields.csrf()).await?;
         Ok((account, fields))
     }
 
@@ -3458,6 +3489,19 @@ mod pages {
         detail: String,
     }
 
+    impl From<crate::db::AuditLogRow> for AuditRow {
+        fn from(entry: crate::db::AuditLogRow) -> Self {
+            Self {
+                id: entry.id,
+                at: entry.created_at,
+                actor: entry.actor,
+                action: entry.action,
+                target: entry.target,
+                detail: entry.detail,
+            }
+        }
+    }
+
     #[derive(Template)]
     #[template(path = "console.html")]
     struct Console {
@@ -3636,14 +3680,7 @@ mod pages {
         .await
         .map_err(|e| super::device::admin_db_error("audit log", e))?
         .into_iter()
-        .map(|entry| AuditRow {
-            id: entry.id,
-            at: entry.created_at,
-            actor: entry.actor,
-            action: entry.action,
-            target: entry.target,
-            detail: entry.detail,
-        })
+        .map(AuditRow::from)
         .collect();
         let (networks, connected) = bnc_counts(state);
         let live = state.telemetry.snapshot(networks, connected);
@@ -4719,21 +4756,9 @@ mod pages {
         Path((owner, name)): Path<(String, String)>,
         form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
-        let axum::Form(f) = match form {
-            Ok(f) => f,
-            Err(e) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid form",
-                    Some(&e.to_string()),
-                );
-            }
-        };
-        let admin = match require_admin_form_actor(&state, &headers, &f.csrf).await {
-            Ok(account) => account,
+        let registry = require_registry!(state);
+        let (admin, f) = match admin_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
         let Some(enabled) = toggle_target(&f.enabled) else {
@@ -5262,13 +5287,7 @@ mod pages {
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        let Some(config) = &state.managed_config else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Configuration unavailable",
-                Some("PostgreSQL is required for UI-managed configuration."),
-            );
-        };
+        let config = require_managed_config!(state);
         let snapshot = config.read().await.clone();
         render_configuration(&state, account, csrf, snapshot, None, true).await
     }
@@ -5302,13 +5321,7 @@ mod pages {
             csrf,
         }: AdminConfigPayload<ManagedConfigForm>,
     ) -> Response {
-        let Some(config) = &state.managed_config else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Configuration unavailable",
-                Some("PostgreSQL is required for UI-managed configuration."),
-            );
-        };
+        let config = require_managed_config!(state);
         let mut current = config.write().await;
         if current.revision != form.revision {
             return render_configuration_error(
@@ -5548,13 +5561,7 @@ mod pages {
         csrf: String,
         change: impl FnOnce(&mut crate::config::ManagedConfig) -> Result<String, String>,
     ) -> Response {
-        let Some(config) = &state.managed_config else {
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Configuration unavailable",
-                Some("PostgreSQL is required for UI-managed configuration."),
-            );
-        };
+        let config = require_managed_config!(state);
         let mut current = config.write().await;
         let mut settings = current.settings.clone();
         let detail = match change(&mut settings) {
@@ -5631,6 +5638,40 @@ mod pages {
         .await
     }
 
+    /// Reject a credential mutation while the config still holds
+    /// bootstrap-sealed credentials — the master key must be configured and
+    /// the server restarted first, so a console edit cannot silently strand
+    /// the bootstrap operator/provider secrets. `what` names the credential
+    /// family ("operator", "identity-provider").
+    fn reject_bootstrap_credential_change(
+        settings: &crate::config::ManagedConfig,
+        what: &str,
+    ) -> Result<(), String> {
+        if settings.credentials_from_bootstrap {
+            return Err(format!(
+                "Configure a master key and restart before changing bootstrap {what} credentials."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove the item named `name` from a managed-config list, or report it
+    /// missing. `kind` names the list for the error ("IRC operator",
+    /// "identity provider").
+    fn remove_named<T>(
+        items: &mut Vec<T>,
+        name: &str,
+        kind: &str,
+        item_name: impl Fn(&T) -> &str,
+    ) -> Result<(), String> {
+        let before = items.len();
+        items.retain(|item| item_name(item) != name);
+        if items.len() == before {
+            return Err(format!("No {kind} named '{name}'."));
+        }
+        Ok(())
+    }
+
     pub async fn console_delete_oper(
         State(state): State<Arc<AppState>>,
         AdminConfigPayload {
@@ -5640,17 +5681,10 @@ mod pages {
         }: AdminConfigPayload<DeleteConfigItem>,
     ) -> Response {
         mutate_managed_config(&state, account, csrf, move |settings| {
-            if settings.credentials_from_bootstrap {
-                return Err(
-                    "Configure a master key and restart before changing bootstrap operator credentials."
-                        .into(),
-                );
-            }
-            let before = settings.opers.len();
-            settings.opers.retain(|oper| oper.name != form.name);
-            if settings.opers.len() == before {
-                return Err(format!("No IRC operator named '{}'.", form.name));
-            }
+            reject_bootstrap_credential_change(settings, "operator")?;
+            remove_named(&mut settings.opers, &form.name, "IRC operator", |oper| {
+                &oper.name
+            })?;
             Ok(format!("removed IRC operator {}", form.name))
         })
         .await
@@ -5718,19 +5752,13 @@ mod pages {
         }: AdminConfigPayload<DeleteConfigItem>,
     ) -> Response {
         mutate_managed_config(&state, account, csrf, move |settings| {
-            if settings.credentials_from_bootstrap {
-                return Err(
-                    "Configure a master key and restart before changing bootstrap identity-provider credentials."
-                        .into(),
-                );
-            }
-            let before = settings.oidc_providers.len();
-            settings
-                .oidc_providers
-                .retain(|provider| provider.name != form.name);
-            if settings.oidc_providers.len() == before {
-                return Err(format!("No identity provider named '{}'.", form.name));
-            }
+            reject_bootstrap_credential_change(settings, "identity-provider")?;
+            remove_named(
+                &mut settings.oidc_providers,
+                &form.name,
+                "identity provider",
+                |provider| &provider.name,
+            )?;
             Ok(format!("removed OpenID Connect provider {}", form.name))
         })
         .await
@@ -6379,6 +6407,27 @@ mod pages {
         })
     }
 
+    /// Re-render the networks console with the just-submitted form and the
+    /// mutation error mapped onto its fields — the shared failure tail of the
+    /// add/preflight network handlers.
+    async fn console_networks_mutation_error(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        form_view: NetworkFormView,
+        error: &crate::http::networks::NetworkMutationError,
+    ) -> Response {
+        console_networks_page(
+            state,
+            account,
+            csrf,
+            form_view,
+            Some(FormFieldError::from_mutation(error)),
+            None,
+        )
+        .await
+    }
+
     /// Console → BNC networks: the caller's own always-on upstreams with live
     /// connection status, plus add/remove. Any authenticated user manages their
     /// own networks (not admin-gated); an anonymous visitor goes to `/login`.
@@ -6420,12 +6469,8 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let fields = match parse_form(form) {
-            Ok(fields) => fields,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &fields.csrf).await {
-            Ok(account) => account,
+        let (account, fields) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
         let csrf = session_token(&headers, state.secure_cookies)
@@ -6450,27 +6495,12 @@ mod pages {
         let req = match preset_result {
             Ok(()) => fields.into_resolved_create(),
             Err(error) => {
-                return console_networks_page(
-                    &state,
-                    account,
-                    csrf,
-                    form_view,
-                    Some(FormFieldError::from_mutation(&error)),
-                    None,
-                )
-                .await;
+                return console_networks_mutation_error(&state, account, csrf, form_view, &error)
+                    .await;
             }
         };
         if let Err(error) = create_network_core(&state, registry, &account, &req).await {
-            return console_networks_page(
-                &state,
-                account,
-                csrf,
-                form_view,
-                Some(FormFieldError::from_mutation(&error)),
-                None,
-            )
-            .await;
+            return console_networks_mutation_error(&state, account, csrf, form_view, &error).await;
         }
         Redirect::to("/console/networks").into_response()
     }
@@ -6483,12 +6513,8 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let mut fields = match parse_form(form) {
-            Ok(fields) => fields,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &fields.csrf).await {
-            Ok(account) => account,
+        let (account, mut fields) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
         let csrf = session_token(&headers, state.secure_cookies)
@@ -6496,15 +6522,7 @@ mod pages {
             .unwrap_or_default();
         if let Err(error) = fields.apply_preset() {
             let form_view = NetworkFormView::submitted(&fields);
-            return console_networks_page(
-                &state,
-                account,
-                csrf,
-                form_view,
-                Some(FormFieldError::from_mutation(&error)),
-                None,
-            )
-            .await;
+            return console_networks_mutation_error(&state, account, csrf, form_view, &error).await;
         }
         let form_view = NetworkFormView::submitted(&fields);
         let create = fields.into_resolved_create();
@@ -6562,12 +6580,8 @@ mod pages {
         Path(name): Path<String>,
         form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &form.csrf).await {
-            Ok(account) => account,
+        let (account, _) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
         if let Err(response) = delete_network_by_name(&state, &account, &name).await {
@@ -6608,21 +6622,9 @@ mod pages {
         Path(name): Path<String>,
         form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
-        let axum::Form(f) = match form {
-            Ok(f) => f,
-            Err(e) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid form",
-                    Some(&e.to_string()),
-                );
-            }
-        };
-        let account = match require_form_actor(&state, &headers, &f.csrf).await {
-            Ok(account) => account,
+        let registry = require_registry!(state);
+        let (account, f) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
         let Some(enabled) = toggle_target(&f.enabled) else {
@@ -6722,23 +6724,11 @@ mod pages {
         form: Result<axum::Form<NetworkEditForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
         // Plain form: parse first, then authenticate + verify the body CSRF.
-        let axum::Form(f) = match form {
-            Ok(f) => f,
-            Err(e) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid form",
-                    Some(&e.to_string()),
-                );
-            }
+        let (account, f) = match account_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
-        let account = match require_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
+        let registry = require_registry!(state);
         let tls = f.tls.as_deref() == Some("on");
         let realname = (!f.realname.trim().is_empty()).then(|| f.realname.trim().to_string());
         let autojoin: Vec<String> = f
@@ -6992,13 +6982,10 @@ mod pages {
         }
     }
 
-    /// The console add-bridge form (urlencoded with a hidden CSRF field). Field
-    /// meaning is per kind.
+    /// The bridge connection/identity fields shared by the add and edit
+    /// forms (all optional on the wire; meaning is per kind).
     #[derive(Deserialize)]
-    pub struct BridgeFormFields {
-        csrf: String,
-        kind: String,
-        name: String,
+    struct BridgeConnectionFields {
         #[serde(default)]
         addr: String,
         #[serde(default)]
@@ -7011,19 +6998,22 @@ mod pages {
         autojoin: String,
     }
 
+    /// The console add-bridge form (urlencoded with a hidden CSRF field). Field
+    /// meaning is per kind.
+    #[derive(Deserialize)]
+    pub struct BridgeFormFields {
+        csrf: String,
+        kind: String,
+        name: String,
+        #[serde(flatten)]
+        connection: BridgeConnectionFields,
+    }
+
     #[derive(Deserialize)]
     pub struct BridgeEditFormFields {
         csrf: String,
-        #[serde(default)]
-        addr: String,
-        #[serde(default)]
-        nick: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-        #[serde(default)]
-        autojoin: String,
+        #[serde(flatten)]
+        connection: BridgeConnectionFields,
     }
 
     #[derive(Deserialize)]
@@ -7233,6 +7223,25 @@ mod pages {
         }
     }
 
+    /// Run an admin console form action and render its policy-error page on an
+    /// action failure — the shared tail of the ban, channel, and session
+    /// handlers, which differ only in redirect, request, and error page.
+    async fn admin_form_page(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        csrf: &str,
+        redirect: &'static str,
+        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
+        error_page: AdminPolicyPage,
+    ) -> Response {
+        match run_admin_form(state, headers, csrf, redirect, make_req).await {
+            Ok(resp) => resp,
+            Err((account, msg)) => {
+                admin_policy_error_page(state, headers, account, msg, error_page).await
+            }
+        }
+    }
+
     /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
     /// and disconnects matching sessions exactly like oper KLINE.
     pub async fn console_add_ban(
@@ -7250,13 +7259,15 @@ mod pages {
             reason: f.reason,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console/bans", make).await {
-            Ok(resp) => resp,
-            Err((account, msg)) => {
-                admin_policy_error_page(&state, &headers, account, msg, AdminPolicyPage::ServerBans)
-                    .await
-            }
-        }
+        admin_form_page(
+            &state,
+            &headers,
+            &f.csrf,
+            "/console/bans",
+            make,
+            AdminPolicyPage::ServerBans,
+        )
+        .await
     }
 
     /// Console → remove a K/D/X-line (admin).
@@ -7274,13 +7285,15 @@ mod pages {
             kind: f.kind,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console/bans", make).await {
-            Ok(resp) => resp,
-            Err((account, msg)) => {
-                admin_policy_error_page(&state, &headers, account, msg, AdminPolicyPage::ServerBans)
-                    .await
-            }
-        }
+        admin_form_page(
+            &state,
+            &headers,
+            &f.csrf,
+            "/console/bans",
+            make,
+            AdminPolicyPage::ServerBans,
+        )
+        .await
     }
 
     /// Console → unregister a channel (admin), like ChanServ DROP.
@@ -7297,19 +7310,15 @@ mod pages {
             channel: f.channel,
             actor,
         };
-        match run_admin_form(&state, &headers, &f.csrf, "/console/admin/channels", make).await {
-            Ok(resp) => resp,
-            Err((account, msg)) => {
-                admin_policy_error_page(
-                    &state,
-                    &headers,
-                    account,
-                    msg,
-                    AdminPolicyPage::RegisteredChannels,
-                )
-                .await
-            }
-        }
+        admin_form_page(
+            &state,
+            &headers,
+            &f.csrf,
+            "/console/admin/channels",
+            make,
+            AdminPolicyPage::RegisteredChannels,
+        )
+        .await
     }
 
     #[derive(Deserialize)]
@@ -7581,16 +7590,7 @@ mod pages {
             .await
         {
             Ok(Some(false)) => Redirect::to("/console/my-sessions").into_response(),
-            Ok(Some(true)) => {
-                let mut response = Redirect::to("/login").into_response();
-                response.headers_mut().insert(
-                    header::SET_COOKIE,
-                    clear_session_cookie(state.secure_cookies)
-                        .parse()
-                        .expect("session clear cookie is valid"),
-                );
-                response
-            }
+            Ok(Some(true)) => redirect_signed_out(&state),
             Ok(None) => {
                 browser_session_error(&state, &headers, account, "No such browser session.").await
             }
@@ -7720,17 +7720,12 @@ mod pages {
         Path(name): Path<String>,
         form: Result<axum::Form<BridgeEditFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
+        let (account, form) = match admin_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let account = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
+        let registry = require_registry!(state);
+        let form = form.connection;
         let autojoin: Vec<String> = form
             .autojoin
             .split(',')
@@ -7796,13 +7791,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BridgeFormFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
-        };
-        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
+        let (account, f) = match admin_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
         let Some(registry) = &state.bnc_registry else {
             let msg = "The bouncer is not enabled on this server.".to_string();
@@ -7822,22 +7813,23 @@ mod pages {
             return console_integrations_error(&state, &headers, account, msg).await;
         }
         let opt = |s: String| if s.is_empty() { None } else { Some(s) };
+        let conn = f.connection;
         let req = CreateNetwork {
             kind,
             name: f.name,
-            addr: f.addr,
+            addr: conn.addr,
             tls: true,
-            nick: f.nick,
+            nick: conn.nick,
             realname: None,
-            autojoin: f
+            autojoin: conn
                 .autojoin
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            sasl_account: opt(f.sasl_account),
-            sasl_password: opt(f.sasl_password),
+            sasl_account: opt(conn.sasl_account),
+            sasl_password: opt(conn.sasl_password),
         };
         if let Err(error) = create_network_core(&state, registry, &account, &req).await {
             return console_integrations_error(&state, &headers, account, error.message()).await;
@@ -7851,17 +7843,11 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BridgeDeleteFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
+        let (account, f) = match admin_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
-        let account = match require_admin_form_actor(&state, &headers, &f.csrf).await {
-            Ok(a) => a,
-            Err(r) => return r,
-        };
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
+        let registry = require_registry!(state);
         if let Err(error) = delete_network_core(
             &state,
             registry,
@@ -7883,17 +7869,11 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BridgeToggleFields>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let form = match parse_form(form) {
-            Ok(form) => form,
+        let (account, form) = match admin_form_actor(&state, &headers, form).await {
+            Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let account = match require_admin_form_actor(&state, &headers, &form.csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let Some(registry) = &state.bnc_registry else {
-            return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
-        };
+        let registry = require_registry!(state);
         let Some(enabled) = toggle_target(&form.enabled) else {
             return invalid_toggle_response();
         };
@@ -8450,6 +8430,19 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
         logout_token_with_type(payload, Some("logout+jwt"))
     }
 
+    fn logout_test_provider() -> OidcProviderConfig {
+        OidcProviderConfig {
+            name: "shauth".into(),
+            issuer_url: "https://auth.example".into(),
+            client_id: "e6irc".into(),
+            client_secret: "secret".into(),
+            scopes: vec![],
+            allowed_email_domains: vec![],
+            end_session_endpoint: None,
+            token_endpoint_auth_method: Default::default(),
+        }
+    }
+
     #[test]
     fn verifies_signed_backchannel_logout_contract() {
         let now = 1_800_000_000;
@@ -8463,16 +8456,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
             "jti": "logout-1",
             "events": { BACKCHANNEL_LOGOUT_EVENT: {} }
         }));
-        let provider = OidcProviderConfig {
-            name: "shauth".into(),
-            issuer_url: "https://auth.example".into(),
-            client_id: "e6irc".into(),
-            client_secret: "secret".into(),
-            scopes: vec![],
-            allowed_email_domains: vec![],
-            end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
-        };
+        let provider = logout_test_provider();
         let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
         let claims = verify_logout_token_with_metadata(
             &raw,
@@ -8536,16 +8520,7 @@ ELXcSQ+IOhrSANLPrHcXve6GfmpJx1m8A7Whc0RfbsjoBAmNuALv
     #[test]
     fn backchannel_logout_normalizes_and_validates_claims() {
         let now = 1_800_000_000;
-        let provider = OidcProviderConfig {
-            name: "shauth".into(),
-            issuer_url: "https://auth.example".into(),
-            client_id: "e6irc".into(),
-            client_secret: "secret".into(),
-            scopes: vec![],
-            allowed_email_domains: vec![],
-            end_session_endpoint: None,
-            token_endpoint_auth_method: Default::default(),
-        };
+        let provider = logout_test_provider();
         let algorithm = CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256;
         let verify = |payload: serde_json::Value| {
             let (raw, key) = logout_token(payload);

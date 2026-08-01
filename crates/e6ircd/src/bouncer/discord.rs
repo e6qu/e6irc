@@ -60,44 +60,24 @@ impl NetworkDriver for DiscordDriver {
         "discord"
     }
 
-    fn start(self: Box<Self>) -> NetworkHandle {
-        let (handle, ends) = NetworkHandle::channels(self.config.buffer_cap);
-        tokio::spawn(run(self.config, ends));
-        handle
-    }
+    super::bridge_start!();
 }
 
-fn api_base(config: &DiscordConfig) -> String {
-    if config.api_base.is_empty() {
-        DEFAULT_API.to_string()
-    } else {
-        config.api_base.trim_end_matches('/').to_string()
-    }
-}
-
-async fn run(config: DiscordConfig, mut ends: DriverEnds) {
-    // Always-on: reconnect (from scratch) with backoff on any gateway drop,
-    // rather than dying on the first disconnect and silently dropping all
-    // later messages. Only a dropped handle stops the driver.
-    super::run_with_backoff(config, &mut ends, |config, ends| {
-        Box::pin(session_once(config, ends))
-    })
-    .await;
-}
+// Always-on: reconnect (from scratch) with backoff on any gateway drop,
+// rather than dying on the first disconnect and silently dropping all
+// later messages. Only a dropped handle stops the driver.
+super::bridge_run!(DiscordConfig);
 
 async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::SessionOutcome {
     use super::NetworkFailure;
     use super::SessionOutcome::Dropped;
     // Bound REST calls so a hung request can't stall the gateway loop; vet every
     // resolved IP and refuse redirects (SSRF control; see `bridge_http_client`).
-    let http = match super::bridge_http_client(Duration::from_secs(30)) {
+    let http = match super::bridge_http_or_outcome("discord", Duration::from_secs(30)) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("discord: http client build failed: {e}");
-            return Dropped(NetworkFailure::UpstreamRequestFailed);
-        }
+        Err(outcome) => return outcome,
     };
-    let base = api_base(config);
+    let base = super::bridge_api_base(&config.api_base, DEFAULT_API);
 
     let (id_to_channel, channel_to_id) = match super::resolve_bridge_channels(
         "discord",
@@ -130,21 +110,9 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
     // Bound the WS handshake so a black-holed gateway (accepts the connection
     // then goes silent) can't wedge the driver — the same guard irc_driver and
     // matrix already have.
-    let ws = match tokio::time::timeout(
-        Duration::from_secs(30),
-        super::bridge_ws_connect(&url, super::bridge_ws_config()),
-    )
-    .await
-    {
-        Ok(Ok(ws)) => ws,
-        Ok(Err(e)) => {
-            eprintln!("discord: gateway connect failed: {e}");
-            return Dropped(NetworkFailure::ConnectionFailed);
-        }
-        Err(_) => {
-            eprintln!("discord: gateway connect timed out");
-            return Dropped(NetworkFailure::ConnectionTimedOut);
-        }
+    let ws = match super::bridge_ws_open(&url, "discord", "gateway").await {
+        Ok(ws) => ws,
+        Err(outcome) => return outcome,
     };
     let (mut write, mut read) = ws.split();
 
@@ -211,41 +179,26 @@ async fn session_once(config: &DiscordConfig, ends: &mut DriverEnds) -> super::S
                     return Dropped(NetworkFailure::UpstreamWriteFailed);
                 }
             }
-            frame = tokio::time::timeout(read_timeout, read.next()) => {
-                let Ok(frame) = frame else {
-                    eprintln!("discord: gateway idle past timeout; reconnecting");
-                    return Dropped(NetworkFailure::KeepaliveTimedOut);
-                };
-                let text = match frame {
-                    Some(Ok(Ws::Text(t))) => t.as_str().to_string(),
-                    Some(Ok(Ws::Ping(p))) => {
-                        if write.send(Ws::Pong(p)).await.is_err() {
-                            return Dropped(NetworkFailure::UpstreamWriteFailed);
-                        }
-                        continue;
-                    }
-                    Some(Ok(Ws::Close(frame))) => {
-                        // Discord close code 4004 = authentication failed (bad
-                        // token); 4013/4014 = invalid/disallowed gateway intents.
-                        // These are permanent config errors — stop re-dialing (like
-                        // the IRC driver on a rejected password) rather than
-                        // reconnecting forever with the same bad token.
-                        let code = frame.as_ref().map(|f| u16::from(f.code));
-                        if matches!(code, Some(4004 | 4013 | 4014)) {
-                            eprintln!(
-                                "discord: gateway closed with fatal auth/intents code {code:?}; \
-                                 will stop retrying"
-                            );
-                            return super::SessionOutcome::AuthRejected;
-                        }
-                        return Dropped(NetworkFailure::ConnectionLost);
-                    }
-                    None => return Dropped(NetworkFailure::ConnectionLost),
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => {
-                        eprintln!("discord: gateway read error: {e}");
-                        return Dropped(NetworkFailure::ConnectionLost);
-                    }
+            text = super::next_bridge_text(&mut read, &mut write, read_timeout, "discord", "gateway", |code| {
+                // Discord close code 4004 = authentication failed (bad token);
+                // 4013/4014 = invalid/disallowed gateway intents. These are
+                // permanent config errors — stop re-dialing (like the IRC driver
+                // on a rejected password) rather than reconnecting forever with
+                // the same bad token.
+                if matches!(code, Some(4004 | 4013 | 4014)) {
+                    eprintln!(
+                        "discord: gateway closed with fatal auth/intents code {code:?}; \
+                         will stop retrying"
+                    );
+                    super::SessionOutcome::AuthRejected
+                } else {
+                    Dropped(NetworkFailure::ConnectionLost)
+                }
+            }) => {
+                let text = match text {
+                    Ok(Some(t)) => t,
+                    Ok(None) => continue,
+                    Err(outcome) => return outcome,
                 };
                 let frame = match parse_frame(&text) {
                     Ok(frame) => frame,
@@ -451,13 +404,8 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
 }
 
 async fn gateway_url(http: &reqwest::Client, base: &str) -> Result<String, String> {
-    let v: serde_json::Value = http
-        .get(format!("{base}/gateway"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
+    let v: serde_json::Value = super::bridge_send(http.get(format!("{base}/gateway")))
+        .await?
         .bounded_json()
         .await?;
     v["url"]
@@ -472,16 +420,13 @@ async fn fetch_channel_name(
     token: &str,
     id: &str,
 ) -> Result<String, String> {
-    let v: serde_json::Value = http
-        .get(format!("{base}/channels/{id}"))
-        .header("Authorization", format!("Bot {token}"))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .bounded_json()
-        .await?;
+    let v: serde_json::Value = super::bridge_send(
+        http.get(format!("{base}/channels/{id}"))
+            .header("Authorization", format!("Bot {token}")),
+    )
+    .await?
+    .bounded_json()
+    .await?;
     v["name"]
         .as_str()
         .map(str::to_string)
@@ -629,9 +574,15 @@ mod tests {
             channels: vec![],
             buffer_cap: 10,
         };
-        assert_eq!(api_base(&c), DEFAULT_API);
+        assert_eq!(
+            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
+            DEFAULT_API
+        );
         c.api_base = "http://localhost:8080/".into();
-        assert_eq!(api_base(&c), "http://localhost:8080");
+        assert_eq!(
+            crate::bouncer::bridge_api_base(&c.api_base, DEFAULT_API),
+            "http://localhost:8080"
+        );
     }
 
     #[tokio::test]

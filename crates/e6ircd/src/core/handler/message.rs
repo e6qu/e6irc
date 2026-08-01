@@ -380,67 +380,46 @@ pub(super) fn deliver_one_message(
     // rather than each seeing a differently-cut or dropped copy.
     let text = fit_relayed_text(&prefix, kind.wire(), target, text);
     let line = format!(":{prefix} {} {target} :{text}", kind.wire());
+    // One stamp, one delivery description, one history entry: the channel and
+    // direct-message branches record the same message — only who receives it
+    // and under which history key differs, so live delivery and CHATHISTORY
+    // replay cannot drift. The delivery borrows the entry's fields, so the
+    // entry moves into the branch's `record_history` call after delivery.
+    let (ts, msgid) = state.stamp();
+    let entry = crate::core::state::HistoryEntry {
+        msgid,
+        ts,
+        sender_prefix: prefix.clone(),
+        sender_account: state.sessions[&conn].account.clone(),
+        kind,
+        body: text.to_string(),
+        sender_is_bot: state.sessions[&conn].bot,
+        multiline: None,
+    };
+    let delivery = Delivery {
+        sender_account: entry.sender_account.as_deref(),
+        sender_is_bot: entry.sender_is_bot,
+        msgid: &entry.msgid,
+        client_tags,
+        body: &line,
+        ts: entry.ts,
+        bypass_capture: true,
+    };
     if let ResolvedKind::Channel { key, status_prefix } = resolved.kind {
         let recipients = resolved.recipients;
-        let sender_account = state.sessions[&conn].account.clone();
-        let sender_is_bot = state.sessions[&conn].bot;
-        let (ts, msgid) = state.stamp();
-        deliver_and_echo(
-            state,
-            conn,
-            &recipients,
-            &Delivery {
-                sender_account: sender_account.as_deref(),
-                sender_is_bot,
-                msgid: &msgid,
-                client_tags,
-                body: &line,
-                ts,
-                bypass_capture: true,
-            },
-        );
+        deliver_and_echo(state, conn, &recipients, &delivery);
         // A STATUSMSG (@#/+#) reached only ops/voiced members. It must not
         // enter the shared history ring or the messages table, or CHATHISTORY
         // would replay it to members who were excluded from the live delivery.
         if status_prefix.is_some() {
             return;
         }
-        record_history(
-            state,
-            &(&key).into(),
-            Vec::new(),
-            crate::core::state::HistoryEntry {
-                msgid,
-                ts,
-                sender_prefix: prefix.clone(),
-                sender_account,
-                kind,
-                body: text.to_string(),
-                sender_is_bot,
-                multiline: None,
-            },
-        );
+        record_history(state, &(&key).into(), Vec::new(), entry);
     } else {
         let ResolvedKind::User { peer } = resolved.kind else {
             unreachable!("resolve_message_target returns Channel or User");
         };
-        let sender_account = state.sessions[&conn].account.clone();
-        let sender_is_bot = state.sessions[&conn].bot;
-        let (ts, msgid) = state.stamp();
-        deliver_and_echo(
-            state,
-            conn,
-            &[peer],
-            &Delivery {
-                sender_account: sender_account.as_deref(),
-                sender_is_bot,
-                msgid: &msgid,
-                client_tags,
-                body: &line,
-                ts,
-                bypass_capture: true,
-            },
-        );
+        deliver_and_echo(state, conn, &[peer], &delivery);
         // The conversation is recorded once, under a key both participants
         // derive identically, so each side's CHATHISTORY sees the whole thread
         // rather than only the half it sent.
@@ -450,21 +429,7 @@ pub(super) fn deliver_one_message(
             .expect("registered");
         let (conv, peers) =
             state.dm_conversation(&state.conn_identity(conn), &state.conn_identity(peer));
-        record_history(
-            state,
-            &conv,
-            peers,
-            crate::core::state::HistoryEntry {
-                msgid,
-                ts,
-                sender_prefix: prefix.clone(),
-                sender_account,
-                kind,
-                body: text.to_string(),
-                sender_is_bot,
-                multiline: None,
-            },
-        );
+        record_history(state, &conv, peers, entry);
         // Away auto-reply, PRIVMSG only (NOTICE must stay reply-free), and never
         // for a message to yourself — you don't need to be told you're away.
         if loud

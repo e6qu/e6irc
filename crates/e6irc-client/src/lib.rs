@@ -662,7 +662,19 @@ impl Connection {
             bytes.extend_from_slice(password.as_bytes());
             e6irc_proto::base64::encode(&bytes)
         };
-        // Send registration info while CAP is still open, then the credentials.
+        self.register_with_sasl(nick, realname, payload).await
+    }
+
+    /// Send the registration info while CAP is still open, then the
+    /// credentials, and finish to the welcome burst — the shared tail of
+    /// every SASL mechanism (the mechanism is already negotiated and its
+    /// payload built, which is all that differs between them).
+    async fn register_with_sasl(
+        &mut self,
+        nick: &str,
+        realname: &str,
+        payload: String,
+    ) -> io::Result<String> {
         self.send_line(&format!("NICK {nick}")).await?;
         self.send_line(&format!("USER {nick} 0 * :{realname}"))
             .await?;
@@ -685,11 +697,7 @@ impl Connection {
         // RFC 7628 client response: gs2 header, then the bearer credential.
         let payload =
             e6irc_proto::base64::encode(format!("n,,\x01auth=Bearer {token}\x01\x01").as_bytes());
-        self.send_line(&format!("NICK {nick}")).await?;
-        self.send_line(&format!("USER {nick} 0 * :{realname}"))
-            .await?;
-        self.send_line(&format!("AUTHENTICATE {payload}")).await?;
-        self.finish_sasl_then_welcome(nick).await
+        self.register_with_sasl(nick, realname, payload).await
     }
 
     /// Register with a nick and realname, answering PINGs, until the

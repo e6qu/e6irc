@@ -1439,6 +1439,24 @@ mod tests {
         })
     }
 
+    /// Spawn `serve_conn` against a `DeadPeer` with the standard test wiring —
+    /// the channel, connection id, transport, backlog, and telemetry every
+    /// wiring test shares.
+    fn spawn_dead_peer(peer: &str) -> (Receiver<Input>, tokio::task::JoinHandle<()>) {
+        let (core_tx, core_rx) = test_core_channel();
+        let peer: SocketAddr = peer.parse().unwrap();
+        let served = tokio::spawn(serve_conn(
+            DeadPeer,
+            ConnId(1),
+            peer,
+            crate::core::ConnectionTransport::Tcp,
+            core_tx,
+            8,
+            Arc::new(Telemetry::new()),
+        ));
+        (core_rx, served)
+    }
+
     #[tokio::test]
     async fn flush_failure_is_a_connection_write_error() {
         let (tx, rx) = queue(e6irc_queue::Config {
@@ -1458,17 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn core_close_cancels_a_parked_read() {
-        let (core_tx, mut core_rx) = test_core_channel();
-        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let served = tokio::spawn(serve_conn(
-            DeadPeer,
-            ConnId(1),
-            peer,
-            crate::core::ConnectionTransport::Tcp,
-            core_tx,
-            8,
-            Arc::new(Telemetry::new()),
-        ));
+        let (mut core_rx, served) = spawn_dead_peer("127.0.0.1:5000");
 
         // The connection registered its sendq via Open; take that sender.
         let env = core_rx.pop().await.expect("Open event");
@@ -1492,17 +1500,7 @@ mod tests {
         // `Input::Open` carries — the string `ban_match` tests DLINE/KLINE
         // against and WHOIS shows — must be the canonical IPv4, or an operator's
         // `DLINE 203.0.113.7` in natural notation would silently not match.
-        let (core_tx, mut core_rx) = test_core_channel();
-        let peer: SocketAddr = "[::ffff:203.0.113.7]:5000".parse().unwrap();
-        let served = tokio::spawn(serve_conn(
-            DeadPeer,
-            ConnId(1),
-            peer,
-            crate::core::ConnectionTransport::Tcp,
-            core_tx,
-            8,
-            Arc::new(Telemetry::new()),
-        ));
+        let (mut core_rx, served) = spawn_dead_peer("[::ffff:203.0.113.7]:5000");
         let env = core_rx.pop().await.expect("Open event");
         let Input::Open { host, tx, .. } = env.payload else {
             panic!("expected Open");

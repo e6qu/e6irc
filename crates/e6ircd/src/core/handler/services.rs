@@ -446,6 +446,27 @@ fn chanserv_founder_gate(
     channel: &str,
     identify_hint: &str,
 ) -> Option<(ChanKey, String)> {
+    let (key, account) = chanserv_registered_gate(state, conn, channel, identify_hint)?;
+    if !state.is_founder(&key, &account) {
+        state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("You are not the founder of \x02{channel}\x02."),
+        );
+        return None;
+    }
+    Some((key, account))
+}
+
+/// Gate a ChanServ command to an identified user on a registered channel:
+/// reply and return `None` when the caller is unidentified or the channel is
+/// not registered. The privilege-specific gates (founder, access) build on it.
+fn chanserv_registered_gate(
+    state: &mut ServerState,
+    conn: ConnId,
+    channel: &str,
+    identify_hint: &str,
+) -> Option<(ChanKey, String)> {
     let Some(account) = state.sessions[&conn].account.clone() else {
         state.service_notice(conn, "ChanServ", identify_hint);
         return None;
@@ -456,14 +477,6 @@ fn chanserv_founder_gate(
             conn,
             "ChanServ",
             &format!("\x02{channel}\x02 is not registered."),
-        );
-        return None;
-    }
-    if !state.is_founder(&key, &account) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("You are not the founder of \x02{channel}\x02."),
         );
         return None;
     }
@@ -568,23 +581,14 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
         state.service_notice(conn, "ChanServ", "Syntax: OP <#channel> [nick]");
         return;
     };
-    let Some(account) = state.sessions[&conn].account.clone() else {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            "You must identify to services before using OP.",
-        );
+    let Some((key, account)) = chanserv_registered_gate(
+        state,
+        conn,
+        channel,
+        "You must identify to services before using OP.",
+    ) else {
         return;
     };
-    let key = state.chan_key(channel);
-    if !state.is_registered(&key) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{channel}\x02 is not registered."),
-        );
-        return;
-    }
     if !(state.is_founder(&key, &account) || state.access_modes(&key, &account).0) {
         state.service_notice(
             conn,
