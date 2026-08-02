@@ -762,12 +762,12 @@ pub(super) async fn admin_delete_oidc_provider(
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    delete_managed_configuration_item(
+    delete_managed_configuration_item_api(
         state,
         actor,
         name,
         body,
-        NamedConfigurationItem {
+        ManagedConfigurationItem {
             credential_kind: "identity-provider",
             item_kind: "identity provider",
             items: |settings| &mut settings.oidc_providers,
@@ -819,12 +819,12 @@ pub(super) async fn admin_delete_oper(
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    delete_managed_configuration_item(
+    delete_managed_configuration_item_api(
         state,
         actor,
         name,
         body,
-        NamedConfigurationItem {
+        ManagedConfigurationItem {
             credential_kind: "operator",
             item_kind: "IRC operator",
             items: |settings| &mut settings.opers,
@@ -834,33 +834,19 @@ pub(super) async fn admin_delete_oper(
     .await
 }
 
-struct NamedConfigurationItem<T> {
-    credential_kind: &'static str,
-    item_kind: &'static str,
-    items: fn(&mut crate::config::ManagedConfig) -> &mut Vec<T>,
-    item_name: fn(&T) -> &str,
-}
-
-async fn delete_managed_configuration_item<T>(
+async fn delete_managed_configuration_item_api<T>(
     state: Arc<AppState>,
     actor: String,
     name: String,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
-    item: NamedConfigurationItem<T>,
+    item: ManagedConfigurationItem<T>,
 ) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
         Err(response) => return response,
     };
     mutate_managed_configuration(&state, &actor, body.revision, |settings| {
-        reject_bootstrap_credential_change(settings, item.credential_kind)?;
-        remove_named(
-            (item.items)(settings),
-            &name,
-            item.item_kind,
-            item.item_name,
-        )?;
-        Ok(format!("removed {} {name}", item.item_kind))
+        delete_managed_configuration_item(settings, &name, item)
     })
     .await
 }

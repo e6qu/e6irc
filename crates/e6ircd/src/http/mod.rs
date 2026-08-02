@@ -1512,6 +1512,23 @@ fn add_managed_oidc_provider(
     Ok(format!("added OpenID Connect provider {name}"))
 }
 
+struct ManagedConfigurationItem<T> {
+    credential_kind: &'static str,
+    item_kind: &'static str,
+    items: fn(&mut crate::config::ManagedConfig) -> &mut Vec<T>,
+    item_name: fn(&T) -> &str,
+}
+
+fn delete_managed_configuration_item<T>(
+    settings: &mut crate::config::ManagedConfig,
+    name: &str,
+    item: ManagedConfigurationItem<T>,
+) -> Result<String, String> {
+    reject_bootstrap_credential_change(settings, item.credential_kind)?;
+    remove_named((item.items)(settings), name, item.item_kind, item.item_name)?;
+    Ok(format!("removed {} {name}", item.item_kind))
+}
+
 /// Server-rendered HTML pages (askama). Complements the Vite chat client with
 /// authentication, self-service, and operational management surfaces.
 mod pages {
@@ -5676,11 +5693,16 @@ mod pages {
         }: AdminConfigPayload<DeleteConfigItem>,
     ) -> Response {
         mutate_managed_config(&state, account, csrf, move |settings| {
-            reject_bootstrap_credential_change(settings, "operator")?;
-            remove_named(&mut settings.opers, &form.name, "IRC operator", |oper| {
-                &oper.name
-            })?;
-            Ok(format!("removed IRC operator {}", form.name))
+            delete_managed_configuration_item(
+                settings,
+                &form.name,
+                ManagedConfigurationItem {
+                    credential_kind: "operator",
+                    item_kind: "IRC operator",
+                    items: |settings| &mut settings.opers,
+                    item_name: |oper| &oper.name,
+                },
+            )
         })
         .await
     }
@@ -5746,14 +5768,16 @@ mod pages {
         }: AdminConfigPayload<DeleteConfigItem>,
     ) -> Response {
         mutate_managed_config(&state, account, csrf, move |settings| {
-            reject_bootstrap_credential_change(settings, "identity-provider")?;
-            remove_named(
-                &mut settings.oidc_providers,
+            delete_managed_configuration_item(
+                settings,
                 &form.name,
-                "identity provider",
-                |provider| &provider.name,
-            )?;
-            Ok(format!("removed OpenID Connect provider {}", form.name))
+                ManagedConfigurationItem {
+                    credential_kind: "identity-provider",
+                    item_kind: "identity provider",
+                    items: |settings| &mut settings.oidc_providers,
+                    item_name: |provider| &provider.name,
+                },
+            )
         })
         .await
     }
