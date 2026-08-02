@@ -865,13 +865,16 @@ pub(crate) fn channel_drop_result(
                 crate::core::ChannelDropResult::Dropped => {
                     crate::core::AdminReply::Ok(format!("Unregistered {}", key.as_str()))
                 }
-                crate::core::ChannelDropResult::Missing => crate::core::AdminReply::Err(format!(
-                    "{} is no longer a registered channel",
-                    key.as_str()
-                )),
-                crate::core::ChannelDropResult::Unavailable => crate::core::AdminReply::Err(
-                    "persistence unavailable; channel not dropped".into(),
-                ),
+                crate::core::ChannelDropResult::Missing => crate::core::AdminReply::ChannelErr {
+                    kind: crate::core::ChannelControlError::NotFound,
+                    message: format!("{} is no longer a registered channel", key.as_str()),
+                },
+                crate::core::ChannelDropResult::Unavailable => {
+                    crate::core::AdminReply::ChannelErr {
+                        kind: crate::core::ChannelControlError::Unavailable,
+                        message: "persistence unavailable; channel not dropped".into(),
+                    }
+                }
             };
             match state.pending_admin_channel_drops.remove(&request_id) {
                 Some(reply) => {

@@ -711,21 +711,23 @@ fn begin_drop_channel(
     reply: tokio::sync::oneshot::Sender<AdminReply>,
 ) {
     let Some(key) = state.chan_key_if_channel(channel_in) else {
-        let _ = reply.send(AdminReply::Err(format!(
-            "'{channel_in}' is not a channel name"
-        )));
+        let _ = reply.send(channel_error(
+            crate::core::ChannelControlError::Invalid,
+            format!("'{channel_in}' is not a channel name"),
+        ));
         return;
     };
     if !state.registered_founders.contains_key(&key) {
-        let _ = reply.send(AdminReply::Err(format!(
-            "{} is not a registered channel",
-            key.as_str()
-        )));
+        let _ = reply.send(channel_error(
+            crate::core::ChannelControlError::NotFound,
+            format!("{} is not a registered channel", key.as_str()),
+        ));
         return;
     }
     let Some(request_id) = state.admin_channel_drop_id.checked_add(1) else {
-        let _ = reply.send(AdminReply::Err(
-            "persistence unavailable; admin request ID space exhausted".into(),
+        let _ = reply.send(channel_error(
+            crate::core::ChannelControlError::Unavailable,
+            "persistence unavailable; admin request ID space exhausted",
         ));
         return;
     };
@@ -734,8 +736,9 @@ fn begin_drop_channel(
         requester: crate::core::ChannelDropRequester::Admin { request_id, actor },
     };
     if state.db_tx.try_push(request).is_err() {
-        let _ = reply.send(AdminReply::Err(
-            "persistence unavailable; channel not dropped".into(),
+        let _ = reply.send(channel_error(
+            crate::core::ChannelControlError::Unavailable,
+            "persistence unavailable; channel not dropped",
         ));
         return;
     }

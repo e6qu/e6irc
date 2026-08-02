@@ -137,6 +137,35 @@ pub(super) async fn delete_owned_channel(
     mutate_response(&state, name, account, crate::core::ChannelMutation::Drop).await
 }
 
+/// Unregister a channel through the administrator control plane. This remains
+/// core-owned so the durable deletion, live registration state, and audit
+/// outcome commit in the same ordered transition as the IRC services command.
+pub(super) async fn delete_admin_channel(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    Path(name): Path<String>,
+) -> Response {
+    match core_reply(
+        &state,
+        crate::core::AdminRequest::DropChannel {
+            channel: name,
+            actor,
+        },
+    )
+    .await
+    {
+        Ok(crate::core::AdminReply::Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::core::AdminReply::ChannelErr { kind, message }) => {
+            channel_error_response(kind, message, "No such registered channel")
+        }
+        Ok(_) | Err(_) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Channel control unavailable",
+            None,
+        ),
+    }
+}
+
 pub(super) async fn put_channel_access(
     State(state): State<Arc<AppState>>,
     Authenticated(owner): Authenticated,
@@ -197,22 +226,7 @@ async fn control_response(
         )
             .into_response(),
         Ok(crate::core::AdminReply::ChannelErr { kind, message }) => {
-            let (status, title) = match kind {
-                crate::core::ChannelControlError::Invalid => {
-                    (StatusCode::BAD_REQUEST, "Invalid channel change")
-                }
-                crate::core::ChannelControlError::NotFound => {
-                    (StatusCode::NOT_FOUND, "No such owned channel")
-                }
-                crate::core::ChannelControlError::Conflict => {
-                    (StatusCode::CONFLICT, "Channel change conflict")
-                }
-                crate::core::ChannelControlError::Unavailable => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Channel control unavailable",
-                ),
-            };
-            problem(status, title, Some(&message))
+            channel_error_response(kind, message, "No such owned channel")
         }
         Ok(crate::core::AdminReply::Err(message)) => problem(
             StatusCode::CONFLICT,
@@ -232,4 +246,25 @@ async fn control_response(
             Some(&message),
         ),
     }
+}
+
+fn channel_error_response(
+    kind: crate::core::ChannelControlError,
+    message: String,
+    not_found_title: &'static str,
+) -> Response {
+    let (status, title) = match kind {
+        crate::core::ChannelControlError::Invalid => {
+            (StatusCode::BAD_REQUEST, "Invalid channel change")
+        }
+        crate::core::ChannelControlError::NotFound => (StatusCode::NOT_FOUND, not_found_title),
+        crate::core::ChannelControlError::Conflict => {
+            (StatusCode::CONFLICT, "Channel change conflict")
+        }
+        crate::core::ChannelControlError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Channel control unavailable",
+        ),
+    };
+    problem(status, title, Some(&message))
 }

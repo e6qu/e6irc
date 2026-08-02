@@ -48,7 +48,7 @@ operation's semantics.
 | `/console/channels/access/delete` | `DELETE /api/v1/me/channels/{name}/access/{account}` | Mapped | Refresh from committed access state. |
 | `/console/channels/founder` | `PATCH /api/v1/me/channels/{name}` | Mapped | Preserve irreversible founder-transfer confirmation. |
 | `/console/channels/drop` | `DELETE /api/v1/me/channels/{name}` | Mapped | Preserve explicit destructive confirmation. |
-| `/console/admin/channels/drop` | `DELETE /api/v1/admin/channels/{name}` | Gap | Add an administrator-scoped audited unregister resource. |
+| `/console/admin/channels/drop` | `DELETE /api/v1/admin/channels/{name}` | Mapped | Use the administrator-scoped audited unregister resource. |
 
 ## Owner networks and bridges
 
