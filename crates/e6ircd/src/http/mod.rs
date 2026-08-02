@@ -1463,6 +1463,55 @@ mod web {
     }
 }
 
+/// Reject a credential mutation while the config still holds bootstrap-sealed
+/// credentials. A master key and restart are required before changing them.
+fn reject_bootstrap_credential_change(
+    settings: &crate::config::ManagedConfig,
+    credential_kind: &str,
+) -> Result<(), String> {
+    (!settings.credentials_from_bootstrap)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "Configure a master key and restart before changing bootstrap {credential_kind} credentials."
+            )
+        })
+}
+
+/// Remove one named managed-configuration item, reporting a missing name.
+fn remove_named<T>(
+    items: &mut Vec<T>,
+    name: &str,
+    item_kind: &str,
+    item_name: impl Fn(&T) -> &str,
+) -> Result<(), String> {
+    let before = items.len();
+    items.retain(|item| item_name(item) != name);
+    (items.len() != before)
+        .then_some(())
+        .ok_or_else(|| format!("No {item_kind} named '{name}'."))
+}
+
+fn add_managed_oper(
+    settings: &mut crate::config::ManagedConfig,
+    oper: crate::config::OperConfig,
+) -> Result<String, String> {
+    reject_bootstrap_credential_change(settings, "operator")?;
+    let name = oper.name.clone();
+    settings.opers.push(oper);
+    Ok(format!("added IRC operator {name}"))
+}
+
+fn add_managed_oidc_provider(
+    settings: &mut crate::config::ManagedConfig,
+    provider: crate::config::OidcProviderConfig,
+) -> Result<String, String> {
+    reject_bootstrap_credential_change(settings, "identity-provider")?;
+    let name = provider.name.clone();
+    settings.oidc_providers.push(provider);
+    Ok(format!("added OpenID Connect provider {name}"))
+}
+
 /// Server-rendered HTML pages (askama). Complements the Vite chat client with
 /// authentication, self-service, and operational management surfaces.
 mod pages {
@@ -5607,47 +5656,15 @@ mod pages {
             if name.is_empty() || form.password.is_empty() {
                 return Err("Operator name and password are required.".into());
             }
-            settings.opers.push(crate::config::OperConfig {
-                name: name.to_string(),
-                password: key.seal(&form.password, crate::secret::CONFIG_CONTEXT),
-            });
-            Ok(format!("added IRC operator {name}"))
+            add_managed_oper(
+                settings,
+                crate::config::OperConfig {
+                    name: name.to_string(),
+                    password: key.seal(&form.password, crate::secret::CONFIG_CONTEXT),
+                },
+            )
         })
         .await
-    }
-
-    /// Reject a credential mutation while the config still holds
-    /// bootstrap-sealed credentials — the master key must be configured and
-    /// the server restarted first, so a console edit cannot silently strand
-    /// the bootstrap operator/provider secrets. `what` names the credential
-    /// family ("operator", "identity-provider").
-    fn reject_bootstrap_credential_change(
-        settings: &crate::config::ManagedConfig,
-        what: &str,
-    ) -> Result<(), String> {
-        if settings.credentials_from_bootstrap {
-            return Err(format!(
-                "Configure a master key and restart before changing bootstrap {what} credentials."
-            ));
-        }
-        Ok(())
-    }
-
-    /// Remove the item named `name` from a managed-config list, or report it
-    /// missing. `kind` names the list for the error ("IRC operator",
-    /// "identity provider").
-    fn remove_named<T>(
-        items: &mut Vec<T>,
-        name: &str,
-        kind: &str,
-        item_name: impl Fn(&T) -> &str,
-    ) -> Result<(), String> {
-        let before = items.len();
-        items.retain(|item| item_name(item) != name);
-        if items.len() == before {
-            return Err(format!("No {kind} named '{name}'."));
-        }
-        Ok(())
     }
 
     pub async fn console_delete_oper(
@@ -5688,7 +5705,6 @@ mod pages {
                 "client_secret_post" => crate::config::TokenEndpointAuthMethod::ClientSecretPost,
                 _ => return Err("Unknown token endpoint authentication method.".into()),
             };
-            let name = form.name.trim().to_string();
             let allowed_email_domains = form
                 .allowed_email_domains
                 .split([',', ' ', '\n'])
@@ -5697,10 +5713,10 @@ mod pages {
                 .map(crate::identity::EmailDomain::parse)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?;
-            settings
-                .oidc_providers
-                .push(crate::config::OidcProviderConfig {
-                    name: name.clone(),
+            add_managed_oidc_provider(
+                settings,
+                crate::config::OidcProviderConfig {
+                    name: form.name.trim().to_string(),
                     issuer_url: form.issuer_url.trim().to_string(),
                     client_id: form.client_id.trim().to_string(),
                     client_secret: key.seal(&form.client_secret, crate::secret::CONFIG_CONTEXT),
@@ -5715,8 +5731,8 @@ mod pages {
                     end_session_endpoint: (!form.end_session_endpoint.trim().is_empty())
                         .then(|| form.end_session_endpoint.trim().to_string()),
                     token_endpoint_auth_method: method,
-                });
-            Ok(format!("added OpenID Connect provider {name}"))
+                },
+            )
         })
         .await
     }

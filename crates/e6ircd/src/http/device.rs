@@ -739,10 +739,21 @@ pub(super) async fn admin_create_oidc_provider(
         .end_session_endpoint
         .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
     mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
-        if settings.credentials_from_bootstrap { return Err("Configure a master key and restart before changing bootstrap identity-provider credentials.".into()); }
-        settings.oidc_providers.push(crate::config::OidcProviderConfig { name: name.clone(), issuer_url, client_id, client_secret: key.seal(&body.client_secret, crate::secret::CONFIG_CONTEXT), scopes, allowed_email_domains: domains, end_session_endpoint, token_endpoint_auth_method: body.token_endpoint_auth_method });
-        Ok(format!("added OpenID Connect provider {name}"))
-    }).await
+        add_managed_oidc_provider(
+            settings,
+            crate::config::OidcProviderConfig {
+                name,
+                issuer_url,
+                client_id,
+                client_secret: key.seal(&body.client_secret, crate::secret::CONFIG_CONTEXT),
+                scopes,
+                allowed_email_domains: domains,
+                end_session_endpoint,
+                token_endpoint_auth_method: body.token_endpoint_auth_method,
+            },
+        )
+    })
+    .await
 }
 
 pub(super) async fn admin_delete_oidc_provider(
@@ -751,17 +762,19 @@ pub(super) async fn admin_delete_oidc_provider(
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    mutate_managed_configuration(&state, &actor, body.revision, |settings| {
-        if settings.credentials_from_bootstrap { return Err("Configure a master key and restart before changing bootstrap identity-provider credentials.".into()); }
-        let before = settings.oidc_providers.len();
-        settings.oidc_providers.retain(|provider| provider.name != name);
-        if settings.oidc_providers.len() == before { return Err(format!("No identity provider named '{name}'.")); }
-        Ok(format!("removed OpenID Connect provider {name}"))
-    }).await
+    delete_managed_configuration_item(
+        state,
+        actor,
+        name,
+        body,
+        NamedConfigurationItem {
+            credential_kind: "identity-provider",
+            item_kind: "identity provider",
+            items: |settings| &mut settings.oidc_providers,
+            item_name: |provider| &provider.name,
+        },
+    )
+    .await
 }
 
 pub(super) async fn admin_create_oper(
@@ -789,12 +802,15 @@ pub(super) async fn admin_create_oper(
         );
     }
     mutate_managed_configuration(&state, &actor, body.revision, |settings| {
-        if settings.credentials_from_bootstrap {
-            return Err("Configure a master key and restart before changing bootstrap operator credentials.".into());
-        }
-        settings.opers.push(crate::config::OperConfig { name: name.to_string(), password: key.seal(&body.password, crate::secret::CONFIG_CONTEXT) });
-        Ok(format!("added IRC operator {name}"))
-    }).await
+        add_managed_oper(
+            settings,
+            crate::config::OperConfig {
+                name: name.to_string(),
+                password: key.seal(&body.password, crate::secret::CONFIG_CONTEXT),
+            },
+        )
+    })
+    .await
 }
 
 pub(super) async fn admin_delete_oper(
@@ -803,19 +819,50 @@ pub(super) async fn admin_delete_oper(
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    delete_managed_configuration_item(
+        state,
+        actor,
+        name,
+        body,
+        NamedConfigurationItem {
+            credential_kind: "operator",
+            item_kind: "IRC operator",
+            items: |settings| &mut settings.opers,
+            item_name: |oper| &oper.name,
+        },
+    )
+    .await
+}
+
+struct NamedConfigurationItem<T> {
+    credential_kind: &'static str,
+    item_kind: &'static str,
+    items: fn(&mut crate::config::ManagedConfig) -> &mut Vec<T>,
+    item_name: fn(&T) -> &str,
+}
+
+async fn delete_managed_configuration_item<T>(
+    state: Arc<AppState>,
+    actor: String,
+    name: String,
+    body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
+    item: NamedConfigurationItem<T>,
+) -> Response {
     let body = match parse_json(body) {
         Ok(body) => body,
         Err(response) => return response,
     };
     mutate_managed_configuration(&state, &actor, body.revision, |settings| {
-        if settings.credentials_from_bootstrap {
-            return Err("Configure a master key and restart before changing bootstrap operator credentials.".into());
-        }
-        let before = settings.opers.len();
-        settings.opers.retain(|oper| oper.name != name);
-        if settings.opers.len() == before { return Err(format!("No IRC operator named '{name}'.")); }
-        Ok(format!("removed IRC operator {name}"))
-    }).await
+        reject_bootstrap_credential_change(settings, item.credential_kind)?;
+        remove_named(
+            (item.items)(settings),
+            &name,
+            item.item_kind,
+            item.item_name,
+        )?;
+        Ok(format!("removed {} {name}", item.item_kind))
+    })
+    .await
 }
 
 async fn mutate_managed_configuration(
