@@ -4,7 +4,7 @@
     <div>
       <p class="eyebrow">Self-service security</p>
       <h1>Account &amp; access</h1>
-      <p class="lede">Manage the credentials, API access, and login identities attached to <strong>{{ account }}</strong>. Secrets are displayed once and stored only as hashes.</p>
+      <p class="lede">Manage the credentials, API access, and login identities attached to <strong>{{ shell.account }}</strong>. Secrets are displayed once and stored only as hashes.</p>
     </div>
     <a class="button-link" href="/api/v1/me/export">Download my data</a>
   </div>
@@ -36,7 +36,7 @@
       <span class="tag">Private</span>
     </div>
     <form class="inline-create" method="post" action="/console/account/profile">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Email address</span>
         <input type="email" name="contact_email" maxlength="254" value="{{ contact_email }}" placeholder="alice@example.com" />
@@ -55,7 +55,7 @@
       <span class="tag">Argon2id</span>
     </div>
     <form class="field-grid" method="post" action="/console/account/password">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       {% if has_local_password %}
         <label class="field">
           <span>Current password</span>
@@ -86,7 +86,7 @@
         <span class="count">{{ credentials.len() }}</span>
       </div>
       <form class="inline-create" method="post" action="/console/account/app-passwords">
-        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
         <label class="field">
           <span>Label</span>
           <input name="label" maxlength="64" placeholder="Laptop IRC client" required />
@@ -110,7 +110,7 @@
                   <td>
                     {% if credential.revocable %}
                       <form class="cell-form" method="post" action="/console/account/app-passwords/{{ credential.id }}/delete" data-confirm="Revoke this app password?">
-                        <input type="hidden" name="csrf" value="{{ csrf }}" />
+                        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                         <button class="danger" type="submit">Revoke</button>
                       </form>
                     {% else %}
@@ -123,7 +123,7 @@
           </table>
         </div>
       {% endif %}
-      <p class="section-note">For a BNC network, authenticate as <code>{{ account }}/&lt;network&gt;</code> with one of these app passwords.</p>
+      <p class="section-note">For a BNC network, authenticate as <code>{{ shell.account }}/&lt;network&gt;</code> with one of these app passwords.</p>
     </section>
 
     <section class="panel">
@@ -135,7 +135,7 @@
         <span class="count">{{ tokens.len() }}</span>
       </div>
       <form class="inline-create" method="post" action="/console/account/tokens">
-        <input type="hidden" name="csrf" value="{{ csrf }}" />
+        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
         <label class="field">
           <span>Label</span>
           <input name="label" maxlength="64" placeholder="Monitoring automation" required />
@@ -154,7 +154,7 @@
           <label><input type="checkbox" name="scope_read" checked /> Read</label>
           <label><input type="checkbox" name="scope_write" checked /> Write</label>
           <label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>
-          {% if is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}
+          {% if shell.is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}
         </fieldset>
         <button class="primary" type="submit">Create token</button>
       </form>
@@ -174,7 +174,7 @@
                   <td>{{ token.expires }}</td>
                   <td>
                     <form class="cell-form" method="post" action="/console/account/tokens/{{ token.id }}/delete" data-confirm="Revoke this personal access token?">
-                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <button class="danger" type="submit">Revoke</button>
                     </form>
                   </td>
@@ -217,7 +217,7 @@
             </div>
             {% if identities.len() > 1 || has_local_password %}
               <form method="post" action="/console/account/identities/{{ identity.id }}/delete" data-confirm="Unlink this identity and revoke its browser sessions?">
-                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <button class="danger" type="submit">Unlink</button>
               </form>
             {% else %}
@@ -289,10 +289,10 @@
       </div>
     </div>
     <form class="field-grid" method="post" action="/console/account/delete"
-          data-confirm="Permanently delete {{ account }} and all account-owned data? This cannot be undone.">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+          data-confirm="Permanently delete {{ shell.account }} and all account-owned data? This cannot be undone.">
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field field-wide">
-        <span>Type <code>{{ account }}</code> to confirm</span>
+        <span>Type <code>{{ shell.account }}</code> to confirm</span>
         <input name="confirmation" autocomplete="off" required />
       </label>
       <div class="form-actions field-wide">

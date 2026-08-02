@@ -80,7 +80,7 @@
                 <td>
                   <form class="cell-form" method="post" action="/console/admin/channels/drop"
                         data-confirm="Unregister {{ entry.name }} and delete its retained policy?">
-                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                     <input type="hidden" name="channel" value="{{ entry.name }}" />
                     <button class="danger" type="submit">Unregister</button>
                   </form>

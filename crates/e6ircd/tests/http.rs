@@ -6431,11 +6431,10 @@ async fn rp_initiated_logout_redirects_to_provider() {
 #[cfg(feature = "embed-web")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn application_entry_is_fail_closed_and_starts_provider_authorization() {
+async fn application_entry_redirects_anonymous_visitors_to_the_login_page() {
     use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
     let url =
-        support::test_db("application_entry_is_fail_closed_and_starts_provider_authorization")
-            .await;
+        support::test_db("application_entry_redirects_anonymous_visitors_to_the_login_page").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -6482,10 +6481,14 @@ async fn application_entry_is_fail_closed_and_starts_provider_authorization() {
         .expect("http");
 
     let (status, headers, _) = request(http, &get("/")).await;
-    assert_eq!(status, 307, "{headers}");
+    assert_eq!(status, 303, "{headers}");
+    assert!(headers.contains("location: /login") || headers.contains("Location: /login"));
+
+    let (status, _, body) = request(http, &get("/login")).await;
+    assert_eq!(status, 200, "{body}");
     assert!(
-        headers.contains("/api/v1/auth/oidc/shauth/start"),
-        "{headers}"
+        body.contains("href=\"/api/v1/auth/oidc/shauth/start\""),
+        "{body}"
     );
 
     let (status, headers, _) = request(http, &get("/?sso=none")).await;

@@ -1389,11 +1389,6 @@ pub fn ws_irc_router(state: Arc<AppState>) -> Router {
 mod web {
     use super::*;
 
-    #[derive(Default, Deserialize)]
-    pub struct EntryQuery {
-        sso: Option<String>,
-    }
-
     #[derive(rust_embed::Embed)]
     #[folder = "../../web/dist"]
     struct Dist;
@@ -1435,26 +1430,18 @@ mod web {
     }
 
     /// The application entry point is an authentication boundary, not a
-    /// public static file. An existing local session renders the client. A
-    /// browser is sent through the provider's ordinary OpenID Connect
-    /// authorization request. An existing provider session completes without
-    /// prompting; otherwise the provider owns the credential prompt.
+    /// public static file. An existing local session renders the client. An
+    /// anonymous browser is sent to `/login`, which renders the provider
+    /// sign-in links a validator (and a human) can discover and click —
+    /// auto-redirecting to the single provider's `/start` skips that page
+    /// and is undetectable by SSO validators (#191).
     pub async fn index(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        Query(query): Query<EntryQuery>,
     ) -> Response {
         match authenticate(&state, &headers).await {
             Ok(_) => serve("index.html"),
             Err(response) if response.status() != StatusCode::UNAUTHORIZED => response,
-            Err(_) if query.sso.as_deref() == Some("none") => {
-                Redirect::to("/login").into_response()
-            }
-            Err(_) if state.oidc_providers.len() == 1 => Redirect::temporary(&format!(
-                "/api/v1/auth/oidc/{}/start",
-                state.oidc_providers[0].name
-            ))
-            .into_response(),
             Err(_) => Redirect::to("/login").into_response(),
         }
     }
@@ -1490,6 +1477,29 @@ mod pages {
         /// provider anything other than `shauth` would otherwise be offered a
         /// link to a starter that does not exist.
         sole_provider: Option<String>,
+    }
+
+    /// Shared context inherited by every console template.
+    #[derive(Clone)]
+    struct ConsoleShell {
+        account: String,
+        csrf: String,
+        is_admin: bool,
+        active: &'static str,
+    }
+
+    fn console_shell(
+        state: &AppState,
+        account: String,
+        csrf: String,
+        active: &'static str,
+    ) -> ConsoleShell {
+        ConsoleShell {
+            is_admin: is_admin_account(state, &account),
+            account,
+            csrf,
+            active,
+        }
     }
 
     #[derive(Template)]
@@ -2293,10 +2303,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_account.html")]
     struct ConsoleAccount {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         credentials: Vec<CredentialView>,
         has_local_password: bool,
         tokens: Vec<ApiTokenView>,
@@ -2387,17 +2394,13 @@ mod pages {
         .into_iter()
         .map(AuditRow::from)
         .collect();
-        let is_admin = is_admin_account(state, &account);
         let link_providers = state
             .oidc_providers
             .iter()
             .map(|provider| provider.name.clone())
             .collect();
         Ok(ConsoleAccount {
-            account,
-            csrf,
-            is_admin,
-            active: "account",
+            shell: console_shell(state, account, csrf, "account"),
             credentials,
             has_local_password,
             tokens,
@@ -3191,10 +3194,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_channels.html")]
     struct ConsoleChannels {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         channels: Vec<OwnedChannelView>,
         error: Option<String>,
     }
@@ -3231,10 +3231,7 @@ mod pages {
             })
             .collect();
         Ok(ConsoleChannels {
-            is_admin: is_admin_account(state, &account),
-            account,
-            csrf,
-            active: "channels",
+            shell: console_shell(state, account, csrf, "channels"),
             channels,
             error,
         })
@@ -3523,10 +3520,7 @@ mod pages {
     #[template(path = "console.html")]
     struct Console {
         // Shared console-shell fields (see `console_base.html`).
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         server_name: String,
         network_name: String,
         version: String,
@@ -3546,10 +3540,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_accounts.html")]
     struct ConsoleAccounts {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         entries: Vec<crate::db::AccountDirectoryRow>,
         invitations: Vec<crate::db::AccountInvitationRow>,
         invitation_before_id: Option<i64>,
@@ -3567,10 +3558,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_admin_channels.html")]
     struct ConsoleAdminChannels {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         entries: Vec<crate::db::RegisteredChannelDirectoryRow>,
         name: String,
         founder: String,
@@ -3600,20 +3588,14 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_admin_networks.html")]
     struct ConsoleAdminNetworks {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         networks: Vec<ConsoleAdminNetworkView>,
     }
 
     #[derive(Template)]
     #[template(path = "console_bans.html")]
     struct ConsoleServerBans {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         entries: Vec<crate::db::ServerBanDirectoryRow>,
         kind: String,
         mask: String,
@@ -3627,10 +3609,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_audit.html")]
     struct ConsoleAudit {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         entries: Vec<AuditRow>,
         actor: String,
         action: String,
@@ -3702,10 +3681,7 @@ mod pages {
         let (networks, connected) = bnc_counts(state);
         let live = state.telemetry.snapshot(networks, connected);
         Ok(Console {
-            account,
-            csrf,
-            is_admin: true,
-            active: "overview",
+            shell: console_shell(state, account, csrf, "overview"),
             server_name: state.server_name.clone(),
             network_name: state.network_name.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3894,10 +3870,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_monitoring.html")]
     struct ConsoleMonitoring {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         view: MonitoringView,
     }
 
@@ -4296,10 +4269,7 @@ mod pages {
         };
         let view = monitoring_view(&state, window).await;
         render_private(ConsoleMonitoring {
-            account,
-            csrf,
-            is_admin: true,
-            active: "monitoring",
+            shell: console_shell(&state, account, csrf, "monitoring"),
             view,
         })
     }
@@ -4369,10 +4339,7 @@ mod pages {
                 )
             });
         render_private(ConsoleAccounts {
-            account,
-            csrf,
-            is_admin: true,
-            active: "accounts",
+            shell: console_shell(state, account, csrf, "accounts"),
             entries: page.entries,
             invitations: invitation_page.entries,
             invitation_before_id,
@@ -4676,10 +4643,7 @@ mod pages {
         let name = query.name.unwrap_or_default();
         let founder = query.founder.unwrap_or_default();
         Ok(ConsoleAdminChannels {
-            account,
-            csrf,
-            is_admin: true,
-            active: "admin-channels",
+            shell: console_shell(state, account, csrf, "admin-channels"),
             entries: page.entries,
             has_filters: !name.is_empty() || !founder.is_empty(),
             has_cursor: query.before_id.is_some(),
@@ -4757,10 +4721,7 @@ mod pages {
             })
             .collect();
         render_private(ConsoleAdminNetworks {
-            account,
-            csrf,
-            is_admin: true,
-            active: "admin-networks",
+            shell: console_shell(&state, account, csrf, "admin-networks"),
             networks,
         })
     }
@@ -4805,10 +4766,7 @@ mod pages {
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
         Ok(ConsoleServerBans {
-            account,
-            csrf,
-            is_admin: true,
-            active: "bans",
+            shell: console_shell(state, account, csrf, "bans"),
             entries: page.entries,
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
@@ -4866,10 +4824,7 @@ mod pages {
         let target = query.target.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
         render_private(ConsoleAudit {
-            account,
-            csrf,
-            is_admin: true,
-            active: "audit",
+            shell: console_shell(&state, account, csrf, "audit"),
             entries,
             has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
             has_cursor,
@@ -4912,10 +4867,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_configuration.html")]
     struct ConsoleConfiguration {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         revision: i64,
         settings: crate::config::ManagedConfig,
         updated_by: String,
@@ -5243,10 +5195,7 @@ mod pages {
             })
             .collect();
         render_private(ConsoleConfiguration {
-            account,
-            csrf,
-            is_admin: true,
-            active: "configuration",
+            shell: console_shell(state, account, csrf, "configuration"),
             revision: snapshot.revision,
             updated_by: snapshot.updated_by,
             updated_at: snapshot.updated_at,
@@ -5927,10 +5876,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_sessions.html")]
     struct ConsoleSessions {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         title: &'static str,
         hint: &'static str,
         disconnect_action: &'static str,
@@ -5960,10 +5906,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_networks.html")]
     struct ConsoleNetworks {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         networks: Vec<ConsoleNetView>,
         attach_addr: Option<std::net::SocketAddr>,
         presets: &'static [IrcNetworkPreset],
@@ -5986,10 +5929,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_network_edit.html")]
     struct ConsoleNetworkEdit {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         name: String,
         addr: String,
         tls: bool,
@@ -6004,10 +5944,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_bridge_edit.html")]
     struct ConsoleBridgeEdit {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         name: String,
         platform: &'static str,
         needs_nick: bool,
@@ -6053,10 +5990,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_network_detail.html")]
     struct ConsoleNetworkDetail {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         name: String,
         kind: &'static str,
         addr: String,
@@ -6350,10 +6284,7 @@ mod pages {
             };
         let is_admin = is_admin_account(&state, &account);
         render_private(ConsoleNetworkDetail {
-            account: account.clone(),
-            csrf,
-            is_admin,
-            active: "networks",
+            shell: console_shell(&state, account.clone(), csrf, "networks"),
             name: network.name,
             kind: network.kind.as_db_str(),
             addr: network.addr,
@@ -6395,7 +6326,6 @@ mod pages {
         error: Option<FormFieldError>,
         success: Option<NetworkPreflightView>,
     ) -> Response {
-        let is_admin = is_admin_account(state, &account);
         let networks = match console_network_views(state, &account).await {
             Ok(n) => n,
             Err(r) => return r,
@@ -6405,10 +6335,7 @@ mod pages {
             None => None,
         };
         render_private(ConsoleNetworks {
-            account,
-            csrf,
-            is_admin,
-            active: "networks",
+            shell: console_shell(state, account, csrf, "networks"),
             networks,
             attach_addr,
             presets: IRC_NETWORK_PRESETS,
@@ -6663,12 +6590,8 @@ mod pages {
         can_store_secrets: bool,
         error: Option<String>,
     ) -> Response {
-        let is_admin = is_admin_account(state, &account); // shell nav only
         render_private(ConsoleNetworkEdit {
-            account,
-            csrf,
-            is_admin,
-            active: "networks",
+            shell: console_shell(state, account, csrf, "networks"),
             name,
             addr,
             tls,
@@ -6872,10 +6795,7 @@ mod pages {
     #[derive(Template)]
     #[template(path = "console_integrations.html")]
     struct ConsoleIntegrations {
-        account: String,
-        csrf: String,
-        is_admin: bool,
-        active: &'static str,
+        shell: ConsoleShell,
         bouncer_enabled: bool,
         platforms: Vec<BridgePlatform>,
         /// Error banner shown after a failed add/remove; `None` on the plain GET.
@@ -6952,10 +6872,7 @@ mod pages {
             })
             .collect();
         Ok(ConsoleIntegrations {
-            account,
-            csrf,
-            is_admin: true,
-            active: "integrations",
+            shell: console_shell(state, account, csrf, "integrations"),
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
             error,
@@ -7373,7 +7290,6 @@ mod pages {
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let is_admin = is_admin_account(state, &account);
         let page =
             list_live_connections(state, query.core_query(own.then_some(account.as_str()))).await;
         let (sessions, next_before_id, mut error) = match page {
@@ -7451,10 +7367,7 @@ mod pages {
             .to_owned();
         let oper_filter = query.oper.map(|oper| oper.to_string()).unwrap_or_default();
         render_private(ConsoleSessions {
-            account,
-            csrf,
-            is_admin,
-            active,
+            shell: console_shell(state, account, csrf, active),
             title,
             hint,
             disconnect_action,
@@ -7682,10 +7595,7 @@ mod pages {
             return problem(StatusCode::BAD_REQUEST, "Not a bridge", None);
         };
         render_private(ConsoleBridgeEdit {
-            account,
-            csrf,
-            is_admin: true,
-            active: "integrations",
+            shell: console_shell(state, account, csrf, "integrations"),
             name: row.name,
             platform: meta.name,
             needs_nick: meta.needs_nick,

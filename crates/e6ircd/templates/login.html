@@ -44,7 +44,7 @@
         {% endif %}
         <div class="actions">
         {% for p in providers %}
-          <a class="primary-action" href="/api/v1/auth/oidc/{{ p }}/start">Continue with {{ p }}</a>
+          <a class="primary-action" href="/api/v1/auth/oidc/{{ p }}/start">Sign in with {{ p|capitalize }}</a>
         {% endfor %}
         </div>
       {% endif %}

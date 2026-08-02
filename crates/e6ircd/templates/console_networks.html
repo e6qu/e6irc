@@ -14,12 +14,12 @@
               <span class="status-label"><span class="dot on"></span>Attach listener online</span>
               <strong>{{ addr }}</strong>
             </div>
-            <p>Sign in with SASL PLAIN using <code>{{ account }}/&lt;network&gt;</code> as the account name and your e6irc app password.</p>
+            <p>Sign in with SASL PLAIN using <code>{{ shell.account }}/&lt;network&gt;</code> as the account name and your e6irc app password.</p>
           </div>
         {% else %}
           <div class="banner-info">
             <div><strong>Raw IRC attachment is currently off.</strong> Your networks still run and remain available to the web client.</div>
-            {% if is_admin %}<a class="button-link" href="/console/configuration">Enable attach listener</a>{% endif %}
+            {% if shell.is_admin %}<a class="button-link" href="/console/configuration">Enable attach listener</a>{% endif %}
           </div>
         {% endif %}
 
@@ -55,7 +55,7 @@
             </div>
           </div>
         <form class="network-form" method="post" action="/console/networks" data-network-form>
-          <input type="hidden" name="csrf" value="{{ csrf }}" />
+          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <label class="field field-wide">
             <span>IRC network</span>
             <select name="preset" data-network-preset>
@@ -106,7 +106,7 @@
           {% if !can_store_secrets %}
             <div class="banner-info field-wide">
               <div><strong>Upstream credentials are unavailable.</strong> This deployment has no master key, so e6irc refuses to store passwords in plaintext. Networks that do not require SASL can still be added.</div>
-              {% if is_admin %}<a class="button-link" href="/console/configuration">View configuration</a>{% endif %}
+              {% if shell.is_admin %}<a class="button-link" href="/console/configuration">View configuration</a>{% endif %}
             </div>
           {% endif %}
           <label class="check field-wide">
@@ -128,6 +128,7 @@
           <span class="count">{{ networks.len() }}</span>
         </div>
         <div class="scroll" id="network-rows" data-refresh-url="/console/networks/rows" data-refresh-seconds="10" data-refresh-status="network-rows-status">
+            {% let csrf = shell.csrf %}
             {% include "console_network_rows.html" %}
         </div>
         <p id="network-rows-status" class="refresh-status sr-only" aria-live="polite">Refreshes every ten seconds.</p>

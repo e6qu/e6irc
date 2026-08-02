@@ -1026,14 +1026,16 @@ try {
   );
 
   // Clearing only e6irc's application session leaves the provider SSO cookie
-  // intact. Opening the application directly must use the ordinary
-  // authorization starter and restore access without prompting at the
-  // provider.
+  // intact. Opening the application entry goes to the login page; clicking
+  // the provider link restores access without prompting at the provider
+  // (the IdP session is still valid).
   assert.equal((await context.request.post(`${applicationOrigin}/api/v1/auth/logout`)).status(), 204);
   assert.equal((await context.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
-  const directTraceStart = navigationTrace.length;
   await page.goto(`${applicationOrigin}/`);
-  assert.equal(page.url(), `${applicationOrigin}/`);
+  assert.equal(page.url(), `${applicationOrigin}/login`);
+  const directTraceStart = navigationTrace.length;
+  const directSignIn = page.getByRole("link", { name: "Sign in with dex" });
+  await clickAndWaitForURL(page, directSignIn, `${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
   assert.ok(
     navigationTrace.slice(directTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),

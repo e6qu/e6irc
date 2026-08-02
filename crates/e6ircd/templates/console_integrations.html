@@ -30,7 +30,7 @@
       {% if p.built %}
         {% if bouncer_enabled %}
           <form class="inline-config-form" method="post" action="/console/integrations">
-            <input type="hidden" name="csrf" value="{{ csrf }}" />
+            <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
             <input type="hidden" name="kind" value="{{ p.meta.feature }}" />
             <label class="field"><span>Network name</span><input name="name" placeholder="{{ p.meta.feature }}-main" required /></label>
             <label class="field"><span>Homeserver / API base {% if !p.meta.addr_required %}<em>optional</em>{% endif %}</span><input name="addr" placeholder="{% if p.meta.addr_required %}https://chat.example.com{% else %}Provider default{% endif %}" {% if p.meta.addr_required %}required{% endif %} /></label>
@@ -60,13 +60,13 @@
                         <a class="rowlink" href="/console/networks/{{ n.name }}">Inspect</a>
                         <a class="rowlink" href="/console/integrations/{{ n.name }}/edit">Edit</a>
                         <form method="post" action="/console/integrations/toggle">
-                          <input type="hidden" name="csrf" value="{{ csrf }}" />
+                          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                           <input type="hidden" name="name" value="{{ n.name }}" />
                           <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
                           <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
                         </form>
                         <form method="post" action="/console/integrations/delete" data-confirm="Remove bridge {{ n.name }}? Its stored backlog will also be deleted.">
-                          <input type="hidden" name="csrf" value="{{ csrf }}" />
+                          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                           <input type="hidden" name="name" value="{{ n.name }}" />
                           <button class="danger" type="submit">Remove</button>
                         </form>

@@ -339,31 +339,31 @@
     <header>
       <span class="brand" aria-label="e6irc">e6irc console</span>
       <span>
-        <span class="who" data-shauth-user="{{ account }}">{{ account }}</span>
+        <span class="who" data-shauth-user="{{ shell.account }}">{{ shell.account }}</span>
         &nbsp;·&nbsp;
-        <a data-shauth-sign-out href="/api/v1/auth/logout?csrf={{ csrf }}">Sign out</a>
+        <a data-shauth-sign-out href="/api/v1/auth/logout?csrf={{ shell.csrf }}">Sign out</a>
       </span>
     </header>
     <div class="layout">
       <nav aria-label="Console">
-        {% if is_admin %}
+        {% if shell.is_admin %}
           <div class="section">Server</div>
-          <a href="/console"{% if active == "overview" %} class="active"{% endif %}>Overview</a>
-          <a href="/console/accounts"{% if active == "accounts" %} class="active"{% endif %}>Accounts</a>
-          <a href="/console/admin/channels"{% if active == "admin-channels" %} class="active"{% endif %}>Channel registry</a>
-          <a href="/console/admin/networks"{% if active == "admin-networks" %} class="active"{% endif %}>Networks</a>
-          <a href="/console/bans"{% if active == "bans" %} class="active"{% endif %}>Server bans</a>
-          <a href="/console/monitoring"{% if active == "monitoring" %} class="active"{% endif %}>Monitoring</a>
-          <a href="/console/audit"{% if active == "audit" %} class="active"{% endif %}>Audit log</a>
-          <a href="/console/configuration"{% if active == "configuration" %} class="active"{% endif %}>Configuration</a>
-          <a href="/console/sessions"{% if active == "sessions" %} class="active"{% endif %}>Live connections</a>
-          <a href="/console/integrations"{% if active == "integrations" %} class="active"{% endif %}>Integrations</a>
+          <a href="/console"{% if shell.active == "overview" %} class="active"{% endif %}>Overview</a>
+          <a href="/console/accounts"{% if shell.active == "accounts" %} class="active"{% endif %}>Accounts</a>
+          <a href="/console/admin/channels"{% if shell.active == "admin-channels" %} class="active"{% endif %}>Channel registry</a>
+          <a href="/console/admin/networks"{% if shell.active == "admin-networks" %} class="active"{% endif %}>Networks</a>
+          <a href="/console/bans"{% if shell.active == "bans" %} class="active"{% endif %}>Server bans</a>
+          <a href="/console/monitoring"{% if shell.active == "monitoring" %} class="active"{% endif %}>Monitoring</a>
+          <a href="/console/audit"{% if shell.active == "audit" %} class="active"{% endif %}>Audit log</a>
+          <a href="/console/configuration"{% if shell.active == "configuration" %} class="active"{% endif %}>Configuration</a>
+          <a href="/console/sessions"{% if shell.active == "sessions" %} class="active"{% endif %}>Live connections</a>
+          <a href="/console/integrations"{% if shell.active == "integrations" %} class="active"{% endif %}>Integrations</a>
         {% endif %}
         <div class="section">You</div>
-        <a href="/console/networks"{% if active == "networks" %} class="active"{% endif %}>BNC networks</a>
-        <a href="/console/channels"{% if active == "channels" %} class="active"{% endif %}>Registered channels</a>
-        <a href="/console/my-sessions"{% if active == "my-sessions" %} class="active"{% endif %}>Your sessions</a>
-        <a href="/console/account"{% if active == "account" %} class="active"{% endif %}>Account &amp; access</a>
+        <a href="/console/networks"{% if shell.active == "networks" %} class="active"{% endif %}>BNC networks</a>
+        <a href="/console/channels"{% if shell.active == "channels" %} class="active"{% endif %}>Registered channels</a>
+        <a href="/console/my-sessions"{% if shell.active == "my-sessions" %} class="active"{% endif %}>Your sessions</a>
+        <a href="/console/account"{% if shell.active == "account" %} class="active"{% endif %}>Account &amp; access</a>
       </nav>
       <main>
         {% block main %}{% endblock %}
