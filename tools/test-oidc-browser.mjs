@@ -612,6 +612,13 @@ try {
         .querySelector("#network-operations .health-strip > div:first-child strong")
         ?.textContent?.trim() === "connected",
   );
+  // The upstream message arrives over the live WebSocket — wait for it to
+  // render into the operations panel before asserting, or the async relay
+  // races the read on slower runners.
+  await page
+    .locator("#network-operations")
+    .getByText("browser receives through the real stack")
+    .waitFor();
   assert.match(await page.locator("#network-operations").innerText(), /browser receives through the real stack/);
 
   // Exercise the daemon's actual signal handler and startup preload while the
