@@ -1515,6 +1515,7 @@ fn add_managed_oidc_provider(
 struct ManagedConfigurationItem<T> {
     credential_kind: &'static str,
     item_kind: &'static str,
+    action_kind: &'static str,
     items: fn(&mut crate::config::ManagedConfig) -> &mut Vec<T>,
     item_name: fn(&T) -> &str,
 }
@@ -1526,7 +1527,28 @@ fn delete_managed_configuration_item<T>(
 ) -> Result<String, String> {
     reject_bootstrap_credential_change(settings, item.credential_kind)?;
     remove_named((item.items)(settings), name, item.item_kind, item.item_name)?;
-    Ok(format!("removed {} {name}", item.item_kind))
+    Ok(format!("removed {} {name}", item.action_kind))
+}
+
+fn oidc_provider_configuration_item() -> ManagedConfigurationItem<crate::config::OidcProviderConfig>
+{
+    ManagedConfigurationItem {
+        credential_kind: "identity-provider",
+        item_kind: "identity provider",
+        action_kind: "OpenID Connect provider",
+        items: |settings| &mut settings.oidc_providers,
+        item_name: |provider| &provider.name,
+    }
+}
+
+fn oper_configuration_item() -> ManagedConfigurationItem<crate::config::OperConfig> {
+    ManagedConfigurationItem {
+        credential_kind: "operator",
+        item_kind: "IRC operator",
+        action_kind: "IRC operator",
+        items: |settings| &mut settings.opers,
+        item_name: |oper| &oper.name,
+    }
 }
 
 /// Server-rendered HTML pages (askama). Complements the Vite chat client with
@@ -5693,16 +5715,7 @@ mod pages {
         }: AdminConfigPayload<DeleteConfigItem>,
     ) -> Response {
         mutate_managed_config(&state, account, csrf, move |settings| {
-            delete_managed_configuration_item(
-                settings,
-                &form.name,
-                ManagedConfigurationItem {
-                    credential_kind: "operator",
-                    item_kind: "IRC operator",
-                    items: |settings| &mut settings.opers,
-                    item_name: |oper| &oper.name,
-                },
-            )
+            delete_managed_configuration_item(settings, &form.name, oper_configuration_item())
         })
         .await
     }
@@ -5771,12 +5784,7 @@ mod pages {
             delete_managed_configuration_item(
                 settings,
                 &form.name,
-                ManagedConfigurationItem {
-                    credential_kind: "identity-provider",
-                    item_kind: "identity provider",
-                    items: |settings| &mut settings.oidc_providers,
-                    item_name: |provider| &provider.name,
-                },
+                oidc_provider_configuration_item(),
             )
         })
         .await

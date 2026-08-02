@@ -823,25 +823,6 @@ fn master_key_required(credential_label: &str) -> Response {
     )
 }
 
-fn oidc_provider_configuration_item() -> ManagedConfigurationItem<crate::config::OidcProviderConfig>
-{
-    ManagedConfigurationItem {
-        credential_kind: "identity-provider",
-        item_kind: "identity provider",
-        items: |settings| &mut settings.oidc_providers,
-        item_name: |provider| &provider.name,
-    }
-}
-
-fn oper_configuration_item() -> ManagedConfigurationItem<crate::config::OperConfig> {
-    ManagedConfigurationItem {
-        credential_kind: "operator",
-        item_kind: "IRC operator",
-        items: |settings| &mut settings.opers,
-        item_name: |oper| &oper.name,
-    }
-}
-
 async fn delete_managed_configuration_item_api<T>(
     state: Arc<AppState>,
     actor: String,
