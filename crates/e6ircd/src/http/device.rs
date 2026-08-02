@@ -693,12 +693,8 @@ pub(super) async fn admin_create_oidc_provider(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let Some(key) = &state.secret_key else {
-        return problem(
-            StatusCode::CONFLICT,
-            "Master key required",
-            Some("OIDC client secrets cannot be stored without a master key."),
-        );
+    let Some(key) = configuration_secret_key(&state) else {
+        return master_key_required("OIDC client secrets");
     };
     let domains = match body
         .allowed_email_domains
@@ -767,12 +763,7 @@ pub(super) async fn admin_delete_oidc_provider(
         actor,
         name,
         body,
-        ManagedConfigurationItem {
-            credential_kind: "identity-provider",
-            item_kind: "identity provider",
-            items: |settings| &mut settings.oidc_providers,
-            item_name: |provider| &provider.name,
-        },
+        oidc_provider_configuration_item(),
     )
     .await
 }
@@ -786,12 +777,8 @@ pub(super) async fn admin_create_oper(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let Some(key) = &state.secret_key else {
-        return problem(
-            StatusCode::CONFLICT,
-            "Master key required",
-            Some("Operator passwords cannot be stored without a master key."),
-        );
+    let Some(key) = configuration_secret_key(&state) else {
+        return master_key_required("Operator passwords");
     };
     let name = body.name.trim();
     if name.is_empty() || body.password.is_empty() {
@@ -819,19 +806,40 @@ pub(super) async fn admin_delete_oper(
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    delete_managed_configuration_item_api(
-        state,
-        actor,
-        name,
-        body,
-        ManagedConfigurationItem {
-            credential_kind: "operator",
-            item_kind: "IRC operator",
-            items: |settings| &mut settings.opers,
-            item_name: |oper| &oper.name,
-        },
+    delete_managed_configuration_item_api(state, actor, name, body, oper_configuration_item()).await
+}
+
+fn configuration_secret_key(state: &AppState) -> Option<&Arc<crate::secret::SecretKeyring>> {
+    state.secret_key.as_ref()
+}
+
+fn master_key_required(credential_label: &str) -> Response {
+    problem(
+        StatusCode::CONFLICT,
+        "Master key required",
+        Some(&format!(
+            "{credential_label} cannot be stored without a master key."
+        )),
     )
-    .await
+}
+
+fn oidc_provider_configuration_item() -> ManagedConfigurationItem<crate::config::OidcProviderConfig>
+{
+    ManagedConfigurationItem {
+        credential_kind: "identity-provider",
+        item_kind: "identity provider",
+        items: |settings| &mut settings.oidc_providers,
+        item_name: |provider| &provider.name,
+    }
+}
+
+fn oper_configuration_item() -> ManagedConfigurationItem<crate::config::OperConfig> {
+    ManagedConfigurationItem {
+        credential_kind: "operator",
+        item_kind: "IRC operator",
+        items: |settings| &mut settings.opers,
+        item_name: |oper| &oper.name,
+    }
 }
 
 async fn delete_managed_configuration_item_api<T>(
