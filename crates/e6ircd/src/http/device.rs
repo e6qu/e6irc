@@ -692,7 +692,7 @@ pub(super) async fn admin_create_oper(
             Some("Operator name and password are required."),
         );
     }
-    mutate_oper_configuration(&state, &actor, body.revision, |settings| {
+    mutate_managed_configuration(&state, &actor, body.revision, |settings| {
         if settings.credentials_from_bootstrap {
             return Err("Configure a master key and restart before changing bootstrap operator credentials.".into());
         }
@@ -711,7 +711,7 @@ pub(super) async fn admin_delete_oper(
         Ok(body) => body,
         Err(response) => return response,
     };
-    mutate_oper_configuration(&state, &actor, body.revision, |settings| {
+    mutate_managed_configuration(&state, &actor, body.revision, |settings| {
         if settings.credentials_from_bootstrap {
             return Err("Configure a master key and restart before changing bootstrap operator credentials.".into());
         }
@@ -722,7 +722,7 @@ pub(super) async fn admin_delete_oper(
     }).await
 }
 
-async fn mutate_oper_configuration(
+async fn mutate_managed_configuration(
     state: &AppState,
     actor: &str,
     revision: i64,
