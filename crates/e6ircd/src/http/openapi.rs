@@ -1022,6 +1022,14 @@ fn document() -> serde_json::Value {
                     "responses": { "200": { "description": "networks with runtime snapshots" },
                         "403": { "description": "not an admin account" } } }
             },
+            "/api/v1/admin/networks/{owner}/{name}": {
+                "patch": { "summary": "Change one owner's network lifecycle (admin only)",
+                    "description": "Persists the enabled state and starts or stops the same always-on driver as the owner API. The administrator is retained as the audit actor.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
+                    "responses": { "200": { "description": "network lifecycle updated" }, "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "503": { "description": "database unavailable" } } }
+            },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",
                     "security": authenticated,

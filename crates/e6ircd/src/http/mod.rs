@@ -1104,6 +1104,7 @@ documented_routes! {
     "/api/v1/admin/channels" => { get: admin_channels },
     "/api/v1/admin/channels/{name}" => { delete: delete_admin_channel },
     "/api/v1/admin/networks" => { get: admin_networks },
+    "/api/v1/admin/networks/{owner}/{name}" => { patch: patch_admin_network },
     "/api/v1/admin/bans" => { get: admin_server_bans, post: admin_create_server_ban },
     "/api/v1/admin/bans/{id}" => { delete: admin_delete_server_ban },
     "/api/v1/admin/audit" => { get: admin_audit },

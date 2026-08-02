@@ -1401,6 +1401,31 @@ pub(super) async fn patch_network(
         .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkPatch {
+    enabled: bool,
+}
+
+/// Enable or disable any owner's network (administrator only). The actor is
+/// distinct from the owner so the existing audit event preserves provenance.
+pub(super) async fn patch_admin_network(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    Path((owner, name)): Path<(String, String)>,
+    JsonBody(req): JsonBody<AdminNetworkPatch>,
+) -> Response {
+    let Some(registry) = &state.bnc_registry else {
+        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+    };
+    if let Err(error) =
+        set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await
+    {
+        return error.into_response();
+    }
+    json_no_store(serde_json::json!({ "owner": owner, "name": name, "enabled": req.enabled }))
+}
+
 /// Delete one of the caller's networks and stop its driver.
 pub(super) async fn delete_network(
     State(state): State<Arc<AppState>>,

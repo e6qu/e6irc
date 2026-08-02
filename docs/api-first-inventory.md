@@ -74,7 +74,7 @@ operation's semantics.
 | `/console/accounts/{id}/delete` | `DELETE /api/v1/admin/accounts/{id}` | Mapped | Preserve succession and last-administrator protection. |
 | `/console/accounts/{id}/suspension` | `PATCH /api/v1/admin/accounts/{id}` | Mapped | Return the committed suspension posture. |
 | `/console/accounts/{id}/administrator` | `PATCH /api/v1/admin/accounts/{id}` | Mapped | Return durable/effective authority distinctly. |
-| `/console/admin/networks/{owner}/{name}/toggle` | `PATCH /api/v1/admin/networks/{owner}/{name}` | Gap | Add an administrator-scoped audited lifecycle patch. |
+| `/console/admin/networks/{owner}/{name}/toggle` | `PATCH /api/v1/admin/networks/{owner}/{name}` | Mapped | Use the administrator-scoped audited lifecycle patch. |
 | `/console/bans` | `POST /api/v1/admin/bans` | Mapped | Use the typed audited K/D/X-line creation resource. |
 | `/console/bans/delete` | `DELETE /api/v1/admin/bans/{id}` | Mapped | Resolve the immutable ID before the core preserves casefolded removal semantics. |
 | `/console/sessions/{id}/disconnect` | `DELETE /api/v1/admin/connections/{id}` | Mapped | Keep exact immutable-ID disconnect semantics. |
