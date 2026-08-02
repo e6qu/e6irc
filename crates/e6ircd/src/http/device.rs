@@ -668,6 +668,102 @@ pub(super) struct AdminConfigRevision {
     revision: i64,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminOidcBody {
+    revision: i64,
+    name: String,
+    issuer_url: String,
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    allowed_email_domains: Vec<String>,
+    end_session_endpoint: Option<String>,
+    token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod,
+}
+
+pub(super) async fn admin_create_oidc_provider(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminOidcBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(key) = &state.secret_key else {
+        return problem(
+            StatusCode::CONFLICT,
+            "Master key required",
+            Some("OIDC client secrets cannot be stored without a master key."),
+        );
+    };
+    let domains = match body
+        .allowed_email_domains
+        .into_iter()
+        .map(|domain| crate::identity::EmailDomain::parse(&domain))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(domains) => domains,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid OIDC provider",
+                Some(&error.to_string()),
+            );
+        }
+    };
+    let name = body.name.trim().to_string();
+    let issuer_url = body.issuer_url.trim().to_string();
+    let client_id = body.client_id.trim().to_string();
+    if name.is_empty()
+        || issuer_url.is_empty()
+        || client_id.is_empty()
+        || body.client_secret.is_empty()
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid OIDC provider",
+            Some("Name, issuer URL, client ID, and client secret are required."),
+        );
+    }
+    let scopes = body
+        .scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+        .collect();
+    let end_session_endpoint = body
+        .end_session_endpoint
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+        if settings.credentials_from_bootstrap { return Err("Configure a master key and restart before changing bootstrap identity-provider credentials.".into()); }
+        settings.oidc_providers.push(crate::config::OidcProviderConfig { name: name.clone(), issuer_url, client_id, client_secret: key.seal(&body.client_secret, crate::secret::CONFIG_CONTEXT), scopes, allowed_email_domains: domains, end_session_endpoint, token_endpoint_auth_method: body.token_endpoint_auth_method });
+        Ok(format!("added OpenID Connect provider {name}"))
+    }).await
+}
+
+pub(super) async fn admin_delete_oidc_provider(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    mutate_managed_configuration(&state, &actor, body.revision, |settings| {
+        if settings.credentials_from_bootstrap { return Err("Configure a master key and restart before changing bootstrap identity-provider credentials.".into()); }
+        let before = settings.oidc_providers.len();
+        settings.oidc_providers.retain(|provider| provider.name != name);
+        if settings.oidc_providers.len() == before { return Err(format!("No identity provider named '{name}'.")); }
+        Ok(format!("removed OpenID Connect provider {name}"))
+    }).await
+}
+
 pub(super) async fn admin_create_oper(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,

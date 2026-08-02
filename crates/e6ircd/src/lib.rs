@@ -2,7 +2,7 @@
 
 // The hand-authored OpenAPI spec is one large `serde_json::json!` literal
 // whose nesting exceeds the default macro recursion limit.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 pub mod bouncer;
 pub mod config;

@@ -86,8 +86,8 @@ operation's semantics.
 | `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Gap | Add revisioned configuration read and compare-and-swap write. |
 | `/console/configuration/opers` | `POST /api/v1/admin/configuration/opers` | Mapped | Uses the typed revisioned operator resource. |
 | `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Mapped | Carries the configuration revision and audit provenance. |
-| `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Gap | Keep provider secret fields write-only. |
-| `/console/configuration/oidc/delete` | `DELETE /api/v1/admin/configuration/oidc-providers/{name}` | Gap | Preserve revision/audit provenance. |
+| `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Mapped | Provider secret fields are write-only. |
+| `/console/configuration/oidc/delete` | `DELETE /api/v1/admin/configuration/oidc-providers/{name}` | Mapped | Carries revision and audit provenance. |
 | `/console/configuration/shared-networks` | `POST /api/v1/admin/configuration/networks` | Gap | Use the same closed network-kind schema as owner resources. |
 | `/console/configuration/shared-networks/delete` | `DELETE /api/v1/admin/configuration/networks/{name}` | Gap | Preserve revision/audit provenance. |
 
