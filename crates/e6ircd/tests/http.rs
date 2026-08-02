@@ -6686,30 +6686,23 @@ async fn admin_networks_fleet_view_and_toggle() {
     assert_eq!(networks[0]["name"], "work", "{body}");
     assert_eq!(networks[0]["enabled"], true, "{body}");
 
-    // The console page lists it for the admin with a CSRF-bearing toggle.
+    // The console page remains a rendered admin view.
     let page_req = format!(
         "GET /console/admin/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (status, _, page) = request(http, &page_req).await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("bob") && page.contains("work"), "{page}");
-    let csrf = page
-        .split("name=\"csrf\" value=\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token in admin networks page")
-        .to_string();
-
-    // Admin disables the misbehaving network -> redirect, row flipped,
-    // privileged action audited.
-    let body = format!("csrf={csrf}&enabled=false");
+    // Admin disables the misbehaving network through the API; the row flips
+    // and the privileged action retains the administrator's audit identity.
+    let body = r#"{"enabled":false}"#;
     let toggle = format!(
-        "POST /console/admin/networks/bob/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "PATCH /api/v1/admin/networks/bob/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let (status, _, _) = request(http, &toggle).await;
-    assert!(status == 302 || status == 303, "{status}");
+    assert_eq!(status, 200, "{status}");
 
     let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
     let row = e6ircd::db::get_bnc_network(&pool, "bob", "work")
