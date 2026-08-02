@@ -251,6 +251,19 @@ fn document() -> serde_json::Value {
                         "200": { "description": "unexpired browser sessions, current first" },
                         "503": { "description": "database unavailable" }
                     }
+                },
+                "delete": {
+                    "summary": "Revoke every other active browser session",
+                    "description": "Requires the explicit `except=current` selector and a cookie-authenticated browser session. The database deletion is atomic, preserves the authorizing session, and returns the number revoked.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "except", "in": "query", "required": true,
+                        "schema": { "type": "string", "enum": ["current"] } }],
+                    "responses": {
+                        "200": { "description": "other browser sessions revoked" },
+                        "400": { "description": "missing or invalid selector" },
+                        "401": { "description": "browser cookie session required" },
+                        "503": { "description": "database unavailable" }
+                    }
                 }
             },
             "/api/v1/me/sessions/{id}": {

@@ -4651,15 +4651,18 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     let third = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("third session");
-    let revoke_others_body = format!("csrf={csrf}");
     let revoke_others = format!(
-        "POST /console/my-sessions/browser/others/delete HTTP/1.1\r\nHost: t\r\n\
-         Cookie: e6irc_session={current}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{revoke_others_body}",
-        revoke_others_body.len()
+        "DELETE /api/v1/me/sessions?except=current HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={current}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
-    let (status, headers, _) = request(http, &revoke_others).await;
-    assert_eq!(status, 303, "{headers}");
+    let (status, headers, body) = request(http, &revoke_others).await;
+    assert_eq!(status, 200, "{headers}: {body}");
+    assert!(headers.contains("cache-control: no-store"), "{headers}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revoked"],
+        1
+    );
     assert_eq!(
         e6ircd::db::session_account(&pool, &current)
             .await

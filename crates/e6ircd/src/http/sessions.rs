@@ -75,6 +75,47 @@ pub(super) async fn revoke_browser_session(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct BrowserSessionBulkDeleteQuery {
+    except: Option<String>,
+}
+
+/// Revoke every browser session other than the cookie session that authorized
+/// this request. The selector is explicit so an accidental collection DELETE
+/// cannot broaden into a destructive account-wide operation.
+pub(super) async fn revoke_other_browser_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<BrowserSessionBulkDeleteQuery>,
+    Authenticated(account): Authenticated,
+) -> Response {
+    if query.except.as_deref() != Some("current") {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid browser session selector",
+            Some("DELETE /api/v1/me/sessions requires except=current."),
+        );
+    }
+    let Some(current) = session_token(&headers, state.secure_cookies) else {
+        return problem(
+            StatusCode::UNAUTHORIZED,
+            "Browser session required",
+            Some("A bearer token cannot identify the browser session to preserve."),
+        );
+    };
+    match crate::db::delete_other_web_sessions(pool_of(&state), &account, &current).await {
+        Ok(revoked) => json_no_store(serde_json::json!({ "revoked": revoked })),
+        Err(error) => {
+            eprintln!("http: other browser sessions revoke failed: {error}");
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable",
+                None,
+            )
+        }
+    }
+}
+
 #[derive(Default, serde::Deserialize)]
 pub(super) struct LiveConnectionQueryParams {
     pub(super) limit: Option<usize>,

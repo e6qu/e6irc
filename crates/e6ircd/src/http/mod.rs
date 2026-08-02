@@ -1055,7 +1055,10 @@ documented_routes! {
     "/api/v1/me/security-activity" => { get: me_security_activity },
     "/api/v1/me/identities" => { get: me_identities },
     "/api/v1/me/identities/{id}" => { delete: me_identity_unlink },
-    "/api/v1/me/sessions" => { get: list_browser_sessions },
+    "/api/v1/me/sessions" => {
+        get: list_browser_sessions,
+        delete: revoke_other_browser_sessions,
+    },
     "/api/v1/me/sessions/{id}" => { delete: revoke_browser_session },
     "/api/v1/me/connections" => { get: me_connections },
     "/api/v1/me/connections/{id}" => { delete: me_disconnect_connection },
