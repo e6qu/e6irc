@@ -17,6 +17,269 @@ The 2026-07-30 whole-product traceability audit is in
 boundaries in [`coverage.md`](docs/journeys/coverage.md). Legend: ✅ done ·
 🔶 partial · ⛔ blocked (reason).
 
+## Product-completion program — API-first, usable, and qualified
+
+The phase history below records completed engineering work. It does **not**
+mean that the product is finished. e6irc is a feature-rich, tested server and
+client baseline, but its control plane and browser chat need a deliberate
+product-quality pass before they can be described as complete. This program is
+the active completion roadmap; each numbered stage is one or more PRs on the
+single active PR branch, and each stage ends with its contract, journey
+evidence, and status updated here.
+
+### Completion standard
+
+The application is complete only when all of the following are true:
+
+- The versioned REST API is the single client contract for every product state
+  read and mutation. Browser chat, operational console, CLI, and any future
+  client use the same documented resource shapes, authorization decisions,
+  validation, error vocabulary, and durable/core mutation path.
+- The browser experience is intentionally designed, responsive, keyboard
+  usable, screen-reader usable, and coherent across chat, account, and
+  administrator workflows. A correct form submission alone is not a complete
+  UI outcome.
+- Every shipped workflow has fast API-level contract evidence plus browser
+  evidence for browser-only behavior. Visual, responsive, accessibility, and
+  interaction regressions are detected rather than discovered by users.
+- The operational claims in `DESIGN.md` have measured qualification evidence:
+  production-scale behavior, recovery, release artifacts, and the real
+  third-party integrations that are advertised as supported.
+
+### Stage A — Establish the API-first boundary
+
+**Goal:** make `/api/v1` the authoritative product interface and eliminate
+parallel console-specific behavior.
+
+1. Inventory every browser-chat, server-rendered-console, CLI, and native
+   client read/mutation. For each one, record its canonical resource, request
+   shape, success shape, problem shape, authorization rule, CSRF/bearer rule,
+   audit action, and core/database mutation entry point.
+2. Close every inventory gap with typed versioned API endpoints. Resource IDs,
+   cursors, limits, enum values, and mutation results must have one canonical
+   representation; no UI-only sentinel, inferred status, or untyped form
+   convention may remain.
+3. Move shared validation and policy to typed API/core boundaries. A browser
+   page must never obtain a different result because it reached a dedicated
+   console handler rather than the public resource. The API handler itself
+   must submit the existing typed core/database operation; it must not make an
+   internal loopback HTTP request.
+4. Define a complete API error taxonomy: field validation, authentication,
+   authorization, conflict/revision, rate limit, unavailable dependency,
+   timeout, and internal correlation identifier. Each error remains safe for
+   users and operationally distinguishable.
+5. Keep authentication bootstrap, OIDC navigation, and static asset delivery
+   as HTTP page/navigation concerns. Once authenticated, all dynamic UI reads
+   and mutations call the public API with the same cookie+CSRF or bearer
+   semantics available to non-browser clients.
+6. Replace hand-maintained API examples with schema-derived fixtures and
+   compatibility tests. OpenAPI remains an executable compatibility contract:
+   route, method, input, output, error, pagination, and authorization drift
+   fail CI.
+
+**Exit evidence:** an API inventory with no console-only state transition;
+contract tests exercise every resource family through HTTP; generated or
+checked fixtures match OpenAPI; a browser action and a direct API call produce
+the same persistent/core/audit result.
+
+### Stage B — Rebuild the console as an API client
+
+**Goal:** turn the management console from a parallel rendered-form surface
+into a responsive client of the canonical API.
+
+1. Retain only thin server-rendered document shells where they add value
+   (sign-in, bootstrap, initial document/security headers). Render authenticated
+   account and operations views from API data with explicit loading, empty,
+   permission-denied, stale, retryable-failure, and success states.
+2. Convert each console domain in order: account/profile and credentials;
+   browser sessions and exports; networks and bridges; registered channels;
+   administrator accounts/policy/audit; configuration; monitoring and live
+   connection controls. A domain moves only after its complete API parity and
+   browser transition/error behavior are proven.
+3. Use one in-browser request client for headers, CSRF, bounded JSON decoding,
+   correlation-aware problem rendering, cancellation, retry eligibility, and
+   optimistic/conservative update policy. Mutation controls acknowledge only
+   committed or core-admitted results; ambiguous network failures remain
+   visible and refreshable.
+4. Preserve URL-addressable views, history/back behavior, permission-aware
+   navigation, safe destructive confirmations, and no-store/private-page
+   security headers throughout the migration.
+5. Remove each dedicated console handler, template context, and duplicate
+   validation path once its API-client replacement has equivalent behavior and
+   evidence. The end state has one domain model and one mutation route, not a
+   permanent rendered-console/API fork.
+
+**Exit evidence:** every authenticated console action is observable as an
+API request; direct API contract suites and browser flows share fixtures and
+expected results; no console-only mutation handler or state representation
+remains.
+
+### Stage C — Product-design and interaction quality
+
+**Goal:** make the browser application feel intentional rather than merely
+functional.
+
+1. Establish a small in-repository design system: semantic color, spacing,
+   typography, elevation, focus, status, density, and motion tokens; reusable
+   button, field, menu, dialog, table, alert, empty-state, and loading-state
+   patterns; light, dark, and system themes from the same tokens.
+2. Redesign information architecture for the distinct user jobs: chat,
+   personal account/security, network ownership, channel ownership, and
+   administrator operations. Navigation must make role, location, pending
+   work, and recovery paths obvious without exposing unauthorized controls.
+3. Improve chat ergonomics: discoverable network/buffer switching, unread and
+   mention treatment, reliable composer/error/retry affordances, long-history
+   navigation, member/context actions, responsive rail behavior, and clear
+   detached/upstream/reconnect state. Preserve bounded client state and the
+   no-false-echo delivery contract.
+4. Improve dense operational workflows: searchable/filterable cursor tables,
+   safe bulk-free destructive actions, explicit audit provenance, useful empty
+   states, responsive forms, secret-entry guidance, and live-status refresh
+   behavior that never overwrites an operator's in-progress edit.
+5. Specify desktop, tablet, narrow-phone, high-zoom, reduced-motion, and
+   forced-colors behavior. Layout changes must preserve every essential task;
+   mobile is not a clipped desktop console.
+
+**Exit evidence:** documented interaction maps and component states; review of
+every role/viewport/theme; task-based usability sessions with representative
+operators and chat users; all findings either fixed in the same work or put to
+the human as an explicit product decision.
+
+### Stage D — UI, accessibility, and contract test pyramid
+
+**Goal:** test the right layer for each risk, rather than relying on expensive
+browser journeys for ordinary API behavior.
+
+1. Build exhaustive API contract tests for each resource: valid lifecycle,
+   malformed input, authorization matrix, CSRF/bearer distinction, ownership
+   isolation, pagination/cursor stability, concurrency/conflict, dependency
+   failure, audit provenance, and restart visibility.
+2. Add deterministic browser component/state tests for rendering decisions,
+   optimistic and rejected mutations, navigation, focus restoration, keyboard
+   shortcuts, escape/cancel behavior, responsive rail/dialog transitions, and
+   offline/reconnect states. Keep server and WebSocket doubles only for races
+   that need deterministic scheduling.
+3. Keep real browser end-to-end flows for OIDC/local login, CSRF/cookie
+   boundaries, API-client integration, real WebSocket attachment, database
+   persistence/restart, and every role's critical task. Run the core journeys
+   in Chromium, Firefox, and WebKit with isolated dependencies.
+4. Add screenshot-based visual regression coverage for each shared component
+   and critical page across approved viewport/theme combinations. Baselines are
+   reviewed artifacts; intentional visual changes update them deliberately.
+5. Add automated accessibility checks and manual keyboard/screen-reader
+   scripts. Cover semantic structure, accessible names, focus order/traps,
+   contrast, visible focus, zoom/reflow, error association, live-region noise,
+   tables, dialogs, and dynamic updates. Existing template structural checks
+   are a floor, not the complete accessibility claim.
+6. Make test fixtures deterministic and independent: per-test database,
+   clock/identity/network controls where appropriate, bounded retries with
+   failure diagnostics, and artifacts (trace, screenshot, console/network
+   log) retained for failed browser runs.
+
+**Exit evidence:** API contract coverage is the primary proof of business
+behavior; browser suites demonstrate UI-specific behavior; visual and
+accessibility regressions gate merges; flaky-test rate and rerun causes are
+measured and driven down.
+
+### Stage E — Client and protocol product parity
+
+**Goal:** ensure the browser, CLI, TUI, and IRC clients have deliberate,
+documented capability boundaries rather than accidental feature gaps.
+
+1. Publish a client capability matrix covering chat, history, read state,
+   network selection, authentication, recovery, notifications, moderation,
+   and administrator workflows. Each unsupported action fails explicitly and
+   links to the supported surface where appropriate.
+2. Complete the documented NickServ/ChanServ command surface or narrow the
+   advertised compatibility contract to the implemented subset with explicit
+   protocol replies and tests.
+3. Complete direct-message durable history and its CHATHISTORY/TARGETS
+   behavior, including privacy/participant authorization, pagination, replay,
+   deletion/retention, and client presentation. The plan currently records
+   this as an unimplemented services/history boundary.
+4. Expand real-world IRC interoperability from opt-in probes into a controlled
+   qualification matrix for supported public networks and common clients,
+   while retaining respectful rate and connection limits.
+5. Review browser chat parity with the native clients for reconnection,
+   history/read markers, multi-network selection, accessibility, and failure
+   reporting; make intentional differences product-documented.
+
+**Exit evidence:** published capability matrix, compatibility tests for every
+advertised command/capability, and no documented-but-unimplemented client
+surface presented as ready.
+
+### Stage F — Operational and scale qualification
+
+**Goal:** convert performance and recovery aspirations into measured release
+claims.
+
+1. Define production hardware profiles and acceptance budgets for connection
+   rate, fan-out throughput, P50/P95/P99 latency, CPU, file descriptors,
+   memory per connection, queue pressure, reconnect recovery, and shutdown
+   drain time.
+2. Run reproducible tuned-Linux load campaigns through the existing harness,
+   capture raw environment/configuration/results, and publish baselines. The
+   100k target is not claimed until the selected production profile meets its
+   explicit budget under representative channel distributions and failures.
+3. Implement the required target-architecture pieces when measurements demand
+   them: shard ownership/routing, cross-shard fan-out discipline, timer-wheel
+   scheduling, deterministic whole-core replay, and queue/allocator tuning.
+   Each change retains the existing delivered-or-returned and single-writer
+   invariants with property, loom, and fault-injection evidence.
+4. Expand chaos and recovery qualification: PostgreSQL loss/slowdown, DNS and
+   upstream address churn, TLS failure, provider throttling, queue saturation,
+   process restart, key rotation, disk pressure, clock shifts, and partial
+   network partitions. Every observed condition has a bounded user/operator
+   outcome and telemetry provenance.
+5. Publish operator runbooks for capacity planning, upgrades, rollback,
+   database/key backup and restore, incident diagnosis, metrics/alert
+   thresholds, and supported deployment topologies. Exercise the runbooks in
+   disposable environments.
+
+**Exit evidence:** repeatable performance reports, fault/recovery evidence,
+production budgets in CI or release qualification, and an honest scale claim
+in `DESIGN.md` and user-facing operations documentation.
+
+### Stage G — External integration and release qualification
+
+**Goal:** qualify every advertised integration and distribution channel at its
+real boundary.
+
+1. Maintain Matrix's self-hosted oracle and add credentialed, rate-limited
+   release qualification for Discord and Slack with dedicated test tenants,
+   bot/app lifecycle controls, secret rotation, API-version compatibility,
+   reconnect/rate-limit behavior, and audit-safe diagnostics.
+2. Broaden identity-provider qualification beyond Dex and Shauth with a
+   versioned provider matrix covering discovery, JWKS rotation, claims/domain
+   policy, front/back-channel logout, and provider-specific browser behavior.
+3. Test upgrade compatibility across supported database schema versions and
+   persisted configuration/data, including rollback policy and release-note
+   requirements. Restore rehearsal must use representative sealed secrets and
+   redacted production-shaped data.
+4. Establish release readiness gates: security review, dependency/advisory
+   review, accessibility/visual sign-off, API compatibility report, load and
+   recovery report, supported-provider report, migration/rollback rehearsal,
+   container/native artifact verification, and operator documentation review.
+
+**Exit evidence:** every public support claim has a maintained qualification
+record, credentialed providers are tested in controlled accounts, and release
+notes name both verified capabilities and explicit environmental boundaries.
+
+### Program governance
+
+- Maintain one public work inventory with owner, user outcome, API/domain
+  contract, acceptance evidence, risk, and current status. An empty issue list
+  must never be used as evidence that product work is exhausted.
+- Prioritize user-observed defects, security/correctness gaps, and evidence
+  failures before cosmetic expansion. A discovered defect is fixed in the
+  active change or escalated as an explicit human decision under `AGENTS.md`.
+- Every PR changes the smallest coherent vertical slice: API contract, shared
+  domain path, UI state, automated evidence, documentation, and migration or
+  release note when applicable. The one-open-PR rule continues to apply.
+- Review the completion standard after each stage with product users and
+  operators. Update `DESIGN.md`, journey contracts, API documentation, and
+  this plan only when the implementation and evidence support the new claim.
+
 V1 closure identity and API admission (2026-07-30): account registration now
 parses and persists a normalized private contact email, while the self-service
 console and `/api/v1/me/profile` provide owner-scoped replacement/removal with
