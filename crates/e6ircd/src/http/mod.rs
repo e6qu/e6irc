@@ -1479,11 +1479,7 @@ mod pages {
         sole_provider: Option<String>,
     }
 
-    /// The console navigation context: who the signed-in account is, the
-    /// session-bound CSRF token, whether they are an administrator, and which
-    /// nav section is active. Every console template struct embeds this
-    /// rather than repeating the four fields, so the shell contract with
-    /// `console_base.html` is stated once.
+    /// Shared context inherited by every console template.
     #[derive(Clone)]
     struct ConsoleShell {
         account: String,
@@ -1492,10 +1488,7 @@ mod pages {
         active: &'static str,
     }
 
-    /// Build the shell for a console page, computing `is_admin` from the
-    /// configured administrator set. The `active` nav key must match a
-    /// `{% if active == "..." %}` check in `console_base.html`.
-    fn shell(
+    fn console_shell(
         state: &AppState,
         account: String,
         csrf: String,
@@ -2401,19 +2394,13 @@ mod pages {
         .into_iter()
         .map(AuditRow::from)
         .collect();
-        let is_admin = is_admin_account(state, &account);
         let link_providers = state
             .oidc_providers
             .iter()
             .map(|provider| provider.name.clone())
             .collect();
         Ok(ConsoleAccount {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin,
-                active: "account",
-            },
+            shell: console_shell(state, account, csrf, "account"),
             credentials,
             has_local_password,
             tokens,
@@ -3244,7 +3231,7 @@ mod pages {
             })
             .collect();
         Ok(ConsoleChannels {
-            shell: shell(state, account, csrf, "channels"),
+            shell: console_shell(state, account, csrf, "channels"),
             channels,
             error,
         })
@@ -3694,12 +3681,7 @@ mod pages {
         let (networks, connected) = bnc_counts(state);
         let live = state.telemetry.snapshot(networks, connected);
         Ok(Console {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "overview",
-            },
+            shell: console_shell(state, account, csrf, "overview"),
             server_name: state.server_name.clone(),
             network_name: state.network_name.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -4287,12 +4269,7 @@ mod pages {
         };
         let view = monitoring_view(&state, window).await;
         render_private(ConsoleMonitoring {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "monitoring",
-            },
+            shell: console_shell(&state, account, csrf, "monitoring"),
             view,
         })
     }
@@ -4362,12 +4339,7 @@ mod pages {
                 )
             });
         render_private(ConsoleAccounts {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "accounts",
-            },
+            shell: console_shell(state, account, csrf, "accounts"),
             entries: page.entries,
             invitations: invitation_page.entries,
             invitation_before_id,
@@ -4671,12 +4643,7 @@ mod pages {
         let name = query.name.unwrap_or_default();
         let founder = query.founder.unwrap_or_default();
         Ok(ConsoleAdminChannels {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "admin-channels",
-            },
+            shell: console_shell(state, account, csrf, "admin-channels"),
             entries: page.entries,
             has_filters: !name.is_empty() || !founder.is_empty(),
             has_cursor: query.before_id.is_some(),
@@ -4754,12 +4721,7 @@ mod pages {
             })
             .collect();
         render_private(ConsoleAdminNetworks {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "admin-networks",
-            },
+            shell: console_shell(&state, account, csrf, "admin-networks"),
             networks,
         })
     }
@@ -4804,12 +4766,7 @@ mod pages {
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
         Ok(ConsoleServerBans {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "bans",
-            },
+            shell: console_shell(state, account, csrf, "bans"),
             entries: page.entries,
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
@@ -4867,12 +4824,7 @@ mod pages {
         let target = query.target.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
         render_private(ConsoleAudit {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "audit",
-            },
+            shell: console_shell(&state, account, csrf, "audit"),
             entries,
             has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
             has_cursor,
@@ -5243,12 +5195,7 @@ mod pages {
             })
             .collect();
         render_private(ConsoleConfiguration {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "configuration",
-            },
+            shell: console_shell(state, account, csrf, "configuration"),
             revision: snapshot.revision,
             updated_by: snapshot.updated_by,
             updated_at: snapshot.updated_at,
@@ -6337,12 +6284,7 @@ mod pages {
             };
         let is_admin = is_admin_account(&state, &account);
         render_private(ConsoleNetworkDetail {
-            shell: ConsoleShell {
-                account: account.clone(),
-                csrf,
-                is_admin,
-                active: "networks",
-            },
+            shell: console_shell(&state, account.clone(), csrf, "networks"),
             name: network.name,
             kind: network.kind.as_db_str(),
             addr: network.addr,
@@ -6384,7 +6326,6 @@ mod pages {
         error: Option<FormFieldError>,
         success: Option<NetworkPreflightView>,
     ) -> Response {
-        let is_admin = is_admin_account(state, &account);
         let networks = match console_network_views(state, &account).await {
             Ok(n) => n,
             Err(r) => return r,
@@ -6394,12 +6335,7 @@ mod pages {
             None => None,
         };
         render_private(ConsoleNetworks {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin,
-                active: "networks",
-            },
+            shell: console_shell(state, account, csrf, "networks"),
             networks,
             attach_addr,
             presets: IRC_NETWORK_PRESETS,
@@ -6654,14 +6590,8 @@ mod pages {
         can_store_secrets: bool,
         error: Option<String>,
     ) -> Response {
-        let is_admin = is_admin_account(state, &account); // shell nav only
         render_private(ConsoleNetworkEdit {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin,
-                active: "networks",
-            },
+            shell: console_shell(state, account, csrf, "networks"),
             name,
             addr,
             tls,
@@ -6942,12 +6872,7 @@ mod pages {
             })
             .collect();
         Ok(ConsoleIntegrations {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "integrations",
-            },
+            shell: console_shell(state, account, csrf, "integrations"),
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
             error,
@@ -7365,7 +7290,6 @@ mod pages {
         let csrf = session_token(headers, state.secure_cookies)
             .map(|s| state.csrf_token(&s))
             .unwrap_or_default();
-        let is_admin = is_admin_account(state, &account);
         let page =
             list_live_connections(state, query.core_query(own.then_some(account.as_str()))).await;
         let (sessions, next_before_id, mut error) = match page {
@@ -7443,12 +7367,7 @@ mod pages {
             .to_owned();
         let oper_filter = query.oper.map(|oper| oper.to_string()).unwrap_or_default();
         render_private(ConsoleSessions {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin,
-                active,
-            },
+            shell: console_shell(state, account, csrf, active),
             title,
             hint,
             disconnect_action,
@@ -7676,12 +7595,7 @@ mod pages {
             return problem(StatusCode::BAD_REQUEST, "Not a bridge", None);
         };
         render_private(ConsoleBridgeEdit {
-            shell: ConsoleShell {
-                account,
-                csrf,
-                is_admin: true,
-                active: "integrations",
-            },
+            shell: console_shell(state, account, csrf, "integrations"),
             name: row.name,
             platform: meta.name,
             needs_nick: meta.needs_nick,
