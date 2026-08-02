@@ -629,14 +629,31 @@ pub(super) fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d:
 
 // ---- topic --------------------------------------------------------------
 
+/// Look up a channel by name, or answer `ERR_NOSUCHCHANNEL` and return
+/// `None` — the prologue every channel-targeted command shares. (Written
+/// borrow-safe: the `contains_key` probe ends before the reply borrows
+/// `state` mutably.)
+fn require_channel<'a>(
+    state: &'a mut ServerState,
+    conn: ConnId,
+    target: &str,
+) -> Option<(ChanKey, &'a Channel)> {
+    let key = state.chan_key(target);
+    if state.channels.contains_key(&key) {
+        let chan = state.channels.get(&key).expect("checked");
+        Some((key, chan))
+    } else {
+        state.err_nosuchchannel(conn, clip_echo(target));
+        None
+    }
+}
+
 pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p: &[&str]) {
     let Some(&target) = p.first() else {
         state.err_needmoreparams(conn, "TOPIC");
         return;
     };
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
-        state.err_nosuchchannel(conn, clip_echo(target));
+    let Some((key, chan)) = require_channel(state, conn, target) else {
         return;
     };
     let display = chan.name.clone();
@@ -1114,9 +1131,7 @@ fn emit_channel_list(
 
 pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
     let casemap = state.casemap;
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
-        state.err_nosuchchannel(conn, clip_echo(target));
+    let Some((key, chan)) = require_channel(state, conn, target) else {
         return;
     };
     let display = chan.name.clone();

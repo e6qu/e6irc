@@ -108,16 +108,14 @@ pub(super) fn chathistory_fail(
     detail: &str,
 ) {
     let server = state.config.server_name.clone();
-    let mut line = format!(":{server} FAIL CHATHISTORY {code}");
-    for param in context {
-        line.push(' ');
-        // Context params echo the client's own subcommand/target for
-        // attribution; clipped so the FAIL explaining an error is never itself
-        // discarded for length.
-        line.push_str(crate::core::handler::clip_echo(param));
-    }
-    line.push_str(" :");
-    line.push_str(detail);
+    // Context params echo the client's own subcommand/target for
+    // attribution; clipped so the FAIL explaining an error is never itself
+    // discarded for length.
+    let clipped: Vec<&str> = context
+        .iter()
+        .map(|p| crate::core::handler::clip_echo(p))
+        .collect();
+    let line = super::fail_line(&server, "CHATHISTORY", code, &clipped, detail);
     state.send(conn, &line);
 }
 

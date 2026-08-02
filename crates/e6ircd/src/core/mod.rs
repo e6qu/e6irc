@@ -164,6 +164,26 @@ pub enum Input {
     },
 }
 
+/// Drain framed line events into the core queue as [`Input`] lines. Returns
+/// `false` when the core is gone, so the connection stops directly rather
+/// than queueing into a void. Shared by the TCP and WebSocket read loops.
+pub(crate) async fn push_framed(
+    core_tx: &e6irc_queue::Sender<Input>,
+    conn: ConnId,
+    events: &mut Vec<e6irc_proto::framing::LineEvent>,
+) -> bool {
+    for event in events.drain(..) {
+        let input = match event {
+            e6irc_proto::framing::LineEvent::Line(line) => Input::Line { conn, line },
+            e6irc_proto::framing::LineEvent::TooLong => Input::OverlongLine { conn },
+        };
+        if core_tx.push(input).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// A mutation or live-state query requested by an authenticated HTTP console
 /// or API surface (DESIGN §9.4). Processed on the core thread via
 /// [`Input::Admin`], reusing the same live state, hot lists and persistence

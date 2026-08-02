@@ -106,7 +106,7 @@ pub(super) async fn ws_irc_conn(
     conn: crate::core::ConnId,
 ) {
     use crate::core::{Input, Output};
-    use e6irc_proto::framing::{LineBuffer, LineEvent};
+    use e6irc_proto::framing::LineBuffer;
 
     // Held for the whole connection; its Drop releases the per-IP slot.
     let (out_tx, mut out_rx) = e6irc_queue::queue::<Output>(e6irc_queue::Config {
@@ -189,14 +189,8 @@ pub(super) async fn ws_irc_conn(
                 let mut with_nl = data;
                 with_nl.push(b'\n');
                 framing.feed(&with_nl, &mut events);
-                for event in events.drain(..) {
-                    let input = match event {
-                        LineEvent::Line(line) => Input::Line { conn, line },
-                        LineEvent::TooLong => Input::OverlongLine { conn },
-                    };
-                    if core_tx.push(input).await.is_err() {
-                        break 'conn; // core gone: stop the connection directly
-                    }
+                if !crate::core::push_framed(&core_tx, conn, &mut events).await {
+                    break 'conn; // core gone: stop the connection directly
                 }
             }
         }

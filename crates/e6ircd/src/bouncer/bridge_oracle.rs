@@ -232,16 +232,33 @@ async fn discord_post(
     StatusCode::NO_CONTENT
 }
 
+/// The Slack oracle's request gate: right provider, right query value, right
+/// bot bearer — or the Slack-shaped auth failure.
+fn slack_gate(
+    state: &OracleState,
+    headers: &HeaderMap,
+    query: &std::collections::HashMap<String, String>,
+    param: &str,
+    want: &str,
+) -> Option<axum::Json<serde_json::Value>> {
+    if !matches!(state.provider, Provider::Slack)
+        || query.get(param).map(String::as_str) != Some(want)
+        || bearer(headers) != "Bearer xoxb-token"
+    {
+        return Some(axum::Json(
+            serde_json::json!({ "ok": false, "error": "invalid_auth" }),
+        ));
+    }
+    None
+}
+
 async fn slack_channel(
     State(state): State<OracleState>,
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !matches!(state.provider, Provider::Slack)
-        || query.get("channel").map(String::as_str) != Some("C1")
-        || bearer(&headers) != "Bearer xoxb-token"
-    {
-        return axum::Json(serde_json::json!({ "ok": false, "error": "invalid_auth" }));
+    if let Some(fail) = slack_gate(&state, &headers, &query, "channel", "C1") {
+        return fail;
     }
     axum::Json(serde_json::json!({
         "ok": true,
@@ -254,11 +271,8 @@ async fn slack_user(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !matches!(state.provider, Provider::Slack)
-        || query.get("user").map(String::as_str) != Some("U1")
-        || bearer(&headers) != "Bearer xoxb-token"
-    {
-        return axum::Json(serde_json::json!({ "ok": false, "error": "invalid_auth" }));
+    if let Some(fail) = slack_gate(&state, &headers, &query, "user", "U1") {
+        return fail;
     }
     axum::Json(serde_json::json!({
         "ok": true,

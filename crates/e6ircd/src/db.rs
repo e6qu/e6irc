@@ -4472,6 +4472,30 @@ async fn lock_account_id(
         .map_err(DbError::Query)
 }
 
+/// Begin a password-mutation transaction: hash the new password, fold the
+/// account, and lock the account row. Returns the transaction, folded name,
+/// new hash, and account id — `None` when the account does not exist (each
+/// caller decides how to answer that: a dummy verification or a plain error).
+async fn begin_password_mutation<'a>(
+    pool: &'a PgPool,
+    account: &str,
+    new_password: &str,
+) -> Result<
+    (
+        sqlx::Transaction<'a, sqlx::Postgres>,
+        String,
+        String,
+        Option<i64>,
+    ),
+    DbError,
+> {
+    let new_hash = hash_password(new_password.to_string()).await?;
+    let folded = CaseMapping::Rfc1459.casefold(account);
+    let mut tx = pool.begin().await.map_err(DbError::Query)?;
+    let account_id = lock_account_id(&mut tx, &folded).await?;
+    Ok((tx, folded, new_hash, account_id))
+}
+
 /// Replace an account's primary password after verifying the current primary
 /// credential. The credential row is locked across verify-and-update so two
 /// concurrent rotations cannot both authorize against the same old password.
@@ -4481,10 +4505,8 @@ pub async fn change_local_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<(), DbError> {
-    let new_hash = hash_password(new_password.to_string()).await?;
-    let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id = lock_account_id(&mut tx, &folded).await?;
+    let (mut tx, folded, new_hash, account_id) =
+        begin_password_mutation(pool, account, new_password).await?;
     let Some(account_id) = account_id else {
         spend_dummy_verification(current_password.to_string()).await;
         return Err(DbError::BadCredentials);
@@ -4541,10 +4563,8 @@ pub async fn set_local_password(
     account: &str,
     new_password: &str,
 ) -> Result<(), DbError> {
-    let new_hash = hash_password(new_password.to_string()).await?;
-    let folded = CaseMapping::Rfc1459.casefold(account);
-    let mut tx = pool.begin().await.map_err(DbError::Query)?;
-    let account_id = lock_account_id(&mut tx, &folded).await?;
+    let (mut tx, folded, new_hash, account_id) =
+        begin_password_mutation(pool, account, new_password).await?;
     let Some(account_id) = account_id else {
         return Err(DbError::BadCredentials);
     };
@@ -5626,6 +5646,20 @@ fn token_hash(token: &str) -> Vec<u8> {
         .to_vec()
 }
 
+/// The `FROM web_sessions s JOIN accounts a ... WHERE s.token_hash = $1 AND
+/// s.expires_at > now()` fragment shared by the session-token lookups; the
+/// argument is the SELECT column list (`history_select!` precedent).
+macro_rules! session_lookup {
+    ($cols:literal) => {
+        concat!(
+            "SELECT ",
+            $cols,
+            " FROM web_sessions s JOIN accounts a ON a.id = s.account_id \
+             WHERE s.token_hash = $1 AND s.expires_at > now()"
+        )
+    };
+}
+
 /// The upstream identity a single-sign-on web session was minted from.
 ///
 /// These travel together and are all `Option<&str>` on the wire, so passing
@@ -5791,11 +5825,9 @@ pub async fn session_identity(
 ) -> Result<Option<WebSessionIdentity>, DbError> {
     // (account name, email, role, provider) as selected below.
     type IdentityRow = (String, Option<String>, Option<String>, Option<String>);
-    let row: Option<IdentityRow> = sqlx::query_as(
-        "SELECT a.name, s.oidc_email, s.oidc_role, s.oidc_provider FROM web_sessions s
-         JOIN accounts a ON a.id = s.account_id
-         WHERE s.token_hash = $1 AND s.expires_at > now()",
-    )
+    let row: Option<IdentityRow> = sqlx::query_as(session_lookup!(
+        "a.name, s.oidc_email, s.oidc_role, s.oidc_provider"
+    ))
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
@@ -5954,15 +5986,11 @@ pub async fn session_logout_hint(
 
 /// Resolve a session token to its account name, if valid and unexpired.
 pub async fn session_account(pool: &PgPool, token: &str) -> Result<Option<String>, DbError> {
-    sqlx::query_scalar(
-        "SELECT a.name FROM web_sessions s
-         JOIN accounts a ON a.id = s.account_id
-         WHERE s.token_hash = $1 AND s.expires_at > now()",
-    )
-    .bind(token_hash(token))
-    .fetch_optional(pool)
-    .await
-    .map_err(DbError::Query)
+    sqlx::query_scalar(session_lookup!("a.name"))
+        .bind(token_hash(token))
+        .fetch_optional(pool)
+        .await
+        .map_err(DbError::Query)
 }
 
 /// Delete a session (logout). Deleting an unknown token is not an

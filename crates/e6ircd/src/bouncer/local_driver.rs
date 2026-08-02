@@ -283,6 +283,26 @@ mod tests {
             .expect("local session task")
     }
 
+    /// Spawn a session and drive it through registration to the `Connected`
+    /// event — the shared setup of the lifecycle tests. Returns everything;
+    /// a test keeps only what it drives next.
+    async fn connected_session() -> (
+        Receiver<Input>,
+        NetworkHandle,
+        broadcast::Receiver<super::super::DriverEvent>,
+        tokio::task::JoinHandle<super::super::SessionOutcome>,
+        Sender<Output>,
+    ) {
+        let (core_tx, mut core_rx) = core_queue(8);
+        let (handle, mut events, task) = spawn_session(core_tx, Vec::new());
+        let out_tx = finish_registration(&mut core_rx).await;
+        assert!(matches!(
+            events.recv().await,
+            Ok(super::super::DriverEvent::Connected)
+        ));
+        (core_rx, handle, events, task, out_tx)
+    }
+
     #[tokio::test]
     async fn autojoin_failure_stops_before_connected() {
         // Capacity one lets registration fill the queue with USER and park on
@@ -315,13 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn pong_failure_stops_when_the_core_is_gone() {
-        let (core_tx, mut core_rx) = core_queue(8);
-        let (_handle, mut events, task) = spawn_session(core_tx, Vec::new());
-        let out_tx = finish_registration(&mut core_rx).await;
-        assert!(matches!(
-            events.recv().await,
-            Ok(super::super::DriverEvent::Connected)
-        ));
+        let (core_rx, _handle, _events, task, out_tx) = connected_session().await;
         drop(core_rx);
 
         out_tx
@@ -336,13 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn downstream_failure_does_not_retry_a_closed_core() {
-        let (core_tx, mut core_rx) = core_queue(8);
-        let (handle, mut events, task) = spawn_session(core_tx, Vec::new());
-        let _out_tx = finish_registration(&mut core_rx).await;
-        assert!(matches!(
-            events.recv().await,
-            Ok(super::super::DriverEvent::Connected)
-        ));
+        let (core_rx, handle, _events, task, _out_tx) = connected_session().await;
         drop(core_rx);
 
         assert_eq!(
