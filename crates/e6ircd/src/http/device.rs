@@ -815,6 +815,109 @@ pub(super) async fn admin_server_bans(
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminServerBanBody {
+    kind: String,
+    mask: String,
+    #[serde(default)]
+    reason: String,
+}
+
+pub(super) async fn admin_create_server_ban(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminServerBanBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    server_ban_response(
+        &state,
+        crate::core::AdminRequest::AddServerBan {
+            mask: body.mask,
+            kind: body.kind,
+            reason: body.reason,
+            actor,
+        },
+        StatusCode::CREATED,
+    )
+    .await
+}
+
+pub(super) async fn admin_delete_server_ban(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    if id <= 0 {
+        return problem(StatusCode::BAD_REQUEST, "Invalid server-ban id", None);
+    }
+    let ban = match crate::db::server_ban_directory_entry(pool_of(&state), id).await {
+        Ok(Some(ban)) => ban,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such server ban", None),
+        Err(error) => return admin_db_error("server-ban lookup", error),
+    };
+    server_ban_response(
+        &state,
+        crate::core::AdminRequest::RemoveServerBan {
+            expected_id: Some(id),
+            mask: ban.mask,
+            kind: ban.kind,
+            actor,
+        },
+        StatusCode::NO_CONTENT,
+    )
+    .await
+}
+
+async fn server_ban_response(
+    state: &AppState,
+    request: crate::core::AdminRequest,
+    success: StatusCode,
+) -> Response {
+    match super::core_reply(state, request).await {
+        Ok(crate::core::AdminReply::Ok(_message)) if success == StatusCode::NO_CONTENT => {
+            let mut response = success.into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Ok(crate::core::AdminReply::Ok(message)) => {
+            let mut response = (
+                success,
+                axum::Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Ok(crate::core::AdminReply::BanErr { kind, message }) => {
+            let (status, title) = match kind {
+                crate::core::BanControlError::Invalid => {
+                    (StatusCode::BAD_REQUEST, "Invalid server ban")
+                }
+                crate::core::BanControlError::NotFound => {
+                    (StatusCode::NOT_FOUND, "No such server ban")
+                }
+                crate::core::BanControlError::Conflict => {
+                    (StatusCode::CONFLICT, "Server-ban change conflict")
+                }
+                crate::core::BanControlError::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server-ban control unavailable",
+                ),
+            };
+            problem(status, title, Some(&message))
+        }
+        Ok(_) | Err(_) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server-ban control unavailable",
+            None,
+        ),
+    }
+}
+
 #[derive(Default, serde::Deserialize)]
 pub(super) struct AuditQuery {
     pub(super) limit: Option<usize>,

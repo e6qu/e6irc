@@ -4003,37 +4003,40 @@ async fn admin_console_ban_and_channel_actions() {
         }
     };
 
-    // Add a K-line via the console -> 303 back to its owning page; the ban appears.
-    let body = "csrf=CSRF&kind=kline&mask=*@bad.example&reason=spam";
-    let body = body.replace("CSRF", &csrf);
+    // Add a K-line through the API; the persisted policy appears in the
+    // administrator directory after the core commits the transition.
+    let body = r#"{"kind":"kline","mask":"*@bad.example","reason":"spam"}"#;
     let add = format!(
-        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+        "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );
-    let (status, head, _) = request(http, &add).await;
-    assert_eq!(status, 303, "{head}");
-    assert!(
-        head.to_ascii_lowercase()
-            .contains("location: /console/bans"),
-        "{head}"
-    );
+    let (status, _, _) = request(http, &add).await;
+    assert_eq!(status, 201);
     assert!(
         policy_page_has("/console/bans", "No server bans are active.", false).await,
         "ban not listed after add"
     );
 
-    // Remove it -> 303; the server-ban directory is empty again.
-    let del = "csrf=CSRF&kind=kline&mask=*@bad.example".replace("CSRF", &csrf);
+    let directory = format!(
+        "GET /api/v1/admin/bans?kind=kline&mask=%2A%40bad.example HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &directory).await;
+    assert_eq!(status, 200, "{body}");
+    let ban_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["bans"][0]["id"]
+        .as_i64()
+        .expect("stable server-ban id");
+
+    // Delete that exact immutable policy resource; a client never selects a
+    // mutable visible mask for removal.
     let del_req = format!(
-        "POST /console/bans/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{del}",
-        del.len()
+        "DELETE /api/v1/admin/bans/{ban_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
     );
     let (status, _, _) = request(http, &del_req).await;
-    assert_eq!(status, 303);
+    assert_eq!(status, 204);
     assert!(
         policy_page_has("/console/bans", "No server bans are active.", true).await,
         "ban still listed after remove"

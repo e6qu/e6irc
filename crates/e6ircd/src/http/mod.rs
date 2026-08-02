@@ -406,7 +406,8 @@ async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result
     match core_reply(state, req).await? {
         crate::core::AdminReply::Ok(message) => Ok(message),
         crate::core::AdminReply::Err(message)
-        | crate::core::AdminReply::ChannelErr { message, .. } => Err(message),
+        | crate::core::AdminReply::ChannelErr { message, .. }
+        | crate::core::AdminReply::BanErr { message, .. } => Err(message),
         crate::core::AdminReply::Connections(_) => {
             Err("unexpected live-connection reply for a mutation".into())
         }
@@ -1103,7 +1104,8 @@ documented_routes! {
     "/api/v1/admin/channels" => { get: admin_channels },
     "/api/v1/admin/channels/{name}" => { delete: delete_admin_channel },
     "/api/v1/admin/networks" => { get: admin_networks },
-    "/api/v1/admin/bans" => { get: admin_server_bans },
+    "/api/v1/admin/bans" => { get: admin_server_bans, post: admin_create_server_ban },
+    "/api/v1/admin/bans/{id}" => { delete: admin_delete_server_ban },
     "/api/v1/admin/audit" => { get: admin_audit },
     "/api/v1/admin/stats" => { get: admin_stats },
     "/api/v1/admin/observability" => { get: admin_observability },
@@ -7228,6 +7230,7 @@ mod pages {
             "/console/bans",
             AdminPolicyPage::ServerBans,
             |f, actor| crate::core::AdminRequest::RemoveServerBan {
+                expected_id: None,
                 mask: f.mask,
                 kind: f.kind,
                 actor,

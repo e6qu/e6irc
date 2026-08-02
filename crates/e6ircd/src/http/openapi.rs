@@ -984,6 +984,21 @@ fn document() -> serde_json::Value {
                     "responses": { "200": { "description": "server-ban policy and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, kind, or mask filter" },
                         "403": { "description": "not an admin account" } } }
+                ,"post": { "summary": "Create or refresh a K/D/X-line policy (admin only)",
+                    "description": "Uses the core-owned oper policy path, so persistence, immediate enforcement, matching-session disconnects, and audit provenance commit together.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": {
+                        "type": "object", "required": ["kind", "mask"],
+                        "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" } }
+                    } } } },
+                    "responses": { "201": { "description": "server ban created" }, "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
+            },
+            "/api/v1/admin/bans/{id}": {
+                "delete": { "summary": "Delete one immutable server-ban resource (admin only)",
+                    "description": "Resolves the stable directory ID before submitting the matching policy removal through the core. A stale ID cannot delete a recreated visible mask.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "204": { "description": "server ban removed" }, "400": { "description": "invalid ID" }, "403": { "description": "not an admin account" }, "404": { "description": "server ban no longer exists" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/audit": {
                 "get": { "summary": "Filter and page the privileged-action audit log (admin only)",

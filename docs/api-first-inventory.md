@@ -75,8 +75,8 @@ operation's semantics.
 | `/console/accounts/{id}/suspension` | `PATCH /api/v1/admin/accounts/{id}` | Mapped | Return the committed suspension posture. |
 | `/console/accounts/{id}/administrator` | `PATCH /api/v1/admin/accounts/{id}` | Mapped | Return durable/effective authority distinctly. |
 | `/console/admin/networks/{owner}/{name}/toggle` | `PATCH /api/v1/admin/networks/{owner}/{name}` | Gap | Add an administrator-scoped audited lifecycle patch. |
-| `/console/bans` | `POST /api/v1/admin/bans` | Gap | Add typed audited K/D/X-line creation. |
-| `/console/bans/delete` | `DELETE /api/v1/admin/bans/{id-or-key}` | Gap | Choose one immutable identifier and preserve casefolded removal semantics. |
+| `/console/bans` | `POST /api/v1/admin/bans` | Mapped | Use the typed audited K/D/X-line creation resource. |
+| `/console/bans/delete` | `DELETE /api/v1/admin/bans/{id}` | Mapped | Resolve the immutable ID before the core preserves casefolded removal semantics. |
 | `/console/sessions/{id}/disconnect` | `DELETE /api/v1/admin/connections/{id}` | Mapped | Keep exact immutable-ID disconnect semantics. |
 
 ## Managed configuration

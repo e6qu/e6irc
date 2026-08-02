@@ -3653,6 +3653,7 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
     );
 
     let remove = e6ircd::core::ServerBanMutation::Remove {
+        expected_id: None,
         mask: "baddie@*".into(),
         mask_display: "Baddie@*".into(),
         kind: "kline".into(),
