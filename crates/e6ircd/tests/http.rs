@@ -4039,7 +4039,8 @@ async fn admin_console_ban_and_channel_actions() {
         "ban still listed after remove"
     );
 
-    // Drop the registered channel -> 303; the channel registry becomes empty.
+    // Drop the registered channel through its administrator API resource; the
+    // registry becomes empty after the core commits the ordered transition.
     assert!(
         policy_page_has(
             "/console/admin/channels",
@@ -4049,15 +4050,13 @@ async fn admin_console_ban_and_channel_actions() {
         .await,
         "channel not listed to begin with"
     );
-    let drop_body = "csrf=CSRF&channel=%23dropme".replace("CSRF", &csrf);
     let drop_req = format!(
-        "POST /console/admin/channels/drop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{drop_body}",
-        drop_body.len()
+        "DELETE /api/v1/admin/channels/%23dropme HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
+         Connection: close\r\n\r\n"
     );
     let (status, _, _) = request(http, &drop_req).await;
-    assert_eq!(status, 303);
+    assert_eq!(status, 204);
     assert!(
         policy_page_has(
             "/console/admin/channels",

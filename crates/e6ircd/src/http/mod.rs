@@ -1101,6 +1101,7 @@ documented_routes! {
     "/api/v1/admin/connections" => { get: admin_connections },
     "/api/v1/admin/connections/{id}" => { delete: admin_disconnect_connection },
     "/api/v1/admin/channels" => { get: admin_channels },
+    "/api/v1/admin/channels/{name}" => { delete: delete_admin_channel },
     "/api/v1/admin/networks" => { get: admin_networks },
     "/api/v1/admin/bans" => { get: admin_server_bans },
     "/api/v1/admin/audit" => { get: admin_audit },

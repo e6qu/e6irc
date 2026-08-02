@@ -960,6 +960,22 @@ fn document() -> serde_json::Value {
                         "400": { "description": "invalid limit, cursor, channel, or founder filter" },
                         "403": { "description": "not an admin account" } } }
             },
+            "/api/v1/admin/channels/{name}": {
+                "delete": {
+                    "summary": "Unregister one registered channel (admin only)",
+                    "description": "Uses the same ordered core control path as ChanServ DROP. The canonical channel name is validated before its durable registration and live state are removed, and the action is audited.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "name", "in": "path", "required": true,
+                        "schema": { "type": "string" } }],
+                    "responses": {
+                        "204": { "description": "channel unregistered" },
+                        "400": { "description": "invalid channel name" },
+                        "403": { "description": "not an admin account" },
+                        "404": { "description": "channel is not registered" },
+                        "503": { "description": "channel control unavailable" }
+                    }
+                }
+            },
             "/api/v1/admin/bans": {
                 "get": { "summary": "Filter and page persisted K/D/X-line policy (admin only)",
                     "description": "Returns stable policy IDs newest-first. before_id selects strictly older rows, so concurrent policy additions cannot duplicate or skip entries. Kind is a closed exact filter; mask matching is exact under RFC1459 case-folding while display casing is preserved.",
