@@ -654,6 +654,135 @@ pub(super) async fn admin_configuration(
     }))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminOperBody {
+    revision: i64,
+    name: String,
+    password: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminConfigRevision {
+    revision: i64,
+}
+
+pub(super) async fn admin_create_oper(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminOperBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(key) = &state.secret_key else {
+        return problem(
+            StatusCode::CONFLICT,
+            "Master key required",
+            Some("Operator passwords cannot be stored without a master key."),
+        );
+    };
+    let name = body.name.trim();
+    if name.is_empty() || body.password.is_empty() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid operator",
+            Some("Operator name and password are required."),
+        );
+    }
+    mutate_oper_configuration(&state, &actor, body.revision, |settings| {
+        if settings.credentials_from_bootstrap {
+            return Err("Configure a master key and restart before changing bootstrap operator credentials.".into());
+        }
+        settings.opers.push(crate::config::OperConfig { name: name.to_string(), password: key.seal(&body.password, crate::secret::CONFIG_CONTEXT) });
+        Ok(format!("added IRC operator {name}"))
+    }).await
+}
+
+pub(super) async fn admin_delete_oper(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    mutate_oper_configuration(&state, &actor, body.revision, |settings| {
+        if settings.credentials_from_bootstrap {
+            return Err("Configure a master key and restart before changing bootstrap operator credentials.".into());
+        }
+        let before = settings.opers.len();
+        settings.opers.retain(|oper| oper.name != name);
+        if settings.opers.len() == before { return Err(format!("No IRC operator named '{name}'.")); }
+        Ok(format!("removed IRC operator {name}"))
+    }).await
+}
+
+async fn mutate_oper_configuration(
+    state: &AppState,
+    actor: &str,
+    revision: i64,
+    change: impl FnOnce(&mut crate::config::ManagedConfig) -> Result<String, String>,
+) -> Response {
+    let Some(config) = &state.managed_config else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable",
+            None,
+        );
+    };
+    let mut current = config.write().await;
+    if current.revision != revision {
+        return problem(
+            StatusCode::CONFLICT,
+            "Configuration revision conflict",
+            Some("Reload the configuration and retry with its current revision."),
+        );
+    }
+    let mut settings = current.settings.clone();
+    let detail = match change(&mut settings) {
+        Ok(detail) => detail,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid configuration change",
+                Some(&error),
+            );
+        }
+    };
+    if let Err(error) = settings.validate() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid configuration change",
+            Some(&error.to_string()),
+        );
+    }
+    match crate::db::save_managed_config(
+        pool_of(state),
+        revision,
+        &settings,
+        actor,
+        &format!("{detail}; restart required"),
+    )
+    .await
+    {
+        Ok(snapshot) => {
+            *current = snapshot.clone();
+            admin_json(serde_json::json!({ "revision": snapshot.revision, "message": detail }))
+        }
+        Err(crate::db::DbError::StaleServerSettings) => problem(
+            StatusCode::CONFLICT,
+            "Configuration revision conflict",
+            Some("Reload the configuration and retry with its current revision."),
+        ),
+        Err(error) => admin_db_error("operator configuration", error),
+    }
+}
+
 #[derive(Default, serde::Deserialize)]
 pub(super) struct RegisteredChannelDirectoryQuery {
     pub(super) limit: Option<usize>,

@@ -1110,6 +1110,8 @@ documented_routes! {
     "/api/v1/admin/audit" => { get: admin_audit },
     "/api/v1/admin/stats" => { get: admin_stats },
     "/api/v1/admin/configuration" => { get: admin_configuration },
+    "/api/v1/admin/configuration/opers" => { post: admin_create_oper },
+    "/api/v1/admin/configuration/opers/{name}" => { delete: admin_delete_oper },
     "/api/v1/admin/observability" => { get: admin_observability },
     "/api/v1/admin/metrics" => { get: admin_metrics },
 }

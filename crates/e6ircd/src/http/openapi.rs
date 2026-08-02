@@ -1021,6 +1021,17 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "responses": { "200": { "description": "redacted settings and revision" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } }
             },
+            "/api/v1/admin/configuration/opers": {
+                "post": { "summary": "Add an IRC operator to managed configuration", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "password"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "password": { "type": "string", "writeOnly": true } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/opers/{name}": {
+                "delete": { "summary": "Remove an IRC operator from managed configuration", "security": authenticated,
+                    "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+            },
             "/api/v1/admin/networks": {
                 "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
                     "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
