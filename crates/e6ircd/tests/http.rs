@@ -1798,16 +1798,20 @@ async fn console_configuration_manages_every_credential_collection() {
     let csrf = csrf_from_html(&page).to_string();
 
     let oper_secret = "operator-password-must-not-render";
-    let oper_form = format!("csrf={csrf}&name=netop&password={oper_secret}");
-    let (status, _, page) = request(
-        http,
-        &cookie_form_post("/console/configuration/opers", &session, &oper_form),
-    )
-    .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains("added IRC operator netop"), "{page}");
-    assert!(page.contains("<code>netop</code>"), "{page}");
-    assert!(!page.contains(oper_secret), "{page}");
+    let oper_body = format!(r#"{{"revision":1,"name":"netop","password":"{oper_secret}"}}"#);
+    let oper_request = format!(
+        "POST /api/v1/admin/configuration/opers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{oper_body}",
+        oper_body.len()
+    );
+    let (status, _, body) = request(http, &oper_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        2
+    );
+    assert!(!body.contains(oper_secret), "{body}");
 
     let oidc_secret = "provider-secret-must-not-render";
     let oidc_form = format!(
@@ -1926,12 +1930,21 @@ async fn console_configuration_manages_every_credential_collection() {
         assert!(!detail.contains(upstream_secret), "{detail}");
     }
 
+    let delete_oper_body = r#"{"revision":4}"#;
+    let delete_oper = format!(
+        "DELETE /api/v1/admin/configuration/opers/netop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_oper_body}",
+        delete_oper_body.len()
+    );
+    let (status, _, body) = request(http, &delete_oper).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        5
+    );
+
     for (path, body, message) in [
-        (
-            "/console/configuration/opers/delete",
-            format!("csrf={csrf}&name=netop"),
-            "removed IRC operator netop",
-        ),
         (
             "/console/configuration/oidc/delete",
             format!("csrf={csrf}&name=workforce"),
