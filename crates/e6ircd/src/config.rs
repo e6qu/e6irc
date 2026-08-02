@@ -1718,6 +1718,18 @@ mod tests {
         })
     }
 
+    /// A test config with the standard listener and `[bnc]`/`[database]`
+    /// scaffolding around the given networks — shared by the validation tests.
+    fn config_with(networks: Vec<NetworkEntry>) -> Config {
+        Config {
+            listeners: vec![listener()],
+            networks,
+            bnc: bnc(),
+            database: db(),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn irc_network_address_requires_host_and_nonzero_numeric_port() {
         for addr in [
@@ -1741,25 +1753,13 @@ mod tests {
 
         let mut network = net("ipv6", None);
         network.addr = "[2001:db8::1]:6697".into();
-        let cfg = Config {
-            listeners: vec![listener()],
-            networks: vec![network],
-            bnc: bnc(),
-            database: db(),
-            ..Config::default()
-        };
+        let cfg = config_with(vec![network]);
         cfg.validate().expect("bracketed IPv6 address is valid");
     }
 
     #[test]
     fn bridge_config_uses_the_same_canonical_shapes_as_the_driver_factory() {
-        let bridge_config = |network| Config {
-            listeners: vec![listener()],
-            networks: vec![network],
-            bnc: bnc(),
-            database: db(),
-            ..Config::default()
-        };
+        let bridge_config = |network| config_with(vec![network]);
         let mut matrix = net("matrix", None);
         matrix.kind = NetworkKind::Matrix;
         matrix.addr = "https://matrix.example".into();
@@ -1802,13 +1802,7 @@ mod tests {
 
     #[test]
     fn configured_network_credentials_are_complete_nonempty_and_bounded() {
-        let config = |network| Config {
-            listeners: vec![listener()],
-            networks: vec![network],
-            bnc: bnc(),
-            database: db(),
-            ..Config::default()
-        };
+        let config = |network| config_with(vec![network]);
         let mut irc = net("irc-sasl", None);
         irc.sasl_account = Some("alice".into());
         assert!(

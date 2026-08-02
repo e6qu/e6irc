@@ -21,7 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::config::{Config, TlsConfig};
 use crate::core::{ConnId, ConnectionIdAllocator, Core, CoreConfig, Input, Output};
 use crate::observability::{ErrorKind, Telemetry};
-use e6irc_proto::framing::{LineBuffer, LineEvent};
+use e6irc_proto::framing::LineBuffer;
 use e6irc_queue::{Policy, Receiver, Sender, queue};
 
 /// Traditional 512-byte line minus CRLF, plus the 4096-byte client tag
@@ -1176,14 +1176,8 @@ async fn read_loop<R>(
             Ok(0) => break "Connection closed".to_string(),
             Ok(n) => {
                 framing.feed(&buf[..n], &mut events);
-                for event in events.drain(..) {
-                    let input = match event {
-                        LineEvent::Line(line) => Input::Line { conn, line },
-                        LineEvent::TooLong => Input::OverlongLine { conn },
-                    };
-                    if core_tx.push(input).await.is_err() {
-                        return; // core gone
-                    }
+                if !crate::core::push_framed(core_tx, conn, &mut events).await {
+                    return; // core gone
                 }
             }
             Err(e) => {

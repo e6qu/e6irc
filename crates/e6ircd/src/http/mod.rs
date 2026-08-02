@@ -345,6 +345,25 @@ fn problem(status: StatusCode, title: &str, detail: Option<&str>) -> Response {
         .into_response()
 }
 
+/// Map an account-authority lifecycle failure to its HTTP status: the
+/// self-targeting and last-administrator refusals are client conflicts the
+/// caller can fix; anything else is a store fault — logged, never detailed
+/// to the client. One rule for the suspend and authority-change endpoints.
+fn authority_error_status(context: &str, error: crate::db::DbError) -> (StatusCode, String) {
+    match error {
+        crate::db::DbError::CannotSuspendSelf
+        | crate::db::DbError::CannotDemoteSelf
+        | crate::db::DbError::LastAdministrator => (StatusCode::CONFLICT, error.to_string()),
+        _ => {
+            eprintln!("{context} failed: {error}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database unavailable".into(),
+            )
+        }
+    }
+}
+
 /// A JSON response with `no-store` cache control — the shared shape for
 /// private, per-account API payloads that must never be cached.
 fn json_no_store(value: impl serde::Serialize) -> Response {
@@ -497,18 +516,7 @@ pub(super) async fn mutate_account_suspension(
         &configured_administrators,
     )
     .await
-    .map_err(|error| match error {
-        crate::db::DbError::CannotSuspendSelf | crate::db::DbError::LastAdministrator => {
-            (StatusCode::CONFLICT, error.to_string())
-        }
-        _ => {
-            eprintln!("account lifecycle mutation failed: {error}");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable".into(),
-            )
-        }
-    })?
+    .map_err(|error| authority_error_status("account lifecycle mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
 
     if suspended {
@@ -580,18 +588,7 @@ pub(super) async fn mutate_account_administrator(
         &configured_administrators,
     )
     .await
-    .map_err(|error| match error {
-        crate::db::DbError::CannotDemoteSelf | crate::db::DbError::LastAdministrator => {
-            (StatusCode::CONFLICT, error.to_string())
-        }
-        _ => {
-            eprintln!("account authority mutation failed: {error}");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Database unavailable".into(),
-            )
-        }
-    })?
+    .map_err(|error| authority_error_status("account authority mutation", error))?
     .ok_or((StatusCode::NOT_FOUND, "No such account".into()))?;
     let configured = state.configured_admin_accounts.contains(&change.folded);
     let mut effective = state
@@ -2652,6 +2649,9 @@ mod pages {
         BridgeDeleteFields,
         BridgeFormFields,
         BridgeEditFormFields,
+        BanForm,
+        BanDeleteForm,
+        DropChannelForm,
     );
 
     async fn account_form_actor<T: AccountForm>(
@@ -2759,6 +2759,33 @@ mod pages {
         success: &'static str,
         missing: &'static str,
         operation: &'static str,
+    }
+
+    /// The shared body of the "revoke one owned credential by id" console
+    /// handlers: authenticate the form actor, run the delete, and render the
+    /// outcome with the per-endpoint messages. `delete` is a boxed future so
+    /// the two async db fns fit one signature.
+    #[allow(clippy::type_complexity)] // HRTB boxed future — the only shape that fits two async db fns
+    async fn console_revoke_owned(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
+        id: i64,
+        delete: for<'a> fn(
+            &'a sqlx::PgPool,
+            &'a str,
+            i64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, crate::db::DbError>> + Send + 'a>,
+        >,
+        messages: AccountDeleteMessages,
+    ) -> Response {
+        let (account, _) = match account_form_actor(state, headers, form).await {
+            Ok(account) => account,
+            Err(response) => return response,
+        };
+        let result = delete(pool_of(state), &account, id).await;
+        account_delete_result(state, account, headers, result, messages).await
     }
 
     struct AccountIssueMessages {
@@ -2955,16 +2982,12 @@ mod pages {
         Path(id): Path<i64>,
         form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let result = crate::db::revoke_credential(pool_of(&state), &account, id).await;
-        account_delete_result(
+        console_revoke_owned(
             &state,
-            account,
             &headers,
-            result,
+            form,
+            id,
+            |pool, account, id| Box::pin(crate::db::revoke_credential(pool, account, id)),
             AccountDeleteMessages {
                 success: "App password revoked.",
                 missing: "No revocable app password with that identifier.",
@@ -3059,16 +3082,12 @@ mod pages {
         Path(id): Path<i64>,
         form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let result = crate::db::delete_api_token(pool_of(&state), &account, id).await;
-        account_delete_result(
+        console_revoke_owned(
             &state,
-            account,
             &headers,
-            result,
+            form,
+            id,
+            |pool, account, id| Box::pin(crate::db::delete_api_token(pool, account, id)),
             AccountDeleteMessages {
                 success: "Personal access token revoked.",
                 missing: "No personal access token with that identifier.",
@@ -3225,12 +3244,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
         match console_channels_build(&state, account, csrf, None).await {
             Ok(view) => render_private(view),
             Err(response) => response,
@@ -6090,15 +6107,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let (account, csrf) = match page_actor(&state, &headers, true).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
-        if !is_admin_account(&state, &account) {
-            return problem(StatusCode::FORBIDDEN, "Admin only", None);
-        }
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
         match console_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(resp) => resp,
@@ -6435,12 +6447,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
         let form = NetworkFormView::libera(&account);
         console_networks_page(&state, account, csrf, form, None, None).await
     }
@@ -6450,12 +6460,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
         let networks = match console_network_views(&state, &account).await {
             Ok(n) => n,
             Err(r) => return r,
@@ -7242,6 +7250,27 @@ mod pages {
         }
     }
 
+    /// The full console mutation flow for a csrf-carrying admin form: parse,
+    /// build the request from the form and actor, run it, and render the
+    /// policy-error page on failure. The admin mutation handlers differ only
+    /// in the request the form becomes.
+    async fn admin_policy_form<F: AccountForm>(
+        state: &AppState,
+        headers: &axum::http::HeaderMap,
+        form: Result<axum::Form<F>, axum::extract::rejection::FormRejection>,
+        redirect: &'static str,
+        error_page: AdminPolicyPage,
+        make: impl FnOnce(F, String) -> crate::core::AdminRequest,
+    ) -> Response {
+        let f = match parse_form(form) {
+            Ok(f) => f,
+            Err(r) => return r,
+        };
+        let csrf = f.csrf().to_string();
+        let make = |actor| make(f, actor);
+        admin_form_page(state, headers, &csrf, redirect, make, error_page).await
+    }
+
     /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
     /// and disconnects matching sessions exactly like oper KLINE.
     pub async fn console_add_ban(
@@ -7249,23 +7278,18 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BanForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
-        };
-        let make = |actor| crate::core::AdminRequest::AddServerBan {
-            mask: f.mask,
-            kind: f.kind,
-            reason: f.reason,
-            actor,
-        };
-        admin_form_page(
+        admin_policy_form(
             &state,
             &headers,
-            &f.csrf,
+            form,
             "/console/bans",
-            make,
             AdminPolicyPage::ServerBans,
+            |f, actor| crate::core::AdminRequest::AddServerBan {
+                mask: f.mask,
+                kind: f.kind,
+                reason: f.reason,
+                actor,
+            },
         )
         .await
     }
@@ -7276,22 +7300,17 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<BanDeleteForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
-        };
-        let make = |actor| crate::core::AdminRequest::RemoveServerBan {
-            mask: f.mask,
-            kind: f.kind,
-            actor,
-        };
-        admin_form_page(
+        admin_policy_form(
             &state,
             &headers,
-            &f.csrf,
+            form,
             "/console/bans",
-            make,
             AdminPolicyPage::ServerBans,
+            |f, actor| crate::core::AdminRequest::RemoveServerBan {
+                mask: f.mask,
+                kind: f.kind,
+                actor,
+            },
         )
         .await
     }
@@ -7302,21 +7321,16 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<DropChannelForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
-        };
-        let make = |actor| crate::core::AdminRequest::DropChannel {
-            channel: f.channel,
-            actor,
-        };
-        admin_form_page(
+        admin_policy_form(
             &state,
             &headers,
-            &f.csrf,
+            form,
             "/console/admin/channels",
-            make,
             AdminPolicyPage::RegisteredChannels,
+            |f, actor| crate::core::AdminRequest::DropChannel {
+                channel: f.channel,
+                actor,
+            },
         )
         .await
     }
@@ -7528,8 +7542,9 @@ mod pages {
         headers: axum::http::HeaderMap,
         Query(params): Query<OwnLiveConnectionQueryParams>,
     ) -> Response {
-        let Ok(account) = authenticate(&state, &headers).await else {
-            return Redirect::to("/login").into_response();
+        let (account, _) = match page_actor(&state, &headers, false).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
         };
         let query = match validate_live_connection_query(params.into(), 50) {
             Ok(query) => query,
@@ -7985,15 +8000,23 @@ mod pages {
     /// every personalized page can carry a useful CSP in every build. Inline
     /// styles remain necessary for the server-rendered traffic bars.
     fn render_private<T: Template>(template: T) -> Response {
+        render_with_security_headers(
+            template,
+            "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        )
+    }
+
+    /// Render a template with private-page caching and the shared security
+    /// headers (no-store, frame-deny, no-referrer). `csp` is the only thing
+    /// that varies between page families.
+    fn render_with_security_headers<T: Template>(template: T, csp: &'static str) -> Response {
         let mut response = render(template);
         if response.status().is_success() {
             let headers = response.headers_mut();
             no_store(headers);
             headers.insert(
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
-                    .parse()
-                    .expect("static header"),
+                csp.parse().expect("static header"),
             );
             headers.insert(
                 header::X_FRAME_OPTIONS,
@@ -8008,27 +8031,14 @@ mod pages {
     }
 
     fn render_auth<T: Template>(template: T) -> Response {
-        let mut response = render(template);
+        let mut response = render_with_security_headers(
+            template,
+            "default-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        );
         if response.status().is_success() {
-            let headers = response.headers_mut();
-            no_store(headers);
-            headers.insert(
-                header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-                    .parse()
-                    .expect("static header"),
-            );
-            headers.insert(
-                header::X_FRAME_OPTIONS,
-                "DENY".parse().expect("static header"),
-            );
-            headers.insert(
+            response.headers_mut().insert(
                 header::X_CONTENT_TYPE_OPTIONS,
                 "nosniff".parse().expect("static header"),
-            );
-            headers.insert(
-                header::REFERRER_POLICY,
-                "no-referrer".parse().expect("static header"),
             );
         }
         response

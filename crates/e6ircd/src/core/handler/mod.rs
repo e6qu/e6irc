@@ -187,6 +187,26 @@ pub(crate) fn clip_echo(token: &str) -> &str {
     e6irc_proto::message::truncate_on_char_boundary(token, 64)
 }
 
+/// The shared `:{server} FAIL <command> <code> [context] :<detail>` wire
+/// shape. The CHATHISTORY and multiline failure paths differ in label
+/// handling and context clipping, not in the line itself.
+pub(super) fn fail_line(
+    server: &str,
+    command: &str,
+    code: &str,
+    context: &[&str],
+    detail: &str,
+) -> String {
+    let mut line = format!(":{server} FAIL {command} {code}");
+    for param in context {
+        line.push(' ');
+        line.push_str(param);
+    }
+    line.push_str(" :");
+    line.push_str(detail);
+    line
+}
+
 /// Answer a query against a `+s` channel the requester can't see: report it as
 /// non-existent (`ERR_NOSUCHCHANNEL`), never a numeric that would confirm it
 /// exists. The [`Hidden`](crate::core::state::Hidden) proof can only come from

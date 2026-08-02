@@ -194,12 +194,12 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "NickServ", "Syntax: GHOST <nick>");
                 return;
             };
-            let Some(account) = state.sessions[&conn].account.clone() else {
-                state.service_notice(
-                    conn,
-                    "NickServ",
-                    "You must identify to services before using GHOST.",
-                );
+            let Some(account) = require_identified(
+                state,
+                conn,
+                "NickServ",
+                "You must identify to services before using GHOST.",
+            ) else {
                 return;
             };
             if state.casemap.casefold(&account) != state.casemap.casefold(nick) {
@@ -271,12 +271,12 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "ChanServ", "Syntax: REGISTER <#channel>");
                 return;
             };
-            let Some(account) = state.sessions[&conn].account.clone() else {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "You must identify to services before registering a channel.",
-                );
+            let Some(account) = require_identified(
+                state,
+                conn,
+                "ChanServ",
+                "You must identify to services before registering a channel.",
+            ) else {
                 return;
             };
             let key = state.chan_key(channel);
@@ -349,12 +349,12 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "ChanServ", "Syntax: DROP <#channel>");
                 return;
             };
-            let Some(account) = state.sessions[&conn].account.clone() else {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "You must identify to services before dropping a channel.",
-                );
+            let Some(account) = require_identified(
+                state,
+                conn,
+                "ChanServ",
+                "You must identify to services before dropping a channel.",
+            ) else {
                 return;
             };
             let key = state.chan_key(channel);
@@ -467,10 +467,7 @@ fn chanserv_registered_gate(
     channel: &str,
     identify_hint: &str,
 ) -> Option<(ChanKey, String)> {
-    let Some(account) = state.sessions[&conn].account.clone() else {
-        state.service_notice(conn, "ChanServ", identify_hint);
-        return None;
-    };
+    let account = require_identified(state, conn, "ChanServ", identify_hint)?;
     let key = state.chan_key(channel);
     if !state.is_registered(&key) {
         state.service_notice(
@@ -481,6 +478,22 @@ fn chanserv_registered_gate(
         return None;
     }
     Some((key, account))
+}
+
+/// Take the caller's account, or tell them to identify and return `None` —
+/// the login gate every services subcommand applies before touching
+/// account-owned state. `service` is the NOTICE sender (ChanServ/NickServ).
+fn require_identified(
+    state: &mut ServerState,
+    conn: ConnId,
+    service: &str,
+    hint: &str,
+) -> Option<String> {
+    let Some(account) = state.sessions[&conn].account.clone() else {
+        state.service_notice(conn, service, hint);
+        return None;
+    };
+    Some(account)
 }
 
 pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str]) {

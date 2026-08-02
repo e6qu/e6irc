@@ -560,28 +560,31 @@ impl Connection {
     async fn await_authenticate_challenge(&mut self) -> io::Result<()> {
         loop {
             let msg = self.recv("closed during SASL").await?;
-            // A SASL-refusal or registration-refusal numeric here is terminal —
-            // otherwise a server that rejects the mechanism (904/905/906/908) or
-            // the nick (433, ...) and holds the socket open hangs this loop
-            // forever. The sibling wait loops already do this; this one was
-            // missed.
-            if let Some(err) = registration_refused(&msg.command) {
+            if let Some(err) = self.sasl_terminal_error(&msg).await? {
                 return Err(err);
             }
-            match msg.command.as_str() {
-                "AUTHENTICATE" => return Ok(()),
-                "902" | "904" | "905" | "906" | "908" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "SASL authentication failed",
-                    ));
-                }
-                // Answer PINGs so auth can't be ping-timeout-killed.
-                _ => {
-                    self.answer_ping(&msg).await?;
-                }
+            if msg.command == "AUTHENTICATE" {
+                return Ok(());
             }
         }
+    }
+
+    /// In a SASL wait loop: the terminal errors — a registration-refusal
+    /// numeric (a rejected NICK can arrive mid-SASL, before the welcome) or a
+    /// SASL failure numeric. `Ok(None)` means keep looping; a PING was
+    /// answered on the way.
+    async fn sasl_terminal_error(&mut self, msg: &OwnedMessage) -> io::Result<Option<io::Error>> {
+        if let Some(err) = registration_refused(&msg.command) {
+            return Ok(Some(err));
+        }
+        if matches!(msg.command.as_str(), "902" | "904" | "905" | "906" | "908") {
+            return Ok(Some(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SASL authentication failed",
+            )));
+        }
+        self.answer_ping(msg).await?;
+        Ok(None)
     }
 
     /// After the credential is sent: wait for the SASL verdict, finish CAP on
@@ -591,28 +594,13 @@ impl Connection {
     async fn finish_sasl_then_welcome(&mut self, nick: &str) -> io::Result<String> {
         loop {
             let msg = self.recv("closed during SASL").await?;
-            // A registration-refusal numeric can arrive here, before the
-            // welcome — e.g. the server rejects the requested NICK (433) the
-            // moment it is sent, mid-SASL. Treat it as terminal in this loop
-            // too, or CAP END is sent and await_welcome blocks forever.
-            if let Some(err) = registration_refused(&msg.command) {
+            if let Some(err) = self.sasl_terminal_error(&msg).await? {
                 return Err(err);
             }
-            match msg.command.as_str() {
-                // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
-                "903" => {
-                    self.send_line("CAP END").await?;
-                    break;
-                }
-                "902" | "904" | "905" | "906" | "908" => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "SASL authentication failed",
-                    ));
-                }
-                _ => {
-                    self.answer_ping(&msg).await?;
-                }
+            // 903 RPL_SASLSUCCESS: authenticated — now finish CAP.
+            if msg.command == "903" {
+                self.send_line("CAP END").await?;
+                break;
             }
         }
         self.await_welcome(nick).await
@@ -890,7 +878,11 @@ impl Connection {
     }
 }
 
-fn is_join_refusal(command: &str) -> bool {
+/// The JOIN-refusal numerics (the set a client waits on to know a JOIN was
+/// rejected) — shared by the client crate's own drain loops and the CLI,
+/// which must fail on the same conditions rather than wait for a 366 that
+/// never comes.
+pub fn is_join_refusal(command: &str) -> bool {
     matches!(
         command,
         "403" | "405" | "471" | "473" | "474" | "475" | "476" | "477" | "480"

@@ -624,13 +624,7 @@ pub(super) fn multiline_fail(
     if let Some(label) = &label {
         line.push_str(&format!("@label={label} "));
     }
-    line.push_str(&format!(":{server} FAIL BATCH {code}"));
-    for param in context {
-        line.push(' ');
-        line.push_str(param);
-    }
-    line.push_str(" :");
-    line.push_str(detail);
+    line.push_str(&super::fail_line(&server, "BATCH", code, context, detail));
     match label {
         // This answers the BATCH that opened the batch, not whatever line
         // tripped it, so it must not also be framed as the current command's

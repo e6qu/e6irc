@@ -76,14 +76,25 @@ cd "$(dirname "$0")/.."
 # `spawn_db_offload`, the ChanServ registered gate split out of the founder
 # gate, the message Delivery/HistoryEntry construction hoisted out of the
 # channel/DM branch, and the OpenAPI cursor/confirmation fragments became
-# shared values).
+# shared values) → 1.8% (sweep 36: the admin ban/channel handlers became
+# one `admin_policy_form`, the credential-revocation handlers became
+# `console_revoke_owned`, the console GET handlers route through `page_actor`,
+# the lifecycle error map became `authority_error_status`, the session-token
+# lookups became a `session_lookup!` macro, the password-mutation prologue
+# became `begin_password_mutation`, the services identify-guard became
+# `require_identified`, the channel lookup became `require_channel`, the
+# FAIL line builders became `fail_line`, the render-private/render-auth
+# envelope became `render_with_security_headers`, the SASL loop terminal
+# check became `sasl_terminal_error`, the join-refusal numeric set moved
+# from the CLI to the client crate, the LineEvent drain became `push_framed`,
+# and the bridge-oracle Slack gate became `slack_gate`).
 #
 # What is left is mostly sqlx builder chains — `.bind().execute().await
 # .map_err()` — and per-route response shaping. Those are plumbing: abstracting
 # them would read worse than the repetition, so the number is expected to sit
 # here rather than keep falling. Lower it only when a real shared concept is
 # found, not by wrapping boilerplate to move a metric.
-THRESHOLD=2.1
+THRESHOLD=1.9
 JSCPD_VERSION=4.0.5
 
 echo "duplication guard: scanning crate source (jscpd@${JSCPD_VERSION}, threshold ${THRESHOLD}%) ..."

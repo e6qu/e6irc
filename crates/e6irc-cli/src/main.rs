@@ -10,18 +10,9 @@ use clap::{Parser, Subcommand};
 use e6irc_client::token_cache::{default_token_path, load_token};
 use e6irc_client::{
     Authentication, ClientEvent, Connection, ConnectionOptions, OwnedMessage, TerminalSafe,
+    is_join_refusal,
 };
 use serde::Serialize;
-
-/// IRC numerics that mean a JOIN was refused — so a `send`/`history` client
-/// bails with a clear error instead of waiting forever for a 366 that will
-/// never arrive.
-fn is_join_error(command: &str) -> bool {
-    matches!(
-        command,
-        "403" | "405" | "471" | "473" | "474" | "475" | "476" | "477" | "480"
-    )
-}
 
 /// IRC numerics that mean a PRIVMSG was not delivered — `send` exists to
 /// deliver one message, so any of these arriving during the post-send drain
@@ -266,7 +257,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     if msg.command == "366" {
                         break; // end of NAMES = joined
                     }
-                    if is_join_error(&msg.command) {
+                    if is_join_refusal(&msg.command) {
                         let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                         return Err(std::io::Error::other(format!(
                             "cannot join {target}: {reason}"
@@ -311,7 +302,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
                 // A refused JOIN must be reported, not waited on forever — the
                 // same loud failure Send and History give.
-                if target.starts_with('#') && is_join_error(&msg.command) {
+                if target.starts_with('#') && is_join_refusal(&msg.command) {
                     let reason = terminal_safe(&msg.params.last().cloned().unwrap_or_default());
                     return Err(std::io::Error::other(format!(
                         "cannot join {target}: {reason}"
@@ -460,8 +451,8 @@ mod tests {
 
     #[test]
     fn join_errors_are_recognized() {
-        assert!(is_join_error("475"));
-        assert!(!is_join_error("366"));
+        assert!(is_join_refusal("475"));
+        assert!(!is_join_refusal("366"));
     }
 
     #[test]
