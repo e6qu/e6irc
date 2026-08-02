@@ -86,6 +86,8 @@ try {
 
   await page.goto(`${shauthOrigin}/apps`);
   await page.getByRole("link", { name: "Open e6irc secondary", exact: true }).click();
+  await page.waitForURL(`${secondaryOrigin}/login`);
+  await page.getByRole("link", { name: "Sign in with Shauth" }).click();
   await page.waitForURL(`${secondaryOrigin}/`);
   assert.equal(await page.locator("#username").count(), 0);
   await assertProductIdentity(page, secondaryOrigin, "admin@localhost.test", "admin");
