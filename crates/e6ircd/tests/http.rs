@@ -1850,6 +1850,21 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(page.contains("irc.example:6697"), "{page}");
     assert!(!page.contains(upstream_secret), "{page}");
 
+    let configuration_api = format!(
+        "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &configuration_api).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains(oper_secret), "{body}");
+    assert!(!body.contains(oidc_secret), "{body}");
+    assert!(!body.contains(upstream_secret), "{body}");
+    let api: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
+    assert_eq!(api["revision"], 4);
+    assert_eq!(api["settings"]["opers"][0]["password"], "");
+    assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
+    assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
+
     let verification_pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("verification pool");

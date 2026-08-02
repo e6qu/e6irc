@@ -1015,6 +1015,12 @@ fn document() -> serde_json::Value {
                     "responses": { "200": { "description": "counts" },
                         "403": { "description": "not an admin account" } } }
             },
+            "/api/v1/admin/configuration": {
+                "get": { "summary": "Read revisioned managed configuration (admin only)",
+                    "description": "Returns the compare-and-swap revision and redacted operational settings. OIDC client secrets, oper passwords, upstream SASL passwords, and secret bridge accounts are never returned.",
+                    "security": authenticated,
+                    "responses": { "200": { "description": "redacted settings and revision" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } }
+            },
             "/api/v1/admin/networks": {
                 "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
                     "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",

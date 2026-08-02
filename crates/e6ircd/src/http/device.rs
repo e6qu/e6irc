@@ -618,6 +618,42 @@ pub(super) async fn admin_stats(
     }
 }
 
+/// Return the revisioned managed configuration without credential material.
+/// A client can use `revision` as the compare-and-swap precondition for later
+/// writes, but no OIDC, oper, or upstream secret ever crosses this boundary.
+pub(super) async fn admin_configuration(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAccount,
+) -> Response {
+    let Some(config) = &state.managed_config else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable",
+            None,
+        );
+    };
+    let snapshot = config.read().await.clone();
+    let mut settings = snapshot.settings;
+    for provider in &mut settings.oidc_providers {
+        provider.client_secret.clear();
+    }
+    for oper in &mut settings.opers {
+        oper.password.clear();
+    }
+    for network in &mut settings.networks {
+        network.sasl_password = None;
+        if network.kind.account_is_secret() {
+            network.sasl_account = None;
+        }
+    }
+    admin_json(serde_json::json!({
+        "revision": snapshot.revision,
+        "updated_by": snapshot.updated_by,
+        "updated_at": snapshot.updated_at,
+        "settings": settings,
+    }))
+}
+
 #[derive(Default, serde::Deserialize)]
 pub(super) struct RegisteredChannelDirectoryQuery {
     pub(super) limit: Option<usize>,
