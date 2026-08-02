@@ -1388,10 +1388,12 @@ async fn full_buffer_evicts_oldest() {
                 .iter()
                 .filter(|l| l.contains("PRIVMSG #ring :message"))
                 .collect();
-            if messages.len() == 5 {
-                panic!("cap 3 held all 5 messages");
-            }
-            if messages.len() == 3 {
+            // Wait for message 5 to land — the buffer passes through an
+            // intermediate 3-message state (1, 2, 3) before 4 and 5 arrive
+            // and evict the oldest. Checking for the newest three
+            // specifically avoids that false positive on slower runners.
+            if messages.iter().any(|m| m.contains("message 5")) {
+                assert_eq!(messages.len(), 3, "{messages:?}");
                 assert!(messages[0].contains("message 3"), "{messages:?}");
                 assert!(messages[1].contains("message 4"), "{messages:?}");
                 assert!(messages[2].contains("message 5"), "{messages:?}");
