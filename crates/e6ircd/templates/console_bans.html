@@ -20,7 +20,7 @@
       </div>
     </div>
     <form class="field-grid" method="post" action="/console/bans">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Policy kind</span>
         <select name="kind" required>
@@ -108,7 +108,7 @@
                 <td>
                   <form class="cell-form" method="post" action="/console/bans/delete"
                         data-confirm="Remove {{ entry.kind }} {{ entry.mask }}?">
-                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                     <input type="hidden" name="kind" value="{{ entry.kind }}" />
                     <input type="hidden" name="mask" value="{{ entry.mask }}" />
                     <button class="danger" type="submit">Remove</button>

@@ -35,7 +35,7 @@
       </div>
     </div>
     <form class="field-grid" method="post" action="/console/accounts/invitations">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Account name</span>
         <input name="account" maxlength="64" autocomplete="off" placeholder="alice" required />
@@ -83,7 +83,7 @@
                   <form class="cell-form" method="post"
                         action="/console/accounts/invitations/{{ invitation.id }}/delete"
                         data-confirm="Revoke the invitation for {{ invitation.account_name }}?">
-                    <input type="hidden" name="csrf" value="{{ csrf }}" />
+                    <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                     <button class="danger" type="submit">Revoke</button>
                   </form>
                 </td>
@@ -117,7 +117,7 @@
       </div>
     </div>
     <form class="field-grid" method="post" action="/console/accounts/create">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Account name</span>
         <input name="account" maxlength="64" autocomplete="off" placeholder="alice" required />
@@ -222,7 +222,7 @@
                     <form class="cell-form" method="post"
                           action="/console/accounts/{{ entry.id }}/suspension"
                           data-confirm="{% if entry.suspended %}Reactivate {{ entry.name }} and restart its enabled networks?{% else %}Suspend {{ entry.name }}, revoke its sessions and tokens, disconnect its clients, and stop its networks?{% endif %}">
-                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <input type="hidden" name="suspended" value="{% if entry.suspended %}false{% else %}true{% endif %}" />
                       <button class="{% if !entry.suspended %}danger{% endif %}" type="submit">
                         {% if entry.suspended %}Reactivate{% else %}Suspend{% endif %}
@@ -231,7 +231,7 @@
                     <form class="cell-form account-delete-form" method="post"
                           action="/console/accounts/{{ entry.id }}/administrator"
                           data-confirm="{% if entry.administrator %}Remove durable administrator authority from {{ entry.name }}? A configuration grant, if shown, remains effective until configuration changes and restart.{% else %}Grant durable administrator authority to {{ entry.name }}?{% endif %}">
-                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <input type="hidden" name="administrator" value="{% if entry.administrator %}false{% else %}true{% endif %}" />
                       <button class="{% if entry.administrator %}danger{% endif %}" type="submit">
                         {% if entry.administrator %}Revoke durable admin{% else %}Grant durable admin{% endif %}
@@ -240,7 +240,7 @@
                     <form class="cell-form" method="post"
                           action="/console/accounts/{{ entry.id }}/delete"
                           data-confirm="Permanently delete {{ entry.name }}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.">
-                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <label class="field">
                         <span>Type <code>{{ entry.name }}</code> to delete</span>
                         <input name="confirmation" autocomplete="off" required />

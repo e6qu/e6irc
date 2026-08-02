@@ -21,7 +21,7 @@
       </div>
     </div>
     <form class="inline-control" method="post" action="/console/channels/register">
-      <input type="hidden" name="csrf" value="{{ csrf }}" />
+      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Live channel</span>
         <input name="channel" placeholder="#channel" required />
@@ -59,7 +59,7 @@
                 <p>Restored when the channel is recreated after becoming empty. Setter: {{ channel.topic_setter }}</p>
               </div>
               <form method="post" action="/console/channels/topic">
-                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <input type="hidden" name="channel" value="{{ channel.name }}" />
                 <label class="field">
                   <span>Topic <em>leave empty to clear</em></span>
@@ -68,7 +68,7 @@
                 <button class="primary" type="submit">Save topic</button>
               </form>
               <form class="inline-control" method="post" action="/console/channels/keeptopic">
-                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <input type="hidden" name="channel" value="{{ channel.name }}" />
                 <label class="field">
                   <span>Retention</span>
@@ -87,7 +87,7 @@
                 <p>Force boolean modes on or off whenever the channel exists. Lockable modes: <code>i m n s t C</code>.</p>
               </div>
               <form method="post" action="/console/channels/mlock">
-                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <input type="hidden" name="channel" value="{{ channel.name }}" />
                 <label class="field">
                   <span>MLOCK <em>empty clears</em></span>
@@ -116,7 +116,7 @@
                     <span class="tag">+{{ grant.flags }}</span>
                     <span class="meta">{% if grant.auto_op %}auto-op{% endif %}{% if grant.auto_op && grant.auto_voice %} · {% endif %}{% if grant.auto_voice %}auto-voice{% endif %}</span>
                     <form method="post" action="/console/channels/access/delete" data-confirm="Remove {{ grant.account }} from {{ channel.name }} access?">
-                      <input type="hidden" name="csrf" value="{{ csrf }}" />
+                      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <input type="hidden" name="channel" value="{{ channel.name }}" />
                       <input type="hidden" name="account" value="{{ grant.account }}" />
                       <button class="danger" type="submit">Remove</button>
@@ -126,7 +126,7 @@
               </div>
             {% endif %}
             <form class="access-create" method="post" action="/console/channels/access">
-              <input type="hidden" name="csrf" value="{{ csrf }}" />
+              <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
               <input type="hidden" name="channel" value="{{ channel.name }}" />
               <label class="field">
                 <span>Registered account</span>
@@ -146,7 +146,7 @@
             </div>
             <div class="danger-actions">
               <form method="post" action="/console/channels/founder" data-confirm="Transfer {{ channel.name }} to this account? You will lose founder control.">
-                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <input type="hidden" name="channel" value="{{ channel.name }}" />
                 <label class="field">
                   <span>New founder account</span>
@@ -155,7 +155,7 @@
                 <button type="submit">Transfer ownership</button>
               </form>
               <form method="post" action="/console/channels/drop" data-confirm="Unregister {{ channel.name }} and delete all durable channel settings?">
-                <input type="hidden" name="csrf" value="{{ csrf }}" />
+                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <input type="hidden" name="channel" value="{{ channel.name }}" />
                 <button class="danger" type="submit">Unregister channel</button>
               </form>

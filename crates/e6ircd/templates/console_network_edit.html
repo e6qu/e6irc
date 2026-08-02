@@ -6,7 +6,7 @@
         <div class="page-head"><div><p class="eyebrow">IRC network</p><h1>Edit {{ name }}</h1><p class="lede">Saving replaces the live upstream connection after the new values are validated.</p></div></div>
         <section class="panel">
         <form class="network-form" method="post" action="/console/networks/{{ name }}/edit">
-          <input type="hidden" name="csrf" value="{{ csrf }}" />
+          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <label class="field"><span>Server and port</span><input name="addr" value="{{ addr }}" required /></label>
           <label class="field"><span>Nickname</span><input name="nick" value="{{ nick }}" required /></label>
           <label class="field field-wide"><span>Real name <em>optional</em></span><input name="realname" value="{{ realname }}" /></label>
