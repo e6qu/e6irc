@@ -156,7 +156,7 @@ pub(super) async fn delete_admin_channel(
     {
         Ok(crate::core::AdminReply::Ok(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(crate::core::AdminReply::ChannelErr { kind, message }) => {
-            channel_error_response(kind, message)
+            channel_error_response(kind, message, "No such registered channel")
         }
         Ok(_) | Err(_) => problem(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -226,7 +226,7 @@ async fn control_response(
         )
             .into_response(),
         Ok(crate::core::AdminReply::ChannelErr { kind, message }) => {
-            channel_error_response(kind, message)
+            channel_error_response(kind, message, "No such owned channel")
         }
         Ok(crate::core::AdminReply::Err(message)) => problem(
             StatusCode::CONFLICT,
@@ -248,12 +248,16 @@ async fn control_response(
     }
 }
 
-fn channel_error_response(kind: crate::core::ChannelControlError, message: String) -> Response {
+fn channel_error_response(
+    kind: crate::core::ChannelControlError,
+    message: String,
+    not_found_title: &'static str,
+) -> Response {
     let (status, title) = match kind {
         crate::core::ChannelControlError::Invalid => {
             (StatusCode::BAD_REQUEST, "Invalid channel change")
         }
-        crate::core::ChannelControlError::NotFound => (StatusCode::NOT_FOUND, "No such channel"),
+        crate::core::ChannelControlError::NotFound => (StatusCode::NOT_FOUND, not_found_title),
         crate::core::ChannelControlError::Conflict => {
             (StatusCode::CONFLICT, "Channel change conflict")
         }
