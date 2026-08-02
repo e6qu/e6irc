@@ -55,6 +55,9 @@ jobs:
       # Structural server-rendered accessibility: every data table keeps an
       # accessible caption and every navigation landmark keeps a name.
       - run: python3 tools/check-template-accessibility.py
+      # API-first migration guard: every console mutation is explicitly mapped
+      # to its public API operation or recorded as an API gap.
+      - run: python3 tools/check-api-first-inventory.py
       # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
       # file-it-for-later idiom may be added to PLAN.md. The checkout is
       # shallow, so fetch main to diff the PLAN.md additions against; the guard
