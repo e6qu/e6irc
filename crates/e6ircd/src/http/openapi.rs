@@ -640,7 +640,24 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/credentials": {
                 "get": { "summary": "List the account's credentials", "security": authenticated,
-                    "responses": ok_json }
+                    "responses": ok_json },
+                "post": {
+                    "summary": "Mint an app password for the current browser-session account",
+                    "description": "Requires a cookie-authenticated browser session and session-bound CSRF. Bearer tokens cannot mint credentials.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "required": ["label"], "additionalProperties": false,
+                            "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 } } }
+                    } } },
+                    "responses": {
+                        "201": { "description": "the app password, shown once" },
+                        "400": { "description": "invalid label" },
+                        "401": { "description": "browser session required" },
+                        "403": { "description": "invalid or missing CSRF token" },
+                        "409": { "description": "credential cap reached" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
             },
             "/api/v1/me/credentials/{id}": {
                 "delete": { "summary": "Revoke an app password", "security": authenticated,

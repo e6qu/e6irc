@@ -9,23 +9,9 @@
     <a class="button-link" href="/api/v1/me/export">Download my data</a>
   </div>
 
-  {% if let Some(message) = outcome %}
-    <div class="{% if success %}banner-success{% else %}banner-error{% endif %}" role="{% if success %}status{% else %}alert{% endif %}">{{ message }}</div>
-  {% endif %}
-
-  {% if let Some(value) = secret %}
-    <section class="secret-reveal" aria-labelledby="new-secret-title">
-      <div>
-        <p class="eyebrow">Shown once</p>
-        <h2 id="new-secret-title">{{ secret_kind }}</h2>
-        <p>Copy this value before leaving the page. e6irc cannot retrieve it later.</p>
-      </div>
-      <div class="secret-value">
-        <code id="issued-secret">{{ value }}</code>
-        <button type="button" data-copy-target="issued-secret">Copy</button>
-      </div>
-    </section>
-  {% endif %}
+  <div id="account-api-result" role="status" aria-live="polite"></div>
+  <div id="account-api-secret"></div>
+  <noscript><div class="banner-error">JavaScript is required to manage account controls because they use the account API directly.</div></noscript>
 
   <section class="panel">
     <div class="panel-head">
@@ -35,7 +21,7 @@
       </div>
       <span class="tag">Private</span>
     </div>
-    <form class="inline-create" method="post" action="/console/account/profile">
+    <form class="inline-create" method="post" action="/api/v1/me/profile" data-api-account-profile>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Email address</span>
@@ -54,7 +40,7 @@
       </div>
       <span class="tag">Argon2id</span>
     </div>
-    <form class="field-grid" method="post" action="/console/account/password">
+    <form class="field-grid" method="post" action="/api/v1/me/password" data-api-account-password>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       {% if has_local_password %}
         <label class="field">
@@ -85,7 +71,7 @@
         </div>
         <span class="count">{{ credentials.len() }}</span>
       </div>
-      <form class="inline-create" method="post" action="/console/account/app-passwords">
+      <form class="inline-create" method="post" action="/api/v1/me/credentials" data-api-account-app-password>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
         <label class="field">
           <span>Label</span>
@@ -109,7 +95,7 @@
                   <td>{{ credential.last_used }}</td>
                   <td>
                     {% if credential.revocable %}
-                      <form class="cell-form" method="post" action="/console/account/app-passwords/{{ credential.id }}/delete" data-confirm="Revoke this app password?">
+                      <form class="cell-form" method="post" action="/api/v1/me/credentials/{{ credential.id }}" data-api-account-delete data-confirm="Revoke this app password?">
                         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                         <button class="danger" type="submit">Revoke</button>
                       </form>
@@ -134,7 +120,7 @@
         </div>
         <span class="count">{{ tokens.len() }}</span>
       </div>
-      <form class="inline-create" method="post" action="/console/account/tokens">
+      <form class="inline-create" method="post" action="/api/v1/me/tokens" data-api-account-token>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
         <label class="field">
           <span>Label</span>
@@ -173,7 +159,7 @@
                   <td>{{ token.created }}</td>
                   <td>{{ token.expires }}</td>
                   <td>
-                    <form class="cell-form" method="post" action="/console/account/tokens/{{ token.id }}/delete" data-confirm="Revoke this personal access token?">
+                    <form class="cell-form" method="post" action="/api/v1/me/tokens/{{ token.id }}" data-api-account-delete data-confirm="Revoke this personal access token?">
                       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <button class="danger" type="submit">Revoke</button>
                     </form>
@@ -216,7 +202,7 @@
               <small>Linked {{ identity.created }}</small>
             </div>
             {% if identities.len() > 1 || has_local_password %}
-              <form method="post" action="/console/account/identities/{{ identity.id }}/delete" data-confirm="Unlink this identity and revoke its browser sessions?">
+              <form method="post" action="/api/v1/me/identities/{{ identity.id }}" data-api-account-delete data-confirm="Unlink this identity and revoke its browser sessions?">
                 <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                 <button class="danger" type="submit">Unlink</button>
               </form>
@@ -288,7 +274,7 @@
         <p>This revokes every credential and session, erases private history, stops owned networks, and retires the account name. It cannot be undone.</p>
       </div>
     </div>
-    <form class="field-grid" method="post" action="/console/account/delete"
+    <form class="field-grid" method="post" action="/api/v1/me/account" data-api-account-delete-self
           data-confirm="Permanently delete {{ shell.account }} and all account-owned data? This cannot be undone.">
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field field-wide">

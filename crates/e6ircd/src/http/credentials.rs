@@ -178,13 +178,23 @@ pub(super) async fn create_app_password(
     if let Some(resp) = validate_label(&req.label) {
         return resp;
     }
-    match crate::db::issue_app_password(pool, &req.account, &req.password, &req.label).await {
+    app_password_issue_response(
+        crate::db::issue_app_password(pool, &req.account, &req.password, &req.label).await,
+        req.label,
+    )
+}
+
+fn app_password_issue_response(
+    result: Result<String, crate::db::DbError>,
+    label: String,
+) -> Response {
+    match result {
         Ok(secret) => (
             StatusCode::CREATED,
             [(header::CONTENT_TYPE, "application/json")],
             serde_json::json!({
                 "app_password": secret,
-                "label": req.label,
+                "label": label,
                 "note": "Store this now; it is not retrievable later.",
             })
             .to_string(),
@@ -202,6 +212,30 @@ pub(super) async fn create_app_password(
         ),
         Err(error) => database_unavailable("app password issuance", error),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SessionAppPasswordRequest {
+    pub(super) label: String,
+}
+
+/// Mint an app password for the browser-session account. This separate
+/// session-only resource preserves the public password-exchange endpoint's
+/// no-bearer-escalation contract while letting the console use its canonical
+/// API rather than a rendered mutation handler.
+pub(super) async fn create_session_app_password(
+    State(state): State<Arc<AppState>>,
+    SessionMutation(account): SessionMutation,
+    JsonBody(request): JsonBody<SessionAppPasswordRequest>,
+) -> Response {
+    if let Some(response) = validate_label(&request.label) {
+        return response;
+    }
+    app_password_issue_response(
+        crate::db::issue_app_password_for_account(pool_of(&state), &account, &request.label).await,
+        request.label,
+    )
 }
 
 #[derive(Deserialize)]
@@ -321,12 +355,31 @@ pub(super) async fn me_identities(
 /// in the same transaction.
 pub(super) async fn me_identity_unlink(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Authenticated(account): Authenticated,
     Path(id): Path<i64>,
 ) -> Response {
     let pool = pool_of(&state);
     match crate::db::unlink_oidc_identity(pool, &account, id).await {
-        Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => StatusCode::NO_CONTENT.into_response(),
+        Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => {
+            let Some(session) = session_token(&headers, state.secure_cookies) else {
+                return StatusCode::NO_CONTENT.into_response();
+            };
+            match crate::db::session_account(pool, &session).await {
+                Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
+                Ok(None) => {
+                    let mut response = StatusCode::NO_CONTENT.into_response();
+                    response.headers_mut().insert(
+                        header::SET_COOKIE,
+                        clear_session_cookie(state.secure_cookies)
+                            .parse()
+                            .expect("session clear cookie is valid"),
+                    );
+                    response
+                }
+                Err(error) => database_unavailable("identity-unlink session refresh", error),
+            }
+        }
         Ok(crate::db::UnlinkIdentityOutcome::LastLoginMethod) => problem(
             StatusCode::CONFLICT,
             "Last login method",

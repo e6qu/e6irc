@@ -837,6 +837,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-ban-create"), "{body}");
     assert!(body.contains("data-api-session-revoke"), "{body}");
     assert!(body.contains("data-api-session-disconnect"), "{body}");
+    assert!(body.contains("data-api-account-app-password"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
@@ -5386,19 +5387,17 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
-    let contact_form = format!("csrf={csrf}&contact_email=Alice%2BIRC%40Example.COM");
+    assert!(page.contains("data-api-account-profile"), "{page}");
+    assert!(page.contains("data-api-account-app-password"), "{page}");
+    let initial_profile = r#"{"contact_email":"Alice+IRC@Example.COM"}"#;
     let update_contact = format!(
-        "POST /console/account/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{contact_form}",
-        contact_form.len()
+        "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{initial_profile}",
+        initial_profile.len()
     );
     let (status, _, body) = request(http, &update_contact).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(
-        body.contains("Contact email updated") && body.contains("value=\"Alice+IRC@example.com\""),
-        "{body}"
-    );
+    assert_eq!(status, 204, "{body}");
     assert_eq!(
         e6ircd::db::account_contact_email(&pool, "alice")
             .await
@@ -5441,31 +5440,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         Some("Second@new.example".into())
     );
 
-    let password_form =
-        format!("csrf={csrf}&current_password=pw&new_password=new-pw&confirm_password=new-pw");
-    let change_password = format!(
-        "POST /console/account/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{password_form}",
-        password_form.len()
-    );
-    let (status, _, body) = request(http, &change_password).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Primary password changed"), "{body}");
-    assert_eq!(
-        e6ircd::db::verify_local_password(&pool, "alice", "pw")
-            .await
-            .expect("old password verify"),
-        None
-    );
-    assert_eq!(
-        e6ircd::db::verify_local_password(&pool, "alice", "new-pw")
-            .await
-            .expect("new password verify"),
-        Some("alice".into())
-    );
-
-    let api_password = r#"{"current_password":"new-pw","new_password":"api-pw"}"#;
+    let api_password = r#"{"current_password":"pw","new_password":"api-pw"}"#;
     let api_change_without_csrf = format!(
         "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\
@@ -5490,19 +5465,27 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         Some("alice".into())
     );
 
-    let app_form = format!("csrf={csrf}&label=Laptop");
+    let app_body = r#"{"label":"Laptop"}"#;
+    let create_app_without_csrf = format!(
+        "POST /api/v1/me/credentials HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{app_body}",
+        app_body.len()
+    );
+    let (status, _, body) = request(http, &create_app_without_csrf).await;
+    assert_eq!(status, 403, "{body}");
     let create_app = format!(
-        "POST /console/account/app-passwords HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{app_form}",
-        app_form.len()
+        "POST /api/v1/me/credentials HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{app_body}",
+        app_body.len()
     );
     let (status, _, body) = request(http, &create_app).await;
     assert_eq!(status, 201, "{body}");
     assert!(
-        body.contains("App password created")
-            && body.contains("id=\"issued-secret\"")
-            && body.contains(">Laptop<"),
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["app_password"]
+            .as_str()
+            .is_some_and(|secret| secret.starts_with("e6a_")),
         "{body}"
     );
     let credentials = e6ircd::db::list_credentials(&pool, "alice")
@@ -5514,21 +5497,19 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .map(|row| row.0)
         .expect("created app password");
 
-    let token_form =
-        format!("csrf={csrf}&label=Automation&expires_in_days=90&scope_read=on&scope_irc=on");
+    let token_body = r#"{"label":"Automation","expires_in_days":90,"scopes":["read","irc"]}"#;
     let create_token = format!(
-        "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{token_form}",
-        token_form.len()
+        "POST /api/v1/me/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{token_body}",
+        token_body.len()
     );
     let (status, _, body) = request(http, &create_token).await;
     assert_eq!(status, 201, "{body}");
     assert!(
-        body.contains("Personal access token created")
-            && body.contains("e6p_")
-            && body.contains(">Automation<")
-            && body.contains("read, irc"),
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+            .as_str()
+            .is_some_and(|secret| secret.starts_with("e6p_")),
         "{body}"
     );
     let tokens = e6ircd::db::list_api_tokens(&pool, "alice")
@@ -5551,30 +5532,26 @@ async fn account_console_manages_credentials_tokens_and_identities() {
             .contains(e6ircd::identity::ApiTokenScope::Write)
     );
 
-    let bad_form = "csrf=wrong&label=Rejected&expires_in_days=30&scope_read=on";
+    let bad_body = r#"{"label":"Rejected","expires_in_days":30,"scopes":["read"]}"#;
     let bad_create = format!(
-        "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{bad_form}",
-        bad_form.len()
+        "POST /api/v1/me/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad_body}",
+        bad_body.len()
     );
     let (status, _, _) = request(http, &bad_create).await;
     assert_eq!(status, 403);
 
     for (path, id) in [
-        ("/console/account/app-passwords", app_id),
-        ("/console/account/tokens", token_id),
+        ("/api/v1/me/credentials", app_id),
+        ("/api/v1/me/tokens", token_id),
     ] {
-        let revoke_form = format!("csrf={csrf}");
         let revoke = format!(
-            "POST {path}/{id}/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n{revoke_form}",
-            revoke_form.len()
+            "DELETE {path}/{id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
         );
         let (status, _, body) = request(http, &revoke).await;
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("revoked"), "{body}");
+        assert_eq!(status, 204, "{body}");
     }
     assert!(
         e6ircd::db::list_credentials(&pool, "alice")
@@ -5599,16 +5576,12 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .find(|row| row.2 == "alice-secondary")
         .map(|row| row.0)
         .expect("secondary identity");
-    let unlink_form = format!("csrf={csrf}");
     let unlink = format!(
-        "POST /console/account/identities/{unlink_id}/delete HTTP/1.1\r\nHost: t\r\n\
-         Cookie: e6irc_session={session}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{unlink_form}",
-        unlink_form.len()
+        "DELETE /api/v1/me/identities/{unlink_id} HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
     );
     let (status, headers, body) = request(http, &unlink).await;
-    assert_eq!(status, 200, "{headers}");
-    assert!(body.contains("Login identity unlinked"), "{body}");
+    assert_eq!(status, 204, "{headers}: {body}");
     assert!(
         !headers.contains("Max-Age=0"),
         "a valid local session must not be cleared: {headers}"

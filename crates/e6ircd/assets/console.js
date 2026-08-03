@@ -567,4 +567,148 @@
       void mutateSession(form, `${form.action}${query}`, "Disconnect request failed.");
     });
   }
+
+  const accountResult = document.getElementById("account-api-result");
+  const accountSecret = document.getElementById("account-api-secret");
+  const setAccountResult = (message, success) => {
+    if (!accountResult) return;
+    accountResult.textContent = message;
+    accountResult.className = success ? "banner-success" : "banner-error";
+  };
+
+  const showAccountSecret = (kind, value) => {
+    if (!accountSecret) return;
+    accountSecret.replaceChildren();
+    const section = document.createElement("section");
+    section.className = "secret-reveal";
+    const copy = document.createElement("button");
+    const code = document.createElement("code");
+    code.id = "issued-secret";
+    code.textContent = value;
+    copy.type = "button";
+    copy.textContent = "Copy";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(value);
+        copy.textContent = "Copied";
+      } catch (_) {
+        copy.textContent = "Select and copy manually";
+      }
+    });
+    const heading = document.createElement("h2");
+    heading.textContent = kind;
+    const valueBox = document.createElement("div");
+    valueBox.className = "secret-value";
+    valueBox.append(code, copy);
+    section.append(heading, valueBox);
+    accountSecret.append(section);
+  };
+
+  const mutateAccount = async (form, method, body, failure) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(form.action, {
+        method,
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-E6IRC-CSRF": csrf,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      const contentType = response.headers.get("content-type") || "";
+      return contentType.includes("application/json") ? response.json() : null;
+    } catch (error) {
+      setAccountResult(error instanceof Error ? error.message : failure, false);
+      if (submit) submit.disabled = false;
+      return undefined;
+    }
+  };
+
+  const reloadAccount = () => window.location.reload();
+
+  for (const form of document.querySelectorAll("[data-api-account-profile]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const email = fieldValue(new FormData(form), "contact_email");
+      void mutateAccount(form, "PATCH", { contact_email: email || null }, "Profile update failed.")
+        .then((result) => { if (result !== undefined) reloadAccount(); });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-account-password]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const current = fieldValue(fields, "current_password");
+      const next = fieldValue(fields, "new_password");
+      if (next !== fieldValue(fields, "confirm_password")) {
+        setAccountResult("The new password and confirmation do not match.", false);
+        return;
+      }
+      void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
+        .then((result) => { if (result !== undefined) reloadAccount(); });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-account-app-password]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const label = fieldValue(new FormData(form), "label");
+      if (!label) {
+        setAccountResult("Enter an app-password label.", false);
+        return;
+      }
+      void mutateAccount(form, "POST", { label }, "App-password creation failed.")
+        .then((result) => {
+          if (result === undefined) return;
+          showAccountSecret("App password", result.app_password);
+          setAccountResult("App password created. Copy it now; it cannot be shown again.", true);
+        });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-account-token]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const scopes = ["read", "write", "administrator", "irc"]
+        .filter((scope) => fields.has(`scope_${scope}`));
+      if (!scopes.length) {
+        setAccountResult("Choose at least one token scope.", false);
+        return;
+      }
+      void mutateAccount(form, "POST", {
+        label: fieldValue(fields, "label"),
+        scopes,
+        expires_in_days: Number(fields.get("expires_in_days")),
+      }, "Token creation failed.").then((result) => {
+        if (result === undefined) return;
+        showAccountSecret("Personal access token", result.token);
+        setAccountResult("Personal access token created. Copy it now; it cannot be shown again.", true);
+      });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-account-delete]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
+        .then((result) => { if (result !== undefined) reloadAccount(); });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-account-delete-self]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const confirmation = fieldValue(new FormData(form), "confirmation");
+      void mutateAccount(form, "DELETE", { confirmation }, "Account deletion failed.")
+        .then((result) => { if (result !== undefined) window.location.assign("/auth/signed-out"); });
+    });
+  }
 })();

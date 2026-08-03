@@ -372,20 +372,6 @@ fn json_no_store(value: impl serde::Serialize) -> Response {
     response
 }
 
-/// Redirect to `/login` while clearing the browser session cookie — the
-/// shared tail of the "this session is gone now" flows (account deletion,
-/// revoking one's own current browser session).
-fn redirect_signed_out(state: &AppState) -> Response {
-    let mut response = Redirect::to("/login").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        clear_session_cookie(state.secure_cookies)
-            .parse()
-            .expect("session clear cookie is valid"),
-    );
-    response
-}
-
 /// Parse an optional contact-email field, or return a `BAD_REQUEST` problem
 /// response for an invalid one. Shared by the profile and invitation handlers.
 pub(super) fn parse_optional_contact_email(
@@ -1077,7 +1063,7 @@ documented_routes! {
         put: put_channel_access,
         delete: delete_channel_access,
     },
-    "/api/v1/me/credentials" => { get: list_credentials },
+    "/api/v1/me/credentials" => { get: list_credentials, post: create_session_app_password },
     "/api/v1/me/credentials/{id}" => { delete: revoke_credential },
     "/api/v1/me/networks" => { get: list_networks, post: create_network },
     "/api/v1/me/networks/preflight" => { post: preflight_network },
@@ -1177,14 +1163,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
-        .route(
-            "/console/account/profile",
-            post(pages::console_update_profile),
-        )
-        .route(
-            "/console/account/delete",
-            post(pages::console_delete_own_account),
-        )
         .route("/console/channels", get(pages::console_channels))
         .route(
             "/console/channels/topic",
@@ -1215,30 +1193,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(pages::console_channel_founder),
         )
         .route("/console/channels/drop", post(pages::console_channel_drop))
-        .route(
-            "/console/account/app-passwords",
-            post(pages::console_create_app_password),
-        )
-        .route(
-            "/console/account/password",
-            post(pages::console_change_password),
-        )
-        .route(
-            "/console/account/app-passwords/{id}/delete",
-            post(pages::console_revoke_app_password),
-        )
-        .route(
-            "/console/account/tokens",
-            post(pages::console_create_api_token),
-        )
-        .route(
-            "/console/account/tokens/{id}/delete",
-            post(pages::console_revoke_api_token),
-        )
-        .route(
-            "/console/account/identities/{id}/delete",
-            post(pages::console_unlink_identity),
-        )
         .route("/console/monitoring", get(pages::console_monitoring))
         .route(
             "/console/monitoring/panel",
@@ -2370,20 +2324,12 @@ mod pages {
         security_activity: Vec<AuditRow>,
         contact_email: String,
         link_providers: Vec<String>,
-        outcome: Option<String>,
-        success: bool,
-        secret: Option<String>,
-        secret_kind: &'static str,
     }
 
     async fn account_build(
         state: &AppState,
         account: String,
         csrf: String,
-        outcome: Option<String>,
-        success: bool,
-        secret: Option<String>,
-        secret_kind: &'static str,
     ) -> Result<ConsoleAccount, Response> {
         let pool = pool_of(state);
         let credentials: Vec<CredentialView> = crate::db::list_credentials(pool, &account)
@@ -2467,10 +2413,6 @@ mod pages {
             security_activity,
             contact_email,
             link_providers,
-            outcome,
-            success,
-            secret,
-            secret_kind,
         })
     }
 
@@ -2535,129 +2477,10 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response,
         };
-        match account_build(&state, account, csrf, None, true, None, "").await {
+        match account_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
-    }
-
-    pub async fn console_update_profile(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountContactForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let contact_email = if form.contact_email.trim().is_empty() {
-            None
-        } else {
-            match crate::identity::ContactEmail::parse(form.contact_email.trim()) {
-                Ok(email) => Some(email),
-                Err(error) => {
-                    return account_result(
-                        &state,
-                        account,
-                        &headers,
-                        AccountResult::message(StatusCode::BAD_REQUEST, error.to_string()),
-                    )
-                    .await;
-                }
-            }
-        };
-        let result =
-            crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
-                .await;
-        let view = match result {
-            Ok(()) => AccountResult::message(
-                StatusCode::OK,
-                if contact_email.is_some() {
-                    "Contact email updated."
-                } else {
-                    "Contact email removed."
-                },
-            ),
-            Err(error) => {
-                eprintln!("http: contact email update failed: {error}");
-                AccountResult::message(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Contact email was not changed.",
-                )
-            }
-        };
-        account_result(&state, account, &headers, view).await
-    }
-
-    pub async fn console_delete_own_account(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<
-            axum::Form<AccountPermanentDeleteForm>,
-            axum::extract::rejection::FormRejection,
-        >,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if form.confirmation != account {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::BAD_REQUEST,
-                    "Account confirmation does not match. Supply the exact display-cased account name.",
-                ),
-            )
-            .await;
-        }
-        let account_id = match crate::db::account_id_by_name(pool_of(&state), &account).await {
-            Ok(Some(account_id)) => account_id,
-            Ok(None) => return Redirect::to("/login").into_response(),
-            Err(error) => return super::device::admin_db_error("account deletion target", error),
-        };
-        match delete_account_lifecycle(&state, &account, account_id, true).await {
-            Ok(_) => redirect_signed_out(&state),
-            Err((status, detail)) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(status, detail),
-                )
-                .await
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountLabelForm {
-        csrf: String,
-        label: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountContactForm {
-        csrf: String,
-        #[serde(default)]
-        contact_email: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountTokenForm {
-        csrf: String,
-        label: String,
-        expires_in_days: u16,
-        #[serde(default)]
-        scope_read: Option<String>,
-        #[serde(default)]
-        scope_write: Option<String>,
-        #[serde(default)]
-        scope_administrator: Option<String>,
-        #[serde(default)]
-        scope_irc: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -2669,15 +2492,6 @@ mod pages {
     pub struct AccountPermanentDeleteForm {
         csrf: String,
         confirmation: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountPasswordForm {
-        csrf: String,
-        #[serde(default)]
-        current_password: String,
-        new_password: String,
-        confirm_password: String,
     }
 
     trait AccountForm {
@@ -2697,12 +2511,8 @@ mod pages {
         };
     }
     account_form!(
-        AccountLabelForm,
-        AccountTokenForm,
-        AccountContactForm,
         AccountDeleteForm,
         AccountPermanentDeleteForm,
-        AccountPasswordForm,
         ToggleFields,
         NetworkFormFields,
         NetworkEditForm,
@@ -2733,501 +2543,6 @@ mod pages {
         let fields = parse_form(form)?;
         let account = require_admin_form_actor(state, headers, fields.csrf()).await?;
         Ok((account, fields))
-    }
-
-    async fn account_label_actor(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, String), Response> {
-        let (account, form) = account_form_actor(state, headers, form).await?;
-        if let Some(error) = label_validation_error(&form.label) {
-            return Err(account_result(
-                state,
-                account,
-                headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, error),
-            )
-            .await);
-        }
-        Ok((account, form.label))
-    }
-
-    struct AccountResult {
-        status: StatusCode,
-        message: String,
-        secret: Option<String>,
-        secret_kind: &'static str,
-    }
-
-    impl AccountResult {
-        fn message(status: StatusCode, message: impl Into<String>) -> Self {
-            Self {
-                status,
-                message: message.into(),
-                secret: None,
-                secret_kind: "",
-            }
-        }
-
-        fn issued(
-            status: StatusCode,
-            message: impl Into<String>,
-            secret: String,
-            secret_kind: &'static str,
-        ) -> Self {
-            Self {
-                status,
-                message: message.into(),
-                secret: Some(secret),
-                secret_kind,
-            }
-        }
-    }
-
-    async fn account_result(
-        state: &AppState,
-        account: String,
-        headers: &axum::http::HeaderMap,
-        result: AccountResult,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        match account_build(
-            state,
-            account,
-            csrf,
-            Some(result.message),
-            result.status.is_success(),
-            result.secret,
-            result.secret_kind,
-        )
-        .await
-        {
-            Ok(view) => {
-                let mut response = render_private(view);
-                *response.status_mut() = result.status;
-                response
-            }
-            Err(response) => response,
-        }
-    }
-
-    struct AccountDeleteMessages {
-        success: &'static str,
-        missing: &'static str,
-        operation: &'static str,
-    }
-
-    /// The shared body of the "revoke one owned credential by id" console
-    /// handlers: authenticate the form actor, run the delete, and render the
-    /// outcome with the per-endpoint messages. `delete` is a boxed future so
-    /// the two async db fns fit one signature.
-    #[allow(clippy::type_complexity)] // HRTB boxed future — the only shape that fits two async db fns
-    async fn console_revoke_owned(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-        id: i64,
-        delete: for<'a> fn(
-            &'a sqlx::PgPool,
-            &'a str,
-            i64,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<bool, crate::db::DbError>> + Send + 'a>,
-        >,
-        messages: AccountDeleteMessages,
-    ) -> Response {
-        let (account, _) = match account_form_actor(state, headers, form).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let result = delete(pool_of(state), &account, id).await;
-        account_delete_result(state, account, headers, result, messages).await
-    }
-
-    struct AccountIssueMessages {
-        success: &'static str,
-        secret_kind: &'static str,
-        cap_reached: &'static str,
-        operation: &'static str,
-    }
-
-    async fn account_issue_result(
-        state: &AppState,
-        account: String,
-        headers: &axum::http::HeaderMap,
-        result: Result<String, crate::db::DbError>,
-        messages: AccountIssueMessages,
-    ) -> Response {
-        match result {
-            Ok(secret) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::issued(
-                        StatusCode::CREATED,
-                        messages.success,
-                        secret,
-                        messages.secret_kind,
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::TooManyCredentials) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::message(StatusCode::CONFLICT, messages.cap_reached),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error(messages.operation, error),
-        }
-    }
-
-    async fn account_delete_result(
-        state: &AppState,
-        account: String,
-        headers: &axum::http::HeaderMap,
-        result: Result<bool, crate::db::DbError>,
-        messages: AccountDeleteMessages,
-    ) -> Response {
-        match result {
-            Ok(true) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::message(StatusCode::OK, messages.success),
-                )
-                .await
-            }
-            Ok(false) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::message(StatusCode::NOT_FOUND, messages.missing),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error(messages.operation, error),
-        }
-    }
-
-    pub async fn console_create_app_password(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, label) = match account_label_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let result =
-            crate::db::issue_app_password_for_account(pool_of(&state), &account, &label).await;
-        account_issue_result(
-            &state,
-            account,
-            &headers,
-            result,
-            AccountIssueMessages {
-                success: "App password created. Copy it now; it cannot be shown again.",
-                secret_kind: "App password",
-                cap_reached: "Too many app passwords. Revoke one before creating another.",
-                operation: "app-password creation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_change_password(
-        State(state): State<Arc<AppState>>,
-        _rate_limited: RateLimited,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountPasswordForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if let Some(detail) = (!form.current_password.is_empty())
-            .then(|| password_input_error(&form.current_password))
-            .flatten()
-            .or_else(|| password_input_error(&form.new_password))
-        {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, detail),
-            )
-            .await;
-        }
-        if form.new_password != form.confirm_password {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::BAD_REQUEST,
-                    "The new password and confirmation do not match.",
-                ),
-            )
-            .await;
-        }
-        let adding_first_password = form.current_password.is_empty();
-        let result = if adding_first_password {
-            crate::db::set_local_password(pool_of(&state), &account, &form.new_password).await
-        } else {
-            crate::db::change_local_password(
-                pool_of(&state),
-                &account,
-                &form.current_password,
-                &form.new_password,
-            )
-            .await
-        };
-        match result {
-            Ok(()) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::OK,
-                        if adding_first_password {
-                            "Local password added."
-                        } else {
-                            "Primary password changed."
-                        },
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::BadCredentials) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::UNAUTHORIZED,
-                        "The current password is incorrect.",
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::LocalPasswordExists) => account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::CONFLICT,
-                    "This account already has a primary password. Enter it to rotate the password.",
-                ),
-            )
-            .await,
-            Err(error) => super::device::admin_db_error("password rotation", error),
-        }
-    }
-
-    pub async fn console_revoke_app_password(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        console_revoke_owned(
-            &state,
-            &headers,
-            form,
-            id,
-            |pool, account, id| Box::pin(crate::db::revoke_credential(pool, account, id)),
-            AccountDeleteMessages {
-                success: "App password revoked.",
-                missing: "No revocable app password with that identifier.",
-                operation: "app-password revocation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_create_api_token(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountTokenForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if let Some(error) = label_validation_error(&form.label) {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, error),
-            )
-            .await;
-        }
-        let scopes = [
-            form.scope_read
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Read),
-            form.scope_write
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Write),
-            form.scope_administrator
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Administrator),
-            form.scope_irc
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Irc),
-        ]
-        .into_iter()
-        .flatten();
-        let Some(scopes) = crate::identity::ApiTokenScopes::new(scopes) else {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, "Choose at least one token scope."),
-            )
-            .await;
-        };
-        let Some(lifetime) = crate::identity::ApiTokenLifetimeDays::new(form.expires_in_days)
-        else {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::BAD_REQUEST,
-                    "Token lifetime must be between 1 and 365 days.",
-                ),
-            )
-            .await;
-        };
-        let result = crate::db::issue_scoped_api_token(
-            pool_of(&state),
-            &account,
-            &form.label,
-            scopes,
-            lifetime,
-        )
-        .await;
-        account_issue_result(
-            &state,
-            account,
-            &headers,
-            result,
-            AccountIssueMessages {
-                success: "Personal access token created. Copy it now; it cannot be shown again.",
-                secret_kind: "Personal access token",
-                cap_reached: "Too many personal access tokens. Revoke one before creating another.",
-                operation: "token creation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_revoke_api_token(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        console_revoke_owned(
-            &state,
-            &headers,
-            form,
-            id,
-            |pool, account, id| Box::pin(crate::db::delete_api_token(pool, account, id)),
-            AccountDeleteMessages {
-                success: "Personal access token revoked.",
-                missing: "No personal access token with that identifier.",
-                operation: "token revocation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_unlink_identity(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        match crate::db::unlink_oidc_identity(pool_of(&state), &account, id).await {
-            Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => {
-                let session_still_valid = match session_token(&headers, state.secure_cookies) {
-                    Some(token) => {
-                        crate::db::session_account(pool_of(&state), &token)
-                            .await
-                            .map_err(|error| {
-                                super::device::admin_db_error("session refresh", error)
-                            })
-                    }
-                    None => Ok(None),
-                };
-                match session_still_valid {
-                    Ok(Some(_)) => {
-                        account_result(
-                            &state,
-                            account,
-                            &headers,
-                            AccountResult::message(
-                                StatusCode::OK,
-                                "Login identity unlinked.",
-                            ),
-                        )
-                        .await
-                    }
-                    Ok(None) => {
-                        let mut response = Redirect::to("/login").into_response();
-                        response.headers_mut().insert(
-                            header::SET_COOKIE,
-                            clear_session_cookie(state.secure_cookies)
-                                .parse()
-                                .expect("session clear cookie is valid"),
-                        );
-                        response
-                    }
-                    Err(response) => response,
-                }
-            }
-            Ok(crate::db::UnlinkIdentityOutcome::LastLoginMethod) => account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::CONFLICT,
-                    "This is your last login method. Add a local password or link another provider before removing it.",
-                ),
-            )
-            .await,
-            Ok(crate::db::UnlinkIdentityOutcome::NotFound) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::NOT_FOUND,
-                        "No linked identity with that identifier.",
-                    ),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error("identity unlink", error),
-        }
     }
 
     struct ChannelAccessView {

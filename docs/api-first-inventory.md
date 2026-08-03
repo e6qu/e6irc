@@ -24,14 +24,6 @@ operation's semantics.
 
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
-| `/console/account/profile` | `PATCH /api/v1/me/profile` | Mapped | Render and submit the profile editor through this resource. |
-| `/console/account/delete` | `DELETE /api/v1/me/account` | Mapped | Preserve exact-name confirmation and post-delete session handling. |
-| `/console/account/app-passwords` | `POST /api/v1/auth/app-passwords` | Mapped | Return the one-time secret only through the API response. |
-| `/console/account/password` | `PUT /api/v1/me/password` | Mapped | Preserve current-password and confirmation validation. |
-| `/console/account/app-passwords/{id}/delete` | `DELETE /api/v1/me/credentials/{id}` | Mapped | Keep primary-password refusal explicit. |
-| `/console/account/tokens` | `POST /api/v1/me/tokens` | Mapped | Preserve closed scopes and one-time bearer display. |
-| `/console/account/tokens/{id}/delete` | `DELETE /api/v1/me/tokens/{id}` | Mapped | Refresh only after committed revocation. |
-| `/console/account/identities/{id}/delete` | `DELETE /api/v1/me/identities/{id}` | Mapped | Preserve linked-session revocation behavior. |
 
 ## Registered channels
 
