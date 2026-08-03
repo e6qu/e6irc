@@ -705,6 +705,60 @@
     });
   }
 
+  const accountTokenRows = document.querySelector("[data-api-account-token-list]");
+  if (accountTokenRows instanceof HTMLElement) {
+    void apiRead("/api/v1/me/tokens")
+      .then((result) => {
+        const tokens = Array.isArray(result.tokens) ? result.tokens : [];
+        accountTokenRows.replaceChildren();
+        const count = document.getElementById("account-token-count");
+        if (count) count.textContent = String(tokens.length);
+        if (!tokens.length) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 5;
+          cell.className = "empty";
+          cell.textContent = "No personal access tokens.";
+          row.append(cell);
+          accountTokenRows.append(row);
+          return;
+        }
+        for (const token of tokens) {
+          const row = document.createElement("tr");
+          const scopes = Array.isArray(token.scopes) ? token.scopes.join(", ") : "";
+          [token.label, scopes, token.created_at, token.expires_at].forEach((value) => {
+            const cell = document.createElement("td");
+            cell.textContent = String(value || "");
+            row.append(cell);
+          });
+          const actions = document.createElement("td");
+          const form = document.createElement("form");
+          form.className = "cell-form";
+          form.method = "post";
+          form.action = `/api/v1/me/tokens/${token.id}`;
+          form.dataset.apiAccountDelete = "";
+          form.dataset.confirm = "Revoke this personal access token?";
+          const csrf = document.createElement("input");
+          csrf.type = "hidden";
+          csrf.name = "csrf";
+          csrf.value = accountTokenRows.dataset.csrf || "";
+          const button = document.createElement("button");
+          button.className = "danger";
+          button.type = "submit";
+          button.textContent = "Revoke";
+          form.append(csrf, button);
+          actions.append(form);
+          row.append(actions);
+          accountTokenRows.append(row);
+        }
+      })
+      .catch((error) => {
+        accountTokenRows.textContent = error instanceof Error
+          ? error.message
+          : "Personal access tokens failed to load.";
+      });
+  }
+
   for (const form of document.querySelectorAll("[data-api-account-delete]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();

@@ -118,7 +118,7 @@
           <h2>Personal access tokens</h2>
           <p>Expiring bearer grants for API clients, IRC authentication, and automation.</p>
         </div>
-        <span class="count">{{ tokens.len() }}</span>
+        <span class="count" id="account-token-count">…</span>
       </div>
       <form class="inline-create" method="post" action="/api/v1/me/tokens" data-api-account-token>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
@@ -144,32 +144,15 @@
         </fieldset>
         <button class="primary" type="submit">Create token</button>
       </form>
-      {% if tokens.is_empty() %}
-        <p class="empty">No personal access tokens.</p>
-      {% else %}
-        <div class="scroll">
-          <table>
-            <caption class="sr-only">Personal access tokens</caption>
-            <thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
-            <tbody>
-              {% for token in tokens %}
-                <tr>
-                  <td>{{ token.label }}</td>
-                  <td><code>{{ token.scopes }}</code></td>
-                  <td>{{ token.created }}</td>
-                  <td>{{ token.expires }}</td>
-                  <td>
-                    <form class="cell-form" method="post" action="/api/v1/me/tokens/{{ token.id }}" data-api-account-delete data-confirm="Revoke this personal access token?">
-                      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                      <button class="danger" type="submit">Revoke</button>
-                    </form>
-                  </td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      {% endif %}
+      <div class="scroll">
+        <table>
+          <caption class="sr-only">Personal access tokens</caption>
+          <thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
+          <tbody id="account-token-rows" data-api-account-token-list data-csrf="{{ shell.csrf }}">
+            <tr><td colspan="5" class="empty">Loading personal access tokens…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </section>
   </div>
 

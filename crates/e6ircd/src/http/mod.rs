@@ -2059,14 +2059,6 @@ mod pages {
         revocable: bool,
     }
 
-    struct ApiTokenView {
-        id: i64,
-        label: String,
-        created: String,
-        expires: String,
-        scopes: String,
-    }
-
     struct IdentityView {
         id: i64,
         issuer: String,
@@ -2080,7 +2072,6 @@ mod pages {
         shell: ConsoleShell,
         credentials: Vec<CredentialView>,
         has_local_password: bool,
-        tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
         link_providers: Vec<String>,
     }
@@ -2107,23 +2098,6 @@ mod pages {
         let has_local_password = credentials
             .iter()
             .any(|credential| credential.kind == "local_password");
-        let tokens = crate::db::list_api_tokens(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("token list", e))?
-            .into_iter()
-            .map(|token| ApiTokenView {
-                id: token.id,
-                label: token.label,
-                created: token.created_at,
-                expires: token.expires_at,
-                scopes: token
-                    .scopes
-                    .iter()
-                    .map(crate::identity::ApiTokenScope::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            })
-            .collect();
         let identities = crate::db::list_oidc_identities(pool, &account)
             .await
             .map_err(|e| super::device::admin_db_error("identity list", e))?
@@ -2144,7 +2118,6 @@ mod pages {
             shell: console_shell(state, account, csrf, "account"),
             credentials,
             has_local_password,
-            tokens,
             identities,
             link_providers,
         })
