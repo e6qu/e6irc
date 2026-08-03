@@ -4978,6 +4978,10 @@ async fn account_console_manages_credentials_tokens_and_identities() {
 
     assert!(page.contains("data-api-account-profile"), "{page}");
     assert!(page.contains("data-api-account-app-password"), "{page}");
+    assert!(
+        page.contains("data-api-account-security-activity-list"),
+        "{page}"
+    );
     let initial_profile = r#"{"contact_email":"Alice+IRC@Example.COM"}"#;
     let update_contact = format!(
         "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\

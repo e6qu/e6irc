@@ -2088,7 +2088,6 @@ mod pages {
         tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
         read_markers: Vec<ReadMarkerView>,
-        security_activity: Vec<AuditRow>,
         contact_email: String,
         link_providers: Vec<String>,
     }
@@ -2153,18 +2152,6 @@ mod pages {
             .await
             .map_err(|e| super::device::admin_db_error("profile read", e))?
             .unwrap_or_default();
-        let security_activity = crate::db::query_account_security_activity(
-            pool,
-            &account,
-            None,
-            crate::db::AuditLogPageSize::new(50).expect("static activity page size is valid"),
-        )
-        .await
-        .map_err(|e| super::device::admin_db_error("security activity", e))?
-        .entries
-        .into_iter()
-        .map(AuditRow::from)
-        .collect();
         let link_providers = state
             .oidc_providers
             .iter()
@@ -2177,7 +2164,6 @@ mod pages {
             tokens,
             identities,
             read_markers,
-            security_activity,
             contact_email,
             link_providers,
         })

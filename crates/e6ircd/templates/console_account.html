@@ -240,30 +240,18 @@
         <h2>Security activity</h2>
         <p>Your 50 most recent retained security and administrator events. The JSON API provides stable cursor pagination for older entries.</p>
       </div>
-      <span class="count">{{ security_activity.len() }}</span>
+      <span class="count" id="account-security-activity-count">…</span>
     </div>
-    {% if security_activity.is_empty() %}
-      <p class="empty">No retained security activity.</p>
-    {% else %}
-      <div class="scroll">
-        <table>
-          <caption class="sr-only">Security activity</caption>
-          <thead><tr><th>Time (UTC)</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead>
-          <tbody>
-            {% for event in security_activity %}
-              <tr>
-                <td><time datetime="{{ event.at }}">{{ event.at }}</time></td>
-                <td><span class="tag">{{ event.action }}</span></td>
-                <td><code>{{ event.actor }}</code></td>
-                <td><code>{{ event.target }}</code></td>
-                <td>{{ event.detail }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <p class="section-note"><a href="/api/v1/me/security-activity">Open security activity JSON</a></p>
-    {% endif %}
+    <div class="scroll">
+      <table>
+        <caption class="sr-only">Security activity</caption>
+        <thead><tr><th>Time (UTC)</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead>
+        <tbody id="account-security-activity-rows" data-api-account-security-activity-list>
+          <tr><td colspan="5" class="empty">Loading security activity…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="section-note"><a href="/api/v1/me/security-activity">Open security activity JSON</a></p>
   </section>
 
   <section class="panel danger-panel" aria-labelledby="delete-account-title">

@@ -712,6 +712,43 @@
     });
   }
 
+  const accountSecurityActivityRows = document.querySelector("[data-api-account-security-activity-list]");
+  if (accountSecurityActivityRows instanceof HTMLElement) {
+    void apiRead("/api/v1/me/security-activity?limit=50")
+      .then((result) => {
+        const activity = Array.isArray(result.activity) ? result.activity : [];
+        accountSecurityActivityRows.replaceChildren();
+        const count = document.getElementById("account-security-activity-count");
+        if (count) count.textContent = String(activity.length);
+        if (!activity.length) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 5;
+          cell.className = "empty";
+          cell.textContent = "No retained security activity.";
+          row.append(cell);
+          accountSecurityActivityRows.append(row);
+          return;
+        }
+        for (const event of activity) {
+          const row = document.createElement("tr");
+          [event.at, event.action, event.actor, event.target, event.detail]
+            .forEach((value, index) => {
+              const cell = document.createElement("td");
+              cell.textContent = String(value || "");
+              if (index === 1) cell.className = "tag";
+              row.append(cell);
+            });
+          accountSecurityActivityRows.append(row);
+        }
+      })
+      .catch((error) => {
+        accountSecurityActivityRows.textContent = error instanceof Error
+          ? error.message
+          : "Security activity failed to load.";
+      });
+  }
+
   const adminAccountResult = document.getElementById("admin-account-api-result");
   const adminAccountSecret = document.getElementById("admin-account-api-secret");
   const setAdminAccountResult = (message, success) => {
