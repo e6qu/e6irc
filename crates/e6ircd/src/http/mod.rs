@@ -2325,7 +2325,6 @@ mod pages {
     }
 
     struct AuditRow {
-        id: i64,
         at: String,
         actor: String,
         action: String,
@@ -2336,7 +2335,6 @@ mod pages {
     impl From<crate::db::AuditLogRow> for AuditRow {
         fn from(entry: crate::db::AuditLogRow) -> Self {
             Self {
-                id: entry.id,
                 at: entry.created_at,
                 actor: entry.actor,
                 action: entry.action,
@@ -2414,14 +2412,12 @@ mod pages {
     #[template(path = "console_audit.html")]
     struct ConsoleAudit {
         shell: ConsoleShell,
-        entries: Vec<AuditRow>,
         actor: String,
         action: String,
         target: String,
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-        next_before_id: Option<i64>,
     }
 
     /// Assemble the bounded admin overview. Callers have already admin-gated
@@ -3256,37 +3252,18 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        let page = match crate::db::query_audit_log(pool_of(&state), query.database_filter()).await
-        {
-            Ok(page) => page,
-            Err(error) => return super::device::admin_db_error("audit log", error),
-        };
-        let entries = page
-            .entries
-            .into_iter()
-            .map(|entry| AuditRow {
-                id: entry.id,
-                at: entry.created_at,
-                actor: entry.actor,
-                action: entry.action,
-                target: entry.target,
-                detail: entry.detail,
-            })
-            .collect();
         let actor = query.actor.unwrap_or_default();
         let action = query.action.unwrap_or_default();
         let target = query.target.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
         render_private(ConsoleAudit {
             shell: console_shell(&state, account, csrf, "audit"),
-            entries,
             has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
             has_cursor,
             actor,
             action,
             target,
             limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
         })
     }
 

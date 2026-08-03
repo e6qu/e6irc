@@ -103,7 +103,8 @@ API failures visible in the document. The superseded Configuration mutation
 handlers are removed. Administrator server-ban creation and immutable-ID
 deletion now follow the same API-only pattern; their rendered mutation routes
 are removed.
-All console mutations and the API-hydrated administrator directories share
+All console mutations and the API-hydrated administrator directories (fleet
+networks, registered channels, server bans, and audit history) share
 same-origin request helpers for authentication context, problem decoding, and
 bounded JSON response decoding; only read-only HTML fragment refreshes fetch
 rendered markup directly.

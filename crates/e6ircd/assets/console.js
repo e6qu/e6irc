@@ -953,6 +953,64 @@
       })
       .catch((error) => { adminChannelRows.textContent = error instanceof Error ? error.message : "Channel directory failed to load."; });
   }
+
+  const adminAuditRows = document.querySelector("[data-api-admin-audit-list]");
+  if (adminAuditRows instanceof HTMLElement) {
+    void apiRead(`/api/v1/admin/audit${window.location.search}`)
+      .then((result) => {
+        const entries = Array.isArray(result.audit) ? result.audit : [];
+        adminAuditRows.replaceChildren();
+        const count = document.getElementById("admin-audit-count");
+        if (count) count.textContent = String(entries.length);
+        const pager = document.getElementById("admin-audit-pager");
+        if (pager) {
+          pager.replaceChildren();
+          const status = document.createElement("span");
+          status.className = "meta";
+          status.textContent = new URLSearchParams(window.location.search).has("before_id")
+            ? "Showing an older page."
+            : "Showing the newest matching actions.";
+          pager.append(status);
+          if (result.next_before_id) {
+            const link = document.createElement("a");
+            const query = new URLSearchParams(window.location.search);
+            query.set("before_id", String(result.next_before_id));
+            link.href = `/console/audit?${query}`;
+            link.textContent = "Older actions";
+            pager.append(link);
+          }
+        }
+        if (!entries.length) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 6;
+          cell.className = "empty";
+          cell.textContent = "No audited actions match this view.";
+          row.append(cell);
+          adminAuditRows.append(row);
+          return;
+        }
+        for (const entry of entries) {
+          const row = document.createElement("tr");
+          [entry.id, entry.at, entry.actor, entry.action, entry.target, entry.detail]
+            .forEach((value, index) => {
+              const cell = document.createElement("td");
+              cell.textContent = String(value || "");
+              if (index === 0 || index === 1) cell.className = "meta";
+              if (index === 4) cell.className = "audit-target";
+              if (index === 5) cell.className = "audit-detail";
+              row.append(cell);
+            });
+          adminAuditRows.append(row);
+        }
+      })
+      .catch((error) => {
+        adminAuditRows.textContent = error instanceof Error
+          ? error.message
+          : "Audit history failed to load.";
+      });
+  }
+
   const setChannelResult = (message, success) => {
     if (!channelResult) return;
     channelResult.textContent = message;

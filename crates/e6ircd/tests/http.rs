@@ -3598,15 +3598,15 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("<h1>Audit log</h1>"), "{page}");
     assert!(page.contains("Exact filters"), "{page}");
-    assert!(
-        page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
-        "{page}"
-    );
+    assert!(page.contains("data-api-admin-audit-list"), "{page}");
     assert!(!page.contains("<script>alert(1)</script>"), "{page}");
     let (status, _, short_page) =
         request(http, &cookie_get("/console/audit?limit=2", &alice_session)).await;
     assert_eq!(status, 200, "{short_page}");
-    assert!(short_page.contains("Older actions"), "{short_page}");
+    assert!(
+        short_page.contains("Loading audited actions"),
+        "{short_page}"
+    );
 
     let (status, _, filtered_page) = request(
         http,
@@ -3614,7 +3614,11 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     )
     .await;
     assert_eq!(status, 200, "{filtered_page}");
-    assert!(filtered_page.contains("revision 2"), "{filtered_page}");
+    assert!(
+        filtered_page.contains("data-api-admin-audit-list"),
+        "{filtered_page}"
+    );
+    assert!(!filtered_page.contains("revision 2"), "{filtered_page}");
     assert!(!filtered_page.contains("third@host"), "{filtered_page}");
 
     let (status, headers, _) = request(http, &get("/console/audit")).await;
