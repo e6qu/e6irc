@@ -35,15 +35,6 @@ operation's semantics.
 
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
-| `/console/networks` | `POST /api/v1/me/networks` | Mapped | Use one typed network/bridge creation schema. |
-| `/console/networks/preflight` | `POST /api/v1/me/networks/preflight` | Mapped | Keep preflight non-persistent and distinguish it from creation. |
-| `/console/networks/{name}/edit` | `PUT /api/v1/me/networks/{name}` | Mapped | Preserve typed secret `keep`/`set`/`remove` behavior. |
-| `/console/networks/{name}/delete` | `DELETE /api/v1/me/networks/{name}` | Mapped | Surface durable/runtime teardown outcomes. |
-| `/console/networks/{name}/toggle` | `PATCH /api/v1/me/networks/{name}` | Mapped | Use an explicit enabled-state patch. |
-| `/console/integrations` | `POST /api/v1/me/networks` | Mapped | Bridge creation uses the generic typed network resource. |
-| `/console/integrations/{name}/edit` | `PUT /api/v1/me/networks/{name}` | Mapped | Keep platform-specific fields inside the closed network-kind schema. |
-| `/console/integrations/delete` | `DELETE /api/v1/me/networks/{name}` | Mapped | Preserve bridge teardown and buffer handling. |
-| `/console/integrations/toggle` | `PATCH /api/v1/me/networks/{name}` | Mapped | Use the same lifecycle transition as IRC networks. |
 
 ## Administrator accounts, policy, and live controls
 

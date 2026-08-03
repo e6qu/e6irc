@@ -712,6 +712,147 @@
     });
   }
 
+  const ownerNetworkResult = document.getElementById("network-api-result");
+  const setOwnerNetworkResult = (message, success) => {
+    if (!ownerNetworkResult) return;
+    ownerNetworkResult.textContent = message;
+    ownerNetworkResult.className = success ? "banner-success" : "banner-error";
+  };
+
+  const mutateOwnerNetwork = async (form, url, method, body, reload = true) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(url, {
+        method,
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-E6IRC-CSRF": csrf,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      const result = response.status === 204 ? null : await response.json().catch(() => null);
+      if (reload) {
+        window.location.reload();
+      } else {
+        setOwnerNetworkResult(result?.detail || "Connection check passed; no network was created.", true);
+      }
+    } catch (error) {
+      setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);
+      if (submit) submit.disabled = false;
+    }
+  };
+
+  const ownerNetworkConnection = (fields) => ({
+    addr: fieldValue(fields, "addr"),
+    tls: fields.has("tls"),
+    nick: fieldValue(fields, "nick"),
+    realname: optionalValue(String(fields.get("realname") || "")),
+    autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
+    sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
+    sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
+  });
+
+  for (const form of document.querySelectorAll("[data-api-owner-network-create]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const name = fieldValue(fields, "name");
+      const connection = ownerNetworkConnection(fields);
+      if (!name || !connection.addr || !connection.nick) {
+        setOwnerNetworkResult("Enter a network ID, server, and nickname.", false);
+        return;
+      }
+      const preflight = event.submitter instanceof HTMLElement
+        && event.submitter.matches("[data-api-network-preflight]");
+      if (preflight) {
+        const { addr, tls, nick, realname, sasl_account, sasl_password } = connection;
+        void mutateOwnerNetwork(form, "/api/v1/me/networks/preflight", "POST", {
+          addr, tls, nick, realname, sasl_account, sasl_password,
+        }, false);
+        return;
+      }
+      void mutateOwnerNetwork(form, form.action, "POST", { kind: "irc", name, ...connection });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-owner-bridge-create]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const name = fieldValue(fields, "name");
+      const kind = fieldValue(fields, "kind");
+      const password = String(fields.get("sasl_password") || "");
+      if (!name || !kind || !password) {
+        setOwnerNetworkResult("Enter every required bridge value.", false);
+        return;
+      }
+      void mutateOwnerNetwork(form, form.action, "POST", {
+        kind, name, addr: fieldValue(fields, "addr"), tls: true,
+        nick: fieldValue(fields, "nick"), realname: null,
+        autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
+        sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
+        sasl_password: password,
+      });
+    });
+  }
+
+  const ownerNetworkUpdate = (form, bridge) => {
+    const fields = new FormData(form);
+    const password = String(fields.get("sasl_password") || "");
+    const account = optionalValue(String(fields.get("sasl_account") || ""));
+    const credentials = fields.has("clear_sasl")
+      ? { action: "remove" }
+      : (account || password)
+        ? { action: "set", account, password: password || null }
+        : { action: "keep" };
+    const body = {
+      addr: fieldValue(fields, "addr"), tls: bridge || fields.has("tls"),
+      nick: fieldValue(fields, "nick"),
+      realname: bridge ? null : optionalValue(String(fields.get("realname") || "")),
+      autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
+    };
+    if (!body.addr || (!bridge && !body.nick)) {
+      throw new Error("Enter the required network connection values.");
+    }
+    return body;
+  };
+
+  for (const form of document.querySelectorAll("[data-api-owner-network-update], [data-api-owner-bridge-update]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      try {
+        void mutateOwnerNetwork(form, form.action, "PUT", ownerNetworkUpdate(form, form.hasAttribute("data-api-owner-bridge-update")));
+      } catch (error) {
+        setOwnerNetworkResult(error instanceof Error ? error.message : "Invalid network configuration.", false);
+      }
+    });
+  }
+
+  // The network-list fragment is replaced during live refreshes, so lifecycle
+  // controls are delegated rather than bound only to the original rows.
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (form.matches("[data-api-owner-network-toggle]")) {
+      event.preventDefault();
+      const enabled = fieldValue(new FormData(form), "enabled");
+      if (enabled !== "true" && enabled !== "false") {
+        setOwnerNetworkResult("The requested network state is invalid. Reload and try again.", false);
+        return;
+      }
+      void mutateOwnerNetwork(form, form.action, "PATCH", { enabled: enabled === "true" });
+    } else if (form.matches("[data-api-owner-network-delete]")) {
+      event.preventDefault();
+      void mutateOwnerNetwork(form, form.action, "DELETE");
+    }
+  });
+
   const channelResult = document.getElementById("channel-api-result");
   const setChannelResult = (message, success) => {
     if (!channelResult) return;

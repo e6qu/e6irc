@@ -19,12 +19,12 @@
         <td>{{ n.errors }}</td>
         <td class="row-actions">
           <a class="rowlink" href="/console/networks/{{ n.name }}">Inspect</a>
-          <form method="post" action="/console/networks/{{ n.name }}/toggle">
+          <form method="post" action="/api/v1/me/networks/{{ n.name }}" data-api-owner-network-toggle>
             <input type="hidden" name="csrf" value="{{ csrf }}" />
             <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
             <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
           </form>
-          <form method="post" action="/console/networks/{{ n.name }}/delete" data-confirm="Remove network {{ n.name }}? This also stops its live connection.">
+          <form method="post" action="/api/v1/me/networks/{{ n.name }}" data-api-owner-network-delete data-confirm="Remove network {{ n.name }}? This also stops its live connection.">
             <input type="hidden" name="csrf" value="{{ csrf }}" />
             <button class="danger" type="submit">Remove</button>
           </form>

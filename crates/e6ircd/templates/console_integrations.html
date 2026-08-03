@@ -1,8 +1,7 @@
 {% extends "console_base.html" %}
 {% block main %}
-  {% if let Some(err) = error %}
-    <p class="banner-error" role="alert">{{ err }}</p>
-  {% endif %}
+  <p id="network-api-result" role="status" aria-live="polite"></p>
+  <noscript><div class="banner-error">JavaScript is required to manage bridges because these controls use the network API directly.</div></noscript>
   <div class="page-head">
     <div>
       <p class="eyebrow">Chat bridges</p>
@@ -29,7 +28,7 @@
       {% endif %}
       {% if p.built %}
         {% if bouncer_enabled %}
-          <form class="inline-config-form" method="post" action="/console/integrations">
+          <form class="inline-config-form" method="post" action="/api/v1/me/networks" data-api-owner-bridge-create>
             <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
             <input type="hidden" name="kind" value="{{ p.meta.feature }}" />
             <label class="field"><span>Network name</span><input name="name" placeholder="{{ p.meta.feature }}-main" required /></label>
@@ -59,13 +58,13 @@
                       {% if n.manageable %}
                         <a class="rowlink" href="/console/networks/{{ n.name }}">Inspect</a>
                         <a class="rowlink" href="/console/integrations/{{ n.name }}/edit">Edit</a>
-                        <form method="post" action="/console/integrations/toggle">
+                        <form method="post" action="/api/v1/me/networks/{{ n.name }}" data-api-owner-network-toggle>
                           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                           <input type="hidden" name="name" value="{{ n.name }}" />
                           <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
                           <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
                         </form>
-                        <form method="post" action="/console/integrations/delete" data-confirm="Remove bridge {{ n.name }}? Its stored backlog will also be deleted.">
+                        <form method="post" action="/api/v1/me/networks/{{ n.name }}" data-api-owner-network-delete data-confirm="Remove bridge {{ n.name }}? Its stored backlog will also be deleted.">
                           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                           <input type="hidden" name="name" value="{{ n.name }}" />
                           <button class="danger" type="submit">Remove</button>

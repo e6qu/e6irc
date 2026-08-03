@@ -1146,26 +1146,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(pages::console_monitoring_panel),
         )
         .route("/console/configuration", get(pages::console_configuration))
-        .route(
-            "/console/networks",
-            get(pages::console_networks).post(pages::console_add_network),
-        )
+        .route("/console/networks", get(pages::console_networks))
         .route("/console/networks/rows", get(pages::console_network_rows))
         .route(
-            "/console/networks/{name}/delete",
-            post(pages::console_delete_network),
-        )
-        .route(
-            "/console/networks/preflight",
-            post(pages::console_preflight_network),
-        )
-        .route(
-            "/console/networks/{name}/toggle",
-            post(pages::console_toggle_network),
-        )
-        .route(
             "/console/networks/{name}/edit",
-            get(pages::console_edit_network).post(pages::console_update_network),
+            get(pages::console_edit_network),
         )
         .route(
             "/console/networks/{name}/operations",
@@ -1175,21 +1160,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/networks/{name}",
             get(pages::console_network_detail),
         )
-        .route(
-            "/console/integrations",
-            get(pages::console_integrations).post(pages::console_add_bridge),
-        )
+        .route("/console/integrations", get(pages::console_integrations))
         .route(
             "/console/integrations/{name}/edit",
-            get(pages::console_edit_bridge).post(pages::console_update_bridge),
-        )
-        .route(
-            "/console/integrations/delete",
-            post(pages::console_delete_bridge),
-        )
-        .route(
-            "/console/integrations/toggle",
-            post(pages::console_toggle_bridge),
+            get(pages::console_edit_bridge),
         )
         .route("/console/bans", get(pages::console_server_bans))
         .route(
@@ -2091,104 +2065,6 @@ mod pages {
             .into_response()
     }
 
-    /// The console add-network form (urlencoded). `tls` is an
-    /// HTML checkbox (`"on"` when checked, absent otherwise). The SASL pair and
-    /// realname are optional text inputs that submit as empty strings when left
-    /// blank, so `into_create` maps blank → `None`.
-    #[derive(Deserialize)]
-    pub struct NetworkFormFields {
-        csrf: String,
-        #[serde(default)]
-        preset: String,
-        name: String,
-        addr: String,
-        nick: String,
-        #[serde(default)]
-        tls: Option<String>,
-        #[serde(default)]
-        autojoin: String,
-        #[serde(default)]
-        realname: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-    }
-
-    impl NetworkFormFields {
-        /// Resolve a selected catalog entry into the submitted fields. Doing
-        /// this server-side makes presets work without JavaScript; mutating the
-        /// fields also ensures a later validation error re-renders the values
-        /// that will actually be submitted, not stale values from the previous
-        /// selection.
-        fn apply_preset(&mut self) -> Result<(), NetworkMutationError> {
-            if !self.preset.is_empty() && self.preset != "custom" {
-                let Some(preset) = irc_network_preset(&self.preset) else {
-                    return Err(NetworkMutationError::new(
-                        StatusCode::BAD_REQUEST,
-                        "Unknown IRC network preset",
-                        Some("select one of the listed networks or Custom"),
-                    ));
-                };
-                self.name = preset.name.to_string();
-                self.addr = preset.addr.to_string();
-                self.tls = preset.tls.then(|| "on".to_string());
-            }
-            Ok(())
-        }
-
-        /// Build the `CreateNetwork` for an IRC upstream from already-resolved
-        /// form fields, treating a blank optional text input as absent.
-        fn into_resolved_create(self) -> CreateNetwork {
-            let opt = |s: String| {
-                let s = s.trim().to_string();
-                (!s.is_empty()).then_some(s)
-            };
-            CreateNetwork {
-                kind: crate::config::NetworkKind::Irc,
-                name: self.name.trim().to_string(),
-                addr: self.addr.trim().to_string(),
-                tls: self.tls.as_deref() == Some("on"),
-                nick: self.nick.trim().to_string(),
-                realname: opt(self.realname),
-                autojoin: self
-                    .autojoin
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                sasl_account: opt(self.sasl_account),
-                sasl_password: opt(self.sasl_password),
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    /// A form failure plus the field it belongs to, when it has one. Field
-    /// errors render inline at the offending input; fieldless failures render
-    /// as the page banner.
-    struct FormFieldError {
-        message: String,
-        field: Option<&'static str>,
-    }
-
-    impl FormFieldError {
-        fn banner(message: impl Into<String>) -> Self {
-            Self {
-                message: message.into(),
-                field: None,
-            }
-        }
-
-        fn from_mutation(error: &crate::http::networks::NetworkMutationError) -> Self {
-            Self {
-                message: error.message(),
-                field: error.field(),
-            }
-        }
-    }
-
     struct NetworkFormView {
         preset: String,
         name: String,
@@ -2213,19 +2089,6 @@ mod pages {
                 autojoin: String::new(),
                 sasl_account: String::new(),
                 tls: preset.tls,
-            }
-        }
-
-        fn submitted(fields: &NetworkFormFields) -> Self {
-            Self {
-                preset: fields.preset.clone(),
-                name: fields.name.clone(),
-                addr: fields.addr.clone(),
-                nick: fields.nick.clone(),
-                realname: fields.realname.clone(),
-                autojoin: fields.autojoin.clone(),
-                sasl_account: fields.sasl_account.clone(),
-                tls: fields.tls.as_deref() == Some("on"),
             }
         }
     }
@@ -2431,11 +2294,6 @@ mod pages {
     }
 
     #[derive(Deserialize)]
-    pub struct AccountDeleteForm {
-        csrf: String,
-    }
-
-    #[derive(Deserialize)]
     pub struct AccountPermanentDeleteForm {
         csrf: String,
         confirmation: String,
@@ -2457,31 +2315,9 @@ mod pages {
             })*
         };
     }
-    account_form!(
-        AccountDeleteForm,
-        AccountPermanentDeleteForm,
-        ToggleFields,
-        NetworkFormFields,
-        NetworkEditForm,
-        BridgeToggleFields,
-        BridgeDeleteFields,
-        BridgeFormFields,
-        BridgeEditFormFields,
-        DropChannelForm,
-    );
+    account_form!(AccountPermanentDeleteForm, ToggleFields, DropChannelForm,);
 
-    async fn account_form_actor<T: AccountForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, T), Response> {
-        let fields = parse_form(form)?;
-        let account = require_form_actor(state, headers, fields.csrf()).await?;
-        Ok((account, fields))
-    }
-
-    /// Parse a console form and authenticate its actor as an administrator —
-    /// the admin-gated sibling of [`account_form_actor`].
+    /// Parse a console form and authenticate its actor as an administrator.
     async fn admin_form_actor<T: AccountForm>(
         state: &AppState,
         headers: &axum::http::HeaderMap,
@@ -4163,14 +3999,6 @@ mod pages {
         error: Option<String>,
     }
 
-    struct NetworkPreflightView {
-        confirmed_nick: String,
-        resolved_addresses: usize,
-        dns_ms: u64,
-        connect_ms: u64,
-        registration_ms: u64,
-    }
-
     #[derive(Template)]
     #[template(path = "console_networks.html")]
     struct ConsoleNetworks {
@@ -4179,8 +4007,6 @@ mod pages {
         attach_addr: Option<std::net::SocketAddr>,
         presets: &'static [IrcNetworkPreset],
         form: NetworkFormView,
-        error: Option<FormFieldError>,
-        success: Option<NetworkPreflightView>,
         can_store_secrets: bool,
     }
 
@@ -4206,7 +4032,6 @@ mod pages {
         autojoin: String,
         sasl_account: String,
         can_store_secrets: bool,
-        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -4226,7 +4051,6 @@ mod pages {
         has_sasl_account: bool,
         has_sasl_password: bool,
         can_store_secrets: bool,
-        error: Option<String>,
     }
 
     struct NetworkOperationsView {
@@ -4278,26 +4102,6 @@ mod pages {
     #[template(path = "_network_operations.html")]
     struct ConsoleNetworkOperations {
         view: NetworkOperationsView,
-    }
-
-    /// The console edit-network form (urlencoded). `tls` is an HTML checkbox.
-    #[derive(Deserialize)]
-    pub struct NetworkEditForm {
-        csrf: String,
-        addr: String,
-        nick: String,
-        #[serde(default)]
-        tls: Option<String>,
-        #[serde(default)]
-        realname: String,
-        #[serde(default)]
-        autojoin: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-        #[serde(default)]
-        clear_sasl: Option<String>,
     }
 
     /// Admin console: server-wide read views (accounts, registered channels,
@@ -4584,60 +4388,8 @@ mod pages {
         }
     }
 
-    /// Render the network list and create form. Failed submissions use this same
-    /// path so their exact error and all non-secret fields remain in context.
-    async fn console_networks_page(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        form: NetworkFormView,
-        error: Option<FormFieldError>,
-        success: Option<NetworkPreflightView>,
-    ) -> Response {
-        let networks = match console_network_views(state, &account).await {
-            Ok(n) => n,
-            Err(r) => return r,
-        };
-        let attach_addr = match &state.bnc_listener {
-            Some(listener) => listener.status().await.map(|(_, bound)| bound),
-            None => None,
-        };
-        render_private(ConsoleNetworks {
-            shell: console_shell(state, account, csrf, "networks"),
-            networks,
-            attach_addr,
-            presets: IRC_NETWORK_PRESETS,
-            form,
-            error,
-            success,
-            can_store_secrets: state.secret_key.is_some(),
-        })
-    }
-
-    /// Re-render the networks console with the just-submitted form and the
-    /// mutation error mapped onto its fields — the shared failure tail of the
-    /// add/preflight network handlers.
-    async fn console_networks_mutation_error(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        form_view: NetworkFormView,
-        error: &crate::http::networks::NetworkMutationError,
-    ) -> Response {
-        console_networks_page(
-            state,
-            account,
-            csrf,
-            form_view,
-            Some(FormFieldError::from_mutation(error)),
-            None,
-        )
-        .await
-    }
-
     /// Console → BNC networks: the caller's own always-on upstreams with live
-    /// connection status, plus add/remove. Any authenticated user manages their
-    /// own networks (not admin-gated); an anonymous visitor goes to `/login`.
+    /// connection status. Mutations are performed by the typed network API.
     pub async fn console_networks(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -4646,8 +4398,22 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let form = NetworkFormView::libera(&account);
-        console_networks_page(&state, account, csrf, form, None, None).await
+        let networks = match console_network_views(&state, &account).await {
+            Ok(networks) => networks,
+            Err(response) => return response,
+        };
+        let attach_addr = match &state.bnc_listener {
+            Some(listener) => listener.status().await.map(|(_, bound)| bound),
+            None => None,
+        };
+        render_private(ConsoleNetworks {
+            shell: console_shell(&state, account.clone(), csrf, "networks"),
+            networks,
+            attach_addr,
+            presets: IRC_NETWORK_PRESETS,
+            form: NetworkFormView::libera(&account),
+            can_store_secrets: state.secret_key.is_some(),
+        })
     }
 
     /// The live-refresh fragment backing `/console/networks`' table.
@@ -4660,137 +4426,10 @@ mod pages {
             Err(response) => return response,
         };
         let networks = match console_network_views(&state, &account).await {
-            Ok(n) => n,
-            Err(r) => return r,
+            Ok(networks) => networks,
+            Err(response) => return response,
         };
         render_private(ConsoleNetworkRows { networks, csrf })
-    }
-
-    /// Add a network from the console and return to the canonical list.
-    pub async fn console_add_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, fields) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        let mut fields = fields;
-        let preset_result = fields.apply_preset();
-        let form_view = NetworkFormView::submitted(&fields);
-        let Some(registry) = &state.bnc_registry else {
-            return console_networks_page(
-                &state,
-                account,
-                csrf,
-                form_view,
-                Some(FormFieldError::banner(
-                    "The network registry is not available on this server.",
-                )),
-                None,
-            )
-            .await;
-        };
-        let req = match preset_result {
-            Ok(()) => fields.into_resolved_create(),
-            Err(error) => {
-                return console_networks_mutation_error(&state, account, csrf, form_view, &error)
-                    .await;
-            }
-        };
-        if let Err(error) = create_network_core(&state, registry, &account, &req).await {
-            return console_networks_mutation_error(&state, account, csrf, form_view, &error).await;
-        }
-        Redirect::to("/console/networks").into_response()
-    }
-
-    /// Exercise the exact production IRC dial and registration path while
-    /// retaining the form for a subsequent create. The preflight has no
-    /// durable side effect and never starts a reconnect loop.
-    pub async fn console_preflight_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, mut fields) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        if let Err(error) = fields.apply_preset() {
-            let form_view = NetworkFormView::submitted(&fields);
-            return console_networks_mutation_error(&state, account, csrf, form_view, &error).await;
-        }
-        let form_view = NetworkFormView::submitted(&fields);
-        let create = fields.into_resolved_create();
-        let request = PreflightNetwork {
-            addr: create.addr,
-            tls: create.tls,
-            nick: create.nick,
-            realname: create.realname,
-            sasl_account: create.sasl_account,
-            sasl_password: create.sasl_password,
-        };
-        match preflight_network_core(request).await {
-            Ok(result) => {
-                let view = NetworkPreflightView {
-                    confirmed_nick: result.confirmed_nick,
-                    resolved_addresses: result.resolved_addresses,
-                    dns_ms: result.dns_ms,
-                    connect_ms: result.connect_ms,
-                    registration_ms: result.registration_ms,
-                };
-                console_networks_page(&state, account, csrf, form_view, None, Some(view)).await
-            }
-            Err(error) => {
-                console_networks_page(
-                    &state,
-                    account,
-                    csrf,
-                    form_view,
-                    Some(FormFieldError::banner(error.message())),
-                    None,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Delete an owner-scoped network and stop its live driver.
-    async fn delete_network_by_name(
-        state: &AppState,
-        account: &str,
-        name: &str,
-    ) -> Result<(), Response> {
-        let Some(registry) = &state.bnc_registry else {
-            return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
-        };
-        delete_network_core(state, registry, account, name, EditableNetworkKind::Any)
-            .await
-            .map_err(NetworkMutationError::into_response)
-    }
-
-    /// Delete a network from the console and return to the canonical list.
-    pub async fn console_delete_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if let Err(response) = delete_network_by_name(&state, &account, &name).await {
-            return response;
-        }
-        Redirect::to("/console/networks").into_response()
     }
 
     /// The console toggle button posts the *target* enabled state so the flip is
@@ -4817,32 +4456,7 @@ mod pages {
         )
     }
 
-    /// Enable/disable a network from the console. Reuses the same core the REST
-    /// `PATCH` uses.
-    pub async fn console_toggle_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let registry = require_registry!(state);
-        let (account, f) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let Some(enabled) = toggle_target(&f.enabled) else {
-            return invalid_toggle_response();
-        };
-        if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &account, &name, enabled).await
-        {
-            return error.into_response();
-        }
-        Redirect::to("/console/networks").into_response()
-    }
-
-    /// Render the edit-network form (shared by the GET and the failed-POST
-    /// re-render, which differ only in field values and the error banner).
+    /// Render the edit-network form from the stored configuration.
     #[allow(clippy::too_many_arguments)]
     fn console_network_edit_page(
         state: &AppState,
@@ -4856,7 +4470,6 @@ mod pages {
         autojoin: String,
         sasl_account: String,
         can_store_secrets: bool,
-        error: Option<String>,
     ) -> Response {
         render_private(ConsoleNetworkEdit {
             shell: console_shell(state, account, csrf, "networks"),
@@ -4868,7 +4481,6 @@ mod pages {
             autojoin,
             sasl_account,
             can_store_secrets,
-            error,
         })
     }
 
@@ -4908,85 +4520,6 @@ mod pages {
             row.autojoin.join(", "),
             row.sasl_account.unwrap_or_default(),
             state.secret_key.is_some(),
-            None,
-        )
-    }
-
-    /// Console → apply an edited network (POST): validate, persist the new
-    /// connection/identity fields, and rebuild the live driver. On success
-    /// redirect to the network list; on failure re-render the form with a banner
-    /// (keeping the submitted values).
-    pub async fn console_update_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<NetworkEditForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        // Plain form: parse first, then authenticate + verify the body CSRF.
-        let (account, f) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        let tls = f.tls.as_deref() == Some("on");
-        let realname = (!f.realname.trim().is_empty()).then(|| f.realname.trim().to_string());
-        let autojoin: Vec<String> = f
-            .autojoin
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        let sasl_account = f.sasl_account.trim();
-        let sasl_password = (!f.sasl_password.is_empty()).then_some(f.sasl_password.as_str());
-        let credentials = if f.clear_sasl.as_deref() == Some("on") {
-            // The checkbox is the explicit operation. Values may still arrive
-            // from a no-JavaScript browser whose pre-filled account field was
-            // not disabled; removal wins rather than making that UI path fail.
-            NetworkCredentialUpdate::Remove
-        } else if sasl_account.is_empty() && sasl_password.is_none() {
-            NetworkCredentialUpdate::Remove
-        } else {
-            NetworkCredentialUpdate::Set {
-                account: Some(sasl_account),
-                password: sasl_password,
-            }
-        };
-        let result = update_network_core(
-            &state,
-            registry,
-            &account,
-            &name,
-            EditableNetworkKind::Irc,
-            &f.addr,
-            tls,
-            &f.nick,
-            realname.as_deref(),
-            &autojoin,
-            credentials,
-        )
-        .await;
-        let error = match result {
-            Ok(()) => return Redirect::to("/console/networks").into_response(),
-            Err(error) => error.message(),
-        };
-        // Re-render the form with a banner, keeping what the user typed.
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        console_network_edit_page(
-            &state,
-            account,
-            csrf,
-            name,
-            f.addr,
-            tls,
-            f.nick,
-            f.realname,
-            f.autojoin,
-            f.sasl_account,
-            state.secret_key.is_some(),
-            Some(error),
         )
     }
 
@@ -5066,8 +4599,6 @@ mod pages {
         shell: ConsoleShell,
         bouncer_enabled: bool,
         platforms: Vec<BridgePlatform>,
-        /// Error banner shown after a failed add/remove; `None` on the plain GET.
-        error: Option<String>,
     }
 
     /// Console → Integrations (admin): the chat-platform bridges. For each
@@ -5078,7 +4609,6 @@ mod pages {
         state: &AppState,
         account: String,
         csrf: String,
-        error: Option<String>,
     ) -> Result<ConsoleIntegrations, Response> {
         let all = state
             .bnc_registry
@@ -5143,7 +4673,6 @@ mod pages {
             shell: console_shell(state, account, csrf, "integrations"),
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
-            error,
         })
     }
 
@@ -5152,74 +4681,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        match console_integrations_build(&state, account, csrf, None).await {
+        match console_integrations_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
-    }
-
-    /// Re-render the integrations page with an error banner after a failed
-    /// add/remove (an admin has already been resolved by the caller).
-    async fn console_integrations_error(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        message: String,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        match console_integrations_build(state, account, csrf, Some(message)).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
-    }
-
-    /// The bridge connection/identity fields shared by the add and edit
-    /// forms (all optional on the wire; meaning is per kind).
-    #[derive(Deserialize)]
-    struct BridgeConnectionFields {
-        #[serde(default)]
-        addr: String,
-        #[serde(default)]
-        nick: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-        #[serde(default)]
-        autojoin: String,
-    }
-
-    /// The console add-bridge form (urlencoded with a hidden CSRF field). Field
-    /// meaning is per kind.
-    #[derive(Deserialize)]
-    pub struct BridgeFormFields {
-        csrf: String,
-        kind: String,
-        name: String,
-        #[serde(flatten)]
-        connection: BridgeConnectionFields,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BridgeEditFormFields {
-        csrf: String,
-        #[serde(flatten)]
-        connection: BridgeConnectionFields,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BridgeDeleteFields {
-        csrf: String,
-        name: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BridgeToggleFields {
-        csrf: String,
-        name: String,
-        enabled: String,
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.
@@ -5616,7 +5081,6 @@ mod pages {
         addr: String,
         nick: String,
         autojoin: String,
-        error: Option<String>,
     ) -> Response {
         let Some(meta) = bridge_platform_meta(row.kind) else {
             return problem(StatusCode::BAD_REQUEST, "Not a bridge", None);
@@ -5636,7 +5100,6 @@ mod pages {
             has_sasl_account: row.sasl_account.is_some(),
             has_sasl_password: row.sasl_password_sealed.is_some(),
             can_store_secrets: state.secret_key.is_some(),
-            error,
         })
     }
 
@@ -5659,183 +5122,7 @@ mod pages {
             row.addr,
             row.nick,
             row.autojoin.join(", "),
-            None,
         )
-    }
-
-    /// Validate and atomically replace one account-owned bridge's mutable
-    /// endpoint, identity, channel list, and any explicitly supplied tokens.
-    /// Blank token inputs preserve the encrypted stored value.
-    pub async fn console_update_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<BridgeEditFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        let form = form.connection;
-        let autojoin: Vec<String> = form
-            .autojoin
-            .split(',')
-            .map(str::trim)
-            .filter(|channel| !channel.is_empty())
-            .map(str::to_string)
-            .collect();
-        let account_secret = (!form.sasl_account.is_empty()).then_some(form.sasl_account.as_str());
-        let password_secret =
-            (!form.sasl_password.is_empty()).then_some(form.sasl_password.as_str());
-        let credentials = if account_secret.is_none() && password_secret.is_none() {
-            NetworkCredentialUpdate::Keep
-        } else {
-            NetworkCredentialUpdate::Set {
-                account: account_secret,
-                password: password_secret,
-            }
-        };
-        let result = update_network_core(
-            &state,
-            registry,
-            &account,
-            &name,
-            EditableNetworkKind::Bridge,
-            &form.addr,
-            true,
-            &form.nick,
-            None,
-            &autojoin,
-            credentials,
-        )
-        .await;
-        let error = match result {
-            Ok(()) => return Redirect::to("/console/integrations").into_response(),
-            Err(error) => error.message(),
-        };
-        let row = match owned_bridge(&state, &account, &name).await {
-            Ok(row) => row,
-            Err(response) => return response,
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        console_bridge_edit_page(
-            &state,
-            account,
-            csrf,
-            row,
-            form.addr,
-            form.nick,
-            form.autojoin,
-            Some(error),
-        )
-    }
-
-    /// Console → Integrations: add a bridge (admin). Maps the platform form onto
-    /// `CreateNetwork` and reuses `create_network_core` (schema, per-kind secret
-    /// sealing, feature-gated driver construction) — so a console-created bridge
-    /// and a config-file one run through the exact same path. Owned by the
-    /// creating admin's account.
-    pub async fn console_add_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BridgeFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, f) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let Some(registry) = &state.bnc_registry else {
-            let msg = "The bouncer is not enabled on this server.".to_string();
-            return console_integrations_error(&state, &headers, account, msg).await;
-        };
-        let Some(kind) = crate::config::NetworkKind::from_db_str(&f.kind).filter(|k| k.is_bridge())
-        else {
-            let msg = format!("'{}' is not a bridge platform.", f.kind);
-            return console_integrations_error(&state, &headers, account, msg).await;
-        };
-        // Pre-check the build feature so the banner names it specifically.
-        if !kind_feature_available(kind) {
-            let msg = format!(
-                "This server was not built with the {} feature — rebuild with --features {}.",
-                f.kind, f.kind
-            );
-            return console_integrations_error(&state, &headers, account, msg).await;
-        }
-        let opt = |s: String| if s.is_empty() { None } else { Some(s) };
-        let conn = f.connection;
-        let req = CreateNetwork {
-            kind,
-            name: f.name,
-            addr: conn.addr,
-            tls: true,
-            nick: conn.nick,
-            realname: None,
-            autojoin: conn
-                .autojoin
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-            sasl_account: opt(conn.sasl_account),
-            sasl_password: opt(conn.sasl_password),
-        };
-        if let Err(error) = create_network_core(&state, registry, &account, &req).await {
-            return console_integrations_error(&state, &headers, account, error.message()).await;
-        }
-        Redirect::to("/console/integrations").into_response()
-    }
-
-    /// Console → Integrations: remove one of the admin's own bridges.
-    pub async fn console_delete_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BridgeDeleteFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, f) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        if let Err(error) = delete_network_core(
-            &state,
-            registry,
-            &account,
-            &f.name,
-            EditableNetworkKind::Bridge,
-        )
-        .await
-        {
-            return console_integrations_error(&state, &headers, account, error.message()).await;
-        }
-        Redirect::to("/console/integrations").into_response()
-    }
-
-    /// Pause or resume one of the administrator's account-owned bridges while
-    /// retaining its encrypted configuration and detached backlog.
-    pub async fn console_toggle_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BridgeToggleFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        let Some(enabled) = toggle_target(&form.enabled) else {
-            return invalid_toggle_response();
-        };
-        if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &account, &form.name, enabled)
-                .await
-        {
-            return console_integrations_error(&state, &headers, account, error.message()).await;
-        }
-        Redirect::to("/console/integrations").into_response()
     }
 
     #[derive(Template)]
@@ -6038,56 +5325,6 @@ mod pages {
             );
             assert_ne!(digest, super::super::bootstrap_token_digest("other-secret"));
             assert_eq!(digest.len(), 32);
-        }
-    }
-
-    #[cfg(test)]
-    mod network_form_tests {
-        use super::*;
-
-        fn fields(preset: &str) -> NetworkFormFields {
-            NetworkFormFields {
-                csrf: "token".into(),
-                preset: preset.into(),
-                name: "stale name".into(),
-                addr: "stale.example:6667".into(),
-                nick: "alice".into(),
-                tls: None,
-                autojoin: "#rust, #e6irc".into(),
-                realname: String::new(),
-                sasl_account: String::new(),
-                sasl_password: String::new(),
-            }
-        }
-
-        #[test]
-        fn preset_owns_safe_id_endpoint_and_tls_defaults() {
-            let mut submitted = fields("libera");
-            submitted.apply_preset().expect("known preset");
-            let request = submitted.into_resolved_create();
-            assert_eq!(request.name, "libera");
-            assert_eq!(request.addr, "irc.libera.chat:6697");
-            assert!(request.tls);
-            assert_eq!(request.autojoin, ["#rust", "#e6irc"]);
-        }
-
-        #[test]
-        fn resolved_preset_values_are_the_values_rerendered_after_an_error() {
-            let mut submitted = fields("oftc");
-            submitted.apply_preset().expect("known preset");
-            let view = NetworkFormView::submitted(&submitted);
-            assert_eq!(view.preset, "oftc");
-            assert_eq!(view.name, "oftc");
-            assert_eq!(view.addr, "irc.oftc.net:6697");
-            assert!(view.tls);
-        }
-
-        #[test]
-        fn unknown_preset_is_not_silently_treated_as_custom() {
-            let error = fields("invented")
-                .apply_preset()
-                .expect_err("unknown preset must fail");
-            assert!(error.message().contains("Unknown IRC network preset"));
         }
     }
 }
