@@ -165,6 +165,15 @@
     return response.status === 204 ? undefined : apiJson(response);
   };
 
+  const apiRead = async (url) => {
+    const response = await fetch(url, {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(await apiProblem(response));
+    return apiJson(response);
+  };
+
   const optionalValue = (value) => {
     const trimmed = value.trim();
     return trimmed || null;
@@ -479,8 +488,7 @@
   const banResult = document.getElementById("ban-api-result");
   const adminBanRows = document.querySelector("[data-api-admin-ban-list]");
   if (adminBanRows instanceof HTMLElement) {
-    void fetch(`/api/v1/admin/bans${window.location.search}`, { credentials: "same-origin", headers: { Accept: "application/json" } })
-      .then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); return apiJson(response); })
+    void apiRead(`/api/v1/admin/bans${window.location.search}`)
       .then((result) => { const bans = Array.isArray(result.bans) ? result.bans : []; adminBanRows.replaceChildren(); const count = document.getElementById("admin-ban-count"); if (count) count.textContent = String(bans.length); const pager = document.getElementById("admin-ban-pager"); if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/bans?${query}`; link.textContent = "Older rules"; pager.append(link); } } if (!bans.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No server bans match this view."; row.append(cell); adminBanRows.append(row); return; } for (const ban of bans) { const row = document.createElement("tr"); [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at].forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value || ""); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/bans/${ban.id}`; form.dataset.apiBanDelete = ""; form.dataset.confirm = `Remove ${ban.kind} ${ban.mask}?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminBanRows.dataset.csrf || ""; const id = document.createElement("input"); id.type = "hidden"; id.name = "id"; id.value = String(ban.id); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Remove"; form.append(csrf, id, button); actions.append(form); row.append(actions); adminBanRows.append(row); } })
       .catch((error) => { adminBanRows.textContent = error instanceof Error ? error.message : "Server-ban directory failed to load."; });
   }
@@ -777,8 +785,7 @@
     }
   };
   if (adminNetworkRows instanceof HTMLElement) {
-    void fetch("/api/v1/admin/networks", { credentials: "same-origin", headers: { Accept: "application/json" } })
-      .then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); return response.json(); })
+    void apiRead("/api/v1/admin/networks")
       .then((result) => renderAdminNetworks(Array.isArray(result.networks) ? result.networks : []))
       .catch((error) => { adminNetworkRows.textContent = error instanceof Error ? error.message : "Network list failed to load."; });
   }
@@ -934,8 +941,7 @@
   const channelResult = document.getElementById("channel-api-result");
   const adminChannelRows = document.querySelector("[data-api-admin-channel-list]");
   if (adminChannelRows instanceof HTMLElement) {
-    void fetch(`/api/v1/admin/channels${window.location.search}`, { credentials: "same-origin", headers: { Accept: "application/json" } })
-      .then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); return response.json(); })
+    void apiRead(`/api/v1/admin/channels${window.location.search}`)
       .then((result) => {
         const channels = Array.isArray(result.channels) ? result.channels : [];
         const pager = document.getElementById("admin-channel-pager");

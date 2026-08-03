@@ -103,9 +103,10 @@ API failures visible in the document. The superseded Configuration mutation
 handlers are removed. Administrator server-ban creation and immutable-ID
 deletion now follow the same API-only pattern; their rendered mutation routes
 are removed.
-All console mutations now share one same-origin JSON request boundary for CSRF
-headers, problem decoding, and bounded response decoding; only read-only HTML
-fragment refreshes fetch rendered markup directly.
+All console mutations and the API-hydrated administrator directories share
+same-origin request helpers for authentication context, problem decoding, and
+bounded JSON response decoding; only read-only HTML fragment refreshes fetch
+rendered markup directly.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

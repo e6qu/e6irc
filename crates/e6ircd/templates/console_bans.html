@@ -1,9 +1,7 @@
 {% extends "console_base.html" %}
 {% block main %}
-  {% if let Some(err) = error %}
-    <p class="banner-error" role="alert">{{ err }}</p>
-  {% endif %}
   <div id="ban-api-result" role="status" aria-live="polite"></div>
+  <noscript><div class="banner-error">JavaScript is required to manage server bans because these controls use the administrator API directly.</div></noscript>
   <div class="page-head">
     <div>
       <p class="eyebrow">Connection policy</p>
@@ -13,8 +11,6 @@
     <a class="button-link" href="/api/v1/admin/bans">Open JSON API</a>
   </div>
 
-    <div class="scroll"><table><caption class="sr-only">Persisted server-ban policy</caption><thead><tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th></th></tr></thead><tbody id="admin-ban-rows" data-api-admin-ban-list data-csrf="{{ shell.csrf }}"><tr><td colspan="7" class="empty">Loading server bans…</td></tr></tbody></table></div>
-    <div class="pager" id="admin-ban-pager"></div>
   <section class="panel">
     <div class="panel-head">
       <div>
@@ -24,7 +20,6 @@
     </div>
     <form class="field-grid" method="post" action="/api/v1/admin/bans" data-api-ban-create>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-      <noscript><div class="banner-error">JavaScript is required to manage server bans because these controls use the administrator API directly.</div></noscript>
       <label class="field">
         <span>Policy kind</span>
         <select name="kind" required>
@@ -91,52 +86,17 @@
       </div>
       <span class="count" id="admin-ban-count">…</span>
     </div>
-    {% if entries.is_empty() %}
-      <p class="empty">{% if has_filters %}No server ban matches these exact filters.{% else %}No server bans are active.{% endif %}</p>
-    {% else %}
-      <div class="scroll">
-        <table>
-          <caption class="sr-only">Persisted server-ban policy</caption>
-          <thead>
-            <tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th></th></tr>
-          </thead>
-          <tbody>
-            {% for entry in entries %}
-              <tr>
-                <td class="meta">{{ entry.id }}</td>
-                <td><span class="tag">{{ entry.kind }}</span></td>
-                <td><strong><code>{{ entry.mask }}</code></strong></td>
-                <td class="audit-detail">{{ entry.reason }}</td>
-                <td><code>{{ entry.set_by }}</code></td>
-                <td class="meta"><time datetime="{{ entry.created_at }}">{{ entry.created_at }}</time></td>
-                <td>
-                  <form class="cell-form" method="post" action="/api/v1/admin/bans/{{ entry.id }}" data-api-ban-delete
-                        data-confirm="Remove {{ entry.kind }} {{ entry.mask }}?">
-                    <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                    <input type="hidden" name="id" value="{{ entry.id }}" />
-                    <input type="hidden" name="kind" value="{{ entry.kind }}" />
-                    <input type="hidden" name="mask" value="{{ entry.mask }}" />
-                    <button class="danger" type="submit">Remove</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% endif %}
-
-    <div class="pager">
+    <div class="scroll">
+      <table>
+        <caption class="sr-only">Persisted server-ban policy</caption>
+        <thead><tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th></th></tr></thead>
+        <tbody id="admin-ban-rows" data-api-admin-ban-list data-csrf="{{ shell.csrf }}">
+          <tr><td colspan="7" class="empty">Loading server bans…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="pager" id="admin-ban-pager">
       <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching rules.{% endif %}</span>
-      {% if let Some(before_id) = next_before_id %}
-        <form method="get" action="/console/bans">
-          <input type="hidden" name="kind" value="{{ kind }}" />
-          <input type="hidden" name="mask" value="{{ mask }}" />
-          <input type="hidden" name="limit" value="{{ limit }}" />
-          <input type="hidden" name="before_id" value="{{ before_id }}" />
-          <button type="submit">Older rules</button>
-        </form>
-      {% endif %}
     </div>
   </section>
 {% endblock %}

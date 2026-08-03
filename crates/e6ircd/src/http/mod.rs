@@ -2403,14 +2403,11 @@ mod pages {
     #[template(path = "console_bans.html")]
     struct ConsoleServerBans {
         shell: ConsoleShell,
-        entries: Vec<crate::db::ServerBanDirectoryRow>,
         kind: String,
         mask: String,
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-        next_before_id: Option<i64>,
-        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -3222,20 +3219,16 @@ mod pages {
         account: String,
         csrf: String,
         query: super::device::ValidatedServerBanDirectoryQuery,
-        error: Option<String>,
     ) -> Result<ConsoleServerBans, Response> {
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
         Ok(ConsoleServerBans {
             shell: console_shell(state, account, csrf, "bans"),
-            entries: Vec::new(),
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
             kind,
             mask,
             limit: query.page_size.value(),
-            next_before_id: None,
-            error,
         })
     }
 
@@ -3248,7 +3241,7 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        match console_server_bans_build(&state, account, csrf, query, None).await {
+        match console_server_bans_build(&state, account, csrf, query).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
