@@ -327,13 +327,13 @@
     // A successful reload remains authoritative if the browser denies session storage.
   }
 
-  const mutateConfiguration = async (form, url, method, body) => {
+  const mutateConfiguration = async (form, url, method, body, success = "Configuration saved.") => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
       await apiRequest(form, url, method, body);
       try {
-        window.sessionStorage.setItem("e6irc.configuration-result", "Configuration saved.");
+        window.sessionStorage.setItem("e6irc.configuration-result", success);
       } catch (_) {
         // A successful API response is still authoritative if the browser denies storage.
       }
@@ -368,7 +368,13 @@
         setConfigurationResult(error instanceof Error ? error.message : "Invalid network configuration.", false);
         return;
       }
-      void mutateConfiguration(form, "/api/v1/admin/configuration/networks", "POST", body);
+      void mutateConfiguration(
+        form,
+        "/api/v1/admin/configuration/networks",
+        "POST",
+        body,
+        `added server network ${body.name}`,
+      );
     });
   }
 
