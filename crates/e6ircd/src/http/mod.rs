@@ -2082,7 +2082,6 @@ mod pages {
         has_local_password: bool,
         tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
-        contact_email: String,
         link_providers: Vec<String>,
     }
 
@@ -2136,10 +2135,6 @@ mod pages {
                 created,
             })
             .collect();
-        let contact_email = crate::db::account_contact_email(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("profile read", e))?
-            .unwrap_or_default();
         let link_providers = state
             .oidc_providers
             .iter()
@@ -2151,7 +2146,6 @@ mod pages {
             has_local_password,
             tokens,
             identities,
-            contact_email,
             link_providers,
         })
     }

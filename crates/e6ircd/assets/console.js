@@ -641,6 +641,16 @@
     });
   }
 
+  const accountContactEmail = document.querySelector("[data-api-account-contact-email]");
+  if (accountContactEmail instanceof HTMLInputElement) {
+    void apiRead("/api/v1/me/profile")
+      .then((profile) => { accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : ""; })
+      .catch((error) => setAccountResult(
+        error instanceof Error ? error.message : "Contact email failed to load.",
+        false,
+      ));
+  }
+
   for (const form of document.querySelectorAll("[data-api-account-password]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
