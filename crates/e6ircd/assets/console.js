@@ -968,6 +968,151 @@
     ownerNetworkResult.className = success ? "banner-success" : "banner-error";
   };
 
+  const ownerNetworkRows = document.querySelector("[data-api-owner-network-list]");
+  const ownerNetworkCount = document.getElementById("owner-network-count");
+  const ownerNetworkRefreshStatus = ownerNetworkRows instanceof HTMLElement
+    ? document.getElementById(ownerNetworkRows.dataset.refreshStatus)
+    : null;
+  const networkCell = (value) => {
+    const cell = document.createElement("td");
+    cell.textContent = String(value);
+    return cell;
+  };
+  const renderOwnerNetworks = (networks) => {
+    if (!(ownerNetworkRows instanceof HTMLElement)) return;
+    const body = document.createElement("tbody");
+    if (ownerNetworkCount) ownerNetworkCount.textContent = String(networks.length);
+    if (!networks.length) {
+      const row = document.createElement("tr");
+      const cell = networkCell("No networks yet. Add one above.");
+      cell.colSpan = 7;
+      cell.className = "empty";
+      row.append(cell);
+      body.append(row);
+    }
+    for (const network of networks) {
+      if (!network || typeof network.name !== "string" || typeof network.kind !== "string") {
+        throw new Error("The network list response is invalid. Reload and try again.");
+      }
+      const runtime = network.runtime && typeof network.runtime === "object" ? network.runtime : null;
+      const enabled = network.enabled === true;
+      const connected = network.connected === true;
+      const state = !enabled
+        ? "disabled"
+        : typeof runtime?.state === "string" ? runtime.state.replaceAll("_", " ") : "not running";
+      const row = document.createElement("tr");
+      const status = document.createElement("td");
+      const dot = document.createElement("span");
+      dot.className = `dot ${connected ? "on" : "off"}`;
+      status.append(dot, document.createTextNode(state));
+      const name = document.createElement("a");
+      name.className = "rowlink";
+      name.href = `/console/networks/${encodeURIComponent(network.name)}`;
+      name.textContent = network.name;
+      const nameCell = document.createElement("td");
+      nameCell.append(name);
+      const kind = networkCell(network.kind);
+      const upstream = document.createElement("td");
+      const address = document.createElement("code");
+      address.textContent = typeof network.addr === "string" ? network.addr : "";
+      upstream.append(address);
+      if (network.tls === true) {
+        const tls = document.createElement("span");
+        tls.className = "tag";
+        tls.textContent = "TLS";
+        upstream.append(document.createTextNode(" "), tls);
+      }
+      const clients = networkCell(Number.isSafeInteger(runtime?.attached_clients) ? runtime.attached_clients : 0);
+      const errors = networkCell(Number.isSafeInteger(runtime?.errors) ? runtime.errors : 0);
+      const actions = document.createElement("td");
+      actions.className = "row-actions";
+      const inspect = document.createElement("a");
+      inspect.className = "rowlink";
+      inspect.href = name.href;
+      inspect.textContent = "Inspect";
+      const toggle = document.createElement("form");
+      toggle.method = "post";
+      toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
+      toggle.dataset.apiOwnerNetworkToggle = "";
+      const csrf = document.createElement("input");
+      csrf.type = "hidden";
+      csrf.name = "csrf";
+      csrf.value = ownerNetworkRows.dataset.csrf || "";
+      const nextEnabled = document.createElement("input");
+      nextEnabled.type = "hidden";
+      nextEnabled.name = "enabled";
+      nextEnabled.value = enabled ? "false" : "true";
+      const toggleButton = document.createElement("button");
+      toggleButton.type = "submit";
+      toggleButton.textContent = enabled ? "Disable" : "Enable";
+      toggle.append(csrf, nextEnabled, toggleButton);
+      const remove = document.createElement("form");
+      remove.method = "post";
+      remove.action = toggle.action;
+      remove.dataset.apiOwnerNetworkDelete = "";
+      remove.dataset.confirm = `Remove network ${network.name}? This also stops its live connection.`;
+      const removeCsrf = csrf.cloneNode();
+      const removeButton = document.createElement("button");
+      removeButton.className = "danger";
+      removeButton.type = "submit";
+      removeButton.textContent = "Remove";
+      remove.append(removeCsrf, removeButton);
+      actions.append(inspect, toggle, remove);
+      row.append(status, nameCell, kind, upstream, clients, errors, actions);
+      body.append(row);
+    }
+    const table = ownerNetworkRows.querySelector("table");
+    const previous = table?.querySelector("tbody");
+    if (!(table instanceof HTMLTableElement) || !(previous instanceof HTMLTableSectionElement)) {
+      throw new Error("The network list is unavailable. Reload and try again.");
+    }
+    table.replaceChild(body, previous);
+  };
+  const renderOwnerNetworkFailure = (message) => {
+    if (!(ownerNetworkRows instanceof HTMLElement)) return;
+    const table = ownerNetworkRows.querySelector("table");
+    const previous = table?.querySelector("tbody");
+    if (!(table instanceof HTMLTableElement) || !(previous instanceof HTMLTableSectionElement)) return;
+    if (ownerNetworkCount) ownerNetworkCount.textContent = "—";
+    const body = document.createElement("tbody");
+    const row = document.createElement("tr");
+    const cell = networkCell(message);
+    cell.colSpan = 7;
+    cell.className = "empty";
+    row.append(cell);
+    body.append(row);
+    table.replaceChild(body, previous);
+  };
+  const refreshOwnerNetworks = async () => {
+    if (!(ownerNetworkRows instanceof HTMLElement)) return;
+    ownerNetworkRows.setAttribute("aria-busy", "true");
+    if (ownerNetworkRefreshStatus) {
+      ownerNetworkRefreshStatus.textContent = "Refreshing…";
+      ownerNetworkRefreshStatus.classList.remove("refresh-error");
+    }
+    try {
+      const result = await apiRead("/api/v1/me/networks");
+      renderOwnerNetworks(Array.isArray(result.networks) ? result.networks : []);
+      if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Network list failed to load.";
+      renderOwnerNetworkFailure(message);
+      if (ownerNetworkRefreshStatus) {
+        ownerNetworkRefreshStatus.textContent = `Live refresh failed (${message}). Use Reload to retry.`;
+        ownerNetworkRefreshStatus.classList.add("refresh-error");
+      }
+    } finally {
+      ownerNetworkRows.removeAttribute("aria-busy");
+    }
+  };
+  if (ownerNetworkRows instanceof HTMLElement) {
+    void refreshOwnerNetworks();
+    const seconds = Number(ownerNetworkRows.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) {
+      window.setInterval(() => { void refreshOwnerNetworks(); }, seconds * 1000);
+    }
+  }
+
   const mutateOwnerNetwork = async (form, url, method, body, reload = true) => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
@@ -976,13 +1121,17 @@
       if (reload) {
         window.location.reload();
       } else {
-        const nick = typeof result?.confirmed_nick === "string"
-          ? result.confirmed_nick
-          : "";
+        const nick = result?.confirmed_nick;
+        const timings = [result?.dns_ms, result?.connect_ms, result?.registration_ms];
+        if (
+          typeof nick !== "string" || !nick
+          || !Number.isSafeInteger(result?.resolved_addresses) || result.resolved_addresses < 1
+          || timings.some((value) => !Number.isSafeInteger(value) || value < 0)
+        ) {
+          throw new Error("The connection check returned an invalid response. Reload and try again.");
+        }
         setOwnerNetworkResult(
-          nick
-            ? `Registered as ${nick}. Connection check passed; no network was created.`
-            : "Connection check passed; no network was created.",
+          `Registered as ${nick}. Resolved ${result.resolved_addresses} address${result.resolved_addresses === 1 ? "" : "es"}; DNS ${result.dns_ms}ms, connection ${result.connect_ms}ms, registration ${result.registration_ms}ms. No network was created.`,
           true,
         );
       }

@@ -1108,7 +1108,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/console/configuration", get(pages::console_configuration))
         .route("/console/networks", get(pages::console_networks))
-        .route("/console/networks/rows", get(pages::console_network_rows))
         .route(
             "/console/networks/{name}/edit",
             get(pages::console_edit_network),
@@ -3221,20 +3220,6 @@ mod pages {
         })
     }
 
-    /// One BNC network in the console networks view, with its live upstream
-    /// connection state resolved from the registry (not just its stored config).
-    struct ConsoleNetView {
-        name: String,
-        kind: &'static str,
-        addr: String,
-        tls: bool,
-        enabled: bool,
-        connected: bool,
-        state: String,
-        attached_clients: u64,
-        errors: u64,
-    }
-
     #[derive(Template)]
     #[template(path = "console_configuration.html")]
     struct ConsoleConfiguration {
@@ -3466,21 +3451,10 @@ mod pages {
     #[template(path = "console_networks.html")]
     struct ConsoleNetworks {
         shell: ConsoleShell,
-        networks: Vec<ConsoleNetView>,
         attach_addr: Option<std::net::SocketAddr>,
         presets: &'static [IrcNetworkPreset],
         form: NetworkFormView,
         can_store_secrets: bool,
-    }
-
-    /// The networks table as a standalone fragment: the list page's live
-    /// refresh swaps it in whole (the same discipline as the monitoring
-    /// panel), so reconnecting upstreams update without a full page reload.
-    #[derive(Template)]
-    #[template(path = "console_network_rows.html")]
-    struct ConsoleNetworkRows {
-        networks: Vec<ConsoleNetView>,
-        csrf: String,
     }
 
     #[derive(Template)]
@@ -3593,61 +3567,6 @@ mod pages {
             .read()
             .expect("administrator registry lock")
             .contains(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(account))
-    }
-
-    /// Build the caller's BNC networks with live upstream state from the
-    /// registry (a network with no live handle — disabled, or not yet dialed —
-    /// reads as not connected). One place keeps the list view consistent after
-    /// every form redirect.
-    async fn console_network_views(
-        state: &AppState,
-        account: &str,
-    ) -> Result<Vec<ConsoleNetView>, Response> {
-        let pool = pool_of(state);
-        let rows = crate::db::list_bnc_networks(pool, account)
-            .await
-            .map_err(|e| {
-                eprintln!("console: network list: {e}");
-                problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Database unavailable",
-                    None,
-                )
-            })?;
-        Ok(rows
-            .into_iter()
-            .map(|n| {
-                let runtime = state
-                    .bnc_registry
-                    .as_ref()
-                    .and_then(|r| r.get_owned(account, &n.name))
-                    .map(|h| h.runtime_snapshot());
-                let connected = runtime.as_ref().is_some_and(|runtime| {
-                    runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
-                });
-                let state_label = if n.enabled {
-                    runtime
-                        .as_ref()
-                        .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
-                        .unwrap_or_else(|| "not running".into())
-                } else {
-                    "disabled".into()
-                };
-                ConsoleNetView {
-                    name: n.name,
-                    kind: n.kind.as_db_str(),
-                    addr: n.addr,
-                    tls: n.tls,
-                    enabled: n.enabled,
-                    connected,
-                    state: state_label,
-                    attached_clients: runtime
-                        .as_ref()
-                        .map_or(0, |runtime| runtime.attached_clients),
-                    errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
-                }
-            })
-            .collect())
     }
 
     fn runtime_time(value: Option<e6irc_proto::time::Millis>) -> String {
@@ -3861,38 +3780,17 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let networks = match console_network_views(&state, &account).await {
-            Ok(networks) => networks,
-            Err(response) => return response,
-        };
         let attach_addr = match &state.bnc_listener {
             Some(listener) => listener.status().await.map(|(_, bound)| bound),
             None => None,
         };
         render_private(ConsoleNetworks {
             shell: console_shell(&state, account.clone(), csrf, "networks"),
-            networks,
             attach_addr,
             presets: IRC_NETWORK_PRESETS,
             form: NetworkFormView::libera(&account),
             can_store_secrets: state.secret_key.is_some(),
         })
-    }
-
-    /// The live-refresh fragment backing `/console/networks`' table.
-    pub async fn console_network_rows(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-    ) -> Response {
-        let (account, csrf) = match page_actor(&state, &headers, false).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let networks = match console_network_views(&state, &account).await {
-            Ok(networks) => networks,
-            Err(response) => return response,
-        };
-        render_private(ConsoleNetworkRows { networks, csrf })
     }
 
     /// Render the edit-network form from the stored configuration.

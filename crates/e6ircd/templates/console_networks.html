@@ -96,11 +96,16 @@
             <h2>Configured networks</h2>
             <p>Live status from the running connection, not just stored configuration.</p>
           </div>
-          <span class="count">{{ networks.len() }}</span>
+          <span class="count" id="owner-network-count">…</span>
         </div>
-        <div class="scroll" id="network-rows" data-refresh-url="/console/networks/rows" data-refresh-seconds="10" data-refresh-status="network-rows-status">
-            {% let csrf = shell.csrf %}
-            {% include "console_network_rows.html" %}
+        <div class="scroll" id="network-rows" data-api-owner-network-list data-csrf="{{ shell.csrf }}" data-refresh-seconds="10" data-refresh-status="network-rows-status">
+          <table>
+            <caption class="sr-only">Configured networks</caption>
+            <thead>
+              <tr><th>Status</th><th>Name</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th></th></tr>
+            </thead>
+            <tbody><tr><td colspan="7" class="empty">Loading configured networks…</td></tr></tbody>
+          </table>
         </div>
         <p id="network-rows-status" class="refresh-status sr-only" aria-live="polite">Refreshes every ten seconds.</p>
 {% endblock %}

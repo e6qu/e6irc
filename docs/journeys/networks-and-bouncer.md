@@ -67,9 +67,10 @@ credentials are supplied.
    blocks prohibited IP literals, seals any password, constructs the driver,
    inserts the owner-scoped row, and starts the driver immediately. Each DNS
    result is vetted again at dial time.
-6. The result redirects to the network list. Status comes from the live
-   runtime snapshot, including connected state, attempts, timestamps,
-   latency, traffic, attachments, and fixed-category errors.
+6. The committed result reloads the network list. The list reads only
+   `GET /api/v1/me/networks`; status comes from its live runtime snapshot,
+   including connected state, attempts, timestamps, latency, traffic,
+   attachments, and fixed-category errors.
 
 **Visible failures and recovery.**
 
@@ -117,8 +118,9 @@ monitoring; live runtime diagnosis remains tied to the registry.
 
 **Flow.**
 
-1. The network list shows enabled/paused, connecting/connected/disconnected,
-   driver kind, upstream, attached clients, and error count.
+1. The network list reads `GET /api/v1/me/networks` and shows
+   enabled/paused, connecting/connected/disconnected, driver kind, upstream,
+   attached clients, and error count.
 2. **Inspect** shows configuration without returning the stored secret.
 3. **Operations** refreshes the live snapshot: attempt/success/disconnect
    timestamps, the scheduled time of the next reconnect attempt while the
