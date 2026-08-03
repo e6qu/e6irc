@@ -446,7 +446,7 @@ try {
 
     await guest.goto(`${applicationOrigin}/console/account`);
     await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
-    assert.match(await guest.locator("main").innerText(), /ACCOUNT_LOGIN/);
+    await guest.getByText("ACCOUNT_LOGIN", { exact: true }).waitFor();
     const exportResponse = await guestContext.request.get(`${applicationOrigin}/api/v1/me/export`);
     assert.equal(exportResponse.status(), 200);
     assert.match(exportResponse.headers()["content-disposition"], /e6irc-account-export\.json/);
