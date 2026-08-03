@@ -3729,7 +3729,7 @@ async fn admin_console_ban_and_channel_actions() {
     let (status, _, _) = request(http, &add).await;
     assert_eq!(status, 201);
     assert!(
-        policy_page_has("/console/bans", "No server bans are active.", false).await,
+        policy_page_has("/api/v1/admin/bans", "*@bad.example", true).await,
         "ban not listed after add"
     );
 
@@ -3752,7 +3752,7 @@ async fn admin_console_ban_and_channel_actions() {
     let (status, _, _) = request(http, &del_req).await;
     assert_eq!(status, 204);
     assert!(
-        policy_page_has("/console/bans", "No server bans are active.", true).await,
+        policy_page_has("/api/v1/admin/bans", "*@bad.example", false).await,
         "ban still listed after remove"
     );
 
