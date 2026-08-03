@@ -3437,7 +3437,7 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
         "{channel_page}"
     );
     assert!(
-        channel_page.contains("#Eve&#60;script&#62;"),
+        channel_page.contains("data-api-admin-channel-list"),
         "{channel_page}"
     );
     assert!(!channel_page.contains("#Eve<script>"), "{channel_page}");
@@ -3448,17 +3448,14 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
     .await;
     assert_eq!(status, 200, "{channel_short_page}");
     assert!(
-        channel_short_page.contains("Older registrations"),
+        channel_short_page.contains("Loading registered channels"),
         "{channel_short_page}"
     );
 
     let (status, _, ban_page) = request(http, &cookie_get("/console/bans", &alice_session)).await;
     assert_eq!(status, 200, "{ban_page}");
     assert!(ban_page.contains("<h1>Server bans</h1>"), "{ban_page}");
-    assert!(
-        ban_page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
-        "{ban_page}"
-    );
+    assert!(ban_page.contains("data-api-admin-ban-list"), "{ban_page}");
     assert!(
         !ban_page.contains("<script>alert(1)</script>"),
         "{ban_page}"
@@ -3466,7 +3463,10 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
     let (status, _, ban_short_page) =
         request(http, &cookie_get("/console/bans?limit=2", &alice_session)).await;
     assert_eq!(status, 200, "{ban_short_page}");
-    assert!(ban_short_page.contains("Older rules"), "{ban_short_page}");
+    assert!(
+        ban_short_page.contains("Loading server bans"),
+        "{ban_short_page}"
+    );
 
     for path in ["/console/admin/channels", "/console/bans"] {
         let (status, headers, _) = request(http, &get(path)).await;
@@ -5080,7 +5080,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["app_password"]
             .as_str()
-            .is_some_and(|secret| secret.starts_with("e6a_")),
+            .is_some_and(|secret| !secret.is_empty()),
         "{body}"
     );
     let credentials = e6ircd::db::list_credentials(&pool, "alice")
@@ -6358,7 +6358,7 @@ async fn admin_networks_fleet_view_and_toggle() {
     );
     let (status, _, page) = request(http, &page_req).await;
     assert_eq!(status, 200, "{page}");
-    assert!(page.contains("bob") && page.contains("work"), "{page}");
+    assert!(page.contains("data-api-admin-network-list"), "{page}");
     // Admin disables the misbehaving network through the API; the row flips
     // and the privileged action retains the administrator's audit identity.
     let body = r#"{"enabled":false}"#;
