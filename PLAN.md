@@ -52,11 +52,13 @@ The application is complete only when all of the following are true:
 parallel console-specific behavior.
 
 **Current milestone:** [`docs/api-first-inventory.md`](docs/api-first-inventory.md)
-lists every mutable console route and its canonical API mapping. Every listed
-state transition now has a typed versioned API operation; CI verifies that the
-inventory covers the router's complete console-mutation set. Retiring rendered
-form handlers is Stage B work, after their API-client replacements have the
-same browser transition and error evidence.
+lists every remaining mutable console route and its canonical API mapping.
+Every listed state transition has a typed versioned API operation; CI verifies
+that the inventory covers the router's complete console-mutation set. The
+configuration, administrator-ban, live-connection, and owner-session controls
+now issue those API requests directly and their rendered mutation handlers are
+gone, with HTTP tests covering the same authorization and committed-result
+contracts.
 
 1. Inventory every browser-chat, server-rendered-console, CLI, and native
    client read/mutation. For each one, record its canonical resource, request

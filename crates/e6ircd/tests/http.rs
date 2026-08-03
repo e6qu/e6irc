@@ -835,6 +835,8 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-oidc-create"), "{body}");
     assert!(body.contains("data-api-configuration-patch"), "{body}");
     assert!(body.contains("data-api-ban-create"), "{body}");
+    assert!(body.contains("data-api-session-revoke"), "{body}");
+    assert!(body.contains("data-api-session-disconnect"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
@@ -4517,8 +4519,15 @@ async fn my_sessions_are_scoped_to_the_caller() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(ok && !csrf.is_empty(), "alice's own session not listed");
+    assert!(
+        request(http, &page_req)
+            .await
+            .2
+            .contains("data-api-session-disconnect"),
+        "owner session page must use the API connection control"
+    );
     let alice_connection_id =
-        body_connection_id(&request(http, &page_req).await.2, "/console/my-sessions/");
+        body_connection_id(&request(http, &page_req).await.2, "/api/v1/me/connections/");
 
     // The next accepted IRC connection belongs to Bob. Guessing its immutable
     // id is still refused because owner authorization is re-checked in core.
@@ -4545,19 +4554,6 @@ async fn my_sessions_are_scoped_to_the_caller() {
     let (status, _, body) = request(http, &delete_bob_api).await;
     assert_eq!(status, 404, "{body}");
 
-    let kill_bob = format!("csrf={csrf}&reason=x");
-    let kb = format!(
-        "POST /console/my-sessions/{bob_connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{kill_bob}",
-        kill_bob.len()
-    );
-    let (status, _, body) = request(http, &kb).await;
-    assert_eq!(status, 200, "{body}"); // re-renders with a banner, not a redirect
-    assert!(
-        body.contains("banner-error"),
-        "expected refusal banner: {body}"
-    );
     // bob is still alive: a PING gets a PONG.
     bob_cli.send_line("PING :stillhere").await.unwrap();
     let bob_alive = tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -4611,29 +4607,6 @@ async fn my_sessions_are_scoped_to_the_caller() {
     );
     let (status, _, body) = request(http, &delete_alice_api).await;
     assert_eq!(status, 404, "{body}");
-
-    // Disconnecting alice's original session works -> 303.
-    let kill_me = format!("csrf={csrf}&reason=bye");
-    let km = format!(
-        "POST /console/my-sessions/{alice_connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{kill_me}",
-        kill_me.len()
-    );
-    let (status, head, _) = request(http, &km).await;
-    assert_eq!(status, 303, "{head}");
-    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match alice_cli.next_message().await {
-                Ok(Some(m)) if m.command == "ERROR" => return true,
-                Ok(Some(_)) => continue,
-                _ => return true, // EOF
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-    assert!(killed, "alice's own session was not disconnected");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4725,6 +4698,11 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     assert!(page_body.contains("Browser &#60;other&#62;"), "{page_body}");
     assert!(!page_body.contains("Browser <other>"), "{page_body}");
     assert!(page_body.contains("Current session"), "{page_body}");
+    assert!(page_body.contains("data-api-session-revoke"), "{page_body}");
+    assert!(
+        page_body.contains("action=\"/api/v1/me/sessions?except=current\""),
+        "{page_body}"
+    );
     assert!(
         page_body.contains("Sign out others"),
         "bulk revocation missing: {page_body}"

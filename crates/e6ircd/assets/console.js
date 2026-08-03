@@ -5,8 +5,11 @@
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     const message = form.dataset.confirm;
-    if (message && !window.confirm(message)) event.preventDefault();
-  });
+    if (message && !window.confirm(message)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }, true);
 
   for (const button of document.querySelectorAll("[data-copy-target]")) {
     button.addEventListener("click", async () => {
@@ -523,7 +526,33 @@
     sessionResult.className = success ? "banner-success" : "banner-error";
   };
 
-  for (const form of document.querySelectorAll("[data-api-admin-disconnect]")) {
+  const mutateSession = async (form, url, message) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(url, {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: { Accept: "application/json", "X-E6IRC-CSRF": csrf },
+      });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      window.location.reload();
+    } catch (error) {
+      setSessionResult(error instanceof Error ? error.message : message, false);
+      if (submit) submit.disabled = false;
+    }
+  };
+
+  for (const form of document.querySelectorAll("[data-api-session-revoke]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void mutateSession(form, form.action, "Browser-session request failed.");
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-session-disconnect]")) {
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const fields = new FormData(form);
@@ -532,24 +561,10 @@
         setSessionResult("The live-connection ID is invalid. Reload and try again.", false);
         return;
       }
-      const submit = form.querySelector('button[type="submit"]');
-      if (submit) submit.disabled = true;
-      try {
-        const csrf = form.querySelector('input[name="csrf"]')?.value;
-        if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-        const reason = fieldValue(fields, "reason");
-        const query = reason ? `?reason=${encodeURIComponent(reason)}` : "";
-        const response = await fetch(`/api/v1/admin/connections/${id}${query}`, {
-          method: "DELETE",
-          credentials: "same-origin",
-          headers: { Accept: "application/json", "X-E6IRC-CSRF": csrf },
-        });
-        if (!response.ok) throw new Error(await apiProblem(response));
-        window.location.reload();
-      } catch (error) {
-        setSessionResult(error instanceof Error ? error.message : "Disconnect request failed.", false);
-        if (submit) submit.disabled = false;
-      }
+      const reason = fieldValue(fields, "reason");
+      const separator = form.action.includes("?") ? "&" : "?";
+      const query = reason ? `${separator}reason=${encodeURIComponent(reason)}` : "";
+      void mutateSession(form, `${form.action}${query}`, "Disconnect request failed.");
     });
   }
 })();

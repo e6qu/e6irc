@@ -32,9 +32,6 @@ operation's semantics.
 | `/console/account/tokens` | `POST /api/v1/me/tokens` | Mapped | Preserve closed scopes and one-time bearer display. |
 | `/console/account/tokens/{id}/delete` | `DELETE /api/v1/me/tokens/{id}` | Mapped | Refresh only after committed revocation. |
 | `/console/account/identities/{id}/delete` | `DELETE /api/v1/me/identities/{id}` | Mapped | Preserve linked-session revocation behavior. |
-| `/console/my-sessions/browser/{id}/delete` | `DELETE /api/v1/me/sessions/{id}` | Mapped | Clear the current cookie when its own session is revoked. |
-| `/console/my-sessions/browser/others/delete` | `DELETE /api/v1/me/sessions?except=current` | Mapped | Use the atomic selector; do not emulate it with a racy client loop. |
-| `/console/my-sessions/{id}/disconnect` | `DELETE /api/v1/me/connections/{id}` | Mapped | Keep owner scope and immutable connection ID. |
 
 ## Registered channels
 

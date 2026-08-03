@@ -1298,18 +1298,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/sessions", get(pages::console_sessions))
         .route("/console/my-sessions", get(pages::console_my_sessions))
         .route(
-            "/console/my-sessions/{id}/disconnect",
-            post(pages::console_disconnect_own_session),
-        )
-        .route(
-            "/console/my-sessions/browser/{id}/delete",
-            post(pages::console_revoke_browser_session),
-        )
-        .route(
-            "/console/my-sessions/browser/others/delete",
-            post(pages::console_revoke_other_browser_sessions),
-        )
-        .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
         );
@@ -5144,7 +5132,6 @@ mod pages {
         shell: ConsoleShell,
         title: &'static str,
         hint: &'static str,
-        disconnect_action: &'static str,
         sessions: Vec<SessionRow>,
         nick_filter: String,
         account_filter: String,
@@ -6444,30 +6431,6 @@ mod pages {
         .await
     }
 
-    #[derive(Deserialize)]
-    pub struct DisconnectForm {
-        csrf: String,
-        #[serde(default)]
-        reason: String,
-    }
-
-    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-    fn parse_disconnect_form(
-        connection_id: u64,
-        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, String), Response> {
-        if connection_id == 0 {
-            return Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid live-connection id",
-                None,
-            ));
-        }
-        let form = parse_form(form)?;
-        let reason = validate_disconnect_reason(form.reason)?;
-        Ok((form.csrf, reason))
-    }
-
     /// Render one bounded live-connection page. `own` forces the account filter
     /// for self-service and also includes the caller's capped durable browser
     /// logins.
@@ -6535,19 +6498,17 @@ mod pages {
         } else {
             Vec::new()
         };
-        let (active, title, hint, disconnect_action) = if own {
+        let (active, title, hint) = if own {
             (
                 "my-sessions",
                 "Your sessions",
                 "Durable browser logins and live IRC connections authenticated to your account. Disconnecting a live connection targets its immutable connection ID.",
-                "/console/my-sessions",
             )
         } else {
             (
                 "sessions",
                 "Live connections",
                 "Bounded, newest-first registered IRC connections across TCP, TLS, WebSocket, and the local in-process network.",
-                "/console/sessions",
             )
         };
         let nick_filter = query.nick.unwrap_or_default();
@@ -6562,7 +6523,6 @@ mod pages {
             shell: console_shell(state, account, csrf, active),
             title,
             hint,
-            disconnect_action,
             sessions,
             has_filters: !nick_filter.is_empty()
                 || !account_filter.is_empty()
@@ -6582,25 +6542,6 @@ mod pages {
         })
     }
 
-    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-    fn default_live_connection_query() -> Result<ValidatedLiveConnectionQuery, Response> {
-        validate_live_connection_query(LiveConnectionQueryParams::default(), 50)
-    }
-
-    async fn sessions_error_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        own: bool,
-        message: String,
-    ) -> Response {
-        let query = match default_live_connection_query() {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        render_sessions_page(state, headers, account, own, query, Some(message)).await
-    }
-
     /// Console → bounded live connection directory (admin-gated).
     pub async fn console_sessions(
         State(state): State<Arc<AppState>>,
@@ -6615,8 +6556,8 @@ mod pages {
         render_sessions_page(&state, &headers, account, false, query, None).await
     }
 
-    /// Console → disconnect an exact live connection (admin), like oper KILL
-    /// after its nick has resolved to one immutable connection.
+    /// Console → the caller's bounded live-connection directory and durable
+    /// browser-session inventory.
     pub async fn console_my_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -6631,103 +6572,6 @@ mod pages {
             Err(response) => return response,
         };
         render_sessions_page(&state, &headers, account, true, query, None).await
-    }
-
-    /// Console → disconnect one exact live connection only if it remains owned
-    /// by the caller.
-    pub async fn console_disconnect_own_session(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(connection_id): Path<u64>,
-        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let request = crate::core::AdminRequest::DisconnectOwnConnection {
-            connection_id,
-            reason,
-            account: account.clone(),
-        };
-        match core_action(&state, request).await {
-            Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(message) => sessions_error_page(&state, &headers, account, true, message).await,
-        }
-    }
-
-    async fn browser_session_error(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        message: &'static str,
-    ) -> Response {
-        sessions_error_page(state, headers, account, true, message.to_owned()).await
-    }
-
-    /// Console → revoke one durable browser session owned by the caller.
-    pub async fn console_revoke_browser_session(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let current = session_token(&headers, state.secure_cookies);
-        match crate::db::delete_web_session_by_id(pool_of(&state), &account, id, current.as_deref())
-            .await
-        {
-            Ok(Some(false)) => Redirect::to("/console/my-sessions").into_response(),
-            Ok(Some(true)) => redirect_signed_out(&state),
-            Ok(None) => {
-                browser_session_error(&state, &headers, account, "No such browser session.").await
-            }
-            Err(error) => {
-                eprintln!("console: browser session revoke failed: {error}");
-                browser_session_error(
-                    &state,
-                    &headers,
-                    account,
-                    "Browser session storage is unavailable.",
-                )
-                .await
-            }
-        }
-    }
-
-    /// Console → revoke every other browser login while preserving the session
-    /// whose CSRF token authorized the form.
-    pub async fn console_revoke_other_browser_sessions(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let current = session_token(&headers, state.secure_cookies)
-            .expect("form actor requires a cookie session");
-        match crate::db::delete_other_web_sessions(pool_of(&state), &account, &current).await {
-            Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(error) => {
-                eprintln!("console: other browser session revoke failed: {error}");
-                browser_session_error(
-                    &state,
-                    &headers,
-                    account,
-                    "Browser session storage is unavailable.",
-                )
-                .await
-            }
-        }
     }
 
     async fn owned_bridge(

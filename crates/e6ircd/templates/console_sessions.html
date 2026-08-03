@@ -27,9 +27,10 @@
         <div class="row-actions">
           <span class="count">{{ browser_sessions.len() }}</span>
           {% if browser_sessions.len() > 1 %}
-            <form method="post" action="/console/my-sessions/browser/others/delete"
-                  data-confirm="Sign out every other browser session?">
+            <form method="post" action="/api/v1/me/sessions?except=current"
+                  data-api-session-revoke data-confirm="Sign out every other browser session?">
               <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+              <noscript><div class="banner-error">JavaScript is required to manage browser sessions because these controls use the account API directly.</div></noscript>
               <button class="danger" type="submit">Sign out others</button>
             </form>
           {% endif %}
@@ -56,9 +57,10 @@
                       <span class="tag">Current session</span>
                     {% else %}
                       <form class="cell-form" method="post"
-                            action="/console/my-sessions/browser/{{ session.id }}/delete"
+                            action="/api/v1/me/sessions/{{ session.id }}" data-api-session-revoke
                             data-confirm="Sign out this browser session?">
                         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                        <noscript><div class="banner-error">JavaScript is required to manage browser sessions because these controls use the account API directly.</div></noscript>
                         <button class="danger" type="submit">Sign out</button>
                       </form>
                     {% endif %}
@@ -164,10 +166,11 @@
                 <td>{% if s.channels.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ s.channels }}</code>{% endif %}</td>
                 <td>
                   <form class="cell-form" method="post"
-                        {% if show_browser_sessions %}action="{{ disconnect_action }}/{{ s.id }}/disconnect"{% else %}action="/api/v1/admin/connections/{{ s.id }}" data-api-admin-disconnect{% endif %}
+                        {% if show_browser_sessions %}action="/api/v1/me/connections/{{ s.id }}"{% else %}action="/api/v1/admin/connections/{{ s.id }}"{% endif %} data-api-session-disconnect
                         data-confirm="Disconnect connection {{ s.id }} ({{ s.nick }})?">
                     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                    {% if !show_browser_sessions %}<input type="hidden" name="id" value="{{ s.id }}" />{% endif %}
+                    <input type="hidden" name="id" value="{{ s.id }}" />
+                    <noscript><div class="banner-error">JavaScript is required to disconnect a live connection because this control uses the API directly.</div></noscript>
                     <input type="text" name="reason" maxlength="300" placeholder="reason" />
                     <button class="danger" type="submit">Disconnect</button>
                   </form>
