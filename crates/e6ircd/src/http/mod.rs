@@ -2074,11 +2074,6 @@ mod pages {
         created: String,
     }
 
-    struct ReadMarkerView {
-        target: String,
-        timestamp: String,
-    }
-
     #[derive(Template)]
     #[template(path = "console_account.html")]
     struct ConsoleAccount {
@@ -2087,7 +2082,6 @@ mod pages {
         has_local_password: bool,
         tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
-        read_markers: Vec<ReadMarkerView>,
         contact_email: String,
         link_providers: Vec<String>,
     }
@@ -2142,12 +2136,6 @@ mod pages {
                 created,
             })
             .collect();
-        let read_markers = crate::db::list_read_markers(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("read-marker list", e))?
-            .into_iter()
-            .map(|(target, timestamp)| ReadMarkerView { target, timestamp })
-            .collect();
         let contact_email = crate::db::account_contact_email(pool, &account)
             .await
             .map_err(|e| super::device::admin_db_error("profile read", e))?
@@ -2163,7 +2151,6 @@ mod pages {
             has_local_password,
             tokens,
             identities,
-            read_markers,
             contact_email,
             link_providers,
         })

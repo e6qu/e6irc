@@ -749,6 +749,38 @@
       });
   }
 
+  const accountReadMarkers = document.querySelector("[data-api-account-read-marker-list]");
+  if (accountReadMarkers instanceof HTMLElement) {
+    void apiRead("/api/v1/me/read-markers")
+      .then((result) => {
+        const markers = Array.isArray(result.markers) ? result.markers : [];
+        accountReadMarkers.replaceChildren();
+        const count = document.getElementById("account-read-marker-count");
+        if (count) count.textContent = String(markers.length);
+        if (!markers.length) {
+          const empty = document.createElement("p");
+          empty.className = "empty";
+          empty.textContent = "No read markers have been stored yet.";
+          accountReadMarkers.append(empty);
+          return;
+        }
+        for (const marker of markers) {
+          const entry = document.createElement("div");
+          const target = document.createElement("code");
+          target.textContent = String(marker.target || "");
+          const timestamp = document.createElement("span");
+          timestamp.textContent = String(marker.timestamp || "");
+          entry.append(target, timestamp);
+          accountReadMarkers.append(entry);
+        }
+      })
+      .catch((error) => {
+        accountReadMarkers.textContent = error instanceof Error
+          ? error.message
+          : "Read markers failed to load.";
+      });
+  }
+
   const adminAccountResult = document.getElementById("admin-account-api-result");
   const adminAccountSecret = document.getElementById("admin-account-api-secret");
   const setAdminAccountResult = (message, success) => {

@@ -221,17 +221,11 @@
         <h2>Read state</h2>
         <p>Latest IRCv3 read marker persisted for each conversation.</p>
       </div>
-      <span class="count">{{ read_markers.len() }}</span>
+      <span class="count" id="account-read-marker-count">…</span>
     </div>
-    {% if read_markers.is_empty() %}
-      <p class="empty">No read markers have been stored yet.</p>
-    {% else %}
-      <div class="marker-grid">
-        {% for marker in read_markers %}
-          <div><code>{{ marker.target }}</code><span>{{ marker.timestamp }}</span></div>
-        {% endfor %}
-      </div>
-    {% endif %}
+    <div class="marker-grid" id="account-read-markers" data-api-account-read-marker-list>
+      <p class="empty">Loading read markers…</p>
+    </div>
   </section>
 
   <section class="panel">
