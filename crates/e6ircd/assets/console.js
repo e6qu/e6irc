@@ -885,6 +885,7 @@
     const title = document.createElement("h2");
     title.textContent = "Account invitation link";
     const code = document.createElement("code");
+    code.id = "issued-invitation";
     code.textContent = value;
     const copy = document.createElement("button");
     copy.type = "button";

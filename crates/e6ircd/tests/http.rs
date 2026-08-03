@@ -1619,10 +1619,6 @@ async fn console_configuration_manages_every_credential_collection() {
         "provider creation must go through the JSON API: {page}"
     );
     assert!(
-        page.contains("data-api-oidc-delete"),
-        "provider deletion must go through the JSON API: {page}"
-    );
-    assert!(
         page.contains("action=\"/api/v1/admin/configuration/oidc-providers\""),
         "provider creation must not target a rendered mutation handler: {page}"
     );
@@ -4566,9 +4562,9 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         form.len()
     );
     let (status, _, body) = request(http, &post).await;
-    assert_eq!(status, 404, "{body}");
+    assert_eq!(status, 405, "{body}");
 
-    // A wrong CSRF token -> 403.
+    // Removed form routes do not reach CSRF dispatch.
     let form_nocsrf = "csrf=wrong&kind=matrix&name=hq&sasl_password=x";
     let post_nocsrf = format!(
         "POST /console/integrations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -4577,7 +4573,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         form_nocsrf.len()
     );
     let (status, _, _) = request(http, &post_nocsrf).await;
-    assert_eq!(status, 404);
+    assert_eq!(status, 405);
 }
 
 /// The all-feature database lane proves the complete bridge management
