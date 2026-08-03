@@ -2396,27 +2396,10 @@ mod pages {
         error: Option<String>,
     }
 
-    /// One row of the admin fleet view: a network of any account with its
-    /// live driver state.
-    struct ConsoleAdminNetworkView {
-        owner: String,
-        name: String,
-        kind: String,
-        addr: String,
-        tls: bool,
-        enabled: bool,
-        connected: bool,
-        state: String,
-        attached_clients: u64,
-        errors: u64,
-        last_error: Option<String>,
-    }
-
     #[derive(Template)]
     #[template(path = "console_admin_networks.html")]
     struct ConsoleAdminNetworks {
         shell: ConsoleShell,
-        networks: Vec<ConsoleAdminNetworkView>,
     }
 
     #[derive(Template)]
@@ -3242,52 +3225,8 @@ mod pages {
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        let rows = match crate::db::list_bnc_network_inventory(pool_of(&state)).await {
-            Ok(rows) => rows,
-            Err(error) => return super::device::admin_db_error("network inventory", error),
-        };
-        let networks = rows
-            .into_iter()
-            .map(|row| {
-                let runtime = state
-                    .bnc_registry
-                    .as_ref()
-                    .and_then(|r| r.get_owned(&row.owner, &row.network.name))
-                    .map(|h| h.runtime_snapshot());
-                let connected = runtime.as_ref().is_some_and(|runtime| {
-                    runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
-                });
-                let state_label = if row.network.enabled {
-                    runtime
-                        .as_ref()
-                        .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
-                        .unwrap_or_else(|| "not running".into())
-                } else {
-                    "disabled".into()
-                };
-                ConsoleAdminNetworkView {
-                    owner: row.owner,
-                    name: row.network.name,
-                    kind: row.network.kind.as_db_str().to_string(),
-                    addr: row.network.addr,
-                    tls: row.network.tls,
-                    enabled: row.network.enabled,
-                    connected,
-                    state: state_label,
-                    attached_clients: runtime
-                        .as_ref()
-                        .map_or(0, |runtime| runtime.attached_clients),
-                    errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
-                    last_error: runtime
-                        .as_ref()
-                        .and_then(|runtime| runtime.last_error)
-                        .map(|failure| failure.summary().to_string()),
-                }
-            })
-            .collect();
         render_private(ConsoleAdminNetworks {
             shell: console_shell(&state, account, csrf, "admin-networks"),
-            networks,
         })
     }
 

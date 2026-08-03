@@ -8,7 +8,7 @@
             <h1>All BNC networks</h1>
             <p class="lede">Every account's always-on networks with live driver state. Disable a single misbehaving upstream here instead of suspending the whole account.</p>
           </div>
-          <span class="count">{{ networks.len() }}</span>
+          <span class="count" id="admin-network-count">…</span>
         </div>
 
         <div class="scroll">
@@ -17,33 +17,9 @@
             <thead>
               <tr><th>Status</th><th>Owner</th><th>Network</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th>Last failure</th><th></th></tr>
             </thead>
-            {% if networks.is_empty() %}
-              <tbody><tr><td colspan="9" class="empty">No networks configured by any account.</td></tr></tbody>
-            {% else %}
-              <tbody>
-                {% for n in networks %}
-                  <tr>
-                    <td>
-                      <span class="dot {% if n.connected %}on{% else %}off{% endif %}"></span>{{ n.state }}
-                    </td>
-                    <td>{{ n.owner }}</td>
-                    <td>{{ n.name }}</td>
-                    <td><span class="tag">{{ n.kind }}</span></td>
-                    <td><code>{{ n.addr }}</code>{% if n.tls %} <span class="tag">TLS</span>{% endif %}</td>
-                    <td>{{ n.attached_clients }}</td>
-                    <td>{{ n.errors }}</td>
-                    <td>{% if let Some(reason) = n.last_error %}{{ reason }}{% else %}—{% endif %}</td>
-                    <td class="row-actions">
-                      <form method="post" action="/api/v1/admin/networks/{{ n.owner }}/{{ n.name }}" data-api-admin-network-toggle>
-                        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                        <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
-                        <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
-                      </form>
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            {% endif %}
+            <tbody id="admin-network-rows" data-api-admin-network-list data-csrf="{{ shell.csrf }}">
+              <tr><td colspan="9" class="empty">Loading networks…</td></tr>
+            </tbody>
           </table>
         </div>
 {% endblock %}

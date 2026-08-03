@@ -723,6 +723,45 @@
   document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement)) return; if (form.matches("[data-api-admin-invitation-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", undefined, "Invitation revocation failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-state]")) { event.preventDefault(); const fields = new FormData(form); const key = form.dataset.apiAdminAccountState === "suspension" ? "suspended" : "administrator"; void mutateAdminAccount(form, "PATCH", { [key]: fieldValue(fields, key) === "true" }, "Account state change failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", { confirmation: fieldValue(new FormData(form), "confirmation") }, "Account deletion failed.").then((result) => { if (result) window.location.reload(); }); } });
 
   const adminNetworkResult = document.getElementById("admin-network-api-result");
+  const adminNetworkRows = document.querySelector("[data-api-admin-network-list]");
+  const renderAdminNetworks = (networks) => {
+    if (!(adminNetworkRows instanceof HTMLElement)) return;
+    adminNetworkRows.replaceChildren();
+    const count = document.getElementById("admin-network-count");
+    if (count) count.textContent = String(networks.length);
+    if (!networks.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 9;
+      cell.className = "empty";
+      cell.textContent = "No networks configured by any account.";
+      row.append(cell);
+      adminNetworkRows.append(row);
+      return;
+    }
+    for (const network of networks) {
+      const row = document.createElement("tr");
+      const runtime = network.runtime || {};
+      const cells = [runtime.state || (network.enabled ? "not running" : "disabled"), network.owner, network.name, network.kind, network.addr, runtime.attached_clients || 0, runtime.errors || 0, runtime.last_error?.summary || "—"];
+      cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } row.append(cell); });
+      const actions = document.createElement("td");
+      actions.className = "row-actions";
+      const form = document.createElement("form");
+      form.method = "post";
+      form.action = `/api/v1/admin/networks/${encodeURIComponent(network.owner)}/${encodeURIComponent(network.name)}`;
+      form.dataset.apiAdminNetworkToggle = "";
+      const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminNetworkRows.dataset.csrf || "";
+      const enabled = document.createElement("input"); enabled.type = "hidden"; enabled.name = "enabled"; enabled.value = network.enabled ? "false" : "true";
+      const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable";
+      form.append(csrf, enabled, button); actions.append(form); row.append(actions); adminNetworkRows.append(row);
+    }
+  };
+  if (adminNetworkRows instanceof HTMLElement) {
+    void fetch("/api/v1/admin/networks", { credentials: "same-origin", headers: { Accept: "application/json" } })
+      .then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); return response.json(); })
+      .then((result) => renderAdminNetworks(Array.isArray(result.networks) ? result.networks : []))
+      .catch((error) => { adminNetworkRows.textContent = error instanceof Error ? error.message : "Network list failed to load."; });
+  }
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-admin-network-toggle]")) return;
