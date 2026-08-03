@@ -83,11 +83,8 @@ operation's semantics.
 
 The Configuration document is now a read-only shell. Its scalar settings,
 operators, OpenID Connect providers, and server networks all mutate only via
-the administrator API routes below; the former `/console/configuration/*`
-mutation routes no longer exist.
-
-| Console mutation | Canonical API operation | State | Migration requirement |
-|---|---|---|---|
+administrator API routes; the former `/console/configuration/*` mutation
+routes no longer exist.
 
 ## Read-only console views
 
