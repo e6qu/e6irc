@@ -167,6 +167,7 @@
 
   const apiRead = async (url) => {
     const response = await fetch(url, {
+      cache: "no-store",
       credentials: "same-origin",
       headers: { Accept: "application/json" },
     });

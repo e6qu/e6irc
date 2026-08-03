@@ -3722,6 +3722,15 @@ async fn admin_console_ban_and_channel_actions() {
         policy_page_has("/api/v1/admin/bans", "*@bad.example", false).await,
         "ban still listed after remove"
     );
+    assert!(
+        policy_page_has(
+            "/api/v1/admin/audit?action=UNKLINE&target=%2A%40bad.example",
+            "UNKLINE",
+            true,
+        )
+        .await,
+        "server-ban removal was not recorded in the administrator audit API"
+    );
 
     // Drop the registered channel through its administrator API resource; the
     // registry becomes empty after the core commits the ordered transition.
