@@ -974,7 +974,15 @@
       if (reload) {
         window.location.reload();
       } else {
-        setOwnerNetworkResult(result?.detail || "Connection check passed; no network was created.", true);
+        const nick = typeof result?.result?.confirmed_nick === "string"
+          ? result.result.confirmed_nick
+          : "";
+        setOwnerNetworkResult(
+          nick
+            ? `Registered as ${nick}. Connection check passed; no network was created.`
+            : "Connection check passed; no network was created.",
+          true,
+        );
       }
     } catch (error) {
       setOwnerNetworkResult(error instanceof Error ? error.message : "Network request failed.", false);

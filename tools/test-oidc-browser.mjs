@@ -542,15 +542,10 @@ try {
   await page.locator('input[name="nick"]').fill("webjourney");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
-  await clickAndWaitForURL(
-    page,
-    page.getByRole("button", { name: "Test connection", exact: true }),
-    `${applicationOrigin}/console/networks/preflight`,
-  );
-  await page
-    .getByRole("heading", { name: "Registered as webjourney", exact: true })
-    .waitFor();
-  assert.match(await page.getByRole("status").innerText(), /Not saved yet/);
+  await page.getByRole("button", { name: "Test connection", exact: true }).click();
+  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor();
+  assert.match(await page.getByRole("status").innerText(), /no network was created/);
+  assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
   await clickAndWaitForURL(
