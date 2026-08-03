@@ -310,11 +310,7 @@ pub(super) async fn list_credentials(
                     })
                 })
                 .collect();
-            (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "credentials": creds }).to_string(),
-            )
-                .into_response()
+            json_no_store(serde_json::json!({ "credentials": creds }))
         }
         Err(error) => database_unavailable("credential list", error),
     }
@@ -340,11 +336,7 @@ pub(super) async fn me_identities(
                     })
                 })
                 .collect();
-            (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "identities": identities }).to_string(),
-            )
-                .into_response()
+            json_no_store(serde_json::json!({ "identities": identities }))
         }
         Err(error) => database_unavailable("identity list", error),
     }
@@ -407,11 +399,7 @@ pub(super) async fn me_read_markers(
                     serde_json::json!({ "target": target, "timestamp": timestamp })
                 })
                 .collect();
-            (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "markers": markers }).to_string(),
-            )
-                .into_response()
+            json_no_store(serde_json::json!({ "markers": markers }))
         }
         Err(error) => database_unavailable("read-marker list", error),
     }
@@ -438,11 +426,7 @@ pub(super) async fn me_tokens_list(
                     })
                 })
                 .collect();
-            (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::json!({ "tokens": tokens }).to_string(),
-            )
-                .into_response()
+            json_no_store(serde_json::json!({ "tokens": tokens }))
         }
         Err(error) => database_unavailable("token list", error),
     }
