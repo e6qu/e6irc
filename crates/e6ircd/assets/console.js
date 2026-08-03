@@ -135,6 +135,23 @@
     return `Request failed with HTTP ${response.status}.`;
   };
 
+  const apiRequest = async (form, url, method, body) => {
+    const csrf = form.querySelector('input[name="csrf"]')?.value;
+    if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+    const response = await fetch(url, {
+      method,
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-E6IRC-CSRF": csrf,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(await apiProblem(response));
+    return response.status === 204 ? undefined : response.json().catch(() => undefined);
+  };
+
   const optionalValue = (value) => {
     const trimmed = value.trim();
     return trimmed || null;
@@ -292,19 +309,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(url, {
-        method,
-        credentials: "same-origin",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-E6IRC-CSRF": csrf,
-        },
-        body: JSON.stringify(body),
-      });
-      if (!response.ok) throw new Error(await apiProblem(response));
+      await apiRequest(form, url, method, body);
       try {
         window.sessionStorage.setItem("e6irc.configuration-result", "Configuration saved.");
       } catch (_) {
@@ -469,19 +474,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(url, {
-        method,
-        credentials: "same-origin",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-E6IRC-CSRF": csrf,
-        },
-        body: JSON.stringify(body),
-      });
-      if (!response.ok) throw new Error(await apiProblem(response));
+      await apiRequest(form, url, method, body);
       window.location.reload();
     } catch (error) {
       setBanResult(error instanceof Error ? error.message : "Server-ban request failed.", false);
@@ -530,14 +523,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(url, {
-        method: "DELETE",
-        credentials: "same-origin",
-        headers: { Accept: "application/json", "X-E6IRC-CSRF": csrf },
-      });
-      if (!response.ok) throw new Error(await apiProblem(response));
+      await apiRequest(form, url, "DELETE");
       window.location.reload();
     } catch (error) {
       setSessionResult(error instanceof Error ? error.message : message, false);
@@ -608,21 +594,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(form.action, {
-        method,
-        credentials: "same-origin",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-E6IRC-CSRF": csrf,
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      if (!response.ok) throw new Error(await apiProblem(response));
-      const contentType = response.headers.get("content-type") || "";
-      return contentType.includes("application/json") ? response.json() : null;
+      return apiRequest(form, form.action, method, body);
     } catch (error) {
       setAccountResult(error instanceof Error ? error.message : failure, false);
       if (submit) submit.disabled = false;
@@ -723,11 +695,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(form.action, { method, credentials: "same-origin", headers: { Accept: "application/json", "Content-Type": "application/json", "X-E6IRC-CSRF": csrf }, body: body === undefined ? undefined : JSON.stringify(body) });
-      if (!response.ok) throw new Error(await apiProblem(response));
-      return response.status === 204 ? {} : response.json();
+      return (await apiRequest(form, form.action, method, body)) ?? {};
     } catch (error) {
       setAdminAccountResult(error instanceof Error ? error.message : failure, false);
       if (submit) submit.disabled = false;
@@ -755,7 +723,26 @@
   document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement)) return; if (form.matches("[data-api-admin-invitation-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", undefined, "Invitation revocation failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-state]")) { event.preventDefault(); const fields = new FormData(form); const key = form.dataset.apiAdminAccountState === "suspension" ? "suspended" : "administrator"; void mutateAdminAccount(form, "PATCH", { [key]: fieldValue(fields, key) === "true" }, "Account state change failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", { confirmation: fieldValue(new FormData(form), "confirmation") }, "Account deletion failed.").then((result) => { if (result) window.location.reload(); }); } });
 
   const adminNetworkResult = document.getElementById("admin-network-api-result");
-  document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-admin-network-toggle]")) return; event.preventDefault(); const csrf = form.querySelector('input[name="csrf"]')?.value; const enabled = fieldValue(new FormData(form), "enabled"); if (!csrf || (enabled !== "true" && enabled !== "false")) { if (adminNetworkResult) { adminNetworkResult.textContent = "The requested network state is invalid. Reload and try again."; adminNetworkResult.className = "banner-error"; } return; } void fetch(form.action, { method: "PATCH", credentials: "same-origin", headers: { Accept: "application/json", "Content-Type": "application/json", "X-E6IRC-CSRF": csrf }, body: JSON.stringify({ enabled: enabled === "true" }) }).then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); window.location.reload(); }).catch((error) => { if (adminNetworkResult) { adminNetworkResult.textContent = error instanceof Error ? error.message : "Network lifecycle change failed."; adminNetworkResult.className = "banner-error"; } }); });
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-admin-network-toggle]")) return;
+    event.preventDefault();
+    const enabled = fieldValue(new FormData(form), "enabled");
+    if (enabled !== "true" && enabled !== "false") {
+      if (adminNetworkResult) {
+        adminNetworkResult.textContent = "The requested network state is invalid. Reload and try again.";
+        adminNetworkResult.className = "banner-error";
+      }
+      return;
+    }
+    void apiRequest(form, form.action, "PATCH", { enabled: enabled === "true" })
+      .then(() => window.location.reload())
+      .catch((error) => {
+        if (!adminNetworkResult) return;
+        adminNetworkResult.textContent = error instanceof Error ? error.message : "Network lifecycle change failed.";
+        adminNetworkResult.className = "banner-error";
+      });
+  });
 
   const ownerNetworkResult = document.getElementById("network-api-result");
   const setOwnerNetworkResult = (message, success) => {
@@ -768,20 +755,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(url, {
-        method,
-        credentials: "same-origin",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-E6IRC-CSRF": csrf,
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      if (!response.ok) throw new Error(await apiProblem(response));
-      const result = response.status === 204 ? null : await response.json().catch(() => null);
+      const result = await apiRequest(form, url, method, body);
       if (reload) {
         window.location.reload();
       } else {
@@ -909,19 +883,7 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      const csrf = form.querySelector('input[name="csrf"]')?.value;
-      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
-      const response = await fetch(url, {
-        method,
-        credentials: "same-origin",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-E6IRC-CSRF": csrf,
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      if (!response.ok) throw new Error(await apiProblem(response));
+      await apiRequest(form, url, method, body);
       window.location.reload();
     } catch (error) {
       setChannelResult(error instanceof Error ? error.message : "Channel request failed.", false);
