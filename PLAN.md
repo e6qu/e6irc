@@ -98,8 +98,8 @@ into a responsive client of the canonical API.
 revisioned administrator JSON request with the page's session-bound CSRF token.
 The scalar form serializes its nested typed settings rather than inventing a
 form-only API shape. Controls reload only after a committed response and keep
-API failures visible in the document. Removing the superseded rendered
-handlers is the next step of this stage.
+API failures visible in the document. The superseded Configuration mutation
+handlers are removed.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

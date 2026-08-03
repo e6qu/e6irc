@@ -81,15 +81,13 @@ operation's semantics.
 
 ## Managed configuration
 
+The Configuration document is now a read-only shell. Its scalar settings,
+operators, OpenID Connect providers, and server networks all mutate only via
+the administrator API routes below; the former `/console/configuration/*`
+mutation routes no longer exist.
+
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
-| `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Browser migrated | PATCH carries typed scalar settings and preserves credential collections. |
-| `/console/configuration/opers` | `POST /api/v1/admin/configuration/opers` | Browser migrated | The Configuration page sends the operator name, write-only password, and revision through the JSON API. |
-| `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Browser migrated | The Configuration page sends the revision through the JSON API. |
-| `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Browser migrated | The Configuration page sends its write-only provider secret and revision through the JSON API. |
-| `/console/configuration/oidc/delete` | `DELETE /api/v1/admin/configuration/oidc-providers/{name}` | Browser migrated | The Configuration page sends the revision through the JSON API. |
-| `/console/configuration/shared-networks` | `POST /api/v1/admin/configuration/networks` | Browser migrated | The Configuration page sends the same closed network-kind JSON schema with its session CSRF token and revision. |
-| `/console/configuration/shared-networks/delete` | `DELETE /api/v1/admin/configuration/networks/{name}` | Browser migrated | The Configuration page sends the revision and owner selector through the JSON API. |
 
 ## Read-only console views
 

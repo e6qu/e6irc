@@ -59,15 +59,6 @@ fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn cookie_form_post(path: &str, session: &str, body: &str) -> String {
-    format!(
-        "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-
 fn csrf_from_html(html: &str) -> &str {
     html.split("name=\"csrf\" value=\"")
         .nth(1)
@@ -1656,24 +1647,36 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     assert!(body.contains("e6irc_queue_capacity{queue=\"db\"} 1024"));
     assert!(body.contains("e6irc_queue_mode{queue=\"core\",mode=\"fifo\"} 1"));
 
-    let form = format!(
-        "csrf={csrf}&revision=1&server_name=irc.control.example&network_name=ControlNet&\
-         description=e6irc+server&motd=&nicklen=16&sendq=1024&core_queue=65536&\
-         max_hot_channels=8192&bnc_enabled=on&bnc_addr=127.0.0.1%3A0&\
-         listeners=127.0.0.1%3A0+%7C+plain&admin_accounts=alice&\
-         observability_enabled=on&observability_sample_interval_seconds=5&\
-         observability_retention_hours=1&storage_history_retention_days=30&\
-         storage_audit_retention_days=365"
+    let configuration = format!(
+        "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let post = format!(
-        "POST /console/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{form}",
-        form.len()
+    let (status, _, body) = request(http, &configuration).await;
+    assert_eq!(status, 200, "{body}");
+    let current: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
+    let mut settings = current["settings"].clone();
+    let settings_object = settings.as_object_mut().expect("settings object");
+    settings_object.remove("oidc_providers");
+    settings_object.remove("opers");
+    settings_object.remove("networks");
+    settings_object.remove("credentials_from_bootstrap");
+    settings_object["bnc_addr"] = serde_json::Value::String("127.0.0.1:0".into());
+    settings_object["observability"]["enabled"] = serde_json::Value::Bool(true);
+    settings_object["observability"]["sample_interval_seconds"] = 5.into();
+    settings_object["observability"]["retention_hours"] = 1.into();
+    let patch_body =
+        serde_json::json!({ "revision": current["revision"], "settings": settings }).to_string();
+    let patch = format!(
+        "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{patch_body}",
+        patch_body.len()
     );
-    let (status, _, page) = request(http, &post).await;
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains("Configuration saved and applied"), "{page}");
+    let (status, _, body) = request(http, &patch).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        2
+    );
     let mut stored_history = false;
     for _ in 0..14 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1867,24 +1870,22 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(!body.contains(oper_secret), "{body}");
 
     let oidc_secret = "provider-secret-must-not-render";
-    let oidc_form = format!(
-        "csrf={csrf}&name=workforce&issuer_url=https%3A%2F%2Fid.example&\
-         client_id=e6irc&client_secret={oidc_secret}&scopes=openid+profile&\
-         end_session_endpoint=https%3A%2F%2Fid.example%2Flogout&\
-         token_endpoint_auth_method=client_secret_post"
+    let oidc_body = format!(
+        r#"{{"revision":2,"name":"workforce","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"{oidc_secret}","scopes":["openid","profile"],"allowed_email_domains":[],"end_session_endpoint":"https://id.example/logout","token_endpoint_auth_method":"client_secret_post"}}"#
     );
-    let (status, _, page) = request(
-        http,
-        &cookie_form_post("/console/configuration/oidc", &session, &oidc_form),
-    )
-    .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(
-        page.contains("added OpenID Connect provider workforce"),
-        "{page}"
+    let oidc_request = format!(
+        "POST /api/v1/admin/configuration/oidc-providers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{oidc_body}",
+        oidc_body.len()
     );
-    assert!(page.contains("https://id.example"), "{page}");
-    assert!(!page.contains(oidc_secret), "{page}");
+    let (status, _, body) = request(http, &oidc_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        3
+    );
+    assert!(!body.contains(oidc_secret), "{body}");
 
     let upstream_secret = "upstream-password-must-not-render";
     let network_body = format!(
@@ -2018,15 +2019,19 @@ async fn console_configuration_manages_every_credential_collection() {
         6
     );
 
-    for (path, body, message) in [(
-        "/console/configuration/oidc/delete",
-        format!("csrf={csrf}&name=workforce"),
-        "removed OpenID Connect provider workforce",
-    )] {
-        let (status, _, page) = request(http, &cookie_form_post(path, &session, &body)).await;
-        assert_eq!(status, 200, "{page}");
-        assert!(page.contains(message), "{page}");
-    }
+    let delete_oidc_body = r#"{"revision":6}"#;
+    let delete_oidc = format!(
+        "DELETE /api/v1/admin/configuration/oidc-providers/workforce HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_oidc_body}",
+        delete_oidc_body.len()
+    );
+    let (status, _, body) = request(http, &delete_oidc).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        7
+    );
     let delete_network_body = r#"{"revision":7,"owner":"alice"}"#;
     let delete_network = format!(
         "DELETE /api/v1/admin/configuration/networks/staffnet HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
