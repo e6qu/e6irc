@@ -135,6 +135,19 @@
     return `Request failed with HTTP ${response.status}.`;
   };
 
+  const MAX_API_JSON_BYTES = 1024 * 1024;
+  const apiJson = async (response) => {
+    const length = Number(response.headers.get("content-length"));
+    if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
+      throw new Error("The API response is too large. Reload and try again.");
+    }
+    const text = await response.text();
+    if (text.length > MAX_API_JSON_BYTES) {
+      throw new Error("The API response is too large. Reload and try again.");
+    }
+    return text ? JSON.parse(text) : undefined;
+  };
+
   const apiRequest = async (form, url, method, body) => {
     const csrf = form.querySelector('input[name="csrf"]')?.value;
     if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
@@ -149,7 +162,7 @@
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!response.ok) throw new Error(await apiProblem(response));
-    return response.status === 204 ? undefined : response.json().catch(() => undefined);
+    return response.status === 204 ? undefined : apiJson(response);
   };
 
   const optionalValue = (value) => {
