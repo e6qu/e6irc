@@ -29,14 +29,6 @@ operation's semantics.
 
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
-| `/console/channels/register` | `POST /api/v1/me/channels` | Mapped | Use the API's live-core admission verdict. |
-| `/console/channels/topic` | `PATCH /api/v1/me/channels/{name}` | Mapped | Represent topic as an explicit typed patch field. |
-| `/console/channels/keeptopic` | `PATCH /api/v1/me/channels/{name}` | Mapped | Represent the policy toggle as an explicit typed patch field. |
-| `/console/channels/mlock` | `PATCH /api/v1/me/channels/{name}` | Mapped | Return canonical mode-lock spelling. |
-| `/console/channels/access` | `PUT /api/v1/me/channels/{name}/access/{account}` | Mapped | Preserve owner/founder authorization and closed flags. |
-| `/console/channels/access/delete` | `DELETE /api/v1/me/channels/{name}/access/{account}` | Mapped | Refresh from committed access state. |
-| `/console/channels/founder` | `PATCH /api/v1/me/channels/{name}` | Mapped | Preserve irreversible founder-transfer confirmation. |
-| `/console/channels/drop` | `DELETE /api/v1/me/channels/{name}` | Mapped | Preserve explicit destructive confirmation. |
 | `/console/admin/channels/drop` | `DELETE /api/v1/admin/channels/{name}` | Mapped | Use the administrator-scoped audited unregister resource. |
 
 ## Owner networks and bridges

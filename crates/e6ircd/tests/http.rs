@@ -838,6 +838,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-session-revoke"), "{body}");
     assert!(body.contains("data-api-session-disconnect"), "{body}");
     assert!(body.contains("data-api-account-app-password"), "{body}");
+    assert!(body.contains("data-api-channel-register"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
@@ -1351,6 +1352,8 @@ async fn console_add_and_delete_network_via_the_console() {
         );
     }
     let csrf = csrf_from_html(&page).to_string();
+    assert!(page.contains("data-api-channel-register"), "{page}");
+    assert!(page.contains("data-api-channel-patch"), "{page}");
     assert!(
         page.contains("data-api-configuration-patch"),
         "scalar configuration must go through the JSON API: {page}"
@@ -2548,8 +2551,9 @@ async fn owned_channel_api_covers_configuration_access_transfer_and_drop() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
-    let url = support::test_db("owned_channel_console_is_complete_scoped_and_csrf_protected").await;
+async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
+    let url =
+        support::test_db("owned_channel_api_and_console_shell_are_scoped_and_csrf_protected").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -2618,10 +2622,12 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
         "another account's channel leaked: {mallory_page}"
     );
 
-    let post_form = |path: &str, body: String| {
+    let api_request = |method: &str, path: &str, body: &str, csrf: Option<&str>| {
+        let csrf_header =
+            csrf.map_or_else(String::new, |token| format!("X-E6IRC-CSRF: {token}\r\n"));
         format!(
-            "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\n{csrf_header}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
             body.len()
         )
@@ -2644,37 +2650,53 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
             break;
         }
     }
-    let register = format!("csrf={csrf}&channel=%23Web");
-    let (status, headers, body) =
-        request(http, &post_form("/console/channels/register", register)).await;
-    assert_eq!(status, 303, "{headers}\n{body}");
+    let register = r##"{"name":"#Web"}"##;
+    let (status, headers, body) = request(
+        http,
+        &api_request("POST", "/api/v1/me/channels", register, Some(&csrf)),
+    )
+    .await;
+    assert_eq!(status, 201, "{headers}\n{body}");
 
-    let empty_access = format!("csrf={csrf}&channel=%23Control&account=alice");
-    let (status, _, body) =
-        request(http, &post_form("/console/channels/access", empty_access)).await;
-    assert_eq!(status, 200, "{body}");
+    let empty_access = r#"{"flags":""}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PUT",
+            "/api/v1/me/channels/%23Control/access/alice",
+            empty_access,
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
     assert!(
-        body.contains("access flags must be one of o, v, ov, or vo")
-            && body.contains("role=\"alert\""),
-        "empty access grant was not visibly rejected: {body}"
+        body.contains("access flags must be one of o, v, ov, or vo"),
+        "empty access grant was not rejected: {body}"
     );
 
     for (path, body) in [
         (
-            "/console/channels/topic",
-            format!("csrf={csrf}&channel=%23Control&topic=Welcome+operators"),
+            "/api/v1/me/channels/%23Control",
+            r#"{"action":"set_topic","topic":"Welcome operators"}"#,
         ),
         (
-            "/console/channels/mlock",
-            format!("csrf={csrf}&channel=%23Control&mlock=%2Bnt-i"),
+            "/api/v1/me/channels/%23Control",
+            r#"{"action":"set_mlock","mlock":"+nt-i"}"#,
         ),
         (
-            "/console/channels/access",
-            format!("csrf={csrf}&channel=%23Control&account=alice&auto_op=on&auto_voice=on"),
+            "/api/v1/me/channels/%23Control/access/alice",
+            r#"{"flags":"ov"}"#,
         ),
     ] {
-        let (status, headers, body) = request(http, &post_form(path, body)).await;
-        assert_eq!(status, 303, "{path}: {headers}\n{body}");
+        let method = if path.ends_with("/alice") {
+            "PUT"
+        } else {
+            "PATCH"
+        };
+        let (status, headers, body) =
+            request(http, &api_request(method, path, body, Some(&csrf))).await;
+        assert_eq!(status, 200, "{path}: {headers}\n{body}");
     }
     let (_, _, updated) = request(http, &page_request(&boss_session)).await;
     for needle in ["Welcome operators", "+nt-i", "alice", "+ov"] {
@@ -2684,29 +2706,52 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
         );
     }
 
-    let invalid = format!("csrf={csrf}&channel=%23Control&mlock=%2Bk");
-    let (status, _, body) = request(http, &post_form("/console/channels/mlock", invalid)).await;
-    assert_eq!(status, 200, "{body}");
+    let invalid = r#"{"action":"set_mlock","mlock":"+k"}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            invalid,
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
     assert!(
-        body.contains("not a lockable mode") && body.contains("role=\"alert\""),
-        "invalid MLOCK was not visibly rejected: {body}"
+        body.contains("not a lockable mode"),
+        "invalid MLOCK was not rejected: {body}"
     );
 
-    let bad_csrf = "csrf=wrong&channel=%23Control";
-    let (status, _, _) = request(http, &post_form("/console/channels/drop", bad_csrf.into())).await;
+    let (status, _, _) = request(
+        http,
+        &api_request(
+            "DELETE",
+            "/api/v1/me/channels/%23Control",
+            "",
+            Some("wrong"),
+        ),
+    )
+    .await;
     assert_eq!(status, 403);
 
-    let drop_body = format!("csrf={csrf}&channel=%23Control");
-    let (status, _, body) = request(http, &post_form("/console/channels/drop", drop_body)).await;
-    assert_eq!(status, 303, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request("DELETE", "/api/v1/me/channels/%23Control", "", Some(&csrf)),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     let (_, _, empty) = request(http, &page_request(&boss_session)).await;
     assert!(
         !empty.contains("#Control") && empty.contains("#Web"),
         "drop affected the wrong owner channel: {empty}"
     );
-    let drop_web = format!("csrf={csrf}&channel=%23Web");
-    let (status, _, body) = request(http, &post_form("/console/channels/drop", drop_web)).await;
-    assert_eq!(status, 303, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request("DELETE", "/api/v1/me/channels/%23Web", "", Some(&csrf)),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     let (_, _, empty) = request(http, &page_request(&boss_session)).await;
     assert!(
         empty.contains("No channels registered to this account"),

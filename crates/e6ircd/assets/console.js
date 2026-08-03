@@ -711,4 +711,112 @@
         .then((result) => { if (result !== undefined) window.location.assign("/auth/signed-out"); });
     });
   }
+
+  const channelResult = document.getElementById("channel-api-result");
+  const setChannelResult = (message, success) => {
+    if (!channelResult) return;
+    channelResult.textContent = message;
+    channelResult.className = success ? "banner-success" : "banner-error";
+  };
+
+  const mutateChannel = async (form, url, method, body) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(url, {
+        method,
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-E6IRC-CSRF": csrf,
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      window.location.reload();
+    } catch (error) {
+      setChannelResult(error instanceof Error ? error.message : "Channel request failed.", false);
+      if (submit) submit.disabled = false;
+    }
+  };
+
+  for (const form of document.querySelectorAll("[data-api-channel-register]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const name = fieldValue(new FormData(form), "channel");
+      if (!name) {
+        setChannelResult("Enter the channel to register.", false);
+        return;
+      }
+      void mutateChannel(form, form.action, "POST", { name });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-channel-patch]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      let body;
+      switch (form.dataset.apiChannelPatch) {
+        case "topic": {
+          const topic = fieldValue(fields, "topic");
+          body = { action: "set_topic", topic: topic || null };
+          break;
+        }
+        case "keeptopic":
+          body = { action: "set_keeptopic", enabled: fieldValue(fields, "enabled") === "on" };
+          break;
+        case "mlock": {
+          const mlock = fieldValue(fields, "mlock");
+          body = { action: "set_mlock", mlock: mlock || null };
+          break;
+        }
+        case "founder": {
+          const account = fieldValue(fields, "account");
+          if (!account) {
+            setChannelResult("Enter the new founder account.", false);
+            return;
+          }
+          body = { action: "transfer_founder", account };
+          break;
+        }
+        default:
+          setChannelResult("The channel operation is invalid. Reload and try again.", false);
+          return;
+      }
+      void mutateChannel(form, form.action, "PATCH", body);
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-channel-access]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const account = fieldValue(fields, "account");
+      const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"]
+        .filter(Boolean).join("");
+      if (!account || !flags) {
+        setChannelResult("Enter an account and select at least one access grant.", false);
+        return;
+      }
+      void mutateChannel(form, `${form.action}/${encodeURIComponent(account)}`, "PUT", { flags });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-channel-access-delete]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void mutateChannel(form, form.action, "DELETE");
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-channel-drop]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void mutateChannel(form, form.action, "DELETE");
+    });
+  }
 })();

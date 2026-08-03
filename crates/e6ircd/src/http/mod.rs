@@ -85,30 +85,6 @@ macro_rules! require_registry {
     };
 }
 
-/// A URL-encoded form body whose extraction failures use the API's problem
-/// response contract instead of Axum's default text rejection.
-pub(crate) struct FormBody<T>(pub(crate) T);
-
-impl<T, S> axum::extract::FromRequest<S> for FormBody<T>
-where
-    axum::Form<T>:
-        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::FormRejection>,
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Form::<T>::from_request(req, state).await {
-            Ok(axum::Form(value)) => Ok(Self(value)),
-            Err(error) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid form",
-                Some(&error.to_string()),
-            )),
-        }
-    }
-}
-
 /// One in-flight OIDC authorization (state → verifier/nonce), expiring
 /// after ten minutes.
 pub struct PendingAuth {
@@ -1164,35 +1140,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
         .route("/console/channels", get(pages::console_channels))
-        .route(
-            "/console/channels/topic",
-            post(pages::console_channel_topic),
-        )
-        .route(
-            "/console/channels/register",
-            post(pages::console_channel_register),
-        )
-        .route(
-            "/console/channels/keeptopic",
-            post(pages::console_channel_keeptopic),
-        )
-        .route(
-            "/console/channels/mlock",
-            post(pages::console_channel_mlock),
-        )
-        .route(
-            "/console/channels/access",
-            post(pages::console_channel_access),
-        )
-        .route(
-            "/console/channels/access/delete",
-            post(pages::console_channel_access_delete),
-        )
-        .route(
-            "/console/channels/founder",
-            post(pages::console_channel_founder),
-        )
-        .route("/console/channels/drop", post(pages::console_channel_drop))
         .route("/console/monitoring", get(pages::console_monitoring))
         .route(
             "/console/monitoring/panel",
@@ -2567,14 +2514,12 @@ mod pages {
     struct ConsoleChannels {
         shell: ConsoleShell,
         channels: Vec<OwnedChannelView>,
-        error: Option<String>,
     }
 
     async fn console_channels_build(
         state: &AppState,
         account: String,
         csrf: String,
-        error: Option<String>,
     ) -> Result<ConsoleChannels, Response> {
         let channels = crate::db::list_owned_channels(pool_of(state), &account)
             .await
@@ -2604,7 +2549,6 @@ mod pages {
         Ok(ConsoleChannels {
             shell: console_shell(state, account, csrf, "channels"),
             channels,
-            error,
         })
     }
 
@@ -2616,253 +2560,10 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        match console_channels_build(&state, account, csrf, None).await {
+        match console_channels_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelTopicForm {
-        csrf: String,
-        channel: String,
-        #[serde(default)]
-        topic: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelRegisterForm {
-        csrf: String,
-        channel: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelKeeptopicForm {
-        csrf: String,
-        channel: String,
-        enabled: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelMlockForm {
-        csrf: String,
-        channel: String,
-        #[serde(default)]
-        mlock: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelAccessForm {
-        csrf: String,
-        channel: String,
-        account: String,
-        #[serde(default)]
-        auto_op: Option<String>,
-        #[serde(default)]
-        auto_voice: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelAccessDeleteForm {
-        csrf: String,
-        channel: String,
-        account: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelFounderForm {
-        csrf: String,
-        channel: String,
-        account: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct OwnedChannelDropForm {
-        csrf: String,
-        channel: String,
-    }
-
-    async fn run_owned_channel_form(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-        channel: String,
-        mutation: crate::core::ChannelMutation,
-    ) -> Response {
-        let account = match require_form_actor(state, headers, csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let request = crate::core::AdminRequest::MutateOwnedChannel {
-            channel,
-            actor: account.clone(),
-            mutation,
-        };
-        match core_action(state, request).await {
-            Ok(_) => Redirect::to("/console/channels").into_response(),
-            Err(message) => {
-                let csrf = session_token(headers, state.secure_cookies)
-                    .map(|session| state.csrf_token(&session))
-                    .unwrap_or_default();
-                match console_channels_build(state, account, csrf, Some(message)).await {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-        }
-    }
-
-    pub async fn console_channel_topic(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelTopicForm>,
-    ) -> Response {
-        let topic = (!form.topic.trim().is_empty()).then_some(form.topic);
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetTopic { topic },
-        )
-        .await
-    }
-
-    pub async fn console_channel_register(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelRegisterForm>,
-    ) -> Response {
-        let account = match require_form_actor(&state, &headers, &form.csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let request = crate::core::AdminRequest::RegisterOwnedChannel {
-            channel: form.channel,
-            actor: account.clone(),
-        };
-        match core_action(&state, request).await {
-            Ok(_) => Redirect::to("/console/channels").into_response(),
-            Err(message) => {
-                match console_channels_build(&state, account, form.csrf, Some(message)).await {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-        }
-    }
-
-    pub async fn console_channel_keeptopic(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelKeeptopicForm>,
-    ) -> Response {
-        let enabled = match form.enabled.as_str() {
-            "on" => true,
-            "off" => false,
-            _ => {
-                return problem(StatusCode::BAD_REQUEST, "Invalid KEEPTOPIC value", None);
-            }
-        };
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetKeeptopic { enabled },
-        )
-        .await
-    }
-
-    pub async fn console_channel_mlock(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelMlockForm>,
-    ) -> Response {
-        let mlock = (!form.mlock.trim().is_empty()).then_some(form.mlock);
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetMlock { mlock },
-        )
-        .await
-    }
-
-    pub async fn console_channel_access(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelAccessForm>,
-    ) -> Response {
-        let mut flags = String::new();
-        if form.auto_op.is_some() {
-            flags.push('o');
-        }
-        if form.auto_voice.is_some() {
-            flags.push('v');
-        }
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetAccess {
-                account: form.account,
-                flags: Some(flags),
-            },
-        )
-        .await
-    }
-
-    pub async fn console_channel_access_delete(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelAccessDeleteForm>,
-    ) -> Response {
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetAccess {
-                account: form.account,
-                flags: None,
-            },
-        )
-        .await
-    }
-
-    pub async fn console_channel_founder(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelFounderForm>,
-    ) -> Response {
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::TransferFounder {
-                account: form.account,
-            },
-        )
-        .await
-    }
-
-    pub async fn console_channel_drop(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<OwnedChannelDropForm>,
-    ) -> Response {
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::Drop,
-        )
-        .await
     }
 
     struct AuditRow {
