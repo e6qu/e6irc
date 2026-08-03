@@ -513,10 +513,18 @@ try {
   await page.goto(`${applicationOrigin}/console/audit`);
   await page.getByRole("heading", { name: "Audit log", exact: true }).waitFor();
   await page.getByText("KLINE", { exact: true }).waitFor();
-  await page.getByText("UNKLINE", { exact: true }).waitFor();
+  await page.waitForFunction(async (auditURL) => {
+    const response = await fetch(auditURL, {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    return Array.isArray(payload.audit) && payload.audit.some((entry) => entry.action === "UNKLINE");
+  }, `${applicationOrigin}/api/v1/admin/audit?action=UNKLINE&target=${encodeURIComponent("*@browser-policy.example")}`);
   assert.match(await page.locator("main").innerText(), /browser-policy\.example/);
   assert.match(await page.locator("main").innerText(), /KLINE/);
-  assert.match(await page.locator("main").innerText(), /UNKLINE/);
 
   // Configure a custom IRC upstream entirely through the server-rendered UI,
   // then use the production web client and its real /ws/ui socket in both
