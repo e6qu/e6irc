@@ -512,6 +512,8 @@ try {
 
   await page.goto(`${applicationOrigin}/console/audit`);
   await page.getByRole("heading", { name: "Audit log", exact: true }).waitFor();
+  await page.getByText("KLINE", { exact: true }).waitFor();
+  await page.getByText("UNKLINE", { exact: true }).waitFor();
   assert.match(await page.locator("main").innerText(), /browser-policy\.example/);
   assert.match(await page.locator("main").innerText(), /KLINE/);
   assert.match(await page.locator("main").innerText(), /UNKLINE/);
