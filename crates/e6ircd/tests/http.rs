@@ -3759,12 +3759,7 @@ async fn admin_console_ban_and_channel_actions() {
     // Drop the registered channel through its administrator API resource; the
     // registry becomes empty after the core commits the ordered transition.
     assert!(
-        policy_page_has(
-            "/console/admin/channels",
-            "No registered channels exist yet.",
-            false
-        )
-        .await,
+        policy_page_has("/api/v1/admin/channels", "#dropme", true).await,
         "channel not listed to begin with"
     );
     let drop_req = format!(
@@ -3775,12 +3770,7 @@ async fn admin_console_ban_and_channel_actions() {
     let (status, _, _) = request(http, &drop_req).await;
     assert_eq!(status, 204);
     assert!(
-        policy_page_has(
-            "/console/admin/channels",
-            "No registered channels exist yet.",
-            true
-        )
-        .await,
+        policy_page_has("/api/v1/admin/channels", "#dropme", false).await,
         "channel still listed after drop"
     );
 
