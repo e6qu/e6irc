@@ -94,12 +94,12 @@ the same persistent/core/audit result.
 **Goal:** turn the management console from a parallel rendered-form surface
 into a responsive client of the canonical API.
 
-**Current progress:** the Configuration page's server-network and IRC-operator
-create/delete controls now issue the revisioned administrator JSON requests
-with the page's session-bound CSRF token. They reload only after a committed
-response and keep API failures visible in the document. The remaining
-Configuration controls still use their rendered handlers and remain part of
-this stage.
+**Current progress:** the Configuration page's server-network, IRC-operator,
+and OpenID Connect provider create/delete controls now issue the revisioned
+administrator JSON requests with the page's session-bound CSRF token. They
+reload only after a committed response and keep API failures visible in the
+document. The scalar Configuration form still uses its rendered handler and
+remains part of this stage.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

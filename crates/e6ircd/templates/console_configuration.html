@@ -290,6 +290,7 @@
       <p>Identity providers used for browser sign-in. Client secrets are encrypted and replace-only.</p>
     </div>
     <div>
+      <noscript><div class="banner-error">JavaScript is required to manage identity providers because these controls use the administrator API directly.</div></noscript>
       {% if settings.credentials_from_bootstrap %}
         <div class="banner-info"><div><strong>Credentials still come from bootstrap configuration.</strong> Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.</div></div>
       {% endif %}
@@ -303,8 +304,9 @@
               <code>{{ provider.issuer_url }}</code>
               <span class="meta">Client {{ provider.client_id }} · scopes {{ provider.scopes }}</span>
               <span class="meta">Allowed email domains: {% if provider.allowed_email_domains.is_empty() %}any verified provider identity{% else %}{{ provider.allowed_email_domains }}{% endif %}</span>
-              <form method="post" action="/console/configuration/oidc/delete">
+              <form method="post" action="/api/v1/admin/configuration/oidc-providers/{{ provider.name }}" data-api-oidc-delete>
                 <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                <input type="hidden" name="revision" value="{{ revision }}" />
                 <input type="hidden" name="name" value="{{ provider.name }}" />
                 <button class="danger" type="submit">Remove</button>
               </form>
@@ -312,8 +314,9 @@
           {% endfor %}
         </div>
       {% endif %}
-      <form class="oidc-form" method="post" action="/console/configuration/oidc">
+      <form class="oidc-form" method="post" action="/api/v1/admin/configuration/oidc-providers" data-api-oidc-create>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <input type="hidden" name="revision" value="{{ revision }}" />
         <label class="field"><span>Provider name</span><input name="name" placeholder="corp" required /></label>
         <label class="field"><span>Issuer URL</span><input type="url" name="issuer_url" required /></label>
         <label class="field"><span>Client ID</span><input name="client_id" required /></label>

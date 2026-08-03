@@ -841,6 +841,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-refresh-url"), "{body}");
     assert!(body.contains("data-api-network-create"), "{body}");
     assert!(body.contains("data-api-oper-create"), "{body}");
+    assert!(body.contains("data-api-oidc-create"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
@@ -1826,6 +1827,18 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(
         page.contains("action=\"/api/v1/admin/configuration/opers\""),
         "operator creation must not target a rendered mutation handler: {page}"
+    );
+    assert!(
+        page.contains("data-api-oidc-create"),
+        "provider creation must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("data-api-oidc-delete"),
+        "provider deletion must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("action=\"/api/v1/admin/configuration/oidc-providers\""),
+        "provider creation must not target a rendered mutation handler: {page}"
     );
 
     let oper_secret = "operator-password-must-not-render";

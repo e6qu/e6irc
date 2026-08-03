@@ -137,6 +137,12 @@
     return trimmed || null;
   };
 
+  const splitValues = (value, separator) =>
+    value
+      .split(separator)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
   const networkBody = (form) => {
     const fields = new FormData(form);
     const number = Number(fields.get("buffer_cap"));
@@ -156,10 +162,7 @@
       tls: fields.has("tls"),
       nick: String(fields.get("nick") || "").trim(),
       realname: optionalValue(String(fields.get("realname") || "")),
-      autojoin: String(fields.get("autojoin") || "")
-        .split(",")
-        .map((channel) => channel.trim())
-        .filter(Boolean),
+      autojoin: splitValues(String(fields.get("autojoin") || ""), ","),
       buffer_cap: number,
       sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
       sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
@@ -266,6 +269,57 @@
       void mutateConfiguration(
         form,
         `/api/v1/admin/configuration/opers/${encodeURIComponent(name)}`,
+        "DELETE",
+        { revision },
+      );
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-oidc-create]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const revision = Number(fields.get("revision"));
+      const name = String(fields.get("name") || "").trim();
+      const issuer_url = String(fields.get("issuer_url") || "").trim();
+      const client_id = String(fields.get("client_id") || "").trim();
+      const client_secret = String(fields.get("client_secret") || "");
+      if (!Number.isSafeInteger(revision) || revision < 0 || !name || !issuer_url || !client_id || !client_secret) {
+        setConfigurationResult("Enter every required provider value, then reload if the revision is stale.", false);
+        return;
+      }
+      void mutateConfiguration(
+        form,
+        "/api/v1/admin/configuration/oidc-providers",
+        "POST",
+        {
+          revision,
+          name,
+          issuer_url,
+          client_id,
+          client_secret,
+          scopes: splitValues(String(fields.get("scopes") || ""), /\s+/),
+          allowed_email_domains: splitValues(String(fields.get("allowed_email_domains") || ""), ","),
+          end_session_endpoint: optionalValue(String(fields.get("end_session_endpoint") || "")),
+          token_endpoint_auth_method: String(fields.get("token_endpoint_auth_method") || ""),
+        },
+      );
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-oidc-delete]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const revision = Number(fields.get("revision"));
+      const name = String(fields.get("name") || "").trim();
+      if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
+        setConfigurationResult("The provider or configuration revision is missing. Reload and try again.", false);
+        return;
+      }
+      void mutateConfiguration(
+        form,
+        `/api/v1/admin/configuration/oidc-providers/${encodeURIComponent(name)}`,
         "DELETE",
         { revision },
       );
