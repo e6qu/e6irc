@@ -11,7 +11,7 @@ use axum::extract::{Form, Path, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -70,17 +70,6 @@ macro_rules! require_managed_config {
                     Some("PostgreSQL is required for UI-managed configuration."),
                 )
             }
-        }
-    };
-}
-
-/// The BNC registry for a console network/bridge handler, or a 404 problem
-/// when the server runs without the bouncer enabled.
-macro_rules! require_registry {
-    ($state:expr) => {
-        match &$state.bnc_registry {
-            Some(registry) => registry,
-            None => return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None),
         }
     };
 }
@@ -1102,40 +1091,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console", get(pages::console))
         .route("/console/accounts", get(pages::console_accounts))
         .route(
-            "/console/accounts/create",
-            post(pages::console_create_account),
-        )
-        .route(
-            "/console/accounts/invitations",
-            post(pages::console_create_invitation),
-        )
-        .route(
-            "/console/accounts/invitations/{id}/delete",
-            post(pages::console_revoke_invitation),
-        )
-        .route(
-            "/console/accounts/{id}/delete",
-            post(pages::console_delete_account),
-        )
-        .route(
-            "/console/accounts/{id}/suspension",
-            post(pages::console_account_suspension),
-        )
-        .route(
-            "/console/accounts/{id}/administrator",
-            post(pages::console_account_administrator),
-        )
-        .route(
             "/console/admin/channels",
             get(pages::console_admin_channels),
         )
         .route(
             "/console/admin/networks",
             get(pages::console_admin_networks),
-        )
-        .route(
-            "/console/admin/networks/{owner}/{name}/toggle",
-            post(pages::console_admin_network_toggle),
         )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
@@ -1166,10 +1127,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(pages::console_edit_bridge),
         )
         .route("/console/bans", get(pages::console_server_bans))
-        .route(
-            "/console/admin/channels/drop",
-            post(pages::console_drop_channel),
-        )
         .route("/console/sessions", get(pages::console_sessions))
         .route("/console/my-sessions", get(pages::console_my_sessions))
         .route(
@@ -2293,41 +2250,6 @@ mod pages {
         }
     }
 
-    #[derive(Deserialize)]
-    pub struct AccountPermanentDeleteForm {
-        csrf: String,
-        confirmation: String,
-    }
-
-    trait AccountForm {
-        fn csrf(&self) -> &str;
-    }
-
-    /// Every form type carrying a `csrf` field implements [`AccountForm`] the
-    /// same way — one macro so the mapping can't drift (or grow a copy that
-    /// points at the wrong field).
-    macro_rules! account_form {
-        ($($t:ty),* $(,)?) => {
-            $(impl AccountForm for $t {
-                fn csrf(&self) -> &str {
-                    &self.csrf
-                }
-            })*
-        };
-    }
-    account_form!(AccountPermanentDeleteForm, ToggleFields, DropChannelForm,);
-
-    /// Parse a console form and authenticate its actor as an administrator.
-    async fn admin_form_actor<T: AccountForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, T), Response> {
-        let fields = parse_form(form)?;
-        let account = require_admin_form_actor(state, headers, fields.csrf()).await?;
-        Ok((account, fields))
-    }
-
     struct ChannelAccessView {
         account: String,
         flags: String,
@@ -2458,9 +2380,6 @@ mod pages {
         has_filter: bool,
         has_cursor: bool,
         next_before_id: Option<i64>,
-        outcome: Option<String>,
-        success: bool,
-        invitation_url: Option<String>,
     }
 
     #[derive(Template)]
@@ -3182,19 +3101,12 @@ mod pages {
         })
     }
 
-    struct AccountDirectorySubmission {
-        outcome: String,
-        success: bool,
-        invitation_url: Option<String>,
-    }
-
     async fn console_accounts_response(
         state: &AppState,
         account: String,
         csrf: String,
         params: super::device::AccountDirectoryQuery,
         invitation_before_id: Option<i64>,
-        submission: Option<AccountDirectorySubmission>,
     ) -> Response {
         let query = match super::device::validate_account_directory_query(params, 50) {
             Ok(query) => query,
@@ -3238,14 +3150,6 @@ mod pages {
         }
         let name = query.name.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
-        let (outcome, success, invitation_url) =
-            submission.map_or((None, true, None), |submission| {
-                (
-                    Some(submission.outcome),
-                    submission.success,
-                    submission.invitation_url,
-                )
-            });
         render_private(ConsoleAccounts {
             shell: console_shell(state, account, csrf, "accounts"),
             entries: page.entries,
@@ -3257,9 +3161,6 @@ mod pages {
             name,
             limit: query.page_size.value(),
             next_before_id: page.next_before_id,
-            outcome,
-            success,
-            invitation_url,
         })
     }
 
@@ -3279,7 +3180,6 @@ mod pages {
                 name: params.name,
             },
             invitation_before_id,
-            None,
         )
         .await
     }
@@ -3290,249 +3190,6 @@ mod pages {
         before_id: Option<i64>,
         name: Option<String>,
         invitation_before_id: Option<i64>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountSuspensionForm {
-        csrf: String,
-        suspended: bool,
-    }
-
-    pub async fn console_account_suspension(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(account_id): Path<i64>,
-        form: Result<axum::Form<AccountSuspensionForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        match mutate_account_suspension(&state, &actor, account_id, form.suspended).await {
-            Ok(_message) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(status, "Account state change failed", Some(&detail)),
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountAdministratorForm {
-        csrf: String,
-        administrator: bool,
-    }
-
-    pub async fn console_account_administrator(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(account_id): Path<i64>,
-        form: Result<axum::Form<AccountAdministratorForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        match mutate_account_administrator(&state, &actor, account_id, form.administrator).await {
-            Ok(_message) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(
-                status,
-                "Administrator authority change failed",
-                Some(&detail),
-            ),
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountCreateForm {
-        csrf: String,
-        account: String,
-        password: String,
-        #[serde(default)]
-        contact_email: String,
-        #[serde(default)]
-        administrator: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountInvitationForm {
-        csrf: String,
-        account: String,
-        #[serde(default)]
-        contact_email: String,
-        expires_in_days: u16,
-        #[serde(default)]
-        administrator: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountInvitationRevokeForm {
-        csrf: String,
-    }
-
-    pub async fn console_create_account(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountCreateForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let contact_email =
-            (!form.contact_email.trim().is_empty()).then_some(form.contact_email.trim());
-        match create_account_lifecycle(
-            &state,
-            &actor,
-            &form.account,
-            &form.password,
-            contact_email,
-            form.administrator.as_deref() == Some("on"),
-        )
-        .await
-        {
-            Ok(_) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(status, "Account creation failed", Some(&detail)),
-        }
-    }
-
-    pub async fn console_create_invitation(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountInvitationForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let result = if !crate::sanitize::valid_nick(&form.account, MAX_ACCOUNT_LEN) {
-            Err((
-                StatusCode::BAD_REQUEST,
-                "The account must be a valid IRC nickname of at most 64 bytes.".to_string(),
-            ))
-        } else {
-            let contact_email = if form.contact_email.trim().is_empty() {
-                Ok(None)
-            } else {
-                crate::identity::ContactEmail::parse(form.contact_email.trim())
-                    .map(Some)
-                    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
-            };
-            let lifetime =
-                crate::identity::AccountInvitationLifetimeDays::new(form.expires_in_days).ok_or((
-                    StatusCode::BAD_REQUEST,
-                    "Invitation lifetime must be between 1 and 30 days.".to_string(),
-                ));
-            match (contact_email, lifetime) {
-                (Ok(contact_email), Ok(lifetime)) => crate::db::issue_account_invitation(
-                    pool_of(&state),
-                    &form.account,
-                    contact_email.as_ref(),
-                    form.administrator.as_deref() == Some("on"),
-                    lifetime,
-                    &actor,
-                )
-                .await
-                .map_err(|error| match error {
-                    crate::db::DbError::DuplicateAccount(_) => (
-                        StatusCode::CONFLICT,
-                        "The account name already exists, is retired, or has a pending invitation."
-                            .to_string(),
-                    ),
-                    crate::db::DbError::TooManyInvitations => {
-                        (StatusCode::CONFLICT, error.to_string())
-                    }
-                    _ => {
-                        eprintln!("account invitation issuance failed: {error}");
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Invitation storage unavailable.".to_string(),
-                        )
-                    }
-                }),
-                (Err(error), _) | (_, Err(error)) => Err(error),
-            }
-        };
-        let (status, outcome, invitation_url) = match result {
-            Ok(token) => {
-                let url = account_invitation_url(&state, &token);
-                (
-                    StatusCode::OK,
-                    "Invitation issued. Copy the single-use link before leaving this page."
-                        .to_string(),
-                    Some(url),
-                )
-            }
-            Err((status, detail)) => (status, detail, None),
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        let mut response = console_accounts_response(
-            &state,
-            actor,
-            csrf,
-            super::device::AccountDirectoryQuery::default(),
-            None,
-            Some(AccountDirectorySubmission {
-                outcome,
-                success: status.is_success(),
-                invitation_url,
-            }),
-        )
-        .await;
-        *response.status_mut() = status;
-        response
-    }
-
-    pub async fn console_revoke_invitation(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(invitation_id): Path<i64>,
-        form: Result<
-            axum::Form<AccountInvitationRevokeForm>,
-            axum::extract::rejection::FormRejection,
-        >,
-    ) -> Response {
-        let (_form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        match crate::db::revoke_account_invitation(pool_of(&state), invitation_id, &actor).await {
-            Ok(true) => Redirect::to("/console/accounts").into_response(),
-            Ok(false) => problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
-            Err(error) => super::device::admin_db_error("account invitation revocation", error),
-        }
-    }
-
-    pub async fn console_delete_account(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(account_id): Path<i64>,
-        form: Result<
-            axum::Form<AccountPermanentDeleteForm>,
-            axum::extract::rejection::FormRejection,
-        >,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
-            Ok(Some(target)) => target,
-            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
-            Err(error) => {
-                return super::device::admin_db_error("account deletion target", error);
-            }
-        };
-        if form.confirmation != target {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Account confirmation does not match",
-                Some("Supply the exact display-cased account name."),
-            );
-        }
-        match delete_account_lifecycle(&state, &actor, account_id, false).await {
-            Ok(_) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(status, "Account deletion failed", Some(&detail)),
-        }
     }
 
     async fn console_admin_channels_build(
@@ -3632,33 +3289,6 @@ mod pages {
             shell: console_shell(&state, account, csrf, "admin-networks"),
             networks,
         })
-    }
-
-    /// Enable or disable one network of any account (admin lever for a
-    /// misbehaving upstream). Privileged and audited as such.
-    pub async fn console_admin_network_toggle(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path((owner, name)): Path<(String, String)>,
-        form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let registry = require_registry!(state);
-        let (admin, f) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let Some(enabled) = toggle_target(&f.enabled) else {
-            return invalid_toggle_response();
-        };
-        // The admin is the actor here (the owner is only the target), and the
-        // core audits every toggle — an administrator touching another
-        // account's network is unmistakably attributed.
-        if let Err(error) =
-            set_network_enabled_core(&state, registry, &admin, &owner, &name, enabled).await
-        {
-            return error.into_response();
-        }
-        Redirect::to("/console/admin/networks").into_response()
     }
 
     async fn console_server_bans_build(
@@ -4432,30 +4062,6 @@ mod pages {
         render_private(ConsoleNetworkRows { networks, csrf })
     }
 
-    /// The console toggle button posts the *target* enabled state so the flip is
-    /// not derived from a possibly-stale row (no read-then-write race).
-    #[derive(Deserialize)]
-    pub struct ToggleFields {
-        csrf: String,
-        enabled: String,
-    }
-
-    fn toggle_target(value: &str) -> Option<bool> {
-        match value {
-            "true" | "on" | "1" => Some(true),
-            "false" | "off" | "0" => Some(false),
-            _ => None,
-        }
-    }
-
-    fn invalid_toggle_response() -> Response {
-        problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid enabled state",
-            Some("enabled must be true or false"),
-        )
-    }
-
     /// Render the edit-network form from the stored configuration.
     #[allow(clippy::too_many_arguments)]
     fn console_network_edit_page(
@@ -4704,76 +4310,6 @@ mod pages {
         }
     }
 
-    /// Authenticate a plain-form (body-CSRF) actor: the caller is signed in and
-    /// the form carried a valid CSRF token. Not admin-gated — for self-service
-    /// actions on the caller's own resources. Returns the account or a response.
-    async fn require_form_actor(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-    ) -> Result<String, Response> {
-        let account = authenticate(state, headers)
-            .await
-            .map_err(|_| Redirect::to("/login").into_response())?;
-        let Some(session) = session_token(headers, state.secure_cookies) else {
-            return Err(problem(StatusCode::UNAUTHORIZED, "Session required", None));
-        };
-        if !state.csrf_valid(&session, csrf) {
-            return Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None));
-        }
-        Ok(account)
-    }
-
-    async fn require_admin_form_actor(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-    ) -> Result<String, Response> {
-        let account = require_form_actor(state, headers, csrf).await?;
-        if !is_admin_account(state, &account) {
-            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
-        }
-        Ok(account)
-    }
-
-    trait CsrfForm {
-        fn csrf(&self) -> &str;
-    }
-
-    macro_rules! csrf_forms {
-        ($($form:ty),+ $(,)?) => {
-            $(
-                impl CsrfForm for $form {
-                    fn csrf(&self) -> &str {
-                        &self.csrf
-                    }
-                }
-            )+
-        };
-    }
-
-    csrf_forms!(
-        AccountSuspensionForm,
-        AccountAdministratorForm,
-        AccountCreateForm,
-        AccountInvitationForm,
-        AccountInvitationRevokeForm,
-        AccountPermanentDeleteForm,
-    );
-
-    /// Parse and authorize an administrator-owned browser form as one gate so
-    /// mutations cannot drift between subtly different CSRF/admin prologues.
-    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-    async fn parse_admin_form<T: CsrfForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(T, String), Response> {
-        let form = parse_form(form)?;
-        let actor = require_admin_form_actor(state, headers, form.csrf()).await?;
-        Ok((form, actor))
-    }
-
     /// Ask the core for one already-validated bounded connection page.
     async fn list_live_connections(
         state: &AppState,
@@ -4784,132 +4320,6 @@ mod pages {
             Ok(_) => Err("unexpected reply".into()),
             Err(error) => Err(error),
         }
-    }
-
-    enum AdminPolicyPage {
-        RegisteredChannels,
-    }
-
-    /// Re-render the policy page that owns a failed mutation. Successful
-    /// actions use Post/Redirect/Get; failures stay visible beside the exact
-    /// controls that produced them.
-    async fn admin_policy_error_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        message: String,
-        page: AdminPolicyPage,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        match page {
-            AdminPolicyPage::RegisteredChannels => {
-                let query = match super::device::validate_registered_channel_directory_query(
-                    super::device::RegisteredChannelDirectoryQuery::default(),
-                    50,
-                ) {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                match console_admin_channels_build(state, account, csrf, query, Some(message)).await
-                {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct DropChannelForm {
-        csrf: String,
-        channel: String,
-    }
-
-    /// Gate an admin form action (admin + CSRF) and run it on the core. Returns
-    /// the redirect `Response` on success, or the gate `Response` (login/403) on
-    /// a gate failure; on an *action* failure returns `Err((account, message))`
-    /// so the caller re-renders its own page with the message. This is the shared
-    /// tail of every console mutation — only the form type, the request it builds,
-    /// and the page it re-renders on error differ.
-    async fn run_admin_form(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-        redirect: &'static str,
-        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
-    ) -> Result<Response, (String, String)> {
-        let account = match require_admin_form_actor(state, headers, csrf).await {
-            Ok(a) => a,
-            Err(gate) => return Ok(gate),
-        };
-        let req = make_req(account.clone());
-        match core_action(state, req).await {
-            Ok(_) => Ok(Redirect::to(redirect).into_response()),
-            Err(msg) => Err((account, msg)),
-        }
-    }
-
-    /// Run an admin console form action and render its policy-error page on an
-    /// action failure — the shared tail of the ban, channel, and session
-    /// handlers, which differ only in redirect, request, and error page.
-    async fn admin_form_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-        redirect: &'static str,
-        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
-        error_page: AdminPolicyPage,
-    ) -> Response {
-        match run_admin_form(state, headers, csrf, redirect, make_req).await {
-            Ok(resp) => resp,
-            Err((account, msg)) => {
-                admin_policy_error_page(state, headers, account, msg, error_page).await
-            }
-        }
-    }
-
-    /// The full console mutation flow for a csrf-carrying admin form: parse,
-    /// build the request from the form and actor, run it, and render the
-    /// policy-error page on failure. The admin mutation handlers differ only
-    /// in the request the form becomes.
-    async fn admin_policy_form<F: AccountForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<F>, axum::extract::rejection::FormRejection>,
-        redirect: &'static str,
-        error_page: AdminPolicyPage,
-        make: impl FnOnce(F, String) -> crate::core::AdminRequest,
-    ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
-        };
-        let csrf = f.csrf().to_string();
-        let make = |actor| make(f, actor);
-        admin_form_page(state, headers, &csrf, redirect, make, error_page).await
-    }
-
-    /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
-    /// and disconnects matching sessions exactly like oper KLINE.
-    pub async fn console_drop_channel(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<DropChannelForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        admin_policy_form(
-            &state,
-            &headers,
-            form,
-            "/console/admin/channels",
-            AdminPolicyPage::RegisteredChannels,
-            |f, actor| crate::core::AdminRequest::DropChannel {
-                channel: f.channel,
-                actor,
-            },
-        )
-        .await
     }
 
     /// Render one bounded live-connection page. `own` forces the account filter

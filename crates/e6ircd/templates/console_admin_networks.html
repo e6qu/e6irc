@@ -1,5 +1,7 @@
 {% extends "console_base.html" %}
 {% block main %}
+        <p id="admin-network-api-result" role="status" aria-live="polite"></p>
+        <noscript><div class="banner-error">JavaScript is required to manage fleet networks because these controls use the administrator API directly.</div></noscript>
         <div class="page-head">
           <div>
             <p class="eyebrow">Fleet</p>
@@ -32,7 +34,7 @@
                     <td>{{ n.errors }}</td>
                     <td>{% if let Some(reason) = n.last_error %}{{ reason }}{% else %}—{% endif %}</td>
                     <td class="row-actions">
-                      <form method="post" action="/console/admin/networks/{{ n.owner }}/{{ n.name }}/toggle">
+                      <form method="post" action="/api/v1/admin/networks/{{ n.owner }}/{{ n.name }}" data-api-admin-network-toggle>
                         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                         <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
                         <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>

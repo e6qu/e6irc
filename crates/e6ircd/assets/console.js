@@ -712,6 +712,51 @@
     });
   }
 
+  const adminAccountResult = document.getElementById("admin-account-api-result");
+  const adminAccountSecret = document.getElementById("admin-account-api-secret");
+  const setAdminAccountResult = (message, success) => {
+    if (!adminAccountResult) return;
+    adminAccountResult.textContent = message;
+    adminAccountResult.className = success ? "banner-success" : "banner-error";
+  };
+  const mutateAdminAccount = async (form, method, body, failure) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(form.action, { method, credentials: "same-origin", headers: { Accept: "application/json", "Content-Type": "application/json", "X-E6IRC-CSRF": csrf }, body: body === undefined ? undefined : JSON.stringify(body) });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      return response.status === 204 ? {} : response.json();
+    } catch (error) {
+      setAdminAccountResult(error instanceof Error ? error.message : failure, false);
+      if (submit) submit.disabled = false;
+      return undefined;
+    }
+  };
+  const showInvitationSecret = (value) => {
+    if (!adminAccountSecret) return;
+    adminAccountSecret.replaceChildren();
+    const section = document.createElement("section");
+    section.className = "secret-reveal";
+    const title = document.createElement("h2");
+    title.textContent = "Account invitation link";
+    const code = document.createElement("code");
+    code.textContent = value;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.textContent = "Copy";
+    copy.addEventListener("click", async () => { try { await navigator.clipboard.writeText(value); copy.textContent = "Copied"; } catch (_) { copy.textContent = "Select and copy manually"; } });
+    section.append(title, code, copy);
+    adminAccountSecret.append(section);
+  };
+  for (const form of document.querySelectorAll("[data-api-admin-account-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), password: String(fields.get("password") || ""), contact_email: optionalValue(String(fields.get("contact_email") || "")), administrator: fields.has("administrator") }, "Account creation failed.").then((result) => { if (result) window.location.reload(); }); });
+  for (const form of document.querySelectorAll("[data-api-admin-invitation-create]")) form.addEventListener("submit", (event) => { event.preventDefault(); const fields = new FormData(form); void mutateAdminAccount(form, "POST", { account: fieldValue(fields, "account"), contact_email: optionalValue(String(fields.get("contact_email") || "")), expires_in_days: Number(fields.get("expires_in_days")), administrator: fields.has("administrator") }, "Invitation creation failed.").then((result) => { if (!result) return; showInvitationSecret(result.invitation_url); setAdminAccountResult("Invitation issued. Copy the link now; it cannot be shown again.", true); }); });
+  document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement)) return; if (form.matches("[data-api-admin-invitation-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", undefined, "Invitation revocation failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-state]")) { event.preventDefault(); const fields = new FormData(form); const key = form.dataset.apiAdminAccountState === "suspension" ? "suspended" : "administrator"; void mutateAdminAccount(form, "PATCH", { [key]: fieldValue(fields, key) === "true" }, "Account state change failed.").then((result) => { if (result) window.location.reload(); }); } else if (form.matches("[data-api-admin-account-delete]")) { event.preventDefault(); void mutateAdminAccount(form, "DELETE", { confirmation: fieldValue(new FormData(form), "confirmation") }, "Account deletion failed.").then((result) => { if (result) window.location.reload(); }); } });
+
+  const adminNetworkResult = document.getElementById("admin-network-api-result");
+  document.addEventListener("submit", (event) => { const form = event.target; if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-admin-network-toggle]")) return; event.preventDefault(); const csrf = form.querySelector('input[name="csrf"]')?.value; const enabled = fieldValue(new FormData(form), "enabled"); if (!csrf || (enabled !== "true" && enabled !== "false")) { if (adminNetworkResult) { adminNetworkResult.textContent = "The requested network state is invalid. Reload and try again."; adminNetworkResult.className = "banner-error"; } return; } void fetch(form.action, { method: "PATCH", credentials: "same-origin", headers: { Accept: "application/json", "Content-Type": "application/json", "X-E6IRC-CSRF": csrf }, body: JSON.stringify({ enabled: enabled === "true" }) }).then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); window.location.reload(); }).catch((error) => { if (adminNetworkResult) { adminNetworkResult.textContent = error instanceof Error ? error.message : "Network lifecycle change failed."; adminNetworkResult.className = "banner-error"; } }); });
+
   const ownerNetworkResult = document.getElementById("network-api-result");
   const setOwnerNetworkResult = (message, success) => {
     if (!ownerNetworkResult) return;
@@ -955,6 +1000,13 @@
   }
 
   for (const form of document.querySelectorAll("[data-api-channel-drop]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void mutateChannel(form, form.action, "DELETE");
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-admin-channel-drop]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       void mutateChannel(form, form.action, "DELETE");

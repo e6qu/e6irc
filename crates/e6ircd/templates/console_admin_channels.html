@@ -1,5 +1,7 @@
 {% extends "console_base.html" %}
 {% block main %}
+  <p id="channel-api-result" role="status" aria-live="polite"></p>
+  <noscript><div class="banner-error">JavaScript is required to manage registered channels because these controls use the channel API directly.</div></noscript>
   {% if let Some(err) = error %}
     <p class="banner-error" role="alert">{{ err }}</p>
   {% endif %}
@@ -78,7 +80,7 @@
                 </td>
                 <td>{{ entry.access_entries }} grants</td>
                 <td>
-                  <form class="cell-form" method="post" action="/console/admin/channels/drop"
+                  <form class="cell-form" method="post" action="/api/v1/admin/channels/{{ entry.name }}" data-api-admin-channel-drop
                         data-confirm="Unregister {{ entry.name }} and delete its retained policy?">
                     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                     <input type="hidden" name="channel" value="{{ entry.name }}" />

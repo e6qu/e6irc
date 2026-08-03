@@ -55,10 +55,9 @@ parallel console-specific behavior.
 lists every remaining mutable console route and its canonical API mapping.
 Every listed state transition has a typed versioned API operation; CI verifies
 that the inventory covers the router's complete console-mutation set. The
-configuration, administrator-ban, live-connection, owner-session, account,
-registered-channel, and owner-network/bridge controls now issue those API
-requests directly and their rendered mutation handlers are gone, with HTTP
-tests covering the same authorization and committed-result contracts.
+All administrator and owner console controls now issue their typed API requests
+directly and their rendered mutation handlers are gone, with HTTP tests
+covering the same authorization and committed-result contracts.
 
 1. Inventory every browser-chat, server-rendered-console, CLI, and native
    client read/mutation. For each one, record its canonical resource, request

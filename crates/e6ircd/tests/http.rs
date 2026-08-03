@@ -840,6 +840,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-account-app-password"), "{body}");
     assert!(body.contains("data-api-channel-register"), "{body}");
     assert!(body.contains("data-api-owner-network-create"), "{body}");
+    assert!(body.contains("data-api-admin-account-create"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
