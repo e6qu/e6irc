@@ -1290,11 +1290,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/integrations/toggle",
             post(pages::console_toggle_bridge),
         )
-        .route(
-            "/console/bans",
-            get(pages::console_server_bans).post(pages::console_add_ban),
-        )
-        .route("/console/bans/delete", post(pages::console_remove_ban))
+        .route("/console/bans", get(pages::console_server_bans))
         .route(
             "/console/admin/channels/drop",
             post(pages::console_drop_channel),
@@ -2730,8 +2726,6 @@ mod pages {
         BridgeDeleteFields,
         BridgeFormFields,
         BridgeEditFormFields,
-        BanForm,
-        BanDeleteForm,
         DropChannelForm,
     );
 
@@ -6330,7 +6324,6 @@ mod pages {
 
     enum AdminPolicyPage {
         RegisteredChannels,
-        ServerBans,
     }
 
     /// Re-render the policy page that owns a failed mutation. Successful
@@ -6361,36 +6354,7 @@ mod pages {
                     Err(response) => response,
                 }
             }
-            AdminPolicyPage::ServerBans => {
-                let query = match super::device::validate_server_ban_directory_query(
-                    super::device::ServerBanDirectoryQuery::default(),
-                    50,
-                ) {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                match console_server_bans_build(state, account, csrf, query, Some(message)).await {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
         }
-    }
-
-    #[derive(Deserialize)]
-    pub struct BanForm {
-        csrf: String,
-        kind: String,
-        mask: String,
-        #[serde(default)]
-        reason: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BanDeleteForm {
-        csrf: String,
-        kind: String,
-        mask: String,
     }
 
     #[derive(Deserialize)]
@@ -6465,50 +6429,6 @@ mod pages {
 
     /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
     /// and disconnects matching sessions exactly like oper KLINE.
-    pub async fn console_add_ban(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BanForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        admin_policy_form(
-            &state,
-            &headers,
-            form,
-            "/console/bans",
-            AdminPolicyPage::ServerBans,
-            |f, actor| crate::core::AdminRequest::AddServerBan {
-                mask: f.mask,
-                kind: f.kind,
-                reason: f.reason,
-                actor,
-            },
-        )
-        .await
-    }
-
-    /// Console → remove a K/D/X-line (admin).
-    pub async fn console_remove_ban(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BanDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        admin_policy_form(
-            &state,
-            &headers,
-            form,
-            "/console/bans",
-            AdminPolicyPage::ServerBans,
-            |f, actor| crate::core::AdminRequest::RemoveServerBan {
-                expected_id: None,
-                mask: f.mask,
-                kind: f.kind,
-                actor,
-            },
-        )
-        .await
-    }
-
-    /// Console → unregister a channel (admin), like ChanServ DROP.
     pub async fn console_drop_channel(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,

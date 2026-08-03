@@ -3,6 +3,7 @@
   {% if let Some(err) = error %}
     <p class="banner-error" role="alert">{{ err }}</p>
   {% endif %}
+  <div id="ban-api-result" role="status" aria-live="polite"></div>
   <div class="page-head">
     <div>
       <p class="eyebrow">Connection policy</p>
@@ -19,8 +20,9 @@
         <p>Matching connected clients are disconnected only after the policy is durably stored.</p>
       </div>
     </div>
-    <form class="field-grid" method="post" action="/console/bans">
+    <form class="field-grid" method="post" action="/api/v1/admin/bans" data-api-ban-create>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+      <noscript><div class="banner-error">JavaScript is required to manage server bans because these controls use the administrator API directly.</div></noscript>
       <label class="field">
         <span>Policy kind</span>
         <select name="kind" required>
@@ -106,9 +108,10 @@
                 <td><code>{{ entry.set_by }}</code></td>
                 <td class="meta"><time datetime="{{ entry.created_at }}">{{ entry.created_at }}</time></td>
                 <td>
-                  <form class="cell-form" method="post" action="/console/bans/delete"
+                  <form class="cell-form" method="post" action="/api/v1/admin/bans/{{ entry.id }}" data-api-ban-delete
                         data-confirm="Remove {{ entry.kind }} {{ entry.mask }}?">
                     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                    <input type="hidden" name="id" value="{{ entry.id }}" />
                     <input type="hidden" name="kind" value="{{ entry.kind }}" />
                     <input type="hidden" name="mask" value="{{ entry.mask }}" />
                     <button class="danger" type="submit">Remove</button>

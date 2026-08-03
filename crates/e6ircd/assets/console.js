@@ -454,4 +454,65 @@
       );
     });
   }
+
+  const banResult = document.getElementById("ban-api-result");
+  const setBanResult = (message, success) => {
+    if (!banResult) return;
+    banResult.textContent = message;
+    banResult.className = success ? "banner-success" : "banner-error";
+  };
+
+  const mutateBan = async (form, url, method, body) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(url, {
+        method,
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-E6IRC-CSRF": csrf,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      window.location.reload();
+    } catch (error) {
+      setBanResult(error instanceof Error ? error.message : "Server-ban request failed.", false);
+      if (submit) submit.disabled = false;
+    }
+  };
+
+  for (const form of document.querySelectorAll("[data-api-ban-create]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const kind = fieldValue(fields, "kind");
+      const mask = fieldValue(fields, "mask");
+      if (!kind || !mask) {
+        setBanResult("Choose a policy kind and enter a mask.", false);
+        return;
+      }
+      void mutateBan(form, "/api/v1/admin/bans", "POST", {
+        kind,
+        mask,
+        reason: fieldValue(fields, "reason"),
+      });
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-ban-delete]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const id = Number(new FormData(form).get("id"));
+      if (!Number.isSafeInteger(id) || id < 1) {
+        setBanResult("The server-ban ID is invalid. Reload and try again.", false);
+        return;
+      }
+      void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", {});
+    });
+  }
 })();

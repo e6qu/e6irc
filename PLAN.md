@@ -99,7 +99,9 @@ revisioned administrator JSON request with the page's session-bound CSRF token.
 The scalar form serializes its nested typed settings rather than inventing a
 form-only API shape. Controls reload only after a committed response and keep
 API failures visible in the document. The superseded Configuration mutation
-handlers are removed.
+handlers are removed. Administrator server-ban creation and immutable-ID
+deletion now follow the same API-only pattern; their rendered mutation routes
+are removed.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

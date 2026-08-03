@@ -834,6 +834,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-oper-create"), "{body}");
     assert!(body.contains("data-api-oidc-create"), "{body}");
     assert!(body.contains("data-api-configuration-patch"), "{body}");
+    assert!(body.contains("data-api-ban-create"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
@@ -4089,6 +4090,8 @@ async fn admin_console_ban_and_channel_actions() {
     );
     let (status, _, page) = request(http, &ban_page_req).await;
     assert_eq!(status, 200, "{page}");
+    assert!(page.contains("data-api-ban-create"), "{page}");
+    assert!(page.contains("action=\"/api/v1/admin/bans\""), "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
         .nth(1)
@@ -4183,25 +4186,26 @@ async fn admin_console_ban_and_channel_actions() {
         "channel still listed after drop"
     );
 
-    // Gate: a wrong CSRF is refused (403); an anonymous POST redirects to login.
-    let bad = "csrf=wrong&kind=kline&mask=*@x.example&reason=x";
+    // Gate: browser API mutations require their session CSRF token and an
+    // authenticated administrator; the retired rendered route cannot bypass
+    // those boundaries.
+    let bad = r#"{"kind":"kline","mask":"*@x.example","reason":"x"}"#;
     let bad_req = format!(
-        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+        "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: wrong\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{bad}",
         bad.len()
     );
     let (status, _, _) = request(http, &bad_req).await;
     assert_eq!(status, 403);
     let anon = format!(
-        "POST /console/bans HTTP/1.1\r\nHost: t\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+        "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{bad}",
         bad.len()
     );
     let (status, head, _) = request(http, &anon).await;
-    assert_eq!(status, 303, "{head}");
-    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+    assert_eq!(status, 401, "{head}");
 }
 
 /// The administrator connection API and console expose immutable connection
