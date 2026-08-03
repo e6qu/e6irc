@@ -1127,10 +1127,12 @@ async fn nick_conflict_retries_with_alt_nick() {
 async fn driver_tracks_forced_upstream_nick_change() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (nick_tx, mut nick_rx) = tokio::sync::mpsc::channel::<()>(1);
     let (go_tx, mut go_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
         let mut session = fake_accept(&listener).await;
         session.complete_registration("bncbot").await;
+        nick_rx.recv().await;
         session.send(":bncbot!~bncbot@up NICK :renamed").await;
         go_rx.recv().await;
         // Stay open: the test ends by dropping the handle.
@@ -1146,6 +1148,7 @@ async fn driver_tracks_forced_upstream_nick_change() {
     });
     let mut events = handle.subscribe();
     wait_connected(&handle, &mut events).await;
+    nick_tx.send(()).await.unwrap();
     // Drain the NICK line itself, then send a message whose echo must use
     // the new nick.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
