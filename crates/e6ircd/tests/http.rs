@@ -5830,8 +5830,14 @@ async fn me_read_markers_list() {
     let auth = format!(
         "GET /api/v1/me/read-markers HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
-    let (status, _, body) = request(http, &auth).await;
+    let (status, headers, body) = request(http, &auth).await;
     assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let markers = v["markers"].as_array().expect("array");
     assert_eq!(markers.len(), 2, "{body}");
