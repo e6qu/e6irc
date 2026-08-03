@@ -83,7 +83,7 @@ operation's semantics.
 
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
-| `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Gap | Add revisioned configuration read and compare-and-swap write. |
+| `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Mapped | PATCH carries typed scalar settings and preserves credential collections. |
 | `/console/configuration/opers` | `POST /api/v1/admin/configuration/opers` | Mapped | Uses the typed revisioned operator resource. |
 | `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Mapped | Carries the configuration revision and audit provenance. |
 | `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Mapped | Provider secret fields are write-only. |

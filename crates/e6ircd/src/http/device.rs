@@ -711,6 +711,167 @@ pub(super) struct AdminNetworkDeleteBody {
     owner: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminConfigurationPatch {
+    revision: i64,
+    settings: AdminScalarSettings,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminScalarSettings {
+    server_name: String,
+    network_name: String,
+    description: String,
+    motd: Vec<String>,
+    nicklen: usize,
+    sendq: usize,
+    core_queue: usize,
+    max_hot_channels: usize,
+    listeners: Vec<crate::config::ListenerConfig>,
+    registration: crate::config::RegistrationConfig,
+    limits: crate::config::LimitsConfig,
+    observability: crate::config::ObservabilityConfig,
+    storage: crate::config::StorageConfig,
+    bnc_addr: Option<std::net::SocketAddr>,
+    public_url: Option<String>,
+    secure_cookies: bool,
+    admin_accounts: Vec<String>,
+}
+
+impl AdminScalarSettings {
+    fn apply_to(self, current: &crate::config::ManagedConfig) -> crate::config::ManagedConfig {
+        crate::config::ManagedConfig {
+            server_name: self.server_name,
+            network_name: self.network_name,
+            description: self.description,
+            motd: self.motd,
+            nicklen: self.nicklen,
+            sendq: self.sendq,
+            core_queue: self.core_queue,
+            max_hot_channels: self.max_hot_channels,
+            listeners: self.listeners,
+            registration: self.registration,
+            limits: self.limits,
+            observability: self.observability,
+            storage: self.storage,
+            bnc_addr: self.bnc_addr,
+            public_url: self.public_url,
+            secure_cookies: self.secure_cookies,
+            admin_accounts: self.admin_accounts,
+            oidc_providers: current.oidc_providers.clone(),
+            opers: current.opers.clone(),
+            networks: current.networks.clone(),
+            credentials_from_bootstrap: current.credentials_from_bootstrap,
+        }
+    }
+}
+
+pub(super) async fn admin_patch_configuration(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminConfigurationPatch>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(config) = &state.managed_config else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable",
+            None,
+        );
+    };
+    let mut current = config.write().await;
+    if current.revision != body.revision {
+        return problem(
+            StatusCode::CONFLICT,
+            "Configuration revision conflict",
+            Some("Reload the configuration and retry with its current revision."),
+        );
+    }
+    let settings = body.settings.apply_to(&current.settings);
+    if let Err(error) = settings.validate() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid configuration",
+            Some(&error.to_string()),
+        );
+    }
+    let previous_bnc = current.settings.bnc_addr;
+    let bnc_changed = previous_bnc != settings.bnc_addr;
+    if bnc_changed {
+        let Some(listener) = &state.bnc_listener else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BNC listener unavailable",
+                None,
+            );
+        };
+        let applied = match settings.bnc_addr {
+            Some(address) => listener
+                .enable(address)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("Could not bind {address}: {error}")),
+            None => {
+                listener.stop().await;
+                Ok(())
+            }
+        };
+        if let Err(error) = applied {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid BNC listener",
+                Some(&error),
+            );
+        }
+    }
+    let mut restart_comparison = current.settings.clone();
+    restart_comparison.bnc_addr = settings.bnc_addr;
+    restart_comparison.observability = settings.observability.clone();
+    let restart_required = restart_comparison != settings;
+    let detail = format!(
+        "revision {}; BNC listener {}; restart {}",
+        current.revision + 1,
+        if bnc_changed { "changed" } else { "unchanged" },
+        if restart_required {
+            "required"
+        } else {
+            "not required"
+        }
+    );
+    match crate::db::save_managed_config(
+        pool_of(&state),
+        current.revision,
+        &settings,
+        &actor,
+        &detail,
+    )
+    .await
+    {
+        Ok(snapshot) => {
+            *current = snapshot.clone();
+            admin_json(
+                serde_json::json!({ "revision": snapshot.revision, "restart_required": restart_required }),
+            )
+        }
+        Err(error) => {
+            if bnc_changed && let Some(listener) = &state.bnc_listener {
+                match previous_bnc {
+                    Some(address) => {
+                        let _ = listener.enable(address).await;
+                    }
+                    None => listener.stop().await,
+                }
+            }
+            admin_db_error("managed configuration", error)
+        }
+    }
+}
+
 pub(super) async fn admin_create_network(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,

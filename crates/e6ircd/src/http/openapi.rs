@@ -1019,7 +1019,10 @@ fn document() -> serde_json::Value {
                 "get": { "summary": "Read revisioned managed configuration (admin only)",
                     "description": "Returns the compare-and-swap revision and redacted operational settings. OIDC client secrets, oper passwords, upstream SASL passwords, and secret bridge accounts are never returned.",
                     "security": authenticated,
-                    "responses": { "200": { "description": "redacted settings and revision" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } }
+                    "responses": { "200": { "description": "redacted settings and revision" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
+                "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": { "type": "object", "description": "Scalar managed settings; credential collections are not accepted here." } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced and restart_required indicator" }, "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
             },
             "/api/v1/admin/configuration/opers": {
                 "post": { "summary": "Add an IRC operator to managed configuration", "security": authenticated,
