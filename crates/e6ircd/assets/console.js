@@ -515,4 +515,41 @@
       void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", {});
     });
   }
+
+  const sessionResult = document.getElementById("session-api-result");
+  const setSessionResult = (message, success) => {
+    if (!sessionResult) return;
+    sessionResult.textContent = message;
+    sessionResult.className = success ? "banner-success" : "banner-error";
+  };
+
+  for (const form of document.querySelectorAll("[data-api-admin-disconnect]")) {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const id = Number(fields.get("id"));
+      if (!Number.isSafeInteger(id) || id < 1) {
+        setSessionResult("The live-connection ID is invalid. Reload and try again.", false);
+        return;
+      }
+      const submit = form.querySelector('button[type="submit"]');
+      if (submit) submit.disabled = true;
+      try {
+        const csrf = form.querySelector('input[name="csrf"]')?.value;
+        if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+        const reason = fieldValue(fields, "reason");
+        const query = reason ? `?reason=${encodeURIComponent(reason)}` : "";
+        const response = await fetch(`/api/v1/admin/connections/${id}${query}`, {
+          method: "DELETE",
+          credentials: "same-origin",
+          headers: { Accept: "application/json", "X-E6IRC-CSRF": csrf },
+        });
+        if (!response.ok) throw new Error(await apiProblem(response));
+        window.location.reload();
+      } catch (error) {
+        setSessionResult(error instanceof Error ? error.message : "Disconnect request failed.", false);
+        if (submit) submit.disabled = false;
+      }
+    });
+  }
 })();

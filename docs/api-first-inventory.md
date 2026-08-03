@@ -75,7 +75,6 @@ operation's semantics.
 | `/console/accounts/{id}/suspension` | `PATCH /api/v1/admin/accounts/{id}` | Mapped | Return the committed suspension posture. |
 | `/console/accounts/{id}/administrator` | `PATCH /api/v1/admin/accounts/{id}` | Mapped | Return durable/effective authority distinctly. |
 | `/console/admin/networks/{owner}/{name}/toggle` | `PATCH /api/v1/admin/networks/{owner}/{name}` | Mapped | Use the administrator-scoped audited lifecycle patch. |
-| `/console/sessions/{id}/disconnect` | `DELETE /api/v1/admin/connections/{id}` | Mapped | Keep exact immutable-ID disconnect semantics. |
 
 ## Managed configuration
 

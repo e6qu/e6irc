@@ -3,6 +3,7 @@
   {% if let Some(err) = error %}
     <p class="banner-error" role="alert">{{ err }}</p>
   {% endif %}
+  <div id="session-api-result" role="status" aria-live="polite"></div>
   <div class="page-head">
     <div>
       <p class="eyebrow">Access &amp; connections</p>
@@ -163,9 +164,10 @@
                 <td>{% if s.channels.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ s.channels }}</code>{% endif %}</td>
                 <td>
                   <form class="cell-form" method="post"
-                        action="{{ disconnect_action }}/{{ s.id }}/disconnect"
+                        {% if show_browser_sessions %}action="{{ disconnect_action }}/{{ s.id }}/disconnect"{% else %}action="/api/v1/admin/connections/{{ s.id }}" data-api-admin-disconnect{% endif %}
                         data-confirm="Disconnect connection {{ s.id }} ({{ s.nick }})?">
                     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                    {% if !show_browser_sessions %}<input type="hidden" name="id" value="{{ s.id }}" />{% endif %}
                     <input type="text" name="reason" maxlength="300" placeholder="reason" />
                     <button class="danger" type="submit">Disconnect</button>
                   </form>

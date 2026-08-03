@@ -4356,16 +4356,13 @@ async fn admin_connection_directory_and_disconnect_controls() {
         );
     }
 
-    // Disconnect the exact immutable resource from the console -> 303.
-    let body = "csrf=CSRF&reason=cleanup".replace("CSRF", &csrf);
+    // Disconnect the exact immutable resource through the administrator API.
     let kill = format!(
-        "POST /console/sessions/{connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
+        "DELETE /api/v1/admin/connections/{connection_id}?reason=cleanup HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
     );
     let (status, head, _) = request(http, &kill).await;
-    assert_eq!(status, 303, "{head}");
+    assert_eq!(status, 204, "{head}");
 
     // The victim's connection is closed by the server (an ERROR then EOF).
     let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {

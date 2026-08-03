@@ -1296,10 +1296,6 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(pages::console_drop_channel),
         )
         .route("/console/sessions", get(pages::console_sessions))
-        .route(
-            "/console/sessions/{id}/disconnect",
-            post(pages::console_disconnect_session),
-        )
         .route("/console/my-sessions", get(pages::console_my_sessions))
         .route(
             "/console/my-sessions/{id}/disconnect",
@@ -6621,31 +6617,6 @@ mod pages {
 
     /// Console → disconnect an exact live connection (admin), like oper KILL
     /// after its nick has resolved to one immutable connection.
-    pub async fn console_disconnect_session(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(connection_id): Path<u64>,
-        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let make = |actor| crate::core::AdminRequest::DisconnectConnection {
-            connection_id,
-            reason,
-            actor,
-        };
-        match run_admin_form(&state, &headers, &csrf, "/console/sessions", make).await {
-            Ok(response) => response,
-            Err((account, message)) => {
-                sessions_error_page(&state, &headers, account, false, message).await
-            }
-        }
-    }
-
-    /// Console → the caller's capped browser sessions and bounded live
-    /// connections.
     pub async fn console_my_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
