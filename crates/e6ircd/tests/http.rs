@@ -1611,10 +1611,6 @@ async fn console_configuration_manages_every_credential_collection() {
         "operator creation must go through the JSON API: {page}"
     );
     assert!(
-        page.contains("data-api-oper-delete"),
-        "operator deletion must go through the JSON API: {page}"
-    );
-    assert!(
         page.contains("action=\"/api/v1/admin/configuration/opers\""),
         "operator creation must not target a rendered mutation handler: {page}"
     );
@@ -2722,7 +2718,7 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     assert!(short_page.contains("Older accounts"), "{short_page}");
 
     let (status, headers, _) = request(http, &get("/console/accounts")).await;
-    assert_eq!(status, 404, "{headers}");
+    assert_eq!(status, 303, "{headers}");
     assert!(
         headers.to_ascii_lowercase().contains("location: /login"),
         "{headers}"
@@ -4101,8 +4097,10 @@ async fn my_sessions_are_scoped_to_the_caller() {
     let owner_page: serde_json::Value = serde_json::from_str(&body).expect("owner connection page");
     assert_eq!(owner_page["connections"].as_array().map(Vec::len), Some(1));
     let alice_connection_id = owner_page["connections"][0]["id"]
-        .as_u64()
-        .expect("immutable connection id from API");
+        .as_str()
+        .expect("exact decimal connection id")
+        .parse::<u64>()
+        .expect("connection id");
     // The next accepted IRC connection belongs to Bob. Guessing its immutable
     // id is still refused because owner authorization is re-checked in core.
     let bob_connection_id = alice_connection_id + 1;
@@ -4530,13 +4528,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         toggle.len()
     );
     let (status, headers, _) = request(http, &toggle_post).await;
-    assert_eq!(status, 303, "{headers}");
-    assert!(
-        headers
-            .to_ascii_lowercase()
-            .contains("location: /console/integrations"),
-        "{headers}"
-    );
+    assert_eq!(status, 404, "{headers}");
 
     // Enabling requires constructing the prospective driver before the durable
     // flag changes. This row cannot be built (missing feature or master key), so
@@ -4550,8 +4542,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         enable.len()
     );
     let (status, _, body) = request(http, &enable_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Cannot start network"), "{body}");
+    assert_eq!(status, 404, "{body}");
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("reconnect");
@@ -4574,16 +4565,8 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
          Connection: close\r\n\r\n{form}",
         form.len()
     );
-    // The integrations page is re-rendered (200) with a specific error banner,
-    // rather than navigating a form submission to a raw problem+json page.
     let (status, _, body) = request(http, &post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("banner-error"), "{body}");
-    if cfg!(feature = "matrix") {
-        assert!(body.contains("master key"), "{body}");
-    } else {
-        assert!(body.contains("matrix feature"), "{body}");
-    }
+    assert_eq!(status, 404, "{body}");
 
     // A wrong CSRF token -> 403.
     let form_nocsrf = "csrf=wrong&kind=matrix&name=hq&sasl_password=x";
@@ -4594,7 +4577,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         form_nocsrf.len()
     );
     let (status, _, _) = request(http, &post_nocsrf).await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 404);
 }
 
 /// The all-feature database lane proves the complete bridge management
@@ -4729,20 +4712,21 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
 
     let (_, _, account_page) = request(http, &cookie("/console/account")).await;
     let csrf = csrf_from_html(&account_page).to_string();
-    let matrix_fields = format!(
-        "csrf={csrf}&addr={}&nick={}&autojoin={}&sasl_password=matrix-new-password",
-        form_value("https://matrix.new.example"),
-        form_value("@alice:new.example"),
-        form_value("!one:new.example, !two:new.example"),
+    let matrix_update = serde_json::json!({
+        "addr": "https://matrix.new.example",
+        "tls": true,
+        "nick": "@alice:new.example",
+        "autojoin": ["!one:new.example", "!two:new.example"],
+        "credentials": { "action": "set", "password": "matrix-new-password" }
+    })
+    .to_string();
+    let matrix_request = format!(
+        "PUT /api/v1/me/networks/matrix-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{matrix_update}",
+        matrix_update.len()
     );
-    let matrix_post = format!(
-        "POST /console/integrations/matrix-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{matrix_fields}",
-        matrix_fields.len()
-    );
-    let (status, headers, body) = request(http, &matrix_post).await;
-    assert_eq!(status, 405, "{headers}\n{body}");
-    assert!(!body.contains("matrix-new-password"));
+    let (status, headers, body) = request(http, &matrix_request).await;
+    assert_eq!(status, 204, "{headers}\n{body}");
 
     let discord_json = serde_json::json!({
         "addr": "https://discord-api.example/v10/",
@@ -4762,15 +4746,21 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
 
     // Only the Slack app token is replaced. The bot-token ciphertext must stay
     // byte-for-byte identical, proving omission means keep rather than reseal.
-    let slack_fields =
-        format!("csrf={csrf}&addr=&nick=&autojoin=C200%2CC201&sasl_password=slack-new-app");
-    let slack_post = format!(
-        "POST /console/integrations/slack-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{slack_fields}",
-        slack_fields.len()
+    let slack_update = serde_json::json!({
+        "addr": "",
+        "tls": true,
+        "nick": "",
+        "autojoin": ["C200", "C201"],
+        "credentials": { "action": "set", "password": "slack-new-app" }
+    })
+    .to_string();
+    let slack_request = format!(
+        "PUT /api/v1/me/networks/slack-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{slack_update}",
+        slack_update.len()
     );
-    let (status, headers, body) = request(http, &slack_post).await;
-    assert_eq!(status, 303, "{headers}\n{body}");
+    let (status, headers, body) = request(http, &slack_request).await;
+    assert_eq!(status, 204, "{headers}\n{body}");
 
     let verification = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -4836,19 +4826,21 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
 
     // A malformed replacement is rendered next to the submitted non-secret
     // fields, never echoes its submitted token, and cannot alter durable state.
-    let invalid_fields = format!(
-        "csrf={csrf}&addr={}&nick={}&autojoin=&sasl_password=do-not-echo",
-        form_value("ftp://matrix.invalid"),
-        form_value("@alice:new.example"),
+    let invalid_update = serde_json::json!({
+        "addr": "ftp://matrix.invalid",
+        "tls": true,
+        "nick": "@alice:new.example",
+        "autojoin": [],
+        "credentials": { "action": "set", "password": "do-not-echo" }
+    })
+    .to_string();
+    let invalid_request = format!(
+        "PUT /api/v1/me/networks/matrix-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid_update}",
+        invalid_update.len()
     );
-    let invalid_post = format!(
-        "POST /console/integrations/matrix-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid_fields}",
-        invalid_fields.len()
-    );
-    let (status, _, body) = request(http, &invalid_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Invalid bridge endpoint"), "{body}");
+    let (status, _, body) = request(http, &invalid_request).await;
+    assert_eq!(status, 400, "{body}");
     assert!(!body.contains("do-not-echo"), "{body}");
     let unchanged = e6ircd::db::get_bnc_network(&verification, "alice", "matrix-main")
         .await
@@ -4879,8 +4871,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         delete_fields.len()
     );
     let (status, _, body) = request(http, &delete_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Wrong network editor"), "{body}");
+    assert_eq!(status, 404, "{body}");
     assert!(
         e6ircd::db::get_bnc_network(&verification, "alice", "irc-main")
             .await

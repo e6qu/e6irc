@@ -397,6 +397,7 @@
         `/api/v1/admin/configuration/networks/${encodeURIComponent(name)}`,
         "DELETE",
         { revision, owner: optionalValue(String(fields.get("owner") || "")) },
+        `removed server network ${name}`,
       );
     });
   }
@@ -417,6 +418,7 @@
         "/api/v1/admin/configuration/opers",
         "POST",
         { revision, name, password },
+        `added IRC operator ${name}`,
       );
     });
   }
@@ -436,6 +438,7 @@
         `/api/v1/admin/configuration/opers/${encodeURIComponent(name)}`,
         "DELETE",
         { revision },
+        `removed IRC operator ${name}`,
       );
     });
   }
@@ -468,6 +471,7 @@
           end_session_endpoint: optionalValue(String(fields.get("end_session_endpoint") || "")),
           token_endpoint_auth_method: String(fields.get("token_endpoint_auth_method") || ""),
         },
+        `added OpenID Connect provider ${name}`,
       );
     });
   }
@@ -487,6 +491,7 @@
         `/api/v1/admin/configuration/oidc-providers/${encodeURIComponent(name)}`,
         "DELETE",
         { revision },
+        `removed OpenID Connect provider ${name}`,
       );
     });
   }
