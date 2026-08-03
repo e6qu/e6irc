@@ -842,6 +842,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-network-create"), "{body}");
     assert!(body.contains("data-api-oper-create"), "{body}");
     assert!(body.contains("data-api-oidc-create"), "{body}");
+    assert!(body.contains("data-api-configuration-patch"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
     assert!(
         body.contains("/api/v1/admin/configuration/networks"),
@@ -1355,6 +1356,14 @@ async fn console_add_and_delete_network_via_the_console() {
         );
     }
     let csrf = csrf_from_html(&page).to_string();
+    assert!(
+        page.contains("data-api-configuration-patch"),
+        "scalar configuration must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("action=\"/api/v1/admin/configuration\""),
+        "scalar configuration must not target a rendered mutation handler: {page}"
+    );
     assert!(!csrf.is_empty());
 
     // Test connection is a non-mutating operation that renders the measured

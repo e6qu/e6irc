@@ -83,7 +83,7 @@ operation's semantics.
 
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
-| `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Mapped | PATCH carries typed scalar settings and preserves credential collections. |
+| `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Browser migrated | PATCH carries typed scalar settings and preserves credential collections. |
 | `/console/configuration/opers` | `POST /api/v1/admin/configuration/opers` | Browser migrated | The Configuration page sends the operator name, write-only password, and revision through the JSON API. |
 | `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Browser migrated | The Configuration page sends the revision through the JSON API. |
 | `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Browser migrated | The Configuration page sends its write-only provider secret and revision through the JSON API. |

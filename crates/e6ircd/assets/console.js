@@ -143,6 +143,106 @@
       .map((item) => item.trim())
       .filter(Boolean);
 
+  const textLines = (value) => {
+    if (!value) return [];
+    const lines = value.split("\n");
+    if (value.endsWith("\n")) lines.pop();
+    return lines;
+  };
+
+  const fieldValue = (fields, name) => String(fields.get(name) || "").trim();
+
+  const positiveInteger = (fields, name, label) => {
+    const value = Number(fields.get(name));
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`${label} must be a positive whole number.`);
+    }
+    return value;
+  };
+
+  const optionalPositiveInteger = (fields, name, label) => {
+    const value = fieldValue(fields, name);
+    return value ? positiveInteger({ get: () => value }, name, label) : null;
+  };
+
+  const parseListeners = (value) =>
+    value
+      .split("\n")
+      .map((line, index) => {
+        const fields = line.split("|").map((field) => field.trim());
+        if (!fields.some(Boolean)) return null;
+        const [addr, mode = "plain", cert_path, key_path] = fields;
+        if (!addr) throw new Error(`Listener line ${index + 1} has no address.`);
+        if (mode === "plain") return { addr, tls: null, websocket: false };
+        if (mode === "websocket") return { addr, tls: null, websocket: true };
+        if (mode === "tls" && cert_path && key_path) {
+          return { addr, tls: { cert_path, key_path }, websocket: false };
+        }
+        if (mode === "tls") {
+          throw new Error(`TLS listener line ${index + 1} needs certificate and private-key paths.`);
+        }
+        throw new Error(`Listener line ${index + 1} mode must be plain, tls, or websocket.`);
+      })
+      .filter(Boolean);
+
+  const configurationPatch = (form) => {
+    const fields = new FormData(form);
+    const revision = Number(fields.get("revision"));
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error("The configuration revision is invalid. Reload and try again.");
+    }
+    const bnc_addr = fields.has("bnc_enabled") ? fieldValue(fields, "bnc_addr") : null;
+    if (fields.has("bnc_enabled") && !bnc_addr) {
+      throw new Error("BNC listen address must be host:port when the listener is enabled.");
+    }
+    return {
+      revision,
+      settings: {
+        server_name: fieldValue(fields, "server_name"),
+        network_name: fieldValue(fields, "network_name"),
+        description: fieldValue(fields, "description"),
+        motd: textLines(String(fields.get("motd") || "")),
+        nicklen: positiveInteger(fields, "nicklen", "Nickname length"),
+        sendq: positiveInteger(fields, "sendq", "Send queue"),
+        core_queue: positiveInteger(fields, "core_queue", "Core queue"),
+        max_hot_channels: positiveInteger(fields, "max_hot_channels", "Hot channels"),
+        listeners: parseListeners(String(fields.get("listeners") || "")),
+        registration: {
+          before_connect: fields.has("registration_before_connect"),
+          require_email: fields.has("registration_require_email"),
+        },
+        limits: {
+          max_connections_per_ip: optionalPositiveInteger(fields, "max_connections_per_ip", "Connections per IP"),
+          command_burst: optionalPositiveInteger(fields, "command_burst", "Command burst"),
+          trusted_proxies: String(fields.get("trusted_proxies") || "")
+            .split("\n")
+            .map((entry) => entry.trim())
+            .filter(Boolean),
+          auth_rate_burst: optionalPositiveInteger(fields, "auth_rate_burst", "Authentication burst"),
+          api_rate_burst: optionalPositiveInteger(fields, "api_rate_burst", "Authenticated API burst"),
+          administrator_api_rate_burst: optionalPositiveInteger(fields, "administrator_api_rate_burst", "Administrator API burst"),
+          registration_burst: optionalPositiveInteger(fields, "registration_burst", "Registration burst"),
+        },
+        observability: {
+          enabled: fields.has("observability_enabled"),
+          sample_interval_seconds: positiveInteger(fields, "observability_sample_interval_seconds", "Sample interval"),
+          retention_hours: positiveInteger(fields, "observability_retention_hours", "Monitoring retention"),
+        },
+        storage: {
+          history_retention_days: positiveInteger(fields, "storage_history_retention_days", "Message history retention"),
+          audit_retention_days: positiveInteger(fields, "storage_audit_retention_days", "Audit retention"),
+        },
+        bnc_addr,
+        public_url: optionalValue(String(fields.get("public_url") || "")),
+        secure_cookies: fields.has("secure_cookies"),
+        admin_accounts: String(fields.get("admin_accounts") || "")
+          .split("\n")
+          .map((account) => account.trim())
+          .filter(Boolean),
+      },
+    };
+  };
+
   const networkBody = (form) => {
     const fields = new FormData(form);
     const number = Number(fields.get("buffer_cap"));
@@ -175,6 +275,16 @@
     configurationResult.className = success ? "banner-success" : "banner-error";
   };
 
+  try {
+    const message = window.sessionStorage.getItem("e6irc.configuration-result");
+    if (message) {
+      window.sessionStorage.removeItem("e6irc.configuration-result");
+      setConfigurationResult(message, true);
+    }
+  } catch (_) {
+    // A successful reload remains authoritative if the browser denies session storage.
+  }
+
   const mutateConfiguration = async (form, url, method, body) => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
@@ -192,12 +302,31 @@
         body: JSON.stringify(body),
       });
       if (!response.ok) throw new Error(await apiProblem(response));
+      try {
+        window.sessionStorage.setItem("e6irc.configuration-result", "Configuration saved.");
+      } catch (_) {
+        // A successful API response is still authoritative if the browser denies storage.
+      }
       window.location.reload();
     } catch (error) {
       setConfigurationResult(error instanceof Error ? error.message : "Configuration request failed.", false);
       if (submit) submit.disabled = false;
     }
   };
+
+  for (const form of document.querySelectorAll("[data-api-configuration-patch]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      let body;
+      try {
+        body = configurationPatch(form);
+      } catch (error) {
+        setConfigurationResult(error instanceof Error ? error.message : "Invalid configuration.", false);
+        return;
+      }
+      void mutateConfiguration(form, "/api/v1/admin/configuration", "PATCH", body);
+    });
+  }
 
   for (const form of document.querySelectorAll("[data-api-network-create]")) {
     form.addEventListener("submit", (event) => {

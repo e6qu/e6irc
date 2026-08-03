@@ -27,9 +27,10 @@
     <p>These bootstrap values must exist before the console can start. Their effective state is shown here; more than one key means a credential rotation window is active. Operational configuration below is UI-managed.</p>
   </section>
 
-  <form class="settings-form" method="post" action="/console/configuration">
+  <form class="settings-form" method="post" action="/api/v1/admin/configuration" data-api-configuration-patch>
     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
     <input type="hidden" name="revision" value="{{ revision }}" />
+    <noscript><div class="banner-error">JavaScript is required to save configuration because this form uses the administrator API directly.</div></noscript>
 
     <section class="settings-section">
       <div class="section-copy">
