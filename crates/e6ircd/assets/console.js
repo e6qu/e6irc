@@ -622,7 +622,8 @@
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
-      return apiRequest(form, form.action, method, body);
+      const result = await apiRequest(form, form.action, method, body);
+      return result === undefined ? true : result;
     } catch (error) {
       setAccountResult(error instanceof Error ? error.message : failure, false);
       if (submit) submit.disabled = false;
@@ -637,7 +638,7 @@
       event.preventDefault();
       const email = fieldValue(new FormData(form), "contact_email");
       void mutateAccount(form, "PATCH", { contact_email: email || null }, "Profile update failed.")
-        .then((result) => { if (result !== undefined) reloadAccount(); });
+        .then((result) => { if (result !== false) reloadAccount(); });
     });
   }
 
@@ -662,7 +663,9 @@
         return;
       }
       void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
-        .then((result) => { if (result !== undefined) reloadAccount(); });
+        .then((result) => {
+          if (result !== false) setAccountResult(current ? "Local password changed." : "Local password added.", true);
+        });
     });
   }
 
@@ -676,7 +679,7 @@
       }
       void mutateAccount(form, "POST", { label }, "App-password creation failed.")
         .then((result) => {
-          if (result === undefined) return;
+          if (!result || typeof result !== "object") return;
           showAccountSecret("App password", result.app_password);
           setAccountResult("App password created. Copy it now; it cannot be shown again.", true);
         });
@@ -698,7 +701,7 @@
         scopes,
         expires_in_days: Number(fields.get("expires_in_days")),
       }, "Token creation failed.").then((result) => {
-        if (result === undefined) return;
+        if (!result || typeof result !== "object") return;
         showAccountSecret("Personal access token", result.token);
         setAccountResult("Personal access token created. Copy it now; it cannot be shown again.", true);
       });
@@ -763,7 +766,7 @@
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
-        .then((result) => { if (result !== undefined) reloadAccount(); });
+        .then((result) => { if (result !== false) reloadAccount(); });
     });
   }
 
@@ -772,7 +775,7 @@
       event.preventDefault();
       const confirmation = fieldValue(new FormData(form), "confirmation");
       void mutateAccount(form, "DELETE", { confirmation }, "Account deletion failed.")
-        .then((result) => { if (result !== undefined) window.location.assign("/auth/signed-out"); });
+        .then((result) => { if (result !== false) window.location.assign("/auth/signed-out"); });
     });
   }
 
