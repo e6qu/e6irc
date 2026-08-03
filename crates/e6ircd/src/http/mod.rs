@@ -1068,6 +1068,7 @@ documented_routes! {
     "/api/v1/admin/configuration/networks" => { post: admin_create_network },
     "/api/v1/admin/configuration/networks/{name}" => { delete: admin_delete_network },
     "/api/v1/admin/observability" => { get: admin_observability },
+    "/api/v1/admin/monitoring" => { get: pages::admin_monitoring },
     "/api/v1/admin/metrics" => { get: admin_metrics },
 }
 
@@ -1102,10 +1103,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/account", get(pages::console_account))
         .route("/console/channels", get(pages::console_channels))
         .route("/console/monitoring", get(pages::console_monitoring))
-        .route(
-            "/console/monitoring/panel",
-            get(pages::console_monitoring_panel),
-        )
         .route("/console/configuration", get(pages::console_configuration))
         .route("/console/networks", get(pages::console_networks))
         .route(
@@ -2443,29 +2440,34 @@ mod pages {
         })
     }
 
+    #[derive(Serialize)]
     struct TrafficBar {
         inbound_height: u64,
         outbound_height: u64,
         title: String,
     }
 
+    #[derive(Serialize)]
     struct ConnectionBar {
         irc_height: u64,
         bnc_height: u64,
         title: String,
     }
 
+    #[derive(Serialize)]
     struct UpstreamBar {
         height: u64,
         status_class: &'static str,
         title: String,
     }
 
+    #[derive(Serialize)]
     struct ErrorBar {
         height: u64,
         title: String,
     }
 
+    #[derive(Serialize)]
     struct LatencyBar {
         core_height: u64,
         database_height: u64,
@@ -2473,12 +2475,14 @@ mod pages {
         title: String,
     }
 
+    #[derive(Serialize)]
     struct QueueBar {
         core_height: u64,
         database_height: u64,
         title: String,
     }
 
+    #[derive(Serialize)]
     struct QueueView {
         label: &'static str,
         depth: u64,
@@ -2488,6 +2492,7 @@ mod pages {
         mode_switches: u64,
     }
 
+    #[derive(Serialize)]
     struct MonitoringWindowLink {
         label: &'static str,
         minutes: u64,
@@ -2537,6 +2542,17 @@ mod pages {
         }
     }
 
+    fn monitoring_window_links(window: MonitoringWindow) -> Vec<MonitoringWindowLink> {
+        MonitoringWindow::ALL
+            .into_iter()
+            .map(|candidate| MonitoringWindowLink {
+                label: candidate.label(),
+                minutes: candidate.minutes(),
+                active: candidate.minutes() == window.minutes(),
+            })
+            .collect()
+    }
+
     #[derive(Deserialize, Default)]
     pub struct ConsoleMonitoringQuery {
         minutes: Option<u64>,
@@ -2550,12 +2566,14 @@ mod pages {
         )
     }
 
+    #[derive(Serialize)]
     struct ErrorView {
         kind: String,
         count: u64,
         last_seen: String,
     }
 
+    #[derive(Serialize)]
     struct MonitoringView {
         core_ready: bool,
         database_ready: bool,
@@ -2610,13 +2628,8 @@ mod pages {
     #[template(path = "console_monitoring.html")]
     struct ConsoleMonitoring {
         shell: ConsoleShell,
-        view: MonitoringView,
-    }
-
-    #[derive(Template)]
-    #[template(path = "_monitoring_panel.html")]
-    struct ConsoleMonitoringPanel {
-        view: MonitoringView,
+        minutes: u64,
+        window_links: Vec<MonitoringWindowLink>,
     }
 
     fn format_bytes(bytes: u64) -> String {
@@ -2986,14 +2999,7 @@ mod pages {
             history_samples: history.len().saturating_sub(1),
             window_label: window.label(),
             window_minutes: window.minutes(),
-            window_links: MonitoringWindow::ALL
-                .into_iter()
-                .map(|candidate| MonitoringWindowLink {
-                    label: candidate.label(),
-                    minutes: candidate.minutes(),
-                    active: candidate.minutes() == window.minutes(),
-                })
-                .collect(),
+            window_links: monitoring_window_links(window),
         }
     }
 
@@ -3006,11 +3012,26 @@ mod pages {
             Ok(window) => window,
             Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
         };
-        let view = monitoring_view(&state, window).await;
         render_private(ConsoleMonitoring {
             shell: console_shell(&state, account, csrf, "monitoring"),
-            view,
+            minutes: window.minutes(),
+            window_links: monitoring_window_links(window),
         })
+    }
+
+    /// Render-ready, bounded administrator monitoring data. This is the same
+    /// projection used by the console, exposed as JSON so the browser never
+    /// needs a parallel HTML fragment endpoint.
+    pub async fn admin_monitoring(
+        State(state): State<Arc<AppState>>,
+        _admin: AdminAccount,
+        Query(query): Query<ConsoleMonitoringQuery>,
+    ) -> Response {
+        let window = match MonitoringWindow::from_query(query.minutes) {
+            Ok(window) => window,
+            Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
+        };
+        super::json_no_store(monitoring_view(&state, window).await)
     }
 
     async fn console_accounts_response(
@@ -3203,20 +3224,6 @@ mod pages {
             action,
             target,
             limit: query.page_size.value(),
-        })
-    }
-
-    pub async fn console_monitoring_panel(
-        State(state): State<Arc<AppState>>,
-        _admin: AdminPageActor,
-        Query(query): Query<ConsoleMonitoringQuery>,
-    ) -> Response {
-        let window = match MonitoringWindow::from_query(query.minutes) {
-            Ok(window) => window,
-            Err(InvalidMonitoringWindow) => return invalid_monitoring_window_response(),
-        };
-        render_private(ConsoleMonitoringPanel {
-            view: monitoring_view(&state, window).await,
         })
     }
 

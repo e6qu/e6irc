@@ -647,15 +647,18 @@ uses labeled responsive field grids, explicit capability/status banners, live
 listener state, provenance, and accessible error/success regions instead of
 the clipped placeholder-only form.
 
-Observability console (2026-07-28): the same UI-managed control plane now
+Observability console (2026-08-03): the same UI-managed control plane now
 owns live sampling and bounded retention. `/console/monitoring` presents core
 and database health, IRC/BNC traffic, client and upstream connections,
 cumulative latency percentiles, SendQ pressure, and a fixed-category error
 ledger; its overview refreshes every ten seconds. Selectable 1-hour, 6-hour,
 24-hour, and 7-day views now graph IRC traffic, live IRC/BNC attachments,
 upstream availability, new errors, and P95 core/database/HTTP latency from the
-same stored snapshots. The selected range survives live panel refresh and
-flows into the JSON link. Raw IRC and web clients share one authenticated
+same stored snapshots. The browser renders that view from the documented
+administrator `/api/v1/admin/monitoring` JSON projection rather than a
+parallel server-rendered HTML fragment; the selected range survives live
+refresh and flows into the JSON link. Raw IRC and web clients share one
+authenticated
 network-attachment guard, so the global and per-network attachment gauges
 agree and unauthenticated accepted sockets are excluded. Snapshot schema
 version 2 makes that semantic change explicit and keeps the connection chart

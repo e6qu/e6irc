@@ -878,6 +878,7 @@ async fn openapi_spec_is_served() {
     assert!(v["paths"]["/healthz"]["get"].is_object());
     assert!(v["paths"]["/readyz"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/observability"]["get"].is_object());
+    assert!(v["paths"]["/api/v1/admin/monitoring"]["get"].is_object());
     assert!(v["paths"]["/api/v1/admin/metrics"]["get"].is_object());
     let account_parameters = v["paths"]["/api/v1/admin/accounts"]["get"]["parameters"]
         .as_array()
@@ -1354,19 +1355,10 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, monitoring_page) = request(http, &monitoring).await;
     assert_eq!(status, 200, "{monitoring_page}");
     for needle in [
-        "IRC traffic",
-        "Upstream traffic",
-        "Connections",
-        "Upstream availability",
-        "New errors",
-        "P95 latency",
-        "Queue pressure",
-        "Runtime queues",
-        "IRC core",
-        "Database worker",
-        "data-refresh-url=\"/console/monitoring/panel?minutes=60\"",
-        "/api/v1/admin/observability?minutes=60",
-        "Authenticated raw IRC and web attachments",
+        "data-api-admin-monitoring",
+        "data-minutes=\"60\"",
+        "data-refresh-seconds=\"10\"",
+        "Loading monitoring data…",
     ] {
         assert!(
             monitoring_page.contains(needle),
@@ -1380,14 +1372,14 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, six_hour_page) = request(http, &six_hour_monitoring).await;
     assert_eq!(status, 200, "{six_hour_page}");
     assert!(
-        six_hour_page.contains("data-refresh-url=\"/console/monitoring/panel?minutes=360\""),
-        "{six_hour_page}"
-    );
-    assert!(
-        six_hour_page.contains("/api/v1/admin/observability?minutes=360"),
+        six_hour_page.contains("data-minutes=\"360\""),
         "{six_hour_page}"
     );
     assert!(six_hour_page.contains("6 hours"), "{six_hour_page}");
+    assert!(
+        !monitoring_page.contains("/console/monitoring/panel"),
+        "{monitoring_page}"
+    );
 
     let invalid_monitoring = format!(
         "GET /console/monitoring?minutes=17 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -1415,6 +1407,32 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     assert_eq!(body["current"]["queues"]["db"]["capacity"], 1_024);
     assert_eq!(body["current"]["queues"]["core"]["mode"], "fifo");
     assert!(body["history"].is_array());
+    let monitoring_api = format!(
+        "GET /api/v1/admin/monitoring?minutes=60 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, monitoring_headers, monitoring_body) = request(http, &monitoring_api).await;
+    assert_eq!(status, 200, "{monitoring_body}");
+    assert!(
+        monitoring_headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{monitoring_headers}"
+    );
+    let monitoring_body: serde_json::Value =
+        serde_json::from_str(&monitoring_body).expect("monitoring JSON");
+    assert_eq!(monitoring_body["window_minutes"], 60);
+    assert!(monitoring_body["active_connections"].is_u64());
+    assert!(monitoring_body["traffic_bars"].is_array());
+    assert!(monitoring_body["window_links"].is_array());
+    let invalid_monitoring_api = format!(
+        "GET /api/v1/admin/monitoring?minutes=17 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, invalid_monitoring_body) = request(http, &invalid_monitoring_api).await;
+    assert_eq!(status, 400, "{invalid_monitoring_body}");
+    assert!(
+        invalid_monitoring_body.contains("Invalid monitoring window"),
+        "{invalid_monitoring_body}"
+    );
     let invalid_observability = format!(
         "GET /api/v1/admin/observability?minutes=10081 HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );

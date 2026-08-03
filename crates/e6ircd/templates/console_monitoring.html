@@ -14,17 +14,18 @@
   <div class="monitoring-toolbar">
     <strong>History window</strong>
     <div class="window-picker" role="group" aria-label="Monitoring history window">
-      {% for window in view.window_links %}
+      {% for window in window_links %}
         <a href="/console/monitoring?minutes={{ window.minutes }}"
            {% if window.active %}class="active" aria-current="page"{% endif %}>{{ window.label }}</a>
       {% endfor %}
     </div>
   </div>
   <div id="monitoring-panel"
-       data-refresh-url="/console/monitoring/panel?minutes={{ view.window_minutes }}"
+       data-api-admin-monitoring
+       data-minutes="{{ minutes }}"
        data-refresh-seconds="10"
        data-refresh-status="monitoring-refresh-status">
-    {% include "_monitoring_panel.html" %}
+    <div class="chart-empty">Loading monitoring data…</div>
   </div>
   <p id="monitoring-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
 {% endblock %}
