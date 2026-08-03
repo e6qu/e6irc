@@ -46,15 +46,17 @@ The application is complete only when all of the following are true:
   production-scale behavior, recovery, release artifacts, and the real
   third-party integrations that are advertised as supported.
 
-### Stage A — Establish the API-first boundary 🔶 inventory in progress
+### Stage A — Establish the API-first boundary 🔶 resource parity complete
 
 **Goal:** make `/api/v1` the authoritative product interface and eliminate
 parallel console-specific behavior.
 
 **Current milestone:** [`docs/api-first-inventory.md`](docs/api-first-inventory.md)
-lists every mutable console route, its current API mapping, and the API gaps
-that must close before the rendered-form handlers can retire. CI verifies that
-the inventory covers the router's complete console-mutation set.
+lists every mutable console route and its canonical API mapping. Every listed
+state transition now has a typed versioned API operation; CI verifies that the
+inventory covers the router's complete console-mutation set. Retiring rendered
+form handlers is Stage B work, after their API-client replacements have the
+same browser transition and error evidence.
 
 1. Inventory every browser-chat, server-rendered-console, CLI, and native
    client read/mutation. For each one, record its canonical resource, request
