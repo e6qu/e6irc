@@ -2,6 +2,15 @@
 
 use super::*;
 
+macro_rules! json_or_response {
+    ($body:expr) => {
+        match parse_json($body) {
+            Ok(body) => body,
+            Err(response) => return response,
+        }
+    };
+}
+
 // ---- device authorization grant (RFC 8628) ------------------------------
 
 /// Start a device grant. No auth: the client is not yet a principal, but each
@@ -298,10 +307,7 @@ pub(super) async fn admin_account_state(
     axum::extract::Path(account_id): axum::extract::Path<i64>,
     body: Result<axum::Json<AccountStateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     let mutation = match (body.suspended, body.administrator) {
         (Some(suspended), None) => {
             super::mutate_account_suspension(&state, &actor, account_id, suspended)
@@ -346,10 +352,7 @@ pub(super) async fn admin_create_account(
     AdminAccount(actor): AdminAccount,
     body: Result<axum::Json<AdminCreateAccountBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     let account_id = match super::create_account_lifecycle(
         &state,
         &actor,
@@ -446,10 +449,7 @@ pub(super) async fn admin_create_account_invitation(
         axum::extract::rejection::JsonRejection,
     >,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     if !crate::sanitize::valid_nick(&body.account, MAX_ACCOUNT_LEN) {
         return problem(
             StatusCode::BAD_REQUEST,
@@ -529,10 +529,7 @@ pub(super) async fn admin_delete_account(
     axum::extract::Path(account_id): axum::extract::Path<i64>,
     body: Result<axum::Json<AccountDeletionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
         Ok(Some(target)) => target,
         Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
