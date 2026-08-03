@@ -12,6 +12,7 @@
   {% if let Some(message) = outcome %}
     <div class="{% if success %}banner-success{% else %}banner-error{% endif %}" role="status">{{ message }}</div>
   {% endif %}
+  <div id="configuration-api-result" role="status" aria-live="polite"></div>
 
   <div class="provenance">
     <span>Last changed by <strong>{{ updated_by }}</strong></span>
@@ -203,6 +204,7 @@
       <p>Shared or account-owned networks imported from <code>[[network]]</code>. They start from the persisted configuration after restart.</p>
     </div>
     <div>
+      <noscript><div class="banner-error">JavaScript is required to manage server networks because these controls use the administrator API directly.</div></noscript>
       {% if settings.credentials_from_bootstrap %}
         <div class="banner-info"><div><strong>Credential-bearing networks still come from bootstrap configuration.</strong> Configure the master key and restart once to enable UI changes.</div></div>
       {% endif %}
@@ -215,8 +217,9 @@
               <div><strong>{{ network.name }}</strong><span class="tag">{{ network.kind }}</span></div>
               <code>{{ network.addr }}</code>
               <span class="meta">Available to {{ network.owner_display }}</span>
-              <form method="post" action="/console/configuration/shared-networks/delete">
+              <form method="post" action="/api/v1/admin/configuration/networks/{{ network.name }}" data-api-network-delete>
                 <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                <input type="hidden" name="revision" value="{{ revision }}" />
                 <input type="hidden" name="name" value="{{ network.name }}" />
                 <input type="hidden" name="owner" value="{{ network.owner_value }}" />
                 <button class="danger" type="submit">Remove</button>
@@ -225,8 +228,9 @@
           {% endfor %}
         </div>
       {% endif %}
-      <form class="oidc-form" method="post" action="/console/configuration/shared-networks">
+      <form class="oidc-form" method="post" action="/api/v1/admin/configuration/networks" data-api-network-create>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <input type="hidden" name="revision" value="{{ revision }}" />
         <label class="field"><span>Network name</span><input name="name" required /></label>
         <label class="field"><span>Owner <em>blank for shared</em></span><input name="owner" /></label>
         <label class="field"><span>Driver</span><select name="kind"><option value="irc">IRC</option><option value="local">Local e6irc</option>{% if matrix_built %}<option value="matrix">Matrix</option>{% endif %}{% if discord_built %}<option value="discord">Discord</option>{% endif %}{% if slack_built %}<option value="slack">Slack</option>{% endif %}</select></label>

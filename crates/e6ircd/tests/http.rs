@@ -839,6 +839,12 @@ async fn console_runtime_is_served_in_every_build() {
     );
     assert!(body.contains("dataset.confirm"), "{body}");
     assert!(body.contains("data-refresh-url"), "{body}");
+    assert!(body.contains("data-api-network-create"), "{body}");
+    assert!(body.contains("X-E6IRC-CSRF"), "{body}");
+    assert!(
+        body.contains("/api/v1/admin/configuration/networks"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -1796,6 +1802,18 @@ async fn console_configuration_manages_every_credential_collection() {
     let (status, _, page) = request(http, &page_request).await;
     assert_eq!(status, 200, "{page}");
     let csrf = csrf_from_html(&page).to_string();
+    assert!(
+        page.contains("data-api-network-create"),
+        "server-network creation must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("data-api-network-delete"),
+        "server-network deletion must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("action=\"/api/v1/admin/configuration/networks\""),
+        "server-network creation must not target a rendered mutation handler: {page}"
+    );
 
     let oper_secret = "operator-password-must-not-render";
     let oper_body = format!(r#"{{"revision":1,"name":"netop","password":"{oper_secret}"}}"#);

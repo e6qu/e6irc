@@ -118,4 +118,118 @@
       if (panel) refresh(panel);
     });
   }
+
+  const configurationResult = document.getElementById("configuration-api-result");
+
+  const apiProblem = async (response) => {
+    try {
+      const problem = await response.json();
+      if (typeof problem.detail === "string") return problem.detail;
+      if (typeof problem.title === "string") return problem.title;
+    } catch (_) {
+      // An intermediary may replace a problem response with a non-JSON body.
+    }
+    return `Request failed with HTTP ${response.status}.`;
+  };
+
+  const optionalValue = (value) => {
+    const trimmed = value.trim();
+    return trimmed || null;
+  };
+
+  const networkBody = (form) => {
+    const fields = new FormData(form);
+    const number = Number(fields.get("buffer_cap"));
+    const revision = Number(fields.get("revision"));
+    if (!Number.isSafeInteger(number) || number < 1) {
+      throw new Error("Buffer capacity must be a positive whole number.");
+    }
+    if (!Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error("The configuration revision is invalid. Reload and try again.");
+    }
+    return {
+      revision,
+      name: String(fields.get("name") || "").trim(),
+      owner: optionalValue(String(fields.get("owner") || "")),
+      kind: String(fields.get("kind") || ""),
+      addr: String(fields.get("addr") || "").trim(),
+      tls: fields.has("tls"),
+      nick: String(fields.get("nick") || "").trim(),
+      realname: optionalValue(String(fields.get("realname") || "")),
+      autojoin: String(fields.get("autojoin") || "")
+        .split(",")
+        .map((channel) => channel.trim())
+        .filter(Boolean),
+      buffer_cap: number,
+      sasl_account: optionalValue(String(fields.get("sasl_account") || "")),
+      sasl_password: optionalValue(String(fields.get("sasl_password") || "")),
+    };
+  };
+
+  const setConfigurationResult = (message, success) => {
+    if (!configurationResult) return;
+    configurationResult.textContent = message;
+    configurationResult.className = success ? "banner-success" : "banner-error";
+  };
+
+  const mutateConfiguration = async (form, url, method, body) => {
+    const submit = form.querySelector('button[type="submit"]');
+    if (submit) submit.disabled = true;
+    try {
+      const csrf = form.querySelector('input[name="csrf"]')?.value;
+      if (!csrf) throw new Error("The session security token is missing. Reload and try again.");
+      const response = await fetch(url, {
+        method,
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "X-E6IRC-CSRF": csrf,
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(await apiProblem(response));
+      window.location.reload();
+    } catch (error) {
+      setConfigurationResult(error instanceof Error ? error.message : "Configuration request failed.", false);
+      if (submit) submit.disabled = false;
+    }
+  };
+
+  for (const form of document.querySelectorAll("[data-api-network-create]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      let body;
+      try {
+        body = networkBody(form);
+      } catch (error) {
+        setConfigurationResult(error instanceof Error ? error.message : "Invalid network configuration.", false);
+        return;
+      }
+      void mutateConfiguration(form, "/api/v1/admin/configuration/networks", "POST", body);
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-network-delete]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const revision = Number(fields.get("revision"));
+      if (!Number.isSafeInteger(revision) || revision < 0) {
+        setConfigurationResult("The configuration revision is invalid. Reload and try again.", false);
+        return;
+      }
+      const name = String(fields.get("name") || "").trim();
+      if (!name) {
+        setConfigurationResult("The network name is missing. Reload and try again.", false);
+        return;
+      }
+      void mutateConfiguration(
+        form,
+        `/api/v1/admin/configuration/networks/${encodeURIComponent(name)}`,
+        "DELETE",
+        { revision, owner: optionalValue(String(fields.get("owner") || "")) },
+      );
+    });
+  }
 })();
