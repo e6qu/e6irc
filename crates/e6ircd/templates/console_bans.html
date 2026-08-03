@@ -13,6 +13,8 @@
     <a class="button-link" href="/api/v1/admin/bans">Open JSON API</a>
   </div>
 
+    <div class="scroll"><table><caption class="sr-only">Persisted server-ban policy</caption><thead><tr><th>ID</th><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th><th></th></tr></thead><tbody id="admin-ban-rows" data-api-admin-ban-list data-csrf="{{ shell.csrf }}"><tr><td colspan="7" class="empty">Loading server bans…</td></tr></tbody></table></div>
+    <div class="pager" id="admin-ban-pager"></div>
   <section class="panel">
     <div class="panel-head">
       <div>
@@ -87,7 +89,7 @@
         <h2>Persisted policy</h2>
         <p>Newest rules first. Display casing is preserved while matching remains canonical.</p>
       </div>
-      <span class="count">{{ entries.len() }}</span>
+      <span class="count" id="admin-ban-count">…</span>
     </div>
     {% if entries.is_empty() %}
       <p class="empty">{% if has_filters %}No server ban matches these exact filters.{% else %}No server bans are active.{% endif %}</p>

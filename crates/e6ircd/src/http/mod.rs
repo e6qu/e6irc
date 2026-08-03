@@ -3224,20 +3224,17 @@ mod pages {
         query: super::device::ValidatedServerBanDirectoryQuery,
         error: Option<String>,
     ) -> Result<ConsoleServerBans, Response> {
-        let page = crate::db::query_server_ban_directory(pool_of(state), query.database_filter())
-            .await
-            .map_err(|error| super::device::admin_db_error("server-ban directory", error))?;
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
         Ok(ConsoleServerBans {
             shell: console_shell(state, account, csrf, "bans"),
-            entries: page.entries,
+            entries: Vec::new(),
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
             kind,
             mask,
             limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
+            next_before_id: None,
             error,
         })
     }
