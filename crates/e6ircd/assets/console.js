@@ -974,8 +974,8 @@
       if (reload) {
         window.location.reload();
       } else {
-        const nick = typeof result?.result?.confirmed_nick === "string"
-          ? result.result.confirmed_nick
+        const nick = typeof result?.confirmed_nick === "string"
+          ? result.confirmed_nick
           : "";
         setOwnerNetworkResult(
           nick
