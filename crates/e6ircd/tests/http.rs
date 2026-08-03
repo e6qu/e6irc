@@ -1865,6 +1865,29 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(api["settings"]["opers"][0]["password"], "");
     assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
     assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
+    let mut scalar_settings = api["settings"].clone();
+    let scalar = scalar_settings.as_object_mut().expect("settings object");
+    scalar.remove("oidc_providers");
+    scalar.remove("opers");
+    scalar.remove("networks");
+    scalar.remove("credentials_from_bootstrap");
+    scalar.insert(
+        "description".into(),
+        serde_json::Value::String("API-managed description".into()),
+    );
+    let patch_body = serde_json::json!({ "revision": 4, "settings": scalar_settings }).to_string();
+    let patch_request = format!(
+        "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{patch_body}",
+        patch_body.len()
+    );
+    let (status, _, body) = request(http, &patch_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        5
+    );
 
     let verification_pool = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -1872,7 +1895,8 @@ async fn console_configuration_manages_every_credential_collection() {
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration");
-    assert_eq!(snapshot.revision, 4);
+    assert_eq!(snapshot.revision, 5);
+    assert_eq!(snapshot.settings.description, "API-managed description");
     assert_eq!(snapshot.updated_by, "alice");
     assert_eq!(snapshot.settings.opers.len(), 1);
     assert_eq!(
@@ -1917,7 +1941,7 @@ async fn console_configuration_manages_every_credential_collection() {
             .fetch_all(&verification_pool)
             .await
             .expect("configuration audit");
-    assert_eq!(audit_details.len(), 3);
+    assert_eq!(audit_details.len(), 4);
     assert!(audit_details[0].contains("added IRC operator netop"));
     assert!(audit_details[1].contains("added OpenID Connect provider workforce"));
     assert!(audit_details[2].contains("added server network staffnet"));
@@ -1927,7 +1951,7 @@ async fn console_configuration_manages_every_credential_collection() {
         assert!(!detail.contains(upstream_secret), "{detail}");
     }
 
-    let delete_oper_body = r#"{"revision":4}"#;
+    let delete_oper_body = r#"{"revision":5}"#;
     let delete_oper = format!(
         "DELETE /api/v1/admin/configuration/opers/netop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -1938,7 +1962,7 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        5
+        6
     );
 
     for (path, body, message) in [(
@@ -1950,7 +1974,7 @@ async fn console_configuration_manages_every_credential_collection() {
         assert_eq!(status, 200, "{page}");
         assert!(page.contains(message), "{page}");
     }
-    let delete_network_body = r#"{"revision":6,"owner":"alice"}"#;
+    let delete_network_body = r#"{"revision":7,"owner":"alice"}"#;
     let delete_network = format!(
         "DELETE /api/v1/admin/configuration/networks/staffnet HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
@@ -1961,12 +1985,12 @@ async fn console_configuration_manages_every_credential_collection() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
-        7
+        8
     );
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration after deletes");
-    assert_eq!(snapshot.revision, 7);
+    assert_eq!(snapshot.revision, 8);
     assert!(snapshot.settings.opers.is_empty());
     assert!(snapshot.settings.oidc_providers.is_empty());
     assert!(snapshot.settings.networks.is_empty());
