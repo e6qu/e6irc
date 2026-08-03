@@ -540,17 +540,19 @@
     });
   }
 
-  for (const form of document.querySelectorAll("[data-api-ban-delete]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const id = Number(new FormData(form).get("id"));
-      if (!Number.isSafeInteger(id) || id < 1) {
-        setBanResult("The server-ban ID is invalid. Reload and try again.", false);
-        return;
-      }
-      void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", {});
-    });
-  }
+  // The ban directory is populated after its API read completes, so delete
+  // forms must be delegated instead of bound only to the server-rendered DOM.
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("[data-api-ban-delete]")) return;
+    event.preventDefault();
+    const id = Number(new FormData(form).get("id"));
+    if (!Number.isSafeInteger(id) || id < 1) {
+      setBanResult("The server-ban ID is invalid. Reload and try again.", false);
+      return;
+    }
+    void mutateBan(form, `/api/v1/admin/bans/${id}`, "DELETE", {});
+  });
 
   const sessionResult = document.getElementById("session-api-result");
   const setSessionResult = (message, success) => {
