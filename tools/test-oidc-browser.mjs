@@ -115,8 +115,12 @@ try {
   await context.grantPermissions(["notifications"], { origin: applicationOrigin });
   const page = await context.newPage();
   const applicationErrors = [];
+  const applicationRequests = [];
   const navigationTrace = [];
   page.on("request", (request) => {
+    if (isApplicationURL(request.url())) {
+      applicationRequests.push(`${request.method()} ${sanitizeURL(request.url())}`);
+    }
     if (request.isNavigationRequest()) navigationTrace.push(`request ${request.method()} ${sanitizeURL(request.url())}`);
   });
   page.on("console", (message) => {
@@ -526,13 +530,22 @@ try {
   assert.match(await page.locator("main").innerText(), /browser-policy\.example/);
   assert.match(await page.locator("main").innerText(), /KLINE/);
 
-  // Configure a custom IRC upstream entirely through the server-rendered UI,
+  // Configure a custom IRC upstream entirely through the API-backed console,
   // then use the production web client and its real /ws/ui socket in both
   // directions. The local upstream is a protocol peer, not a browser route
   // replacement: this crosses browser → REST/console → PostgreSQL → registry →
   // IRC driver → TCP peer and back through the multiplexer/WebSocket.
+  const networkReadStart = applicationRequests.length;
+  const networkListRead = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks` && response.status() === 200,
+  );
   await page.goto(`${applicationOrigin}/console/networks`);
   await page.getByRole("heading", { name: "Your networks", exact: true }).waitFor();
+  await networkListRead;
+  assert.ok(
+    !applicationRequests.slice(networkReadStart).includes(`GET ${applicationOrigin}/console/networks/rows`),
+    "owner network list used a rendered console fragment instead of its API resource",
+  );
   assert.equal(await page.locator('select[name="preset"]').inputValue(), "libera");
   assert.equal(await page.locator('input[name="addr"]').inputValue(), "irc.libera.chat:6697");
   assert.equal(await page.locator('input[name="tls"]').isChecked(), true);
@@ -544,7 +557,8 @@ try {
   await page.locator('input[name="tls"]').uncheck();
   await page.getByRole("button", { name: "Test connection", exact: true }).click();
   await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor();
-  assert.match(await page.getByRole("status").innerText(), /no network was created/);
+  assert.match(await page.getByRole("status").innerText(), /DNS \d+ms, connection \d+ms, registration \d+ms/);
+  assert.match(await page.getByRole("status").innerText(), /No network was created/);
   assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);

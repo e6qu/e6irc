@@ -103,11 +103,12 @@ API failures visible in the document. The superseded Configuration mutation
 handlers are removed. Administrator server-ban creation and immutable-ID
 deletion now follow the same API-only pattern; their rendered mutation routes
 are removed.
-All console mutations and the API-hydrated administrator directories (fleet
+All console mutations and API-hydrated directories (owner networks, fleet
 networks, registered channels, server bans, and audit history) share
 same-origin request helpers for authentication context, problem decoding, and
-bounded JSON response decoding; only read-only HTML fragment refreshes fetch
-rendered markup directly.
+bounded JSON response decoding. The owner-network list no longer has a
+parallel rendered refresh route; it renders solely from its canonical API
+resource.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

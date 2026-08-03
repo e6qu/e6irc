@@ -1237,8 +1237,9 @@ async fn console_networks_page_lists_the_callers_networks() {
     assert_eq!(status, 303, "{head}");
     assert!(head.to_lowercase().contains("location: /login"), "{head}");
 
-    // Authenticated -> the console shell with the caller's network and its
-    // status column.
+    // Authenticated -> an API-backed console shell. The durable and live
+    // network projection is owned by GET /api/v1/me/networks, never a parallel
+    // rendered console fragment.
     let req = format!(
         "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
@@ -1246,15 +1247,30 @@ async fn console_networks_page_lists_the_callers_networks() {
     assert_eq!(status, 200, "{head}");
     for needle in [
         "e6irc console",
-        "BNC networks",
-        "libera",
-        "irc.libera.chat:6697",
+        "Your networks",
+        "data-api-owner-network-list",
+        "Loading configured networks…",
     ] {
         assert!(
             body.contains(needle),
             "console networks missing {needle:?}: {body}"
         );
     }
+    assert!(
+        !body.contains("/console/networks/rows"),
+        "console networks retained a rendered-list read path: {body}"
+    );
+    let list_req = format!(
+        "GET /api/v1/me/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, list) = request(http, &list_req).await;
+    assert_eq!(status, 200, "{list}");
+    let list: serde_json::Value = serde_json::from_str(&list).expect("network API JSON");
+    assert_eq!(list["networks"][0]["name"], "libera", "{list}");
+    assert_eq!(
+        list["networks"][0]["addr"], "irc.libera.chat:6697",
+        "{list}"
+    );
     let detail_req = format!(
         "GET /console/networks/libera HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
