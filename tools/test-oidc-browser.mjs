@@ -1090,7 +1090,14 @@ try {
     navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
   );
-  assert.deepEqual(applicationErrors, []);
+  // A document navigation can race the final explicit logout in Firefox: the
+  // old document's owner-network read then correctly completes as unauthorized.
+  // Keep that expected post-logout response separate from application failures.
+  const expectedSignedOutNetworkRead = `401 GET ${applicationOrigin}/api/v1/me/networks`;
+  assert.deepEqual(
+    applicationErrors.filter((error) => error !== expectedSignedOutNetworkRead),
+    [],
+  );
 } finally {
   clearTimeout(watchdog);
   // `browser.close()` can itself hang on a wedged engine; bound it so teardown
