@@ -1834,25 +1834,22 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(!page.contains(oidc_secret), "{page}");
 
     let upstream_secret = "upstream-password-must-not-render";
-    let network_form = format!(
-        "csrf={csrf}&name=staffnet&owner=alice&kind=irc&\
-         addr=irc.example%3A6697&tls=on&nick=alice&realname=Alice&\
-         autojoin=%23staff&buffer_cap=321&sasl_account=alice-login&\
-         sasl_password={upstream_secret}"
+    let network_body = format!(
+        r##"{{"revision":3,"name":"staffnet","owner":"alice","kind":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":["#staff"],"buffer_cap":321,"sasl_account":"alice-login","sasl_password":"{upstream_secret}"}}"##
     );
-    let (status, _, page) = request(
-        http,
-        &cookie_form_post(
-            "/console/configuration/shared-networks",
-            &session,
-            &network_form,
-        ),
-    )
-    .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains("added server network staffnet"), "{page}");
-    assert!(page.contains("irc.example:6697"), "{page}");
-    assert!(!page.contains(upstream_secret), "{page}");
+    let network_request = format!(
+        "POST /api/v1/admin/configuration/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{network_body}",
+        network_body.len()
+    );
+    let (status, _, body) = request(http, &network_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        4
+    );
+    assert!(!body.contains(upstream_secret), "{body}");
 
     let configuration_api = format!(
         "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -1944,22 +1941,28 @@ async fn console_configuration_manages_every_credential_collection() {
         5
     );
 
-    for (path, body, message) in [
-        (
-            "/console/configuration/oidc/delete",
-            format!("csrf={csrf}&name=workforce"),
-            "removed OpenID Connect provider workforce",
-        ),
-        (
-            "/console/configuration/shared-networks/delete",
-            format!("csrf={csrf}&name=staffnet&owner=alice"),
-            "removed server network staffnet",
-        ),
-    ] {
+    for (path, body, message) in [(
+        "/console/configuration/oidc/delete",
+        format!("csrf={csrf}&name=workforce"),
+        "removed OpenID Connect provider workforce",
+    )] {
         let (status, _, page) = request(http, &cookie_form_post(path, &session, &body)).await;
         assert_eq!(status, 200, "{page}");
         assert!(page.contains(message), "{page}");
     }
+    let delete_network_body = r#"{"revision":6,"owner":"alice"}"#;
+    let delete_network = format!(
+        "DELETE /api/v1/admin/configuration/networks/staffnet HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_network_body}",
+        delete_network_body.len()
+    );
+    let (status, _, body) = request(http, &delete_network).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        7
+    );
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration after deletes");

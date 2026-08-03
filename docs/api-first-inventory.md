@@ -88,8 +88,8 @@ operation's semantics.
 | `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Mapped | Carries the configuration revision and audit provenance. |
 | `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Mapped | Provider secret fields are write-only. |
 | `/console/configuration/oidc/delete` | `DELETE /api/v1/admin/configuration/oidc-providers/{name}` | Mapped | Carries revision and audit provenance. |
-| `/console/configuration/shared-networks` | `POST /api/v1/admin/configuration/networks` | Gap | Use the same closed network-kind schema as owner resources. |
-| `/console/configuration/shared-networks/delete` | `DELETE /api/v1/admin/configuration/networks/{name}` | Gap | Preserve revision/audit provenance. |
+| `/console/configuration/shared-networks` | `POST /api/v1/admin/configuration/networks` | Mapped | Uses the same closed network-kind schema as owner resources. |
+| `/console/configuration/shared-networks/delete` | `DELETE /api/v1/admin/configuration/networks/{name}` | Mapped | Carries the configuration revision and owner selector for audit provenance. |
 
 ## Read-only console views
 

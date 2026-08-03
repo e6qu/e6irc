@@ -684,6 +684,137 @@ pub(super) struct AdminOidcBody {
     token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkBody {
+    revision: i64,
+    name: String,
+    owner: Option<String>,
+    kind: crate::config::NetworkKind,
+    #[serde(default)]
+    addr: String,
+    tls: bool,
+    #[serde(default)]
+    nick: String,
+    realname: Option<String>,
+    #[serde(default)]
+    autojoin: Vec<String>,
+    buffer_cap: usize,
+    sasl_account: Option<String>,
+    sasl_password: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkDeleteBody {
+    revision: i64,
+    owner: Option<String>,
+}
+
+pub(super) async fn admin_create_network(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminNetworkBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if body.kind.is_bridge() && !kind_feature_available(body.kind) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Unsupported network kind",
+            Some(&format!(
+                "This server was not built with the {} feature.",
+                body.kind.as_db_str()
+            )),
+        );
+    }
+    let sasl_account = optional_config_string(body.sasl_account);
+    let sasl_password = optional_config_string(body.sasl_password);
+    let secret_needed =
+        sasl_password.is_some() || (body.kind.account_is_secret() && sasl_account.is_some());
+    let key = state.secret_key.clone();
+    if secret_needed && key.is_none() {
+        return master_key_required("Upstream credentials");
+    }
+    let name = body.name.trim().to_string();
+    let owner = optional_config_string(body.owner);
+    let addr = body.addr.trim().to_string();
+    let nick = body.nick.trim().to_string();
+    let realname = optional_config_string(body.realname);
+    let autojoin = body
+        .autojoin
+        .into_iter()
+        .map(|channel| channel.trim().to_string())
+        .filter(|channel| !channel.is_empty())
+        .collect();
+    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+        reject_bootstrap_credential_change(settings, "network")?;
+        let sealed_account = if body.kind.account_is_secret() {
+            seal_configuration_secret(sasl_account, key.as_ref())?
+        } else {
+            sasl_account
+        };
+        let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
+        settings.networks.push(crate::config::NetworkEntry {
+            name: name.clone(),
+            kind: body.kind,
+            owner,
+            addr,
+            tls: body.tls,
+            nick,
+            realname,
+            autojoin,
+            buffer_cap: body.buffer_cap,
+            sasl_account: sealed_account,
+            sasl_password: sealed_password,
+        });
+        Ok(format!("added server network {name}"))
+    })
+    .await
+}
+
+pub(super) async fn admin_delete_network(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<axum::Json<AdminNetworkDeleteBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let owner = optional_config_string(body.owner);
+    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+        reject_bootstrap_credential_change(settings, "network")?;
+        let before = settings.networks.len();
+        settings
+            .networks
+            .retain(|network| network.name != name || network.owner.as_deref() != owner.as_deref());
+        (settings.networks.len() != before)
+            .then(|| format!("removed server network {name}"))
+            .ok_or_else(|| format!("No matching server network named '{name}'."))
+    })
+    .await
+}
+
+fn optional_config_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+}
+
+fn seal_configuration_secret(
+    value: Option<String>,
+    key: Option<&Arc<crate::secret::SecretKeyring>>,
+) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            key.ok_or_else(|| "A master key is required to store upstream credentials.".into())
+                .map(|key| key.seal(&value, crate::secret::CONFIG_CONTEXT))
+        })
+        .transpose()
+}
+
 pub(super) async fn admin_create_oidc_provider(
     State(state): State<Arc<AppState>>,
     AdminAccount(actor): AdminAccount,

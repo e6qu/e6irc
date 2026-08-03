@@ -1114,6 +1114,8 @@ documented_routes! {
     "/api/v1/admin/configuration/opers/{name}" => { delete: admin_delete_oper },
     "/api/v1/admin/configuration/oidc-providers" => { post: admin_create_oidc_provider },
     "/api/v1/admin/configuration/oidc-providers/{name}" => { delete: admin_delete_oidc_provider },
+    "/api/v1/admin/configuration/networks" => { post: admin_create_network },
+    "/api/v1/admin/configuration/networks/{name}" => { delete: admin_delete_network },
     "/api/v1/admin/observability" => { get: admin_observability },
     "/api/v1/admin/metrics" => { get: admin_metrics },
 }

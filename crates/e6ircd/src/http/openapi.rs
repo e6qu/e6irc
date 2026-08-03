@@ -1043,6 +1043,17 @@ fn document() -> serde_json::Value {
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
+            "/api/v1/admin/configuration/networks": {
+                "post": { "summary": "Add a managed server network", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "kind", "tls", "buffer_cap"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": "string" }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/networks/{name}": {
+                "delete": { "summary": "Remove a managed server network", "security": authenticated,
+                    "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" }, "owner": { "type": "string" } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+            },
             "/api/v1/admin/networks": {
                 "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
                     "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
