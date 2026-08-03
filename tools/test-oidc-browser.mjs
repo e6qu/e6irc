@@ -468,7 +468,7 @@ try {
         name: "Delete my account permanently",
         exact: true,
       }),
-      `${applicationOrigin}/login`,
+      `${applicationOrigin}/auth/signed-out`,
     );
     assert.equal((await guestContext.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   } finally {
