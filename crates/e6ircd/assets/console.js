@@ -912,6 +912,21 @@
   });
 
   const channelResult = document.getElementById("channel-api-result");
+  const adminChannelRows = document.querySelector("[data-api-admin-channel-list]");
+  if (adminChannelRows instanceof HTMLElement) {
+    void fetch(`/api/v1/admin/channels${window.location.search}`, { credentials: "same-origin", headers: { Accept: "application/json" } })
+      .then(async (response) => { if (!response.ok) throw new Error(await apiProblem(response)); return response.json(); })
+      .then((result) => {
+        const channels = Array.isArray(result.channels) ? result.channels : [];
+        const pager = document.getElementById("admin-channel-pager");
+        if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${query}`; link.textContent = "Older registrations"; pager.append(link); } }
+        adminChannelRows.replaceChildren();
+        const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
+        if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return; }
+        for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy || {}; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries || 0} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
+      })
+      .catch((error) => { adminChannelRows.textContent = error instanceof Error ? error.message : "Channel directory failed to load."; });
+  }
   const setChannelResult = (message, success) => {
     if (!channelResult) return;
     channelResult.textContent = message;

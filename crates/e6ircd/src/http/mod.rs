@@ -2386,14 +2386,11 @@ mod pages {
     #[template(path = "console_admin_channels.html")]
     struct ConsoleAdminChannels {
         shell: ConsoleShell,
-        entries: Vec<crate::db::RegisteredChannelDirectoryRow>,
         name: String,
         founder: String,
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-        next_before_id: Option<i64>,
-        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -3180,26 +3177,16 @@ mod pages {
         account: String,
         csrf: String,
         query: super::device::ValidatedRegisteredChannelDirectoryQuery,
-        error: Option<String>,
     ) -> Result<ConsoleAdminChannels, Response> {
-        let page =
-            crate::db::query_registered_channel_directory(pool_of(state), query.database_filter())
-                .await
-                .map_err(|error| {
-                    super::device::admin_db_error("registered-channel directory", error)
-                })?;
         let name = query.name.unwrap_or_default();
         let founder = query.founder.unwrap_or_default();
         Ok(ConsoleAdminChannels {
             shell: console_shell(state, account, csrf, "admin-channels"),
-            entries: page.entries,
             has_filters: !name.is_empty() || !founder.is_empty(),
             has_cursor: query.before_id.is_some(),
             name,
             founder,
             limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
-            error,
         })
     }
 
@@ -3212,7 +3199,7 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        match console_admin_channels_build(&state, account, csrf, query, None).await {
+        match console_admin_channels_build(&state, account, csrf, query).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
