@@ -232,4 +232,43 @@
       );
     });
   }
+
+  for (const form of document.querySelectorAll("[data-api-oper-create]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const revision = Number(fields.get("revision"));
+      const name = String(fields.get("name") || "").trim();
+      const password = String(fields.get("password") || "");
+      if (!Number.isSafeInteger(revision) || revision < 0 || !name || !password) {
+        setConfigurationResult("Enter an operator name and password, then reload if the revision is stale.", false);
+        return;
+      }
+      void mutateConfiguration(
+        form,
+        "/api/v1/admin/configuration/opers",
+        "POST",
+        { revision, name, password },
+      );
+    });
+  }
+
+  for (const form of document.querySelectorAll("[data-api-oper-delete]")) {
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const fields = new FormData(form);
+      const revision = Number(fields.get("revision"));
+      const name = String(fields.get("name") || "").trim();
+      if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
+        setConfigurationResult("The operator or configuration revision is missing. Reload and try again.", false);
+        return;
+      }
+      void mutateConfiguration(
+        form,
+        `/api/v1/admin/configuration/opers/${encodeURIComponent(name)}`,
+        "DELETE",
+        { revision },
+      );
+    });
+  }
 })();

@@ -84,8 +84,8 @@ operation's semantics.
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
 | `/console/configuration` | `GET/PATCH /api/v1/admin/configuration` | Mapped | PATCH carries typed scalar settings and preserves credential collections. |
-| `/console/configuration/opers` | `POST /api/v1/admin/configuration/opers` | Mapped | Uses the typed revisioned operator resource. |
-| `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Mapped | Carries the configuration revision and audit provenance. |
+| `/console/configuration/opers` | `POST /api/v1/admin/configuration/opers` | Browser migrated | The Configuration page sends the operator name, write-only password, and revision through the JSON API. |
+| `/console/configuration/opers/delete` | `DELETE /api/v1/admin/configuration/opers/{name}` | Browser migrated | The Configuration page sends the revision through the JSON API. |
 | `/console/configuration/oidc` | `POST /api/v1/admin/configuration/oidc-providers` | Mapped | Provider secret fields are write-only. |
 | `/console/configuration/oidc/delete` | `DELETE /api/v1/admin/configuration/oidc-providers/{name}` | Mapped | Carries revision and audit provenance. |
 | `/console/configuration/shared-networks` | `POST /api/v1/admin/configuration/networks` | Browser migrated | The Configuration page sends the same closed network-kind JSON schema with its session CSRF token and revision. |
