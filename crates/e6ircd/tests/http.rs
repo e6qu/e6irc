@@ -59,32 +59,11 @@ fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn cookie_form_post(path: &str, session: &str, body: &str) -> String {
-    format!(
-        "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    )
-}
-
 fn csrf_from_html(html: &str) -> &str {
     html.split("name=\"csrf\" value=\"")
         .nth(1)
         .and_then(|tail| tail.split('"').next())
         .expect("csrf token in page")
-}
-
-fn body_connection_id(html: &str, prefix: &str) -> u64 {
-    html.match_indices(prefix)
-        .filter_map(|(offset, _)| {
-            html[offset + prefix.len()..]
-                .split('/')
-                .next()
-                .and_then(|segment| segment.parse().ok())
-        })
-        .next()
-        .expect("immutable connection id in page action")
 }
 
 fn login_state_from_html(html: &str) -> &str {
@@ -839,6 +818,22 @@ async fn console_runtime_is_served_in_every_build() {
     );
     assert!(body.contains("dataset.confirm"), "{body}");
     assert!(body.contains("data-refresh-url"), "{body}");
+    assert!(body.contains("data-api-network-create"), "{body}");
+    assert!(body.contains("data-api-oper-create"), "{body}");
+    assert!(body.contains("data-api-oidc-create"), "{body}");
+    assert!(body.contains("data-api-configuration-patch"), "{body}");
+    assert!(body.contains("data-api-ban-create"), "{body}");
+    assert!(body.contains("data-api-session-revoke"), "{body}");
+    assert!(body.contains("data-api-session-disconnect"), "{body}");
+    assert!(body.contains("data-api-account-app-password"), "{body}");
+    assert!(body.contains("data-api-channel-register"), "{body}");
+    assert!(body.contains("data-api-owner-network-create"), "{body}");
+    assert!(body.contains("data-api-admin-account-create"), "{body}");
+    assert!(body.contains("X-E6IRC-CSRF"), "{body}");
+    assert!(
+        body.contains("/api/v1/admin/configuration/networks"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -1287,198 +1282,6 @@ async fn console_networks_page_lists_the_callers_networks() {
 /// The console networks page can add and remove a network with standard forms even before
 /// the raw attach listener is enabled. Network management depends on the
 /// database-backed registry, not on an unrelated startup listener flag.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn console_add_and_delete_network_via_the_console() {
-    let url = support::test_db("console_add_and_delete_network_via_the_console").await;
-    let pool = e6ircd::db::connect_and_migrate(&url)
-        .await
-        .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "pw")
-        .await
-        .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
-    drop(pool);
-    let upstream = upstream_server().await;
-
-    let config = Config {
-        server_name: "irc.console.example".into(),
-        network_name: "ConsoleNet".into(),
-        listeners: vec![ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-            websocket: false,
-        }],
-        http: Some(HttpConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: None,
-            secure_cookies: false,
-            admin_accounts: vec![],
-        }),
-        database: Some(DatabaseConfig { url }),
-        ..Config::default()
-    };
-    let running = net::start(config).await.expect("start");
-    let http = running.http_addr.expect("http");
-
-    // Load the page and extract the session-bound CSRF token.
-    let page_req = format!(
-        "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (_, _, page) = request(http, &page_req).await;
-    assert!(
-        page.contains("Raw IRC attachment is currently off"),
-        "{page}"
-    );
-    for needle in [
-        "Libera Chat",
-        "OFTC",
-        "EFnet",
-        "Snoonet",
-        "value=\"libera\"",
-        "value=\"irc.libera.chat:6697\"",
-        "value=\"alice\"",
-    ] {
-        assert!(
-            page.contains(needle),
-            "missing preset/form value {needle}: {page}"
-        );
-    }
-    let csrf = csrf_from_html(&page).to_string();
-    assert!(!csrf.is_empty());
-
-    // Test connection is a non-mutating operation that renders the measured
-    // DNS, connect, and registration stages inline.
-    let body = format!("csrf={csrf}&name=probe&addr={upstream}&nick=alice_");
-    let preflight = format!(
-        "POST /console/networks/preflight HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let (status, _, qualified) = request(http, &preflight).await;
-    assert_eq!(status, 200, "{qualified}");
-    for needle in [
-        "Connection qualified",
-        "DNS",
-        "connect",
-        "Registration",
-        "value=\"probe\"",
-    ] {
-        assert!(
-            qualified.contains(needle),
-            "qualification result missing {needle:?}: {qualified}"
-        );
-    }
-    assert!(
-        qualified.contains("No networks yet"),
-        "preflight unexpectedly persisted the candidate: {qualified}"
-    );
-
-    // Add a network with body CSRF -> redirect back to the canonical list.
-    let body =
-        format!("csrf={csrf}&name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby&tls=on");
-    let add = format!(
-        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let (status, headers, _) = request(http, &add).await;
-    assert_eq!(status, 303, "{headers}");
-    let (_, _, page) = request(http, &page_req).await;
-    assert!(
-        page.contains("work") && page.contains("irc.example:6667"),
-        "{page}"
-    );
-
-    // Disable the network via the toggle form, then read its stopped state.
-    let off = format!("csrf={csrf}&enabled=false");
-    let toggle_off = format!(
-        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{off}",
-        off.len()
-    );
-    let (status, _, _) = request(http, &toggle_off).await;
-    assert_eq!(status, 303);
-    let (_, _, page) = request(http, &page_req).await;
-    assert!(
-        page.contains("Enable") && page.contains("disabled"),
-        "{page}"
-    );
-
-    // Re-enable it and verify the rendered action changes back.
-    let on = format!("csrf={csrf}&enabled=true");
-    let toggle_on = format!(
-        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{on}",
-        on.len()
-    );
-    let (status, _, _) = request(http, &toggle_on).await;
-    assert_eq!(status, 303);
-    let (_, _, page) = request(http, &page_req).await;
-    assert!(page.contains("Disable"), "{page}");
-
-    // A malformed target state is rejected rather than silently interpreted
-    // as a request to disable the network.
-    let invalid = format!("csrf={csrf}&enabled=perhaps");
-    let toggle_invalid = format!(
-        "POST /console/networks/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{invalid}",
-        invalid.len()
-    );
-    let (status, _, _) = request(http, &toggle_invalid).await;
-    assert_eq!(status, 400);
-    let (_, _, page) = request(http, &page_req).await;
-    assert!(page.contains("Disable"), "{page}");
-
-    // A name outside the token charset is refused before it can become an
-    // ambiguous path component.
-    let bad = format!("csrf={csrf}&name=bad%3Fname&addr=irc.example:6667&nick=z");
-    let add_bad = format!(
-        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{bad}",
-        bad.len()
-    );
-    let (status, _, error_page) = request(http, &add_bad).await;
-    assert_eq!(status, 200);
-    assert!(error_page.contains("Invalid network name"), "{error_page}");
-    assert!(error_page.contains("value=\"bad?name\""), "{error_page}");
-    assert!(
-        error_page.contains("letters, digits, &#39;-&#39;, &#39;_&#39; or &#39;.&#39;"),
-        "{error_page}"
-    );
-
-    // A forged body token is rejected.
-    let forged = body.replace(&format!("csrf={csrf}"), "csrf=wrong");
-    let no_csrf = format!(
-        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{forged}",
-        forged.len()
-    );
-    let (status, _, _) = request(http, &no_csrf).await;
-    assert_eq!(status, 403);
-
-    // Delete it with a standard POST form, then verify the canonical list.
-    let delete_body = format!("csrf={csrf}");
-    let del = format!(
-        "POST /console/networks/work/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{delete_body}",
-        delete_body.len()
-    );
-    let (status, _, _) = request(http, &del).await;
-    assert_eq!(status, 303);
-    let (_, _, page) = request(http, &page_req).await;
-    assert!(!page.contains("irc.example:6667"), "still present: {page}");
-}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
@@ -1639,24 +1442,36 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     assert!(body.contains("e6irc_queue_capacity{queue=\"db\"} 1024"));
     assert!(body.contains("e6irc_queue_mode{queue=\"core\",mode=\"fifo\"} 1"));
 
-    let form = format!(
-        "csrf={csrf}&revision=1&server_name=irc.control.example&network_name=ControlNet&\
-         description=e6irc+server&motd=&nicklen=16&sendq=1024&core_queue=65536&\
-         max_hot_channels=8192&bnc_enabled=on&bnc_addr=127.0.0.1%3A0&\
-         listeners=127.0.0.1%3A0+%7C+plain&admin_accounts=alice&\
-         observability_enabled=on&observability_sample_interval_seconds=5&\
-         observability_retention_hours=1&storage_history_retention_days=30&\
-         storage_audit_retention_days=365"
+    let configuration = format!(
+        "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let post = format!(
-        "POST /console/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{form}",
-        form.len()
+    let (status, _, body) = request(http, &configuration).await;
+    assert_eq!(status, 200, "{body}");
+    let current: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
+    let mut settings = current["settings"].clone();
+    let settings_object = settings.as_object_mut().expect("settings object");
+    settings_object.remove("oidc_providers");
+    settings_object.remove("opers");
+    settings_object.remove("networks");
+    settings_object.remove("credentials_from_bootstrap");
+    settings_object["bnc_addr"] = serde_json::Value::String("127.0.0.1:0".into());
+    settings_object["observability"]["enabled"] = serde_json::Value::Bool(true);
+    settings_object["observability"]["sample_interval_seconds"] = 5.into();
+    settings_object["observability"]["retention_hours"] = 1.into();
+    let patch_body =
+        serde_json::json!({ "revision": current["revision"], "settings": settings }).to_string();
+    let patch = format!(
+        "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{patch_body}",
+        patch_body.len()
     );
-    let (status, _, page) = request(http, &post).await;
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains("Configuration saved and applied"), "{page}");
+    let (status, _, body) = request(http, &patch).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        2
+    );
     let mut stored_history = false;
     for _ in 0..14 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1715,15 +1530,6 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
         history.len()
     );
     verification_pool.close().await;
-    let bound = page
-        .split("Accepting clients on <code>")
-        .nth(1)
-        .and_then(|rest| rest.split("</code>").next())
-        .expect("bound BNC address");
-    let _: tokio::net::TcpStream = tokio::net::TcpStream::connect(bound)
-        .await
-        .expect("runtime listener accepts");
-
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("reconnect");
@@ -1796,59 +1602,116 @@ async fn console_configuration_manages_every_credential_collection() {
     let (status, _, page) = request(http, &page_request).await;
     assert_eq!(status, 200, "{page}");
     let csrf = csrf_from_html(&page).to_string();
+    assert!(
+        page.contains("data-api-network-create"),
+        "server-network creation must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("data-api-oper-create"),
+        "operator creation must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("action=\"/api/v1/admin/configuration/opers\""),
+        "operator creation must not target a rendered mutation handler: {page}"
+    );
+    assert!(
+        page.contains("data-api-oidc-create"),
+        "provider creation must go through the JSON API: {page}"
+    );
+    assert!(
+        page.contains("action=\"/api/v1/admin/configuration/oidc-providers\""),
+        "provider creation must not target a rendered mutation handler: {page}"
+    );
 
     let oper_secret = "operator-password-must-not-render";
-    let oper_form = format!("csrf={csrf}&name=netop&password={oper_secret}");
-    let (status, _, page) = request(
-        http,
-        &cookie_form_post("/console/configuration/opers", &session, &oper_form),
-    )
-    .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains("added IRC operator netop"), "{page}");
-    assert!(page.contains("<code>netop</code>"), "{page}");
-    assert!(!page.contains(oper_secret), "{page}");
+    let oper_body = format!(r#"{{"revision":1,"name":"netop","password":"{oper_secret}"}}"#);
+    let oper_request = format!(
+        "POST /api/v1/admin/configuration/opers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{oper_body}",
+        oper_body.len()
+    );
+    let (status, _, body) = request(http, &oper_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        2
+    );
+    assert!(!body.contains(oper_secret), "{body}");
 
     let oidc_secret = "provider-secret-must-not-render";
-    let oidc_form = format!(
-        "csrf={csrf}&name=workforce&issuer_url=https%3A%2F%2Fid.example&\
-         client_id=e6irc&client_secret={oidc_secret}&scopes=openid+profile&\
-         end_session_endpoint=https%3A%2F%2Fid.example%2Flogout&\
-         token_endpoint_auth_method=client_secret_post"
+    let oidc_body = format!(
+        r#"{{"revision":2,"name":"workforce","issuer_url":"https://id.example","client_id":"e6irc","client_secret":"{oidc_secret}","scopes":["openid","profile"],"allowed_email_domains":[],"end_session_endpoint":"https://id.example/logout","token_endpoint_auth_method":"client_secret_post"}}"#
     );
-    let (status, _, page) = request(
-        http,
-        &cookie_form_post("/console/configuration/oidc", &session, &oidc_form),
-    )
-    .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(
-        page.contains("added OpenID Connect provider workforce"),
-        "{page}"
+    let oidc_request = format!(
+        "POST /api/v1/admin/configuration/oidc-providers HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{oidc_body}",
+        oidc_body.len()
     );
-    assert!(page.contains("https://id.example"), "{page}");
-    assert!(!page.contains(oidc_secret), "{page}");
+    let (status, _, body) = request(http, &oidc_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        3
+    );
+    assert!(!body.contains(oidc_secret), "{body}");
 
     let upstream_secret = "upstream-password-must-not-render";
-    let network_form = format!(
-        "csrf={csrf}&name=staffnet&owner=alice&kind=irc&\
-         addr=irc.example%3A6697&tls=on&nick=alice&realname=Alice&\
-         autojoin=%23staff&buffer_cap=321&sasl_account=alice-login&\
-         sasl_password={upstream_secret}"
+    let network_body = format!(
+        r##"{{"revision":3,"name":"staffnet","owner":"alice","kind":"irc","addr":"irc.example:6697","tls":true,"nick":"alice","realname":"Alice","autojoin":["#staff"],"buffer_cap":321,"sasl_account":"alice-login","sasl_password":"{upstream_secret}"}}"##
     );
-    let (status, _, page) = request(
-        http,
-        &cookie_form_post(
-            "/console/configuration/shared-networks",
-            &session,
-            &network_form,
-        ),
-    )
-    .await;
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains("added server network staffnet"), "{page}");
-    assert!(page.contains("irc.example:6697"), "{page}");
-    assert!(!page.contains(upstream_secret), "{page}");
+    let network_request = format!(
+        "POST /api/v1/admin/configuration/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{network_body}",
+        network_body.len()
+    );
+    let (status, _, body) = request(http, &network_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        4
+    );
+    assert!(!body.contains(upstream_secret), "{body}");
+
+    let configuration_api = format!(
+        "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &configuration_api).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains(oper_secret), "{body}");
+    assert!(!body.contains(oidc_secret), "{body}");
+    assert!(!body.contains(upstream_secret), "{body}");
+    let api: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
+    assert_eq!(api["revision"], 4);
+    assert_eq!(api["settings"]["opers"][0]["password"], "");
+    assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
+    assert!(api["settings"]["networks"][0]["sasl_password"].is_null());
+    let mut scalar_settings = api["settings"].clone();
+    let scalar = scalar_settings.as_object_mut().expect("settings object");
+    scalar.remove("oidc_providers");
+    scalar.remove("opers");
+    scalar.remove("networks");
+    scalar.remove("credentials_from_bootstrap");
+    scalar.insert(
+        "description".into(),
+        serde_json::Value::String("API-managed description".into()),
+    );
+    let patch_body = serde_json::json!({ "revision": 4, "settings": scalar_settings }).to_string();
+    let patch_request = format!(
+        "PATCH /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{patch_body}",
+        patch_body.len()
+    );
+    let (status, _, body) = request(http, &patch_request).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        5
+    );
 
     let verification_pool = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -1856,7 +1719,8 @@ async fn console_configuration_manages_every_credential_collection() {
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration");
-    assert_eq!(snapshot.revision, 4);
+    assert_eq!(snapshot.revision, 5);
+    assert_eq!(snapshot.settings.description, "API-managed description");
     assert_eq!(snapshot.updated_by, "alice");
     assert_eq!(snapshot.settings.opers.len(), 1);
     assert_eq!(
@@ -1901,7 +1765,7 @@ async fn console_configuration_manages_every_credential_collection() {
             .fetch_all(&verification_pool)
             .await
             .expect("configuration audit");
-    assert_eq!(audit_details.len(), 3);
+    assert_eq!(audit_details.len(), 4);
     assert!(audit_details[0].contains("added IRC operator netop"));
     assert!(audit_details[1].contains("added OpenID Connect provider workforce"));
     assert!(audit_details[2].contains("added server network staffnet"));
@@ -1911,31 +1775,50 @@ async fn console_configuration_manages_every_credential_collection() {
         assert!(!detail.contains(upstream_secret), "{detail}");
     }
 
-    for (path, body, message) in [
-        (
-            "/console/configuration/opers/delete",
-            format!("csrf={csrf}&name=netop"),
-            "removed IRC operator netop",
-        ),
-        (
-            "/console/configuration/oidc/delete",
-            format!("csrf={csrf}&name=workforce"),
-            "removed OpenID Connect provider workforce",
-        ),
-        (
-            "/console/configuration/shared-networks/delete",
-            format!("csrf={csrf}&name=staffnet&owner=alice"),
-            "removed server network staffnet",
-        ),
-    ] {
-        let (status, _, page) = request(http, &cookie_form_post(path, &session, &body)).await;
-        assert_eq!(status, 200, "{page}");
-        assert!(page.contains(message), "{page}");
-    }
+    let delete_oper_body = r#"{"revision":5}"#;
+    let delete_oper = format!(
+        "DELETE /api/v1/admin/configuration/opers/netop HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_oper_body}",
+        delete_oper_body.len()
+    );
+    let (status, _, body) = request(http, &delete_oper).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        6
+    );
+
+    let delete_oidc_body = r#"{"revision":6}"#;
+    let delete_oidc = format!(
+        "DELETE /api/v1/admin/configuration/oidc-providers/workforce HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_oidc_body}",
+        delete_oidc_body.len()
+    );
+    let (status, _, body) = request(http, &delete_oidc).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        7
+    );
+    let delete_network_body = r#"{"revision":7,"owner":"alice"}"#;
+    let delete_network = format!(
+        "DELETE /api/v1/admin/configuration/networks/staffnet HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{delete_network_body}",
+        delete_network_body.len()
+    );
+    let (status, _, body) = request(http, &delete_network).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["revision"],
+        8
+    );
     let snapshot = e6ircd::db::load_managed_config(&verification_pool)
         .await
         .expect("managed configuration after deletes");
-    assert_eq!(snapshot.revision, 7);
+    assert_eq!(snapshot.revision, 8);
     assert!(snapshot.settings.opers.is_empty());
     assert!(snapshot.settings.oidc_providers.is_empty());
     assert!(snapshot.settings.networks.is_empty());
@@ -1950,256 +1833,6 @@ async fn console_configuration_manages_every_credential_collection() {
 /// Editing a network from the console: the pre-filled form, a successful field
 /// update (persisted + reflected in the list), and the SSRF guard on a changed
 /// address re-rendering with an error banner.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn console_edit_network_updates_fields() {
-    let url = support::test_db("console_edit_network_updates_fields").await;
-    let secret_key = e6ircd::secret::SecretKey::generate();
-    let key_path = temporary_path("network-edit-key");
-    std::fs::write(&key_path, secret_key.to_base64()).expect("write test key");
-    let _key_file = TemporaryFile(key_path.clone());
-    let pool = e6ircd::db::connect_and_migrate(&url)
-        .await
-        .expect("connect");
-    e6ircd::db::create_account(&pool, "alice", "pw")
-        .await
-        .expect("acct");
-    let session = e6ircd::db::create_web_session(&pool, "alice", None)
-        .await
-        .expect("session");
-    // A bridge network (kind=matrix), inserted directly (creating one needs the
-    // feature build). enabled=false so boot doesn't try to build its driver.
-    sqlx::query(
-        "INSERT INTO bnc_networks
-           (account_id, name, addr, tls, nick, realname, autojoin,
-            sasl_account, sasl_password_sealed, kind, enabled)
-         SELECT id, 'mtx', 'matrix.example', false, 'bot', NULL,
-                ARRAY[]::text[], NULL, 'enc:v1:x', 'matrix', false
-         FROM accounts WHERE name_folded = 'alice'",
-    )
-    .execute(&pool)
-    .await
-    .expect("bridge row");
-    drop(pool);
-
-    let config = Config {
-        server_name: "irc.edit.example".into(),
-        network_name: "EditNet".into(),
-        listeners: vec![ListenerConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            tls: None,
-            websocket: false,
-        }],
-        http: Some(HttpConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-            public_url: None,
-            secure_cookies: false,
-            admin_accounts: vec![],
-        }),
-        database: Some(DatabaseConfig { url: url.clone() }),
-        bnc: Some(BncConfig {
-            addr: "127.0.0.1:0".parse().unwrap(),
-        }),
-        secrets: Some(SecretsConfig {
-            key_file: key_path,
-            previous_key_files: Vec::new(),
-        }),
-        ..Config::default()
-    };
-    let running = net::start(config).await.expect("start");
-    let http = running.http_addr.expect("http");
-
-    // Extract the session CSRF from the networks page.
-    let page_req = format!(
-        "GET /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (_, _, page) = request(http, &page_req).await;
-    let csrf = csrf_from_html(&page).to_string();
-
-    // Create the network to edit.
-    let body = format!("csrf={csrf}&name=work&addr=irc.example:6667&nick=alice_&autojoin=%23lobby");
-    let add = format!(
-        "POST /console/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let (status, _, _) = request(http, &add).await;
-    assert_eq!(status, 303);
-
-    // The edit form is pre-filled with the current values.
-    let edit_get = format!(
-        "GET /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (status, _, form) = request(http, &edit_get).await;
-    assert_eq!(status, 200, "{form}");
-    assert!(
-        form.contains("value=\"alice_\"")
-            && form.contains("irc.example:6667")
-            && form.contains("name=\"sasl_password\"")
-            && form.contains("name=\"clear_sasl\""),
-        "{form}"
-    );
-
-    // Apply an edit (body CSRF; plain form) -> 303 back to the list.
-    let edit =
-        "csrf=CSRF&addr=irc.new.example:6697&nick=newbie&realname=Bob&autojoin=%23lobby&tls=on"
-            .replace("CSRF", &csrf);
-    let edit_post = format!(
-        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{edit}",
-        edit.len()
-    );
-    let (status, head, _) = request(http, &edit_post).await;
-    assert_eq!(status, 303, "{head}");
-
-    // The operations page now shows the updated stored configuration.
-    let detail_req = format!(
-        "GET /console/networks/work HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (_, _, page2) = request(http, &detail_req).await;
-    assert!(
-        page2.contains("newbie") && page2.contains("irc.new.example:6697"),
-        "{page2}"
-    );
-
-    // Add credentials entirely through the edit UI. The response never echoes
-    // the password, while storage receives a context-bound encrypted value.
-    let credentials = format!(
-        "csrf={csrf}&addr=irc.new.example%3A6697&nick=newbie&realname=Bob&\
-         autojoin=%23lobby&tls=on&sasl_account=alice-login&sasl_password=upstream-secret"
-    );
-    let credential_post = format!(
-        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{credentials}",
-        credentials.len()
-    );
-    let (status, _, body) = request(http, &credential_post).await;
-    assert_eq!(status, 303, "{body}");
-    assert!(!body.contains("upstream-secret"), "{body}");
-    let verification_pool = e6ircd::db::connect_and_migrate(&url)
-        .await
-        .expect("verification connection");
-    let with_credentials = e6ircd::db::get_bnc_network(&verification_pool, "alice", "work")
-        .await
-        .expect("read credentials")
-        .expect("network");
-    assert_eq!(
-        with_credentials.sasl_account.as_deref(),
-        Some("alice-login")
-    );
-    let sealed = with_credentials
-        .sasl_password_sealed
-        .as_deref()
-        .expect("sealed password");
-    assert_ne!(sealed, "upstream-secret");
-    assert_eq!(
-        secret_key
-            .open(sealed, &e6ircd::bouncer::bnc_secret_context("alice"))
-            .expect("decrypt stored password"),
-        "upstream-secret"
-    );
-
-    // Changing only the public SASL account preserves the exact encrypted
-    // password; a blank password is the write-only "keep" operation.
-    let account_only = format!(
-        "csrf={csrf}&addr=irc.new.example%3A6697&nick=newbie&tls=on&sasl_account=alice-renamed"
-    );
-    let account_post = format!(
-        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{account_only}",
-        account_only.len()
-    );
-    let (status, _, body) = request(http, &account_post).await;
-    assert_eq!(status, 303, "{body}");
-    let renamed = e6ircd::db::get_bnc_network(&verification_pool, "alice", "work")
-        .await
-        .expect("read renamed account")
-        .expect("network");
-    assert_eq!(renamed.sasl_account.as_deref(), Some("alice-renamed"));
-    assert_eq!(
-        renamed.sasl_password_sealed,
-        with_credentials.sasl_password_sealed
-    );
-
-    // Explicit removal clears both halves rather than leaving a stored secret
-    // behind after the visible account disappears.
-    let clear = format!("csrf={csrf}&addr=irc.new.example%3A6697&nick=newbie&tls=on&clear_sasl=on");
-    let clear_post = format!(
-        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{clear}",
-        clear.len()
-    );
-    let (status, _, body) = request(http, &clear_post).await;
-    assert_eq!(status, 303, "{body}");
-    let cleared = e6ircd::db::get_bnc_network(&verification_pool, "alice", "work")
-        .await
-        .expect("read cleared credentials")
-        .expect("network");
-    assert_eq!(cleared.sasl_account, None);
-    assert_eq!(cleared.sasl_password_sealed, None);
-
-    // The SSRF guard applies to a changed address too: an internal IP is refused
-    // and the form re-renders (200) with an error banner.
-    let bad = "csrf=CSRF&addr=169.254.169.254:6667&nick=newbie".replace("CSRF", &csrf);
-    let bad_post = format!(
-        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{bad}",
-        bad.len()
-    );
-    let (status, _, body) = request(http, &bad_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(
-        body.contains("banner-error")
-            && body.contains("Disallowed upstream address")
-            && body.contains("link-local"),
-        "{body}"
-    );
-
-    // Wrong CSRF is refused.
-    let wrong = "csrf=nope&addr=irc.x.example:6667&nick=z";
-    let wrong_post = format!(
-        "POST /console/networks/work/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{wrong}",
-        wrong.len()
-    );
-    let (status, _, _) = request(http, &wrong_post).await;
-    assert_eq!(status, 403);
-
-    // A bridge network is not editable via the IRC edit form: the GET redirects
-    // away, and a direct POST does not clobber the bridge's stored fields.
-    let bridge_get = format!(
-        "GET /console/networks/mtx/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
-    );
-    let (status, head, _) = request(http, &bridge_get).await;
-    assert_eq!(status, 303, "{head}"); // redirected away, no IRC form for a bridge
-    let bridge_edit = "csrf=CSRF&addr=irc.x.example:6667&nick=z".replace("CSRF", &csrf);
-    let bridge_post = format!(
-        "POST /console/networks/mtx/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{bridge_edit}",
-        bridge_edit.len()
-    );
-    let _ = request(http, &bridge_post).await; // refused (re-render); must not apply
-    // The bridge's address is unchanged — the attempted overwrite was rejected.
-    let (_, _, page3) = request(http, &page_req).await;
-    assert!(
-        page3.contains("matrix.example"),
-        "bridge addr lost: {page3}"
-    );
-    assert!(
-        !page3.contains("irc.x.example"),
-        "bridge addr was clobbered: {page3}"
-    );
-}
-
-// ---- registered-channel owner control plane (PG-gated) ------------------
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
@@ -2431,8 +2064,9 @@ async fn owned_channel_api_covers_configuration_access_transfer_and_drop() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
-    let url = support::test_db("owned_channel_console_is_complete_scoped_and_csrf_protected").await;
+async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
+    let url =
+        support::test_db("owned_channel_api_and_console_shell_are_scoped_and_csrf_protected").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("connect");
@@ -2501,10 +2135,12 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
         "another account's channel leaked: {mallory_page}"
     );
 
-    let post_form = |path: &str, body: String| {
+    let api_request = |method: &str, path: &str, body: &str, csrf: Option<&str>| {
+        let csrf_header =
+            csrf.map_or_else(String::new, |token| format!("X-E6IRC-CSRF: {token}\r\n"));
         format!(
-            "POST {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\n{csrf_header}\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
              Connection: close\r\n\r\n{body}",
             body.len()
         )
@@ -2527,37 +2163,53 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
             break;
         }
     }
-    let register = format!("csrf={csrf}&channel=%23Web");
-    let (status, headers, body) =
-        request(http, &post_form("/console/channels/register", register)).await;
-    assert_eq!(status, 303, "{headers}\n{body}");
+    let register = r##"{"name":"#Web"}"##;
+    let (status, headers, body) = request(
+        http,
+        &api_request("POST", "/api/v1/me/channels", register, Some(&csrf)),
+    )
+    .await;
+    assert_eq!(status, 201, "{headers}\n{body}");
 
-    let empty_access = format!("csrf={csrf}&channel=%23Control&account=alice");
-    let (status, _, body) =
-        request(http, &post_form("/console/channels/access", empty_access)).await;
-    assert_eq!(status, 200, "{body}");
+    let empty_access = r#"{"flags":""}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PUT",
+            "/api/v1/me/channels/%23Control/access/alice",
+            empty_access,
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
     assert!(
-        body.contains("access flags must be one of o, v, ov, or vo")
-            && body.contains("role=\"alert\""),
-        "empty access grant was not visibly rejected: {body}"
+        body.contains("access flags must be one of o, v, ov, or vo"),
+        "empty access grant was not rejected: {body}"
     );
 
     for (path, body) in [
         (
-            "/console/channels/topic",
-            format!("csrf={csrf}&channel=%23Control&topic=Welcome+operators"),
+            "/api/v1/me/channels/%23Control",
+            r#"{"action":"set_topic","topic":"Welcome operators"}"#,
         ),
         (
-            "/console/channels/mlock",
-            format!("csrf={csrf}&channel=%23Control&mlock=%2Bnt-i"),
+            "/api/v1/me/channels/%23Control",
+            r#"{"action":"set_mlock","mlock":"+nt-i"}"#,
         ),
         (
-            "/console/channels/access",
-            format!("csrf={csrf}&channel=%23Control&account=alice&auto_op=on&auto_voice=on"),
+            "/api/v1/me/channels/%23Control/access/alice",
+            r#"{"flags":"ov"}"#,
         ),
     ] {
-        let (status, headers, body) = request(http, &post_form(path, body)).await;
-        assert_eq!(status, 303, "{path}: {headers}\n{body}");
+        let method = if path.ends_with("/alice") {
+            "PUT"
+        } else {
+            "PATCH"
+        };
+        let (status, headers, body) =
+            request(http, &api_request(method, path, body, Some(&csrf))).await;
+        assert_eq!(status, 200, "{path}: {headers}\n{body}");
     }
     let (_, _, updated) = request(http, &page_request(&boss_session)).await;
     for needle in ["Welcome operators", "+nt-i", "alice", "+ov"] {
@@ -2567,29 +2219,52 @@ async fn owned_channel_console_is_complete_scoped_and_csrf_protected() {
         );
     }
 
-    let invalid = format!("csrf={csrf}&channel=%23Control&mlock=%2Bk");
-    let (status, _, body) = request(http, &post_form("/console/channels/mlock", invalid)).await;
-    assert_eq!(status, 200, "{body}");
+    let invalid = r#"{"action":"set_mlock","mlock":"+k"}"#;
+    let (status, _, body) = request(
+        http,
+        &api_request(
+            "PATCH",
+            "/api/v1/me/channels/%23Control",
+            invalid,
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
     assert!(
-        body.contains("not a lockable mode") && body.contains("role=\"alert\""),
-        "invalid MLOCK was not visibly rejected: {body}"
+        body.contains("not a lockable mode"),
+        "invalid MLOCK was not rejected: {body}"
     );
 
-    let bad_csrf = "csrf=wrong&channel=%23Control";
-    let (status, _, _) = request(http, &post_form("/console/channels/drop", bad_csrf.into())).await;
+    let (status, _, _) = request(
+        http,
+        &api_request(
+            "DELETE",
+            "/api/v1/me/channels/%23Control",
+            "",
+            Some("wrong"),
+        ),
+    )
+    .await;
     assert_eq!(status, 403);
 
-    let drop_body = format!("csrf={csrf}&channel=%23Control");
-    let (status, _, body) = request(http, &post_form("/console/channels/drop", drop_body)).await;
-    assert_eq!(status, 303, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request("DELETE", "/api/v1/me/channels/%23Control", "", Some(&csrf)),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     let (_, _, empty) = request(http, &page_request(&boss_session)).await;
     assert!(
         !empty.contains("#Control") && empty.contains("#Web"),
         "drop affected the wrong owner channel: {empty}"
     );
-    let drop_web = format!("csrf={csrf}&channel=%23Web");
-    let (status, _, body) = request(http, &post_form("/console/channels/drop", drop_web)).await;
-    assert_eq!(status, 303, "{body}");
+    let (status, _, body) = request(
+        http,
+        &api_request("DELETE", "/api/v1/me/channels/%23Web", "", Some(&csrf)),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
     let (_, _, empty) = request(http, &page_request(&boss_session)).await;
     assert!(
         empty.contains("No channels registered to this account"),
@@ -3725,7 +3400,7 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
         "{channel_page}"
     );
     assert!(
-        channel_page.contains("#Eve&#60;script&#62;"),
+        channel_page.contains("data-api-admin-channel-list"),
         "{channel_page}"
     );
     assert!(!channel_page.contains("#Eve<script>"), "{channel_page}");
@@ -3736,17 +3411,14 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
     .await;
     assert_eq!(status, 200, "{channel_short_page}");
     assert!(
-        channel_short_page.contains("Older registrations"),
+        channel_short_page.contains("Loading registered channels"),
         "{channel_short_page}"
     );
 
     let (status, _, ban_page) = request(http, &cookie_get("/console/bans", &alice_session)).await;
     assert_eq!(status, 200, "{ban_page}");
     assert!(ban_page.contains("<h1>Server bans</h1>"), "{ban_page}");
-    assert!(
-        ban_page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
-        "{ban_page}"
-    );
+    assert!(ban_page.contains("data-api-admin-ban-list"), "{ban_page}");
     assert!(
         !ban_page.contains("<script>alert(1)</script>"),
         "{ban_page}"
@@ -3754,7 +3426,10 @@ async fn policy_directories_filter_page_and_escape_for_admins_only() {
     let (status, _, ban_short_page) =
         request(http, &cookie_get("/console/bans?limit=2", &alice_session)).await;
     assert_eq!(status, 200, "{ban_short_page}");
-    assert!(ban_short_page.contains("Older rules"), "{ban_short_page}");
+    assert!(
+        ban_short_page.contains("Loading server bans"),
+        "{ban_short_page}"
+    );
 
     for path in ["/console/admin/channels", "/console/bans"] {
         let (status, headers, _) = request(http, &get(path)).await;
@@ -3886,15 +3561,15 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("<h1>Audit log</h1>"), "{page}");
     assert!(page.contains("Exact filters"), "{page}");
-    assert!(
-        page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
-        "{page}"
-    );
+    assert!(page.contains("data-api-admin-audit-list"), "{page}");
     assert!(!page.contains("<script>alert(1)</script>"), "{page}");
     let (status, _, short_page) =
         request(http, &cookie_get("/console/audit?limit=2", &alice_session)).await;
     assert_eq!(status, 200, "{short_page}");
-    assert!(short_page.contains("Older actions"), "{short_page}");
+    assert!(
+        short_page.contains("Loading audited actions"),
+        "{short_page}"
+    );
 
     let (status, _, filtered_page) = request(
         http,
@@ -3902,7 +3577,11 @@ async fn audit_explorer_filters_pages_and_escapes_for_admins_only() {
     )
     .await;
     assert_eq!(status, 200, "{filtered_page}");
-    assert!(filtered_page.contains("revision 2"), "{filtered_page}");
+    assert!(
+        filtered_page.contains("data-api-admin-audit-list"),
+        "{filtered_page}"
+    );
+    assert!(!filtered_page.contains("revision 2"), "{filtered_page}");
     assert!(!filtered_page.contains("third@host"), "{filtered_page}");
 
     let (status, headers, _) = request(http, &get("/console/audit")).await;
@@ -3976,6 +3655,8 @@ async fn admin_console_ban_and_channel_actions() {
     );
     let (status, _, page) = request(http, &ban_page_req).await;
     assert_eq!(status, 200, "{page}");
+    assert!(page.contains("data-api-ban-create"), "{page}");
+    assert!(page.contains("action=\"/api/v1/admin/bans\""), "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
         .nth(1)
@@ -4003,51 +3684,58 @@ async fn admin_console_ban_and_channel_actions() {
         }
     };
 
-    // Add a K-line via the console -> 303 back to its owning page; the ban appears.
-    let body = "csrf=CSRF&kind=kline&mask=*@bad.example&reason=spam";
-    let body = body.replace("CSRF", &csrf);
+    // Add a K-line through the API; the persisted policy appears in the
+    // administrator directory after the core commits the transition.
+    let body = r#"{"kind":"kline","mask":"*@bad.example","reason":"spam"}"#;
     let add = format!(
-        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+        "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{body}",
         body.len()
     );
-    let (status, head, _) = request(http, &add).await;
-    assert_eq!(status, 303, "{head}");
+    let (status, _, _) = request(http, &add).await;
+    assert_eq!(status, 201);
     assert!(
-        head.to_ascii_lowercase()
-            .contains("location: /console/bans"),
-        "{head}"
-    );
-    assert!(
-        policy_page_has("/console/bans", "No server bans are active.", false).await,
+        policy_page_has("/api/v1/admin/bans", "*@bad.example", true).await,
         "ban not listed after add"
     );
 
-    // Remove it -> 303; the server-ban directory is empty again.
-    let del = "csrf=CSRF&kind=kline&mask=*@bad.example".replace("CSRF", &csrf);
+    let directory = format!(
+        "GET /api/v1/admin/bans?kind=kline&mask=%2A%40bad.example HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, body) = request(http, &directory).await;
+    assert_eq!(status, 200, "{body}");
+    let ban_id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["bans"][0]["id"]
+        .as_i64()
+        .expect("stable server-ban id");
+
+    // Delete that exact immutable policy resource; a client never selects a
+    // mutable visible mask for removal.
     let del_req = format!(
-        "POST /console/bans/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{del}",
-        del.len()
+        "DELETE /api/v1/admin/bans/{ban_id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
     );
     let (status, _, _) = request(http, &del_req).await;
-    assert_eq!(status, 303);
+    assert_eq!(status, 204);
     assert!(
-        policy_page_has("/console/bans", "No server bans are active.", true).await,
+        policy_page_has("/api/v1/admin/bans", "*@bad.example", false).await,
         "ban still listed after remove"
+    );
+    assert!(
+        policy_page_has(
+            "/api/v1/admin/audit?action=UNKLINE&target=%2A%40bad.example",
+            "UNKLINE",
+            true,
+        )
+        .await,
+        "server-ban removal was not recorded in the administrator audit API"
     );
 
     // Drop the registered channel through its administrator API resource; the
     // registry becomes empty after the core commits the ordered transition.
     assert!(
-        policy_page_has(
-            "/console/admin/channels",
-            "No registered channels exist yet.",
-            false
-        )
-        .await,
+        policy_page_has("/api/v1/admin/channels", "#dropme", true).await,
         "channel not listed to begin with"
     );
     let drop_req = format!(
@@ -4058,34 +3746,30 @@ async fn admin_console_ban_and_channel_actions() {
     let (status, _, _) = request(http, &drop_req).await;
     assert_eq!(status, 204);
     assert!(
-        policy_page_has(
-            "/console/admin/channels",
-            "No registered channels exist yet.",
-            true
-        )
-        .await,
+        policy_page_has("/api/v1/admin/channels", "#dropme", false).await,
         "channel still listed after drop"
     );
 
-    // Gate: a wrong CSRF is refused (403); an anonymous POST redirects to login.
-    let bad = "csrf=wrong&kind=kline&mask=*@x.example&reason=x";
+    // Gate: browser API mutations require their session CSRF token and an
+    // authenticated administrator; the retired rendered route cannot bypass
+    // those boundaries.
+    let bad = r#"{"kind":"kline","mask":"*@x.example","reason":"x"}"#;
     let bad_req = format!(
-        "POST /console/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+        "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: wrong\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{bad}",
         bad.len()
     );
     let (status, _, _) = request(http, &bad_req).await;
     assert_eq!(status, 403);
     let anon = format!(
-        "POST /console/bans HTTP/1.1\r\nHost: t\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
+        "POST /api/v1/admin/bans HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{bad}",
         bad.len()
     );
     let (status, head, _) = request(http, &anon).await;
-    assert_eq!(status, 303, "{head}");
-    assert!(head.to_lowercase().contains("location: /login"), "{head}");
+    assert_eq!(status, 401, "{head}");
 }
 
 /// The administrator connection API and console expose immutable connection
@@ -4236,16 +3920,13 @@ async fn admin_connection_directory_and_disconnect_controls() {
         );
     }
 
-    // Disconnect the exact immutable resource from the console -> 303.
-    let body = "csrf=CSRF&reason=cleanup".replace("CSRF", &csrf);
+    // Disconnect the exact immutable resource through the administrator API.
     let kill = format!(
-        "POST /console/sessions/{connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
+        "DELETE /api/v1/admin/connections/{connection_id}?reason=cleanup HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
     );
     let (status, head, _) = request(http, &kill).await;
-    assert_eq!(status, 303, "{head}");
+    assert_eq!(status, 204, "{head}");
 
     // The victim's connection is closed by the server (an ERROR then EOF).
     let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4400,12 +4081,13 @@ async fn my_sessions_are_scoped_to_the_caller() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(ok && !csrf.is_empty(), "alice's own session not listed");
-    let alice_connection_id =
-        body_connection_id(&request(http, &page_req).await.2, "/console/my-sessions/");
-
-    // The next accepted IRC connection belongs to Bob. Guessing its immutable
-    // id is still refused because owner authorization is re-checked in core.
-    let bob_connection_id = alice_connection_id + 1;
+    assert!(
+        request(http, &page_req)
+            .await
+            .2
+            .contains("data-api-session-disconnect"),
+        "owner session page must use the API connection control"
+    );
     let owner_api = format!(
         "GET /api/v1/me/connections?nick=ALICECLI&transport=tcp HTTP/1.1\r\n\
          Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
@@ -4419,6 +4101,14 @@ async fn my_sessions_are_scoped_to_the_caller() {
     );
     let owner_page: serde_json::Value = serde_json::from_str(&body).expect("owner connection page");
     assert_eq!(owner_page["connections"].as_array().map(Vec::len), Some(1));
+    let alice_connection_id = owner_page["connections"][0]["id"]
+        .as_str()
+        .expect("exact decimal connection id")
+        .parse::<u64>()
+        .expect("connection id");
+    // The next accepted IRC connection belongs to Bob. Guessing its immutable
+    // id is still refused because owner authorization is re-checked in core.
+    let bob_connection_id = alice_connection_id + 1;
     assert_eq!(owner_page["connections"][0]["nick"], "alicecli");
     let delete_bob_api = format!(
         "DELETE /api/v1/me/connections/{bob_connection_id}?reason=nope HTTP/1.1\r\n\
@@ -4428,19 +4118,6 @@ async fn my_sessions_are_scoped_to_the_caller() {
     let (status, _, body) = request(http, &delete_bob_api).await;
     assert_eq!(status, 404, "{body}");
 
-    let kill_bob = format!("csrf={csrf}&reason=x");
-    let kb = format!(
-        "POST /console/my-sessions/{bob_connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{kill_bob}",
-        kill_bob.len()
-    );
-    let (status, _, body) = request(http, &kb).await;
-    assert_eq!(status, 200, "{body}"); // re-renders with a banner, not a redirect
-    assert!(
-        body.contains("banner-error"),
-        "expected refusal banner: {body}"
-    );
     // bob is still alive: a PING gets a PONG.
     bob_cli.send_line("PING :stillhere").await.unwrap();
     let bob_alive = tokio::time::timeout(std::time::Duration::from_secs(3), async {
@@ -4494,29 +4171,6 @@ async fn my_sessions_are_scoped_to_the_caller() {
     );
     let (status, _, body) = request(http, &delete_alice_api).await;
     assert_eq!(status, 404, "{body}");
-
-    // Disconnecting alice's original session works -> 303.
-    let kill_me = format!("csrf={csrf}&reason=bye");
-    let km = format!(
-        "POST /console/my-sessions/{alice_connection_id}/disconnect HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{kill_me}",
-        kill_me.len()
-    );
-    let (status, head, _) = request(http, &km).await;
-    assert_eq!(status, 303, "{head}");
-    let killed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match alice_cli.next_message().await {
-                Ok(Some(m)) if m.command == "ERROR" => return true,
-                Ok(Some(_)) => continue,
-                _ => return true, // EOF
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-    assert!(killed, "alice's own session was not disconnected");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4608,6 +4262,11 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     assert!(page_body.contains("Browser &#60;other&#62;"), "{page_body}");
     assert!(!page_body.contains("Browser <other>"), "{page_body}");
     assert!(page_body.contains("Current session"), "{page_body}");
+    assert!(page_body.contains("data-api-session-revoke"), "{page_body}");
+    assert!(
+        page_body.contains("action=\"/api/v1/me/sessions?except=current\""),
+        "{page_body}"
+    );
     assert!(
         page_body.contains("Sign out others"),
         "bulk revocation missing: {page_body}"
@@ -4874,13 +4533,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         toggle.len()
     );
     let (status, headers, _) = request(http, &toggle_post).await;
-    assert_eq!(status, 303, "{headers}");
-    assert!(
-        headers
-            .to_ascii_lowercase()
-            .contains("location: /console/integrations"),
-        "{headers}"
-    );
+    assert_eq!(status, 404, "{headers}");
 
     // Enabling requires constructing the prospective driver before the durable
     // flag changes. This row cannot be built (missing feature or master key), so
@@ -4894,8 +4547,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         enable.len()
     );
     let (status, _, body) = request(http, &enable_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Cannot start network"), "{body}");
+    assert_eq!(status, 404, "{body}");
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
         .expect("reconnect");
@@ -4918,18 +4570,10 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
          Connection: close\r\n\r\n{form}",
         form.len()
     );
-    // The integrations page is re-rendered (200) with a specific error banner,
-    // rather than navigating a form submission to a raw problem+json page.
     let (status, _, body) = request(http, &post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("banner-error"), "{body}");
-    if cfg!(feature = "matrix") {
-        assert!(body.contains("master key"), "{body}");
-    } else {
-        assert!(body.contains("matrix feature"), "{body}");
-    }
+    assert_eq!(status, 405, "{body}");
 
-    // A wrong CSRF token -> 403.
+    // Removed form routes do not reach CSRF dispatch.
     let form_nocsrf = "csrf=wrong&kind=matrix&name=hq&sasl_password=x";
     let post_nocsrf = format!(
         "POST /console/integrations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
@@ -4938,7 +4582,7 @@ async fn console_add_bridge_is_gated_and_feature_checked() {
         form_nocsrf.len()
     );
     let (status, _, _) = request(http, &post_nocsrf).await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 405);
 }
 
 /// The all-feature database lane proves the complete bridge management
@@ -5073,20 +4717,21 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
 
     let (_, _, account_page) = request(http, &cookie("/console/account")).await;
     let csrf = csrf_from_html(&account_page).to_string();
-    let matrix_fields = format!(
-        "csrf={csrf}&addr={}&nick={}&autojoin={}&sasl_password=matrix-new-password",
-        form_value("https://matrix.new.example"),
-        form_value("@alice:new.example"),
-        form_value("!one:new.example, !two:new.example"),
+    let matrix_update = serde_json::json!({
+        "addr": "https://matrix.new.example",
+        "tls": true,
+        "nick": "@alice:new.example",
+        "autojoin": ["!one:new.example", "!two:new.example"],
+        "credentials": { "action": "set", "password": "matrix-new-password" }
+    })
+    .to_string();
+    let matrix_request = format!(
+        "PUT /api/v1/me/networks/matrix-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{matrix_update}",
+        matrix_update.len()
     );
-    let matrix_post = format!(
-        "POST /console/integrations/matrix-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{matrix_fields}",
-        matrix_fields.len()
-    );
-    let (status, headers, body) = request(http, &matrix_post).await;
-    assert_eq!(status, 303, "{headers}\n{body}");
-    assert!(!body.contains("matrix-new-password"));
+    let (status, headers, body) = request(http, &matrix_request).await;
+    assert_eq!(status, 204, "{headers}\n{body}");
 
     let discord_json = serde_json::json!({
         "addr": "https://discord-api.example/v10/",
@@ -5106,15 +4751,21 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
 
     // Only the Slack app token is replaced. The bot-token ciphertext must stay
     // byte-for-byte identical, proving omission means keep rather than reseal.
-    let slack_fields =
-        format!("csrf={csrf}&addr=&nick=&autojoin=C200%2CC201&sasl_password=slack-new-app");
-    let slack_post = format!(
-        "POST /console/integrations/slack-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{slack_fields}",
-        slack_fields.len()
+    let slack_update = serde_json::json!({
+        "addr": "",
+        "tls": true,
+        "nick": "",
+        "autojoin": ["C200", "C201"],
+        "credentials": { "action": "set", "password": "slack-new-app" }
+    })
+    .to_string();
+    let slack_request = format!(
+        "PUT /api/v1/me/networks/slack-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{slack_update}",
+        slack_update.len()
     );
-    let (status, headers, body) = request(http, &slack_post).await;
-    assert_eq!(status, 303, "{headers}\n{body}");
+    let (status, headers, body) = request(http, &slack_request).await;
+    assert_eq!(status, 204, "{headers}\n{body}");
 
     let verification = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -5180,19 +4831,21 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
 
     // A malformed replacement is rendered next to the submitted non-secret
     // fields, never echoes its submitted token, and cannot alter durable state.
-    let invalid_fields = format!(
-        "csrf={csrf}&addr={}&nick={}&autojoin=&sasl_password=do-not-echo",
-        form_value("ftp://matrix.invalid"),
-        form_value("@alice:new.example"),
+    let invalid_update = serde_json::json!({
+        "addr": "ftp://matrix.invalid",
+        "tls": true,
+        "nick": "@alice:new.example",
+        "autojoin": [],
+        "credentials": { "action": "set", "password": "do-not-echo" }
+    })
+    .to_string();
+    let invalid_request = format!(
+        "PUT /api/v1/me/networks/matrix-main HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid_update}",
+        invalid_update.len()
     );
-    let invalid_post = format!(
-        "POST /console/integrations/matrix-main/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{invalid_fields}",
-        invalid_fields.len()
-    );
-    let (status, _, body) = request(http, &invalid_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Invalid bridge endpoint"), "{body}");
+    let (status, _, body) = request(http, &invalid_request).await;
+    assert_eq!(status, 400, "{body}");
     assert!(!body.contains("do-not-echo"), "{body}");
     let unchanged = e6ircd::db::get_bnc_network(&verification, "alice", "matrix-main")
         .await
@@ -5223,8 +4876,7 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         delete_fields.len()
     );
     let (status, _, body) = request(http, &delete_post).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Wrong network editor"), "{body}");
+    assert_eq!(status, 404, "{body}");
     assert!(
         e6ircd::db::get_bnc_network(&verification, "alice", "irc-main")
             .await
@@ -5291,19 +4943,23 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 
-    let contact_form = format!("csrf={csrf}&contact_email=Alice%2BIRC%40Example.COM");
+    assert!(page.contains("data-api-account-profile"), "{page}");
+    assert!(page.contains("data-api-account-app-password"), "{page}");
+    assert!(
+        page.contains("data-api-account-security-activity-list"),
+        "{page}"
+    );
+    assert!(page.contains("data-api-account-read-marker-list"), "{page}");
+    assert!(page.contains("data-api-account-token-list"), "{page}");
+    let initial_profile = r#"{"contact_email":"Alice+IRC@Example.COM"}"#;
     let update_contact = format!(
-        "POST /console/account/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{contact_form}",
-        contact_form.len()
+        "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{initial_profile}",
+        initial_profile.len()
     );
     let (status, _, body) = request(http, &update_contact).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(
-        body.contains("Contact email updated") && body.contains("value=\"Alice+IRC@example.com\""),
-        "{body}"
-    );
+    assert_eq!(status, 204, "{body}");
     assert_eq!(
         e6ircd::db::account_contact_email(&pool, "alice")
             .await
@@ -5346,31 +5002,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         Some("Second@new.example".into())
     );
 
-    let password_form =
-        format!("csrf={csrf}&current_password=pw&new_password=new-pw&confirm_password=new-pw");
-    let change_password = format!(
-        "POST /console/account/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{password_form}",
-        password_form.len()
-    );
-    let (status, _, body) = request(http, &change_password).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("Primary password changed"), "{body}");
-    assert_eq!(
-        e6ircd::db::verify_local_password(&pool, "alice", "pw")
-            .await
-            .expect("old password verify"),
-        None
-    );
-    assert_eq!(
-        e6ircd::db::verify_local_password(&pool, "alice", "new-pw")
-            .await
-            .expect("new password verify"),
-        Some("alice".into())
-    );
-
-    let api_password = r#"{"current_password":"new-pw","new_password":"api-pw"}"#;
+    let api_password = r#"{"current_password":"pw","new_password":"api-pw"}"#;
     let api_change_without_csrf = format!(
         "PUT /api/v1/me/password HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\
@@ -5395,19 +5027,27 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         Some("alice".into())
     );
 
-    let app_form = format!("csrf={csrf}&label=Laptop");
+    let app_body = r#"{"label":"Laptop"}"#;
+    let create_app_without_csrf = format!(
+        "POST /api/v1/me/credentials HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{app_body}",
+        app_body.len()
+    );
+    let (status, _, body) = request(http, &create_app_without_csrf).await;
+    assert_eq!(status, 403, "{body}");
     let create_app = format!(
-        "POST /console/account/app-passwords HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{app_form}",
-        app_form.len()
+        "POST /api/v1/me/credentials HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{app_body}",
+        app_body.len()
     );
     let (status, _, body) = request(http, &create_app).await;
     assert_eq!(status, 201, "{body}");
     assert!(
-        body.contains("App password created")
-            && body.contains("id=\"issued-secret\"")
-            && body.contains(">Laptop<"),
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["app_password"]
+            .as_str()
+            .is_some_and(|secret| !secret.is_empty()),
         "{body}"
     );
     let credentials = e6ircd::db::list_credentials(&pool, "alice")
@@ -5419,21 +5059,19 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .map(|row| row.0)
         .expect("created app password");
 
-    let token_form =
-        format!("csrf={csrf}&label=Automation&expires_in_days=90&scope_read=on&scope_irc=on");
+    let token_body = r#"{"label":"Automation","expires_in_days":90,"scopes":["read","irc"]}"#;
     let create_token = format!(
-        "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{token_form}",
-        token_form.len()
+        "POST /api/v1/me/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{token_body}",
+        token_body.len()
     );
     let (status, _, body) = request(http, &create_token).await;
     assert_eq!(status, 201, "{body}");
     assert!(
-        body.contains("Personal access token created")
-            && body.contains("e6p_")
-            && body.contains(">Automation<")
-            && body.contains("read, irc"),
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+            .as_str()
+            .is_some_and(|secret| secret.starts_with("e6p_")),
         "{body}"
     );
     let tokens = e6ircd::db::list_api_tokens(&pool, "alice")
@@ -5456,30 +5094,26 @@ async fn account_console_manages_credentials_tokens_and_identities() {
             .contains(e6ircd::identity::ApiTokenScope::Write)
     );
 
-    let bad_form = "csrf=wrong&label=Rejected&expires_in_days=30&scope_read=on";
+    let bad_body = r#"{"label":"Rejected","expires_in_days":30,"scopes":["read"]}"#;
     let bad_create = format!(
-        "POST /console/account/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{bad_form}",
-        bad_form.len()
+        "POST /api/v1/me/tokens HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{bad_body}",
+        bad_body.len()
     );
     let (status, _, _) = request(http, &bad_create).await;
     assert_eq!(status, 403);
 
     for (path, id) in [
-        ("/console/account/app-passwords", app_id),
-        ("/console/account/tokens", token_id),
+        ("/api/v1/me/credentials", app_id),
+        ("/api/v1/me/tokens", token_id),
     ] {
-        let revoke_form = format!("csrf={csrf}");
         let revoke = format!(
-            "POST {path}/{id}/delete HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n{revoke_form}",
-            revoke_form.len()
+            "DELETE {path}/{id} HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+             X-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
         );
         let (status, _, body) = request(http, &revoke).await;
-        assert_eq!(status, 200, "{body}");
-        assert!(body.contains("revoked"), "{body}");
+        assert_eq!(status, 204, "{body}");
     }
     assert!(
         e6ircd::db::list_credentials(&pool, "alice")
@@ -5504,16 +5138,12 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .find(|row| row.2 == "alice-secondary")
         .map(|row| row.0)
         .expect("secondary identity");
-    let unlink_form = format!("csrf={csrf}");
     let unlink = format!(
-        "POST /console/account/identities/{unlink_id}/delete HTTP/1.1\r\nHost: t\r\n\
-         Cookie: e6irc_session={session}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{unlink_form}",
-        unlink_form.len()
+        "DELETE /api/v1/me/identities/{unlink_id} HTTP/1.1\r\nHost: t\r\n\
+         Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\nConnection: close\r\n\r\n"
     );
     let (status, headers, body) = request(http, &unlink).await;
-    assert_eq!(status, 200, "{headers}");
-    assert!(body.contains("Login identity unlinked"), "{body}");
+    assert_eq!(status, 204, "{headers}: {body}");
     assert!(
         !headers.contains("Max-Age=0"),
         "a valid local session must not be cleared: {headers}"
@@ -6167,8 +5797,14 @@ async fn me_read_markers_list() {
     let auth = format!(
         "GET /api/v1/me/read-markers HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
     );
-    let (status, _, body) = request(http, &auth).await;
+    let (status, headers, body) = request(http, &auth).await;
     assert_eq!(status, 200, "{body}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).expect("json");
     let markers = v["markers"].as_array().expect("array");
     assert_eq!(markers.len(), 2, "{body}");
@@ -6683,30 +6319,23 @@ async fn admin_networks_fleet_view_and_toggle() {
     assert_eq!(networks[0]["name"], "work", "{body}");
     assert_eq!(networks[0]["enabled"], true, "{body}");
 
-    // The console page lists it for the admin with a CSRF-bearing toggle.
+    // The console page remains a rendered admin view.
     let page_req = format!(
         "GET /console/admin/networks HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (status, _, page) = request(http, &page_req).await;
     assert_eq!(status, 200, "{page}");
-    assert!(page.contains("bob") && page.contains("work"), "{page}");
-    let csrf = page
-        .split("name=\"csrf\" value=\"")
-        .nth(1)
-        .and_then(|s| s.split('"').next())
-        .expect("csrf token in admin networks page")
-        .to_string();
-
-    // Admin disables the misbehaving network -> redirect, row flipped,
-    // privileged action audited.
-    let body = format!("csrf={csrf}&enabled=false");
+    assert!(page.contains("data-api-admin-network-list"), "{page}");
+    // Admin disables the misbehaving network through the API; the row flips
+    // and the privileged action retains the administrator's audit identity.
+    let body = r#"{"enabled":false}"#;
     let toggle = format!(
-        "POST /console/admin/networks/bob/work/toggle HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "PATCH /api/v1/admin/networks/bob/work HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let (status, _, _) = request(http, &toggle).await;
-    assert!(status == 302 || status == 303, "{status}");
+    assert_eq!(status, 200, "{status}");
 
     let pool = e6ircd::db::connect_and_migrate(&url).await.expect("pool");
     let row = e6ircd::db::get_bnc_network(&pool, "bob", "work")

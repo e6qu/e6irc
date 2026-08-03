@@ -1,8 +1,7 @@
 {% extends "console_base.html" %}
 {% block main %}
-  {% if let Some(err) = error %}
-    <p class="banner-error" role="alert">{{ err }}</p>
-  {% endif %}
+  <p id="channel-api-result" role="status" aria-live="polite"></p>
+  <noscript><div class="banner-error">JavaScript is required to manage registered channels because these controls use the channel API directly.</div></noscript>
   <div class="page-head">
     <div>
       <p class="eyebrow">Channel policy</p>
@@ -50,59 +49,17 @@
         <h2>Registered channels</h2>
         <p>Newest registrations first. Unregistering removes retained topic, access, and mode-lock policy.</p>
       </div>
-      <span class="count">{{ entries.len() }}</span>
+      <span class="count" id="admin-channel-count">…</span>
     </div>
-    {% if entries.is_empty() %}
-      <p class="empty">{% if has_filters %}No channel matches these exact filters.{% else %}No registered channels exist yet.{% endif %}</p>
-    {% else %}
-      <div class="scroll">
-        <table>
-          <caption class="sr-only">Registered channel directory</caption>
-          <thead>
-            <tr>
-              <th>ID</th><th>Channel</th><th>Founder</th><th>Registered (UTC)</th>
-              <th>Retained policy</th><th>Access</th><th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for entry in entries %}
-              <tr>
-                <td class="meta">{{ entry.id }}</td>
-                <td><strong><code>{{ entry.name }}</code></strong></td>
-                <td><code>{{ entry.founder }}</code></td>
-                <td class="meta"><time datetime="{{ entry.created_at }}">{{ entry.created_at }}</time></td>
-                <td class="account-posture">
-                  <span class="tag">KEEP{% if entry.keeptopic %} on{% else %} off{% endif %}</span>
-                  {% if entry.topic_retained %}<span class="tag">topic retained</span>{% endif %}
-                  {% if let Some(mlock) = entry.mlock %}<span class="tag">MLOCK <code>{{ mlock }}</code></span>{% endif %}
-                </td>
-                <td>{{ entry.access_entries }} grants</td>
-                <td>
-                  <form class="cell-form" method="post" action="/console/admin/channels/drop"
-                        data-confirm="Unregister {{ entry.name }} and delete its retained policy?">
-                    <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                    <input type="hidden" name="channel" value="{{ entry.name }}" />
-                    <button class="danger" type="submit">Unregister</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% endif %}
-
-    <div class="pager">
-      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching registrations.{% endif %}</span>
-      {% if let Some(before_id) = next_before_id %}
-        <form method="get" action="/console/admin/channels">
-          <input type="hidden" name="name" value="{{ name }}" />
-          <input type="hidden" name="founder" value="{{ founder }}" />
-          <input type="hidden" name="limit" value="{{ limit }}" />
-          <input type="hidden" name="before_id" value="{{ before_id }}" />
-          <button type="submit">Older registrations</button>
-        </form>
-      {% endif %}
+    <div class="scroll">
+      <table>
+        <caption class="sr-only">Registered channel directory</caption>
+        <thead><tr><th>ID</th><th>Channel</th><th>Founder</th><th>Registered (UTC)</th><th>Retained policy</th><th>Access</th><th></th></tr></thead>
+        <tbody id="admin-channel-rows" data-api-admin-channel-list data-csrf="{{ shell.csrf }}">
+          <tr><td colspan="7" class="empty">Loading registered channels…</td></tr>
+        </tbody>
+      </table>
     </div>
+    <div class="pager" id="admin-channel-pager"></div>
   </section>
 {% endblock %}

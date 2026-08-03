@@ -2,6 +2,15 @@
 
 use super::*;
 
+macro_rules! json_or_response {
+    ($body:expr) => {
+        match parse_json($body) {
+            Ok(body) => body,
+            Err(response) => return response,
+        }
+    };
+}
+
 // ---- device authorization grant (RFC 8628) ------------------------------
 
 /// Start a device grant. No auth: the client is not yet a principal, but each
@@ -298,10 +307,7 @@ pub(super) async fn admin_account_state(
     axum::extract::Path(account_id): axum::extract::Path<i64>,
     body: Result<axum::Json<AccountStateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     let mutation = match (body.suspended, body.administrator) {
         (Some(suspended), None) => {
             super::mutate_account_suspension(&state, &actor, account_id, suspended)
@@ -346,10 +352,7 @@ pub(super) async fn admin_create_account(
     AdminAccount(actor): AdminAccount,
     body: Result<axum::Json<AdminCreateAccountBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     let account_id = match super::create_account_lifecycle(
         &state,
         &actor,
@@ -446,10 +449,7 @@ pub(super) async fn admin_create_account_invitation(
         axum::extract::rejection::JsonRejection,
     >,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     if !crate::sanitize::valid_nick(&body.account, MAX_ACCOUNT_LEN) {
         return problem(
             StatusCode::BAD_REQUEST,
@@ -529,10 +529,7 @@ pub(super) async fn admin_delete_account(
     axum::extract::Path(account_id): axum::extract::Path<i64>,
     body: Result<axum::Json<AccountDeletionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let body = match parse_json(body) {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
+    let body = json_or_response!(body);
     let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
         Ok(Some(target)) => target,
         Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
@@ -615,6 +612,581 @@ pub(super) async fn admin_stats(
             "server_bans": server_bans,
         })),
         Err(e) => admin_db_error("server stats", e),
+    }
+}
+
+/// Return the revisioned managed configuration without credential material.
+/// A client can use `revision` as the compare-and-swap precondition for later
+/// writes, but no OIDC, oper, or upstream secret ever crosses this boundary.
+pub(super) async fn admin_configuration(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminAccount,
+) -> Response {
+    let Some(config) = &state.managed_config else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable",
+            None,
+        );
+    };
+    let snapshot = config.read().await.clone();
+    let mut settings = snapshot.settings;
+    for provider in &mut settings.oidc_providers {
+        provider.client_secret.clear();
+    }
+    for oper in &mut settings.opers {
+        oper.password.clear();
+    }
+    for network in &mut settings.networks {
+        network.sasl_password = None;
+        if network.kind.account_is_secret() {
+            network.sasl_account = None;
+        }
+    }
+    admin_json(serde_json::json!({
+        "revision": snapshot.revision,
+        "updated_by": snapshot.updated_by,
+        "updated_at": snapshot.updated_at,
+        "settings": settings,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminOperBody {
+    revision: i64,
+    name: String,
+    password: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminConfigRevision {
+    revision: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminOidcBody {
+    revision: i64,
+    name: String,
+    issuer_url: String,
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    allowed_email_domains: Vec<String>,
+    end_session_endpoint: Option<String>,
+    token_endpoint_auth_method: crate::config::TokenEndpointAuthMethod,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkBody {
+    revision: i64,
+    name: String,
+    owner: Option<String>,
+    kind: crate::config::NetworkKind,
+    #[serde(default)]
+    addr: String,
+    tls: bool,
+    #[serde(default)]
+    nick: String,
+    realname: Option<String>,
+    #[serde(default)]
+    autojoin: Vec<String>,
+    buffer_cap: usize,
+    sasl_account: Option<String>,
+    sasl_password: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkDeleteBody {
+    revision: i64,
+    owner: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminConfigurationPatch {
+    revision: i64,
+    settings: AdminScalarSettings,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminScalarSettings {
+    server_name: String,
+    network_name: String,
+    description: String,
+    motd: Vec<String>,
+    nicklen: usize,
+    sendq: usize,
+    core_queue: usize,
+    max_hot_channels: usize,
+    listeners: Vec<crate::config::ListenerConfig>,
+    registration: crate::config::RegistrationConfig,
+    limits: crate::config::LimitsConfig,
+    observability: crate::config::ObservabilityConfig,
+    storage: crate::config::StorageConfig,
+    bnc_addr: Option<std::net::SocketAddr>,
+    public_url: Option<String>,
+    secure_cookies: bool,
+    admin_accounts: Vec<String>,
+}
+
+impl AdminScalarSettings {
+    fn apply_to(self, current: &crate::config::ManagedConfig) -> crate::config::ManagedConfig {
+        crate::config::ManagedConfig {
+            server_name: self.server_name,
+            network_name: self.network_name,
+            description: self.description,
+            motd: self.motd,
+            nicklen: self.nicklen,
+            sendq: self.sendq,
+            core_queue: self.core_queue,
+            max_hot_channels: self.max_hot_channels,
+            listeners: self.listeners,
+            registration: self.registration,
+            limits: self.limits,
+            observability: self.observability,
+            storage: self.storage,
+            bnc_addr: self.bnc_addr,
+            public_url: self.public_url,
+            secure_cookies: self.secure_cookies,
+            admin_accounts: self.admin_accounts,
+            oidc_providers: current.oidc_providers.clone(),
+            opers: current.opers.clone(),
+            networks: current.networks.clone(),
+            credentials_from_bootstrap: current.credentials_from_bootstrap,
+        }
+    }
+}
+
+pub(super) async fn admin_patch_configuration(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminConfigurationPatch>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(config) = &state.managed_config else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable",
+            None,
+        );
+    };
+    let mut current = config.write().await;
+    if current.revision != body.revision {
+        return problem(
+            StatusCode::CONFLICT,
+            "Configuration revision conflict",
+            Some("Reload the configuration and retry with its current revision."),
+        );
+    }
+    let settings = body.settings.apply_to(&current.settings);
+    if let Err(error) = settings.validate() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid configuration",
+            Some(&error.to_string()),
+        );
+    }
+    let previous_bnc = current.settings.bnc_addr;
+    let bnc_changed = previous_bnc != settings.bnc_addr;
+    if bnc_changed {
+        let Some(listener) = &state.bnc_listener else {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "BNC listener unavailable",
+                None,
+            );
+        };
+        let applied = match settings.bnc_addr {
+            Some(address) => listener
+                .enable(address)
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("Could not bind {address}: {error}")),
+            None => {
+                listener.stop().await;
+                Ok(())
+            }
+        };
+        if let Err(error) = applied {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid BNC listener",
+                Some(&error),
+            );
+        }
+    }
+    let mut restart_comparison = current.settings.clone();
+    restart_comparison.bnc_addr = settings.bnc_addr;
+    restart_comparison.observability = settings.observability.clone();
+    let restart_required = restart_comparison != settings;
+    let detail = format!(
+        "revision {}; BNC listener {}; restart {}",
+        current.revision + 1,
+        if bnc_changed { "changed" } else { "unchanged" },
+        if restart_required {
+            "required"
+        } else {
+            "not required"
+        }
+    );
+    match crate::db::save_managed_config(
+        pool_of(&state),
+        current.revision,
+        &settings,
+        &actor,
+        &detail,
+    )
+    .await
+    {
+        Ok(snapshot) => {
+            *current = snapshot.clone();
+            admin_json(
+                serde_json::json!({ "revision": snapshot.revision, "restart_required": restart_required }),
+            )
+        }
+        Err(error) => {
+            if bnc_changed && let Some(listener) = &state.bnc_listener {
+                match previous_bnc {
+                    Some(address) => {
+                        let _ = listener.enable(address).await;
+                    }
+                    None => listener.stop().await,
+                }
+            }
+            admin_db_error("managed configuration", error)
+        }
+    }
+}
+
+pub(super) async fn admin_create_network(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminNetworkBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if body.kind.is_bridge() && !kind_feature_available(body.kind) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Unsupported network kind",
+            Some(&format!(
+                "This server was not built with the {} feature.",
+                body.kind.as_db_str()
+            )),
+        );
+    }
+    let sasl_account = optional_config_string(body.sasl_account);
+    let sasl_password = optional_config_string(body.sasl_password);
+    let secret_needed =
+        sasl_password.is_some() || (body.kind.account_is_secret() && sasl_account.is_some());
+    let key = state.secret_key.clone();
+    if secret_needed && key.is_none() {
+        return master_key_required("Upstream credentials");
+    }
+    let name = body.name.trim().to_string();
+    let owner = optional_config_string(body.owner);
+    let addr = body.addr.trim().to_string();
+    let nick = body.nick.trim().to_string();
+    let realname = optional_config_string(body.realname);
+    let autojoin = body
+        .autojoin
+        .into_iter()
+        .map(|channel| channel.trim().to_string())
+        .filter(|channel| !channel.is_empty())
+        .collect();
+    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+        reject_bootstrap_credential_change(settings, "network")?;
+        let sealed_account = if body.kind.account_is_secret() {
+            seal_configuration_secret(sasl_account, key.as_ref())?
+        } else {
+            sasl_account
+        };
+        let sealed_password = seal_configuration_secret(sasl_password, key.as_ref())?;
+        settings.networks.push(crate::config::NetworkEntry {
+            name: name.clone(),
+            kind: body.kind,
+            owner,
+            addr,
+            tls: body.tls,
+            nick,
+            realname,
+            autojoin,
+            buffer_cap: body.buffer_cap,
+            sasl_account: sealed_account,
+            sasl_password: sealed_password,
+        });
+        Ok(format!("added server network {name}"))
+    })
+    .await
+}
+
+pub(super) async fn admin_delete_network(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<axum::Json<AdminNetworkDeleteBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let owner = optional_config_string(body.owner);
+    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+        reject_bootstrap_credential_change(settings, "network")?;
+        let before = settings.networks.len();
+        settings
+            .networks
+            .retain(|network| network.name != name || network.owner.as_deref() != owner.as_deref());
+        (settings.networks.len() != before)
+            .then(|| format!("removed server network {name}"))
+            .ok_or_else(|| format!("No matching server network named '{name}'."))
+    })
+    .await
+}
+
+fn optional_config_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()))
+}
+
+fn seal_configuration_secret(
+    value: Option<String>,
+    key: Option<&Arc<crate::secret::SecretKeyring>>,
+) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            key.ok_or_else(|| "A master key is required to store upstream credentials.".into())
+                .map(|key| key.seal(&value, crate::secret::CONFIG_CONTEXT))
+        })
+        .transpose()
+}
+
+pub(super) async fn admin_create_oidc_provider(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminOidcBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(key) = configuration_secret_key(&state) else {
+        return master_key_required("OIDC client secrets");
+    };
+    let domains = match body
+        .allowed_email_domains
+        .into_iter()
+        .map(|domain| crate::identity::EmailDomain::parse(&domain))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(domains) => domains,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid OIDC provider",
+                Some(&error.to_string()),
+            );
+        }
+    };
+    let name = body.name.trim().to_string();
+    let issuer_url = body.issuer_url.trim().to_string();
+    let client_id = body.client_id.trim().to_string();
+    if name.is_empty()
+        || issuer_url.is_empty()
+        || client_id.is_empty()
+        || body.client_secret.is_empty()
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid OIDC provider",
+            Some("Name, issuer URL, client ID, and client secret are required."),
+        );
+    }
+    let scopes = body
+        .scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+        .collect();
+    let end_session_endpoint = body
+        .end_session_endpoint
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+    mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
+        add_managed_oidc_provider(
+            settings,
+            crate::config::OidcProviderConfig {
+                name,
+                issuer_url,
+                client_id,
+                client_secret: key.seal(&body.client_secret, crate::secret::CONFIG_CONTEXT),
+                scopes,
+                allowed_email_domains: domains,
+                end_session_endpoint,
+                token_endpoint_auth_method: body.token_endpoint_auth_method,
+            },
+        )
+    })
+    .await
+}
+
+pub(super) async fn admin_delete_oidc_provider(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    delete_managed_configuration_item_api(
+        state,
+        actor,
+        name,
+        body,
+        oidc_provider_configuration_item(),
+    )
+    .await
+}
+
+pub(super) async fn admin_create_oper(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminOperBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let Some(key) = configuration_secret_key(&state) else {
+        return master_key_required("Operator passwords");
+    };
+    let name = body.name.trim();
+    if name.is_empty() || body.password.is_empty() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid operator",
+            Some("Operator name and password are required."),
+        );
+    }
+    mutate_managed_configuration(&state, &actor, body.revision, |settings| {
+        add_managed_oper(
+            settings,
+            crate::config::OperConfig {
+                name: name.to_string(),
+                password: key.seal(&body.password, crate::secret::CONFIG_CONTEXT),
+            },
+        )
+    })
+    .await
+}
+
+pub(super) async fn admin_delete_oper(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    delete_managed_configuration_item_api(state, actor, name, body, oper_configuration_item()).await
+}
+
+fn configuration_secret_key(state: &AppState) -> Option<&Arc<crate::secret::SecretKeyring>> {
+    state.secret_key.as_ref()
+}
+
+fn master_key_required(credential_label: &str) -> Response {
+    problem(
+        StatusCode::CONFLICT,
+        "Master key required",
+        Some(&format!(
+            "{credential_label} cannot be stored without a master key."
+        )),
+    )
+}
+
+async fn delete_managed_configuration_item_api<T>(
+    state: Arc<AppState>,
+    actor: String,
+    name: String,
+    body: Result<axum::Json<AdminConfigRevision>, axum::extract::rejection::JsonRejection>,
+    item: ManagedConfigurationItem<T>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    mutate_managed_configuration(&state, &actor, body.revision, |settings| {
+        delete_managed_configuration_item(settings, &name, item)
+    })
+    .await
+}
+
+async fn mutate_managed_configuration(
+    state: &AppState,
+    actor: &str,
+    revision: i64,
+    change: impl FnOnce(&mut crate::config::ManagedConfig) -> Result<String, String>,
+) -> Response {
+    let Some(config) = &state.managed_config else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configuration unavailable",
+            None,
+        );
+    };
+    let mut current = config.write().await;
+    if current.revision != revision {
+        return problem(
+            StatusCode::CONFLICT,
+            "Configuration revision conflict",
+            Some("Reload the configuration and retry with its current revision."),
+        );
+    }
+    let mut settings = current.settings.clone();
+    let detail = match change(&mut settings) {
+        Ok(detail) => detail,
+        Err(error) => {
+            return problem(
+                StatusCode::BAD_REQUEST,
+                "Invalid configuration change",
+                Some(&error),
+            );
+        }
+    };
+    if let Err(error) = settings.validate() {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Invalid configuration change",
+            Some(&error.to_string()),
+        );
+    }
+    match crate::db::save_managed_config(
+        pool_of(state),
+        revision,
+        &settings,
+        actor,
+        &format!("{detail}; restart required"),
+    )
+    .await
+    {
+        Ok(snapshot) => {
+            *current = snapshot.clone();
+            admin_json(serde_json::json!({ "revision": snapshot.revision, "message": detail }))
+        }
+        Err(crate::db::DbError::StaleServerSettings) => problem(
+            StatusCode::CONFLICT,
+            "Configuration revision conflict",
+            Some("Reload the configuration and retry with its current revision."),
+        ),
+        Err(error) => admin_db_error("operator configuration", error),
     }
 }
 
@@ -812,6 +1384,109 @@ pub(super) async fn admin_server_bans(
             "next_before_id": page.next_before_id,
         })),
         Err(e) => admin_db_error("server-ban directory", e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminServerBanBody {
+    kind: String,
+    mask: String,
+    #[serde(default)]
+    reason: String,
+}
+
+pub(super) async fn admin_create_server_ban(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    body: Result<axum::Json<AdminServerBanBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let body = match parse_json(body) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    server_ban_response(
+        &state,
+        crate::core::AdminRequest::AddServerBan {
+            mask: body.mask,
+            kind: body.kind,
+            reason: body.reason,
+            actor,
+        },
+        StatusCode::CREATED,
+    )
+    .await
+}
+
+pub(super) async fn admin_delete_server_ban(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Response {
+    if id <= 0 {
+        return problem(StatusCode::BAD_REQUEST, "Invalid server-ban id", None);
+    }
+    let ban = match crate::db::server_ban_directory_entry(pool_of(&state), id).await {
+        Ok(Some(ban)) => ban,
+        Ok(None) => return problem(StatusCode::NOT_FOUND, "No such server ban", None),
+        Err(error) => return admin_db_error("server-ban lookup", error),
+    };
+    server_ban_response(
+        &state,
+        crate::core::AdminRequest::RemoveServerBan {
+            expected_id: Some(id),
+            mask: ban.mask,
+            kind: ban.kind,
+            actor,
+        },
+        StatusCode::NO_CONTENT,
+    )
+    .await
+}
+
+async fn server_ban_response(
+    state: &AppState,
+    request: crate::core::AdminRequest,
+    success: StatusCode,
+) -> Response {
+    match super::core_reply(state, request).await {
+        Ok(crate::core::AdminReply::Ok(_message)) if success == StatusCode::NO_CONTENT => {
+            let mut response = success.into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Ok(crate::core::AdminReply::Ok(message)) => {
+            let mut response = (
+                success,
+                axum::Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+            no_store(response.headers_mut());
+            response
+        }
+        Ok(crate::core::AdminReply::BanErr { kind, message }) => {
+            let (status, title) = match kind {
+                crate::core::BanControlError::Invalid => {
+                    (StatusCode::BAD_REQUEST, "Invalid server ban")
+                }
+                crate::core::BanControlError::NotFound => {
+                    (StatusCode::NOT_FOUND, "No such server ban")
+                }
+                crate::core::BanControlError::Conflict => {
+                    (StatusCode::CONFLICT, "Server-ban change conflict")
+                }
+                crate::core::BanControlError::Unavailable => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Server-ban control unavailable",
+                ),
+            };
+            problem(status, title, Some(&message))
+        }
+        Ok(_) | Err(_) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server-ban control unavailable",
+            None,
+        ),
     }
 }
 

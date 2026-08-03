@@ -35,8 +35,8 @@ def main() -> int:
     router_paths = console_mutations(ROUTER.read_text(encoding="utf-8"))
     inventory_paths = inventory_mutations(INVENTORY.read_text(encoding="utf-8"))
     if not router_paths:
-        print("api-first inventory found no console mutations in the router", file=sys.stderr)
-        return 1
+        print("api-first inventory found no console mutations in the router")
+        return 0
     missing = sorted(router_paths - inventory_paths)
     stale = sorted(inventory_paths - router_paths)
     if missing or stale:

@@ -32,8 +32,13 @@ pub(crate) fn handle(
         } => {
             return begin_add_ban(state, &mask, &kind, &reason, actor, reply);
         }
-        AdminRequest::RemoveServerBan { mask, kind, actor } => {
-            return begin_remove_ban(state, &mask, &kind, actor, reply);
+        AdminRequest::RemoveServerBan {
+            expected_id,
+            mask,
+            kind,
+            actor,
+        } => {
+            return begin_remove_ban(state, expected_id, &mask, &kind, actor, reply);
         }
         AdminRequest::DropChannel { channel, actor } => {
             return begin_drop_channel(state, &channel, actor, reply);
@@ -568,9 +573,10 @@ fn disconnect_own_connection(
 }
 
 fn err_unknown_ban_kind(kind_in: &str) -> AdminReply {
-    AdminReply::Err(format!(
-        "unknown ban kind '{kind_in}' (want kline, dline or xline)"
-    ))
+    ban_error(
+        crate::core::BanControlError::Invalid,
+        format!("unknown ban kind '{kind_in}' (want kline, dline or xline)"),
+    )
 }
 
 fn begin_add_ban(
@@ -587,16 +593,17 @@ fn begin_add_ban(
     };
     // Reuse the oper mask normalization + netban ("matches everyone") refusal so
     // the console cannot set a wider ban than KLINE would allow.
-    let parsed = match BanMask::parse(kind, &[mask_in], false) {
-        Ok((parsed, _default_reason)) => parsed,
-        Err(BanReject::MatchesEveryone(display)) => {
-            let _ = reply.send(AdminReply::Err(format!(
+    let parsed =
+        match BanMask::parse(kind, &[mask_in], false) {
+            Ok((parsed, _default_reason)) => parsed,
+            Err(BanReject::MatchesEveryone(display)) => {
+                let _ = reply.send(ban_error(crate::core::BanControlError::Invalid, format!(
                 "refusing {} for {display}: it matches every user (use a more specific mask)",
                 kind.label()
             )));
-            return;
-        }
-    };
+                return;
+            }
+        };
     let reason = e6irc_proto::message::truncate_on_char_boundary(reason_in.trim(), 300);
     let reason = if reason.is_empty() {
         "Banned via admin console"
@@ -630,13 +637,17 @@ fn begin_add_ban(
 
 fn begin_remove_ban(
     state: &mut ServerState,
+    expected_id: Option<i64>,
     mask_in: &str,
     kind_in: &str,
     actor: String,
     reply: tokio::sync::oneshot::Sender<AdminReply>,
 ) {
     let Some(kind) = BanKind::from_token(kind_in) else {
-        let _ = reply.send(err_unknown_ban_kind(kind_in));
+        let _ = reply.send(ban_error(
+            crate::core::BanControlError::Invalid,
+            format!("unknown server-ban kind {kind_in}"),
+        ));
         return;
     };
     // Fold like enforcement (mirror cmd_remove_ban) so a differently-cased
@@ -647,11 +658,10 @@ fn begin_remove_ban(
         .iter()
         .any(|ban| ban.kind == kind && ban.mask == mask)
     {
-        let _ = reply.send(AdminReply::Err(format!(
-            "no {} matching {}",
-            kind.label(),
-            mask.as_str()
-        )));
+        let _ = reply.send(ban_error(
+            crate::core::BanControlError::NotFound,
+            format!("no {} matching {}", kind.label(), mask.as_str()),
+        ));
         return;
     }
     if !state.config.sasl_enabled {
@@ -663,7 +673,8 @@ fn begin_remove_ban(
         )));
         return;
     }
-    let mutation = crate::core::ServerBanMutation::remove(&mask, kind, actor.clone());
+    let mutation =
+        crate::core::ServerBanMutation::remove_with_id(&mask, kind, actor.clone(), expected_id);
     queue_admin_server_ban(state, kind, mutation, actor, reply);
 }
 
@@ -681,7 +692,10 @@ fn queue_admin_server_ban(
         }
     };
     let Some(request_id) = state.admin_server_ban_id.checked_add(1) else {
-        let _ = reply.send(AdminReply::Err("admin request ID space exhausted".into()));
+        let _ = reply.send(ban_error(
+            crate::core::BanControlError::Unavailable,
+            "admin request ID space exhausted",
+        ));
         return;
     };
     let requester = crate::core::ServerBanRequester::Admin { request_id, actor };
@@ -691,16 +705,27 @@ fn queue_admin_server_ban(
             state.pending_admin_server_bans.insert(request_id, reply);
         }
         Err(QueueServerBanError::AlreadyPending) => {
-            let _ = reply.send(AdminReply::Err(format!(
-                "a {} change for {mask} is already in progress",
-                kind.label()
-            )));
+            let _ = reply.send(ban_error(
+                crate::core::BanControlError::Conflict,
+                format!(
+                    "a {} change for {mask} is already in progress",
+                    kind.label()
+                ),
+            ));
         }
         Err(QueueServerBanError::PersistenceUnavailable) => {
-            let _ = reply.send(AdminReply::Err(format!(
-                "persistence unavailable; server ban not {unavailable_action}"
-            )));
+            let _ = reply.send(ban_error(
+                crate::core::BanControlError::Unavailable,
+                format!("persistence unavailable; server ban not {unavailable_action}"),
+            ));
         }
+    }
+}
+
+fn ban_error(kind: crate::core::BanControlError, message: impl Into<String>) -> AdminReply {
+    AdminReply::BanErr {
+        kind,
+        message: message.into(),
     }
 }
 

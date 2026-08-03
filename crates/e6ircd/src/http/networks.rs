@@ -34,10 +34,7 @@ impl NetworkMutationError {
         self
     }
 
-    pub(super) fn field(&self) -> Option<&'static str> {
-        self.field
-    }
-
+    #[cfg(test)]
     pub(super) fn message(&self) -> String {
         match &self.detail {
             Some(detail) => format!("{}: {detail}", self.title),
@@ -609,35 +606,11 @@ pub(super) fn validate_irc_upstream(
     check_upstream_bounds(addr, nick, realname, autojoin)
 }
 
-/// Which stored driver kinds a mutation surface is allowed to edit. The IRC and
-/// Integrations forms use disjoint variants so posting one form to another
-/// kind's URL cannot reinterpret its generic storage columns.
-#[derive(Clone, Copy)]
-pub(super) enum EditableNetworkKind {
-    Any,
-    Irc,
-    Bridge,
-}
-
-fn editable_kind_accepts(
-    editable_kind: EditableNetworkKind,
-    kind: crate::config::NetworkKind,
-) -> bool {
-    match editable_kind {
-        EditableNetworkKind::Any => true,
-        EditableNetworkKind::Irc => kind == crate::config::NetworkKind::Irc,
-        EditableNetworkKind::Bridge => kind.is_bridge(),
-    }
-}
-
-/// Resolve one owner-scoped row and enforce the editor/driver-kind boundary in
-/// one place. Update and delete must reject exactly the same missing,
-/// unavailable, and cross-surface cases.
+/// Resolve one owner-scoped row for an API mutation.
 async fn editable_network(
     state: &AppState,
     account: &str,
     name: &str,
-    editable_kind: EditableNetworkKind,
     operation: &str,
 ) -> Result<crate::db::BncNetworkRow, NetworkMutationError> {
     let row = match crate::db::get_bnc_network(pool_of(state), account, name).await {
@@ -658,17 +631,6 @@ async fn editable_network(
             ));
         }
     };
-    if !editable_kind_accepts(editable_kind, row.kind) {
-        return Err(network_error(
-            StatusCode::BAD_REQUEST,
-            "Wrong network editor",
-            Some(if row.kind.is_bridge() {
-                "bridges are managed on the Integrations page"
-            } else {
-                "IRC networks are managed on the BNC networks page"
-            }),
-        ));
-    }
     Ok(row)
 }
 
@@ -892,7 +854,6 @@ pub(super) async fn update_network_core(
     registry: &crate::bouncer::Registry,
     account: &str,
     name: &str,
-    editable_kind: EditableNetworkKind,
     addr: &str,
     tls: bool,
     nick: &str,
@@ -902,7 +863,7 @@ pub(super) async fn update_network_core(
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
     let pool = pool_of(state);
-    let mut row = editable_network(state, account, name, editable_kind, "update").await?;
+    let mut row = editable_network(state, account, name, "update").await?;
     if row.kind == crate::config::NetworkKind::Irc {
         validate_irc_upstream(addr, nick, realname, autojoin)?;
     } else {
@@ -1283,7 +1244,6 @@ pub(super) async fn update_network(
         registry,
         &account,
         &name,
-        EditableNetworkKind::Any,
         &req.addr,
         req.tls,
         &req.nick,
@@ -1365,10 +1325,9 @@ pub(super) async fn delete_network_core(
     registry: &crate::bouncer::Registry,
     account: &str,
     name: &str,
-    editable_kind: EditableNetworkKind,
 ) -> Result<(), NetworkMutationError> {
     let _mutation = registry.mutation_guard().await;
-    editable_network(state, account, name, editable_kind, "delete").await?;
+    editable_network(state, account, name, "delete").await?;
     require_network_updated(
         crate::db::delete_bnc_network(pool_of(state), account, name).await,
         "delete failed",
@@ -1401,6 +1360,31 @@ pub(super) async fn patch_network(
         .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdminNetworkPatch {
+    enabled: bool,
+}
+
+/// Enable or disable any owner's network (administrator only). The actor is
+/// distinct from the owner so the existing audit event preserves provenance.
+pub(super) async fn patch_admin_network(
+    State(state): State<Arc<AppState>>,
+    AdminAccount(actor): AdminAccount,
+    Path((owner, name)): Path<(String, String)>,
+    JsonBody(req): JsonBody<AdminNetworkPatch>,
+) -> Response {
+    let Some(registry) = &state.bnc_registry else {
+        return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
+    };
+    if let Err(error) =
+        set_network_enabled_core(&state, registry, &actor, &owner, &name, req.enabled).await
+    {
+        return error.into_response();
+    }
+    json_no_store(serde_json::json!({ "owner": owner, "name": name, "enabled": req.enabled }))
+}
+
 /// Delete one of the caller's networks and stop its driver.
 pub(super) async fn delete_network(
     State(state): State<Arc<AppState>>,
@@ -1410,7 +1394,7 @@ pub(super) async fn delete_network(
     let Some(registry) = &state.bnc_registry else {
         return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None);
     };
-    match delete_network_core(&state, registry, &account, &name, EditableNetworkKind::Any).await {
+    match delete_network_core(&state, registry, &account, &name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => error.into_response(),
     }

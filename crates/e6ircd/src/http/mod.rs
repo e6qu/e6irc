@@ -11,7 +11,7 @@ use axum::extract::{Form, Path, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -72,41 +72,6 @@ macro_rules! require_managed_config {
             }
         }
     };
-}
-
-/// The BNC registry for a console network/bridge handler, or a 404 problem
-/// when the server runs without the bouncer enabled.
-macro_rules! require_registry {
-    ($state:expr) => {
-        match &$state.bnc_registry {
-            Some(registry) => registry,
-            None => return problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None),
-        }
-    };
-}
-
-/// A URL-encoded form body whose extraction failures use the API's problem
-/// response contract instead of Axum's default text rejection.
-pub(crate) struct FormBody<T>(pub(crate) T);
-
-impl<T, S> axum::extract::FromRequest<S> for FormBody<T>
-where
-    axum::Form<T>:
-        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::FormRejection>,
-    S: Send + Sync,
-{
-    type Rejection = Response;
-
-    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
-        match axum::Form::<T>::from_request(req, state).await {
-            Ok(axum::Form(value)) => Ok(Self(value)),
-            Err(error) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid form",
-                Some(&error.to_string()),
-            )),
-        }
-    }
 }
 
 /// One in-flight OIDC authorization (state → verifier/nonce), expiring
@@ -372,20 +337,6 @@ fn json_no_store(value: impl serde::Serialize) -> Response {
     response
 }
 
-/// Redirect to `/login` while clearing the browser session cookie — the
-/// shared tail of the "this session is gone now" flows (account deletion,
-/// revoking one's own current browser session).
-fn redirect_signed_out(state: &AppState) -> Response {
-    let mut response = Redirect::to("/login").into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        clear_session_cookie(state.secure_cookies)
-            .parse()
-            .expect("session clear cookie is valid"),
-    );
-    response
-}
-
 /// Parse an optional contact-email field, or return a `BAD_REQUEST` problem
 /// response for an invalid one. Shared by the profile and invitation handlers.
 pub(super) fn parse_optional_contact_email(
@@ -406,7 +357,8 @@ async fn core_action(state: &AppState, req: crate::core::AdminRequest) -> Result
     match core_reply(state, req).await? {
         crate::core::AdminReply::Ok(message) => Ok(message),
         crate::core::AdminReply::Err(message)
-        | crate::core::AdminReply::ChannelErr { message, .. } => Err(message),
+        | crate::core::AdminReply::ChannelErr { message, .. }
+        | crate::core::AdminReply::BanErr { message, .. } => Err(message),
         crate::core::AdminReply::Connections(_) => {
             Err("unexpected live-connection reply for a mutation".into())
         }
@@ -1076,7 +1028,7 @@ documented_routes! {
         put: put_channel_access,
         delete: delete_channel_access,
     },
-    "/api/v1/me/credentials" => { get: list_credentials },
+    "/api/v1/me/credentials" => { get: list_credentials, post: create_session_app_password },
     "/api/v1/me/credentials/{id}" => { delete: revoke_credential },
     "/api/v1/me/networks" => { get: list_networks, post: create_network },
     "/api/v1/me/networks/preflight" => { post: preflight_network },
@@ -1103,9 +1055,18 @@ documented_routes! {
     "/api/v1/admin/channels" => { get: admin_channels },
     "/api/v1/admin/channels/{name}" => { delete: delete_admin_channel },
     "/api/v1/admin/networks" => { get: admin_networks },
-    "/api/v1/admin/bans" => { get: admin_server_bans },
+    "/api/v1/admin/networks/{owner}/{name}" => { patch: patch_admin_network },
+    "/api/v1/admin/bans" => { get: admin_server_bans, post: admin_create_server_ban },
+    "/api/v1/admin/bans/{id}" => { delete: admin_delete_server_ban },
     "/api/v1/admin/audit" => { get: admin_audit },
     "/api/v1/admin/stats" => { get: admin_stats },
+    "/api/v1/admin/configuration" => { get: admin_configuration, patch: admin_patch_configuration },
+    "/api/v1/admin/configuration/opers" => { post: admin_create_oper },
+    "/api/v1/admin/configuration/opers/{name}" => { delete: admin_delete_oper },
+    "/api/v1/admin/configuration/oidc-providers" => { post: admin_create_oidc_provider },
+    "/api/v1/admin/configuration/oidc-providers/{name}" => { delete: admin_delete_oidc_provider },
+    "/api/v1/admin/configuration/networks" => { post: admin_create_network },
+    "/api/v1/admin/configuration/networks/{name}" => { delete: admin_delete_network },
     "/api/v1/admin/observability" => { get: admin_observability },
     "/api/v1/admin/metrics" => { get: admin_metrics },
 }
@@ -1130,30 +1091,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console", get(pages::console))
         .route("/console/accounts", get(pages::console_accounts))
         .route(
-            "/console/accounts/create",
-            post(pages::console_create_account),
-        )
-        .route(
-            "/console/accounts/invitations",
-            post(pages::console_create_invitation),
-        )
-        .route(
-            "/console/accounts/invitations/{id}/delete",
-            post(pages::console_revoke_invitation),
-        )
-        .route(
-            "/console/accounts/{id}/delete",
-            post(pages::console_delete_account),
-        )
-        .route(
-            "/console/accounts/{id}/suspension",
-            post(pages::console_account_suspension),
-        )
-        .route(
-            "/console/accounts/{id}/administrator",
-            post(pages::console_account_administrator),
-        )
-        .route(
             "/console/admin/channels",
             get(pages::console_admin_channels),
         )
@@ -1161,124 +1098,20 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/admin/networks",
             get(pages::console_admin_networks),
         )
-        .route(
-            "/console/admin/networks/{owner}/{name}/toggle",
-            post(pages::console_admin_network_toggle),
-        )
         .route("/console/audit", get(pages::console_audit))
         .route("/console/account", get(pages::console_account))
-        .route(
-            "/console/account/profile",
-            post(pages::console_update_profile),
-        )
-        .route(
-            "/console/account/delete",
-            post(pages::console_delete_own_account),
-        )
         .route("/console/channels", get(pages::console_channels))
-        .route(
-            "/console/channels/topic",
-            post(pages::console_channel_topic),
-        )
-        .route(
-            "/console/channels/register",
-            post(pages::console_channel_register),
-        )
-        .route(
-            "/console/channels/keeptopic",
-            post(pages::console_channel_keeptopic),
-        )
-        .route(
-            "/console/channels/mlock",
-            post(pages::console_channel_mlock),
-        )
-        .route(
-            "/console/channels/access",
-            post(pages::console_channel_access),
-        )
-        .route(
-            "/console/channels/access/delete",
-            post(pages::console_channel_access_delete),
-        )
-        .route(
-            "/console/channels/founder",
-            post(pages::console_channel_founder),
-        )
-        .route("/console/channels/drop", post(pages::console_channel_drop))
-        .route(
-            "/console/account/app-passwords",
-            post(pages::console_create_app_password),
-        )
-        .route(
-            "/console/account/password",
-            post(pages::console_change_password),
-        )
-        .route(
-            "/console/account/app-passwords/{id}/delete",
-            post(pages::console_revoke_app_password),
-        )
-        .route(
-            "/console/account/tokens",
-            post(pages::console_create_api_token),
-        )
-        .route(
-            "/console/account/tokens/{id}/delete",
-            post(pages::console_revoke_api_token),
-        )
-        .route(
-            "/console/account/identities/{id}/delete",
-            post(pages::console_unlink_identity),
-        )
         .route("/console/monitoring", get(pages::console_monitoring))
         .route(
             "/console/monitoring/panel",
             get(pages::console_monitoring_panel),
         )
-        .route(
-            "/console/configuration",
-            get(pages::console_configuration).post(pages::console_update_configuration),
-        )
-        .route(
-            "/console/configuration/opers",
-            post(pages::console_add_oper),
-        )
-        .route(
-            "/console/configuration/opers/delete",
-            post(pages::console_delete_oper),
-        )
-        .route("/console/configuration/oidc", post(pages::console_add_oidc))
-        .route(
-            "/console/configuration/oidc/delete",
-            post(pages::console_delete_oidc),
-        )
-        .route(
-            "/console/configuration/shared-networks",
-            post(pages::console_add_shared_network),
-        )
-        .route(
-            "/console/configuration/shared-networks/delete",
-            post(pages::console_delete_shared_network),
-        )
-        .route(
-            "/console/networks",
-            get(pages::console_networks).post(pages::console_add_network),
-        )
+        .route("/console/configuration", get(pages::console_configuration))
+        .route("/console/networks", get(pages::console_networks))
         .route("/console/networks/rows", get(pages::console_network_rows))
         .route(
-            "/console/networks/{name}/delete",
-            post(pages::console_delete_network),
-        )
-        .route(
-            "/console/networks/preflight",
-            post(pages::console_preflight_network),
-        )
-        .route(
-            "/console/networks/{name}/toggle",
-            post(pages::console_toggle_network),
-        )
-        .route(
             "/console/networks/{name}/edit",
-            get(pages::console_edit_network).post(pages::console_update_network),
+            get(pages::console_edit_network),
         )
         .route(
             "/console/networks/{name}/operations",
@@ -1288,49 +1121,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/console/networks/{name}",
             get(pages::console_network_detail),
         )
-        .route(
-            "/console/integrations",
-            get(pages::console_integrations).post(pages::console_add_bridge),
-        )
+        .route("/console/integrations", get(pages::console_integrations))
         .route(
             "/console/integrations/{name}/edit",
-            get(pages::console_edit_bridge).post(pages::console_update_bridge),
+            get(pages::console_edit_bridge),
         )
-        .route(
-            "/console/integrations/delete",
-            post(pages::console_delete_bridge),
-        )
-        .route(
-            "/console/integrations/toggle",
-            post(pages::console_toggle_bridge),
-        )
-        .route(
-            "/console/bans",
-            get(pages::console_server_bans).post(pages::console_add_ban),
-        )
-        .route("/console/bans/delete", post(pages::console_remove_ban))
-        .route(
-            "/console/admin/channels/drop",
-            post(pages::console_drop_channel),
-        )
+        .route("/console/bans", get(pages::console_server_bans))
         .route("/console/sessions", get(pages::console_sessions))
-        .route(
-            "/console/sessions/{id}/disconnect",
-            post(pages::console_disconnect_session),
-        )
         .route("/console/my-sessions", get(pages::console_my_sessions))
-        .route(
-            "/console/my-sessions/{id}/disconnect",
-            post(pages::console_disconnect_own_session),
-        )
-        .route(
-            "/console/my-sessions/browser/{id}/delete",
-            post(pages::console_revoke_browser_session),
-        )
-        .route(
-            "/console/my-sessions/browser/others/delete",
-            post(pages::console_revoke_other_browser_sessions),
-        )
         .route(
             "/device",
             get(pages::device_page).post(pages::approve_device_form),
@@ -1452,6 +1250,94 @@ mod web {
 
     pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
         serve(&format!("assets/{path}"))
+    }
+}
+
+/// Reject a credential mutation while the config still holds bootstrap-sealed
+/// credentials. A master key and restart are required before changing them.
+fn reject_bootstrap_credential_change(
+    settings: &crate::config::ManagedConfig,
+    credential_kind: &str,
+) -> Result<(), String> {
+    (!settings.credentials_from_bootstrap)
+        .then_some(())
+        .ok_or_else(|| {
+            format!(
+                "Configure a master key and restart before changing bootstrap {credential_kind} credentials."
+            )
+        })
+}
+
+/// Remove one named managed-configuration item, reporting a missing name.
+fn remove_named<T>(
+    items: &mut Vec<T>,
+    name: &str,
+    item_kind: &str,
+    item_name: impl Fn(&T) -> &str,
+) -> Result<(), String> {
+    let before = items.len();
+    items.retain(|item| item_name(item) != name);
+    (items.len() != before)
+        .then_some(())
+        .ok_or_else(|| format!("No {item_kind} named '{name}'."))
+}
+
+fn add_managed_oper(
+    settings: &mut crate::config::ManagedConfig,
+    oper: crate::config::OperConfig,
+) -> Result<String, String> {
+    reject_bootstrap_credential_change(settings, "operator")?;
+    let name = oper.name.clone();
+    settings.opers.push(oper);
+    Ok(format!("added IRC operator {name}"))
+}
+
+fn add_managed_oidc_provider(
+    settings: &mut crate::config::ManagedConfig,
+    provider: crate::config::OidcProviderConfig,
+) -> Result<String, String> {
+    reject_bootstrap_credential_change(settings, "identity-provider")?;
+    let name = provider.name.clone();
+    settings.oidc_providers.push(provider);
+    Ok(format!("added OpenID Connect provider {name}"))
+}
+
+struct ManagedConfigurationItem<T> {
+    credential_kind: &'static str,
+    item_kind: &'static str,
+    action_kind: &'static str,
+    items: fn(&mut crate::config::ManagedConfig) -> &mut Vec<T>,
+    item_name: fn(&T) -> &str,
+}
+
+fn delete_managed_configuration_item<T>(
+    settings: &mut crate::config::ManagedConfig,
+    name: &str,
+    item: ManagedConfigurationItem<T>,
+) -> Result<String, String> {
+    reject_bootstrap_credential_change(settings, item.credential_kind)?;
+    remove_named((item.items)(settings), name, item.item_kind, item.item_name)?;
+    Ok(format!("removed {} {name}", item.action_kind))
+}
+
+fn oidc_provider_configuration_item() -> ManagedConfigurationItem<crate::config::OidcProviderConfig>
+{
+    ManagedConfigurationItem {
+        credential_kind: "identity-provider",
+        item_kind: "identity provider",
+        action_kind: "OpenID Connect provider",
+        items: |settings| &mut settings.oidc_providers,
+        item_name: |provider| &provider.name,
+    }
+}
+
+fn oper_configuration_item() -> ManagedConfigurationItem<crate::config::OperConfig> {
+    ManagedConfigurationItem {
+        credential_kind: "operator",
+        item_kind: "IRC operator",
+        action_kind: "IRC operator",
+        items: |settings| &mut settings.opers,
+        item_name: |oper| &oper.name,
     }
 }
 
@@ -2136,104 +2022,6 @@ mod pages {
             .into_response()
     }
 
-    /// The console add-network form (urlencoded). `tls` is an
-    /// HTML checkbox (`"on"` when checked, absent otherwise). The SASL pair and
-    /// realname are optional text inputs that submit as empty strings when left
-    /// blank, so `into_create` maps blank → `None`.
-    #[derive(Deserialize)]
-    pub struct NetworkFormFields {
-        csrf: String,
-        #[serde(default)]
-        preset: String,
-        name: String,
-        addr: String,
-        nick: String,
-        #[serde(default)]
-        tls: Option<String>,
-        #[serde(default)]
-        autojoin: String,
-        #[serde(default)]
-        realname: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-    }
-
-    impl NetworkFormFields {
-        /// Resolve a selected catalog entry into the submitted fields. Doing
-        /// this server-side makes presets work without JavaScript; mutating the
-        /// fields also ensures a later validation error re-renders the values
-        /// that will actually be submitted, not stale values from the previous
-        /// selection.
-        fn apply_preset(&mut self) -> Result<(), NetworkMutationError> {
-            if !self.preset.is_empty() && self.preset != "custom" {
-                let Some(preset) = irc_network_preset(&self.preset) else {
-                    return Err(NetworkMutationError::new(
-                        StatusCode::BAD_REQUEST,
-                        "Unknown IRC network preset",
-                        Some("select one of the listed networks or Custom"),
-                    ));
-                };
-                self.name = preset.name.to_string();
-                self.addr = preset.addr.to_string();
-                self.tls = preset.tls.then(|| "on".to_string());
-            }
-            Ok(())
-        }
-
-        /// Build the `CreateNetwork` for an IRC upstream from already-resolved
-        /// form fields, treating a blank optional text input as absent.
-        fn into_resolved_create(self) -> CreateNetwork {
-            let opt = |s: String| {
-                let s = s.trim().to_string();
-                (!s.is_empty()).then_some(s)
-            };
-            CreateNetwork {
-                kind: crate::config::NetworkKind::Irc,
-                name: self.name.trim().to_string(),
-                addr: self.addr.trim().to_string(),
-                tls: self.tls.as_deref() == Some("on"),
-                nick: self.nick.trim().to_string(),
-                realname: opt(self.realname),
-                autojoin: self
-                    .autojoin
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                sasl_account: opt(self.sasl_account),
-                sasl_password: opt(self.sasl_password),
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    /// A form failure plus the field it belongs to, when it has one. Field
-    /// errors render inline at the offending input; fieldless failures render
-    /// as the page banner.
-    struct FormFieldError {
-        message: String,
-        field: Option<&'static str>,
-    }
-
-    impl FormFieldError {
-        fn banner(message: impl Into<String>) -> Self {
-            Self {
-                message: message.into(),
-                field: None,
-            }
-        }
-
-        fn from_mutation(error: &crate::http::networks::NetworkMutationError) -> Self {
-            Self {
-                message: error.message(),
-                field: error.field(),
-            }
-        }
-    }
-
     struct NetworkFormView {
         preset: String,
         name: String,
@@ -2260,19 +2048,6 @@ mod pages {
                 tls: preset.tls,
             }
         }
-
-        fn submitted(fields: &NetworkFormFields) -> Self {
-            Self {
-                preset: fields.preset.clone(),
-                name: fields.name.clone(),
-                addr: fields.addr.clone(),
-                nick: fields.nick.clone(),
-                realname: fields.realname.clone(),
-                autojoin: fields.autojoin.clone(),
-                sasl_account: fields.sasl_account.clone(),
-                tls: fields.tls.as_deref() == Some("on"),
-            }
-        }
     }
 
     struct CredentialView {
@@ -2284,24 +2059,11 @@ mod pages {
         revocable: bool,
     }
 
-    struct ApiTokenView {
-        id: i64,
-        label: String,
-        created: String,
-        expires: String,
-        scopes: String,
-    }
-
     struct IdentityView {
         id: i64,
         issuer: String,
         subject: String,
         created: String,
-    }
-
-    struct ReadMarkerView {
-        target: String,
-        timestamp: String,
     }
 
     #[derive(Template)]
@@ -2310,26 +2072,14 @@ mod pages {
         shell: ConsoleShell,
         credentials: Vec<CredentialView>,
         has_local_password: bool,
-        tokens: Vec<ApiTokenView>,
         identities: Vec<IdentityView>,
-        read_markers: Vec<ReadMarkerView>,
-        security_activity: Vec<AuditRow>,
-        contact_email: String,
         link_providers: Vec<String>,
-        outcome: Option<String>,
-        success: bool,
-        secret: Option<String>,
-        secret_kind: &'static str,
     }
 
     async fn account_build(
         state: &AppState,
         account: String,
         csrf: String,
-        outcome: Option<String>,
-        success: bool,
-        secret: Option<String>,
-        secret_kind: &'static str,
     ) -> Result<ConsoleAccount, Response> {
         let pool = pool_of(state);
         let credentials: Vec<CredentialView> = crate::db::list_credentials(pool, &account)
@@ -2348,23 +2098,6 @@ mod pages {
         let has_local_password = credentials
             .iter()
             .any(|credential| credential.kind == "local_password");
-        let tokens = crate::db::list_api_tokens(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("token list", e))?
-            .into_iter()
-            .map(|token| ApiTokenView {
-                id: token.id,
-                label: token.label,
-                created: token.created_at,
-                expires: token.expires_at,
-                scopes: token
-                    .scopes
-                    .iter()
-                    .map(crate::identity::ApiTokenScope::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            })
-            .collect();
         let identities = crate::db::list_oidc_identities(pool, &account)
             .await
             .map_err(|e| super::device::admin_db_error("identity list", e))?
@@ -2376,28 +2109,6 @@ mod pages {
                 created,
             })
             .collect();
-        let read_markers = crate::db::list_read_markers(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("read-marker list", e))?
-            .into_iter()
-            .map(|(target, timestamp)| ReadMarkerView { target, timestamp })
-            .collect();
-        let contact_email = crate::db::account_contact_email(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("profile read", e))?
-            .unwrap_or_default();
-        let security_activity = crate::db::query_account_security_activity(
-            pool,
-            &account,
-            None,
-            crate::db::AuditLogPageSize::new(50).expect("static activity page size is valid"),
-        )
-        .await
-        .map_err(|e| super::device::admin_db_error("security activity", e))?
-        .entries
-        .into_iter()
-        .map(AuditRow::from)
-        .collect();
         let link_providers = state
             .oidc_providers
             .iter()
@@ -2407,16 +2118,8 @@ mod pages {
             shell: console_shell(state, account, csrf, "account"),
             credentials,
             has_local_password,
-            tokens,
             identities,
-            read_markers,
-            security_activity,
-            contact_email,
             link_providers,
-            outcome,
-            success,
-            secret,
-            secret_kind,
         })
     }
 
@@ -2481,700 +2184,9 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response,
         };
-        match account_build(&state, account, csrf, None, true, None, "").await {
+        match account_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(response) => response,
-        }
-    }
-
-    pub async fn console_update_profile(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountContactForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let contact_email = if form.contact_email.trim().is_empty() {
-            None
-        } else {
-            match crate::identity::ContactEmail::parse(form.contact_email.trim()) {
-                Ok(email) => Some(email),
-                Err(error) => {
-                    return account_result(
-                        &state,
-                        account,
-                        &headers,
-                        AccountResult::message(StatusCode::BAD_REQUEST, error.to_string()),
-                    )
-                    .await;
-                }
-            }
-        };
-        let result =
-            crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
-                .await;
-        let view = match result {
-            Ok(()) => AccountResult::message(
-                StatusCode::OK,
-                if contact_email.is_some() {
-                    "Contact email updated."
-                } else {
-                    "Contact email removed."
-                },
-            ),
-            Err(error) => {
-                eprintln!("http: contact email update failed: {error}");
-                AccountResult::message(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Contact email was not changed.",
-                )
-            }
-        };
-        account_result(&state, account, &headers, view).await
-    }
-
-    pub async fn console_delete_own_account(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<
-            axum::Form<AccountPermanentDeleteForm>,
-            axum::extract::rejection::FormRejection,
-        >,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if form.confirmation != account {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::BAD_REQUEST,
-                    "Account confirmation does not match. Supply the exact display-cased account name.",
-                ),
-            )
-            .await;
-        }
-        let account_id = match crate::db::account_id_by_name(pool_of(&state), &account).await {
-            Ok(Some(account_id)) => account_id,
-            Ok(None) => return Redirect::to("/login").into_response(),
-            Err(error) => return super::device::admin_db_error("account deletion target", error),
-        };
-        match delete_account_lifecycle(&state, &account, account_id, true).await {
-            Ok(_) => redirect_signed_out(&state),
-            Err((status, detail)) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(status, detail),
-                )
-                .await
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountLabelForm {
-        csrf: String,
-        label: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountContactForm {
-        csrf: String,
-        #[serde(default)]
-        contact_email: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountTokenForm {
-        csrf: String,
-        label: String,
-        expires_in_days: u16,
-        #[serde(default)]
-        scope_read: Option<String>,
-        #[serde(default)]
-        scope_write: Option<String>,
-        #[serde(default)]
-        scope_administrator: Option<String>,
-        #[serde(default)]
-        scope_irc: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountDeleteForm {
-        csrf: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountPermanentDeleteForm {
-        csrf: String,
-        confirmation: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountPasswordForm {
-        csrf: String,
-        #[serde(default)]
-        current_password: String,
-        new_password: String,
-        confirm_password: String,
-    }
-
-    trait AccountForm {
-        fn csrf(&self) -> &str;
-    }
-
-    /// Every form type carrying a `csrf` field implements [`AccountForm`] the
-    /// same way — one macro so the mapping can't drift (or grow a copy that
-    /// points at the wrong field).
-    macro_rules! account_form {
-        ($($t:ty),* $(,)?) => {
-            $(impl AccountForm for $t {
-                fn csrf(&self) -> &str {
-                    &self.csrf
-                }
-            })*
-        };
-    }
-    account_form!(
-        AccountLabelForm,
-        AccountTokenForm,
-        AccountContactForm,
-        AccountDeleteForm,
-        AccountPermanentDeleteForm,
-        AccountPasswordForm,
-        ToggleFields,
-        NetworkFormFields,
-        NetworkEditForm,
-        BridgeToggleFields,
-        BridgeDeleteFields,
-        BridgeFormFields,
-        BridgeEditFormFields,
-        BanForm,
-        BanDeleteForm,
-        DropChannelForm,
-    );
-
-    async fn account_form_actor<T: AccountForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, T), Response> {
-        let fields = parse_form(form)?;
-        let account = require_form_actor(state, headers, fields.csrf()).await?;
-        Ok((account, fields))
-    }
-
-    /// Parse a console form and authenticate its actor as an administrator —
-    /// the admin-gated sibling of [`account_form_actor`].
-    async fn admin_form_actor<T: AccountForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, T), Response> {
-        let fields = parse_form(form)?;
-        let account = require_admin_form_actor(state, headers, fields.csrf()).await?;
-        Ok((account, fields))
-    }
-
-    async fn account_label_actor(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, String), Response> {
-        let (account, form) = account_form_actor(state, headers, form).await?;
-        if let Some(error) = label_validation_error(&form.label) {
-            return Err(account_result(
-                state,
-                account,
-                headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, error),
-            )
-            .await);
-        }
-        Ok((account, form.label))
-    }
-
-    struct AccountResult {
-        status: StatusCode,
-        message: String,
-        secret: Option<String>,
-        secret_kind: &'static str,
-    }
-
-    impl AccountResult {
-        fn message(status: StatusCode, message: impl Into<String>) -> Self {
-            Self {
-                status,
-                message: message.into(),
-                secret: None,
-                secret_kind: "",
-            }
-        }
-
-        fn issued(
-            status: StatusCode,
-            message: impl Into<String>,
-            secret: String,
-            secret_kind: &'static str,
-        ) -> Self {
-            Self {
-                status,
-                message: message.into(),
-                secret: Some(secret),
-                secret_kind,
-            }
-        }
-    }
-
-    async fn account_result(
-        state: &AppState,
-        account: String,
-        headers: &axum::http::HeaderMap,
-        result: AccountResult,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        match account_build(
-            state,
-            account,
-            csrf,
-            Some(result.message),
-            result.status.is_success(),
-            result.secret,
-            result.secret_kind,
-        )
-        .await
-        {
-            Ok(view) => {
-                let mut response = render_private(view);
-                *response.status_mut() = result.status;
-                response
-            }
-            Err(response) => response,
-        }
-    }
-
-    struct AccountDeleteMessages {
-        success: &'static str,
-        missing: &'static str,
-        operation: &'static str,
-    }
-
-    /// The shared body of the "revoke one owned credential by id" console
-    /// handlers: authenticate the form actor, run the delete, and render the
-    /// outcome with the per-endpoint messages. `delete` is a boxed future so
-    /// the two async db fns fit one signature.
-    #[allow(clippy::type_complexity)] // HRTB boxed future — the only shape that fits two async db fns
-    async fn console_revoke_owned(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-        id: i64,
-        delete: for<'a> fn(
-            &'a sqlx::PgPool,
-            &'a str,
-            i64,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<bool, crate::db::DbError>> + Send + 'a>,
-        >,
-        messages: AccountDeleteMessages,
-    ) -> Response {
-        let (account, _) = match account_form_actor(state, headers, form).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let result = delete(pool_of(state), &account, id).await;
-        account_delete_result(state, account, headers, result, messages).await
-    }
-
-    struct AccountIssueMessages {
-        success: &'static str,
-        secret_kind: &'static str,
-        cap_reached: &'static str,
-        operation: &'static str,
-    }
-
-    async fn account_issue_result(
-        state: &AppState,
-        account: String,
-        headers: &axum::http::HeaderMap,
-        result: Result<String, crate::db::DbError>,
-        messages: AccountIssueMessages,
-    ) -> Response {
-        match result {
-            Ok(secret) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::issued(
-                        StatusCode::CREATED,
-                        messages.success,
-                        secret,
-                        messages.secret_kind,
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::TooManyCredentials) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::message(StatusCode::CONFLICT, messages.cap_reached),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error(messages.operation, error),
-        }
-    }
-
-    async fn account_delete_result(
-        state: &AppState,
-        account: String,
-        headers: &axum::http::HeaderMap,
-        result: Result<bool, crate::db::DbError>,
-        messages: AccountDeleteMessages,
-    ) -> Response {
-        match result {
-            Ok(true) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::message(StatusCode::OK, messages.success),
-                )
-                .await
-            }
-            Ok(false) => {
-                account_result(
-                    state,
-                    account,
-                    headers,
-                    AccountResult::message(StatusCode::NOT_FOUND, messages.missing),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error(messages.operation, error),
-        }
-    }
-
-    pub async fn console_create_app_password(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountLabelForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, label) = match account_label_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let result =
-            crate::db::issue_app_password_for_account(pool_of(&state), &account, &label).await;
-        account_issue_result(
-            &state,
-            account,
-            &headers,
-            result,
-            AccountIssueMessages {
-                success: "App password created. Copy it now; it cannot be shown again.",
-                secret_kind: "App password",
-                cap_reached: "Too many app passwords. Revoke one before creating another.",
-                operation: "app-password creation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_change_password(
-        State(state): State<Arc<AppState>>,
-        _rate_limited: RateLimited,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountPasswordForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if let Some(detail) = (!form.current_password.is_empty())
-            .then(|| password_input_error(&form.current_password))
-            .flatten()
-            .or_else(|| password_input_error(&form.new_password))
-        {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, detail),
-            )
-            .await;
-        }
-        if form.new_password != form.confirm_password {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::BAD_REQUEST,
-                    "The new password and confirmation do not match.",
-                ),
-            )
-            .await;
-        }
-        let adding_first_password = form.current_password.is_empty();
-        let result = if adding_first_password {
-            crate::db::set_local_password(pool_of(&state), &account, &form.new_password).await
-        } else {
-            crate::db::change_local_password(
-                pool_of(&state),
-                &account,
-                &form.current_password,
-                &form.new_password,
-            )
-            .await
-        };
-        match result {
-            Ok(()) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::OK,
-                        if adding_first_password {
-                            "Local password added."
-                        } else {
-                            "Primary password changed."
-                        },
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::BadCredentials) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::UNAUTHORIZED,
-                        "The current password is incorrect.",
-                    ),
-                )
-                .await
-            }
-            Err(crate::db::DbError::LocalPasswordExists) => account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::CONFLICT,
-                    "This account already has a primary password. Enter it to rotate the password.",
-                ),
-            )
-            .await,
-            Err(error) => super::device::admin_db_error("password rotation", error),
-        }
-    }
-
-    pub async fn console_revoke_app_password(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        console_revoke_owned(
-            &state,
-            &headers,
-            form,
-            id,
-            |pool, account, id| Box::pin(crate::db::revoke_credential(pool, account, id)),
-            AccountDeleteMessages {
-                success: "App password revoked.",
-                missing: "No revocable app password with that identifier.",
-                operation: "app-password revocation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_create_api_token(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountTokenForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if let Some(error) = label_validation_error(&form.label) {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, error),
-            )
-            .await;
-        }
-        let scopes = [
-            form.scope_read
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Read),
-            form.scope_write
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Write),
-            form.scope_administrator
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Administrator),
-            form.scope_irc
-                .is_some()
-                .then_some(crate::identity::ApiTokenScope::Irc),
-        ]
-        .into_iter()
-        .flatten();
-        let Some(scopes) = crate::identity::ApiTokenScopes::new(scopes) else {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(StatusCode::BAD_REQUEST, "Choose at least one token scope."),
-            )
-            .await;
-        };
-        let Some(lifetime) = crate::identity::ApiTokenLifetimeDays::new(form.expires_in_days)
-        else {
-            return account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::BAD_REQUEST,
-                    "Token lifetime must be between 1 and 365 days.",
-                ),
-            )
-            .await;
-        };
-        let result = crate::db::issue_scoped_api_token(
-            pool_of(&state),
-            &account,
-            &form.label,
-            scopes,
-            lifetime,
-        )
-        .await;
-        account_issue_result(
-            &state,
-            account,
-            &headers,
-            result,
-            AccountIssueMessages {
-                success: "Personal access token created. Copy it now; it cannot be shown again.",
-                secret_kind: "Personal access token",
-                cap_reached: "Too many personal access tokens. Revoke one before creating another.",
-                operation: "token creation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_revoke_api_token(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        console_revoke_owned(
-            &state,
-            &headers,
-            form,
-            id,
-            |pool, account, id| Box::pin(crate::db::delete_api_token(pool, account, id)),
-            AccountDeleteMessages {
-                success: "Personal access token revoked.",
-                missing: "No personal access token with that identifier.",
-                operation: "token revocation",
-            },
-        )
-        .await
-    }
-
-    pub async fn console_unlink_identity(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        match crate::db::unlink_oidc_identity(pool_of(&state), &account, id).await {
-            Ok(crate::db::UnlinkIdentityOutcome::Unlinked) => {
-                let session_still_valid = match session_token(&headers, state.secure_cookies) {
-                    Some(token) => {
-                        crate::db::session_account(pool_of(&state), &token)
-                            .await
-                            .map_err(|error| {
-                                super::device::admin_db_error("session refresh", error)
-                            })
-                    }
-                    None => Ok(None),
-                };
-                match session_still_valid {
-                    Ok(Some(_)) => {
-                        account_result(
-                            &state,
-                            account,
-                            &headers,
-                            AccountResult::message(
-                                StatusCode::OK,
-                                "Login identity unlinked.",
-                            ),
-                        )
-                        .await
-                    }
-                    Ok(None) => {
-                        let mut response = Redirect::to("/login").into_response();
-                        response.headers_mut().insert(
-                            header::SET_COOKIE,
-                            clear_session_cookie(state.secure_cookies)
-                                .parse()
-                                .expect("session clear cookie is valid"),
-                        );
-                        response
-                    }
-                    Err(response) => response,
-                }
-            }
-            Ok(crate::db::UnlinkIdentityOutcome::LastLoginMethod) => account_result(
-                &state,
-                account,
-                &headers,
-                AccountResult::message(
-                    StatusCode::CONFLICT,
-                    "This is your last login method. Add a local password or link another provider before removing it.",
-                ),
-            )
-            .await,
-            Ok(crate::db::UnlinkIdentityOutcome::NotFound) => {
-                account_result(
-                    &state,
-                    account,
-                    &headers,
-                    AccountResult::message(
-                        StatusCode::NOT_FOUND,
-                        "No linked identity with that identifier.",
-                    ),
-                )
-                .await
-            }
-            Err(error) => super::device::admin_db_error("identity unlink", error),
         }
     }
 
@@ -3200,14 +2212,12 @@ mod pages {
     struct ConsoleChannels {
         shell: ConsoleShell,
         channels: Vec<OwnedChannelView>,
-        error: Option<String>,
     }
 
     async fn console_channels_build(
         state: &AppState,
         account: String,
         csrf: String,
-        error: Option<String>,
     ) -> Result<ConsoleChannels, Response> {
         let channels = crate::db::list_owned_channels(pool_of(state), &account)
             .await
@@ -3237,7 +2247,6 @@ mod pages {
         Ok(ConsoleChannels {
             shell: console_shell(state, account, csrf, "channels"),
             channels,
-            error,
         })
     }
 
@@ -3249,257 +2258,13 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        match console_channels_build(&state, account, csrf, None).await {
+        match console_channels_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
     }
 
-    #[derive(Deserialize)]
-    pub struct ChannelTopicForm {
-        csrf: String,
-        channel: String,
-        #[serde(default)]
-        topic: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelRegisterForm {
-        csrf: String,
-        channel: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelKeeptopicForm {
-        csrf: String,
-        channel: String,
-        enabled: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelMlockForm {
-        csrf: String,
-        channel: String,
-        #[serde(default)]
-        mlock: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelAccessForm {
-        csrf: String,
-        channel: String,
-        account: String,
-        #[serde(default)]
-        auto_op: Option<String>,
-        #[serde(default)]
-        auto_voice: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelAccessDeleteForm {
-        csrf: String,
-        channel: String,
-        account: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ChannelFounderForm {
-        csrf: String,
-        channel: String,
-        account: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct OwnedChannelDropForm {
-        csrf: String,
-        channel: String,
-    }
-
-    async fn run_owned_channel_form(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-        channel: String,
-        mutation: crate::core::ChannelMutation,
-    ) -> Response {
-        let account = match require_form_actor(state, headers, csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let request = crate::core::AdminRequest::MutateOwnedChannel {
-            channel,
-            actor: account.clone(),
-            mutation,
-        };
-        match core_action(state, request).await {
-            Ok(_) => Redirect::to("/console/channels").into_response(),
-            Err(message) => {
-                let csrf = session_token(headers, state.secure_cookies)
-                    .map(|session| state.csrf_token(&session))
-                    .unwrap_or_default();
-                match console_channels_build(state, account, csrf, Some(message)).await {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-        }
-    }
-
-    pub async fn console_channel_topic(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelTopicForm>,
-    ) -> Response {
-        let topic = (!form.topic.trim().is_empty()).then_some(form.topic);
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetTopic { topic },
-        )
-        .await
-    }
-
-    pub async fn console_channel_register(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelRegisterForm>,
-    ) -> Response {
-        let account = match require_form_actor(&state, &headers, &form.csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let request = crate::core::AdminRequest::RegisterOwnedChannel {
-            channel: form.channel,
-            actor: account.clone(),
-        };
-        match core_action(&state, request).await {
-            Ok(_) => Redirect::to("/console/channels").into_response(),
-            Err(message) => {
-                match console_channels_build(&state, account, form.csrf, Some(message)).await {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-        }
-    }
-
-    pub async fn console_channel_keeptopic(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelKeeptopicForm>,
-    ) -> Response {
-        let enabled = match form.enabled.as_str() {
-            "on" => true,
-            "off" => false,
-            _ => {
-                return problem(StatusCode::BAD_REQUEST, "Invalid KEEPTOPIC value", None);
-            }
-        };
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetKeeptopic { enabled },
-        )
-        .await
-    }
-
-    pub async fn console_channel_mlock(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelMlockForm>,
-    ) -> Response {
-        let mlock = (!form.mlock.trim().is_empty()).then_some(form.mlock);
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetMlock { mlock },
-        )
-        .await
-    }
-
-    pub async fn console_channel_access(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelAccessForm>,
-    ) -> Response {
-        let mut flags = String::new();
-        if form.auto_op.is_some() {
-            flags.push('o');
-        }
-        if form.auto_voice.is_some() {
-            flags.push('v');
-        }
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetAccess {
-                account: form.account,
-                flags: Some(flags),
-            },
-        )
-        .await
-    }
-
-    pub async fn console_channel_access_delete(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelAccessDeleteForm>,
-    ) -> Response {
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::SetAccess {
-                account: form.account,
-                flags: None,
-            },
-        )
-        .await
-    }
-
-    pub async fn console_channel_founder(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<ChannelFounderForm>,
-    ) -> Response {
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::TransferFounder {
-                account: form.account,
-            },
-        )
-        .await
-    }
-
-    pub async fn console_channel_drop(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        FormBody(form): FormBody<OwnedChannelDropForm>,
-    ) -> Response {
-        run_owned_channel_form(
-            &state,
-            &headers,
-            &form.csrf,
-            form.channel,
-            crate::core::ChannelMutation::Drop,
-        )
-        .await
-    }
-
     struct AuditRow {
-        id: i64,
         at: String,
         actor: String,
         action: String,
@@ -3510,7 +2275,6 @@ mod pages {
     impl From<crate::db::AuditLogRow> for AuditRow {
         fn from(entry: crate::db::AuditLogRow) -> Self {
             Self {
-                id: entry.id,
                 at: entry.created_at,
                 actor: entry.actor,
                 action: entry.action,
@@ -3554,74 +2318,46 @@ mod pages {
         has_filter: bool,
         has_cursor: bool,
         next_before_id: Option<i64>,
-        outcome: Option<String>,
-        success: bool,
-        invitation_url: Option<String>,
     }
 
     #[derive(Template)]
     #[template(path = "console_admin_channels.html")]
     struct ConsoleAdminChannels {
         shell: ConsoleShell,
-        entries: Vec<crate::db::RegisteredChannelDirectoryRow>,
         name: String,
         founder: String,
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-        next_before_id: Option<i64>,
-        error: Option<String>,
-    }
-
-    /// One row of the admin fleet view: a network of any account with its
-    /// live driver state.
-    struct ConsoleAdminNetworkView {
-        owner: String,
-        name: String,
-        kind: String,
-        addr: String,
-        tls: bool,
-        enabled: bool,
-        connected: bool,
-        state: String,
-        attached_clients: u64,
-        errors: u64,
-        last_error: Option<String>,
     }
 
     #[derive(Template)]
     #[template(path = "console_admin_networks.html")]
     struct ConsoleAdminNetworks {
         shell: ConsoleShell,
-        networks: Vec<ConsoleAdminNetworkView>,
     }
 
     #[derive(Template)]
     #[template(path = "console_bans.html")]
     struct ConsoleServerBans {
         shell: ConsoleShell,
-        entries: Vec<crate::db::ServerBanDirectoryRow>,
         kind: String,
         mask: String,
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-        next_before_id: Option<i64>,
-        error: Option<String>,
     }
 
     #[derive(Template)]
     #[template(path = "console_audit.html")]
     struct ConsoleAudit {
         shell: ConsoleShell,
-        entries: Vec<AuditRow>,
         actor: String,
         action: String,
         target: String,
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-        next_before_id: Option<i64>,
     }
 
     /// Assemble the bounded admin overview. Callers have already admin-gated
@@ -4278,19 +3014,12 @@ mod pages {
         })
     }
 
-    struct AccountDirectorySubmission {
-        outcome: String,
-        success: bool,
-        invitation_url: Option<String>,
-    }
-
     async fn console_accounts_response(
         state: &AppState,
         account: String,
         csrf: String,
         params: super::device::AccountDirectoryQuery,
         invitation_before_id: Option<i64>,
-        submission: Option<AccountDirectorySubmission>,
     ) -> Response {
         let query = match super::device::validate_account_directory_query(params, 50) {
             Ok(query) => query,
@@ -4334,14 +3063,6 @@ mod pages {
         }
         let name = query.name.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
-        let (outcome, success, invitation_url) =
-            submission.map_or((None, true, None), |submission| {
-                (
-                    Some(submission.outcome),
-                    submission.success,
-                    submission.invitation_url,
-                )
-            });
         render_private(ConsoleAccounts {
             shell: console_shell(state, account, csrf, "accounts"),
             entries: page.entries,
@@ -4353,9 +3074,6 @@ mod pages {
             name,
             limit: query.page_size.value(),
             next_before_id: page.next_before_id,
-            outcome,
-            success,
-            invitation_url,
         })
     }
 
@@ -4375,7 +3093,6 @@ mod pages {
                 name: params.name,
             },
             invitation_before_id,
-            None,
         )
         .await
     }
@@ -4388,274 +3105,21 @@ mod pages {
         invitation_before_id: Option<i64>,
     }
 
-    #[derive(Deserialize)]
-    pub struct AccountSuspensionForm {
-        csrf: String,
-        suspended: bool,
-    }
-
-    pub async fn console_account_suspension(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(account_id): Path<i64>,
-        form: Result<axum::Form<AccountSuspensionForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        match mutate_account_suspension(&state, &actor, account_id, form.suspended).await {
-            Ok(_message) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(status, "Account state change failed", Some(&detail)),
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountAdministratorForm {
-        csrf: String,
-        administrator: bool,
-    }
-
-    pub async fn console_account_administrator(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(account_id): Path<i64>,
-        form: Result<axum::Form<AccountAdministratorForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        match mutate_account_administrator(&state, &actor, account_id, form.administrator).await {
-            Ok(_message) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(
-                status,
-                "Administrator authority change failed",
-                Some(&detail),
-            ),
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountCreateForm {
-        csrf: String,
-        account: String,
-        password: String,
-        #[serde(default)]
-        contact_email: String,
-        #[serde(default)]
-        administrator: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountInvitationForm {
-        csrf: String,
-        account: String,
-        #[serde(default)]
-        contact_email: String,
-        expires_in_days: u16,
-        #[serde(default)]
-        administrator: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct AccountInvitationRevokeForm {
-        csrf: String,
-    }
-
-    pub async fn console_create_account(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountCreateForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let contact_email =
-            (!form.contact_email.trim().is_empty()).then_some(form.contact_email.trim());
-        match create_account_lifecycle(
-            &state,
-            &actor,
-            &form.account,
-            &form.password,
-            contact_email,
-            form.administrator.as_deref() == Some("on"),
-        )
-        .await
-        {
-            Ok(_) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(status, "Account creation failed", Some(&detail)),
-        }
-    }
-
-    pub async fn console_create_invitation(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountInvitationForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let result = if !crate::sanitize::valid_nick(&form.account, MAX_ACCOUNT_LEN) {
-            Err((
-                StatusCode::BAD_REQUEST,
-                "The account must be a valid IRC nickname of at most 64 bytes.".to_string(),
-            ))
-        } else {
-            let contact_email = if form.contact_email.trim().is_empty() {
-                Ok(None)
-            } else {
-                crate::identity::ContactEmail::parse(form.contact_email.trim())
-                    .map(Some)
-                    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))
-            };
-            let lifetime =
-                crate::identity::AccountInvitationLifetimeDays::new(form.expires_in_days).ok_or((
-                    StatusCode::BAD_REQUEST,
-                    "Invitation lifetime must be between 1 and 30 days.".to_string(),
-                ));
-            match (contact_email, lifetime) {
-                (Ok(contact_email), Ok(lifetime)) => crate::db::issue_account_invitation(
-                    pool_of(&state),
-                    &form.account,
-                    contact_email.as_ref(),
-                    form.administrator.as_deref() == Some("on"),
-                    lifetime,
-                    &actor,
-                )
-                .await
-                .map_err(|error| match error {
-                    crate::db::DbError::DuplicateAccount(_) => (
-                        StatusCode::CONFLICT,
-                        "The account name already exists, is retired, or has a pending invitation."
-                            .to_string(),
-                    ),
-                    crate::db::DbError::TooManyInvitations => {
-                        (StatusCode::CONFLICT, error.to_string())
-                    }
-                    _ => {
-                        eprintln!("account invitation issuance failed: {error}");
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Invitation storage unavailable.".to_string(),
-                        )
-                    }
-                }),
-                (Err(error), _) | (_, Err(error)) => Err(error),
-            }
-        };
-        let (status, outcome, invitation_url) = match result {
-            Ok(token) => {
-                let url = account_invitation_url(&state, &token);
-                (
-                    StatusCode::OK,
-                    "Invitation issued. Copy the single-use link before leaving this page."
-                        .to_string(),
-                    Some(url),
-                )
-            }
-            Err((status, detail)) => (status, detail, None),
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        let mut response = console_accounts_response(
-            &state,
-            actor,
-            csrf,
-            super::device::AccountDirectoryQuery::default(),
-            None,
-            Some(AccountDirectorySubmission {
-                outcome,
-                success: status.is_success(),
-                invitation_url,
-            }),
-        )
-        .await;
-        *response.status_mut() = status;
-        response
-    }
-
-    pub async fn console_revoke_invitation(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(invitation_id): Path<i64>,
-        form: Result<
-            axum::Form<AccountInvitationRevokeForm>,
-            axum::extract::rejection::FormRejection,
-        >,
-    ) -> Response {
-        let (_form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        match crate::db::revoke_account_invitation(pool_of(&state), invitation_id, &actor).await {
-            Ok(true) => Redirect::to("/console/accounts").into_response(),
-            Ok(false) => problem(StatusCode::NOT_FOUND, "Invitation unavailable", None),
-            Err(error) => super::device::admin_db_error("account invitation revocation", error),
-        }
-    }
-
-    pub async fn console_delete_account(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(account_id): Path<i64>,
-        form: Result<
-            axum::Form<AccountPermanentDeleteForm>,
-            axum::extract::rejection::FormRejection,
-        >,
-    ) -> Response {
-        let (form, actor) = match parse_admin_form(&state, &headers, form).await {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let target = match crate::db::account_name_by_id(pool_of(&state), account_id).await {
-            Ok(Some(target)) => target,
-            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such account", None),
-            Err(error) => {
-                return super::device::admin_db_error("account deletion target", error);
-            }
-        };
-        if form.confirmation != target {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Account confirmation does not match",
-                Some("Supply the exact display-cased account name."),
-            );
-        }
-        match delete_account_lifecycle(&state, &actor, account_id, false).await {
-            Ok(_) => Redirect::to("/console/accounts").into_response(),
-            Err((status, detail)) => problem(status, "Account deletion failed", Some(&detail)),
-        }
-    }
-
     async fn console_admin_channels_build(
         state: &AppState,
         account: String,
         csrf: String,
         query: super::device::ValidatedRegisteredChannelDirectoryQuery,
-        error: Option<String>,
     ) -> Result<ConsoleAdminChannels, Response> {
-        let page =
-            crate::db::query_registered_channel_directory(pool_of(state), query.database_filter())
-                .await
-                .map_err(|error| {
-                    super::device::admin_db_error("registered-channel directory", error)
-                })?;
         let name = query.name.unwrap_or_default();
         let founder = query.founder.unwrap_or_default();
         Ok(ConsoleAdminChannels {
             shell: console_shell(state, account, csrf, "admin-channels"),
-            entries: page.entries,
             has_filters: !name.is_empty() || !founder.is_empty(),
             has_cursor: query.before_id.is_some(),
             name,
             founder,
             limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
-            error,
         })
     }
 
@@ -4668,7 +3132,7 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        match console_admin_channels_build(&state, account, csrf, query, None).await {
+        match console_admin_channels_build(&state, account, csrf, query).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
@@ -4681,80 +3145,9 @@ mod pages {
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        let rows = match crate::db::list_bnc_network_inventory(pool_of(&state)).await {
-            Ok(rows) => rows,
-            Err(error) => return super::device::admin_db_error("network inventory", error),
-        };
-        let networks = rows
-            .into_iter()
-            .map(|row| {
-                let runtime = state
-                    .bnc_registry
-                    .as_ref()
-                    .and_then(|r| r.get_owned(&row.owner, &row.network.name))
-                    .map(|h| h.runtime_snapshot());
-                let connected = runtime.as_ref().is_some_and(|runtime| {
-                    runtime.lifecycle == crate::bouncer::NetworkLifecycle::Connected
-                });
-                let state_label = if row.network.enabled {
-                    runtime
-                        .as_ref()
-                        .map(|runtime| runtime.lifecycle.as_str().replace('_', " "))
-                        .unwrap_or_else(|| "not running".into())
-                } else {
-                    "disabled".into()
-                };
-                ConsoleAdminNetworkView {
-                    owner: row.owner,
-                    name: row.network.name,
-                    kind: row.network.kind.as_db_str().to_string(),
-                    addr: row.network.addr,
-                    tls: row.network.tls,
-                    enabled: row.network.enabled,
-                    connected,
-                    state: state_label,
-                    attached_clients: runtime
-                        .as_ref()
-                        .map_or(0, |runtime| runtime.attached_clients),
-                    errors: runtime.as_ref().map_or(0, |runtime| runtime.errors),
-                    last_error: runtime
-                        .as_ref()
-                        .and_then(|runtime| runtime.last_error)
-                        .map(|failure| failure.summary().to_string()),
-                }
-            })
-            .collect();
         render_private(ConsoleAdminNetworks {
             shell: console_shell(&state, account, csrf, "admin-networks"),
-            networks,
         })
-    }
-
-    /// Enable or disable one network of any account (admin lever for a
-    /// misbehaving upstream). Privileged and audited as such.
-    pub async fn console_admin_network_toggle(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path((owner, name)): Path<(String, String)>,
-        form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let registry = require_registry!(state);
-        let (admin, f) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let Some(enabled) = toggle_target(&f.enabled) else {
-            return invalid_toggle_response();
-        };
-        // The admin is the actor here (the owner is only the target), and the
-        // core audits every toggle — an administrator touching another
-        // account's network is unmistakably attributed.
-        if let Err(error) =
-            set_network_enabled_core(&state, registry, &admin, &owner, &name, enabled).await
-        {
-            return error.into_response();
-        }
-        Redirect::to("/console/admin/networks").into_response()
     }
 
     async fn console_server_bans_build(
@@ -4762,23 +3155,16 @@ mod pages {
         account: String,
         csrf: String,
         query: super::device::ValidatedServerBanDirectoryQuery,
-        error: Option<String>,
     ) -> Result<ConsoleServerBans, Response> {
-        let page = crate::db::query_server_ban_directory(pool_of(state), query.database_filter())
-            .await
-            .map_err(|error| super::device::admin_db_error("server-ban directory", error))?;
         let kind = query.kind.unwrap_or_default();
         let mask = query.mask.unwrap_or_default();
         Ok(ConsoleServerBans {
             shell: console_shell(state, account, csrf, "bans"),
-            entries: page.entries,
             has_filters: !kind.is_empty() || !mask.is_empty(),
             has_cursor: query.before_id.is_some(),
             kind,
             mask,
             limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
-            error,
         })
     }
 
@@ -4791,7 +3177,7 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        match console_server_bans_build(&state, account, csrf, query, None).await {
+        match console_server_bans_build(&state, account, csrf, query).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
@@ -4806,37 +3192,18 @@ mod pages {
             Ok(query) => query,
             Err(response) => return response,
         };
-        let page = match crate::db::query_audit_log(pool_of(&state), query.database_filter()).await
-        {
-            Ok(page) => page,
-            Err(error) => return super::device::admin_db_error("audit log", error),
-        };
-        let entries = page
-            .entries
-            .into_iter()
-            .map(|entry| AuditRow {
-                id: entry.id,
-                at: entry.created_at,
-                actor: entry.actor,
-                action: entry.action,
-                target: entry.target,
-                detail: entry.detail,
-            })
-            .collect();
         let actor = query.actor.unwrap_or_default();
         let action = query.action.unwrap_or_default();
         let target = query.target.unwrap_or_default();
         let has_cursor = query.before_id.is_some();
         render_private(ConsoleAudit {
             shell: console_shell(&state, account, csrf, "audit"),
-            entries,
             has_filters: !actor.is_empty() || !action.is_empty() || !target.is_empty(),
             has_cursor,
             actor,
             action,
             target,
             limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
         })
     }
 
@@ -4920,128 +3287,8 @@ mod pages {
         addr: String,
     }
 
-    #[derive(Deserialize)]
-    pub struct ManagedConfigForm {
-        csrf: String,
-        revision: i64,
-        server_name: String,
-        network_name: String,
-        description: String,
-        #[serde(default)]
-        motd: String,
-        nicklen: usize,
-        sendq: usize,
-        core_queue: usize,
-        max_hot_channels: usize,
-        #[serde(default)]
-        bnc_enabled: Option<String>,
-        #[serde(default)]
-        bnc_addr: String,
-        #[serde(default)]
-        max_connections_per_ip: String,
-        #[serde(default)]
-        command_burst: String,
-        #[serde(default)]
-        auth_rate_burst: String,
-        #[serde(default)]
-        api_rate_burst: String,
-        #[serde(default)]
-        administrator_api_rate_burst: String,
-        #[serde(default)]
-        registration_burst: String,
-        #[serde(default)]
-        trusted_proxies: String,
-        #[serde(default)]
-        listeners: String,
-        #[serde(default)]
-        public_url: String,
-        #[serde(default)]
-        secure_cookies: Option<String>,
-        #[serde(default)]
-        admin_accounts: String,
-        #[serde(default)]
-        registration_before_connect: Option<String>,
-        #[serde(default)]
-        registration_require_email: Option<String>,
-        #[serde(default)]
-        observability_enabled: Option<String>,
-        observability_sample_interval_seconds: u64,
-        observability_retention_hours: u64,
-        storage_history_retention_days: u64,
-        storage_audit_retention_days: u64,
-    }
-
-    fn optional_number(value: &str, field: &str) -> Result<Option<usize>, String> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Ok(None);
-        }
-        value
-            .parse::<usize>()
-            .map(Some)
-            .map_err(|_| format!("{field} must be a positive whole number or blank"))
-    }
-
     fn optional_number_display(value: Option<usize>) -> String {
         value.map(|number| number.to_string()).unwrap_or_default()
-    }
-
-    fn parse_listeners(value: &str) -> Result<Vec<crate::config::ListenerConfig>, String> {
-        value
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim().is_empty())
-            .map(|(index, line)| {
-                let fields: Vec<_> = line.split('|').map(str::trim).collect();
-                let address = fields
-                    .first()
-                    .ok_or_else(|| format!("Listener line {} has no address", index + 1))?
-                    .parse()
-                    .map_err(|_| format!("Listener line {} has an invalid address", index + 1))?;
-                let mode = fields.get(1).copied().unwrap_or("plain");
-                let (websocket, tls) =
-                    match mode {
-                        "plain" => (false, None),
-                        "websocket" => (true, None),
-                        "tls" => {
-                            let cert = fields.get(2).filter(|field| !field.is_empty()).ok_or_else(
-                                || {
-                                    format!(
-                                        "TLS listener line {} needs a certificate path",
-                                        index + 1
-                                    )
-                                },
-                            )?;
-                            let key = fields.get(3).filter(|field| !field.is_empty()).ok_or_else(
-                                || {
-                                    format!(
-                                        "TLS listener line {} needs a private-key path",
-                                        index + 1
-                                    )
-                                },
-                            )?;
-                            (
-                                false,
-                                Some(crate::config::TlsConfig {
-                                    cert_path: std::path::PathBuf::from(cert),
-                                    key_path: std::path::PathBuf::from(key),
-                                }),
-                            )
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Listener line {} mode must be plain, tls, or websocket",
-                                index + 1
-                            ));
-                        }
-                    };
-                Ok(crate::config::ListenerConfig {
-                    addr: address,
-                    tls,
-                    websocket,
-                })
-            })
-            .collect()
     }
 
     fn display_listeners(listeners: &[crate::config::ListenerConfig]) -> String {
@@ -5059,87 +3306,6 @@ mod pages {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn managed_settings_from_form(
-        form: &ManagedConfigForm,
-    ) -> Result<crate::config::ManagedConfig, String> {
-        let bnc_addr = if form.bnc_enabled.is_some() {
-            Some(
-                form.bnc_addr
-                    .trim()
-                    .parse()
-                    .map_err(|_| "BNC listen address must be host:port".to_string())?,
-            )
-        } else {
-            None
-        };
-        let settings = crate::config::ManagedConfig {
-            server_name: form.server_name.trim().to_string(),
-            network_name: form.network_name.trim().to_string(),
-            description: form.description.trim().to_string(),
-            motd: form.motd.lines().map(str::to_string).collect(),
-            nicklen: form.nicklen,
-            sendq: form.sendq,
-            core_queue: form.core_queue,
-            max_hot_channels: form.max_hot_channels,
-            listeners: parse_listeners(&form.listeners)?,
-            registration: crate::config::RegistrationConfig {
-                before_connect: form.registration_before_connect.is_some(),
-                require_email: form.registration_require_email.is_some(),
-            },
-            limits: crate::config::LimitsConfig {
-                max_connections_per_ip: optional_number(
-                    &form.max_connections_per_ip,
-                    "Connections per IP",
-                )?,
-                command_burst: optional_number(&form.command_burst, "Command burst")?,
-                trusted_proxies: form
-                    .trusted_proxies
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                auth_rate_burst: optional_number(&form.auth_rate_burst, "Authentication burst")?,
-                api_rate_burst: optional_number(&form.api_rate_burst, "Authenticated API burst")?,
-                administrator_api_rate_burst: optional_number(
-                    &form.administrator_api_rate_burst,
-                    "Administrator API burst",
-                )?,
-                registration_burst: optional_number(
-                    &form.registration_burst,
-                    "Registration burst",
-                )?,
-            },
-            observability: crate::config::ObservabilityConfig {
-                enabled: form.observability_enabled.is_some(),
-                sample_interval_seconds: form.observability_sample_interval_seconds,
-                retention_hours: form.observability_retention_hours,
-            },
-            storage: crate::config::StorageConfig {
-                history_retention_days: form.storage_history_retention_days,
-                audit_retention_days: form.storage_audit_retention_days,
-            },
-            bnc_addr,
-            public_url: (!form.public_url.trim().is_empty())
-                .then(|| form.public_url.trim().to_string()),
-            secure_cookies: form.secure_cookies.is_some(),
-            admin_accounts: form
-                .admin_accounts
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect(),
-            oidc_providers: Vec::new(),
-            opers: Vec::new(),
-            networks: Vec::new(),
-            credentials_from_bootstrap: false,
-        };
-        // The scalar form never edits credential-bearing collections; preserve
-        // them by the caller before validation.
-        Ok(settings)
     }
 
     async fn render_configuration(
@@ -5243,16 +3409,6 @@ mod pages {
         })
     }
 
-    async fn render_configuration_error(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        snapshot: crate::db::ManagedConfigSnapshot,
-        error: impl Into<String>,
-    ) -> Response {
-        render_configuration(state, account, csrf, snapshot, Some(error.into()), false).await
-    }
-
     pub async fn console_configuration(
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
@@ -5260,598 +3416,6 @@ mod pages {
         let config = require_managed_config!(state);
         let snapshot = config.read().await.clone();
         render_configuration(&state, account, csrf, snapshot, None, true).await
-    }
-
-    async fn restore_bnc_listener(
-        state: &AppState,
-        previous: Option<std::net::SocketAddr>,
-    ) -> Result<(), String> {
-        let listener = state
-            .bnc_listener
-            .as_ref()
-            .ok_or_else(|| "BNC listener controller is unavailable".to_string())?;
-        match previous {
-            Some(address) => {
-                listener.enable(address).await.map(|_| ()).map_err(|error| {
-                    format!("could not restore the previous BNC listener: {error}")
-                })
-            }
-            None => {
-                listener.stop().await;
-                Ok(())
-            }
-        }
-    }
-
-    pub async fn console_update_configuration(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<ManagedConfigForm>,
-    ) -> Response {
-        let config = require_managed_config!(state);
-        let mut current = config.write().await;
-        if current.revision != form.revision {
-            return render_configuration_error(
-                &state,
-                account,
-                csrf,
-                current.clone(),
-                "Configuration changed in another session. Review the current values and submit again.",
-            )
-            .await;
-        }
-        let mut settings = match managed_settings_from_form(&form) {
-            Ok(settings) => settings,
-            Err(error) => {
-                return render_configuration_error(&state, account, csrf, current.clone(), error)
-                    .await;
-            }
-        };
-        settings.oidc_providers = current.settings.oidc_providers.clone();
-        settings.opers = current.settings.opers.clone();
-        settings.networks = current.settings.networks.clone();
-        settings.credentials_from_bootstrap = current.settings.credentials_from_bootstrap;
-        if let Err(error) = settings.validate() {
-            return render_configuration_error(
-                &state,
-                account,
-                csrf,
-                current.clone(),
-                error.to_string(),
-            )
-            .await;
-        }
-        let previous_bnc = current.settings.bnc_addr;
-        let bnc_changed = previous_bnc != settings.bnc_addr;
-        if bnc_changed {
-            let Some(listener) = &state.bnc_listener else {
-                return render_configuration_error(
-                    &state,
-                    account,
-                    csrf,
-                    current.clone(),
-                    "A database-backed BNC listener controller is unavailable.",
-                )
-                .await;
-            };
-            let applied = match settings.bnc_addr {
-                Some(address) => listener
-                    .enable(address)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| format!("Could not bind {address}: {error}")),
-                None => {
-                    listener.stop().await;
-                    Ok(())
-                }
-            };
-            if let Err(error) = applied {
-                return render_configuration_error(&state, account, csrf, current.clone(), error)
-                    .await;
-            }
-        }
-        let mut restart_comparison = current.settings.clone();
-        restart_comparison.bnc_addr = settings.bnc_addr;
-        restart_comparison.observability = settings.observability.clone();
-        let restart_required = restart_comparison != settings;
-        let detail = format!(
-            "revision {}; BNC listener {}; restart {}",
-            current.revision + 1,
-            if bnc_changed { "changed" } else { "unchanged" },
-            if restart_required {
-                "required"
-            } else {
-                "not required"
-            }
-        );
-        let pool = pool_of(&state);
-        match crate::db::save_managed_config(pool, current.revision, &settings, &account, &detail)
-            .await
-        {
-            Ok(snapshot) => {
-                *current = snapshot.clone();
-                let message = if restart_required {
-                    "Configuration saved. The BNC listener is live; restart the server to apply the other changed settings."
-                } else {
-                    "Configuration saved and applied."
-                };
-                drop(current);
-                render_configuration(&state, account, csrf, snapshot, Some(message.into()), true)
-                    .await
-            }
-            Err(error) => {
-                let rollback = if bnc_changed {
-                    restore_bnc_listener(&state, previous_bnc).await.err()
-                } else {
-                    None
-                };
-                let message = match rollback {
-                    Some(rollback) => format!(
-                        "Configuration was not saved: {error}. Runtime rollback also failed: {rollback}"
-                    ),
-                    None => format!("Configuration was not saved: {error}"),
-                };
-                render_configuration_error(&state, account, csrf, current.clone(), message).await
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct OperForm {
-        csrf: String,
-        name: String,
-        password: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct DeleteConfigItem {
-        csrf: String,
-        name: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct OidcForm {
-        csrf: String,
-        name: String,
-        issuer_url: String,
-        client_id: String,
-        client_secret: String,
-        #[serde(default)]
-        scopes: String,
-        #[serde(default)]
-        allowed_email_domains: String,
-        #[serde(default)]
-        end_session_endpoint: String,
-        token_endpoint_auth_method: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct SharedNetworkForm {
-        csrf: String,
-        name: String,
-        #[serde(default)]
-        owner: String,
-        kind: String,
-        #[serde(default)]
-        addr: String,
-        #[serde(default)]
-        tls: Option<String>,
-        nick: String,
-        #[serde(default)]
-        realname: String,
-        #[serde(default)]
-        autojoin: String,
-        #[serde(default)]
-        buffer_cap: usize,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct DeleteSharedNetwork {
-        csrf: String,
-        name: String,
-        owner: String,
-    }
-
-    trait AdminConfigForm {
-        fn csrf(&self) -> &str;
-    }
-
-    macro_rules! impl_admin_config_form {
-        ($($form:ty),+ $(,)?) => {
-            $(
-                impl AdminConfigForm for $form {
-                    fn csrf(&self) -> &str {
-                        &self.csrf
-                    }
-                }
-            )+
-        };
-    }
-
-    impl_admin_config_form!(
-        ManagedConfigForm,
-        OperForm,
-        DeleteConfigItem,
-        OidcForm,
-        SharedNetworkForm,
-        DeleteSharedNetwork,
-    );
-
-    pub(super) struct AdminConfigPayload<T> {
-        form: T,
-        account: String,
-        csrf: String,
-    }
-
-    impl<T> axum::extract::FromRequest<Arc<AppState>> for AdminConfigPayload<T>
-    where
-        T: AdminConfigForm + Send + 'static,
-        axum::Form<T>: axum::extract::FromRequest<
-                Arc<AppState>,
-                Rejection = axum::extract::rejection::FormRejection,
-            >,
-    {
-        type Rejection = Response;
-
-        async fn from_request(
-            request: axum::extract::Request,
-            state: &Arc<AppState>,
-        ) -> Result<Self, Self::Rejection> {
-            let headers = request.headers().clone();
-            let form = match axum::Form::<T>::from_request(request, state).await {
-                Ok(axum::Form(form)) => form,
-                Err(error) => {
-                    return Err(problem(
-                        StatusCode::BAD_REQUEST,
-                        "Invalid form",
-                        Some(&error.to_string()),
-                    ));
-                }
-            };
-            let csrf = form.csrf().to_string();
-            let account = require_admin_form_actor(state, &headers, &csrf).await?;
-            Ok(Self {
-                form,
-                account,
-                csrf,
-            })
-        }
-    }
-
-    async fn mutate_managed_config(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        change: impl FnOnce(&mut crate::config::ManagedConfig) -> Result<String, String>,
-    ) -> Response {
-        let config = require_managed_config!(state);
-        let mut current = config.write().await;
-        let mut settings = current.settings.clone();
-        let detail = match change(&mut settings) {
-            Ok(detail) => detail,
-            Err(error) => {
-                return render_configuration_error(state, account, csrf, current.clone(), error)
-                    .await;
-            }
-        };
-        if let Err(error) = settings.validate() {
-            return render_configuration_error(
-                state,
-                account,
-                csrf,
-                current.clone(),
-                error.to_string(),
-            )
-            .await;
-        }
-        let outcome =
-            format!("Configuration saved: {detail}. Restart the server to apply this change.");
-        match crate::db::save_managed_config(
-            pool_of(state),
-            current.revision,
-            &settings,
-            &account,
-            &format!("{detail}; restart required"),
-        )
-        .await
-        {
-            Ok(snapshot) => {
-                *current = snapshot.clone();
-                drop(current);
-                render_configuration(state, account, csrf, snapshot, Some(outcome), true).await
-            }
-            Err(error) => {
-                render_configuration_error(
-                    state,
-                    account,
-                    csrf,
-                    current.clone(),
-                    format!("Configuration was not saved: {error}"),
-                )
-                .await
-            }
-        }
-    }
-
-    pub async fn console_add_oper(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<OperForm>,
-    ) -> Response {
-        let Some(key) = state.secret_key.clone() else {
-            return mutate_managed_config(&state, account, csrf, |_| {
-                Err("A master key is required to store operator passwords.".into())
-            })
-            .await;
-        };
-        mutate_managed_config(&state, account, csrf, move |settings| {
-            let name = form.name.trim();
-            if name.is_empty() || form.password.is_empty() {
-                return Err("Operator name and password are required.".into());
-            }
-            settings.opers.push(crate::config::OperConfig {
-                name: name.to_string(),
-                password: key.seal(&form.password, crate::secret::CONFIG_CONTEXT),
-            });
-            Ok(format!("added IRC operator {name}"))
-        })
-        .await
-    }
-
-    /// Reject a credential mutation while the config still holds
-    /// bootstrap-sealed credentials — the master key must be configured and
-    /// the server restarted first, so a console edit cannot silently strand
-    /// the bootstrap operator/provider secrets. `what` names the credential
-    /// family ("operator", "identity-provider").
-    fn reject_bootstrap_credential_change(
-        settings: &crate::config::ManagedConfig,
-        what: &str,
-    ) -> Result<(), String> {
-        if settings.credentials_from_bootstrap {
-            return Err(format!(
-                "Configure a master key and restart before changing bootstrap {what} credentials."
-            ));
-        }
-        Ok(())
-    }
-
-    /// Remove the item named `name` from a managed-config list, or report it
-    /// missing. `kind` names the list for the error ("IRC operator",
-    /// "identity provider").
-    fn remove_named<T>(
-        items: &mut Vec<T>,
-        name: &str,
-        kind: &str,
-        item_name: impl Fn(&T) -> &str,
-    ) -> Result<(), String> {
-        let before = items.len();
-        items.retain(|item| item_name(item) != name);
-        if items.len() == before {
-            return Err(format!("No {kind} named '{name}'."));
-        }
-        Ok(())
-    }
-
-    pub async fn console_delete_oper(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<DeleteConfigItem>,
-    ) -> Response {
-        mutate_managed_config(&state, account, csrf, move |settings| {
-            reject_bootstrap_credential_change(settings, "operator")?;
-            remove_named(&mut settings.opers, &form.name, "IRC operator", |oper| {
-                &oper.name
-            })?;
-            Ok(format!("removed IRC operator {}", form.name))
-        })
-        .await
-    }
-
-    pub async fn console_add_oidc(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<OidcForm>,
-    ) -> Response {
-        let Some(key) = state.secret_key.clone() else {
-            return mutate_managed_config(&state, account, csrf, |_| {
-                Err("A master key is required to store OpenID Connect client secrets.".into())
-            })
-            .await;
-        };
-        mutate_managed_config(&state, account, csrf, move |settings| {
-            let method = match form.token_endpoint_auth_method.as_str() {
-                "client_secret_basic" => crate::config::TokenEndpointAuthMethod::ClientSecretBasic,
-                "client_secret_post" => crate::config::TokenEndpointAuthMethod::ClientSecretPost,
-                _ => return Err("Unknown token endpoint authentication method.".into()),
-            };
-            let name = form.name.trim().to_string();
-            let allowed_email_domains = form
-                .allowed_email_domains
-                .split([',', ' ', '\n'])
-                .map(str::trim)
-                .filter(|domain| !domain.is_empty())
-                .map(crate::identity::EmailDomain::parse)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?;
-            settings
-                .oidc_providers
-                .push(crate::config::OidcProviderConfig {
-                    name: name.clone(),
-                    issuer_url: form.issuer_url.trim().to_string(),
-                    client_id: form.client_id.trim().to_string(),
-                    client_secret: key.seal(&form.client_secret, crate::secret::CONFIG_CONTEXT),
-                    scopes: form
-                        .scopes
-                        .split([',', ' '])
-                        .map(str::trim)
-                        .filter(|scope| !scope.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    allowed_email_domains,
-                    end_session_endpoint: (!form.end_session_endpoint.trim().is_empty())
-                        .then(|| form.end_session_endpoint.trim().to_string()),
-                    token_endpoint_auth_method: method,
-                });
-            Ok(format!("added OpenID Connect provider {name}"))
-        })
-        .await
-    }
-
-    pub async fn console_delete_oidc(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<DeleteConfigItem>,
-    ) -> Response {
-        mutate_managed_config(&state, account, csrf, move |settings| {
-            reject_bootstrap_credential_change(settings, "identity-provider")?;
-            remove_named(
-                &mut settings.oidc_providers,
-                &form.name,
-                "identity provider",
-                |provider| &provider.name,
-            )?;
-            Ok(format!("removed OpenID Connect provider {}", form.name))
-        })
-        .await
-    }
-
-    pub async fn console_add_shared_network(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<SharedNetworkForm>,
-    ) -> Response {
-        let kind = match crate::config::NetworkKind::from_db_str(&form.kind) {
-            Some(kind) => kind,
-            None => {
-                return mutate_managed_config(&state, account, csrf, |_| {
-                    Err("Unknown network driver kind.".into())
-                })
-                .await;
-            }
-        };
-        if kind.is_bridge() && !kind_feature_available(kind) {
-            let feature = kind.as_db_str();
-            return mutate_managed_config(&state, account, csrf, |_| {
-                Err(format!(
-                    "This server was not built with the {feature} feature."
-                ))
-            })
-            .await;
-        }
-        let secret_needed = !form.sasl_password.is_empty()
-            || (kind.account_is_secret() && !form.sasl_account.is_empty());
-        let key = state.secret_key.clone();
-        if secret_needed && key.is_none() {
-            return mutate_managed_config(&state, account, csrf, |_| {
-                Err("A master key is required to store upstream credentials.".into())
-            })
-            .await;
-        }
-        mutate_managed_config(&state, account, csrf, move |settings| {
-            if settings.credentials_from_bootstrap {
-                return Err(
-                    "Configure a master key and restart before changing bootstrap network credentials."
-                        .into(),
-                );
-            }
-            let optional = |value: String| {
-                let value = value.trim().to_string();
-                (!value.is_empty()).then_some(value)
-            };
-            let mut sasl_account = optional(form.sasl_account);
-            let mut sasl_password = optional(form.sasl_password);
-            if kind.account_is_secret()
-                && let Some(value) = &sasl_account
-            {
-                sasl_account = Some(
-                    key.as_ref()
-                        .expect("secret-needed check")
-                        .seal(value, crate::secret::CONFIG_CONTEXT),
-                );
-            }
-            if let Some(value) = &sasl_password {
-                sasl_password = Some(
-                    key.as_ref()
-                        .expect("secret-needed check")
-                        .seal(value, crate::secret::CONFIG_CONTEXT),
-                );
-            }
-            let name = form.name.trim().to_string();
-            settings.networks.push(crate::config::NetworkEntry {
-                name: name.clone(),
-                kind,
-                owner: optional(form.owner),
-                addr: form.addr.trim().to_string(),
-                tls: form.tls.is_some(),
-                nick: form.nick.trim().to_string(),
-                realname: optional(form.realname),
-                autojoin: form
-                    .autojoin
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|channel| !channel.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                buffer_cap: if form.buffer_cap == 0 {
-                    1000
-                } else {
-                    form.buffer_cap
-                },
-                sasl_account,
-                sasl_password,
-            });
-            Ok(format!("added server network {name}"))
-        })
-        .await
-    }
-
-    pub async fn console_delete_shared_network(
-        State(state): State<Arc<AppState>>,
-        AdminConfigPayload {
-            form,
-            account,
-            csrf,
-        }: AdminConfigPayload<DeleteSharedNetwork>,
-    ) -> Response {
-        mutate_managed_config(&state, account, csrf, move |settings| {
-            if settings.credentials_from_bootstrap {
-                return Err(
-                    "Configure a master key and restart before changing bootstrap networks.".into(),
-                );
-            }
-            let owner = (!form.owner.is_empty()).then_some(form.owner.as_str());
-            let before = settings.networks.len();
-            settings.networks.retain(|network| {
-                !(network.name == form.name && network.owner.as_deref() == owner)
-            });
-            if settings.networks.len() == before {
-                return Err(format!("No matching server network named '{}'.", form.name));
-            }
-            Ok(format!("removed server network {}", form.name))
-        })
-        .await
     }
 
     struct SessionRow {
@@ -5883,7 +3447,6 @@ mod pages {
         shell: ConsoleShell,
         title: &'static str,
         hint: &'static str,
-        disconnect_action: &'static str,
         sessions: Vec<SessionRow>,
         nick_filter: String,
         account_filter: String,
@@ -5899,14 +3462,6 @@ mod pages {
         error: Option<String>,
     }
 
-    struct NetworkPreflightView {
-        confirmed_nick: String,
-        resolved_addresses: usize,
-        dns_ms: u64,
-        connect_ms: u64,
-        registration_ms: u64,
-    }
-
     #[derive(Template)]
     #[template(path = "console_networks.html")]
     struct ConsoleNetworks {
@@ -5915,8 +3470,6 @@ mod pages {
         attach_addr: Option<std::net::SocketAddr>,
         presets: &'static [IrcNetworkPreset],
         form: NetworkFormView,
-        error: Option<FormFieldError>,
-        success: Option<NetworkPreflightView>,
         can_store_secrets: bool,
     }
 
@@ -5942,7 +3495,6 @@ mod pages {
         autojoin: String,
         sasl_account: String,
         can_store_secrets: bool,
-        error: Option<String>,
     }
 
     #[derive(Template)]
@@ -5962,7 +3514,6 @@ mod pages {
         has_sasl_account: bool,
         has_sasl_password: bool,
         can_store_secrets: bool,
-        error: Option<String>,
     }
 
     struct NetworkOperationsView {
@@ -6014,26 +3565,6 @@ mod pages {
     #[template(path = "_network_operations.html")]
     struct ConsoleNetworkOperations {
         view: NetworkOperationsView,
-    }
-
-    /// The console edit-network form (urlencoded). `tls` is an HTML checkbox.
-    #[derive(Deserialize)]
-    pub struct NetworkEditForm {
-        csrf: String,
-        addr: String,
-        nick: String,
-        #[serde(default)]
-        tls: Option<String>,
-        #[serde(default)]
-        realname: String,
-        #[serde(default)]
-        autojoin: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-        #[serde(default)]
-        clear_sasl: Option<String>,
     }
 
     /// Admin console: server-wide read views (accounts, registered channels,
@@ -6320,60 +3851,8 @@ mod pages {
         }
     }
 
-    /// Render the network list and create form. Failed submissions use this same
-    /// path so their exact error and all non-secret fields remain in context.
-    async fn console_networks_page(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        form: NetworkFormView,
-        error: Option<FormFieldError>,
-        success: Option<NetworkPreflightView>,
-    ) -> Response {
-        let networks = match console_network_views(state, &account).await {
-            Ok(n) => n,
-            Err(r) => return r,
-        };
-        let attach_addr = match &state.bnc_listener {
-            Some(listener) => listener.status().await.map(|(_, bound)| bound),
-            None => None,
-        };
-        render_private(ConsoleNetworks {
-            shell: console_shell(state, account, csrf, "networks"),
-            networks,
-            attach_addr,
-            presets: IRC_NETWORK_PRESETS,
-            form,
-            error,
-            success,
-            can_store_secrets: state.secret_key.is_some(),
-        })
-    }
-
-    /// Re-render the networks console with the just-submitted form and the
-    /// mutation error mapped onto its fields — the shared failure tail of the
-    /// add/preflight network handlers.
-    async fn console_networks_mutation_error(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        form_view: NetworkFormView,
-        error: &crate::http::networks::NetworkMutationError,
-    ) -> Response {
-        console_networks_page(
-            state,
-            account,
-            csrf,
-            form_view,
-            Some(FormFieldError::from_mutation(error)),
-            None,
-        )
-        .await
-    }
-
     /// Console → BNC networks: the caller's own always-on upstreams with live
-    /// connection status, plus add/remove. Any authenticated user manages their
-    /// own networks (not admin-gated); an anonymous visitor goes to `/login`.
+    /// connection status. Mutations are performed by the typed network API.
     pub async fn console_networks(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -6382,8 +3861,22 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let form = NetworkFormView::libera(&account);
-        console_networks_page(&state, account, csrf, form, None, None).await
+        let networks = match console_network_views(&state, &account).await {
+            Ok(networks) => networks,
+            Err(response) => return response,
+        };
+        let attach_addr = match &state.bnc_listener {
+            Some(listener) => listener.status().await.map(|(_, bound)| bound),
+            None => None,
+        };
+        render_private(ConsoleNetworks {
+            shell: console_shell(&state, account.clone(), csrf, "networks"),
+            networks,
+            attach_addr,
+            presets: IRC_NETWORK_PRESETS,
+            form: NetworkFormView::libera(&account),
+            can_store_secrets: state.secret_key.is_some(),
+        })
     }
 
     /// The live-refresh fragment backing `/console/networks`' table.
@@ -6396,189 +3889,13 @@ mod pages {
             Err(response) => return response,
         };
         let networks = match console_network_views(&state, &account).await {
-            Ok(n) => n,
-            Err(r) => return r,
+            Ok(networks) => networks,
+            Err(response) => return response,
         };
         render_private(ConsoleNetworkRows { networks, csrf })
     }
 
-    /// Add a network from the console and return to the canonical list.
-    pub async fn console_add_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, fields) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        let mut fields = fields;
-        let preset_result = fields.apply_preset();
-        let form_view = NetworkFormView::submitted(&fields);
-        let Some(registry) = &state.bnc_registry else {
-            return console_networks_page(
-                &state,
-                account,
-                csrf,
-                form_view,
-                Some(FormFieldError::banner(
-                    "The network registry is not available on this server.",
-                )),
-                None,
-            )
-            .await;
-        };
-        let req = match preset_result {
-            Ok(()) => fields.into_resolved_create(),
-            Err(error) => {
-                return console_networks_mutation_error(&state, account, csrf, form_view, &error)
-                    .await;
-            }
-        };
-        if let Err(error) = create_network_core(&state, registry, &account, &req).await {
-            return console_networks_mutation_error(&state, account, csrf, form_view, &error).await;
-        }
-        Redirect::to("/console/networks").into_response()
-    }
-
-    /// Exercise the exact production IRC dial and registration path while
-    /// retaining the form for a subsequent create. The preflight has no
-    /// durable side effect and never starts a reconnect loop.
-    pub async fn console_preflight_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<NetworkFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, mut fields) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        if let Err(error) = fields.apply_preset() {
-            let form_view = NetworkFormView::submitted(&fields);
-            return console_networks_mutation_error(&state, account, csrf, form_view, &error).await;
-        }
-        let form_view = NetworkFormView::submitted(&fields);
-        let create = fields.into_resolved_create();
-        let request = PreflightNetwork {
-            addr: create.addr,
-            tls: create.tls,
-            nick: create.nick,
-            realname: create.realname,
-            sasl_account: create.sasl_account,
-            sasl_password: create.sasl_password,
-        };
-        match preflight_network_core(request).await {
-            Ok(result) => {
-                let view = NetworkPreflightView {
-                    confirmed_nick: result.confirmed_nick,
-                    resolved_addresses: result.resolved_addresses,
-                    dns_ms: result.dns_ms,
-                    connect_ms: result.connect_ms,
-                    registration_ms: result.registration_ms,
-                };
-                console_networks_page(&state, account, csrf, form_view, None, Some(view)).await
-            }
-            Err(error) => {
-                console_networks_page(
-                    &state,
-                    account,
-                    csrf,
-                    form_view,
-                    Some(FormFieldError::banner(error.message())),
-                    None,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Delete an owner-scoped network and stop its live driver.
-    async fn delete_network_by_name(
-        state: &AppState,
-        account: &str,
-        name: &str,
-    ) -> Result<(), Response> {
-        let Some(registry) = &state.bnc_registry else {
-            return Err(problem(StatusCode::NOT_FOUND, "Bouncer not enabled", None));
-        };
-        delete_network_core(state, registry, account, name, EditableNetworkKind::Any)
-            .await
-            .map_err(NetworkMutationError::into_response)
-    }
-
-    /// Delete a network from the console and return to the canonical list.
-    pub async fn console_delete_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        if let Err(response) = delete_network_by_name(&state, &account, &name).await {
-            return response;
-        }
-        Redirect::to("/console/networks").into_response()
-    }
-
-    /// The console toggle button posts the *target* enabled state so the flip is
-    /// not derived from a possibly-stale row (no read-then-write race).
-    #[derive(Deserialize)]
-    pub struct ToggleFields {
-        csrf: String,
-        enabled: String,
-    }
-
-    fn toggle_target(value: &str) -> Option<bool> {
-        match value {
-            "true" | "on" | "1" => Some(true),
-            "false" | "off" | "0" => Some(false),
-            _ => None,
-        }
-    }
-
-    fn invalid_toggle_response() -> Response {
-        problem(
-            StatusCode::BAD_REQUEST,
-            "Invalid enabled state",
-            Some("enabled must be true or false"),
-        )
-    }
-
-    /// Enable/disable a network from the console. Reuses the same core the REST
-    /// `PATCH` uses.
-    pub async fn console_toggle_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<ToggleFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let registry = require_registry!(state);
-        let (account, f) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let Some(enabled) = toggle_target(&f.enabled) else {
-            return invalid_toggle_response();
-        };
-        if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &account, &name, enabled).await
-        {
-            return error.into_response();
-        }
-        Redirect::to("/console/networks").into_response()
-    }
-
-    /// Render the edit-network form (shared by the GET and the failed-POST
-    /// re-render, which differ only in field values and the error banner).
+    /// Render the edit-network form from the stored configuration.
     #[allow(clippy::too_many_arguments)]
     fn console_network_edit_page(
         state: &AppState,
@@ -6592,7 +3909,6 @@ mod pages {
         autojoin: String,
         sasl_account: String,
         can_store_secrets: bool,
-        error: Option<String>,
     ) -> Response {
         render_private(ConsoleNetworkEdit {
             shell: console_shell(state, account, csrf, "networks"),
@@ -6604,7 +3920,6 @@ mod pages {
             autojoin,
             sasl_account,
             can_store_secrets,
-            error,
         })
     }
 
@@ -6644,85 +3959,6 @@ mod pages {
             row.autojoin.join(", "),
             row.sasl_account.unwrap_or_default(),
             state.secret_key.is_some(),
-            None,
-        )
-    }
-
-    /// Console → apply an edited network (POST): validate, persist the new
-    /// connection/identity fields, and rebuild the live driver. On success
-    /// redirect to the network list; on failure re-render the form with a banner
-    /// (keeping the submitted values).
-    pub async fn console_update_network(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<NetworkEditForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        // Plain form: parse first, then authenticate + verify the body CSRF.
-        let (account, f) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        let tls = f.tls.as_deref() == Some("on");
-        let realname = (!f.realname.trim().is_empty()).then(|| f.realname.trim().to_string());
-        let autojoin: Vec<String> = f
-            .autojoin
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        let sasl_account = f.sasl_account.trim();
-        let sasl_password = (!f.sasl_password.is_empty()).then_some(f.sasl_password.as_str());
-        let credentials = if f.clear_sasl.as_deref() == Some("on") {
-            // The checkbox is the explicit operation. Values may still arrive
-            // from a no-JavaScript browser whose pre-filled account field was
-            // not disabled; removal wins rather than making that UI path fail.
-            NetworkCredentialUpdate::Remove
-        } else if sasl_account.is_empty() && sasl_password.is_none() {
-            NetworkCredentialUpdate::Remove
-        } else {
-            NetworkCredentialUpdate::Set {
-                account: Some(sasl_account),
-                password: sasl_password,
-            }
-        };
-        let result = update_network_core(
-            &state,
-            registry,
-            &account,
-            &name,
-            EditableNetworkKind::Irc,
-            &f.addr,
-            tls,
-            &f.nick,
-            realname.as_deref(),
-            &autojoin,
-            credentials,
-        )
-        .await;
-        let error = match result {
-            Ok(()) => return Redirect::to("/console/networks").into_response(),
-            Err(error) => error.message(),
-        };
-        // Re-render the form with a banner, keeping what the user typed.
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        console_network_edit_page(
-            &state,
-            account,
-            csrf,
-            name,
-            f.addr,
-            tls,
-            f.nick,
-            f.realname,
-            f.autojoin,
-            f.sasl_account,
-            state.secret_key.is_some(),
-            Some(error),
         )
     }
 
@@ -6802,8 +4038,6 @@ mod pages {
         shell: ConsoleShell,
         bouncer_enabled: bool,
         platforms: Vec<BridgePlatform>,
-        /// Error banner shown after a failed add/remove; `None` on the plain GET.
-        error: Option<String>,
     }
 
     /// Console → Integrations (admin): the chat-platform bridges. For each
@@ -6814,7 +4048,6 @@ mod pages {
         state: &AppState,
         account: String,
         csrf: String,
-        error: Option<String>,
     ) -> Result<ConsoleIntegrations, Response> {
         let all = state
             .bnc_registry
@@ -6879,7 +4112,6 @@ mod pages {
             shell: console_shell(state, account, csrf, "integrations"),
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
-            error,
         })
     }
 
@@ -6888,74 +4120,10 @@ mod pages {
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        match console_integrations_build(&state, account, csrf, None).await {
+        match console_integrations_build(&state, account, csrf).await {
             Ok(view) => render_private(view),
             Err(response) => response,
         }
-    }
-
-    /// Re-render the integrations page with an error banner after a failed
-    /// add/remove (an admin has already been resolved by the caller).
-    async fn console_integrations_error(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        message: String,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        match console_integrations_build(state, account, csrf, Some(message)).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
-    }
-
-    /// The bridge connection/identity fields shared by the add and edit
-    /// forms (all optional on the wire; meaning is per kind).
-    #[derive(Deserialize)]
-    struct BridgeConnectionFields {
-        #[serde(default)]
-        addr: String,
-        #[serde(default)]
-        nick: String,
-        #[serde(default)]
-        sasl_account: String,
-        #[serde(default)]
-        sasl_password: String,
-        #[serde(default)]
-        autojoin: String,
-    }
-
-    /// The console add-bridge form (urlencoded with a hidden CSRF field). Field
-    /// meaning is per kind.
-    #[derive(Deserialize)]
-    pub struct BridgeFormFields {
-        csrf: String,
-        kind: String,
-        name: String,
-        #[serde(flatten)]
-        connection: BridgeConnectionFields,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BridgeEditFormFields {
-        csrf: String,
-        #[serde(flatten)]
-        connection: BridgeConnectionFields,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BridgeDeleteFields {
-        csrf: String,
-        name: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BridgeToggleFields {
-        csrf: String,
-        name: String,
-        enabled: String,
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.
@@ -6975,76 +4143,6 @@ mod pages {
         }
     }
 
-    /// Authenticate a plain-form (body-CSRF) actor: the caller is signed in and
-    /// the form carried a valid CSRF token. Not admin-gated — for self-service
-    /// actions on the caller's own resources. Returns the account or a response.
-    async fn require_form_actor(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-    ) -> Result<String, Response> {
-        let account = authenticate(state, headers)
-            .await
-            .map_err(|_| Redirect::to("/login").into_response())?;
-        let Some(session) = session_token(headers, state.secure_cookies) else {
-            return Err(problem(StatusCode::UNAUTHORIZED, "Session required", None));
-        };
-        if !state.csrf_valid(&session, csrf) {
-            return Err(problem(StatusCode::FORBIDDEN, "Bad CSRF token", None));
-        }
-        Ok(account)
-    }
-
-    async fn require_admin_form_actor(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-    ) -> Result<String, Response> {
-        let account = require_form_actor(state, headers, csrf).await?;
-        if !is_admin_account(state, &account) {
-            return Err(problem(StatusCode::FORBIDDEN, "Admin only", None));
-        }
-        Ok(account)
-    }
-
-    trait CsrfForm {
-        fn csrf(&self) -> &str;
-    }
-
-    macro_rules! csrf_forms {
-        ($($form:ty),+ $(,)?) => {
-            $(
-                impl CsrfForm for $form {
-                    fn csrf(&self) -> &str {
-                        &self.csrf
-                    }
-                }
-            )+
-        };
-    }
-
-    csrf_forms!(
-        AccountSuspensionForm,
-        AccountAdministratorForm,
-        AccountCreateForm,
-        AccountInvitationForm,
-        AccountInvitationRevokeForm,
-        AccountPermanentDeleteForm,
-    );
-
-    /// Parse and authorize an administrator-owned browser form as one gate so
-    /// mutations cannot drift between subtly different CSRF/admin prologues.
-    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-    async fn parse_admin_form<T: CsrfForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<T>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(T, String), Response> {
-        let form = parse_form(form)?;
-        let actor = require_admin_form_actor(state, headers, form.csrf()).await?;
-        Ok((form, actor))
-    }
-
     /// Ask the core for one already-validated bounded connection page.
     async fn list_live_connections(
         state: &AppState,
@@ -7055,229 +4153,6 @@ mod pages {
             Ok(_) => Err("unexpected reply".into()),
             Err(error) => Err(error),
         }
-    }
-
-    enum AdminPolicyPage {
-        RegisteredChannels,
-        ServerBans,
-    }
-
-    /// Re-render the policy page that owns a failed mutation. Successful
-    /// actions use Post/Redirect/Get; failures stay visible beside the exact
-    /// controls that produced them.
-    async fn admin_policy_error_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        message: String,
-        page: AdminPolicyPage,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        match page {
-            AdminPolicyPage::RegisteredChannels => {
-                let query = match super::device::validate_registered_channel_directory_query(
-                    super::device::RegisteredChannelDirectoryQuery::default(),
-                    50,
-                ) {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                match console_admin_channels_build(state, account, csrf, query, Some(message)).await
-                {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-            AdminPolicyPage::ServerBans => {
-                let query = match super::device::validate_server_ban_directory_query(
-                    super::device::ServerBanDirectoryQuery::default(),
-                    50,
-                ) {
-                    Ok(query) => query,
-                    Err(response) => return response,
-                };
-                match console_server_bans_build(state, account, csrf, query, Some(message)).await {
-                    Ok(view) => render_private(view),
-                    Err(response) => response,
-                }
-            }
-        }
-    }
-
-    #[derive(Deserialize)]
-    pub struct BanForm {
-        csrf: String,
-        kind: String,
-        mask: String,
-        #[serde(default)]
-        reason: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct BanDeleteForm {
-        csrf: String,
-        kind: String,
-        mask: String,
-    }
-
-    #[derive(Deserialize)]
-    pub struct DropChannelForm {
-        csrf: String,
-        channel: String,
-    }
-
-    /// Gate an admin form action (admin + CSRF) and run it on the core. Returns
-    /// the redirect `Response` on success, or the gate `Response` (login/403) on
-    /// a gate failure; on an *action* failure returns `Err((account, message))`
-    /// so the caller re-renders its own page with the message. This is the shared
-    /// tail of every console mutation — only the form type, the request it builds,
-    /// and the page it re-renders on error differ.
-    async fn run_admin_form(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-        redirect: &'static str,
-        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
-    ) -> Result<Response, (String, String)> {
-        let account = match require_admin_form_actor(state, headers, csrf).await {
-            Ok(a) => a,
-            Err(gate) => return Ok(gate),
-        };
-        let req = make_req(account.clone());
-        match core_action(state, req).await {
-            Ok(_) => Ok(Redirect::to(redirect).into_response()),
-            Err(msg) => Err((account, msg)),
-        }
-    }
-
-    /// Run an admin console form action and render its policy-error page on an
-    /// action failure — the shared tail of the ban, channel, and session
-    /// handlers, which differ only in redirect, request, and error page.
-    async fn admin_form_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        csrf: &str,
-        redirect: &'static str,
-        make_req: impl FnOnce(String) -> crate::core::AdminRequest,
-        error_page: AdminPolicyPage,
-    ) -> Response {
-        match run_admin_form(state, headers, csrf, redirect, make_req).await {
-            Ok(resp) => resp,
-            Err((account, msg)) => {
-                admin_policy_error_page(state, headers, account, msg, error_page).await
-            }
-        }
-    }
-
-    /// The full console mutation flow for a csrf-carrying admin form: parse,
-    /// build the request from the form and actor, run it, and render the
-    /// policy-error page on failure. The admin mutation handlers differ only
-    /// in the request the form becomes.
-    async fn admin_policy_form<F: AccountForm>(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        form: Result<axum::Form<F>, axum::extract::rejection::FormRejection>,
-        redirect: &'static str,
-        error_page: AdminPolicyPage,
-        make: impl FnOnce(F, String) -> crate::core::AdminRequest,
-    ) -> Response {
-        let f = match parse_form(form) {
-            Ok(f) => f,
-            Err(r) => return r,
-        };
-        let csrf = f.csrf().to_string();
-        let make = |actor| make(f, actor);
-        admin_form_page(state, headers, &csrf, redirect, make, error_page).await
-    }
-
-    /// Console → add a K/D/X-line (admin). Runs through the core so it enforces
-    /// and disconnects matching sessions exactly like oper KLINE.
-    pub async fn console_add_ban(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BanForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        admin_policy_form(
-            &state,
-            &headers,
-            form,
-            "/console/bans",
-            AdminPolicyPage::ServerBans,
-            |f, actor| crate::core::AdminRequest::AddServerBan {
-                mask: f.mask,
-                kind: f.kind,
-                reason: f.reason,
-                actor,
-            },
-        )
-        .await
-    }
-
-    /// Console → remove a K/D/X-line (admin).
-    pub async fn console_remove_ban(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BanDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        admin_policy_form(
-            &state,
-            &headers,
-            form,
-            "/console/bans",
-            AdminPolicyPage::ServerBans,
-            |f, actor| crate::core::AdminRequest::RemoveServerBan {
-                mask: f.mask,
-                kind: f.kind,
-                actor,
-            },
-        )
-        .await
-    }
-
-    /// Console → unregister a channel (admin), like ChanServ DROP.
-    pub async fn console_drop_channel(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<DropChannelForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        admin_policy_form(
-            &state,
-            &headers,
-            form,
-            "/console/admin/channels",
-            AdminPolicyPage::RegisteredChannels,
-            |f, actor| crate::core::AdminRequest::DropChannel {
-                channel: f.channel,
-                actor,
-            },
-        )
-        .await
-    }
-
-    #[derive(Deserialize)]
-    pub struct DisconnectForm {
-        csrf: String,
-        #[serde(default)]
-        reason: String,
-    }
-
-    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-    fn parse_disconnect_form(
-        connection_id: u64,
-        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
-    ) -> Result<(String, String), Response> {
-        if connection_id == 0 {
-            return Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid live-connection id",
-                None,
-            ));
-        }
-        let form = parse_form(form)?;
-        let reason = validate_disconnect_reason(form.reason)?;
-        Ok((form.csrf, reason))
     }
 
     /// Render one bounded live-connection page. `own` forces the account filter
@@ -7347,19 +4222,17 @@ mod pages {
         } else {
             Vec::new()
         };
-        let (active, title, hint, disconnect_action) = if own {
+        let (active, title, hint) = if own {
             (
                 "my-sessions",
                 "Your sessions",
                 "Durable browser logins and live IRC connections authenticated to your account. Disconnecting a live connection targets its immutable connection ID.",
-                "/console/my-sessions",
             )
         } else {
             (
                 "sessions",
                 "Live connections",
                 "Bounded, newest-first registered IRC connections across TCP, TLS, WebSocket, and the local in-process network.",
-                "/console/sessions",
             )
         };
         let nick_filter = query.nick.unwrap_or_default();
@@ -7374,7 +4247,6 @@ mod pages {
             shell: console_shell(state, account, csrf, active),
             title,
             hint,
-            disconnect_action,
             sessions,
             has_filters: !nick_filter.is_empty()
                 || !account_filter.is_empty()
@@ -7394,25 +4266,6 @@ mod pages {
         })
     }
 
-    #[allow(clippy::result_large_err)] // Err is the standard full problem Response
-    fn default_live_connection_query() -> Result<ValidatedLiveConnectionQuery, Response> {
-        validate_live_connection_query(LiveConnectionQueryParams::default(), 50)
-    }
-
-    async fn sessions_error_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        own: bool,
-        message: String,
-    ) -> Response {
-        let query = match default_live_connection_query() {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        render_sessions_page(state, headers, account, own, query, Some(message)).await
-    }
-
     /// Console → bounded live connection directory (admin-gated).
     pub async fn console_sessions(
         State(state): State<Arc<AppState>>,
@@ -7427,33 +4280,8 @@ mod pages {
         render_sessions_page(&state, &headers, account, false, query, None).await
     }
 
-    /// Console → disconnect an exact live connection (admin), like oper KILL
-    /// after its nick has resolved to one immutable connection.
-    pub async fn console_disconnect_session(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(connection_id): Path<u64>,
-        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let make = |actor| crate::core::AdminRequest::DisconnectConnection {
-            connection_id,
-            reason,
-            actor,
-        };
-        match run_admin_form(&state, &headers, &csrf, "/console/sessions", make).await {
-            Ok(response) => response,
-            Err((account, message)) => {
-                sessions_error_page(&state, &headers, account, false, message).await
-            }
-        }
-    }
-
-    /// Console → the caller's capped browser sessions and bounded live
-    /// connections.
+    /// Console → the caller's bounded live-connection directory and durable
+    /// browser-session inventory.
     pub async fn console_my_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -7468,103 +4296,6 @@ mod pages {
             Err(response) => return response,
         };
         render_sessions_page(&state, &headers, account, true, query, None).await
-    }
-
-    /// Console → disconnect one exact live connection only if it remains owned
-    /// by the caller.
-    pub async fn console_disconnect_own_session(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(connection_id): Path<u64>,
-        form: Result<axum::Form<DisconnectForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (csrf, reason) = match parse_disconnect_form(connection_id, form) {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-        let account = match require_form_actor(&state, &headers, &csrf).await {
-            Ok(account) => account,
-            Err(response) => return response,
-        };
-        let request = crate::core::AdminRequest::DisconnectOwnConnection {
-            connection_id,
-            reason,
-            account: account.clone(),
-        };
-        match core_action(&state, request).await {
-            Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(message) => sessions_error_page(&state, &headers, account, true, message).await,
-        }
-    }
-
-    async fn browser_session_error(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        message: &'static str,
-    ) -> Response {
-        sessions_error_page(state, headers, account, true, message.to_owned()).await
-    }
-
-    /// Console → revoke one durable browser session owned by the caller.
-    pub async fn console_revoke_browser_session(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(id): Path<i64>,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let current = session_token(&headers, state.secure_cookies);
-        match crate::db::delete_web_session_by_id(pool_of(&state), &account, id, current.as_deref())
-            .await
-        {
-            Ok(Some(false)) => Redirect::to("/console/my-sessions").into_response(),
-            Ok(Some(true)) => redirect_signed_out(&state),
-            Ok(None) => {
-                browser_session_error(&state, &headers, account, "No such browser session.").await
-            }
-            Err(error) => {
-                eprintln!("console: browser session revoke failed: {error}");
-                browser_session_error(
-                    &state,
-                    &headers,
-                    account,
-                    "Browser session storage is unavailable.",
-                )
-                .await
-            }
-        }
-    }
-
-    /// Console → revoke every other browser login while preserving the session
-    /// whose CSRF token authorized the form.
-    pub async fn console_revoke_other_browser_sessions(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<AccountDeleteForm>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, _) = match account_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let current = session_token(&headers, state.secure_cookies)
-            .expect("form actor requires a cookie session");
-        match crate::db::delete_other_web_sessions(pool_of(&state), &account, &current).await {
-            Ok(_) => Redirect::to("/console/my-sessions").into_response(),
-            Err(error) => {
-                eprintln!("console: other browser session revoke failed: {error}");
-                browser_session_error(
-                    &state,
-                    &headers,
-                    account,
-                    "Browser session storage is unavailable.",
-                )
-                .await
-            }
-        }
     }
 
     async fn owned_bridge(
@@ -7593,7 +4324,6 @@ mod pages {
         addr: String,
         nick: String,
         autojoin: String,
-        error: Option<String>,
     ) -> Response {
         let Some(meta) = bridge_platform_meta(row.kind) else {
             return problem(StatusCode::BAD_REQUEST, "Not a bridge", None);
@@ -7613,7 +4343,6 @@ mod pages {
             has_sasl_account: row.sasl_account.is_some(),
             has_sasl_password: row.sasl_password_sealed.is_some(),
             can_store_secrets: state.secret_key.is_some(),
-            error,
         })
     }
 
@@ -7636,183 +4365,7 @@ mod pages {
             row.addr,
             row.nick,
             row.autojoin.join(", "),
-            None,
         )
-    }
-
-    /// Validate and atomically replace one account-owned bridge's mutable
-    /// endpoint, identity, channel list, and any explicitly supplied tokens.
-    /// Blank token inputs preserve the encrypted stored value.
-    pub async fn console_update_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        Path(name): Path<String>,
-        form: Result<axum::Form<BridgeEditFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        let form = form.connection;
-        let autojoin: Vec<String> = form
-            .autojoin
-            .split(',')
-            .map(str::trim)
-            .filter(|channel| !channel.is_empty())
-            .map(str::to_string)
-            .collect();
-        let account_secret = (!form.sasl_account.is_empty()).then_some(form.sasl_account.as_str());
-        let password_secret =
-            (!form.sasl_password.is_empty()).then_some(form.sasl_password.as_str());
-        let credentials = if account_secret.is_none() && password_secret.is_none() {
-            NetworkCredentialUpdate::Keep
-        } else {
-            NetworkCredentialUpdate::Set {
-                account: account_secret,
-                password: password_secret,
-            }
-        };
-        let result = update_network_core(
-            &state,
-            registry,
-            &account,
-            &name,
-            EditableNetworkKind::Bridge,
-            &form.addr,
-            true,
-            &form.nick,
-            None,
-            &autojoin,
-            credentials,
-        )
-        .await;
-        let error = match result {
-            Ok(()) => return Redirect::to("/console/integrations").into_response(),
-            Err(error) => error.message(),
-        };
-        let row = match owned_bridge(&state, &account, &name).await {
-            Ok(row) => row,
-            Err(response) => return response,
-        };
-        let csrf = session_token(&headers, state.secure_cookies)
-            .map(|session| state.csrf_token(&session))
-            .unwrap_or_default();
-        console_bridge_edit_page(
-            &state,
-            account,
-            csrf,
-            row,
-            form.addr,
-            form.nick,
-            form.autojoin,
-            Some(error),
-        )
-    }
-
-    /// Console → Integrations: add a bridge (admin). Maps the platform form onto
-    /// `CreateNetwork` and reuses `create_network_core` (schema, per-kind secret
-    /// sealing, feature-gated driver construction) — so a console-created bridge
-    /// and a config-file one run through the exact same path. Owned by the
-    /// creating admin's account.
-    pub async fn console_add_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BridgeFormFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, f) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let Some(registry) = &state.bnc_registry else {
-            let msg = "The bouncer is not enabled on this server.".to_string();
-            return console_integrations_error(&state, &headers, account, msg).await;
-        };
-        let Some(kind) = crate::config::NetworkKind::from_db_str(&f.kind).filter(|k| k.is_bridge())
-        else {
-            let msg = format!("'{}' is not a bridge platform.", f.kind);
-            return console_integrations_error(&state, &headers, account, msg).await;
-        };
-        // Pre-check the build feature so the banner names it specifically.
-        if !kind_feature_available(kind) {
-            let msg = format!(
-                "This server was not built with the {} feature — rebuild with --features {}.",
-                f.kind, f.kind
-            );
-            return console_integrations_error(&state, &headers, account, msg).await;
-        }
-        let opt = |s: String| if s.is_empty() { None } else { Some(s) };
-        let conn = f.connection;
-        let req = CreateNetwork {
-            kind,
-            name: f.name,
-            addr: conn.addr,
-            tls: true,
-            nick: conn.nick,
-            realname: None,
-            autojoin: conn
-                .autojoin
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-            sasl_account: opt(conn.sasl_account),
-            sasl_password: opt(conn.sasl_password),
-        };
-        if let Err(error) = create_network_core(&state, registry, &account, &req).await {
-            return console_integrations_error(&state, &headers, account, error.message()).await;
-        }
-        Redirect::to("/console/integrations").into_response()
-    }
-
-    /// Console → Integrations: remove one of the admin's own bridges.
-    pub async fn console_delete_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BridgeDeleteFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, f) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        if let Err(error) = delete_network_core(
-            &state,
-            registry,
-            &account,
-            &f.name,
-            EditableNetworkKind::Bridge,
-        )
-        .await
-        {
-            return console_integrations_error(&state, &headers, account, error.message()).await;
-        }
-        Redirect::to("/console/integrations").into_response()
-    }
-
-    /// Pause or resume one of the administrator's account-owned bridges while
-    /// retaining its encrypted configuration and detached backlog.
-    pub async fn console_toggle_bridge(
-        State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        form: Result<axum::Form<BridgeToggleFields>, axum::extract::rejection::FormRejection>,
-    ) -> Response {
-        let (account, form) = match admin_form_actor(&state, &headers, form).await {
-            Ok(resolved) => resolved,
-            Err(response) => return response,
-        };
-        let registry = require_registry!(state);
-        let Some(enabled) = toggle_target(&form.enabled) else {
-            return invalid_toggle_response();
-        };
-        if let Err(error) =
-            set_network_enabled_core(&state, registry, &account, &account, &form.name, enabled)
-                .await
-        {
-            return console_integrations_error(&state, &headers, account, error.message()).await;
-        }
-        Redirect::to("/console/integrations").into_response()
     }
 
     #[derive(Template)]
@@ -8015,56 +4568,6 @@ mod pages {
             );
             assert_ne!(digest, super::super::bootstrap_token_digest("other-secret"));
             assert_eq!(digest.len(), 32);
-        }
-    }
-
-    #[cfg(test)]
-    mod network_form_tests {
-        use super::*;
-
-        fn fields(preset: &str) -> NetworkFormFields {
-            NetworkFormFields {
-                csrf: "token".into(),
-                preset: preset.into(),
-                name: "stale name".into(),
-                addr: "stale.example:6667".into(),
-                nick: "alice".into(),
-                tls: None,
-                autojoin: "#rust, #e6irc".into(),
-                realname: String::new(),
-                sasl_account: String::new(),
-                sasl_password: String::new(),
-            }
-        }
-
-        #[test]
-        fn preset_owns_safe_id_endpoint_and_tls_defaults() {
-            let mut submitted = fields("libera");
-            submitted.apply_preset().expect("known preset");
-            let request = submitted.into_resolved_create();
-            assert_eq!(request.name, "libera");
-            assert_eq!(request.addr, "irc.libera.chat:6697");
-            assert!(request.tls);
-            assert_eq!(request.autojoin, ["#rust", "#e6irc"]);
-        }
-
-        #[test]
-        fn resolved_preset_values_are_the_values_rerendered_after_an_error() {
-            let mut submitted = fields("oftc");
-            submitted.apply_preset().expect("known preset");
-            let view = NetworkFormView::submitted(&submitted);
-            assert_eq!(view.preset, "oftc");
-            assert_eq!(view.name, "oftc");
-            assert_eq!(view.addr, "irc.oftc.net:6697");
-            assert!(view.tls);
-        }
-
-        #[test]
-        fn unknown_preset_is_not_silently_treated_as_custom() {
-            let error = fields("invented")
-                .apply_preset()
-                .expect_err("unknown preset must fail");
-            assert!(error.message().contains("Unknown IRC network preset"));
         }
     }
 }

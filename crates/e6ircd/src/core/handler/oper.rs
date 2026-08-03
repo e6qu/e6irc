@@ -573,6 +573,19 @@ pub(crate) fn server_ban_result(
         finish_server_ban_unavailable(state, requester, "services are temporarily unavailable");
         return;
     }
+    if result == crate::core::ServerBanResult::Missing {
+        if let crate::core::ServerBanRequester::Admin { request_id, .. } = requester {
+            finish_admin_server_ban(
+                state,
+                request_id,
+                crate::core::AdminReply::BanErr {
+                    kind: crate::core::BanControlError::NotFound,
+                    message: "server ban no longer exists".into(),
+                },
+            );
+        }
+        return;
+    }
 
     match mutation {
         crate::core::ServerBanMutation::Add {
@@ -682,7 +695,10 @@ fn finish_server_ban_unavailable(
             finish_admin_server_ban(
                 state,
                 request_id,
-                crate::core::AdminReply::Err(format!("server-ban change failed: {reason}")),
+                crate::core::AdminReply::BanErr {
+                    kind: crate::core::BanControlError::Unavailable,
+                    message: format!("server-ban change failed: {reason}"),
+                },
             );
         }
     }

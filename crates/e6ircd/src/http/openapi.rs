@@ -640,7 +640,24 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me/credentials": {
                 "get": { "summary": "List the account's credentials", "security": authenticated,
-                    "responses": ok_json }
+                    "responses": ok_json },
+                "post": {
+                    "summary": "Mint an app password for the current browser-session account",
+                    "description": "Requires a cookie-authenticated browser session and session-bound CSRF. Bearer tokens cannot mint credentials.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": { "type": "object", "required": ["label"], "additionalProperties": false,
+                            "properties": { "label": { "type": "string", "minLength": 1, "maxLength": 64 } } }
+                    } } },
+                    "responses": {
+                        "201": { "description": "the app password, shown once" },
+                        "400": { "description": "invalid label" },
+                        "401": { "description": "browser session required" },
+                        "403": { "description": "invalid or missing CSRF token" },
+                        "409": { "description": "credential cap reached" },
+                        "503": { "description": "database unavailable" }
+                    }
+                }
             },
             "/api/v1/me/credentials/{id}": {
                 "delete": { "summary": "Revoke an app password", "security": authenticated,
@@ -984,6 +1001,21 @@ fn document() -> serde_json::Value {
                     "responses": { "200": { "description": "server-ban policy and next_before_id cursor" },
                         "400": { "description": "invalid limit, cursor, kind, or mask filter" },
                         "403": { "description": "not an admin account" } } }
+                ,"post": { "summary": "Create or refresh a K/D/X-line policy (admin only)",
+                    "description": "Uses the core-owned oper policy path, so persistence, immediate enforcement, matching-session disconnects, and audit provenance commit together.",
+                    "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": {
+                        "type": "object", "required": ["kind", "mask"],
+                        "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" } }
+                    } } } },
+                    "responses": { "201": { "description": "server ban created" }, "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
+            },
+            "/api/v1/admin/bans/{id}": {
+                "delete": { "summary": "Delete one immutable server-ban resource (admin only)",
+                    "description": "Resolves the stable directory ID before submitting the matching policy removal through the core. A stale ID cannot delete a recreated visible mask.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "204": { "description": "server ban removed" }, "400": { "description": "invalid ID" }, "403": { "description": "not an admin account" }, "404": { "description": "server ban no longer exists" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
             },
             "/api/v1/admin/audit": {
                 "get": { "summary": "Filter and page the privileged-action audit log (admin only)",
@@ -1000,12 +1032,62 @@ fn document() -> serde_json::Value {
                     "responses": { "200": { "description": "counts" },
                         "403": { "description": "not an admin account" } } }
             },
+            "/api/v1/admin/configuration": {
+                "get": { "summary": "Read revisioned managed configuration (admin only)",
+                    "description": "Returns the compare-and-swap revision and redacted operational settings. OIDC client secrets, oper passwords, upstream SASL passwords, and secret bridge accounts are never returned.",
+                    "security": authenticated,
+                    "responses": { "200": { "description": "redacted settings and revision" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
+                "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": { "type": "object", "description": "Scalar managed settings; credential collections are not accepted here." } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced and restart_required indicator" }, "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
+            },
+            "/api/v1/admin/configuration/opers": {
+                "post": { "summary": "Add an IRC operator to managed configuration", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "password"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "password": { "type": "string", "writeOnly": true } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/opers/{name}": {
+                "delete": { "summary": "Remove an IRC operator from managed configuration", "security": authenticated,
+                    "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/oidc-providers": {
+                "post": { "summary": "Add an OIDC provider to managed configuration", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "issuer_url", "client_id", "client_secret", "token_endpoint_auth_method"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string", "writeOnly": true }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": "string" }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/oidc-providers/{name}": {
+                "delete": { "summary": "Remove an OIDC provider from managed configuration", "security": authenticated,
+                    "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/networks": {
+                "post": { "summary": "Add a managed server network", "security": authenticated,
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "kind", "tls", "buffer_cap"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": "string" }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
+            },
+            "/api/v1/admin/configuration/networks/{name}": {
+                "delete": { "summary": "Remove a managed server network", "security": authenticated,
+                    "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" }, "owner": { "type": "string" } } } } } },
+                    "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
+            },
             "/api/v1/admin/networks": {
                 "get": { "summary": "Fleet-wide BNC network inventory (admin only)",
                     "description": "Every account's networks with stored configuration (credentials as presence booleans only) and live driver runtime state, ordered by owner and network name.",
                     "security": authenticated,
                     "responses": { "200": { "description": "networks with runtime snapshots" },
                         "403": { "description": "not an admin account" } } }
+            },
+            "/api/v1/admin/networks/{owner}/{name}": {
+                "patch": { "summary": "Change one owner's network lifecycle (admin only)",
+                    "description": "Persists the enabled state and starts or stops the same always-on driver as the owner API. The administrator is retained as the audit actor.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
+                    "responses": { "200": { "description": "network lifecycle updated" }, "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/observability": {
                 "get": { "summary": "Live telemetry and bounded history (admin only)",

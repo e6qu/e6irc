@@ -1,11 +1,10 @@
 {% extends "console_base.html" %}
 {% block main %}
-        {% if let Some(err) = error %}
-          <p class="banner-error" role="alert">{{ err }}</p>
-        {% endif %}
+        <p id="network-api-result" role="status" aria-live="polite"></p>
+        <noscript><div class="banner-error">JavaScript is required to manage networks because these controls use the network API directly.</div></noscript>
         <div class="page-head"><div><p class="eyebrow">IRC network</p><h1>Edit {{ name }}</h1><p class="lede">Saving replaces the live upstream connection after the new values are validated.</p></div></div>
         <section class="panel">
-        <form class="network-form" method="post" action="/console/networks/{{ name }}/edit">
+        <form class="network-form" method="post" action="/api/v1/me/networks/{{ name }}" data-api-owner-network-update>
           <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
           <label class="field"><span>Server and port</span><input name="addr" value="{{ addr }}" required /></label>
           <label class="field"><span>Nickname</span><input name="nick" value="{{ nick }}" required /></label>

@@ -1,5 +1,6 @@
 {% extends "console_base.html" %}
 {% block main %}
+  <noscript><div class="banner-error">JavaScript is required to inspect audit history because this directory uses the administrator API directly.</div></noscript>
   <div class="page-head">
     <div>
       <p class="eyebrow">Security operations</p>
@@ -52,45 +53,17 @@
         <h2>Audited actions</h2>
         <p>Stable entry IDs make each older page deterministic while new actions arrive.</p>
       </div>
-      <span class="count">{{ entries.len() }}</span>
+      <span class="count" id="admin-audit-count">…</span>
     </div>
-    {% if entries.is_empty() %}
-      <p class="empty">{% if has_filters %}No audited actions match these exact filters.{% else %}No audited actions.{% endif %}</p>
-    {% else %}
-      <div class="scroll">
-        <table>
-          <caption class="sr-only">Audited actions</caption>
-          <thead>
-            <tr><th>ID</th><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr>
-          </thead>
-          <tbody>
-            {% for entry in entries %}
-              <tr>
-                <td class="meta">{{ entry.id }}</td>
-                <td class="meta"><time datetime="{{ entry.at }}">{{ entry.at }}</time></td>
-                <td><code>{{ entry.actor }}</code></td>
-                <td><strong>{{ entry.action }}</strong></td>
-                <td class="audit-target"><code>{{ entry.target }}</code></td>
-                <td class="audit-detail">{{ entry.detail }}</td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% endif %}
-
-    <div class="pager">
-      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching actions.{% endif %}</span>
-      {% if let Some(before_id) = next_before_id %}
-        <form method="get" action="/console/audit">
-          <input type="hidden" name="actor" value="{{ actor }}" />
-          <input type="hidden" name="action" value="{{ action }}" />
-          <input type="hidden" name="target" value="{{ target }}" />
-          <input type="hidden" name="limit" value="{{ limit }}" />
-          <input type="hidden" name="before_id" value="{{ before_id }}" />
-          <button type="submit">Older actions</button>
-        </form>
-      {% endif %}
+    <div class="scroll">
+      <table>
+        <caption class="sr-only">Audited actions</caption>
+        <thead><tr><th>ID</th><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+        <tbody id="admin-audit-rows" data-api-admin-audit-list>
+          <tr><td colspan="6" class="empty">Loading audited actions…</td></tr>
+        </tbody>
+      </table>
     </div>
+    <div class="pager" id="admin-audit-pager"></div>
   </section>
 {% endblock %}

@@ -9,23 +9,9 @@
     <a class="button-link" href="/api/v1/admin/accounts">Open JSON API</a>
   </div>
 
-  {% if let Some(message) = outcome %}
-    <div class="{% if success %}banner-success{% else %}banner-error{% endif %}" role="{% if success %}status{% else %}alert{% endif %}">{{ message }}</div>
-  {% endif %}
-
-  {% if let Some(value) = invitation_url %}
-    <section class="secret-reveal" aria-labelledby="invitation-link-title">
-      <div>
-        <p class="eyebrow">Shown once</p>
-        <h2 id="invitation-link-title">Account invitation link</h2>
-        <p>The bearer secret is not stored. Copy this link now and send it through a trusted channel.</p>
-      </div>
-      <div class="secret-value">
-        <code id="issued-invitation">{{ value }}</code>
-        <button type="button" data-copy-target="issued-invitation">Copy</button>
-      </div>
-    </section>
-  {% endif %}
+  <div id="admin-account-api-result" role="status" aria-live="polite"></div>
+  <div id="admin-account-api-secret"></div>
+  <noscript><div class="banner-error">JavaScript is required to manage accounts because these controls use the administrator API directly.</div></noscript>
 
   <section class="panel">
     <div class="panel-head">
@@ -34,7 +20,7 @@
         <p>Issue a single-use, expiring link. The recipient chooses the password; e6irc stores only the link digest.</p>
       </div>
     </div>
-    <form class="field-grid" method="post" action="/console/accounts/invitations">
+    <form class="field-grid" method="post" action="/api/v1/admin/invitations" data-api-admin-invitation-create>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Account name</span>
@@ -81,7 +67,7 @@
                 <td><time datetime="{{ invitation.expires_at }}">{{ invitation.expires_at }}</time></td>
                 <td>
                   <form class="cell-form" method="post"
-                        action="/console/accounts/invitations/{{ invitation.id }}/delete"
+                        action="/api/v1/admin/invitations/{{ invitation.id }}" data-api-admin-invitation-delete
                         data-confirm="Revoke the invitation for {{ invitation.account_name }}?">
                     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                     <button class="danger" type="submit">Revoke</button>
@@ -116,7 +102,7 @@
         <p>Provision a local account with an initial password. Contact email is private operator metadata and is not treated as verified.</p>
       </div>
     </div>
-    <form class="field-grid" method="post" action="/console/accounts/create">
+    <form class="field-grid" method="post" action="/api/v1/admin/accounts" data-api-admin-account-create>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field">
         <span>Account name</span>
@@ -220,7 +206,7 @@
                   {% if !entry.current %}
                     <div class="account-actions">
                     <form class="cell-form" method="post"
-                          action="/console/accounts/{{ entry.id }}/suspension"
+                          action="/api/v1/admin/accounts/{{ entry.id }}" data-api-admin-account-state="suspension"
                           data-confirm="{% if entry.suspended %}Reactivate {{ entry.name }} and restart its enabled networks?{% else %}Suspend {{ entry.name }}, revoke its sessions and tokens, disconnect its clients, and stop its networks?{% endif %}">
                       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <input type="hidden" name="suspended" value="{% if entry.suspended %}false{% else %}true{% endif %}" />
@@ -229,7 +215,7 @@
                       </button>
                     </form>
                     <form class="cell-form account-delete-form" method="post"
-                          action="/console/accounts/{{ entry.id }}/administrator"
+                          action="/api/v1/admin/accounts/{{ entry.id }}" data-api-admin-account-state="administrator"
                           data-confirm="{% if entry.administrator %}Remove durable administrator authority from {{ entry.name }}? A configuration grant, if shown, remains effective until configuration changes and restart.{% else %}Grant durable administrator authority to {{ entry.name }}?{% endif %}">
                       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <input type="hidden" name="administrator" value="{% if entry.administrator %}false{% else %}true{% endif %}" />
@@ -238,7 +224,7 @@
                       </button>
                     </form>
                     <form class="cell-form" method="post"
-                          action="/console/accounts/{{ entry.id }}/delete"
+                          action="/api/v1/admin/accounts/{{ entry.id }}" data-api-admin-account-delete
                           data-confirm="Permanently delete {{ entry.name }}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.">
                       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
                       <label class="field">

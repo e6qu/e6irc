@@ -108,7 +108,7 @@ EXPECTED=$(find crates -name '*.rs' \
 	-not -path '*/tests/*' -not -path '*/benches/*' \
 	-not -path '*/fuzz/*' -not -path '*/target/*' | wc -l | tr -d ' ')
 REPORT_DIR=$(mktemp -d)
-trap 'rm -rf "${REPORT_DIR}"' EXIT
+trap '[ -n "${KEEP_DUPLICATION_REPORT:-}" ] || rm -rf "${REPORT_DIR}"' EXIT
 
 if npx --yes "jscpd@${JSCPD_VERSION}" crates \
 	--formats-exts "rust:rs" \

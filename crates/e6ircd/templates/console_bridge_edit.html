@@ -1,8 +1,7 @@
 {% extends "console_base.html" %}
 {% block main %}
-  {% if let Some(err) = error %}
-    <p class="banner-error" role="alert">{{ err }}</p>
-  {% endif %}
+  <p id="network-api-result" role="status" aria-live="polite"></p>
+  <noscript><div class="banner-error">JavaScript is required to manage bridges because these controls use the network API directly.</div></noscript>
   <div class="page-head">
     <div>
       <p class="eyebrow">{{ platform }} bridge</p>
@@ -12,7 +11,7 @@
     <a class="button-link secondary-link" href="/console/integrations">All integrations</a>
   </div>
   <section class="panel">
-    <form class="network-form" method="post" action="/console/integrations/{{ name }}/edit">
+    <form class="network-form" method="post" action="/api/v1/me/networks/{{ name }}" data-api-owner-bridge-update>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field field-wide">
         <span>Homeserver / API base {% if !addr_required %}<em>optional</em>{% endif %}</span>

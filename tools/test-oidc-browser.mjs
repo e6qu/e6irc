@@ -446,7 +446,7 @@ try {
 
     await guest.goto(`${applicationOrigin}/console/account`);
     await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
-    assert.match(await guest.locator("main").innerText(), /ACCOUNT_LOGIN/);
+    await guest.getByText("ACCOUNT_LOGIN", { exact: true }).waitFor();
     const exportResponse = await guestContext.request.get(`${applicationOrigin}/api/v1/me/export`);
     assert.equal(exportResponse.status(), 200);
     assert.match(exportResponse.headers()["content-disposition"], /e6irc-account-export\.json/);
@@ -468,7 +468,7 @@ try {
         name: "Delete my account permanently",
         exact: true,
       }),
-      `${applicationOrigin}/login`,
+      `${applicationOrigin}/auth/signed-out`,
     );
     assert.equal((await guestContext.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
   } finally {
@@ -512,9 +512,19 @@ try {
 
   await page.goto(`${applicationOrigin}/console/audit`);
   await page.getByRole("heading", { name: "Audit log", exact: true }).waitFor();
+  await page.getByText("KLINE", { exact: true }).waitFor();
+  await page.waitForFunction(async (auditURL) => {
+    const response = await fetch(auditURL, {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) return false;
+    const payload = await response.json();
+    return Array.isArray(payload.audit) && payload.audit.some((entry) => entry.action === "UNKLINE");
+  }, `${applicationOrigin}/api/v1/admin/audit?action=UNKLINE&target=${encodeURIComponent("*@browser-policy.example")}`);
   assert.match(await page.locator("main").innerText(), /browser-policy\.example/);
   assert.match(await page.locator("main").innerText(), /KLINE/);
-  assert.match(await page.locator("main").innerText(), /UNKLINE/);
 
   // Configure a custom IRC upstream entirely through the server-rendered UI,
   // then use the production web client and its real /ws/ui socket in both
@@ -532,15 +542,10 @@ try {
   await page.locator('input[name="nick"]').fill("webjourney");
   await page.locator('input[name="autojoin"]').fill("#journey");
   await page.locator('input[name="tls"]').uncheck();
-  await clickAndWaitForURL(
-    page,
-    page.getByRole("button", { name: "Test connection", exact: true }),
-    `${applicationOrigin}/console/networks/preflight`,
-  );
-  await page
-    .getByRole("heading", { name: "Registered as webjourney", exact: true })
-    .waitFor();
-  assert.match(await page.getByRole("status").innerText(), /Not saved yet/);
+  await page.getByRole("button", { name: "Test connection", exact: true }).click();
+  await page.getByRole("status").filter({ hasText: /Registered as webjourney/ }).waitFor();
+  assert.match(await page.getByRole("status").innerText(), /no network was created/);
+  assert.equal(page.url(), `${applicationOrigin}/console/networks`);
   assert.equal(await page.getByRole("link", { name: "journey", exact: true }).count(), 0);
   assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
   await clickAndWaitForURL(

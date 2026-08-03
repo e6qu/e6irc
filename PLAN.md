@@ -46,15 +46,18 @@ The application is complete only when all of the following are true:
   production-scale behavior, recovery, release artifacts, and the real
   third-party integrations that are advertised as supported.
 
-### Stage A — Establish the API-first boundary 🔶 inventory in progress
+### Stage A — Establish the API-first boundary 🔶 resource parity complete
 
 **Goal:** make `/api/v1` the authoritative product interface and eliminate
 parallel console-specific behavior.
 
 **Current milestone:** [`docs/api-first-inventory.md`](docs/api-first-inventory.md)
-lists every mutable console route, its current API mapping, and the API gaps
-that must close before the rendered-form handlers can retire. CI verifies that
-the inventory covers the router's complete console-mutation set.
+lists every remaining mutable console route and its canonical API mapping.
+Every listed state transition has a typed versioned API operation; CI verifies
+that the inventory covers the router's complete console-mutation set. The
+All administrator and owner console controls now issue their typed API requests
+directly and their rendered mutation handlers are gone, with HTTP tests
+covering the same authorization and committed-result contracts.
 
 1. Inventory every browser-chat, server-rendered-console, CLI, and native
    client read/mutation. For each one, record its canonical resource, request
@@ -91,6 +94,20 @@ the same persistent/core/audit result.
 
 **Goal:** turn the management console from a parallel rendered-form surface
 into a responsive client of the canonical API.
+
+**Current progress:** every Configuration page mutation now issues its
+revisioned administrator JSON request with the page's session-bound CSRF token.
+The scalar form serializes its nested typed settings rather than inventing a
+form-only API shape. Controls reload only after a committed response and keep
+API failures visible in the document. The superseded Configuration mutation
+handlers are removed. Administrator server-ban creation and immutable-ID
+deletion now follow the same API-only pattern; their rendered mutation routes
+are removed.
+All console mutations and the API-hydrated administrator directories (fleet
+networks, registered channels, server bans, and audit history) share
+same-origin request helpers for authentication context, problem decoding, and
+bounded JSON response decoding; only read-only HTML fragment refreshes fetch
+rendered markup directly.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

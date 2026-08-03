@@ -2243,7 +2243,8 @@ async fn handle_request(
             requester,
         } => {
             let result = match mutate_server_ban_audited(pool, &mutation).await {
-                Ok(()) => crate::core::ServerBanResult::Stored,
+                Ok(true) => crate::core::ServerBanResult::Stored,
+                Ok(false) => crate::core::ServerBanResult::Missing,
                 Err(e) => {
                     record_database_error(telemetry);
                     eprintln!("db: audited server-ban mutation failed: {e}");
@@ -3339,7 +3340,7 @@ pub async fn remove_server_ban(pool: &PgPool, mask: &str, kind: &str) -> Result<
 async fn mutate_server_ban_audited(
     pool: &PgPool,
     mutation: &crate::core::ServerBanMutation,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
     let (actor, action, target, detail) = match mutation {
         crate::core::ServerBanMutation::Add {
@@ -3373,17 +3374,27 @@ async fn mutate_server_ban_audited(
             )
         }
         crate::core::ServerBanMutation::Remove {
+            expected_id,
             mask,
             mask_display,
             kind,
             actor,
         } => {
-            sqlx::query("DELETE FROM server_bans WHERE mask = $1 AND kind = $2")
-                .bind(mask)
-                .bind(kind)
+            let mut delete =
+                sqlx::QueryBuilder::<sqlx::Postgres>::new("DELETE FROM server_bans WHERE mask = ");
+            delete.push_bind(mask).push(" AND kind = ").push_bind(kind);
+            if let Some(expected_id) = expected_id {
+                delete.push(" AND id = ").push_bind(expected_id);
+            }
+            let deleted = delete
+                .build()
                 .execute(&mut *transaction)
                 .await
                 .map_err(DbError::Query)?;
+            if deleted.rows_affected() == 0 {
+                transaction.rollback().await.map_err(DbError::Query)?;
+                return Ok(false);
+            }
             (
                 actor.as_str(),
                 format!("UN{}", kind.to_ascii_uppercase()),
@@ -3393,7 +3404,8 @@ async fn mutate_server_ban_audited(
         }
     };
     insert_audit_log_with(&mut *transaction, actor, &action, target, detail).await?;
-    transaction.commit().await.map_err(DbError::Query)
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(true)
 }
 
 async fn insert_audit_log_with<'executor>(
@@ -4319,6 +4331,26 @@ pub struct ServerBanDirectoryFilter<'a> {
 pub struct ServerBanDirectoryPage {
     pub entries: Vec<ServerBanDirectoryRow>,
     pub next_before_id: Option<i64>,
+}
+
+/// Look up one immutable administrator policy resource. Its ID is resolved
+/// before the core receives the mutation, preventing a stale client from
+/// deleting a later ban that reused the same visible mask.
+pub async fn server_ban_directory_entry(
+    pool: &PgPool,
+    id: i64,
+) -> Result<Option<ServerBanDirectoryRow>, DbError> {
+    sqlx::query_as(
+        "SELECT b.id, b.kind, COALESCE(b.mask_display, b.mask) AS mask,
+                b.reason, b.set_by,
+                to_char(b.created_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+         FROM server_bans b WHERE b.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(DbError::Query)
 }
 
 bounded_page_size!(

@@ -12,6 +12,7 @@
   {% if let Some(message) = outcome %}
     <div class="{% if success %}banner-success{% else %}banner-error{% endif %}" role="status">{{ message }}</div>
   {% endif %}
+  <div id="configuration-api-result" role="status" aria-live="polite"></div>
 
   <div class="provenance">
     <span>Last changed by <strong>{{ updated_by }}</strong></span>
@@ -26,9 +27,10 @@
     <p>These bootstrap values must exist before the console can start. Their effective state is shown here; more than one key means a credential rotation window is active. Operational configuration below is UI-managed.</p>
   </section>
 
-  <form class="settings-form" method="post" action="/console/configuration">
+  <form class="settings-form" method="post" action="/api/v1/admin/configuration" data-api-configuration-patch>
     <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
     <input type="hidden" name="revision" value="{{ revision }}" />
+    <noscript><div class="banner-error">JavaScript is required to save configuration because this form uses the administrator API directly.</div></noscript>
 
     <section class="settings-section">
       <div class="section-copy">
@@ -203,6 +205,7 @@
       <p>Shared or account-owned networks imported from <code>[[network]]</code>. They start from the persisted configuration after restart.</p>
     </div>
     <div>
+      <noscript><div class="banner-error">JavaScript is required to manage server networks because these controls use the administrator API directly.</div></noscript>
       {% if settings.credentials_from_bootstrap %}
         <div class="banner-info"><div><strong>Credential-bearing networks still come from bootstrap configuration.</strong> Configure the master key and restart once to enable UI changes.</div></div>
       {% endif %}
@@ -215,8 +218,9 @@
               <div><strong>{{ network.name }}</strong><span class="tag">{{ network.kind }}</span></div>
               <code>{{ network.addr }}</code>
               <span class="meta">Available to {{ network.owner_display }}</span>
-              <form method="post" action="/console/configuration/shared-networks/delete">
+              <form method="post" action="/api/v1/admin/configuration/networks/{{ network.name }}" data-api-network-delete>
                 <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                <input type="hidden" name="revision" value="{{ revision }}" />
                 <input type="hidden" name="name" value="{{ network.name }}" />
                 <input type="hidden" name="owner" value="{{ network.owner_value }}" />
                 <button class="danger" type="submit">Remove</button>
@@ -225,8 +229,9 @@
           {% endfor %}
         </div>
       {% endif %}
-      <form class="oidc-form" method="post" action="/console/configuration/shared-networks">
+      <form class="oidc-form" method="post" action="/api/v1/admin/configuration/networks" data-api-network-create>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <input type="hidden" name="revision" value="{{ revision }}" />
         <label class="field"><span>Network name</span><input name="name" required /></label>
         <label class="field"><span>Owner <em>blank for shared</em></span><input name="owner" /></label>
         <label class="field"><span>Driver</span><select name="kind"><option value="irc">IRC</option><option value="local">Local e6irc</option>{% if matrix_built %}<option value="matrix">Matrix</option>{% endif %}{% if discord_built %}<option value="discord">Discord</option>{% endif %}{% if slack_built %}<option value="slack">Slack</option>{% endif %}</select></label>
@@ -249,6 +254,7 @@
       <p>Passwords are encrypted with the deployment master key and are never rendered back to the browser.</p>
     </div>
     <div>
+      <noscript><div class="banner-error">JavaScript is required to manage IRC operators because these controls use the administrator API directly.</div></noscript>
       {% if settings.credentials_from_bootstrap %}
         <div class="banner-info"><div><strong>Credentials still come from bootstrap configuration.</strong> Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.</div></div>
       {% endif %}
@@ -259,8 +265,9 @@
           {% for name in opers %}
             <div>
               <code>{{ name }}</code>
-              <form method="post" action="/console/configuration/opers/delete">
+              <form method="post" action="/api/v1/admin/configuration/opers/{{ name }}" data-api-oper-delete>
                 <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                <input type="hidden" name="revision" value="{{ revision }}" />
                 <input type="hidden" name="name" value="{{ name }}" />
                 <button class="danger" type="submit">Remove</button>
               </form>
@@ -268,8 +275,9 @@
           {% endfor %}
         </div>
       {% endif %}
-      <form class="inline-config-form" method="post" action="/console/configuration/opers">
+      <form class="inline-config-form" method="post" action="/api/v1/admin/configuration/opers" data-api-oper-create>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <input type="hidden" name="revision" value="{{ revision }}" />
         <label class="field"><span>Operator name</span><input name="name" required /></label>
         <label class="field"><span>New password</span><input type="password" name="password" autocomplete="new-password" required /></label>
         <button class="primary" type="submit">Add operator</button>
@@ -283,6 +291,7 @@
       <p>Identity providers used for browser sign-in. Client secrets are encrypted and replace-only.</p>
     </div>
     <div>
+      <noscript><div class="banner-error">JavaScript is required to manage identity providers because these controls use the administrator API directly.</div></noscript>
       {% if settings.credentials_from_bootstrap %}
         <div class="banner-info"><div><strong>Credentials still come from bootstrap configuration.</strong> Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.</div></div>
       {% endif %}
@@ -296,8 +305,9 @@
               <code>{{ provider.issuer_url }}</code>
               <span class="meta">Client {{ provider.client_id }} · scopes {{ provider.scopes }}</span>
               <span class="meta">Allowed email domains: {% if provider.allowed_email_domains.is_empty() %}any verified provider identity{% else %}{{ provider.allowed_email_domains }}{% endif %}</span>
-              <form method="post" action="/console/configuration/oidc/delete">
+              <form method="post" action="/api/v1/admin/configuration/oidc-providers/{{ provider.name }}" data-api-oidc-delete>
                 <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+                <input type="hidden" name="revision" value="{{ revision }}" />
                 <input type="hidden" name="name" value="{{ provider.name }}" />
                 <button class="danger" type="submit">Remove</button>
               </form>
@@ -305,8 +315,9 @@
           {% endfor %}
         </div>
       {% endif %}
-      <form class="oidc-form" method="post" action="/console/configuration/oidc">
+      <form class="oidc-form" method="post" action="/api/v1/admin/configuration/oidc-providers" data-api-oidc-create>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+        <input type="hidden" name="revision" value="{{ revision }}" />
         <label class="field"><span>Provider name</span><input name="name" placeholder="corp" required /></label>
         <label class="field"><span>Issuer URL</span><input type="url" name="issuer_url" required /></label>
         <label class="field"><span>Client ID</span><input name="client_id" required /></label>

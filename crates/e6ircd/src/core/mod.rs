@@ -200,6 +200,7 @@ pub enum AdminRequest {
     },
     /// Remove a K/D/X-line by (mask, kind).
     RemoveServerBan {
+        expected_id: Option<i64>,
         mask: String,
         kind: String,
         actor: String,
@@ -394,6 +395,12 @@ pub enum AdminReply {
         kind: ChannelControlError,
         message: String,
     },
+    /// A server-ban control rejection with a stable machine category for the
+    /// REST problem response.
+    BanErr {
+        kind: BanControlError,
+        message: String,
+    },
     /// A bounded live-connection page.
     Connections(LiveConnectionPage),
     /// An exact connection-id mutation found no eligible live connection.
@@ -402,6 +409,14 @@ pub enum AdminReply {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelControlError {
+    Invalid,
+    NotFound,
+    Conflict,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BanControlError {
     Invalid,
     NotFound,
     Conflict,
@@ -444,6 +459,7 @@ pub enum ServerBanMutation {
         kind: String,
     },
     Remove {
+        expected_id: Option<i64>,
         mask: String,
         mask_display: String,
         kind: String,
@@ -478,7 +494,17 @@ impl ServerBanMutation {
 
     /// A `Remove` mutation from a validated mask and the acting identity.
     pub fn remove(mask: &state::MaskKey, kind: state::BanKind, actor: String) -> Self {
+        Self::remove_with_id(mask, kind, actor, None)
+    }
+
+    pub fn remove_with_id(
+        mask: &state::MaskKey,
+        kind: state::BanKind,
+        actor: String,
+        expected_id: Option<i64>,
+    ) -> Self {
         Self::Remove {
+            expected_id,
             mask: mask.folded().to_string(),
             mask_display: mask.as_str().to_string(),
             kind: kind.as_str().to_string(),
@@ -490,6 +516,7 @@ impl ServerBanMutation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerBanResult {
     Stored,
+    Missing,
     Unavailable,
 }
 
