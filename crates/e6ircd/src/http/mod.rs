@@ -2115,64 +2115,10 @@ mod pages {
         })
     }
 
-    struct ChannelAccessView {
-        account: String,
-        flags: String,
-        auto_op: bool,
-        auto_voice: bool,
-    }
-
-    struct OwnedChannelView {
-        name: String,
-        founder: String,
-        keeptopic: bool,
-        topic: String,
-        topic_setter: String,
-        mlock: String,
-        access: Vec<ChannelAccessView>,
-    }
-
     #[derive(Template)]
     #[template(path = "console_channels.html")]
     struct ConsoleChannels {
         shell: ConsoleShell,
-        channels: Vec<OwnedChannelView>,
-    }
-
-    async fn console_channels_build(
-        state: &AppState,
-        account: String,
-        csrf: String,
-    ) -> Result<ConsoleChannels, Response> {
-        let channels = crate::db::list_owned_channels(pool_of(state), &account)
-            .await
-            .map_err(|error| super::device::admin_db_error("owned channel list", error))?
-            .into_iter()
-            .map(|channel| OwnedChannelView {
-                name: channel.name,
-                founder: channel.founder,
-                keeptopic: channel.keeptopic,
-                topic: channel.topic.unwrap_or_default(),
-                topic_setter: channel
-                    .topic_setter
-                    .unwrap_or_else(|| "No retained topic".into()),
-                mlock: channel.mlock.unwrap_or_default(),
-                access: channel
-                    .access
-                    .into_iter()
-                    .map(|entry| ChannelAccessView {
-                        auto_op: entry.flags.contains('o'),
-                        auto_voice: entry.flags.contains('v'),
-                        account: entry.account,
-                        flags: entry.flags,
-                    })
-                    .collect(),
-            })
-            .collect();
-        Ok(ConsoleChannels {
-            shell: console_shell(state, account, csrf, "channels"),
-            channels,
-        })
     }
 
     pub async fn console_channels(
@@ -2183,10 +2129,9 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        match console_channels_build(&state, account, csrf).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
+        render_private(ConsoleChannels {
+            shell: console_shell(&state, account, csrf, "channels"),
+        })
     }
 
     #[derive(Template)]

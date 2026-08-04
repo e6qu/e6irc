@@ -2198,19 +2198,23 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     assert_eq!(status, 200, "{page}");
     for needle in [
         "Registered channels",
-        "#Control",
-        "Retained topic",
-        "Mode lock",
-        "Channel access",
-        "Transfer ownership",
-        "Unregister channel",
+        "data-api-owned-channel-list",
+        "Loading registered channels",
     ] {
         assert!(page.contains(needle), "page missing {needle:?}: {page}");
     }
+    assert!(
+        !page.contains("#Control"),
+        "channel data leaked into shell: {page}"
+    );
     let csrf = csrf_from_html(&page).to_string();
     let (_, _, mallory_page) = request(http, &page_request(&mallory_session)).await;
     assert!(
-        mallory_page.contains("No channels registered to this account"),
+        mallory_page.contains("data-api-owned-channel-list"),
+        "{mallory_page}"
+    );
+    assert!(
+        !mallory_page.contains("#Control"),
         "another account's channel leaked: {mallory_page}"
     );
 
