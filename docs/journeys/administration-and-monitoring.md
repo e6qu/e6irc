@@ -221,8 +221,9 @@ console views require an administrator session.
    credential rows every five minutes.
 6. **Monitoring** renders selectable time windows, deltas/trends, queue
    capacity pressure, current queue state, cumulative latency histograms, and
-   an error ledger.
-7. `/api/v1/admin/observability` returns JSON history;
+   an error ledger by reading its administrator JSON projection.
+7. `/api/v1/admin/observability` returns raw JSON history;
+   `/api/v1/admin/monitoring` returns the render-ready console projection; and
    `/api/v1/admin/metrics` returns Prometheus text.
 8. Network **Operations** provides owner-scoped per-network detail that global
    aggregates intentionally omit.
@@ -250,9 +251,9 @@ queue monitor transitions, bounded Prometheus labels, and schema-v2 history
 compatibility are unit-tested. Readiness, metrics/observability authorization,
 correlation IDs, HTTPS-only HSTS, queue JSON/Prometheus/UI rendering,
 persistence, monitoring retention, durable storage/credential retention,
-monitoring
-page/panel, and per-network operations are covered by HTTP/PostgreSQL tests.
-The real Chromium/PostgreSQL journey opens Monitoring, verifies both runtime
+monitoring page/API projection, and per-network operations are covered by
+HTTP/PostgreSQL tests. The real Chromium/PostgreSQL journey opens Monitoring
+through its JSON API, verifies both runtime
 queues in the rendered page, proves a restart-required core-capacity edit does
 not misrepresent the still-active queue, then checks the configured capacity
 appears in schema-v3 JSON after restart.

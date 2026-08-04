@@ -118,7 +118,12 @@
   for (const button of document.querySelectorAll("[data-refresh-target]")) {
     button.addEventListener("click", () => {
       const panel = document.querySelector(button.dataset.refreshTarget);
-      if (panel) refresh(panel);
+      if (!panel) return;
+      if (panel.matches("[data-api-admin-monitoring]")) {
+        void refreshMonitoring(panel);
+      } else {
+        void refresh(panel);
+      }
     });
   }
 
@@ -174,6 +179,172 @@
     if (!response.ok) throw new Error(await apiProblem(response));
     return apiJson(response);
   };
+
+  const element = (name, className, text) => {
+    const node = document.createElement(name);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = String(text);
+    return node;
+  };
+
+  const append = (parent, ...children) => {
+    for (const child of children) parent.append(child);
+    return parent;
+  };
+
+  const monitoringEmpty = (message) => element("div", "chart-empty", message);
+
+  const monitoringHealth = (view) => {
+    const health = element("div", "health-strip");
+    health.setAttribute("aria-label", "Component health");
+    const states = [
+      [view.core_ready ? "on" : "off", "IRC core", view.core_ready ? "Healthy" : "Stale"],
+      [view.database_ready ? "on" : "off", "PostgreSQL", view.database_ready ? "Healthy" : "Unavailable"],
+      [view.upstreams_ready ? "on" : view.upstreams_degraded ? "warn" : "off", "Upstreams", `${view.bnc_connected} / ${view.bnc_networks} connected`],
+      [view.error_total === 0 ? "on" : "warn", "Errors", `${view.error_total} since start`],
+    ];
+    for (const [state, label, value] of states) {
+      health.append(append(element("div"), element("span", `dot ${state}`), element("span", "", label), element("strong", "", value)));
+    }
+    return health;
+  };
+
+  const monitoringMetrics = (view) => {
+    const grid = element("div", "metric-grid");
+    const metrics = [
+      ["Connections", view.active_connections, `${view.registered_connections} registered · ${view.opened_total} opened`],
+      ["Channels", view.channels, "Currently active in core memory"],
+      ["Inbound traffic", view.traffic_in, `${view.inbound_rate} over the visible window`],
+      ["Outbound traffic", view.traffic_out, `${view.outbound_rate} over the visible window`],
+      ["Upstream received", view.upstream_in, `${view.upstream_inbound_rate} over the visible window`],
+      ["Upstream sent", view.upstream_out, `${view.upstream_outbound_rate} over the visible window`],
+      ["BNC clients", view.bnc_clients, "Authenticated raw IRC and web attachments"],
+      ["HTTP requests", view.http_requests, "All routes since process start"],
+      ["Database operations", view.database_requests, "Measured IRC, history, and sampler work"],
+      ["Rejected connections", view.rejected_total, "Per-IP admission limit", view.rejected_total > 0],
+      ["SendQ kills", view.sendq_kills, "Slow clients disconnected", view.sendq_kills > 0],
+    ];
+    for (const [label, value, detail, alert] of metrics) {
+      grid.append(append(element("article", alert ? "metric-card metric-alert" : "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail)));
+    }
+    return grid;
+  };
+
+  const monitoringChart = (title, description, windowLabel, ariaLabel, bars, kind, emptyWhenMissing = false) => {
+    const section = element("section", "panel monitoring-chart");
+    section.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", title), element("p", "", description)), element("span", "count", windowLabel)));
+    if (emptyWhenMissing && bars.length === 0) {
+      section.append(monitoringEmpty("Waiting for the first historical sample."));
+      return section;
+    }
+    const chart = element("div", "bar-chart");
+    chart.setAttribute("aria-label", ariaLabel);
+    for (const bar of bars) {
+      const wrapper = element("div", kind === "single" ? "bar-single" : kind === "triplet" ? "bar-triplet" : "bar-pair");
+      wrapper.title = bar.title;
+      const entries = kind === "traffic"
+        ? [["bar-in", bar.inbound_height], ["bar-out", bar.outbound_height]]
+        : kind === "connections"
+          ? [["bar-irc", bar.irc_height], ["bar-bnc", bar.bnc_height]]
+          : kind === "upstreams"
+            ? [[bar.status_class, bar.height]]
+            : kind === "errors"
+              ? [["bar-errors", bar.height]]
+              : kind === "triplet"
+                ? [["bar-core", bar.core_height], ["bar-database", bar.database_height], ["bar-http", bar.http_height]]
+                : kind === "queues"
+                  ? [["bar-core", bar.core_height], ["bar-database", bar.database_height]]
+                  : [];
+      for (const [className, height] of entries) {
+        const line = element("i", className);
+        line.style.height = `${height}%`;
+        wrapper.append(line);
+      }
+      chart.append(wrapper);
+    }
+    section.append(chart);
+    return section;
+  };
+
+  const monitoringTable = (title, description, headings, rows) => {
+    const section = element("section", "panel monitoring-chart");
+    section.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", title), element("p", "", description))));
+    const table = element("div", "latency-table");
+    table.append(append(element("div", "latency-head"), ...headings.map((heading) => element("span", "", heading))));
+    for (const [label, ...values] of rows) {
+      table.append(append(element("div"), element("strong", "", label), ...values.map((value) => element("span", "", value))));
+    }
+    section.append(table);
+    return section;
+  };
+
+  const renderMonitoring = (panel, view) => {
+    const fragment = document.createDocumentFragment();
+    fragment.append(monitoringHealth(view), monitoringMetrics(view));
+    const history = element("div", "monitoring-history-grid");
+    history.append(
+      monitoringChart("IRC traffic", "Bytes per sample · inbound blue, outbound green", view.window_label, "IRC traffic history", view.traffic_bars, "traffic", true),
+      monitoringChart("Upstream traffic", "Bytes per sample · received blue, sent green", view.window_label, "BNC upstream traffic history", view.upstream_traffic_bars, "traffic", true),
+      monitoringChart("Connections", "Current IRC clients in blue · BNC attachments in violet", view.window_label, "Client connection history", view.connection_bars, "connections"),
+      monitoringChart("Upstream availability", "Share of configured networks connected at each sample", view.window_label, "BNC upstream availability history", view.upstream_bars, "upstreams"),
+      monitoringChart("New errors", "New fixed-category errors recorded per sample", view.window_label, "New operational errors history", view.error_bars, "errors", true),
+      monitoringChart("P95 latency", "Core blue · PostgreSQL amber · HTTP violet", view.window_label, "P95 latency history", view.latency_bars, "triplet"),
+      monitoringChart("Queue pressure", "Capacity used · IRC core blue, PostgreSQL amber", view.window_label, "Runtime queue pressure history", view.queue_bars, "queues"),
+      monitoringTable("Runtime queues", "Live bounded-queue state and overload-mode transitions", ["Queue", "Pressure", "Mode", "Switches"], view.queues.map((queue) => [queue.label, `${queue.depth} / ${queue.capacity} (${queue.pressure}%)`, queue.mode, queue.mode_switches])),
+      monitoringTable("Latency", "Cumulative process histograms", ["Path", "P50", "P95", "P99"], [["IRC core", view.core_p50, view.core_p95, view.core_p99], ["PostgreSQL", view.database_p50, view.database_p95, view.database_p99], ["HTTP", view.http_p50, view.http_p95, view.http_p99]])
+    );
+    fragment.append(history);
+    const ledger = element("section", "panel");
+    ledger.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Error ledger"), element("p", "", "Fixed categories only; request data and secrets never become metric labels.")), element("span", "count", `${view.error_total} total`)));
+    if (view.errors.length === 0) {
+      ledger.append(append(element("div", "all-clear"), element("span", "dot on"), document.createTextNode("No operational errors recorded since process start.")));
+    } else {
+      const errors = element("div", "error-grid");
+      for (const error of view.errors) errors.append(append(element("div"), element("strong", "", error.kind), element("span", "", error.count), element("small", "", error.last_seen)));
+      ledger.append(errors);
+    }
+    fragment.append(ledger);
+    const foot = element("div", "monitoring-foot");
+    const json = element("a", "", "JSON");
+    json.href = `/api/v1/admin/monitoring?minutes=${encodeURIComponent(view.window_minutes)}`;
+    const prometheus = element("a", "", "Prometheus");
+    prometheus.href = "/api/v1/admin/metrics";
+    foot.append(element("span", "", `${view.history_samples} stored samples · ${view.window_label}`), element("span", "", `Updated ${view.sampled_age}`), json, prometheus);
+    fragment.append(foot);
+    panel.replaceChildren(fragment);
+  };
+
+  const refreshMonitoring = async (panel) => {
+    const status = document.getElementById(panel.dataset.refreshStatus);
+    panel.setAttribute("aria-busy", "true");
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
+    }
+    try {
+      const minutes = Number(panel.dataset.minutes);
+      if (!Number.isSafeInteger(minutes) || minutes < 1) throw new Error("The monitoring window is invalid. Reload and try again.");
+      const view = await apiRead(`/api/v1/admin/monitoring?minutes=${encodeURIComponent(minutes)}`);
+      renderMonitoring(panel, view);
+      if (status) status.textContent = "Live data refreshed.";
+    } catch (error) {
+      panel.replaceChildren(monitoringEmpty(`Live monitoring failed (${error.message}). Use Refresh to retry.`));
+      if (status) {
+        status.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
+        status.classList.add("refresh-error");
+      }
+    } finally {
+      panel.removeAttribute("aria-busy");
+    }
+  };
+
+  for (const panel of document.querySelectorAll("[data-api-admin-monitoring]")) {
+    void refreshMonitoring(panel);
+    const seconds = Number(panel.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) {
+      window.setInterval(() => void refreshMonitoring(panel), seconds * 1000);
+    }
+  }
 
   const optionalValue = (value) => {
     const trimmed = value.trim();

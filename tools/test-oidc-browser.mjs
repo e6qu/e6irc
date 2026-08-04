@@ -479,9 +479,16 @@ try {
     await guestContext.close();
   }
 
+  const monitoringRead = page.waitForResponse(
+    (response) =>
+      response.url() === `${applicationOrigin}/api/v1/admin/monitoring?minutes=60` &&
+      response.request().method() === "GET",
+  );
   await page.goto(`${applicationOrigin}/console/monitoring`);
+  assert.equal((await monitoringRead).status(), 200);
   await page.getByRole("heading", { name: "Monitoring", exact: true }).waitFor();
   await page.getByRole("heading", { name: "Queue pressure", exact: true }).waitFor();
+  await page.getByText("Live data refreshed.", { exact: true }).waitFor();
   const runtimeQueues = page.locator("section").filter({
     has: page.getByRole("heading", { name: "Runtime queues", exact: true }),
   });
@@ -498,6 +505,11 @@ try {
   // capacity actually enforcing backpressure now, not the next-start value.
   assert.equal(observabilityBody.current.queues.core.capacity, 65_536);
   assert.equal(observabilityBody.current.queues.db.capacity, 1_024);
+  assert.equal(
+    applicationRequests.some((url) => url.includes("/console/monitoring/panel")),
+    false,
+    "monitoring must read its documented JSON endpoint, not an HTML fragment",
+  );
 
   await page.goto(`${applicationOrigin}/console/bans`);
   await page.getByRole("heading", { name: "Server bans", exact: true }).waitFor();
@@ -1078,7 +1090,14 @@ try {
     navigationTrace.slice(recoveryTraceStart).includes(`request GET ${applicationOrigin}/api/v1/auth/oidc/dex/start`),
     `signed-out recovery bypassed the e6irc OpenID Connect starter:\n${navigationTrace.slice(recoveryTraceStart).join("\n")}`,
   );
-  assert.deepEqual(applicationErrors, []);
+  // A document navigation can race the final explicit logout in Firefox: the
+  // old document's owner-network read then correctly completes as unauthorized.
+  // Keep that expected post-logout response separate from application failures.
+  const expectedSignedOutNetworkRead = `401 GET ${applicationOrigin}/api/v1/me/networks`;
+  assert.deepEqual(
+    applicationErrors.filter((error) => error !== expectedSignedOutNetworkRead),
+    [],
+  );
 } finally {
   clearTimeout(watchdog);
   // `browser.close()` can itself hang on a wedged engine; bound it so teardown

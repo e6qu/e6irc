@@ -1100,6 +1100,14 @@ fn document() -> serde_json::Value {
                         "403": { "description": "not an admin account" },
                         "503": { "description": "monitoring storage unavailable" } } }
             },
+            "/api/v1/admin/monitoring": {
+                "get": { "summary": "Render-ready monitoring projection (admin only)",
+                    "description": "Returns the bounded administrator monitoring view used by API clients, including current health, historical charts, queue state, latency, and the fixed error ledger.",
+                    "security": authenticated,
+                    "parameters": [{ "name": "minutes", "in": "query", "schema": { "type": "integer", "enum": [60, 360, 1440, 10080], "default": 60 } }],
+                    "responses": { "200": { "description": "monitoring view" }, "400": { "description": "unsupported monitoring window" }, "403": { "description": "not an admin account" } }
+                }
+            },
             "/api/v1/admin/metrics": {
                 "get": { "summary": "Prometheus exposition (admin only)",
                     "security": authenticated,
