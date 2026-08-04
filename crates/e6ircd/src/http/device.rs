@@ -643,11 +643,33 @@ pub(super) async fn admin_configuration(
             network.sasl_account = None;
         }
     }
+    let bound_bnc_addr = match &state.bnc_listener {
+        Some(listener) => listener.status().await.map(|(_, bound)| bound),
+        None => None,
+    };
+    let network_drivers = [
+        Some("irc"),
+        Some("local"),
+        cfg!(feature = "matrix").then_some("matrix"),
+        cfg!(feature = "discord").then_some("discord"),
+        cfg!(feature = "slack").then_some("slack"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     admin_json(serde_json::json!({
         "revision": snapshot.revision,
         "updated_by": snapshot.updated_by,
         "updated_at": snapshot.updated_at,
         "settings": settings,
+        "runtime": {
+            "bound_bnc_addr": bound_bnc_addr,
+            "http_bind": state.http_bind,
+            "has_master_key": state.secret_key.is_some(),
+            "master_key_count": state.secret_key.as_ref().map_or(0, |keys| keys.key_count()),
+            "release_revision": state.application_release_revision,
+            "network_drivers": network_drivers,
+        },
     }))
 }
 

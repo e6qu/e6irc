@@ -43,10 +43,12 @@ operation's semantics.
 
 ## Managed configuration
 
-The Configuration document is now a read-only shell. Its scalar settings,
-operators, OpenID Connect providers, and server networks all mutate only via
-administrator API routes; the former `/console/configuration/*` mutation
-routes no longer exist.
+The Configuration document is a read-only shell: it hydrates all managed
+settings, credential metadata, revision/provenance, and secret-free runtime
+status from `GET /api/v1/admin/configuration`. Its scalar settings, operators,
+OpenID Connect providers, and server networks all mutate only via administrator
+API routes; the former `/console/configuration/*` mutation routes no longer
+exist.
 
 ## Read-only console views
 
@@ -55,9 +57,8 @@ with their owning domain: overview (`/api/v1/admin/stats`), account and policy
 directories, audit (`/api/v1/admin/audit`), monitoring
 (`/api/v1/admin/observability`, `/api/v1/admin/monitoring`, and
 `/api/v1/admin/metrics`), owner networks and per-network Operations,
-network buffers, owner sessions/connections, and administrator connections.
-Configuration is the remaining read-contract gap before its rendered view can
-retire.
+network buffers, owner sessions/connections, administrator connections, and
+managed configuration.
 
 ## Mechanical coverage
 
