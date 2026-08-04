@@ -634,7 +634,14 @@ try {
 
   // The owner-facing diagnostics must reflect that same live exchange rather
   // than merely rendering the stored row.
+  const operationsReadStart = applicationRequests.length;
+  const operationsRead = page.waitForResponse(
+    (response) =>
+      response.url() === `${applicationOrigin}/api/v1/me/networks/journey/operations` &&
+      response.request().method() === "GET",
+  );
   await page.goto(`${applicationOrigin}/console/networks/journey`);
+  assert.equal((await operationsRead).status(), 200);
   await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
   await page.getByText("Received from upstream", { exact: true }).waitFor();
   await page.waitForFunction(
@@ -651,6 +658,12 @@ try {
     .getByText("browser receives through the real stack")
     .waitFor();
   assert.match(await page.locator("#network-operations").innerText(), /browser receives through the real stack/);
+  assert.ok(
+    !applicationRequests.slice(operationsReadStart).includes(
+      `GET ${applicationOrigin}/console/networks/journey/operations`,
+    ),
+    "network Operations used a rendered console fragment instead of its API resource",
+  );
 
   // Exercise the daemon's actual signal handler and startup preload while the
   // same browser context, account session, network definition, upstream, and

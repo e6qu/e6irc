@@ -1038,6 +1038,7 @@ documented_routes! {
         patch: patch_network,
         delete: delete_network,
     },
+    "/api/v1/me/networks/{name}/operations" => { get: pages::owner_network_operations },
     "/api/v1/me/networks/{name}/buffer" => { get: network_buffer },
     "/api/v1/history" => { get: history },
     "/api/v1/admin/accounts" => { get: admin_accounts, post: admin_create_account },
@@ -1108,10 +1109,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/console/networks/{name}/edit",
             get(pages::console_edit_network),
-        )
-        .route(
-            "/console/networks/{name}/operations",
-            get(pages::console_network_operations),
         )
         .route(
             "/console/networks/{name}",
@@ -3497,6 +3494,7 @@ mod pages {
         can_store_secrets: bool,
     }
 
+    #[derive(Serialize)]
     struct NetworkOperationsView {
         state: String,
         connected: bool,
@@ -3539,13 +3537,6 @@ mod pages {
         bridge_editable: bool,
         has_sasl_account: bool,
         has_sasl_password: bool,
-        view: NetworkOperationsView,
-    }
-
-    #[derive(Template)]
-    #[template(path = "_network_operations.html")]
-    struct ConsoleNetworkOperations {
-        view: NetworkOperationsView,
     }
 
     /// Admin console: server-wide read views (accounts, registered channels,
@@ -3738,11 +3729,6 @@ mod pages {
             Ok(result) => result,
             Err(response) => return response,
         };
-        let view =
-            match network_operations_view(&state, &account, &network.name, network.enabled).await {
-                Ok(view) => view,
-                Err(response) => return response,
-            };
         let is_admin = is_admin_account(&state, &account);
         render_private(ConsoleNetworkDetail {
             shell: console_shell(&state, account.clone(), csrf, "networks"),
@@ -3758,21 +3744,23 @@ mod pages {
             bridge_editable: network.kind.is_bridge() && is_admin,
             has_sasl_account: network.sasl_account.is_some(),
             has_sasl_password: network.sasl_password_sealed.is_some(),
-            view,
         })
     }
 
-    pub async fn console_network_operations(
+    /// Bounded owner-scoped Operations projection. The console reads this JSON
+    /// resource directly instead of refreshing a parallel HTML fragment.
+    pub async fn owner_network_operations(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
+        Authenticated(account): Authenticated,
         Path(name): Path<String>,
     ) -> Response {
-        let (account, _, network) = match console_owned_network(&state, &headers, &name).await {
-            Ok(result) => result,
-            Err(response) => return response,
+        let network = match crate::db::get_bnc_network(pool_of(&state), &account, &name).await {
+            Ok(Some(network)) => network,
+            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
+            Err(error) => return super::device::admin_db_error("network operations", error),
         };
         match network_operations_view(&state, &account, &network.name, network.enabled).await {
-            Ok(view) => render_private(ConsoleNetworkOperations { view }),
+            Ok(view) => super::json_no_store(view),
             Err(response) => response,
         }
     }

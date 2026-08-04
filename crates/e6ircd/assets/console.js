@@ -83,46 +83,14 @@
     });
   }
 
-  const refresh = async (panel) => {
-    const status = document.getElementById(panel.dataset.refreshStatus);
-    panel.setAttribute("aria-busy", "true");
-    if (status) {
-      status.textContent = "Refreshing…";
-      status.classList.remove("refresh-error");
-    }
-    try {
-      const response = await fetch(panel.dataset.refreshUrl, {
-        credentials: "same-origin",
-        headers: { Accept: "text/html" },
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      panel.innerHTML = await response.text();
-      if (status) status.textContent = "Live data refreshed.";
-    } catch (error) {
-      if (status) {
-        status.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
-        status.classList.add("refresh-error");
-      }
-    } finally {
-      panel.removeAttribute("aria-busy");
-    }
-  };
-
-  for (const panel of document.querySelectorAll("[data-refresh-url]")) {
-    const seconds = Number(panel.dataset.refreshSeconds);
-    if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => refresh(panel), seconds * 1000);
-    }
-  }
-
   for (const button of document.querySelectorAll("[data-refresh-target]")) {
     button.addEventListener("click", () => {
       const panel = document.querySelector(button.dataset.refreshTarget);
       if (!panel) return;
       if (panel.matches("[data-api-admin-monitoring]")) {
         void refreshMonitoring(panel);
-      } else {
-        void refresh(panel);
+      } else if (panel.matches("[data-api-network-operations]")) {
+        void refreshNetworkOperations(panel);
       }
     });
   }
@@ -343,6 +311,99 @@
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
       window.setInterval(() => void refreshMonitoring(panel), seconds * 1000);
+    }
+  }
+
+  const networkOperationsHealth = (view) => {
+    const health = element("div", "health-strip");
+    health.setAttribute("aria-label", "Network health");
+    const states = [
+      [view.connected ? "on" : "off", "Lifecycle", view.state],
+      [view.errors === 0 ? "on" : "warn", "Errors", view.errors],
+      [view.attached_clients > 0 ? "on" : "off", "Attached clients", view.attached_clients],
+      [view.stored_lines > 0 ? "on" : "off", "Stored backlog", `${view.stored_lines} ${view.stored_lines === 1 ? "line" : "lines"}`],
+    ];
+    for (const [state, label, value] of states) {
+      health.append(append(element("div"), element("span", `dot ${state}`), element("span", "", label), element("strong", "", value)));
+    }
+    return health;
+  };
+
+  const networkOperationsMetrics = (view) => {
+    const grid = element("div", "metric-grid");
+    const metrics = [
+      ["Received from upstream", view.traffic_in, `${view.lines_in} upstream ${view.lines_in === 1 ? "line" : "lines"}`],
+      ["Sent to upstream", view.traffic_out, `${view.lines_out} upstream ${view.lines_out === 1 ? "line" : "lines"}`],
+      ["Connect latency", view.connect_latency, `${view.connection_attempts} ${view.connection_attempts === 1 ? "attempt" : "attempts"} since start`],
+      ["Memory buffer", view.memory_buffer, "Current lines / capacity"],
+    ];
+    for (const [label, value, detail] of metrics) {
+      grid.append(append(element("article", "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail)));
+    }
+    return grid;
+  };
+
+  const renderNetworkOperations = (panel, view) => {
+    const fragment = document.createDocumentFragment();
+    fragment.append(networkOperationsHealth(view), networkOperationsMetrics(view));
+    const timeline = element("section", "panel");
+    timeline.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Connection timeline"), element("p", "", "Runtime-only timestamps reset when this network is restarted or reconfigured.")), element("span", "count", view.state_changed)));
+    const summary = element("div", "network-summary");
+    const details = [["Connected since", view.connected_since], ["Next reconnect attempt", view.next_retry], ["Last received", view.last_input], ["Last sent", view.last_output], ["Last error", view.last_error], ["Last error reason", view.last_error_reason], ["Oldest stored line", view.stored_oldest], ["Newest stored line", view.stored_newest]];
+    for (const [label, value] of details) summary.append(append(element("div"), element("span", "", label), element("strong", "", value)));
+    timeline.append(summary);
+    if (view.recent_failures.length > 0) {
+      const failures = element("div", "network-summary");
+      const list = element("ul", "failure-history");
+      for (const failure of view.recent_failures) list.append(element("li", "", failure));
+      failures.append(append(element("div"), element("span", "", "Recent failures"), list));
+      timeline.append(failures);
+    }
+    fragment.append(timeline);
+    const backlog = element("section", "panel");
+    backlog.append(append(element("div", "panel-head"), append(element("div"), element("h2", "", "Recent detached backlog"), element("p", "", "The newest 100 persisted upstream lines, shown oldest first. Client attachment replays the same stored stream.")), element("span", "count", `${view.stored_lines} stored`)));
+    if (view.recent_lines.length === 0) {
+      backlog.append(element("p", "empty", "No upstream lines have been stored for this network."));
+    } else {
+      const lines = element("div", "backlog");
+      lines.setAttribute("role", "log");
+      lines.setAttribute("aria-label", "Recent raw IRC backlog");
+      for (const line of view.recent_lines) lines.append(element("code", "", line));
+      backlog.append(lines);
+    }
+    fragment.append(backlog);
+    panel.replaceChildren(fragment);
+  };
+
+  const refreshNetworkOperations = async (panel) => {
+    const status = document.getElementById(panel.dataset.refreshStatus);
+    panel.setAttribute("aria-busy", "true");
+    if (status) {
+      status.textContent = "Refreshing…";
+      status.classList.remove("refresh-error");
+    }
+    try {
+      const name = panel.dataset.networkName;
+      if (!name) throw new Error("The network name is missing. Reload and try again.");
+      const view = await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}/operations`);
+      renderNetworkOperations(panel, view);
+      if (status) status.textContent = "Live data refreshed.";
+    } catch (error) {
+      panel.replaceChildren(monitoringEmpty(`Live network operations failed (${error.message}). Use Refresh to retry.`));
+      if (status) {
+        status.textContent = `Live refresh failed (${error.message}). Use Refresh to retry.`;
+        status.classList.add("refresh-error");
+      }
+    } finally {
+      panel.removeAttribute("aria-busy");
+    }
+  };
+
+  for (const panel of document.querySelectorAll("[data-api-network-operations]")) {
+    void refreshNetworkOperations(panel);
+    const seconds = Number(panel.dataset.refreshSeconds);
+    if (Number.isFinite(seconds) && seconds >= 5) {
+      window.setInterval(() => void refreshNetworkOperations(panel), seconds * 1000);
     }
   }
 
