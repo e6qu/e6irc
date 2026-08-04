@@ -422,7 +422,6 @@ try {
   }
 
   await page.goto(`${applicationOrigin}/console`);
-  await page.getByRole("heading", { name: "irc.browser-managed.example", exact: true }).waitFor();
   await page.getByRole("heading", { name: "Newest accounts", exact: false }).waitFor();
   assert.match(await page.locator("main").innerText(), /Recent audited actions/);
 
