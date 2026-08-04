@@ -2517,10 +2517,10 @@ async fn admin_accounts_endpoint_is_gated() {
 
 /// The admin `/console` page is gated exactly like the admin JSON API — an
 /// anonymous visitor is redirected to `/login`, a signed-in non-admin gets 403,
-/// and an admin gets a server-rendered dashboard carrying the seeded server data.
+/// and an admin gets a static dashboard shell whose data comes from the admin APIs.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn admin_console_page_renders_server_data_for_admins_only() {
+async fn admin_console_page_is_api_hydrated_and_admin_only() {
     let url = support::test_db("admin_console_page_renders_server_data_for_admins_only").await;
     let pool = e6ircd::db::connect_and_migrate(&url)
         .await
@@ -2587,20 +2587,21 @@ async fn admin_console_page_renders_server_data_for_admins_only() {
     // Signed-in non-admin -> 403.
     let (status, _, _) = request(http, &auth(&bob_token)).await;
     assert_eq!(status, 403);
-    // Admin -> 200 with the seeded server data rendered into the dashboard.
+    // Admin -> API-hydrated 200 shell; the seeded data must not be embedded.
     let (status, _, body) = request(http, &auth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
     for needle in [
         "e6irc console",
-        "irc.console.example",
-        "ConsoleNet",
-        "alice",
-        "bob",
-        "#lounge",
-        "spammer@*",
-        "KLINE",
+        "data-api-admin-overview",
+        "Loading overview…",
     ] {
         assert!(body.contains(needle), "console missing {needle:?}: {body}");
+    }
+    for needle in ["#lounge", "spammer@*", "KLINE"] {
+        assert!(
+            !body.contains(needle),
+            "overview data must come from administrator APIs, not the shell: {body}"
+        );
     }
 }
 

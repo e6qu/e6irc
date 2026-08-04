@@ -768,7 +768,7 @@ mod query_limit_tests {
     }
 }
 
-fn bnc_counts(state: &AppState) -> (u64, u64) {
+pub(crate) fn bnc_counts(state: &AppState) -> (u64, u64) {
     state
         .bnc_registry
         .as_ref()
@@ -2257,45 +2257,10 @@ mod pages {
         }
     }
 
-    struct AuditRow {
-        at: String,
-        actor: String,
-        action: String,
-        target: String,
-        detail: String,
-    }
-
-    impl From<crate::db::AuditLogRow> for AuditRow {
-        fn from(entry: crate::db::AuditLogRow) -> Self {
-            Self {
-                at: entry.created_at,
-                actor: entry.actor,
-                action: entry.action,
-                target: entry.target,
-                detail: entry.detail,
-            }
-        }
-    }
-
     #[derive(Template)]
     #[template(path = "console.html")]
     struct Console {
-        // Shared console-shell fields (see `console_base.html`).
         shell: ConsoleShell,
-        server_name: String,
-        network_name: String,
-        version: String,
-        stat_accounts: i64,
-        stat_channels: i64,
-        stat_server_bans: i64,
-        live_connections: u64,
-        live_upstreams: String,
-        live_traffic: String,
-        live_errors: u64,
-        accounts: Vec<crate::db::AccountDirectoryRow>,
-        channels: Vec<crate::db::RegisteredChannelDirectoryRow>,
-        bans: Vec<crate::db::ServerBanDirectoryRow>,
-        audit: Vec<AuditRow>,
     }
 
     #[derive(Template)]
@@ -2351,90 +2316,6 @@ mod pages {
         limit: usize,
         has_filters: bool,
         has_cursor: bool,
-    }
-
-    /// Assemble the bounded admin overview. Callers have already admin-gated
-    /// the request.
-    async fn console_build(
-        state: &AppState,
-        account: String,
-        csrf: String,
-    ) -> Result<Console, Response> {
-        let pool = pool_of(state);
-        let (stat_accounts, stat_channels, stat_server_bans) = crate::db::server_stats(pool)
-            .await
-            .map_err(|e| super::device::admin_db_error("server stats", e))?;
-        let accounts = crate::db::query_account_directory(
-            pool,
-            crate::db::AccountDirectoryFilter {
-                before_id: None,
-                exact_name: None,
-                page_size: crate::db::AccountDirectoryPageSize::new(10)
-                    .expect("ten is a valid account preview size"),
-            },
-        )
-        .await
-        .map_err(|e| super::device::admin_db_error("account directory", e))?
-        .entries;
-        let channels = crate::db::query_registered_channel_directory(
-            pool,
-            crate::db::RegisteredChannelDirectoryFilter {
-                before_id: None,
-                exact_name: None,
-                exact_founder: None,
-                page_size: crate::db::RegisteredChannelDirectoryPageSize::new(10)
-                    .expect("ten is a valid registered-channel preview size"),
-            },
-        )
-        .await
-        .map_err(|e| super::device::admin_db_error("registered-channel directory", e))?
-        .entries;
-        let bans = crate::db::query_server_ban_directory(
-            pool,
-            crate::db::ServerBanDirectoryFilter {
-                before_id: None,
-                exact_kind: None,
-                exact_mask: None,
-                page_size: crate::db::ServerBanDirectoryPageSize::new(10)
-                    .expect("ten is a valid server-ban preview size"),
-            },
-        )
-        .await
-        .map_err(|e| super::device::admin_db_error("server-ban directory", e))?
-        .entries;
-        let audit = crate::db::list_audit_log(
-            pool,
-            crate::db::AuditLogPageSize::new(10).expect("ten is a valid audit preview size"),
-        )
-        .await
-        .map_err(|e| super::device::admin_db_error("audit log", e))?
-        .into_iter()
-        .map(AuditRow::from)
-        .collect();
-        let (networks, connected) = bnc_counts(state);
-        let live = state.telemetry.snapshot(networks, connected);
-        Ok(Console {
-            shell: console_shell(state, account, csrf, "overview"),
-            server_name: state.server_name.clone(),
-            network_name: state.network_name.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            stat_accounts,
-            stat_channels,
-            stat_server_bans,
-            live_connections: live.active_connections,
-            live_upstreams: format!("{} / {}", live.bnc_connected, live.bnc_networks),
-            live_traffic: format_bytes(
-                live.irc_bytes_in_total
-                    .saturating_add(live.irc_bytes_out_total)
-                    .saturating_add(live.bnc_bytes_in_total)
-                    .saturating_add(live.bnc_bytes_out_total),
-            ),
-            live_errors: live.errors.values().sum(),
-            accounts,
-            channels,
-            bans,
-            audit,
-        })
     }
 
     #[derive(Serialize)]
@@ -3385,10 +3266,9 @@ mod pages {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        match console_build(&state, account, csrf).await {
-            Ok(view) => render_private(view),
-            Err(resp) => resp,
-        }
+        render_private(Console {
+            shell: console_shell(&state, account, csrf, "overview"),
+        })
     }
 
     /// Whether `account` may reach the admin console sections.

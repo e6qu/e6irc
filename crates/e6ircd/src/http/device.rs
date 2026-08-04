@@ -603,6 +603,8 @@ pub(super) async fn admin_stats(
     _admin: AdminAccount,
 ) -> Response {
     let pool = pool_of(&state);
+    let (networks, connected) = crate::http::bnc_counts(&state);
+    let live = state.telemetry.snapshot(networks, connected);
     match crate::db::server_stats(pool).await {
         Ok((accounts, channels, server_bans)) => admin_json(serde_json::json!({
             "server": state.server_name,
@@ -610,6 +612,14 @@ pub(super) async fn admin_stats(
             "accounts": accounts,
             "registered_channels": channels,
             "server_bans": server_bans,
+            "version": env!("CARGO_PKG_VERSION"),
+            "live": {
+                "connections": live.active_connections,
+                "connected_upstreams": live.bnc_connected,
+                "upstreams": live.bnc_networks,
+                "traffic": live.irc_bytes_in_total.saturating_add(live.irc_bytes_out_total).saturating_add(live.bnc_bytes_in_total).saturating_add(live.bnc_bytes_out_total),
+                "errors": live.errors.values().sum::<u64>(),
+            },
         })),
         Err(e) => admin_db_error("server stats", e),
     }
