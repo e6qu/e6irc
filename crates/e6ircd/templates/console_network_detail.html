@@ -33,10 +33,11 @@
   </div>
 
   <div id="network-operations"
-       data-refresh-url="/console/networks/{{ name }}/operations"
+       data-api-network-operations
+       data-network-name="{{ name }}"
        data-refresh-seconds="10"
        data-refresh-status="network-refresh-status">
-    {% include "_network_operations.html" %}
+    <div class="chart-empty">Loading network operations…</div>
   </div>
   <p id="network-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
 

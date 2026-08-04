@@ -54,10 +54,10 @@ The following console views already have a principal API data source and move
 with their owning domain: overview (`/api/v1/admin/stats`), account and policy
 directories, audit (`/api/v1/admin/audit`), monitoring
 (`/api/v1/admin/observability`, `/api/v1/admin/monitoring`, and
-`/api/v1/admin/metrics`), owner networks,
+`/api/v1/admin/metrics`), owner networks and per-network Operations,
 network buffers, owner sessions/connections, and administrator connections.
-Configuration and per-network operations require their read contracts to land
-with the gaps above before their rendered views can retire.
+Configuration is the remaining read-contract gap before its rendered view can
+retire.
 
 ## Mechanical coverage
 

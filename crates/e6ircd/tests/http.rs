@@ -817,7 +817,7 @@ async fn console_runtime_is_served_in_every_build() {
         "{headers}"
     );
     assert!(body.contains("dataset.confirm"), "{body}");
-    assert!(body.contains("data-refresh-url"), "{body}");
+    assert!(body.contains("data-api-network-operations"), "{body}");
     assert!(body.contains("data-api-network-create"), "{body}");
     assert!(body.contains("data-api-oper-create"), "{body}");
     assert!(body.contains("data-api-oidc-create"), "{body}");
@@ -1280,10 +1280,10 @@ async fn console_networks_page_lists_the_callers_networks() {
     for needle in [
         "Live connection diagnostics",
         "#e6irc",
-        "Connection timeline",
-        "Recent detached backlog",
         "Not set",
-        "&#60;script&#62;alert(&#39;escaped&#39;)&#60;/script&#62;",
+        "data-api-network-operations",
+        "data-network-name=\"libera\"",
+        "Loading network operations…",
     ] {
         assert!(
             detail.contains(needle),
@@ -1291,8 +1291,32 @@ async fn console_networks_page_lists_the_callers_networks() {
         );
     }
     assert!(
-        !detail.contains("<script>alert('escaped')</script>"),
-        "network detail rendered a stored IRC line as markup: {detail}"
+        !detail.contains("/console/networks/libera/operations"),
+        "{detail}"
+    );
+    let operations_req = format!(
+        "GET /api/v1/me/networks/libera/operations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, headers, operations) = request(http, &operations_req).await;
+    assert_eq!(status, 200, "{operations}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("cache-control: no-store"),
+        "{headers}"
+    );
+    let operations: serde_json::Value =
+        serde_json::from_str(&operations).expect("network operations JSON");
+    assert!(
+        operations["state"]
+            .as_str()
+            .is_some_and(|state| !state.is_empty()),
+        "{operations}"
+    );
+    assert_eq!(operations["stored_lines"], 1);
+    assert_eq!(
+        operations["recent_lines"][0],
+        ":mallory PRIVMSG #e6irc :<script>alert('escaped')</script>"
     );
 }
 

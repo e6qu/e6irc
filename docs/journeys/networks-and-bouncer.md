@@ -143,9 +143,9 @@ selection repeat owner authorization. Error reasons use a closed redacted
 classification, counters are bounded, and message text is confined to the
 owner’s backlog rather than metrics or global logs.
 
-**Evidence.** Snapshot/accounting/error-ledger behavior is unit-tested; network
-detail/operations rendering and owner scoping are HTTP-tested; monitoring
-aggregation/history is tested at HTTP/DB level.
+**Evidence.** Snapshot/accounting/error-ledger behavior is unit-tested; the
+owner-scoped Operations API and its browser rendering are HTTP- and
+Chromium-tested; monitoring aggregation/history is tested at HTTP/DB level.
 
 ## Attach any IRC client to an owned network
 

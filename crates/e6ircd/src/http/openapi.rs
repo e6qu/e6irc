@@ -831,6 +831,15 @@ fn document() -> serde_json::Value {
                     }
                 }
             },
+            "/api/v1/me/networks/{name}/operations": {
+                "get": { "summary": "Read bounded network Operations data",
+                    "description": "Returns the owner-scoped, render-ready Operations projection: live lifecycle and traffic, bounded failure history, persisted backlog summary, and the newest 100 detached upstream lines. Secret material is never returned.",
+                    "security": authenticated,
+                    "parameters": network_name_parameter,
+                    "responses": { "200": { "description": "network Operations projection" },
+                        "404": { "description": "no such network" },
+                        "503": { "description": "database unavailable" } } }
+            },
             "/api/v1/admin/accounts/{id}": {
                 "patch": {
                     "summary": "Change account suspension or durable administrator authority (admin only)",

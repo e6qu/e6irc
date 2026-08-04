@@ -689,15 +689,16 @@ builds under a same-origin script CSP. The unused HTMX/HTMX-WebSocket packages,
 embedded assets, and feature-gated routes were removed; the Vite chat bundle
 has no production package dependencies.
 
-Per-network operations (2026-07-28): every running network now carries the
+Per-network operations (2026-08-04): every running network now carries the
 same typed lifecycle and owner-safe runtime snapshot: state transitions,
 connection age and latency, attempts and errors, attached raw/web clients,
 per-network traffic, last activity, and buffer occupancy. Raw IRC attachment
 now crosses the counted send funnel used by the web client, fixing traffic that
 was absent from observability. `/console/networks/<name>` combines those live
 counters with stored configuration and the persisted detached backlog,
-refreshes every ten seconds, and has matching owner-scoped JSON at
-`GET /api/v1/me/networks/<name>`. The Integrations page now inventories
+refreshes every ten seconds directly from the owner-scoped
+`GET /api/v1/me/networks/<name>/operations` JSON projection rather than a
+parallel HTML fragment. The Integrations page now inventories
 disabled bridges and feature-absent stored bridges instead of losing them when
 no live handle exists, and supports inspect, pause/resume, and removal through
 the same network mutation core. The storage create edge now persists the typed
