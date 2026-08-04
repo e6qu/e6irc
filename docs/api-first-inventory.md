@@ -53,7 +53,8 @@ exist.
 ## Read-only console views
 
 The following console views already have a principal API data source and move
-with their owning domain: overview (`/api/v1/admin/stats`), account and policy
+with their owning domain: overview (the bounded administrator stats and
+directory resources), account and policy
 directories, audit (`/api/v1/admin/audit`), monitoring
 (`/api/v1/admin/observability`, `/api/v1/admin/monitoring`, and
 `/api/v1/admin/metrics`), owner networks and per-network Operations,

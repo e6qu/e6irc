@@ -1036,9 +1036,9 @@ fn document() -> serde_json::Value {
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/stats": {
-                "get": { "summary": "Aggregate server counts (admin only)",
+                "get": { "summary": "Aggregate server counts and live totals (admin only)",
                     "security": authenticated,
-                    "responses": { "200": { "description": "counts" },
+                    "responses": { "200": { "description": "counts, server identity, and live totals" },
                         "403": { "description": "not an admin account" } } }
             },
             "/api/v1/admin/configuration": {

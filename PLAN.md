@@ -113,6 +113,9 @@ same-origin request helpers for authentication context, problem decoding, and
 bounded JSON response decoding. The owner-network list no longer has a
 parallel rendered refresh route; it renders solely from its canonical API
 resource.
+The administrator overview likewise composes its bounded stats, directory,
+policy, and audit resources in the browser rather than rendering a parallel
+server-side snapshot.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

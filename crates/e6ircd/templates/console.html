@@ -1,104 +1,13 @@
 {% extends "console_base.html" %}
 {% block main %}
-        <div class="page-head">
-          <div>
-            <p class="eyebrow">Server administration</p>
-            <h1 id="overview">{{ server_name }}</h1>
-            <p class="lede">Network <strong>{{ network_name }}</strong> · e6ircd {{ version }}</p>
-          </div>
-          <a class="button-link" href="/console/monitoring">Open monitoring</a>
-        </div>
-        <div class="metric-grid overview-metrics">
-          <div class="metric-card"><span class="metric-label">Live IRC connections</span><strong>{{ live_connections }}</strong><small>Current core sessions</small></div>
-          <div class="metric-card"><span class="metric-label">Connected upstreams</span><strong>{{ live_upstreams }}</strong><small>Always-on networks</small></div>
-          <div class="metric-card"><span class="metric-label">Traffic since start</span><strong>{{ live_traffic }}</strong><small>IRC and BNC, both directions</small></div>
-          <div class="metric-card {% if live_errors > 0 %}metric-alert{% endif %}"><span class="metric-label">Operational errors</span><strong>{{ live_errors }}</strong><small>Since process start</small></div>
-        </div>
-        <div class="cards inventory-cards">
-          <div class="card"><div class="n">{{ stat_accounts }}</div><div class="l">Accounts</div></div>
-          <div class="card"><div class="n">{{ stat_channels }}</div><div class="l">Registered channels</div></div>
-          <div class="card"><div class="n">{{ stat_server_bans }}</div><div class="l">Server bans</div></div>
-        </div>
-
-        <div class="panel-head list-head">
-          <h2 id="accounts">Newest accounts <span class="tag">latest {{ accounts.len() }}</span></h2>
-          <a class="secondary-link" href="/console/accounts">Explore account directory</a>
-        </div>
-        {% if accounts.is_empty() %}
-          <p class="empty">No accounts.</p>
-        {% else %}
-          <div class="scroll">
-            <table>
-              <caption class="sr-only">Newest accounts</caption>
-              <thead><tr><th>Name</th></tr></thead>
-              <tbody>
-                {% for a in accounts %}<tr><td><code>{{ a.name }}</code></td></tr>{% endfor %}
-              </tbody>
-            </table>
-          </div>
-        {% endif %}
-
-        <div class="panel-head list-head">
-          <h2 id="channels">Newest registered channels <span class="tag">latest {{ channels.len() }}</span></h2>
-          <a class="secondary-link" href="/console/admin/channels">Explore channel registry</a>
-        </div>
-        {% if channels.is_empty() %}
-          <p class="empty">No registered channels.</p>
-        {% else %}
-          <div class="scroll">
-            <table>
-              <caption class="sr-only">Newest registered channels</caption>
-              <thead><tr><th>Channel</th><th>Founder</th><th>Registered (UTC)</th></tr></thead>
-              <tbody>
-                {% for c in channels %}
-                  <tr><td><code>{{ c.name }}</code></td><td><code>{{ c.founder }}</code></td>
-                    <td class="meta">{{ c.created_at }}</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        {% endif %}
-
-        <div class="panel-head list-head">
-          <h2 id="bans">Newest server bans <span class="tag">latest {{ bans.len() }}</span></h2>
-          <a class="secondary-link" href="/console/bans">Manage server bans</a>
-        </div>
-        {% if bans.is_empty() %}
-          <p class="empty">No server bans.</p>
-        {% else %}
-          <div class="scroll">
-            <table>
-              <caption class="sr-only">Newest server bans</caption>
-              <thead><tr><th>Kind</th><th>Mask</th><th>Reason</th><th>Set by</th><th>Created (UTC)</th></tr></thead>
-              <tbody>
-                {% for b in bans %}
-                  <tr><td>{{ b.kind }}</td><td><code>{{ b.mask }}</code></td>
-                    <td>{{ b.reason }}</td><td><code>{{ b.set_by }}</code></td>
-                    <td class="meta">{{ b.created_at }}</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        {% endif %}
-
-        <div class="panel-head list-head">
-          <h2 id="audit">Recent audited actions <span class="tag">latest {{ audit.len() }}</span></h2>
-          <a class="secondary-link" href="/console/audit">Explore audit log</a>
-        </div>
-        {% if audit.is_empty() %}
-          <p class="empty">No audited actions.</p>
-        {% else %}
-          <div class="scroll">
-            <table>
-              <caption class="sr-only">Recent audited actions</caption>
-              <thead><tr><th>When (UTC)</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
-              <tbody>
-                {% for e in audit %}
-                  <tr><td class="meta">{{ e.at }}</td><td><code>{{ e.actor }}</code></td>
-                    <td>{{ e.action }}</td><td><code>{{ e.target }}</code></td><td>{{ e.detail }}</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        {% endif %}
+  <div data-api-admin-overview>
+    <div class="page-head"><div><p class="eyebrow">Server administration</p><h1 id="overview">Loading overview…</h1><p class="lede" data-overview-lede></p></div><a class="button-link" href="/console/monitoring">Open monitoring</a></div>
+    <p id="overview-api-result" role="status" aria-live="polite"></p>
+    <div class="metric-grid overview-metrics" data-overview-metrics></div>
+    <div class="cards inventory-cards" data-overview-counts></div>
+    <section data-overview-accounts></section>
+    <section data-overview-channels></section>
+    <section data-overview-bans></section>
+    <section data-overview-audit></section>
+  </div>
 {% endblock %}

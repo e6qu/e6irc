@@ -421,6 +421,11 @@ try {
     await page.getByRole("heading", { name: heading, exact: true }).waitFor();
   }
 
+  await page.goto(`${applicationOrigin}/console`);
+  await page.getByRole("heading", { name: "irc.browser-managed.example", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Newest accounts", exact: false }).waitFor();
+  assert.match(await page.locator("main").innerText(), /Recent audited actions/);
+
   // Cross invitation onboarding and permanent self-service deletion through
   // two independent browser contexts. The administrator sees the bearer link
   // once; the recipient chooses its own password, receives its own session,
