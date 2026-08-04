@@ -387,7 +387,7 @@ fn document() -> serde_json::Value {
                         "409": { "description": "identity already linked to another account (on return)" } } }
             },
             "/api/v1/me/identities": {
-                "get": { "summary": "List OIDC identities linked to your account",
+                "get": { "summary": "List OIDC identities linked to your account and available link providers",
                     "security": authenticated, "responses": ok_json }
             },
             "/api/v1/me/identities/{id}": {

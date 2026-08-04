@@ -1072,6 +1072,132 @@
 
   const reloadAccount = () => window.location.reload();
 
+  const accountRoot = document.querySelector("[data-api-account-read]");
+  if (accountRoot instanceof HTMLElement) {
+    const passwordPanel = accountRoot.querySelector("[data-api-account-password-panel]");
+    const credentialRows = accountRoot.querySelector("[data-api-account-credential-list]");
+    const identityList = accountRoot.querySelector("[data-api-account-identity-list]");
+    const linkProviders = accountRoot.querySelector("[data-api-account-link-providers]");
+    const csrf = accountRoot.dataset.csrf || "";
+    const bindDelete = (form) => form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void mutateAccount(form, "DELETE", undefined, "Account access change failed.")
+        .then((result) => { if (result !== false) reloadAccount(); });
+    });
+    const renderPassword = (hasLocalPassword) => {
+      if (!(passwordPanel instanceof HTMLElement)) return;
+      const title = hasLocalPassword ? "Primary password" : "Add a local password";
+      const description = hasLocalPassword
+        ? "Used for local web sign-in, IRC identification, and authorizing new app passwords."
+        : "This account currently signs in through OpenID Connect. Add a password to enable local web and IRC credential sign-in too.";
+      const form = element("form", "field-grid");
+      form.method = "post";
+      form.action = "/api/v1/me/password";
+      form.dataset.apiAccountPassword = "";
+      const token = element("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf;
+      form.append(token);
+      const passwordField = (label, name, autocomplete) => {
+        const field = element("label", "field");
+        const input = element("input");
+        input.type = "password"; input.name = name; input.maxLength = 512; input.autocomplete = autocomplete; input.required = true;
+        append(field, element("span", "", label), input);
+        return field;
+      };
+      if (hasLocalPassword) form.append(passwordField("Current password", "current_password", "current-password"));
+      form.append(passwordField("New password", "new_password", "new-password"), passwordField("Confirm new password", "confirm_password", "new-password"));
+      const actions = element("div", "field field-wide");
+      append(actions, element("button", "primary", hasLocalPassword ? "Change password" : "Add password"));
+      actions.querySelector("button").type = "submit";
+      form.append(actions);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const fields = new FormData(form);
+        const current = fieldValue(fields, "current_password");
+        const next = fieldValue(fields, "new_password");
+        if (next !== fieldValue(fields, "confirm_password")) {
+          setAccountResult("The new password and confirmation do not match.", false);
+          return;
+        }
+        void mutateAccount(form, "PUT", { current_password: current || null, new_password: next }, "Password update failed.")
+          .then((result) => {
+            if (result === false) return;
+            setAccountResult(current ? "Local password changed." : "Local password added.", true);
+            void apiRead("/api/v1/me/credentials").then((updated) => {
+              const credentials = Array.isArray(updated.credentials) ? updated.credentials : [];
+              renderPassword(credentials.some((credential) => credential.kind === "local_password"));
+              renderCredentials(credentials);
+            }).catch((error) => setAccountResult(error instanceof Error ? error.message : "Credential list failed to refresh.", false));
+          });
+      });
+      passwordPanel.replaceChildren(append(element("div", "panel-head"), append(element("div"), element("h2", "", title), element("p", "", description)), element("span", "tag", "Argon2id")), form);
+    };
+    const renderCredentials = (credentials) => {
+      if (!(credentialRows instanceof HTMLElement)) return;
+      credentialRows.replaceChildren();
+      const count = accountRoot.querySelector("[data-api-account-credential-count]");
+      if (count) count.textContent = String(credentials.length);
+      if (!credentials.length) {
+        const cell = element("td", "empty", "No account credentials."); cell.colSpan = 5;
+        credentialRows.append(append(element("tr"), cell));
+        return;
+      }
+      for (const credential of credentials) {
+        const row = element("tr");
+        const label = credential.label || (credential.kind === "local_password" ? "Primary password" : "");
+        append(row, append(element("td"), element("span", "tag", credential.kind)), element("td", "", label), element("td", "", credential.created_at), element("td", "", credential.last_used_at || "Never"));
+        const actions = element("td");
+        if (credential.kind === "app_password") {
+          const form = element("form", "cell-form"); form.method = "post"; form.action = `/api/v1/me/credentials/${encodeURIComponent(credential.id)}`; form.dataset.confirm = "Revoke this app password?";
+          const token = element("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf;
+          const button = element("button", "danger", "Revoke"); button.type = "submit";
+          form.append(token, button); bindDelete(form); actions.append(form);
+        } else actions.append(element("span", "meta", "Primary"));
+        row.append(actions); credentialRows.append(row);
+      }
+    };
+    const renderIdentities = (result, hasLocalPassword) => {
+      if (!(identityList instanceof HTMLElement) || !(linkProviders instanceof HTMLElement)) return;
+      const identities = Array.isArray(result.identities) ? result.identities : [];
+      const providers = Array.isArray(result.link_providers) ? result.link_providers : [];
+      const count = accountRoot.querySelector("[data-api-account-identity-count]");
+      if (count) count.textContent = String(identities.length);
+      linkProviders.replaceChildren();
+      if (providers.length) {
+        const actions = element("div", "provider-actions");
+        for (const provider of providers) {
+          const link = element("a", "button-link secondary-link", `Link ${provider}`);
+          link.href = `/api/v1/auth/oidc/${encodeURIComponent(provider)}/link`;
+          actions.append(link);
+        }
+        linkProviders.append(actions);
+      } else linkProviders.append(element("p", "section-note", "No login providers are currently configured."));
+      identityList.replaceChildren();
+      if (!identities.length) {
+        identityList.append(element("p", "empty", hasLocalPassword ? "No linked single sign-on identities. Local password sign-in remains available." : "No login method is configured for this account."));
+        return;
+      }
+      for (const identity of identities) {
+        const card = element("article");
+        const copy = element("div"); append(copy, element("strong", "", identity.issuer), element("code", "", identity.subject), element("small", "", `Linked ${identity.created_at}`));
+        card.append(copy);
+        if (identities.length > 1 || hasLocalPassword) {
+          const form = element("form"); form.method = "post"; form.action = `/api/v1/me/identities/${encodeURIComponent(identity.id)}`; form.dataset.confirm = "Unlink this identity and revoke its browser sessions?";
+          const token = element("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf;
+          const button = element("button", "danger", "Unlink"); button.type = "submit";
+          form.append(token, button); bindDelete(form); card.append(form);
+        } else card.append(element("span", "tag", "Last login method"));
+        identityList.append(card);
+      }
+    };
+    void Promise.all([apiRead("/api/v1/me/credentials"), apiRead("/api/v1/me/identities")])
+      .then(([credentialResult, identityResult]) => {
+        const credentials = Array.isArray(credentialResult.credentials) ? credentialResult.credentials : [];
+        const hasLocalPassword = credentials.some((credential) => credential.kind === "local_password");
+        renderPassword(hasLocalPassword); renderCredentials(credentials); renderIdentities(identityResult, hasLocalPassword);
+      })
+      .catch((error) => setAccountResult(error instanceof Error ? error.message : "Account data failed to load.", false));
+  }
+
   for (const form of document.querySelectorAll("[data-api-account-profile]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();

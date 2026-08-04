@@ -22,6 +22,12 @@ operation's semantics.
 
 ## Account and identity
 
+The Account & access document is an authenticated shell. It hydrates profile,
+password posture, credentials, linked identities and available identity-provider
+links from `/api/v1/me/profile`, `/api/v1/me/credentials`, and
+`/api/v1/me/identities`; all mutations continue to call their corresponding
+owner-scoped API resources directly.
+
 | Console mutation | Canonical API operation | State | Migration requirement |
 |---|---|---|---|
 

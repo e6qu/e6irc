@@ -116,6 +116,9 @@ resource.
 The administrator overview likewise composes its bounded stats, directory,
 policy, and audit resources in the browser rather than rendering a parallel
 server-side snapshot.
+Account & access now follows the same boundary: its password posture,
+credentials, linked identities, and configured identity-provider links hydrate
+from owner-scoped API resources after the authenticated document shell loads.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated
