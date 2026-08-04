@@ -2294,13 +2294,24 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
             request(http, &api_request(method, path, body, Some(&csrf))).await;
         assert_eq!(status, 200, "{path}: {headers}\n{body}");
     }
-    let (_, _, updated) = request(http, &page_request(&boss_session)).await;
-    for needle in ["Welcome operators", "+nt-i", "alice", "+ov"] {
-        assert!(
-            updated.contains(needle),
-            "updated page missing {needle:?}: {updated}"
-        );
-    }
+    let (status, _, updated) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/channels/%23Control HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    let updated: serde_json::Value = serde_json::from_str(&updated).expect("channel API response");
+    assert_eq!(updated["topic"], "Welcome operators");
+    assert_eq!(updated["mlock"], "+nt-i");
+    assert_eq!(updated["access"][0]["account"], "alice");
+    assert_eq!(updated["access"][0]["flags"], "ov");
+    let (_, _, shell) = request(http, &page_request(&boss_session)).await;
+    assert!(
+        !shell.contains("Welcome operators"),
+        "channel state leaked into shell: {shell}"
+    );
 
     let invalid = r#"{"action":"set_mlock","mlock":"+k"}"#;
     let (status, _, body) = request(
