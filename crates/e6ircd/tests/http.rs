@@ -1511,10 +1511,9 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, body) = request(http, &configuration).await;
     assert_eq!(status, 200, "{body}");
     let current: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
-    let http_bind = http.to_string();
     assert_eq!(
         current["runtime"]["http_bind"].as_str(),
-        Some(http_bind.as_str())
+        Some("127.0.0.1:0")
     );
     assert!(current["runtime"]["network_drivers"].is_array());
     assert!(

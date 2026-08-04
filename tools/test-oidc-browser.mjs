@@ -39,6 +39,13 @@ async function expectStatus(page, pattern) {
   assert.match(await banner.innerText(), pattern);
 }
 
+async function waitForConfigurationServerName(page, value) {
+  await page.waitForFunction(
+    (expected) => document.querySelector('form.settings-form input[name="server_name"]')?.value === expected,
+    value,
+  );
+}
+
 const databaseURL = process.env.E6IRC_TEST_DATABASE_URL;
 const issuerURL = process.env.E6IRC_TEST_DEX_URL;
 assert.ok(databaseURL, "E6IRC_TEST_DATABASE_URL is required");
@@ -297,7 +304,7 @@ try {
   await page.goto(`${applicationOrigin}/console/configuration`);
   await page.getByRole("heading", { name: "Configuration", exact: true }).waitFor();
   const settingsForm = page.locator("form.settings-form");
-  await expect(settingsForm.getByLabel("Server hostname")).toHaveValue("irc.browser.example");
+  await waitForConfigurationServerName(page, "irc.browser.example");
   await settingsForm.getByLabel("Server hostname").fill("irc.browser-managed.example");
   await settingsForm.getByLabel("Network name").fill("ManagedBrowserNet");
   await settingsForm.getByLabel("Description").fill("Browser-managed server");
@@ -334,7 +341,7 @@ try {
   await settingsForm.getByLabel("Require an email field").check();
   await settingsForm.getByRole("button", { name: "Save configuration" }).click();
   await expectStatus(page, /Configuration saved/);
-  await expect(settingsForm.getByLabel("Server hostname")).toHaveValue("irc.browser-managed.example");
+  await waitForConfigurationServerName(page, "irc.browser-managed.example");
   assert.match(await page.locator("main").innerText(), /Revision 2/);
   assert.match(await page.locator("main").innerText(), /Accepting clients on/);
   assert.equal(
