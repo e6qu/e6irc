@@ -1365,7 +1365,12 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, page) = request(http, &get_page).await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("Configuration"), "{page}");
-    assert!(page.contains("Revision 1"), "{page}");
+    assert!(page.contains("data-api-configuration-read"), "{page}");
+    assert!(page.contains("Loading…"), "{page}");
+    assert!(
+        !page.contains("value=\"irc.control.example\""),
+        "configuration state must come from the API, not the console document: {page}"
+    );
     assert!(page.contains("Monitoring history"), "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
@@ -1506,6 +1511,17 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     let (status, _, body) = request(http, &configuration).await;
     assert_eq!(status, 200, "{body}");
     let current: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
+    let http_bind = http.to_string();
+    assert_eq!(
+        current["runtime"]["http_bind"].as_str(),
+        Some(http_bind.as_str())
+    );
+    assert!(current["runtime"]["network_drivers"].is_array());
+    assert!(
+        current["runtime"]["network_drivers"]
+            .as_array()
+            .is_some_and(|drivers| drivers.contains(&serde_json::json!("irc")))
+    );
     let mut settings = current["settings"].clone();
     let settings_object = settings.as_object_mut().expect("settings object");
     settings_object.remove("oidc_providers");
@@ -1665,6 +1681,10 @@ async fn console_configuration_manages_every_credential_collection() {
         "server-network creation must go through the JSON API: {page}"
     );
     assert!(
+        page.contains("data-api-configuration-read"),
+        "configuration state must load through the JSON API: {page}"
+    );
+    assert!(
         page.contains("data-api-oper-create"),
         "operator creation must go through the JSON API: {page}"
     );
@@ -1744,6 +1764,8 @@ async fn console_configuration_manages_every_credential_collection() {
     assert!(!body.contains(upstream_secret), "{body}");
     let api: serde_json::Value = serde_json::from_str(&body).expect("configuration JSON");
     assert_eq!(api["revision"], 4);
+    assert_eq!(api["runtime"]["has_master_key"], true);
+    assert_eq!(api["runtime"]["master_key_count"], 1);
     assert_eq!(api["settings"]["opers"][0]["password"], "");
     assert_eq!(api["settings"]["oidc_providers"][0]["client_secret"], "");
     assert!(api["settings"]["networks"][0]["sasl_password"].is_null());

@@ -297,6 +297,7 @@ try {
   await page.goto(`${applicationOrigin}/console/configuration`);
   await page.getByRole("heading", { name: "Configuration", exact: true }).waitFor();
   const settingsForm = page.locator("form.settings-form");
+  await expect(settingsForm.getByLabel("Server hostname")).toHaveValue("irc.browser.example");
   await settingsForm.getByLabel("Server hostname").fill("irc.browser-managed.example");
   await settingsForm.getByLabel("Network name").fill("ManagedBrowserNet");
   await settingsForm.getByLabel("Description").fill("Browser-managed server");
@@ -333,6 +334,7 @@ try {
   await settingsForm.getByLabel("Require an email field").check();
   await settingsForm.getByRole("button", { name: "Save configuration" }).click();
   await expectStatus(page, /Configuration saved/);
+  await expect(settingsForm.getByLabel("Server hostname")).toHaveValue("irc.browser-managed.example");
   assert.match(await page.locator("main").innerText(), /Revision 2/);
   assert.match(await page.locator("main").innerText(), /Accepting clients on/);
   assert.equal(

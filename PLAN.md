@@ -103,6 +103,10 @@ API failures visible in the document. The superseded Configuration mutation
 handlers are removed. Administrator server-ban creation and immutable-ID
 deletion now follow the same API-only pattern; their rendered mutation routes
 are removed.
+Configuration now reads its complete revisioned settings, credential metadata,
+provenance, and secret-free runtime/bootstrap status from its administrator
+API resource before populating any control; the rendered document carries only
+the authenticated shell and CSRF capability.
 All console mutations and API-hydrated directories (owner networks, fleet
 networks, registered channels, server bans, and audit history) share
 same-origin request helpers for authentication context, problem decoding, and

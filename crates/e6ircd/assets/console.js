@@ -729,6 +729,163 @@
     });
   }
 
+  const configurationValue = (form, name, value) => {
+    const field = form.elements.namedItem(name);
+    if (field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) field.value = value ?? "";
+  };
+
+  const configurationChecked = (form, name, checked) => {
+    const field = form.elements.namedItem(name);
+    if (field instanceof HTMLInputElement) field.checked = Boolean(checked);
+  };
+
+  const configurationListeners = (listeners) => listeners.map((listener) => {
+    if (listener.tls) return `${listener.addr} | tls | ${listener.tls.cert_path} | ${listener.tls.key_path}`;
+    return `${listener.addr} | ${listener.websocket ? "websocket" : "plain"}`;
+  }).join("\n");
+
+  const configurationHidden = (name, value) => {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = String(value ?? "");
+    return input;
+  };
+
+  const configurationDeleteForm = (kind, name, revision, csrf, owner) => {
+    const form = document.createElement("form");
+    form.method = "post";
+    form.dataset.apiConfigurationDelete = kind;
+    form.append(configurationHidden("csrf", csrf), configurationHidden("revision", revision), configurationHidden("name", name));
+    if (owner !== undefined) form.append(configurationHidden("owner", owner));
+    const button = element("button", "danger", "Remove");
+    button.type = "submit";
+    form.append(button);
+    return form;
+  };
+
+  const configurationCredentialWarning = (settings, text) => {
+    if (!settings.credentials_from_bootstrap) return null;
+    const warning = element("div", "banner-info");
+    warning.append(append(element("div"), element("strong", "", text)));
+    return warning;
+  };
+
+  const renderConfigurationList = (target, content, empty) => {
+    target.replaceChildren();
+    if (content.length === 0) {
+      target.append(element("p", "empty", empty));
+      return;
+    }
+    const list = element("div", content[0].tagName === "ARTICLE" ? "provider-list" : "compact-list");
+    list.append(...content);
+    target.append(list);
+  };
+
+  const bindConfigurationDeletes = () => {
+    for (const form of document.querySelectorAll("[data-api-configuration-delete]")) {
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const fields = new FormData(form);
+        const revision = Number(fields.get("revision"));
+        const name = String(fields.get("name") || "").trim();
+        if (!Number.isSafeInteger(revision) || revision < 0 || !name) {
+          setConfigurationResult("The configuration revision or item name is missing. Reload and try again.", false);
+          return;
+        }
+        const kind = form.dataset.apiConfigurationDelete;
+        const route = kind === "network" ? "networks" : kind === "oper" ? "opers" : "oidc-providers";
+        const body = kind === "network" ? { revision, owner: optionalValue(String(fields.get("owner") || "")) } : { revision };
+        void mutateConfiguration(form, `/api/v1/admin/configuration/${route}/${encodeURIComponent(name)}`, "DELETE", body, `removed ${kind === "oidc" ? "OpenID Connect provider" : kind === "oper" ? "IRC operator" : "server network"} ${name}`);
+      });
+    }
+  };
+
+  const renderConfiguration = (root, view) => {
+    const settings = view.settings;
+    const runtime = view.runtime;
+    if (!settings || !runtime || !Number.isSafeInteger(view.revision)) throw new Error("The configuration response is incomplete.");
+    const form = root.querySelector("[data-api-configuration-patch]");
+    if (!(form instanceof HTMLFormElement)) throw new Error("The configuration form is missing.");
+    const revision = String(view.revision);
+    root.querySelector("[data-configuration-revision]").textContent = `Revision ${revision}`;
+    const provenance = root.querySelector("[data-configuration-provenance]");
+    provenance.replaceChildren(append(element("span", "", "Last changed by "), element("strong", "", view.updated_by)), element("span", "", view.updated_at));
+    const bootstrap = root.querySelector("[data-configuration-bootstrap]");
+    const httpBind = runtime.http_bind || "dedicated WebSocket listener only";
+    const release = runtime.release_revision || "not set";
+    const keys = runtime.master_key_count || 0;
+    bootstrap.replaceChildren(
+      append(element("div"), element("span", "", "PostgreSQL"), append(element("strong"), element("span", "dot on"), document.createTextNode("Connected"))),
+      append(element("div"), element("span", "", "HTTP bind"), append(element("strong"), element("code", "", httpBind))),
+      append(element("div"), element("span", "", "Master keyring"), append(element("strong"), element("span", runtime.has_master_key ? "dot on" : "dot off"), document.createTextNode(runtime.has_master_key ? `${keys} key${keys === 1 ? "" : "s"}` : "Not configured"))),
+      append(element("div"), element("span", "", "Release revision"), append(element("strong"), element("code", "", release))),
+      element("p", "", "These bootstrap values must exist before the console can start. Their effective state is shown here; more than one key means a credential rotation window is active. Operational configuration below is UI-managed."),
+    );
+    for (const hidden of root.querySelectorAll('input[name="revision"]')) hidden.value = revision;
+    configurationValue(form, "server_name", settings.server_name);
+    configurationValue(form, "network_name", settings.network_name);
+    configurationValue(form, "description", settings.description);
+    configurationValue(form, "motd", (settings.motd || []).join("\n"));
+    configurationValue(form, "storage_history_retention_days", settings.storage.history_retention_days);
+    configurationValue(form, "storage_audit_retention_days", settings.storage.audit_retention_days);
+    configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
+    configurationValue(form, "bnc_addr", settings.bnc_addr);
+    configurationValue(form, "listeners", configurationListeners(settings.listeners || []));
+    configurationValue(form, "public_url", settings.public_url);
+    configurationChecked(form, "secure_cookies", settings.secure_cookies);
+    configurationValue(form, "admin_accounts", (settings.admin_accounts || []).join("\n"));
+    for (const name of ["nicklen", "sendq", "core_queue", "max_hot_channels"]) configurationValue(form, name, settings[name]);
+    for (const name of ["max_connections_per_ip", "command_burst", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
+    configurationValue(form, "trusted_proxies", (settings.limits.trusted_proxies || []).join("\n"));
+    configurationChecked(form, "observability_enabled", settings.observability.enabled);
+    configurationValue(form, "observability_sample_interval_seconds", settings.observability.sample_interval_seconds);
+    configurationValue(form, "observability_retention_hours", settings.observability.retention_hours);
+    configurationChecked(form, "registration_before_connect", settings.registration.before_connect);
+    configurationChecked(form, "registration_require_email", settings.registration.require_email);
+    const bncStatus = root.querySelector("[data-configuration-bnc-status]");
+    bncStatus.replaceChildren(element("span", runtime.bound_bnc_addr ? "dot on" : "dot off"), document.createTextNode(runtime.bound_bnc_addr ? "Accepting clients on " : "Attach listener is disabled"));
+    if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
+
+    const csrf = root.dataset.csrf || "";
+    const networks = (settings.networks || []).map((network) => {
+      const article = document.createElement("article");
+      article.append(append(element("div"), element("strong", "", network.name), element("span", "tag", network.kind)), element("code", "", network.addr), element("span", "meta", `Available to ${network.owner || "all accounts"}`), configurationDeleteForm("network", network.name, revision, csrf, network.owner || ""));
+      return article;
+    });
+    const networkTarget = root.querySelector("[data-configuration-networks]");
+    renderConfigurationList(networkTarget, networks, "No server-level networks configured.");
+    const networkWarning = configurationCredentialWarning(settings, "Credential-bearing networks still come from bootstrap configuration. Configure the master key and restart once to enable UI changes.");
+    if (networkWarning) networkTarget.prepend(networkWarning);
+    const kinds = root.querySelector("[data-configuration-network-kinds]");
+    kinds.replaceChildren(...(runtime.network_drivers || []).map((kind) => element("option", "", kind.toUpperCase())));
+    for (const option of kinds.options) option.value = option.textContent.toLowerCase();
+
+    const opers = (settings.opers || []).map((oper) => append(element("div"), element("code", "", oper.name), configurationDeleteForm("oper", oper.name, revision, csrf)));
+    const operTarget = root.querySelector("[data-configuration-opers]");
+    renderConfigurationList(operTarget, opers, "No IRC operators configured.");
+    const operWarning = configurationCredentialWarning(settings, "Credentials still come from bootstrap configuration. Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.");
+    if (operWarning) operTarget.prepend(operWarning);
+    const providers = (settings.oidc_providers || []).map((provider) => {
+      const article = document.createElement("article");
+      const domains = provider.allowed_email_domains?.length ? provider.allowed_email_domains.join(", ") : "any verified provider identity";
+      article.append(append(element("div"), element("strong", "", provider.name), element("span", "tag", provider.token_endpoint_auth_method)), element("code", "", provider.issuer_url), element("span", "meta", `Client ${provider.client_id} · scopes ${(provider.scopes || []).join(" ")}`), element("span", "meta", `Allowed email domains: ${domains}`), configurationDeleteForm("oidc", provider.name, revision, csrf));
+      return article;
+    });
+    const providerTarget = root.querySelector("[data-configuration-oidc-providers]");
+    renderConfigurationList(providerTarget, providers, "No identity providers configured.");
+    const providerWarning = configurationCredentialWarning(settings, "Credentials still come from bootstrap configuration. Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.");
+    if (providerWarning) providerTarget.prepend(providerWarning);
+    bindConfigurationDeletes();
+  };
+
+  const configurationRoot = document.querySelector("[data-api-configuration-read]");
+  if (configurationRoot instanceof HTMLElement) {
+    void apiRead("/api/v1/admin/configuration")
+      .then((view) => renderConfiguration(configurationRoot, view))
+      .catch((error) => setConfigurationResult(`Configuration failed to load (${error instanceof Error ? error.message : "unknown error"}). Reload to retry.`, false));
+  }
+
   const banResult = document.getElementById("ban-api-result");
   const adminBanRows = document.querySelector("[data-api-admin-ban-list]");
   if (adminBanRows instanceof HTMLElement) {
