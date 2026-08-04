@@ -2348,22 +2348,33 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let (_, _, empty) = request(http, &page_request(&boss_session)).await;
-    assert!(
-        !empty.contains("#Control") && empty.contains("#Web"),
-        "drop affected the wrong owner channel: {empty}"
-    );
+    let (status, _, remaining) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{remaining}");
+    let remaining: serde_json::Value = serde_json::from_str(&remaining).expect("channel list");
+    assert_eq!(remaining["channels"].as_array().map(Vec::len), Some(1));
+    assert_eq!(remaining["channels"][0]["name"], "#Web");
     let (status, _, body) = request(
         http,
         &api_request("DELETE", "/api/v1/me/channels/%23Web", "", Some(&csrf)),
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let (_, _, empty) = request(http, &page_request(&boss_session)).await;
-    assert!(
-        empty.contains("No channels registered to this account"),
-        "registered channel remained after both drops: {empty}"
-    );
+    let (status, _, empty) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{empty}");
+    let empty: serde_json::Value = serde_json::from_str(&empty).expect("empty channel list");
+    assert_eq!(empty["channels"].as_array().map(Vec::len), Some(0));
 }
 
 // ---- admin API (PG-gated) -----------------------------------------------
