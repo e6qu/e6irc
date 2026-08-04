@@ -5011,15 +5011,18 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .http_addr
         .expect("http");
 
-    // The account console is usable with the default build: its runtime is
-    // always served, and every mutation carries the session-bound form token.
+    // The account console is a static API client: private credentials and OIDC
+    // identities must never be embedded in the document before its API reads.
     let page_req = format!(
         "GET /console/account HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
     let (status, headers, page) = request(http, &page_req).await;
     assert_eq!(status, 200, "{headers}");
-    assert!(page.contains("alice-primary"), "{page}");
-    assert!(page.contains("alice-secondary"), "{page}");
+    assert!(page.contains("data-api-account-read"), "{page}");
+    assert!(page.contains("data-api-account-credential-list"), "{page}");
+    assert!(page.contains("data-api-account-identity-list"), "{page}");
+    assert!(!page.contains("alice-primary"), "{page}");
+    assert!(!page.contains("alice-secondary"), "{page}");
     let csrf = csrf_from_html(&page).to_string();
     assert!(!csrf.is_empty());
 

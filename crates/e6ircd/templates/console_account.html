@@ -1,255 +1,64 @@
 {% extends "console_base.html" %}
 {% block main %}
-  <div class="page-head">
-    <div>
-      <p class="eyebrow">Self-service security</p>
-      <h1>Account &amp; access</h1>
-      <p class="lede">Manage the credentials, API access, and login identities attached to <strong>{{ shell.account }}</strong>. Secrets are displayed once and stored only as hashes.</p>
-    </div>
-    <a class="button-link" href="/api/v1/me/export">Download my data</a>
-  </div>
-
-  <div id="account-api-result" role="status" aria-live="polite"></div>
-  <div id="account-api-secret"></div>
-  <noscript><div class="banner-error">JavaScript is required to manage account controls because they use the account API directly.</div></noscript>
-
-  <section class="panel">
-    <div class="panel-head">
+  <div data-api-account-read data-csrf="{{ shell.csrf }}">
+    <div class="page-head">
       <div>
-        <h2>Contact email</h2>
-        <p>Private account recovery and operator-contact metadata. e6irc stores it but does not claim to verify or send mail to it.</p>
+        <p class="eyebrow">Self-service security</p>
+        <h1>Account &amp; access</h1>
+        <p class="lede">Manage the credentials, API access, and login identities attached to <strong>{{ shell.account }}</strong>. Secrets are displayed once and stored only as hashes.</p>
       </div>
-      <span class="tag">Private</span>
+      <a class="button-link" href="/api/v1/me/export">Download my data</a>
     </div>
-    <form class="inline-create" method="post" action="/api/v1/me/profile" data-api-account-profile>
-      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-      <label class="field">
-        <span>Email address</span>
-        <input type="email" name="contact_email" maxlength="254" placeholder="alice@example.com" data-api-account-contact-email />
-      </label>
-      <button class="primary" type="submit">Save contact email</button>
-    </form>
-    <p class="section-note">Leave the field empty and save to remove the stored address.</p>
-  </section>
 
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <h2>{% if has_local_password %}Primary password{% else %}Add a local password{% endif %}</h2>
-        <p>{% if has_local_password %}Used for local web sign-in, IRC identification, and authorizing new app passwords.{% else %}This account currently signs in through OpenID Connect. Add a password to enable local web and IRC credential sign-in too.{% endif %}</p>
-      </div>
-      <span class="tag">Argon2id</span>
-    </div>
-    <form class="field-grid" method="post" action="/api/v1/me/password" data-api-account-password>
-      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-      {% if has_local_password %}
-        <label class="field">
-          <span>Current password</span>
-          <input type="password" name="current_password" maxlength="512" autocomplete="current-password" required />
-        </label>
-      {% endif %}
-      <label class="field">
-        <span>New password</span>
-        <input type="password" name="new_password" maxlength="512" autocomplete="new-password" required />
-      </label>
-      <label class="field">
-        <span>Confirm new password</span>
-        <input type="password" name="confirm_password" maxlength="512" autocomplete="new-password" required />
-      </label>
-      <div class="field field-wide">
-        <button class="primary" type="submit">{% if has_local_password %}Change password{% else %}Add password{% endif %}</button>
-      </div>
-    </form>
-  </section>
-
-  <div class="access-grid">
-    <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>IRC credentials</h2>
-          <p>The primary password and per-client SASL PLAIN app passwords. The primary account password cannot be revoked here.</p>
-        </div>
-        <span class="count">{{ credentials.len() }}</span>
-      </div>
-      <form class="inline-create" method="post" action="/api/v1/me/credentials" data-api-account-app-password>
-        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-        <label class="field">
-          <span>Label</span>
-          <input name="label" maxlength="64" placeholder="Laptop IRC client" required />
-        </label>
-        <button class="primary" type="submit">Create app password</button>
-      </form>
-      {% if credentials.is_empty() %}
-        <p class="empty">No account credentials.</p>
-      {% else %}
-        <div class="scroll">
-          <table>
-            <caption class="sr-only">IRC credentials</caption>
-            <thead><tr><th>Kind</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
-            <tbody>
-              {% for credential in credentials %}
-                <tr>
-                  <td><span class="tag">{{ credential.kind }}</span></td>
-                  <td>{{ credential.label }}</td>
-                  <td>{{ credential.created }}</td>
-                  <td>{{ credential.last_used }}</td>
-                  <td>
-                    {% if credential.revocable %}
-                      <form class="cell-form" method="post" action="/api/v1/me/credentials/{{ credential.id }}" data-api-account-delete data-confirm="Revoke this app password?">
-                        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                        <button class="danger" type="submit">Revoke</button>
-                      </form>
-                    {% else %}
-                      <span class="meta">Primary</span>
-                    {% endif %}
-                  </td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      {% endif %}
-      <p class="section-note">For a BNC network, authenticate as <code>{{ shell.account }}/&lt;network&gt;</code> with one of these app passwords.</p>
-    </section>
+    <div id="account-api-result" role="status" aria-live="polite"></div>
+    <div id="account-api-secret"></div>
+    <noscript><div class="banner-error">JavaScript is required to manage account controls because they use the account API directly.</div></noscript>
 
     <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>Personal access tokens</h2>
-          <p>Expiring bearer grants for API clients, IRC authentication, and automation.</p>
-        </div>
-        <span class="count" id="account-token-count">…</span>
-      </div>
-      <form class="inline-create" method="post" action="/api/v1/me/tokens" data-api-account-token>
+      <div class="panel-head"><div><h2>Contact email</h2><p>Private account recovery and operator-contact metadata. e6irc stores it but does not claim to verify or send mail to it.</p></div><span class="tag">Private</span></div>
+      <form class="inline-create" method="post" action="/api/v1/me/profile" data-api-account-profile>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-        <label class="field">
-          <span>Label</span>
-          <input name="label" maxlength="64" placeholder="Monitoring automation" required />
-        </label>
-        <label class="field">
-          <span>Lifetime</span>
-          <select name="expires_in_days">
-            <option value="7">7 days</option>
-            <option value="30" selected>30 days</option>
-            <option value="90">90 days</option>
-            <option value="365">365 days</option>
-          </select>
-        </label>
-        <fieldset class="field">
-          <legend>Scopes</legend>
-          <label><input type="checkbox" name="scope_read" checked /> Read</label>
-          <label><input type="checkbox" name="scope_write" checked /> Write</label>
-          <label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>
-          {% if shell.is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}
-        </fieldset>
-        <button class="primary" type="submit">Create token</button>
+        <label class="field"><span>Email address</span><input type="email" name="contact_email" maxlength="254" placeholder="alice@example.com" data-api-account-contact-email /></label>
+        <button class="primary" type="submit">Save contact email</button>
       </form>
-      <div class="scroll">
-        <table>
-          <caption class="sr-only">Personal access tokens</caption>
-          <thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead>
-          <tbody id="account-token-rows" data-api-account-token-list data-csrf="{{ shell.csrf }}">
-            <tr><td colspan="5" class="empty">Loading personal access tokens…</td></tr>
-          </tbody>
-        </table>
-      </div>
+      <p class="section-note">Leave the field empty and save to remove the stored address.</p>
     </section>
+
+    <section class="panel" data-api-account-password-panel><p class="empty">Loading password status…</p></section>
+
+    <div class="access-grid">
+      <section class="panel">
+        <div class="panel-head"><div><h2>IRC credentials</h2><p>The primary password and per-client SASL PLAIN app passwords. The primary account password cannot be revoked here.</p></div><span class="count" data-api-account-credential-count>…</span></div>
+        <form class="inline-create" method="post" action="/api/v1/me/credentials" data-api-account-app-password>
+          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+          <label class="field"><span>Label</span><input name="label" maxlength="64" placeholder="Laptop IRC client" required /></label>
+          <button class="primary" type="submit">Create app password</button>
+        </form>
+        <div class="scroll"><table><caption class="sr-only">IRC credentials</caption><thead><tr><th>Kind</th><th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody data-api-account-credential-list data-csrf="{{ shell.csrf }}"><tr><td colspan="5" class="empty">Loading account credentials…</td></tr></tbody></table></div>
+        <p class="section-note">For a BNC network, authenticate as <code>{{ shell.account }}/&lt;network&gt;</code> with one of these app passwords.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><div><h2>Personal access tokens</h2><p>Expiring bearer grants for API clients, IRC authentication, and automation.</p></div><span class="count" id="account-token-count">…</span></div>
+        <form class="inline-create" method="post" action="/api/v1/me/tokens" data-api-account-token>
+          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+          <label class="field"><span>Label</span><input name="label" maxlength="64" placeholder="Monitoring automation" required /></label>
+          <label class="field"><span>Lifetime</span><select name="expires_in_days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">365 days</option></select></label>
+          <fieldset class="field"><legend>Scopes</legend><label><input type="checkbox" name="scope_read" checked /> Read</label><label><input type="checkbox" name="scope_write" checked /> Write</label><label><input type="checkbox" name="scope_irc" checked /> IRC sign-in</label>{% if shell.is_admin %}<label><input type="checkbox" name="scope_administrator" /> Administrator</label>{% endif %}</fieldset>
+          <button class="primary" type="submit">Create token</button>
+        </form>
+        <div class="scroll"><table><caption class="sr-only">Personal access tokens</caption><thead><tr><th>Label</th><th>Scopes</th><th>Created</th><th>Expiry</th><th></th></tr></thead><tbody id="account-token-rows" data-api-account-token-list data-csrf="{{ shell.csrf }}"><tr><td colspan="5" class="empty">Loading personal access tokens…</td></tr></tbody></table></div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>Login identities</h2><p>OpenID Connect identities that can sign in as this account. Removing an identity revokes its browser sessions and signs this browser out.</p></div><span class="count" data-api-account-identity-count>…</span></div>
+      <div data-api-account-link-providers><p class="empty">Loading available identity providers…</p></div>
+      <div class="identity-list" data-api-account-identity-list><p class="empty">Loading login identities…</p></div>
+    </section>
+
+    <section class="panel"><div class="panel-head"><div><h2>Read state</h2><p>Latest IRCv3 read marker persisted for each conversation.</p></div><span class="count" id="account-read-marker-count">…</span></div><div class="marker-grid" id="account-read-markers" data-api-account-read-marker-list><p class="empty">Loading read markers…</p></div></section>
+    <section class="panel"><div class="panel-head"><div><h2>Security activity</h2><p>Your 50 most recent retained security and administrator events. The JSON API provides stable cursor pagination for older entries.</p></div><span class="count" id="account-security-activity-count">…</span></div><div class="scroll"><table><caption class="sr-only">Security activity</caption><thead><tr><th>Time (UTC)</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead><tbody id="account-security-activity-rows" data-api-account-security-activity-list><tr><td colspan="5" class="empty">Loading security activity…</td></tr></tbody></table></div><p class="section-note"><a href="/api/v1/me/security-activity">Open security activity JSON</a></p></section>
+    <section class="panel danger-panel" aria-labelledby="delete-account-title"><div class="panel-head"><div><p class="eyebrow">Danger zone</p><h2 id="delete-account-title">Permanently delete this account</h2><p>This revokes every credential and session, erases private history, stops owned networks, and retires the account name. It cannot be undone.</p></div></div><form class="field-grid" method="post" action="/api/v1/me/account" data-api-account-delete-self data-confirm="Permanently delete {{ shell.account }} and all account-owned data? This cannot be undone."><input type="hidden" name="csrf" value="{{ shell.csrf }}" /><label class="field field-wide"><span>Type <code>{{ shell.account }}</code> to confirm</span><input name="confirmation" autocomplete="off" required /></label><div class="form-actions field-wide"><button class="danger" type="submit">Delete my account permanently</button></div></form><p class="section-note">If this account founded registered channels, transfer or drop them first. The final active administrator—whether granted by storage or configuration—cannot be deleted.</p></section>
   </div>
-
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <h2>Login identities</h2>
-        <p>OpenID Connect identities that can sign in as this account. Removing an identity revokes its browser sessions and signs this browser out.</p>
-      </div>
-      <span class="count">{{ identities.len() }}</span>
-    </div>
-    {% if link_providers.is_empty() %}
-      <p class="section-note">No login providers are currently configured.</p>
-    {% else %}
-      <div class="provider-actions">
-        {% for provider in link_providers %}
-          <a class="button-link secondary-link" href="/api/v1/auth/oidc/{{ provider }}/link">Link {{ provider }}</a>
-        {% endfor %}
-      </div>
-    {% endif %}
-    {% if identities.is_empty() %}
-      <p class="empty">{% if has_local_password %}No linked single sign-on identities. Local password sign-in remains available.{% else %}No login method is configured for this account.{% endif %}</p>
-    {% else %}
-      <div class="identity-list">
-        {% for identity in identities %}
-          <article>
-            <div>
-              <strong>{{ identity.issuer }}</strong>
-              <code>{{ identity.subject }}</code>
-              <small>Linked {{ identity.created }}</small>
-            </div>
-            {% if identities.len() > 1 || has_local_password %}
-              <form method="post" action="/api/v1/me/identities/{{ identity.id }}" data-api-account-delete data-confirm="Unlink this identity and revoke its browser sessions?">
-                <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                <button class="danger" type="submit">Unlink</button>
-              </form>
-            {% else %}
-              <span class="tag">Last login method</span>
-            {% endif %}
-          </article>
-        {% endfor %}
-      </div>
-    {% endif %}
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <h2>Read state</h2>
-        <p>Latest IRCv3 read marker persisted for each conversation.</p>
-      </div>
-      <span class="count" id="account-read-marker-count">…</span>
-    </div>
-    <div class="marker-grid" id="account-read-markers" data-api-account-read-marker-list>
-      <p class="empty">Loading read markers…</p>
-    </div>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <h2>Security activity</h2>
-        <p>Your 50 most recent retained security and administrator events. The JSON API provides stable cursor pagination for older entries.</p>
-      </div>
-      <span class="count" id="account-security-activity-count">…</span>
-    </div>
-    <div class="scroll">
-      <table>
-        <caption class="sr-only">Security activity</caption>
-        <thead><tr><th>Time (UTC)</th><th>Action</th><th>Actor</th><th>Target</th><th>Detail</th></tr></thead>
-        <tbody id="account-security-activity-rows" data-api-account-security-activity-list>
-          <tr><td colspan="5" class="empty">Loading security activity…</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="section-note"><a href="/api/v1/me/security-activity">Open security activity JSON</a></p>
-  </section>
-
-  <section class="panel danger-panel" aria-labelledby="delete-account-title">
-    <div class="panel-head">
-      <div>
-        <p class="eyebrow">Danger zone</p>
-        <h2 id="delete-account-title">Permanently delete this account</h2>
-        <p>This revokes every credential and session, erases private history, stops owned networks, and retires the account name. It cannot be undone.</p>
-      </div>
-    </div>
-    <form class="field-grid" method="post" action="/api/v1/me/account" data-api-account-delete-self
-          data-confirm="Permanently delete {{ shell.account }} and all account-owned data? This cannot be undone.">
-      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-      <label class="field field-wide">
-        <span>Type <code>{{ shell.account }}</code> to confirm</span>
-        <input name="confirmation" autocomplete="off" required />
-      </label>
-      <div class="form-actions field-wide">
-        <button class="danger" type="submit">Delete my account permanently</button>
-      </div>
-    </form>
-    <p class="section-note">If this account founded registered channels, transfer or drop them first. The final active administrator—whether granted by storage or configuration—cannot be deleted.</p>
-  </section>
 {% endblock %}

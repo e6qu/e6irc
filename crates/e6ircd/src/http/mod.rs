@@ -2043,77 +2043,10 @@ mod pages {
         }
     }
 
-    struct CredentialView {
-        id: i64,
-        kind: String,
-        label: String,
-        created: String,
-        last_used: String,
-        revocable: bool,
-    }
-
-    struct IdentityView {
-        id: i64,
-        issuer: String,
-        subject: String,
-        created: String,
-    }
-
     #[derive(Template)]
     #[template(path = "console_account.html")]
     struct ConsoleAccount {
         shell: ConsoleShell,
-        credentials: Vec<CredentialView>,
-        has_local_password: bool,
-        identities: Vec<IdentityView>,
-        link_providers: Vec<String>,
-    }
-
-    async fn account_build(
-        state: &AppState,
-        account: String,
-        csrf: String,
-    ) -> Result<ConsoleAccount, Response> {
-        let pool = pool_of(state);
-        let credentials: Vec<CredentialView> = crate::db::list_credentials(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("credential list", e))?
-            .into_iter()
-            .map(|(id, kind, label, created, last_used)| CredentialView {
-                id,
-                revocable: kind == "app_password",
-                kind,
-                label: label.unwrap_or_default(),
-                created,
-                last_used: last_used.unwrap_or_else(|| "Never".into()),
-            })
-            .collect();
-        let has_local_password = credentials
-            .iter()
-            .any(|credential| credential.kind == "local_password");
-        let identities = crate::db::list_oidc_identities(pool, &account)
-            .await
-            .map_err(|e| super::device::admin_db_error("identity list", e))?
-            .into_iter()
-            .map(|(id, issuer, subject, created)| IdentityView {
-                id,
-                issuer,
-                subject,
-                created,
-            })
-            .collect();
-        let link_providers = state
-            .oidc_providers
-            .iter()
-            .map(|provider| provider.name.clone())
-            .collect();
-        Ok(ConsoleAccount {
-            shell: console_shell(state, account, csrf, "account"),
-            credentials,
-            has_local_password,
-            identities,
-            link_providers,
-        })
     }
 
     /// Authenticate a cookie session for a server-rendered page and derive its
@@ -2177,10 +2110,9 @@ mod pages {
             Ok(actor) => actor,
             Err(response) => return response,
         };
-        match account_build(&state, account, csrf).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
+        render_private(ConsoleAccount {
+            shell: console_shell(&state, account, csrf, "account"),
+        })
     }
 
     struct ChannelAccessView {

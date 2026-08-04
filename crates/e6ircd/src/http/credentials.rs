@@ -336,7 +336,15 @@ pub(super) async fn me_identities(
                     })
                 })
                 .collect();
-            json_no_store(serde_json::json!({ "identities": identities }))
+            let link_providers: Vec<&str> = state
+                .oidc_providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect();
+            json_no_store(serde_json::json!({
+                "identities": identities,
+                "link_providers": link_providers,
+            }))
         }
         Err(error) => database_unavailable("identity list", error),
     }
