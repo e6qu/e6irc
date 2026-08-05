@@ -1299,6 +1299,14 @@ async fn console_networks_page_lists_the_callers_networks() {
             "network detail retained the stored database projection {stored_value:?}: {detail}"
         );
     }
+    let editor_req = format!(
+        "GET /console/networks/libera/edit HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, editor) = request(http, &editor_req).await;
+    assert_eq!(status, 200, "{editor}");
+    assert!(editor.contains("data-api-owner-network-editor"), "{editor}");
+    assert!(editor.contains("Loading network…"), "{editor}");
+    assert!(!editor.contains("irc.libera.chat:6697"), "{editor}");
     let operations_req = format!(
         "GET /api/v1/me/networks/libera/operations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );

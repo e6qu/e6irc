@@ -685,6 +685,17 @@ try {
     "network Operations used a rendered console fragment instead of its API resource",
   );
 
+  const editorRead = page.waitForResponse(
+    (response) =>
+      response.url() === `${applicationOrigin}/api/v1/me/networks/journey` &&
+      response.request().method() === "GET",
+  );
+  await page.goto(`${applicationOrigin}/console/networks/journey/edit`);
+  assert.equal((await editorRead).status(), 200);
+  await page.locator('input[name="addr"]').waitFor({ state: "visible" });
+  assert.equal(await page.locator('input[name="addr"]').inputValue(), upstream.address);
+  assert.equal(await page.locator('input[name="nick"]').inputValue(), "webjourney");
+
   // Exercise the daemon's actual signal handler and startup preload while the
   // same browser context, account session, network definition, upstream, and
   // backlog all exist. Component restart tests cannot prove that these durable

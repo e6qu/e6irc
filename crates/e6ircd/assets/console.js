@@ -1940,6 +1940,24 @@
     });
   }
 
+  const ownerNetworkEditor = document.querySelector("[data-api-owner-network-editor]");
+  if (ownerNetworkEditor instanceof HTMLElement) {
+    const name = ownerNetworkEditor.dataset.networkName || "";
+    const form = ownerNetworkEditor.querySelector("[data-api-owner-network-update]");
+    const fail = (message) => setOwnerNetworkResult(message, false);
+    if (!name || !(form instanceof HTMLFormElement)) fail("This network editor has no resource ID. Return to the network directory and try again."); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
+      .then((network) => {
+        if (!network || network.kind !== "irc" || typeof network.name !== "string" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin) || typeof network.tls !== "boolean") { window.location.replace("/console/networks"); return; }
+        const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
+        set("addr", network.addr); set("nick", network.nick); set("realname", typeof network.realname === "string" ? network.realname : ""); set("autojoin", network.autojoin.join(", ")); set("sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
+        const tls = form.elements.namedItem("tls"); if (tls instanceof HTMLInputElement) tls.checked = network.tls;
+        form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
+        const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
+        form.hidden = false;
+      })
+      .catch((error) => fail(error instanceof Error ? error.message : "Network configuration failed to load."));
+  }
+
   // The network-list fragment is replaced during live refreshes, so lifecycle
   // controls are delegated rather than bound only to the original rows.
   document.addEventListener("submit", (event) => {
