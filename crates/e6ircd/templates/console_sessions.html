@@ -1,203 +1,76 @@
 {% extends "console_base.html" %}
 {% block main %}
-  {% if let Some(err) = error %}
-    <p class="banner-error" role="alert">{{ err }}</p>
-  {% endif %}
   <div id="session-api-result" role="status" aria-live="polite"></div>
-  <div class="page-head">
-    <div>
-      <p class="eyebrow">Access &amp; connections</p>
-      <h1>{{ title }}</h1>
-      <p class="lede">{{ hint }}</p>
+  <div data-api-session-page data-own="{{ own }}" data-csrf="{{ shell.csrf }}">
+    <div class="page-head">
+      <div>
+        <p class="eyebrow">Access &amp; connections</p>
+        {% if own %}
+          <h1>Your sessions</h1>
+          <p class="lede">Durable browser logins and live IRC connections authenticated to your account.</p>
+          <a class="button-link" href="/api/v1/me/connections">Open connections JSON</a>
+        {% else %}
+          <h1>Live connections</h1>
+          <p class="lede">Bounded, newest-first registered IRC connections across every transport.</p>
+          <a class="button-link" href="/api/v1/admin/connections">Open connections JSON</a>
+        {% endif %}
+      </div>
     </div>
-    {% if show_browser_sessions %}
-      <a class="button-link" href="/api/v1/me/connections">Open connections JSON</a>
-    {% else %}
-      <a class="button-link" href="/api/v1/admin/connections">Open connections JSON</a>
-    {% endif %}
-  </div>
 
-  {% if show_browser_sessions %}
+    {% if own %}
+      <section class="panel" data-api-browser-sessions></section>
+    {% endif %}
+
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>Browser sessions</h2>
-          <p>Durable web logins for this account, capped at 32 active sessions. A new login rolls out the oldest. Tokens remain hash-only and are never displayed.</p>
+          <h2>Exact connection lookup</h2>
+          <p>Nick and account matching follow the server's RFC1459 case-folding rules.</p>
         </div>
-        <div class="row-actions">
-          <span class="count">{{ browser_sessions.len() }}</span>
-          {% if browser_sessions.len() > 1 %}
-            <form method="post" action="/api/v1/me/sessions?except=current"
-                  data-api-session-revoke data-confirm="Sign out every other browser session?">
-              <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-              <noscript><div class="banner-error">JavaScript is required to manage browser sessions because these controls use the account API directly.</div></noscript>
-              <button class="danger" type="submit">Sign out others</button>
-            </form>
-          {% endif %}
-        </div>
+        <a class="secondary-link" data-api-session-clear href="/console/sessions">Clear filters and cursor</a>
       </div>
-      {% if browser_sessions.is_empty() %}
-        <p class="empty">No active browser sessions.</p>
+      {% if own %}
+        <form class="field-grid" method="get" action="/console/my-sessions" data-api-connection-filter>
       {% else %}
-        <div class="scroll">
-          <table>
-            <caption class="sr-only">Active browser sessions</caption>
-            <thead>
-              <tr><th>Browser</th><th>Sign-in method</th><th>Created</th><th>Expires</th><th></th></tr>
-            </thead>
-            <tbody>
-              {% for session in browser_sessions %}
-                <tr>
-                  <td class="session-agent">{{ session.user_agent }}</td>
-                  <td>{{ session.method }}</td>
-                  <td><time datetime="{{ session.created }}">{{ session.created }}</time></td>
-                  <td><time datetime="{{ session.expires }}">{{ session.expires }}</time></td>
-                  <td>
-                    {% if session.current %}
-                      <span class="tag">Current session</span>
-                    {% else %}
-                      <form class="cell-form" method="post"
-                            action="/api/v1/me/sessions/{{ session.id }}" data-api-session-revoke
-                            data-confirm="Sign out this browser session?">
-                        <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                        <noscript><div class="banner-error">JavaScript is required to manage browser sessions because these controls use the account API directly.</div></noscript>
-                        <button class="danger" type="submit">Sign out</button>
-                      </form>
-                    {% endif %}
-                  </td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
+        <form class="field-grid" method="get" action="/console/sessions" data-api-connection-filter>
       {% endif %}
-    </section>
-  {% endif %}
-
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <h2>Exact connection lookup</h2>
-        <p>Nick and account matching follow the server's RFC1459 case-folding rules.</p>
-      </div>
-      {% if has_filters || has_cursor %}
-        {% if show_browser_sessions %}
-          <a class="secondary-link" href="/console/my-sessions">Clear filters and cursor</a>
-        {% else %}
-          <a class="secondary-link" href="/console/sessions">Clear filters and cursor</a>
-        {% endif %}
-      {% endif %}
-    </div>
-    {% if show_browser_sessions %}
-      <form class="field-grid" method="get" action="/console/my-sessions">
-    {% else %}
-      <form class="field-grid" method="get" action="/console/sessions">
-    {% endif %}
-      <label class="field">
-        <span>Exact nick</span>
-        <input name="nick" value="{{ nick_filter }}" maxlength="64" autocomplete="off"
-               placeholder="alice" />
-      </label>
-      {% if show_account_filter %}
         <label class="field">
-          <span>Exact account</span>
-          <input name="account" value="{{ account_filter }}" maxlength="64" autocomplete="off"
-                 placeholder="alice" />
+          <span>Exact nick</span>
+          <input name="nick" maxlength="64" autocomplete="off" placeholder="alice" />
         </label>
-      {% endif %}
-      <label class="field">
-        <span>Transport</span>
-        <select name="transport">
-          <option value="">All transports</option>
-          <option value="tcp"{% if transport_filter == "tcp" %} selected{% endif %}>TCP</option>
-          <option value="tls"{% if transport_filter == "tls" %} selected{% endif %}>TLS</option>
-          <option value="websocket"{% if transport_filter == "websocket" %} selected{% endif %}>WebSocket</option>
-          <option value="local"{% if transport_filter == "local" %} selected{% endif %}>Local network</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>IRC operator</span>
-        <select name="oper">
-          <option value="">All clients</option>
-          <option value="true"{% if oper_filter == "true" %} selected{% endif %}>Operators only</option>
-          <option value="false"{% if oper_filter == "false" %} selected{% endif %}>Non-operators only</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>Rows per page</span>
-        <input type="number" name="limit" value="{{ limit }}" min="1" max="1000"
-               inputmode="numeric" required />
-      </label>
-      <div class="form-actions field-wide">
-        <button class="primary" type="submit">Apply lookup</button>
-      </div>
-    </form>
-  </section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <div>
-        <h2>{% if show_browser_sessions %}Your live IRC connections{% else %}Live IRC connections{% endif %}</h2>
-        <p>Newest connection IDs first. Each disconnect targets the immutable ID shown in this row.</p>
-      </div>
-      <span class="count">{{ sessions.len() }}</span>
-    </div>
-    {% if sessions.is_empty() %}
-      <p class="empty">{% if has_filters %}No live connection matches these exact filters.{% else %}No connected IRC clients.{% endif %}</p>
-    {% else %}
-      <div class="scroll">
-        <table>
-          <caption class="sr-only">{% if show_browser_sessions %}Your live IRC connections{% else %}All live IRC connections{% endif %}</caption>
-          <thead>
-            <tr><th>ID</th><th>Client</th><th>Transport</th><th>Account</th><th>Connected / idle</th><th>Channels</th><th></th></tr>
-          </thead>
-          <tbody>
-            {% for s in sessions %}
-              <tr>
-                <td class="meta">{{ s.id }}</td>
-                <td><strong><code>{{ s.nick }}</code></strong>{% if s.oper %} <span class="tag">oper</span>{% endif %}
-                  <div class="meta"><code>{{ s.user }}@{{ s.host }}</code></div>
-                </td>
-                <td><span class="tag">{{ s.transport }}</span></td>
-                <td>{% if let Some(a) = s.account %}<code>{{ a }}</code>{% else %}<span class="meta">—</span>{% endif %}</td>
-                <td><time datetime="{{ s.connected_at }}">{{ s.connected_at }}</time>
-                  <div class="meta">{{ s.idle_seconds }} seconds idle</div>
-                </td>
-                <td>{% if s.channels.is_empty() %}<span class="meta">—</span>{% else %}<code>{{ s.channels }}</code>{% endif %}</td>
-                <td>
-                  <form class="cell-form" method="post"
-                        {% if show_browser_sessions %}action="/api/v1/me/connections/{{ s.id }}"{% else %}action="/api/v1/admin/connections/{{ s.id }}"{% endif %} data-api-session-disconnect
-                        data-confirm="Disconnect connection {{ s.id }} ({{ s.nick }})?">
-                    <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                    <input type="hidden" name="id" value="{{ s.id }}" />
-                    <noscript><div class="banner-error">JavaScript is required to disconnect a live connection because this control uses the API directly.</div></noscript>
-                    <input type="text" name="reason" maxlength="300" placeholder="reason" />
-                    <button class="danger" type="submit">Disconnect</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    {% endif %}
-    <div class="pager">
-      <span class="meta">{% if has_cursor %}Showing an older page.{% else %}Showing the newest matching connections.{% endif %}</span>
-      {% if let Some(before_id) = next_before_id %}
-        {% if show_browser_sessions %}
-          <form method="get" action="/console/my-sessions">
-        {% else %}
-          <form method="get" action="/console/sessions">
+        {% if !own %}
+          <label class="field">
+            <span>Exact account</span>
+            <input name="account" maxlength="64" autocomplete="off" placeholder="alice" />
+          </label>
         {% endif %}
-          <input type="hidden" name="nick" value="{{ nick_filter }}" />
-          {% if show_account_filter %}<input type="hidden" name="account" value="{{ account_filter }}" />{% endif %}
-          <input type="hidden" name="transport" value="{{ transport_filter }}" />
-          <input type="hidden" name="oper" value="{{ oper_filter }}" />
-          <input type="hidden" name="limit" value="{{ limit }}" />
-          <input type="hidden" name="before_id" value="{{ before_id }}" />
-          <button type="submit">Older connections</button>
-        </form>
-      {% endif %}
-    </div>
-  </section>
+        <label class="field">
+          <span>Transport</span>
+          <select name="transport">
+            <option value="">All transports</option>
+            <option value="tcp">TCP</option>
+            <option value="tls">TLS</option>
+            <option value="websocket">WebSocket</option>
+            <option value="local">Local network</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>IRC operator</span>
+          <select name="oper">
+            <option value="">All clients</option>
+            <option value="true">Operators only</option>
+            <option value="false">Non-operators only</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Rows per page</span>
+          <input type="number" name="limit" value="50" min="1" max="1000" inputmode="numeric" required />
+        </label>
+        <div class="form-actions field-wide"><button class="primary" type="submit">Apply lookup</button></div>
+      </form>
+    </section>
+
+    <section class="panel" data-api-live-connections></section>
+    <noscript><p class="banner-error">JavaScript is required because this page reads and changes session data through the API.</p></noscript>
+  </div>
 {% endblock %}

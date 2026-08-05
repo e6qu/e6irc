@@ -126,6 +126,8 @@ pub(super) struct LiveConnectionQueryParams {
     pub(super) oper: Option<String>,
 }
 
+/// Owner connection queries deliberately cannot carry an account filter:
+/// ownership comes only from the authenticated request.
 #[derive(Default, serde::Deserialize)]
 pub(super) struct OwnLiveConnectionQueryParams {
     pub(super) limit: Option<usize>,

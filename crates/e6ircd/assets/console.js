@@ -986,38 +986,176 @@
     sessionResult.className = success ? "banner-success" : "banner-error";
   };
 
-  const mutateSession = async (form, url, message) => {
+  const mutateSession = async (form, url, message, refresh) => {
     const submit = form.querySelector('button[type="submit"]');
     if (submit) submit.disabled = true;
     try {
       await apiRequest(form, url, "DELETE");
-      window.location.reload();
+      await refresh();
     } catch (error) {
       setSessionResult(error instanceof Error ? error.message : message, false);
       if (submit) submit.disabled = false;
     }
   };
 
-  for (const form of document.querySelectorAll("[data-api-session-revoke]")) {
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      void mutateSession(form, form.action, "Browser-session request failed.");
-    });
-  }
+  const sessionPage = document.querySelector("[data-api-session-page]");
+  if (sessionPage instanceof HTMLElement) {
+    const own = sessionPage.dataset.own === "true";
+    const csrf = sessionPage.dataset.csrf;
+    const browserSessions = sessionPage.querySelector("[data-api-browser-sessions]");
+    const connections = sessionPage.querySelector("[data-api-live-connections]");
+    const filters = sessionPage.querySelector("[data-api-connection-filter]");
+    const clear = sessionPage.querySelector("[data-api-session-clear]");
+    const pagePath = own ? "/console/my-sessions" : "/console/sessions";
+    const apiPath = own ? "/api/v1/me/connections" : "/api/v1/admin/connections";
 
-  for (const form of document.querySelectorAll("[data-api-session-disconnect]")) {
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const fields = new FormData(form);
-      const id = Number(fields.get("id"));
-      if (!Number.isSafeInteger(id) || id < 1) {
-        setSessionResult("The live-connection ID is invalid. Reload and try again.", false);
+    const csrfInput = () => {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = "csrf";
+      input.value = csrf || "";
+      return input;
+    };
+    const formButton = (label, className) => {
+      const button = element("button", className, label);
+      button.type = "submit";
+      return button;
+    };
+    const sessionMethod = (row) => row.method === "oidc"
+      ? `OpenID Connect · ${row.provider || "unknown provider"}`
+      : "Local password";
+    const currentQuery = () => new URLSearchParams(window.location.search);
+    const connectionQuery = () => {
+      const source = currentQuery();
+      const query = new URLSearchParams();
+      for (const key of own
+        ? ["nick", "transport", "oper", "limit", "before_id"]
+        : ["nick", "account", "transport", "oper", "limit", "before_id"]) {
+        const value = source.get(key);
+        if (value) query.set(key, value);
+      }
+      if (!query.has("limit")) query.set("limit", "50");
+      return query;
+    };
+    const refresh = async () => {
+      const query = connectionQuery();
+      const suffix = query.toString();
+      const connectionData = await apiRead(`${apiPath}?${suffix}`);
+      renderConnections(connectionData, query);
+      if (own) renderBrowserSessions(await apiRead("/api/v1/me/sessions"));
+    };
+    const refreshAfterMutation = async () => {
+      await refresh();
+      setSessionResult("Updated.", true);
+    };
+    const renderBrowserSessions = (data) => {
+      if (!(browserSessions instanceof HTMLElement)) return;
+      browserSessions.replaceChildren();
+      const rows = Array.isArray(data.sessions) ? data.sessions : [];
+      const heading = append(element("div", "panel-head"), append(
+        element("div"),
+        element("h2", "", "Browser sessions"),
+        element("p", "", "Durable web logins for this account. Tokens remain hash-only and are never displayed."),
+      ), element("span", "count", rows.length));
+      if (rows.length > 1) {
+        const revokeOthers = document.createElement("form");
+        revokeOthers.dataset.confirm = "Sign out every other browser session?";
+        revokeOthers.append(csrfInput(), formButton("Sign out others", "danger"));
+        revokeOthers.addEventListener("submit", (event) => {
+          event.preventDefault();
+          void mutateSession(revokeOthers, "/api/v1/me/sessions?except=current", "Browser-session request failed.", refreshAfterMutation);
+        });
+        heading.append(revokeOthers);
+      }
+      browserSessions.append(heading);
+      if (rows.length === 0) {
+        browserSessions.append(element("p", "empty", "No active browser sessions."));
         return;
       }
-      const reason = fieldValue(fields, "reason");
-      const separator = form.action.includes("?") ? "&" : "?";
-      const query = reason ? `${separator}reason=${encodeURIComponent(reason)}` : "";
-      void mutateSession(form, `${form.action}${query}`, "Disconnect request failed.");
+      const body = document.createElement("tbody");
+      for (const row of rows) {
+        const action = element("td");
+        if (row.current) {
+          action.append(element("span", "tag", "Current session"));
+        } else {
+          const revoke = document.createElement("form");
+          revoke.className = "cell-form";
+          revoke.dataset.confirm = "Sign out this browser session?";
+          revoke.append(csrfInput(), formButton("Sign out", "danger"));
+          revoke.addEventListener("submit", (event) => {
+            event.preventDefault();
+            void mutateSession(revoke, `/api/v1/me/sessions/${encodeURIComponent(row.id)}`, "Browser-session request failed.", refreshAfterMutation);
+          });
+          action.append(revoke);
+        }
+        const created = element("time", "", row.created_at || "—");
+        created.dateTime = row.created_at || "";
+        const expires = element("time", "", row.expires_at || "—");
+        expires.dateTime = row.expires_at || "";
+        body.append(append(element("tr"), element("td", "session-agent", row.user_agent || "Unknown browser"), element("td", "", sessionMethod(row)), element("td", "", created), element("td", "", expires), action));
+      }
+      const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "Browser"), element("th", "", "Sign-in method"), element("th", "", "Created"), element("th", "", "Expires"), element("th", "", ""))), body);
+      browserSessions.append(append(element("div", "scroll"), table));
+    };
+    const renderConnections = (data, query) => {
+      if (!(connections instanceof HTMLElement)) return;
+      connections.replaceChildren();
+      const rows = Array.isArray(data.connections) ? data.connections : [];
+      const heading = append(element("div", "panel-head"), append(
+        element("div"),
+        element("h2", "", own ? "Your live IRC connections" : "Live IRC connections"),
+        element("p", "", "Newest connection IDs first. Each disconnect targets the immutable ID shown in this row."),
+      ), element("span", "count", rows.length));
+      connections.append(heading);
+      if (rows.length === 0) {
+        connections.append(element("p", "empty", query.has("nick") || query.has("account") || query.has("transport") || query.has("oper") ? "No live connection matches these exact filters." : "No connected IRC clients."));
+      } else {
+        const body = document.createElement("tbody");
+        for (const row of rows) {
+          const client = append(element("td"), append(element("strong"), element("code", "", row.nick)), row.oper ? element("span", "tag", "oper") : document.createTextNode(""), append(element("div", "meta"), element("code", "", `${row.user}@${row.host}`)));
+          const account = row.account ? element("code", "", row.account) : element("span", "meta", "—");
+          const connected = element("time", "", row.connected_at || "—");
+          connected.dateTime = row.connected_at || "";
+          const disconnect = document.createElement("form");
+          disconnect.className = "cell-form";
+          disconnect.dataset.confirm = `Disconnect connection ${row.id} (${row.nick})?`;
+          const reason = document.createElement("input");
+          reason.name = "reason";
+          reason.maxLength = 300;
+          reason.placeholder = "reason";
+          disconnect.append(csrfInput(), reason, formButton("Disconnect", "danger"));
+          disconnect.addEventListener("submit", (event) => {
+            event.preventDefault();
+            const value = reason.value.trim();
+            const suffix = value ? `?reason=${encodeURIComponent(value)}` : "";
+            void mutateSession(disconnect, `${apiPath}/${encodeURIComponent(row.id)}${suffix}`, "Disconnect request failed.", refreshAfterMutation);
+          });
+          body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", Array.isArray(row.channels) && row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
+        }
+        const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Transport"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", ""))), body);
+        connections.append(append(element("div", "scroll"), table));
+      }
+      const pager = element("div", "pager");
+      pager.append(element("span", "meta", query.has("before_id") ? "Showing an older page." : "Showing the newest matching connections."));
+      if (typeof data.next_before_id === "string") {
+        const next = new URLSearchParams(query);
+        next.set("before_id", data.next_before_id);
+        const older = document.createElement("a");
+        older.href = `${pagePath}?${next}`;
+        older.textContent = "Older connections";
+        pager.append(older);
+      }
+      connections.append(pager);
+    };
+    if (filters instanceof HTMLFormElement) {
+      const query = currentQuery();
+      for (const input of filters.elements) {
+        if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = query.get(input.name) || (input.name === "limit" ? "50" : "");
+      }
+    }
+    if (clear instanceof HTMLAnchorElement) clear.href = pagePath;
+    void refresh().catch((error) => {
+      setSessionResult(error instanceof Error ? error.message : "Session data could not be loaded.", false);
     });
   }
 
