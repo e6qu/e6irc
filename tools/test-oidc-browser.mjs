@@ -247,6 +247,31 @@ try {
   );
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
+  // A narrow viewport keeps the console's complete navigation in its own
+  // horizontal rail instead of creating a second tall page above the task.
+  // The document itself must remain free of horizontal overflow, including
+  // the authenticated header and its account identity.
+  await page.setViewportSize({ width: 375, height: 800 });
+  await page.locator("[data-shauth-user]").evaluate((user) => {
+    user.textContent = "an-unbroken-account-identity-that-must-wrap-on-a-narrow-viewport";
+  });
+  assert.equal(
+    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    true,
+  );
+  assert.equal(
+    await page.locator("nav").evaluate((nav) => getComputedStyle(nav).overflowX),
+    "auto",
+  );
+  await page.getByRole("link", { name: "Registered channels", exact: true }).click();
+  await page.getByRole("heading", { name: "Registered channels", exact: true }).waitFor();
+  assert.equal(
+    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    true,
+  );
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto(`${applicationOrigin}/console/account`);
+  await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
   await page.getByRole("button", { name: "Add password", exact: true }).click();

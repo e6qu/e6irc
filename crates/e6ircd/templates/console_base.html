@@ -326,10 +326,16 @@
       .danger-actions form { display: flex; align-items: end; gap: 0.55rem; margin: 0; }
       @media (max-width: 40rem) {
         .layout { flex-direction: column; }
+        header { align-items: flex-start; flex-wrap: wrap; padding: 0.75rem 1rem; }
+        header > span:last-child { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem;
+          min-width: 0; }
+        header .who { overflow-wrap: anywhere; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
           border-right: none; border-bottom: 1px solid var(--border);
-          display: flex; flex-wrap: wrap; gap: 0.25rem; }
-        nav .section { width: 100%; margin: 0.5rem 0.7rem 0.15rem; }
+          display: flex; flex-wrap: nowrap; gap: 0.25rem; overflow-x: auto;
+          overscroll-behavior-inline: contain; padding: 0.55rem 0.7rem; }
+        nav a, nav .section { flex: 0 0 auto; margin: 0; }
+        nav .section { align-self: center; }
         main { padding: 1rem; }
         .page-head, .banner-info, .provenance { align-items: stretch; flex-direction: column; }
         .network-form, .field-grid, .settings-section, .connection-card,
