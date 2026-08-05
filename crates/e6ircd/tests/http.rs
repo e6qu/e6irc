@@ -4520,7 +4520,8 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
     // Signed-in non-admin -> 403.
     let (status, _, _) = request(http, &auth(&bob_token)).await;
     assert_eq!(status, 403);
-    // Admin -> 200 listing all three platforms and the exact build status.
+    // Admin -> 200 with static bridge capabilities; the stored bridge inventory
+    // is hydrated from the administrator API rather than rendered into HTML.
     let (status, _, body) = request(http, &auth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
     for needle in [
@@ -4528,15 +4529,24 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         "Matrix",
         "Discord",
         "Slack",
-        "matrix-archive",
-        "disabled",
-        "Inspect",
+        "data-api-integrations",
+        "Loading Matrix bridges",
     ] {
         assert!(
             body.contains(needle),
             "integrations missing {needle:?}: {body}"
         );
     }
+    assert!(
+        !body.contains("/console/integrations/matrix-archive"),
+        "{body}"
+    );
+    let inventory = format!(
+        "GET /api/v1/admin/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, inventory) = request(http, &inventory).await;
+    assert_eq!(status, 200, "{inventory}");
+    assert!(inventory.contains("matrix-archive"), "{inventory}");
     let built = [
         cfg!(feature = "matrix"),
         cfg!(feature = "discord"),
@@ -4794,11 +4804,23 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
     };
     let (status, _, integrations) = request(http, &cookie("/console/integrations")).await;
     assert_eq!(status, 200, "{integrations}");
+    assert!(
+        integrations.contains("data-api-integrations"),
+        "{integrations}"
+    );
     for name in ["matrix-main", "discord-main", "slack-main"] {
         assert!(
-            integrations.contains(&format!("/console/integrations/{name}/edit")),
+            !integrations.contains(&format!("/console/integrations/{name}")),
             "{integrations}"
         );
+    }
+    let inventory = format!(
+        "GET /api/v1/admin/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, inventory) = request(http, &inventory).await;
+    assert_eq!(status, 200, "{inventory}");
+    for name in ["matrix-main", "discord-main", "slack-main"] {
+        assert!(inventory.contains(name), "{inventory}");
     }
 
     let (status, _, matrix_form) =
@@ -6167,7 +6189,7 @@ async fn rp_initiated_logout_redirects_to_provider() {
 #[cfg(feature = "embed-web")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL; run with --ignored and E6IRC_TEST_DATABASE_URL"]
-async fn application_entry_redirects_anonymous_visitors_to_the_login_page() {
+async fn application_entry_starts_shauth_when_configured() {
     use e6ircd::config::{DatabaseConfig, OidcProviderConfig};
     let url =
         support::test_db("application_entry_redirects_anonymous_visitors_to_the_login_page").await;
@@ -6218,7 +6240,10 @@ async fn application_entry_redirects_anonymous_visitors_to_the_login_page() {
 
     let (status, headers, _) = request(http, &get("/")).await;
     assert_eq!(status, 303, "{headers}");
-    assert!(headers.contains("location: /login") || headers.contains("Location: /login"));
+    assert!(
+        headers.contains("location: /api/v1/auth/oidc/shauth/start")
+            || headers.contains("Location: /api/v1/auth/oidc/shauth/start")
+    );
 
     let (status, _, body) = request(http, &get("/login")).await;
     assert_eq!(status, 200, "{body}");
@@ -6226,10 +6251,14 @@ async fn application_entry_redirects_anonymous_visitors_to_the_login_page() {
         body.contains("href=\"/api/v1/auth/oidc/shauth/start\""),
         "{body}"
     );
+    assert!(!body.contains("type=\"password\""), "{body}");
 
     let (status, headers, _) = request(http, &get("/?sso=none")).await;
     assert_eq!(status, 303, "{headers}");
-    assert!(headers.contains("location: /login") || headers.contains("Location: /login"));
+    assert!(
+        headers.contains("location: /api/v1/auth/oidc/shauth/start")
+            || headers.contains("Location: /api/v1/auth/oidc/shauth/start")
+    );
 
     let req = format!(
         "GET / HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
