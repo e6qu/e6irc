@@ -126,6 +126,9 @@ credentials, linked identities, and configured identity-provider links hydrate
 from owner-scoped API resources after the authenticated document shell loads.
 Founder channel policy and access controls likewise hydrate from the canonical
 owner-scoped channel resource rather than a server-rendered channel snapshot.
+Administrator Accounts & policy now hydrates its bounded account and pending
+invitation directories from administrator API resources; its HTML response
+contains only the authenticated shell and CSRF capability.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

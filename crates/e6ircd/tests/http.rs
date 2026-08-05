@@ -2769,6 +2769,7 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     );
     assert_eq!(alice["administrator_sources"]["durable"], false);
     assert_eq!(alice["administrator_sources"]["configuration"], true);
+    assert_eq!(alice["current"], true);
     assert_eq!(alice["suspended"], false);
     assert_eq!(alice["authentication"]["local_password"], true);
     assert_eq!(alice["authentication"]["app_passwords"], 1);
@@ -2790,10 +2791,8 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     let (status, _, page) = request(http, &cookie_get(hostile_path, &alice_session)).await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("<h1>Account directory</h1>"), "{page}");
-    assert!(
-        page.contains("&#60;script&#62;alert(1)&#60;/script&#62;"),
-        "{page}"
-    );
+    assert!(page.contains("data-api-admin-accounts-page"), "{page}");
+    assert!(!page.contains("Eve"), "{page}");
     assert!(!page.contains("<script>alert(1)</script>"), "{page}");
     let (status, _, alice_page) = request(
         http,
@@ -2801,10 +2800,11 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     )
     .await;
     assert_eq!(status, 200, "{alice_page}");
-    assert!(alice_page.contains("local password"), "{alice_page}");
-    assert!(alice_page.contains("1 OIDC"), "{alice_page}");
-    assert!(alice_page.contains("administrator"), "{alice_page}");
-    assert!(alice_page.contains("Current account"), "{alice_page}");
+    assert!(
+        alice_page.contains("data-api-admin-accounts"),
+        "{alice_page}"
+    );
+    assert!(!alice_page.contains("local password"), "{alice_page}");
     assert!(
         !alice_page.contains("/suspension") && !alice_page.contains("/administrator"),
         "case-only display differences must not expose self-targeting actions: {alice_page}"
@@ -2816,7 +2816,10 @@ async fn account_directory_filters_pages_counts_and_escapes_for_admins_only() {
     )
     .await;
     assert_eq!(status, 200, "{short_page}");
-    assert!(short_page.contains("Older accounts"), "{short_page}");
+    assert!(
+        short_page.contains("data-api-admin-accounts-filter"),
+        "{short_page}"
+    );
 
     let (status, headers, _) = request(http, &get("/console/accounts")).await;
     assert_eq!(status, 303, "{headers}");
@@ -3090,7 +3093,7 @@ async fn invitation_creation_export_and_permanent_deletion_work_end_to_end() {
     for control in [
         "Invite an account",
         "Create an account",
-        "No pending invitations",
+        "data-api-admin-invitations",
     ] {
         assert!(body.contains(control), "missing {control:?}: {body}");
     }
