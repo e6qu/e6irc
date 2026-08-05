@@ -2,6 +2,7 @@
 {% block main %}
   <div id="session-api-result" role="status" aria-live="polite"></div>
   <div data-api-session-page data-own="{{ own }}" data-csrf="{{ shell.csrf }}">
+    <input type="hidden" name="csrf" value="{{ shell.csrf }}" data-api-session-csrf />
     <div class="page-head">
       <div>
         <p class="eyebrow">Access &amp; connections</p>
