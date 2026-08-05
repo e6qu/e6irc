@@ -1,6 +1,54 @@
 (() => {
   "use strict";
 
+  const SETTINGS_KEY = "e6irc.settings";
+  const consoleTheme = document.querySelector("[data-console-theme]");
+  const consoleThemeResult = document.querySelector("[data-console-theme-result]");
+  const showConsoleThemeResult = (message) => {
+    if (consoleThemeResult) consoleThemeResult.textContent = message;
+  };
+  const applyConsoleTheme = (theme) => {
+    if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
+    else delete document.documentElement.dataset.theme;
+  };
+  const readConsoleSettings = () => {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw === null) return {};
+    const settings = JSON.parse(raw);
+    if (settings === null || typeof settings !== "object" || Array.isArray(settings)) {
+      throw new Error("Saved browser preferences have an invalid shape.");
+    }
+    return settings;
+  };
+  if (consoleTheme instanceof HTMLSelectElement) {
+    let theme = "auto";
+    try {
+      const storedTheme = readConsoleSettings().theme;
+      if (storedTheme === "light" || storedTheme === "dark" || storedTheme === "auto") theme = storedTheme;
+      else if (storedTheme !== undefined) showConsoleThemeResult("Saved theme preference is invalid; using the system theme for this tab.");
+    } catch (error) {
+      showConsoleThemeResult(error instanceof Error
+        ? `${error.message} Using the system theme for this tab.`
+        : "Browser preferences are unavailable. Using the system theme for this tab.");
+    }
+    consoleTheme.value = theme;
+    applyConsoleTheme(theme);
+    consoleTheme.addEventListener("change", () => {
+      const nextTheme = consoleTheme.value;
+      applyConsoleTheme(nextTheme);
+      try {
+        const settings = readConsoleSettings();
+        settings.theme = nextTheme;
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        showConsoleThemeResult("Theme preference saved for chat and console.");
+      } catch (error) {
+        showConsoleThemeResult(error instanceof Error
+          ? `${error.message} Theme applies only until this tab closes.`
+          : "Browser preferences are unavailable. Theme applies only until this tab closes.");
+      }
+    });
+  }
+
   document.addEventListener("submit", (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;

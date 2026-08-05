@@ -826,6 +826,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-session-page"), "{body}");
     assert!(body.contains("data-api-account-app-password"), "{body}");
     assert!(body.contains("data-api-channel-register"), "{body}");
+    assert!(body.contains("SETTINGS_KEY = \"e6irc.settings\""), "{body}");
     assert!(body.contains("data-api-owner-network-create"), "{body}");
     assert!(body.contains("data-api-admin-account-create"), "{body}");
     assert!(body.contains("X-E6IRC-CSRF"), "{body}");
@@ -1158,6 +1159,16 @@ async fn account_url_redirects_to_the_complete_account_console() {
     assert!(body.contains("Login identities"), "{body}");
     assert!(body.contains("Read state"), "{body}");
     assert!(body.contains("src=\"/console.js\""), "{body}");
+    assert!(body.contains("data-console-theme"), "{body}");
+    assert!(
+        !body.contains("data-console-theme-result role="),
+        "the theme announcement must not create a second status landmark: {body}"
+    );
+    assert!(
+        body.contains("prefers-reduced-motion: no-preference"),
+        "{body}"
+    );
+    assert!(body.contains("forced-colors: active"), "{body}");
     assert!(
         head.to_ascii_lowercase()
             .contains("content-security-policy: default-src 'none'; script-src 'self'"),

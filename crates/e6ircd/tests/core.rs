@@ -6033,6 +6033,33 @@ fn chathistory_db_error_fails_rather_than_empty_batch() {
     );
 }
 
+/// The deferred-history reply boundary is independent from command parsing:
+/// it must not trust a stale or malformed display value enough to emit a line
+/// the recipient's IRC framing discards. This is the regression seed found by
+/// the `core_multi` fuzz target.
+#[test]
+fn chathistory_reply_clips_an_untrusted_display_before_opening_its_batch() {
+    let mut s = TestServer::new();
+    let alice = register_with_caps(&mut s, 1, "alice", "batch draft/chathistory");
+    s.drain(alice);
+    s.core.handle(Input::HistoryPage {
+        conn: alice,
+        display: format!("#{}", "x".repeat(600)),
+        batch_ref: "b1".into(),
+        rows: Ok(Vec::new()),
+        label: None,
+    });
+    let out = s.drain(alice);
+    let open = out
+        .iter()
+        .find(|line| line.contains("BATCH +b1 chathistory"))
+        .expect("history batch open");
+    assert!(
+        open.len() <= 512,
+        "history batch open exceeds the wire limit: {open:?}"
+    );
+}
+
 // CHATHISTORY TARGETS: enumerate the buffers a client has (DESIGN §11.2).
 
 #[test]

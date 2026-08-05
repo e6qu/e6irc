@@ -824,6 +824,12 @@ pub(crate) fn history_page(
     rows: Result<Vec<crate::core::HistoryRow>, ()>,
     label: Option<&str>,
 ) {
+    // The normal command path clips the requested display before it reaches
+    // this renderer, but the asynchronous reply is also an input boundary:
+    // database recovery and the core fuzzer can supply it directly. Keep the
+    // batch envelope independently wire-safe so one malformed/stale reply
+    // cannot turn a history page into an over-long outbound line.
+    let display = crate::core::handler::clip_echo(display);
     // A store fault answers with a FAIL, not an empty batch — otherwise a
     // transient DB error is indistinguishable from a buffer with no history,
     // and the client would cache "nothing here" for a window that does exist.
