@@ -255,9 +255,23 @@ try {
   await page.locator("[data-shauth-user]").evaluate((user) => {
     user.textContent = "an-unbroken-account-identity-that-must-wrap-on-a-narrow-viewport";
   });
+  const narrowLayout = await page.evaluate(() => {
+    const nav = document.querySelector("nav");
+    const layout = document.querySelector(".layout");
+    const main = document.querySelector("main");
+    return {
+      documentWidth: document.documentElement.scrollWidth,
+      viewportWidth: document.documentElement.clientWidth,
+      layoutWidth: layout.getBoundingClientRect().width,
+      mainWidth: main.getBoundingClientRect().width,
+      navClientWidth: nav.clientWidth,
+      navScrollWidth: nav.scrollWidth,
+    };
+  });
   assert.equal(
-    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    narrowLayout.documentWidth <= narrowLayout.viewportWidth,
     true,
+    JSON.stringify(narrowLayout),
   );
   assert.equal(
     await page.locator("nav").evaluate((nav) => getComputedStyle(nav).overflowX),
