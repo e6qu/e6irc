@@ -248,7 +248,7 @@ pub(super) fn validate_account_directory_query(
 /// Page administrator-safe account posture (admin only).
 pub(super) async fn admin_accounts(
     State(state): State<Arc<AppState>>,
-    _admin: AdminAccount,
+    AdminAccount(actor): AdminAccount,
     axum::extract::Query(params): axum::extract::Query<AccountDirectoryQuery>,
 ) -> Response {
     let pool = pool_of(&state);
@@ -286,6 +286,7 @@ pub(super) async fn admin_accounts(
                         "configuration": configured,
                     },
                     "suspended": entry.suspended,
+                    "current": folded == e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&actor),
                 })})
                 .collect::<Vec<_>>(),
             "next_before_id": page.next_before_id,

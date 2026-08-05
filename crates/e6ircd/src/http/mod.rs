@@ -2144,15 +2144,6 @@ mod pages {
     #[template(path = "console_accounts.html")]
     struct ConsoleAccounts {
         shell: ConsoleShell,
-        entries: Vec<crate::db::AccountDirectoryRow>,
-        invitations: Vec<crate::db::AccountInvitationRow>,
-        invitation_before_id: Option<i64>,
-        invitation_next_before_id: Option<i64>,
-        name: String,
-        limit: usize,
-        has_filter: bool,
-        has_cursor: bool,
-        next_before_id: Option<i64>,
     }
 
     #[derive(Template)]
@@ -2789,95 +2780,13 @@ mod pages {
         super::json_no_store(monitoring_view(&state, window).await)
     }
 
-    async fn console_accounts_response(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        params: super::device::AccountDirectoryQuery,
-        invitation_before_id: Option<i64>,
-    ) -> Response {
-        let query = match super::device::validate_account_directory_query(params, 50) {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        let mut page =
-            match crate::db::query_account_directory(pool_of(state), query.database_filter()).await
-            {
-                Ok(page) => page,
-                Err(error) => {
-                    return super::device::admin_db_error("account directory", error);
-                }
-            };
-        if invitation_before_id.is_some_and(|id| id <= 0) {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid invitation-directory cursor",
-                Some("The invitation_before_id cursor must be a positive invitation id."),
-            );
-        }
-        let invitation_page_size =
-            crate::db::AccountInvitationPageSize::new(50).expect("fixed page size is valid");
-        let invitation_page = match crate::db::list_account_invitations(
-            pool_of(state),
-            invitation_before_id,
-            invitation_page_size,
-        )
-        .await
-        {
-            Ok(invitations) => invitations,
-            Err(error) => {
-                return super::device::admin_db_error("account invitation directory", error);
-            }
-        };
-        let actor_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-        for entry in &mut page.entries {
-            let folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&entry.name);
-            entry.current = folded == actor_folded;
-            entry.configured_administrator = state.configured_admin_accounts.contains(&folded);
-            entry.effective_administrator = entry.administrator || entry.configured_administrator;
-        }
-        let name = query.name.unwrap_or_default();
-        let has_cursor = query.before_id.is_some();
-        render_private(ConsoleAccounts {
-            shell: console_shell(state, account, csrf, "accounts"),
-            entries: page.entries,
-            invitations: invitation_page.entries,
-            invitation_before_id,
-            invitation_next_before_id: invitation_page.next_before_id,
-            has_filter: !name.is_empty(),
-            has_cursor,
-            name,
-            limit: query.page_size.value(),
-            next_before_id: page.next_before_id,
-        })
-    }
-
     pub async fn console_accounts(
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
-        Query(params): Query<ConsoleAccountsQuery>,
     ) -> Response {
-        let invitation_before_id = params.invitation_before_id;
-        console_accounts_response(
-            &state,
-            account,
-            csrf,
-            super::device::AccountDirectoryQuery {
-                limit: params.limit,
-                before_id: params.before_id,
-                name: params.name,
-            },
-            invitation_before_id,
-        )
-        .await
-    }
-
-    #[derive(Default, Deserialize)]
-    pub struct ConsoleAccountsQuery {
-        limit: Option<usize>,
-        before_id: Option<i64>,
-        name: Option<String>,
-        invitation_before_id: Option<i64>,
+        render_private(ConsoleAccounts {
+            shell: console_shell(&state, account, csrf, "accounts"),
+        })
     }
 
     async fn console_admin_channels_build(
