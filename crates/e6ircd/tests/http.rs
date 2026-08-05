@@ -4520,7 +4520,8 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
     // Signed-in non-admin -> 403.
     let (status, _, _) = request(http, &auth(&bob_token)).await;
     assert_eq!(status, 403);
-    // Admin -> 200 listing all three platforms and the exact build status.
+    // Admin -> 200 with static bridge capabilities; the stored bridge inventory
+    // is hydrated from the administrator API rather than rendered into HTML.
     let (status, _, body) = request(http, &auth(&alice_token)).await;
     assert_eq!(status, 200, "{body}");
     for needle in [
@@ -4528,15 +4529,25 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         "Matrix",
         "Discord",
         "Slack",
-        "matrix-archive",
         "disabled",
-        "Inspect",
+        "data-api-integrations",
+        "Loading Matrix bridges",
     ] {
         assert!(
             body.contains(needle),
             "integrations missing {needle:?}: {body}"
         );
     }
+    assert!(
+        !body.contains("/console/integrations/matrix-archive"),
+        "{body}"
+    );
+    let inventory = format!(
+        "GET /api/v1/admin/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {alice_token}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, _, inventory) = request(http, &inventory).await;
+    assert_eq!(status, 200, "{inventory}");
+    assert!(inventory.contains("matrix-archive"), "{inventory}");
     let built = [
         cfg!(feature = "matrix"),
         cfg!(feature = "discord"),
@@ -4799,7 +4810,10 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
         "{integrations}"
     );
     for name in ["matrix-main", "discord-main", "slack-main"] {
-        assert!(!integrations.contains(name), "{integrations}");
+        assert!(
+            !integrations.contains(&format!("/console/integrations/{name}")),
+            "{integrations}"
+        );
     }
     let inventory = format!(
         "GET /api/v1/admin/networks HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {api_token}\r\nConnection: close\r\n\r\n"
