@@ -2998,48 +2998,11 @@ mod pages {
         })
     }
 
-    struct SessionRow {
-        id: u64,
-        nick: String,
-        user: String,
-        host: String,
-        account: Option<String>,
-        oper: bool,
-        transport: &'static str,
-        connected_at: String,
-        idle_seconds: u64,
-        /// Channels the session is in, pre-joined for display.
-        channels: String,
-    }
-
-    struct BrowserSessionRow {
-        id: i64,
-        method: String,
-        user_agent: String,
-        created: String,
-        expires: String,
-        current: bool,
-    }
-
     #[derive(Template)]
     #[template(path = "console_sessions.html")]
     struct ConsoleSessions {
         shell: ConsoleShell,
-        title: &'static str,
-        hint: &'static str,
-        sessions: Vec<SessionRow>,
-        nick_filter: String,
-        account_filter: String,
-        transport_filter: String,
-        oper_filter: String,
-        limit: usize,
-        has_filters: bool,
-        has_cursor: bool,
-        next_before_id: Option<u64>,
-        show_browser_sessions: bool,
-        show_account_filter: bool,
-        browser_sessions: Vec<BrowserSessionRow>,
-        error: Option<String>,
+        own: bool,
     }
 
     #[derive(Template)]
@@ -3626,141 +3589,15 @@ mod pages {
         }
     }
 
-    /// Ask the core for one already-validated bounded connection page.
-    async fn list_live_connections(
-        state: &AppState,
-        query: crate::core::LiveConnectionQuery,
-    ) -> Result<crate::core::LiveConnectionPage, String> {
-        match core_reply(state, crate::core::AdminRequest::ListConnections { query }).await {
-            Ok(crate::core::AdminReply::Connections(page)) => Ok(page),
-            Ok(_) => Err("unexpected reply".into()),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Render one bounded live-connection page. `own` forces the account filter
-    /// for self-service and also includes the caller's capped durable browser
-    /// logins.
-    async fn render_sessions_page(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        account: String,
-        own: bool,
-        query: ValidatedLiveConnectionQuery,
-        error: Option<String>,
-    ) -> Response {
-        let csrf = session_token(headers, state.secure_cookies)
-            .map(|s| state.csrf_token(&s))
-            .unwrap_or_default();
-        let page =
-            list_live_connections(state, query.core_query(own.then_some(account.as_str()))).await;
-        let (sessions, next_before_id, mut error) = match page {
-            Ok(page) => (
-                page.entries
-                    .into_iter()
-                    .map(|connection| SessionRow {
-                        id: connection.id,
-                        nick: connection.nick,
-                        user: connection.user,
-                        host: connection.host,
-                        account: connection.account,
-                        oper: connection.oper,
-                        transport: connection.transport.as_str(),
-                        connected_at: e6irc_proto::time::server_time(connection.connected_at),
-                        idle_seconds: connection.idle_seconds,
-                        channels: connection.channels.join(", "),
-                    })
-                    .collect(),
-                page.next_before_id,
-                error,
-            ),
-            // Surface a snapshot failure as the banner rather than a blank page.
-            Err(message) => (Vec::new(), None, Some(error.unwrap_or(message))),
-        };
-        let browser_sessions = if own {
-            let current = session_token(headers, state.secure_cookies);
-            match crate::db::list_web_sessions(pool_of(state), &account, current.as_deref()).await {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| BrowserSessionRow {
-                        id: row.id,
-                        method: row.provider.map_or_else(
-                            || "Local password".into(),
-                            |provider| format!("OpenID Connect · {provider}"),
-                        ),
-                        user_agent: row.user_agent.unwrap_or_else(|| "Unknown browser".into()),
-                        created: row.created_at,
-                        expires: row.expires_at,
-                        current: row.current,
-                    })
-                    .collect(),
-                Err(database_error) => {
-                    eprintln!("console: browser session list failed: {database_error}");
-                    if error.is_none() {
-                        error = Some("Browser session storage is unavailable.".into());
-                    }
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let (active, title, hint) = if own {
-            (
-                "my-sessions",
-                "Your sessions",
-                "Durable browser logins and live IRC connections authenticated to your account. Disconnecting a live connection targets its immutable connection ID.",
-            )
-        } else {
-            (
-                "sessions",
-                "Live connections",
-                "Bounded, newest-first registered IRC connections across TCP, TLS, WebSocket, and the local in-process network.",
-            )
-        };
-        let nick_filter = query.nick.unwrap_or_default();
-        let account_filter = query.account.unwrap_or_default();
-        let transport_filter = query
-            .transport
-            .map(crate::core::ConnectionTransport::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let oper_filter = query.oper.map(|oper| oper.to_string()).unwrap_or_default();
-        render_private(ConsoleSessions {
-            shell: console_shell(state, account, csrf, active),
-            title,
-            hint,
-            sessions,
-            has_filters: !nick_filter.is_empty()
-                || !account_filter.is_empty()
-                || !transport_filter.is_empty()
-                || !oper_filter.is_empty(),
-            has_cursor: query.before_id.is_some(),
-            nick_filter,
-            account_filter,
-            transport_filter,
-            oper_filter,
-            limit: query.page_size.value(),
-            next_before_id,
-            show_browser_sessions: own,
-            show_account_filter: !own,
-            browser_sessions,
-            error,
-        })
-    }
-
-    /// Console → bounded live connection directory (admin-gated).
+    /// Console → API-hydrated live connection directory (admin-gated).
     pub async fn console_sessions(
         State(state): State<Arc<AppState>>,
-        headers: axum::http::HeaderMap,
-        AdminPageActor { account, .. }: AdminPageActor,
-        Query(params): Query<LiveConnectionQueryParams>,
+        AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        let query = match validate_live_connection_query(params, 50) {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        render_sessions_page(&state, &headers, account, false, query, None).await
+        render_private(ConsoleSessions {
+            shell: console_shell(&state, account, csrf, "sessions"),
+            own: false,
+        })
     }
 
     /// Console → the caller's bounded live-connection directory and durable
@@ -3768,17 +3605,15 @@ mod pages {
     pub async fn console_my_sessions(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
-        Query(params): Query<OwnLiveConnectionQueryParams>,
     ) -> Response {
-        let (account, _) = match page_actor(&state, &headers, false).await {
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(resolved) => resolved,
             Err(response) => return response,
         };
-        let query = match validate_live_connection_query(params.into(), 50) {
-            Ok(query) => query,
-            Err(response) => return response,
-        };
-        render_sessions_page(&state, &headers, account, true, query, None).await
+        render_private(ConsoleSessions {
+            shell: console_shell(&state, account, csrf, "my-sessions"),
+            own: true,
+        })
     }
 
     async fn owned_bridge(

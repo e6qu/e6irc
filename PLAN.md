@@ -97,6 +97,11 @@ into a responsive client of the canonical API.
 
 **Current progress:** every Configuration page mutation now issues its
 revisioned administrator JSON request with the page's session-bound CSRF token.
+
+The sessions and connections console views hydrate browser-session inventory and
+owner/administrator live-connection directories exclusively through their
+existing `/api/v1` resources; the authenticated page response contains only the
+shell and its session-bound CSRF token.
 The scalar form serializes its nested typed settings rather than inventing a
 form-only API shape. Controls reload only after a committed response and keep
 API failures visible in the document. The superseded Configuration mutation
@@ -127,9 +132,9 @@ owner-scoped channel resource rather than a server-rendered channel snapshot.
    account and operations views from API data with explicit loading, empty,
    permission-denied, stale, retryable-failure, and success states.
 2. Convert each console domain in order: account/profile and credentials;
-   browser sessions and exports; networks and bridges; registered channels;
-   administrator accounts/policy/audit; configuration; monitoring and live
-   connection controls. A domain moves only after its complete API parity and
+   exports; networks and bridges; registered channels; administrator
+   accounts/policy/audit; configuration; monitoring. A domain moves only after
+   its complete API parity and
    browser transition/error behavior are proven.
 3. Use one in-browser request client for headers, CSRF, bounded JSON decoding,
    correlation-aware problem rendering, cancellation, retry eligibility, and

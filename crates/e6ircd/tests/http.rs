@@ -823,8 +823,7 @@ async fn console_runtime_is_served_in_every_build() {
     assert!(body.contains("data-api-oidc-create"), "{body}");
     assert!(body.contains("data-api-configuration-patch"), "{body}");
     assert!(body.contains("data-api-ban-create"), "{body}");
-    assert!(body.contains("data-api-session-revoke"), "{body}");
-    assert!(body.contains("data-api-session-disconnect"), "{body}");
+    assert!(body.contains("data-api-session-page"), "{body}");
     assert!(body.contains("data-api-account-app-password"), "{body}");
     assert!(body.contains("data-api-channel-register"), "{body}");
     assert!(body.contains("data-api-owner-network-create"), "{body}");
@@ -3950,32 +3949,23 @@ async fn admin_connection_directory_and_disconnect_controls() {
     let sessions_req = format!(
         "GET /console/sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    // Wait for the session to appear (registration completes asynchronously).
-    let mut csrf = String::new();
-    let mut listed = false;
-    for _ in 0..40 {
-        let (status, _, body) = request(http, &sessions_req).await;
-        assert_eq!(status, 200, "{body}");
-        if body.contains("victim") {
-            listed = true;
-            csrf = body
-                .split("name=\"csrf\" value=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .unwrap_or("")
-                .to_string();
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(listed, "victim session not listed");
-    assert!(!csrf.is_empty(), "no csrf on sessions page");
+    let (status, _, page_body) = request(http, &sessions_req).await;
+    assert_eq!(status, 200, "{page_body}");
+    assert!(page_body.contains("data-api-session-page"), "{page_body}");
+    assert!(!page_body.contains("victim"), "{page_body}");
+    let csrf = csrf_from_html(&page_body).to_string();
     let api_req = format!(
         "GET /api/v1/admin/connections?limit=1&nick=VICTIM&transport=tcp HTTP/1.1\r\n\
          Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let (status, api_head, api_body) = request(http, &api_req).await;
-    assert_eq!(status, 200, "{api_body}");
+    let (api_head, api_body) = loop {
+        let (status, head, body) = request(http, &api_req).await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("victim") {
+            break (head, body);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert!(
         api_head
             .to_ascii_lowercase()
@@ -4048,11 +4038,11 @@ async fn admin_connection_directory_and_disconnect_controls() {
     .expect("victim was not disconnected");
     assert!(killed);
 
-    // It no longer appears in the live-connection list.
+    // It no longer appears in the API inventory that hydrates the console.
     let mut gone = false;
     for _ in 0..40 {
-        let (_, _, body) = request(http, &sessions_req).await;
-        if !body.contains(">victim<") && !body.contains("<code>victim</code>") {
+        let (_, _, body) = request(http, &api_req).await;
+        if !body.contains("victim") {
             gone = true;
             break;
         }
@@ -4164,42 +4154,30 @@ async fn my_sessions_are_scoped_to_the_caller() {
     let page_req = format!(
         "GET /console/my-sessions HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    // Wait for alice's own client to be listed; bob's must never appear.
-    let mut csrf = String::new();
-    let mut ok = false;
-    for _ in 0..40 {
-        let (status, _, body) = request(http, &page_req).await;
-        assert_eq!(status, 200, "{body}");
-        if body.contains("alicecli") {
-            assert!(
-                !body.contains("bobcli"),
-                "another account's session leaked: {body}"
-            );
-            csrf = body
-                .split("name=\"csrf\" value=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .unwrap_or("")
-                .to_string();
-            ok = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(ok && !csrf.is_empty(), "alice's own session not listed");
+    let (status, _, page_body) = request(http, &page_req).await;
+    assert_eq!(status, 200, "{page_body}");
+    assert!(page_body.contains("data-api-session-page"), "{page_body}");
     assert!(
-        request(http, &page_req)
-            .await
-            .2
-            .contains("data-api-session-disconnect"),
-        "owner session page must use the API connection control"
+        !page_body.contains("alicecli") && !page_body.contains("bobcli"),
+        "{page_body}"
+    );
+    let csrf = csrf_from_html(&page_body).to_string();
+    assert!(
+        page_body.contains("data-api-live-connections"),
+        "owner session page must reserve an API connection view"
     );
     let owner_api = format!(
         "GET /api/v1/me/connections?nick=ALICECLI&transport=tcp HTTP/1.1\r\n\
          Host: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
-    let (status, head, body) = request(http, &owner_api).await;
-    assert_eq!(status, 200, "{body}");
+    let (head, body) = loop {
+        let (status, head, body) = request(http, &owner_api).await;
+        assert_eq!(status, 200, "{body}");
+        if body.contains("alicecli") {
+            break (head, body);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert!(
         head.to_ascii_lowercase()
             .contains("cache-control: no-store"),
@@ -4361,22 +4339,15 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     let (status, _, page_body) = request(http, &page).await;
     assert_eq!(status, 200, "{page_body}");
     assert!(
-        page_body.contains("<h2>Browser sessions</h2>"),
+        page_body.contains("data-api-browser-sessions"),
         "{page_body}"
     );
-    assert!(page_body.contains("Current Browser"), "{page_body}");
-    assert!(page_body.contains("Browser &#60;other&#62;"), "{page_body}");
+    assert!(!page_body.contains("Current Browser"), "{page_body}");
+    assert!(
+        !page_body.contains("Browser &#60;other&#62;"),
+        "{page_body}"
+    );
     assert!(!page_body.contains("Browser <other>"), "{page_body}");
-    assert!(page_body.contains("Current session"), "{page_body}");
-    assert!(page_body.contains("data-api-session-revoke"), "{page_body}");
-    assert!(
-        page_body.contains("action=\"/api/v1/me/sessions?except=current\""),
-        "{page_body}"
-    );
-    assert!(
-        page_body.contains("Sign out others"),
-        "bulk revocation missing: {page_body}"
-    );
     let csrf = csrf_from_html(&page_body).to_string();
 
     let bob_id = e6ircd::db::list_web_sessions(&pool, "bob", Some(&bob))
