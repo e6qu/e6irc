@@ -2929,13 +2929,6 @@ mod pages {
     struct ConsoleNetworkEdit {
         shell: ConsoleShell,
         name: String,
-        addr: String,
-        tls: bool,
-        nick: String,
-        realname: String,
-        autojoin: String,
-        sasl_account: String,
-        can_store_secrets: bool,
     }
 
     #[derive(Template)]
@@ -3210,37 +3203,8 @@ mod pages {
         })
     }
 
-    /// Render the edit-network form from the stored configuration.
-    #[allow(clippy::too_many_arguments)]
-    fn console_network_edit_page(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        name: String,
-        addr: String,
-        tls: bool,
-        nick: String,
-        realname: String,
-        autojoin: String,
-        sasl_account: String,
-        can_store_secrets: bool,
-    ) -> Response {
-        render_private(ConsoleNetworkEdit {
-            shell: console_shell(state, account, csrf, "networks"),
-            name,
-            addr,
-            tls,
-            nick,
-            realname,
-            autojoin,
-            sasl_account,
-            can_store_secrets,
-        })
-    }
-
-    /// Console → edit-network form (GET): pre-filled with the network's current
-    /// connection/identity fields. Any authenticated user may edit their own
-    /// network (not admin-gated), matching `/console/networks`.
+    /// Console → edit-network document. The browser obtains the typed owner
+    /// resource before it populates or submits the form.
     pub async fn console_edit_network(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -3250,31 +3214,10 @@ mod pages {
             Ok(x) => x,
             Err(r) => return r,
         };
-        let pool = pool_of(&state);
-        let row = match crate::db::get_bnc_network(pool, &account, &name).await {
-            Ok(Some(row)) => row,
-            Ok(None) => return problem(StatusCode::NOT_FOUND, "No such network", None),
-            Err(e) => return super::device::admin_db_error("network fetch", e),
-        };
-        // This form edits IRC upstream fields; a bridge is configured on the
-        // Integrations page. Send a bridge there rather than render an
-        // IRC-shaped form over it.
-        if row.kind != crate::config::NetworkKind::Irc {
-            return Redirect::to("/console/networks").into_response();
-        }
-        console_network_edit_page(
-            &state,
-            account,
-            csrf,
-            row.name,
-            row.addr,
-            row.tls,
-            row.nick,
-            row.realname.unwrap_or_default(),
-            row.autojoin.join(", "),
-            row.sasl_account.unwrap_or_default(),
-            state.secret_key.is_some(),
-        )
+        render_private(ConsoleNetworkEdit {
+            shell: console_shell(&state, account, csrf, "networks"),
+            name,
+        })
     }
 
     struct BridgeNet {
