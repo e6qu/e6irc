@@ -173,6 +173,12 @@ remains.
 **Goal:** make the browser application feel intentional rather than merely
 functional.
 
+**Current progress:** the console now shares the chat client's persisted
+system/light/dark theme preference, without introducing a server-only state
+path. Its common controls expose a consistent keyboard focus indicator, live
+status animation respects reduced-motion preferences, and the core
+panel/control patterns retain a usable forced-colors rendering.
+
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable
    button, field, menu, dialog, table, alert, empty-state, and loading-state
