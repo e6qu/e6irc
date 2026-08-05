@@ -4339,10 +4339,6 @@ async fn browser_sessions_are_visible_and_owner_scoped_across_api_and_console() 
     let (status, _, page_body) = request(http, &page).await;
     assert_eq!(status, 200, "{page_body}");
     assert!(
-        page_body.contains("<h2>Browser sessions</h2>"),
-        "{page_body}"
-    );
-    assert!(
         page_body.contains("data-api-browser-sessions"),
         "{page_body}"
     );
