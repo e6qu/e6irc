@@ -1634,18 +1634,22 @@
     for (const network of networks) {
       const row = document.createElement("tr");
       const runtime = network.runtime || {};
-      const cells = [runtime.state || (network.enabled ? "not running" : "disabled"), network.owner, network.name, network.kind, network.addr, runtime.attached_clients || 0, runtime.errors || 0, runtime.last_error?.summary || "—"];
+      const cells = [runtime.state || (network.enabled ? "not running" : "disabled"), network.owner, network.name, network.kind, network.shared === true ? "Managed configuration" : network.addr, runtime.attached_clients || 0, runtime.errors || 0, runtime.last_error?.summary || "—"];
       cells.forEach((value, index) => { const cell = document.createElement("td"); cell.textContent = String(value); if (index === 0) { const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; cell.prepend(dot); } if (index === 4 && network.tls) { const tls = document.createElement("span"); tls.className = "tag"; tls.textContent = "TLS"; cell.append(" ", tls); } row.append(cell); });
       const actions = document.createElement("td");
       actions.className = "row-actions";
-      const form = document.createElement("form");
-      form.method = "post";
-      form.action = `/api/v1/admin/networks/${encodeURIComponent(network.owner)}/${encodeURIComponent(network.name)}`;
-      form.dataset.apiAdminNetworkToggle = "";
-      const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminNetworkRows.dataset.csrf || "";
-      const enabled = document.createElement("input"); enabled.type = "hidden"; enabled.name = "enabled"; enabled.value = network.enabled ? "false" : "true";
-      const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable";
-      form.append(csrf, enabled, button); actions.append(form); row.append(actions); adminNetworkRows.append(row);
+      if (network.shared === true) actions.textContent = "Managed configuration";
+      else {
+        const form = document.createElement("form");
+        form.method = "post";
+        form.action = `/api/v1/admin/networks/${encodeURIComponent(network.owner)}/${encodeURIComponent(network.name)}`;
+        form.dataset.apiAdminNetworkToggle = "";
+        const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminNetworkRows.dataset.csrf || "";
+        const enabled = document.createElement("input"); enabled.type = "hidden"; enabled.name = "enabled"; enabled.value = network.enabled ? "false" : "true";
+        const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable";
+        form.append(csrf, enabled, button); actions.append(form);
+      }
+      row.append(actions); adminNetworkRows.append(row);
     }
   };
   if (adminNetworkRows instanceof HTMLElement) {
