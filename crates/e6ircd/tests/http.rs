@@ -2198,19 +2198,23 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     assert_eq!(status, 200, "{page}");
     for needle in [
         "Registered channels",
-        "#Control",
-        "Retained topic",
-        "Mode lock",
-        "Channel access",
-        "Transfer ownership",
-        "Unregister channel",
+        "data-api-owned-channel-list",
+        "Loading registered channels",
     ] {
         assert!(page.contains(needle), "page missing {needle:?}: {page}");
     }
+    assert!(
+        !page.contains("#Control"),
+        "channel data leaked into shell: {page}"
+    );
     let csrf = csrf_from_html(&page).to_string();
     let (_, _, mallory_page) = request(http, &page_request(&mallory_session)).await;
     assert!(
-        mallory_page.contains("No channels registered to this account"),
+        mallory_page.contains("data-api-owned-channel-list"),
+        "{mallory_page}"
+    );
+    assert!(
+        !mallory_page.contains("#Control"),
         "another account's channel leaked: {mallory_page}"
     );
 
@@ -2290,13 +2294,24 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
             request(http, &api_request(method, path, body, Some(&csrf))).await;
         assert_eq!(status, 200, "{path}: {headers}\n{body}");
     }
-    let (_, _, updated) = request(http, &page_request(&boss_session)).await;
-    for needle in ["Welcome operators", "+nt-i", "alice", "+ov"] {
-        assert!(
-            updated.contains(needle),
-            "updated page missing {needle:?}: {updated}"
-        );
-    }
+    let (status, _, updated) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/channels/%23Control HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    let updated: serde_json::Value = serde_json::from_str(&updated).expect("channel API response");
+    assert_eq!(updated["topic"], "Welcome operators");
+    assert_eq!(updated["mlock"], "+nt-i");
+    assert_eq!(updated["access"][0]["account"], "alice");
+    assert_eq!(updated["access"][0]["flags"], "ov");
+    let (_, _, shell) = request(http, &page_request(&boss_session)).await;
+    assert!(
+        !shell.contains("Welcome operators"),
+        "channel state leaked into shell: {shell}"
+    );
 
     let invalid = r#"{"action":"set_mlock","mlock":"+k"}"#;
     let (status, _, body) = request(
@@ -2333,22 +2348,33 @@ async fn owned_channel_api_and_console_shell_are_scoped_and_csrf_protected() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let (_, _, empty) = request(http, &page_request(&boss_session)).await;
-    assert!(
-        !empty.contains("#Control") && empty.contains("#Web"),
-        "drop affected the wrong owner channel: {empty}"
-    );
+    let (status, _, remaining) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{remaining}");
+    let remaining: serde_json::Value = serde_json::from_str(&remaining).expect("channel list");
+    assert_eq!(remaining["channels"].as_array().map(Vec::len), Some(1));
+    assert_eq!(remaining["channels"][0]["name"], "#Web");
     let (status, _, body) = request(
         http,
         &api_request("DELETE", "/api/v1/me/channels/%23Web", "", Some(&csrf)),
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let (_, _, empty) = request(http, &page_request(&boss_session)).await;
-    assert!(
-        empty.contains("No channels registered to this account"),
-        "registered channel remained after both drops: {empty}"
-    );
+    let (status, _, empty) = request(
+        http,
+        &format!(
+            "GET /api/v1/me/channels HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={boss_session}\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{empty}");
+    let empty: serde_json::Value = serde_json::from_str(&empty).expect("empty channel list");
+    assert_eq!(empty["channels"].as_array().map(Vec::len), Some(0));
 }
 
 // ---- admin API (PG-gated) -----------------------------------------------

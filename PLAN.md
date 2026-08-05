@@ -119,6 +119,8 @@ server-side snapshot.
 Account & access now follows the same boundary: its password posture,
 credentials, linked identities, and configured identity-provider links hydrate
 from owner-scoped API resources after the authenticated document shell loads.
+Founder channel policy and access controls likewise hydrate from the canonical
+owner-scoped channel resource rather than a server-rendered channel snapshot.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated

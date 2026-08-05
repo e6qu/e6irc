@@ -1888,6 +1888,46 @@
     }
   };
 
+  const ownedChannelList = document.querySelector("[data-api-owned-channel-list]");
+  if (ownedChannelList instanceof HTMLElement) {
+    const csrf = ownedChannelList.dataset.csrf || "";
+    const input = (name, value = "") => { const node = element("input"); node.name = name; node.value = value; return node; };
+    const form = (url, label, body) => {
+      const node = element("form", "inline-control"); node.method = "post"; node.action = url;
+      const token = input("csrf", csrf); token.type = "hidden"; node.append(token);
+      body(node);
+      node.addEventListener("submit", (event) => { event.preventDefault(); });
+      return node;
+    };
+    const submit = (node, text, run, confirm) => {
+      const button = element("button", text === "Unregister" ? "danger" : "primary", text); button.type = "submit";
+      if (confirm) node.dataset.confirm = confirm;
+      node.append(button);
+      node.addEventListener("submit", (event) => { event.preventDefault(); void run(node); });
+    };
+    void apiRead("/api/v1/me/channels").then((result) => {
+      const channels = Array.isArray(result.channels) ? result.channels : [];
+      ownedChannelList.replaceChildren();
+      const count = document.getElementById("owned-channel-count"); if (count) count.textContent = `${channels.length} owned`;
+      if (!channels.length) { ownedChannelList.append(append(element("section", "panel"), element("h2", "", "No channels registered to this account"), element("p", "empty", "Channels registered above appear here after storage confirms ownership."))); return; }
+      for (const channel of channels) {
+        const url = `/api/v1/me/channels/${encodeURIComponent(channel.name)}`;
+        const card = element("article", "panel channel-control");
+        const access = Array.isArray(channel.access) ? channel.access : [];
+        card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
+        const topic = form(url, "topic", (node) => { const field = element("label", "field"); const area = element("textarea"); area.name = "topic"; area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; append(field, element("span", "", "Retained topic"), area); node.append(field); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
+        const lock = form(url, "mlock", (node) => { const field = element("label", "field"); append(field, element("span", "", "Mode lock"), input("mlock", channel.mlock || "")); node.append(field); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));
+        const keep = form(url, "keep", (node) => { const select = element("select"); select.name = "enabled"; for (const [value, text] of [["on", "Retention on"], ["off", "Retention off"]]) { const option = element("option", "", text); option.value = value; option.selected = channel.keeptopic === (value === "on"); select.append(option); } node.append(select); }); submit(keep, "Apply retention", (node) => mutateChannel(node, url, "PATCH", { action: "set_keeptopic", enabled: fieldValue(new FormData(node), "enabled") === "on" }));
+        const controls = element("div", "channel-control-grid"); controls.append(topic, lock, keep); card.append(controls);
+        const grants = element("section", "control-block access-control"); grants.append(element("h3", "", "Channel access"));
+        for (const grant of access) { const row = element("div", "compact-list"); row.append(element("code", "", grant.account), element("span", "tag", `+${grant.flags}`)); const remove = form(`${url}/access/${encodeURIComponent(grant.account)}`, "remove", () => {}); submit(remove, "Remove", (node) => mutateChannel(node, node.action, "DELETE"), `Remove ${grant.account} from ${channel.name} access?`); row.append(remove); grants.append(row); }
+        const add = form(`${url}/access`, "access", (node) => { node.append(input("account")); for (const [name, text] of [["auto_op", "Auto-op"], ["auto_voice", "Auto-voice"]]) { const label = element("label", "check"); const box = input(name); box.type = "checkbox"; append(label, box, element("span", "", text)); node.append(label); } }); submit(add, "Save access", (node) => { const fields = new FormData(node); const account = fieldValue(fields, "account"); const flags = [fields.has("auto_op") && "o", fields.has("auto_voice") && "v"].filter(Boolean).join(""); if (!account || !flags) { setChannelResult("Enter an account and select at least one access grant.", false); return Promise.resolve(); } return mutateChannel(node, `${node.action}/${encodeURIComponent(account)}`, "PUT", { flags }); }); grants.append(add); card.append(grants);
+        const transfer = form(url, "transfer", (node) => { node.append(input("account")); }); submit(transfer, "Transfer ownership", (node) => { const account = fieldValue(new FormData(node), "account"); if (!account) { setChannelResult("Enter the new founder account.", false); return Promise.resolve(); } return mutateChannel(node, url, "PATCH", { action: "transfer_founder", account }); }, `Transfer ${channel.name} to this account? You will lose founder control.`); card.append(transfer);
+        const drop = form(url, "drop", () => {}); submit(drop, "Unregister", (node) => mutateChannel(node, url, "DELETE"), `Unregister ${channel.name} and delete its retained policy?`); card.append(drop); ownedChannelList.append(card);
+      }
+    }).catch((error) => { ownedChannelList.textContent = error instanceof Error ? error.message : "Registered channels failed to load."; });
+  }
+
   for (const form of document.querySelectorAll("[data-api-channel-register]")) {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
