@@ -1226,10 +1226,10 @@ mod web {
 
     /// The application entry point is an authentication boundary, not a
     /// public static file. An existing local session renders the client. An
-    /// anonymous browser is sent to `/login`, which renders the provider
-    /// sign-in links a validator (and a human) can discover and click —
-    /// auto-redirecting to the single provider's `/start` skips that page
-    /// and is undetectable by SSO validators (#191).
+    /// anonymous browser enters Shauth immediately when it is configured;
+    /// Shauth deployments have one credential authority and must not expose a
+    /// competing local-password landing page (#209). Other deployments retain
+    /// the explicit local/provider chooser.
     pub async fn index(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
@@ -1237,7 +1237,17 @@ mod web {
         match authenticate(&state, &headers).await {
             Ok(_) => serve("index.html"),
             Err(response) if response.status() != StatusCode::UNAUTHORIZED => response,
-            Err(_) => Redirect::to("/login").into_response(),
+            Err(_) => match state
+                .oidc_providers
+                .iter()
+                .find(|provider| provider.name == "shauth")
+            {
+                Some(provider) => {
+                    Redirect::to(&format!("/api/v1/auth/oidc/{}/start", provider.name))
+                        .into_response()
+                }
+                None => Redirect::to("/login").into_response(),
+            },
         }
     }
 
@@ -1401,7 +1411,11 @@ mod pages {
         error: Option<String>,
         status: StatusCode,
     ) -> Response {
-        let local_enabled = state.pool.is_some();
+        let local_enabled = state.pool.is_some()
+            && !state
+                .oidc_providers
+                .iter()
+                .any(|provider| provider.name == "shauth");
         let login_state = local_enabled
             .then(super::random_browser_token)
             .unwrap_or_default();
@@ -1852,6 +1866,17 @@ mod pages {
         headers: axum::http::HeaderMap,
         form: Result<axum::Form<LocalLoginForm>, axum::extract::rejection::FormRejection>,
     ) -> Response {
+        if state
+            .oidc_providers
+            .iter()
+            .any(|provider| provider.name == "shauth")
+        {
+            return problem(
+                StatusCode::FORBIDDEN,
+                "Local login is disabled",
+                Some("This deployment authenticates exclusively through Shauth."),
+            );
+        }
         let Some(pool) = &state.pool else {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -3208,16 +3233,6 @@ mod pages {
         })
     }
 
-    struct BridgeNet {
-        name: String,
-        owner: String,
-        connected: bool,
-        enabled: bool,
-        state: String,
-        /// Whether the viewing admin owns this bridge (so it can be removed from
-        /// here). A config-file / shared bridge is managed via config, not here.
-        manageable: bool,
-    }
     struct BridgePlatformMeta {
         name: &'static str,
         kind: crate::config::NetworkKind,
@@ -3269,7 +3284,6 @@ mod pages {
     struct BridgePlatform {
         meta: &'static BridgePlatformMeta,
         built: bool,
-        networks: Vec<BridgeNet>,
     }
 
     #[derive(Template)]
@@ -3280,79 +3294,25 @@ mod pages {
         platforms: Vec<BridgePlatform>,
     }
 
-    /// Console → Integrations (admin): the chat-platform bridges. For each
-    /// platform it shows whether this binary was built with the feature and the
-    /// bridge networks currently running (with live status), plus add/remove for
-    /// the admin's own bridges. `error` renders a banner after a failed action.
-    async fn console_integrations_build(
+    /// Console → Integrations (admin): a document shell. The browser reads the
+    /// complete stored and shared bridge inventory from the administrator API.
+    fn console_integrations_build(
         state: &AppState,
         account: String,
         csrf: String,
-    ) -> Result<ConsoleIntegrations, Response> {
-        let all = state
-            .bnc_registry
-            .as_ref()
-            .map(|r| r.list())
-            .unwrap_or_default();
-        let stored = crate::db::list_bnc_network_inventory(pool_of(state))
-            .await
-            .map_err(|error| super::device::admin_db_error("network inventory", error))?;
-        let admin_folded = e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&account);
-        let bridge_nets = |kind: &str| -> Vec<BridgeNet> {
-            let mut networks: Vec<BridgeNet> = stored
-                .iter()
-                .filter(|row| row.network.kind.as_db_str() == kind)
-                .map(|row| {
-                    let owner_folded =
-                        e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(&row.owner);
-                    let runtime = all.iter().find(|status| {
-                        status.owner.as_deref() == Some(owner_folded.as_str())
-                            && status.name.eq_ignore_ascii_case(&row.network.name)
-                    });
-                    let connected = runtime.is_some_and(|status| status.connected);
-                    BridgeNet {
-                        name: row.network.name.clone(),
-                        owner: row.owner.clone(),
-                        connected,
-                        enabled: row.network.enabled,
-                        state: if row.network.enabled {
-                            runtime
-                                .map(|status| status.runtime.lifecycle.as_str().replace('_', " "))
-                                .unwrap_or_else(|| "not running".into())
-                        } else {
-                            "disabled".into()
-                        },
-                        manageable: owner_folded == admin_folded,
-                    }
-                })
-                .collect();
-            networks.extend(
-                all.iter()
-                    .filter(|status| status.kind == kind && status.owner.is_none())
-                    .map(|status| BridgeNet {
-                        name: status.name.clone(),
-                        owner: "shared".into(),
-                        connected: status.connected,
-                        enabled: true,
-                        state: status.runtime.lifecycle.as_str().replace('_', " "),
-                        manageable: false,
-                    }),
-            );
-            networks
-        };
+    ) -> ConsoleIntegrations {
         let platforms = BRIDGE_PLATFORMS
             .iter()
             .map(|meta| BridgePlatform {
                 meta,
                 built: kind_feature_available(meta.kind),
-                networks: bridge_nets(meta.feature),
             })
             .collect();
-        Ok(ConsoleIntegrations {
+        ConsoleIntegrations {
             shell: console_shell(state, account, csrf, "integrations"),
             bouncer_enabled: state.bnc_registry.is_some(),
             platforms,
-        })
+        }
     }
 
     /// Console → Integrations (admin) GET.
@@ -3360,10 +3320,7 @@ mod pages {
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
     ) -> Response {
-        match console_integrations_build(&state, account, csrf).await {
-            Ok(view) => render_private(view),
-            Err(response) => response,
-        }
+        render_private(console_integrations_build(&state, account, csrf))
     }
 
     /// Unwrap an axum form, turning a rejection into a 400 problem response.

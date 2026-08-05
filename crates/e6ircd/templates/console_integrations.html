@@ -1,5 +1,6 @@
 {% extends "console_base.html" %}
 {% block main %}
+  <div data-api-integrations data-account="{{ shell.account }}" data-csrf="{{ shell.csrf }}">
   <p id="network-api-result" role="status" aria-live="polite"></p>
   <noscript><div class="banner-error">JavaScript is required to manage bridges because these controls use the network API directly.</div></noscript>
   <div class="page-head">
@@ -21,7 +22,7 @@
           <h2>{{ p.meta.name }} {% if p.built %}<span class="tag">built in</span>{% else %}<span class="tag">not built</span>{% endif %}</h2>
           <p>{{ p.meta.configure }}</p>
         </div>
-        <span class="count">{{ p.networks.len() }}</span>
+        <span class="count" data-integration-count="{{ p.meta.feature }}">—</span>
       </div>
       {% if !p.built %}
         <p class="empty">This binary was built without <code>--features {{ p.meta.feature }}</code>.</p>
@@ -41,44 +42,8 @@
           </form>
         {% endif %}
       {% endif %}
-      {% if p.networks.is_empty() %}
-          <p class="empty">No {{ p.meta.name }} bridges configured.</p>
-        {% else %}
-          <div class="scroll">
-            <table>
-              <caption class="sr-only">{{ p.meta.name }} bridge networks</caption>
-              <thead><tr><th>Status</th><th>Network</th><th>Owner</th><th></th></tr></thead>
-              <tbody>
-                {% for n in p.networks %}
-                  <tr>
-                    <td><span class="dot {% if n.connected %}on{% else %}off{% endif %}"></span>{{ n.state }}</td>
-                    <td><code>{{ n.name }}</code></td>
-                    <td><code>{{ n.owner }}</code></td>
-                    <td class="row-actions">
-                      {% if n.manageable %}
-                        <a class="rowlink" href="/console/networks/{{ n.name }}">Inspect</a>
-                        <a class="rowlink" href="/console/integrations/{{ n.name }}/edit">Edit</a>
-                        <form method="post" action="/api/v1/me/networks/{{ n.name }}" data-api-owner-network-toggle>
-                          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                          <input type="hidden" name="name" value="{{ n.name }}" />
-                          <input type="hidden" name="enabled" value="{% if n.enabled %}false{% else %}true{% endif %}" />
-                          <button type="submit">{% if n.enabled %}Disable{% else %}Enable{% endif %}</button>
-                        </form>
-                        <form method="post" action="/api/v1/me/networks/{{ n.name }}" data-api-owner-network-delete data-confirm="Remove bridge {{ n.name }}? Its stored backlog will also be deleted.">
-                          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-                          <input type="hidden" name="name" value="{{ n.name }}" />
-                          <button class="danger" type="submit">Remove</button>
-                        </form>
-                      {% else %}
-                        <span class="meta">Managed by {{ n.owner }}</span>
-                      {% endif %}
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-      {% endif %}
+      <div data-integration-list="{{ p.meta.feature }}" aria-live="polite"><p class="empty">Loading {{ p.meta.name }} bridges…</p></div>
     </section>
   {% endfor %}
+  </div>
 {% endblock %}

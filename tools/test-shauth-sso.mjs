@@ -74,8 +74,6 @@ try {
   assert.equal(localCredentialAttempt.status(), 401);
 
   await page.goto(`${primaryOrigin}/`);
-  assert.equal(page.url(), `${primaryOrigin}/login`);
-  await page.getByRole("link", { name: "Sign in with Shauth" }).click();
   await page.waitForURL((url) => url.origin === shauthOrigin && url.pathname === "/login");
   await page.locator("#username").fill(username);
   await page.locator("#password").fill(password);
@@ -86,8 +84,6 @@ try {
 
   await page.goto(`${shauthOrigin}/apps`);
   await page.getByRole("link", { name: "Open e6irc secondary", exact: true }).click();
-  await page.waitForURL(`${secondaryOrigin}/login`);
-  await page.getByRole("link", { name: "Sign in with Shauth" }).click();
   await page.waitForURL(`${secondaryOrigin}/`);
   assert.equal(await page.locator("#username").count(), 0);
   await assertProductIdentity(page, secondaryOrigin, "admin@localhost.test", "admin");
@@ -146,7 +142,7 @@ try {
   // After provider-wide sign-out, direct entry shows the login page without
   // exposing an authenticated shell.
   await page.goto(`${primaryOrigin}/`);
-  assert.equal(page.url(), `${primaryOrigin}/login`);
+  await page.waitForURL((url) => url.origin === shauthOrigin && url.pathname === "/login");
   assert.equal(await page.locator("[data-shauth-user]").count(), 0);
 
   assert.deepEqual(credentialBoundary.handlerErrors, []);

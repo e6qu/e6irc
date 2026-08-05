@@ -580,7 +580,7 @@ pub(super) async fn admin_networks(
     let pool = pool_of(&state);
     match crate::db::list_bnc_network_inventory(pool).await {
         Ok(rows) => {
-            let networks: Vec<serde_json::Value> = rows
+            let mut networks: Vec<serde_json::Value> = rows
                 .into_iter()
                 .map(|row| {
                     let runtime = state
@@ -593,6 +593,29 @@ pub(super) async fn admin_networks(
                     value
                 })
                 .collect();
+            if let Some(registry) = &state.bnc_registry {
+                networks.extend(
+                    registry
+                        .list()
+                        .into_iter()
+                        .filter(|status| status.owner.is_none())
+                        .map(|status| {
+                            serde_json::json!({
+                                "owner": "shared",
+                                "name": status.name,
+                                "kind": status.kind,
+                                "enabled": true,
+                                "connected": status.connected,
+                                "runtime": super::networks::runtime_json(&status.runtime),
+                                "shared": true,
+                            })
+                        }),
+                );
+            }
+            networks.sort_by(|left, right| {
+                (left["owner"].as_str(), left["name"].as_str())
+                    .cmp(&(right["owner"].as_str(), right["name"].as_str()))
+            });
             admin_json(serde_json::json!({ "networks": networks }))
         }
         Err(e) => admin_db_error("network inventory", e),

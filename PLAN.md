@@ -129,6 +129,9 @@ only the authenticated shell and URL identifier, while the typed owner-network
 resource populates the editable fields and mutation target in the browser.
 Administrator bridge editors likewise hydrate their typed provider fields and
 credential-presence explanations from the canonical owner-network resource.
+The administrator integrations directory now reads its stored and shared bridge
+inventory from the administrator network API; its document retains only
+compile-time platform capabilities and API mutation controls.
 Account & access now follows the same boundary: its password posture,
 credentials, linked identities, and configured identity-provider links hydrate
 from owner-scoped API resources after the authenticated document shell loads.

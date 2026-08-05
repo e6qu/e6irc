@@ -1940,6 +1940,41 @@
     });
   }
 
+  const integrations = document.querySelector("[data-api-integrations]");
+  if (integrations instanceof HTMLElement) {
+    const account = integrations.dataset.account || "";
+    const csrf = integrations.dataset.csrf || "";
+    const render = (networks) => {
+      for (const kind of ["matrix", "discord", "slack"]) {
+        const target = integrations.querySelector(`[data-integration-list="${kind}"]`);
+        const count = integrations.querySelector(`[data-integration-count="${kind}"]`);
+        if (!(target instanceof HTMLElement)) continue;
+        const entries = networks.filter((network) => network && network.kind === kind);
+        if (count) count.textContent = String(entries.length);
+        target.replaceChildren();
+        if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
+        const table = document.createElement("table"); table.innerHTML = "<thead><tr><th>Status</th><th>Network</th><th>Owner</th><th></th></tr></thead>";
+        const body = document.createElement("tbody");
+        for (const network of entries) {
+          if (typeof network.name !== "string" || typeof network.owner !== "string") continue;
+          const row = document.createElement("tr"); const runtime = network.runtime || {};
+          const status = document.createElement("td"); const dot = document.createElement("span"); dot.className = `dot ${network.connected ? "on" : "off"}`; status.append(dot, String(runtime.state || (network.enabled ? "not running" : "disabled")));
+          const name = document.createElement("td"); const code = document.createElement("code"); code.textContent = network.name; name.append(code);
+          const owner = document.createElement("td"); const ownerCode = document.createElement("code"); ownerCode.textContent = network.owner; owner.append(ownerCode);
+          const actions = document.createElement("td"); actions.className = "row-actions";
+          if (network.owner === account && network.shared !== true) {
+            for (const [label, href] of [["Inspect", `/console/networks/${encodeURIComponent(network.name)}`], ["Edit", `/console/integrations/${encodeURIComponent(network.name)}/edit`]]) { const link = document.createElement("a"); link.className = "rowlink"; link.href = href; link.textContent = label; actions.append(link); }
+            const toggle = document.createElement("form"); toggle.method = "post"; toggle.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; toggle.dataset.apiOwnerNetworkToggle = ""; const token = document.createElement("input"); token.type = "hidden"; token.name = "csrf"; token.value = csrf; const enabled = document.createElement("input"); enabled.type = "hidden"; enabled.name = "enabled"; enabled.value = network.enabled ? "false" : "true"; const button = document.createElement("button"); button.type = "submit"; button.textContent = network.enabled ? "Disable" : "Enable"; toggle.append(token, enabled, button); actions.append(toggle);
+            const remove = document.createElement("form"); remove.method = "post"; remove.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; remove.dataset.apiOwnerNetworkDelete = ""; remove.dataset.confirm = `Remove bridge ${network.name}? Its stored backlog will also be deleted.`; const removeToken = document.createElement("input"); removeToken.type = "hidden"; removeToken.name = "csrf"; removeToken.value = csrf; const removeButton = document.createElement("button"); removeButton.type = "submit"; removeButton.className = "danger"; removeButton.textContent = "Remove"; remove.append(removeToken, removeButton); actions.append(remove);
+          } else actions.textContent = `Managed by ${network.owner}`;
+          row.append(status, name, owner, actions); body.append(row);
+        }
+        table.append(body); target.append(table);
+      }
+    };
+    void apiRead("/api/v1/admin/networks").then((result) => render(Array.isArray(result.networks) ? result.networks : [])).catch((error) => { integrations.querySelectorAll("[data-integration-list]").forEach((target) => { target.textContent = error instanceof Error ? error.message : "Bridge inventory failed to load."; }); });
+  }
+
   const ownerNetworkEditor = document.querySelector("[data-api-owner-network-editor]");
   if (ownerNetworkEditor instanceof HTMLElement) {
     const name = ownerNetworkEditor.dataset.networkName || "";
