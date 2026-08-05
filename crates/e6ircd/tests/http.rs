@@ -1161,6 +1161,18 @@ async fn account_url_redirects_to_the_complete_account_console() {
     assert!(body.contains("src=\"/console.js\""), "{body}");
     assert!(body.contains("data-console-theme"), "{body}");
     assert!(
+        body.contains("href=\"#console-main\">Skip to main content"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<main id=\"console-main\" tabindex=\"-1\">"),
+        "{body}"
+    );
+    assert!(
+        body.contains("href=\"/console/account\" class=\"active\" aria-current=\"page\""),
+        "{body}"
+    );
+    assert!(
         !body.contains("data-console-theme-result role="),
         "the theme announcement must not create a second status landmark: {body}"
     );
