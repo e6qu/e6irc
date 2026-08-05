@@ -1,52 +1,52 @@
 {% extends "console_base.html" %}
 {% block main %}
-  <p id="network-api-result" role="status" aria-live="polite"></p>
-  <noscript><div class="banner-error">JavaScript is required to manage networks because these controls use the network API directly.</div></noscript>
-  <div class="page-head">
-    <div>
-      <p class="eyebrow">{{ kind }} network</p>
-      <h1>{{ name }}</h1>
-      <p class="lede">Live connection diagnostics, traffic, attached clients, and the persisted detached backlog.</p>
+  <div data-api-owner-network-detail data-network-name="{{ name }}" data-is-admin="{% if shell.is_admin %}true{% else %}false{% endif %}">
+    <p id="network-api-result" role="status" aria-live="polite"></p>
+    <noscript><div class="banner-error">JavaScript is required because this page reads and changes network data through the owner API.</div></noscript>
+    <div class="page-head">
+      <div>
+        <p class="eyebrow" data-network-kind>Network</p>
+        <h1 data-network-title>Loading network…</h1>
+        <p class="lede">Live connection diagnostics, traffic, attached clients, and the persisted detached backlog.</p>
+      </div>
+      <div class="page-actions" data-network-actions hidden>
+        <button type="button" data-refresh-target="#network-operations">Refresh</button>
+        <a class="button-link secondary-link" data-network-edit hidden>Edit configuration</a>
+        <form method="post" data-api-owner-network-toggle>
+          <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
+          <input type="hidden" name="enabled" data-network-enabled />
+          <button type="submit" data-network-toggle>Change state</button>
+        </form>
+      </div>
     </div>
-    <div class="page-actions">
-      <button type="button" data-refresh-target="#network-operations">Refresh</button>
-      {% if editable %}<a class="button-link secondary-link" href="/console/networks/{{ name }}/edit">Edit configuration</a>{% endif %}
-      {% if bridge_editable %}<a class="button-link secondary-link" href="/console/integrations/{{ name }}/edit">Edit integration</a>{% endif %}
-      <form method="post" action="/api/v1/me/networks/{{ name }}" data-api-owner-network-toggle>
+
+    <div class="network-summary" aria-label="Stored network configuration" data-network-summary hidden>
+      <div><span>Driver</span><strong data-network-field="kind">—</strong></div>
+      <div><span>Upstream</span><code data-network-field="addr">—</code></div>
+      <div><span>Transport</span><strong data-network-field="transport">—</strong></div>
+      <div><span>Identity</span><code data-network-field="nick">—</code></div>
+      <div><span>Real name</span><code data-network-field="realname">—</code></div>
+      <div><span>Autojoin</span><code data-network-field="autojoin">—</code></div>
+      <div><span>Account credential</span><strong data-network-field="account-credential">—</strong></div>
+      <div><span>Secret credential</span><strong data-network-field="secret-credential">—</strong></div>
+      <div><span>Configured state</span><strong data-network-field="enabled">—</strong></div>
+    </div>
+
+    <div id="network-operations"
+         data-api-network-operations
+         data-network-name="{{ name }}"
+         data-refresh-seconds="10"
+         data-refresh-status="network-refresh-status">
+      <div class="chart-empty">Loading network operations…</div>
+    </div>
+    <p id="network-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
+
+    <div class="page-actions" data-network-destructive hidden>
+      <a class="rowlink" href="/console/networks">Back to networks</a>
+      <form method="post" data-api-owner-network-delete>
         <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-        <input type="hidden" name="enabled" value="{% if enabled %}false{% else %}true{% endif %}" />
-        <button type="submit">{% if enabled %}Disable{% else %}Enable{% endif %}</button>
+        <button class="danger" type="submit">Remove network</button>
       </form>
     </div>
-  </div>
-
-  <div class="network-summary" aria-label="Stored network configuration">
-    <div><span>Driver</span><strong>{{ kind }}</strong></div>
-    <div><span>Upstream</span>{% if addr.is_empty() %}<strong>Provider API</strong>{% else %}<code>{{ addr }}</code>{% endif %}</div>
-    <div><span>Transport</span><strong>{% if tls %}TLS{% else if addr.is_empty() %}Provider-managed{% else %}Plaintext{% endif %}</strong></div>
-    <div><span>Identity</span>{% if nick.is_empty() %}<strong>Provider account</strong>{% else %}<code>{{ nick }}</code>{% endif %}</div>
-    <div><span>Real name</span>{% if realname.is_empty() %}<strong>Not set</strong>{% else %}<code>{{ realname }}</code>{% endif %}</div>
-    <div><span>Autojoin</span>{% if autojoin.is_empty() %}<strong>None</strong>{% else %}<code>{{ autojoin }}</code>{% endif %}</div>
-    <div><span>Account credential</span><strong>{% if has_sasl_account %}Stored{% else %}Not set{% endif %}</strong></div>
-    <div><span>Secret credential</span><strong>{% if has_sasl_password %}Stored encrypted{% else %}Not set{% endif %}</strong></div>
-    <div><span>Configured state</span><strong>{% if enabled %}Enabled{% else %}Disabled{% endif %}</strong></div>
-  </div>
-
-  <div id="network-operations"
-       data-api-network-operations
-       data-network-name="{{ name }}"
-       data-refresh-seconds="10"
-       data-refresh-status="network-refresh-status">
-    <div class="chart-empty">Loading network operations…</div>
-  </div>
-  <p id="network-refresh-status" class="refresh-status" aria-live="polite">Refreshes every ten seconds.</p>
-
-  <div class="page-actions">
-    <a class="rowlink" href="/console/networks">Back to networks</a>
-    <form method="post" action="/api/v1/me/networks/{{ name }}" data-api-owner-network-delete
-          data-confirm="Remove network {{ name }}? Its live connection and stored backlog will be deleted.">
-      <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
-      <button class="danger" type="submit">Remove network</button>
-    </form>
   </div>
 {% endblock %}

@@ -1277,9 +1277,9 @@ async fn console_networks_page_lists_the_callers_networks() {
     let (status, _, detail) = request(http, &detail_req).await;
     assert_eq!(status, 200, "{detail}");
     for needle in [
+        "data-api-owner-network-detail",
+        "Loading network…",
         "Live connection diagnostics",
-        "#e6irc",
-        "Not set",
         "data-api-network-operations",
         "data-network-name=\"libera\"",
         "Loading network operations…",
@@ -1293,6 +1293,12 @@ async fn console_networks_page_lists_the_callers_networks() {
         !detail.contains("/console/networks/libera/operations"),
         "{detail}"
     );
+    for stored_value in ["irc.libera.chat:6697", "#e6irc", "Not set"] {
+        assert!(
+            !detail.contains(stored_value),
+            "network detail retained the stored database projection {stored_value:?}: {detail}"
+        );
+    }
     let operations_req = format!(
         "GET /api/v1/me/networks/libera/operations HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
     );
