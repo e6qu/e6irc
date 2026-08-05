@@ -212,7 +212,7 @@ try {
   // founder workflow remains discoverable in console navigation.
   await page.goto(`${applicationOrigin}/console/channels`);
   await page.getByRole("heading", { name: "Registered channels", exact: true }).waitFor();
-  assert.match(await page.locator("main").innerText(), /No channels registered to this account/);
+  await page.getByText("No channels registered to this account", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Register channel", exact: true }).waitFor();
   assert.equal(
     await page.getByRole("link", { name: "Registered channels", exact: true }).getAttribute("class"),
