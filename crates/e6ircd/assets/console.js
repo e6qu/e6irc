@@ -20,6 +20,10 @@
     }
     return settings;
   };
+  const savedConsoleSettings = (settings, theme) => ({
+    theme,
+    notifications: typeof settings.notifications === "boolean" ? settings.notifications : false,
+  });
   if (consoleTheme instanceof HTMLSelectElement) {
     let theme = "auto";
     try {
@@ -38,8 +42,7 @@
       applyConsoleTheme(nextTheme);
       try {
         const settings = readConsoleSettings();
-        settings.theme = nextTheme;
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(savedConsoleSettings(settings, nextTheme)));
         showConsoleThemeResult("Theme preference saved for chat and console.");
       } catch (error) {
         showConsoleThemeResult(error instanceof Error

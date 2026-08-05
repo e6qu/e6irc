@@ -233,7 +233,7 @@ try {
   await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "light", notifications: true },
+    { theme: "light", notifications: false },
   );
   await page.reload();
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
@@ -243,7 +243,7 @@ try {
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
-    { theme: "auto", notifications: true },
+    { theme: "auto", notifications: false },
   );
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
