@@ -127,6 +127,8 @@ from the canonical owner-network resource.
 The owner IRC network editor follows the same boundary: its document contains
 only the authenticated shell and URL identifier, while the typed owner-network
 resource populates the editable fields and mutation target in the browser.
+Administrator bridge editors likewise hydrate their typed provider fields and
+credential-presence explanations from the canonical owner-network resource.
 Account & access now follows the same boundary: its password posture,
 credentials, linked identities, and configured identity-provider links hydrate
 from owner-scoped API resources after the authenticated document shell loads.

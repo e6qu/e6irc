@@ -1923,7 +1923,7 @@
       realname: bridge ? null : optionalValue(String(fields.get("realname") || "")),
       autojoin: splitValues(String(fields.get("autojoin") || ""), ","), credentials,
     };
-    if (!body.addr || (!bridge && !body.nick)) {
+    if (!bridge && (!body.addr || !body.nick)) {
       throw new Error("Enter the required network connection values.");
     }
     return body;
@@ -1956,6 +1956,26 @@
         form.hidden = false;
       })
       .catch((error) => fail(error instanceof Error ? error.message : "Network configuration failed to load."));
+  }
+
+  const ownerBridgeEditor = document.querySelector("[data-api-owner-bridge-editor]");
+  if (ownerBridgeEditor instanceof HTMLElement) {
+    const name = ownerBridgeEditor.dataset.networkName || "";
+    const form = ownerBridgeEditor.querySelector("[data-api-owner-bridge-update]");
+    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
+      .then((network) => {
+        if (!network || typeof network.name !== "string" || typeof network.kind !== "string" || network.kind === "irc" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin)) { window.location.replace("/console/integrations"); return; }
+        const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
+        set("addr", network.addr); set("nick", network.nick); set("autojoin", network.autojoin.join(", "));
+        const nick = ownerBridgeEditor.querySelector("[data-bridge-nick]"); if (nick instanceof HTMLElement) nick.hidden = !network.nick;
+        const account = ownerBridgeEditor.querySelector("[data-bridge-account]"); if (account instanceof HTMLElement) account.hidden = network.kind !== "slack";
+        const accountStatus = ownerBridgeEditor.querySelector("[data-bridge-account-status]"); if (accountStatus) accountStatus.textContent = network.has_sasl_account === true ? "A token is stored. Leave blank to keep it." : "No token is stored; enter one before saving.";
+        const kind = ownerBridgeEditor.querySelector("[data-bridge-kind]"); if (kind) kind.textContent = `${network.kind} bridge`;
+        const title = ownerBridgeEditor.querySelector("[data-bridge-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
+        const credential = ownerBridgeEditor.querySelector("[data-bridge-credential]"); if (credential) credential.textContent = network.has_sasl_password === true ? "A credential is stored. Leave blank to keep it." : "No credential is stored; enter one before saving.";
+        form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; form.hidden = false;
+      })
+      .catch((error) => setOwnerNetworkResult(error instanceof Error ? error.message : "Bridge configuration failed to load.", false));
   }
 
   // The network-list fragment is replaced during live refreshes, so lifecycle

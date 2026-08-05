@@ -4804,9 +4804,10 @@ async fn bridge_edit_ui_and_api_manage_every_platform_without_exposing_secrets()
     let (status, _, matrix_form) =
         request(http, &cookie("/console/integrations/matrix-main/edit")).await;
     assert_eq!(status, 200, "{matrix_form}");
-    assert!(matrix_form.contains("https://matrix.old.example"));
-    assert!(matrix_form.contains("@alice:old.example"));
-    assert!(matrix_form.contains("A secret is stored"));
+    assert!(matrix_form.contains("data-api-owner-bridge-editor"));
+    assert!(matrix_form.contains("Loading integration…"));
+    assert!(!matrix_form.contains("https://matrix.old.example"));
+    assert!(!matrix_form.contains("@alice:old.example"));
     assert!(!matrix_form.contains("matrix-old-password"));
 
     let (_, _, account_page) = request(http, &cookie("/console/account")).await;
