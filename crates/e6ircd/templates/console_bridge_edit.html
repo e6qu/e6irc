@@ -1,47 +1,34 @@
 {% extends "console_base.html" %}
 {% block main %}
+  <div data-api-owner-bridge-editor data-network-name="{{ name }}">
   <p id="network-api-result" role="status" aria-live="polite"></p>
-  <noscript><div class="banner-error">JavaScript is required to manage bridges because these controls use the network API directly.</div></noscript>
+  <noscript><div class="banner-error">JavaScript is required because this page reads and changes bridge data through the owner API.</div></noscript>
   <div class="page-head">
     <div>
-      <p class="eyebrow">{{ platform }} bridge</p>
-      <h1>Edit {{ name }}</h1>
+      <p class="eyebrow" data-bridge-kind>Bridge</p>
+      <h1 data-bridge-editor-title>Loading integration…</h1>
       <p class="lede">Saving validates the complete bridge configuration before replacing its live connection.</p>
     </div>
     <a class="button-link secondary-link" href="/console/integrations">All integrations</a>
   </div>
   <section class="panel">
-    <form class="network-form" method="post" action="/api/v1/me/networks/{{ name }}" data-api-owner-bridge-update>
+    <form class="network-form" method="post" data-api-owner-bridge-update hidden>
       <input type="hidden" name="csrf" value="{{ shell.csrf }}" />
       <label class="field field-wide">
-        <span>Homeserver / API base {% if !addr_required %}<em>optional</em>{% endif %}</span>
-        <input name="addr" value="{{ addr }}" placeholder="{% if addr_required %}https://chat.example.com{% else %}Provider default{% endif %}" {% if addr_required %}required{% endif %} />
-        <small>{% if addr_required %}Use an absolute HTTP or HTTPS URL.{% else %}Leave blank to use the provider's standard API endpoint.{% endif %}</small>
+        <span>Homeserver / API base <em>optional</em></span>
+        <input name="addr" placeholder="Provider default" />
+        <small>Use the provider endpoint required by this integration.</small>
       </label>
-      {% if needs_nick %}
-        <label class="field"><span>Provider user</span><input name="nick" value="{{ nick }}" autocomplete="username" required /></label>
-      {% else %}
-        <input type="hidden" name="nick" value="" />
-      {% endif %}
-      <label class="field field-wide"><span>Rooms / channel IDs <em>optional</em></span><input name="autojoin" value="{{ autojoin }}" /><small>Comma-separated; the expected identifier depends on the provider.</small></label>
-      {% if needs_account %}
-        <label class="field">
-          <span>New {{ account_label }} <em>optional</em></span>
-          <input type="password" name="sasl_account" autocomplete="new-password" maxlength="255" {% if !can_store_secrets %}disabled{% endif %} />
-          <small>{% if has_sasl_account %}A token is stored. Leave blank to keep it.{% else %}No token is stored; enter one before saving.{% endif %}</small>
-        </label>
-      {% else %}
-        <input type="hidden" name="sasl_account" value="" />
-      {% endif %}
+      <label class="field" data-bridge-nick><span>Provider user</span><input name="nick" autocomplete="username" /></label>
+      <label class="field field-wide"><span>Rooms / channel IDs <em>optional</em></span><input name="autojoin" /><small>Comma-separated; the expected identifier depends on the provider.</small></label>
+      <label class="field" data-bridge-account hidden><span>New provider account token <em>optional</em></span><input type="password" name="sasl_account" autocomplete="new-password" maxlength="255" /><small data-bridge-account-status>Leave blank to keep an existing stored token.</small></label>
       <label class="field">
-        <span>New {{ password_label }} <em>optional</em></span>
-        <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" {% if !can_store_secrets %}disabled{% endif %} />
-        <small>{% if has_sasl_password %}A secret is stored. Leave blank to keep it.{% else %}No secret is stored; enter one before saving.{% endif %}</small>
+        <span>New provider credential <em>optional</em></span>
+        <input type="password" name="sasl_password" autocomplete="new-password" maxlength="512" />
+        <small data-bridge-credential>Leave blank to keep an existing stored credential.</small>
       </label>
-      {% if !can_store_secrets %}
-        <div class="banner-info field-wide"><div><strong>Replacing tokens is unavailable.</strong> This deployment has no master key, so e6irc refuses to store provider credentials in plaintext. Existing encrypted values remain untouched.</div></div>
-      {% endif %}
       <div class="form-actions field-wide"><button class="primary" type="submit">Save bridge</button><a class="rowlink" href="/console/integrations">Cancel</a></div>
     </form>
   </section>
+  </div>
 {% endblock %}

@@ -2936,18 +2936,6 @@ mod pages {
     struct ConsoleBridgeEdit {
         shell: ConsoleShell,
         name: String,
-        platform: &'static str,
-        needs_nick: bool,
-        needs_account: bool,
-        account_label: &'static str,
-        password_label: &'static str,
-        addr: String,
-        addr_required: bool,
-        nick: String,
-        autojoin: String,
-        has_sasl_account: bool,
-        has_sasl_password: bool,
-        can_store_secrets: bool,
     }
 
     #[derive(Serialize)]
@@ -3278,12 +3266,6 @@ mod pages {
         },
     ];
 
-    fn bridge_platform_meta(
-        kind: crate::config::NetworkKind,
-    ) -> Option<&'static BridgePlatformMeta> {
-        BRIDGE_PLATFORMS.iter().find(|meta| meta.kind == kind)
-    }
-
     struct BridgePlatform {
         meta: &'static BridgePlatformMeta,
         built: bool,
@@ -3428,74 +3410,17 @@ mod pages {
         })
     }
 
-    async fn owned_bridge(
-        state: &AppState,
-        account: &str,
-        name: &str,
-    ) -> Result<crate::db::BncNetworkRow, Response> {
-        match crate::db::get_bnc_network(pool_of(state), account, name).await {
-            Ok(Some(row)) if row.kind.is_bridge() => Ok(row),
-            Ok(Some(_)) => Err(problem(
-                StatusCode::BAD_REQUEST,
-                "Not a bridge",
-                Some("IRC networks are managed on the BNC networks page"),
-            )),
-            Ok(None) => Err(problem(StatusCode::NOT_FOUND, "No such bridge", None)),
-            Err(error) => Err(super::device::admin_db_error("bridge fetch", error)),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn console_bridge_edit_page(
-        state: &AppState,
-        account: String,
-        csrf: String,
-        row: crate::db::BncNetworkRow,
-        addr: String,
-        nick: String,
-        autojoin: String,
-    ) -> Response {
-        let Some(meta) = bridge_platform_meta(row.kind) else {
-            return problem(StatusCode::BAD_REQUEST, "Not a bridge", None);
-        };
-        render_private(ConsoleBridgeEdit {
-            shell: console_shell(state, account, csrf, "integrations"),
-            name: row.name,
-            platform: meta.name,
-            needs_nick: meta.needs_nick,
-            needs_account: meta.needs_account,
-            account_label: meta.account_label,
-            password_label: meta.password_label,
-            addr,
-            addr_required: meta.addr_required,
-            nick,
-            autojoin,
-            has_sasl_account: row.sasl_account.is_some(),
-            has_sasl_password: row.sasl_password_sealed.is_some(),
-            can_store_secrets: state.secret_key.is_some(),
-        })
-    }
-
-    /// Console → Integrations: edit one account-owned bridge. Stored secrets
-    /// are represented only by presence indicators and are never rendered.
+    /// Console → Integrations bridge editor. The browser reads the owner API
+    /// resource before populating its typed provider fields.
     pub async fn console_edit_bridge(
         State(state): State<Arc<AppState>>,
         AdminPageActor { account, csrf }: AdminPageActor,
         Path(name): Path<String>,
     ) -> Response {
-        let row = match owned_bridge(&state, &account, &name).await {
-            Ok(row) => row,
-            Err(response) => return response,
-        };
-        console_bridge_edit_page(
-            &state,
-            account,
-            csrf,
-            row.clone(),
-            row.addr,
-            row.nick,
-            row.autojoin.join(", "),
-        )
+        render_private(ConsoleBridgeEdit {
+            shell: console_shell(&state, account, csrf, "integrations"),
+            name,
+        })
     }
 
     #[derive(Template)]
