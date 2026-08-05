@@ -212,6 +212,11 @@ the human as an explicit product decision.
 **Goal:** test the right layer for each risk, rather than relying on expensive
 browser journeys for ordinary API behavior.
 
+**Current progress:** the real OpenID Connect browser journey verifies the
+shared console/chat theme preference through a persisted choice, reload, and
+system-theme reset. API and template tests continue to cover the non-browser
+contract around it.
+
 1. Build exhaustive API contract tests for each resource: valid lifecycle,
    malformed input, authorization matrix, CSRF/bearer distinction, ownership
    isolation, pagination/cursor stability, concurrency/conflict, dependency

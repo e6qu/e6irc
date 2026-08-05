@@ -225,6 +225,28 @@ try {
   // cannot cross.
   await page.goto(`${applicationOrigin}/console/account`);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
+  // Console and chat deliberately share one typed local preference document.
+  // Exercise the console's own control through a persisted choice, a reload,
+  // and the system reset; API tests cannot prove these browser-only outcomes.
+  const consoleTheme = page.locator("[data-console-theme]");
+  await consoleTheme.selectOption("light");
+  await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "light", notifications: false },
+  );
+  await page.reload();
+  await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
+  assert.equal(await consoleTheme.inputValue(), "light");
+  assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
+  await consoleTheme.selectOption("auto");
+  await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
+  assert.deepEqual(
+    await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
+    { theme: "auto", notifications: false },
+  );
+  await consoleTheme.selectOption("dark");
+  await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
   await page.getByRole("button", { name: "Add password", exact: true }).click();
