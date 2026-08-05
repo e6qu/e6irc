@@ -177,7 +177,9 @@ functional.
 system/light/dark theme preference, without introducing a server-only state
 path. Its common controls expose a consistent keyboard focus indicator, live
 status animation respects reduced-motion preferences, and the core
-panel/control patterns retain a usable forced-colors rendering.
+panel/control patterns retain a usable forced-colors rendering. Console
+navigation exposes its current location and offers a keyboard skip link to the
+main API-hydrated document.
 
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable
