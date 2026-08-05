@@ -328,8 +328,8 @@
         .layout { flex-direction: column; }
         header { align-items: flex-start; flex-wrap: wrap; padding: 0.75rem 1rem; }
         header > span:last-child { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem;
-          min-width: 0; }
-        header .who { overflow-wrap: anywhere; }
+          width: 100%; max-width: 100%; min-width: 0; }
+        header .who { min-width: 0; overflow-wrap: anywhere; }
         nav { flex-basis: auto; width: 100%; position: static; min-height: 0;
           border-right: none; border-bottom: 1px solid var(--border);
           display: flex; flex-wrap: nowrap; gap: 0.25rem; overflow-x: auto;
