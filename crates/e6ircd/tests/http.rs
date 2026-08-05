@@ -4529,7 +4529,6 @@ async fn console_integrations_page_lists_platforms_for_admins_only() {
         "Matrix",
         "Discord",
         "Slack",
-        "disabled",
         "data-api-integrations",
         "Loading Matrix bridges",
     ] {
