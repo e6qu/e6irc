@@ -1161,6 +1161,10 @@ async fn account_url_redirects_to_the_complete_account_console() {
     assert!(body.contains("src=\"/console.js\""), "{body}");
     assert!(body.contains("data-console-theme"), "{body}");
     assert!(
+        !body.contains("data-console-theme-result role="),
+        "the theme announcement must not create a second status landmark: {body}"
+    );
+    assert!(
         body.contains("prefers-reduced-motion: no-preference"),
         "{body}"
     );
