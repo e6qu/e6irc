@@ -255,9 +255,18 @@ try {
   await page.locator("[data-shauth-user]").evaluate((user) => {
     user.textContent = "an-unbroken-account-identity-that-must-wrap-on-a-narrow-viewport";
   });
-  assert.equal(
-    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
-    true,
+  assert.deepEqual(
+    await page.evaluate(() => {
+      const viewportRight = document.documentElement.clientWidth;
+      return [...document.body.querySelectorAll("*")]
+        .map((element) => ({
+          element: `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ""}${element.className ? `.${String(element.className).trim().replaceAll(/\\s+/g, ".")}` : ""}`,
+          right: Math.ceil(element.getBoundingClientRect().right),
+          text: element.textContent.trim().slice(0, 80),
+        }))
+        .filter(({ right }) => right > viewportRight);
+    }),
+    [],
   );
   assert.equal(
     await page.locator("nav").evaluate((nav) => getComputedStyle(nav).overflowX),
