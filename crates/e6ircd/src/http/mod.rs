@@ -2989,17 +2989,6 @@ mod pages {
     struct ConsoleNetworkDetail {
         shell: ConsoleShell,
         name: String,
-        kind: &'static str,
-        addr: String,
-        tls: bool,
-        nick: String,
-        realname: String,
-        autojoin: String,
-        enabled: bool,
-        editable: bool,
-        bridge_editable: bool,
-        has_sasl_account: bool,
-        has_sasl_password: bool,
     }
 
     /// Admin console: server-wide read views (accounts, registered channels,
@@ -3165,47 +3154,18 @@ mod pages {
         })
     }
 
-    /// Resolve one authenticated caller's stored network and its page token.
-    /// Keeping authentication, ownership lookup, and not-found/error mapping in
-    /// one edge prevents the detail page and its refresh fragment from drifting
-    /// into different access-control behavior.
-    async fn console_owned_network(
-        state: &AppState,
-        headers: &axum::http::HeaderMap,
-        name: &str,
-    ) -> Result<(String, String, crate::db::BncNetworkRow), Response> {
-        let (account, csrf) = page_actor(state, headers, false).await?;
-        let network = crate::db::get_bnc_network(pool_of(state), &account, name)
-            .await
-            .map_err(|error| super::device::admin_db_error("network fetch", error))?
-            .ok_or_else(|| problem(StatusCode::NOT_FOUND, "No such network", None))?;
-        Ok((account, csrf, network))
-    }
-
     pub async fn console_network_detail(
         State(state): State<Arc<AppState>>,
         headers: axum::http::HeaderMap,
         Path(name): Path<String>,
     ) -> Response {
-        let (account, csrf, network) = match console_owned_network(&state, &headers, &name).await {
+        let (account, csrf) = match page_actor(&state, &headers, false).await {
             Ok(result) => result,
             Err(response) => return response,
         };
-        let is_admin = is_admin_account(&state, &account);
         render_private(ConsoleNetworkDetail {
-            shell: console_shell(&state, account.clone(), csrf, "networks"),
-            name: network.name,
-            kind: network.kind.as_db_str(),
-            addr: network.addr,
-            tls: network.tls,
-            nick: network.nick,
-            realname: network.realname.unwrap_or_default(),
-            autojoin: network.autojoin.join(", "),
-            enabled: network.enabled,
-            editable: network.kind == crate::config::NetworkKind::Irc,
-            bridge_editable: network.kind.is_bridge() && is_admin,
-            has_sasl_account: network.sasl_account.is_some(),
-            has_sasl_password: network.sasl_password_sealed.is_some(),
+            shell: console_shell(&state, account, csrf, "networks"),
+            name,
         })
     }
 

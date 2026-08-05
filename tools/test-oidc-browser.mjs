@@ -645,8 +645,13 @@ try {
     "a server-admitted composer send must render exactly one local echo",
   );
 
-  // The owner-facing diagnostics must reflect that same live exchange rather
-  // than merely rendering the stored row.
+  // The owner-facing configuration and diagnostics must reflect that same live
+  // exchange through their canonical APIs rather than rendering the stored row.
+  const detailRead = page.waitForResponse(
+    (response) =>
+      response.url() === `${applicationOrigin}/api/v1/me/networks/journey` &&
+      response.request().method() === "GET",
+  );
   const operationsReadStart = applicationRequests.length;
   const operationsRead = page.waitForResponse(
     (response) =>
@@ -654,8 +659,10 @@ try {
       response.request().method() === "GET",
   );
   await page.goto(`${applicationOrigin}/console/networks/journey`);
+  assert.equal((await detailRead).status(), 200);
   assert.equal((await operationsRead).status(), 200);
   await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
+  await page.locator('[data-network-field="addr"]', { hasText: upstream.address }).waitFor();
   await page.getByText("Received from upstream", { exact: true }).waitFor();
   await page.waitForFunction(
     () =>
