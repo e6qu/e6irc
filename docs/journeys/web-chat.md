@@ -75,6 +75,10 @@ the working live stream. Socket closure marks the connection disconnected.
 Malformed events are rejected or ignored according to their explicit protocol
 contract without corrupting other buffers.
 
+**Accessibility.** Replacing a historical transcript marks the log busy and
+temporarily mutes its live region, so a buffer switch does not announce old
+messages as new; subsequent live additions remain politely announced.
+
 **Security and observability.** History and replay use the same owner/network
 authorization. Buffers, requested history, and deduplication indexes are
 bounded; upstream text is rendered as text, while replay/database failures are

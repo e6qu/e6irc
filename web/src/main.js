@@ -395,9 +395,18 @@ function renderActive() {
     const eligible = !!network && !!b && b.kind !== "server" && !b.historyLoaded;
     loadEarlierEl.hidden = !eligible;
   }
+  // Switching buffers replaces a complete historical transcript. Mark that
+  // replacement busy and quiet so assistive technology announces only later
+  // live additions, not every already-read line as a new message.
+  messagesEl.setAttribute("aria-busy", "true");
+  messagesEl.setAttribute("aria-live", "off");
   messagesEl.replaceChildren();
   if (b) for (const line of b.lines) messagesEl.appendChild(messageRow(line));
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  requestAnimationFrame(() => {
+    messagesEl.setAttribute("aria-busy", "false");
+    messagesEl.setAttribute("aria-live", "polite");
+  });
   renderNickList();
 }
 
