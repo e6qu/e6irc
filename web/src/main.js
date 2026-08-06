@@ -416,7 +416,7 @@ function messageRow(line) {
   return row;
 }
 
-function renderActive() {
+function renderActive({ atLatest = true } = {}) {
   const b = buffers.get(active);
   bufnameEl.textContent = !b || b.key === SERVER ? "server" : b.display;
   buftopicEl.textContent = b ? b.topic : "";
@@ -442,7 +442,7 @@ function renderActive() {
   messagesEl.setAttribute("aria-live", "off");
   messagesEl.replaceChildren();
   if (b) for (const line of b.lines) messagesEl.appendChild(messageRow(line));
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  messagesEl.scrollTop = atLatest ? messagesEl.scrollHeight : 0;
   if (b) b.pendingVisibleMessages = 0;
   renderJumpLatest();
   requestAnimationFrame(() => {
@@ -1327,7 +1327,9 @@ async function loadEarlier() {
   // Stable msgids suppress true overlap; unidentified rows are retained.
   b.lines = mergeTimeline(rebuilt, b.lines, MAX_LINES);
   b.historyLoaded = true;
-  if (b.key === active) renderActive();
+  // Loading older context is an explicit reader action. Keep that context in
+  // view instead of snapping back to the live edge where it cannot be seen.
+  if (b.key === active) renderActive({ atLatest: false });
 }
 
 const loadEarlierBtn = el("load-earlier");

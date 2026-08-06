@@ -193,6 +193,8 @@ navigation or risking an automatic duplicate send.
 Readers who have scrolled away from the live edge receive an exact-count,
 keyboard-accessible control to return to new chat traffic without losing their
 place or switching conversations.
+Loading persisted chat history opens the newly fetched older context rather
+than hiding it beneath a forced jump to the live edge.
 Transient browser-socket closures likewise retain bounded automatic backoff
 while offering an explicit one-shot retry, without turning terminal network
 unavailability into a futile reconnect loop.
