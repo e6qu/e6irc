@@ -465,7 +465,9 @@ try {
     await row.getByRole("button", { name: "Remove" }).click();
     await expectStatus(page, new RegExp(outcome));
   }
-  assert.match(await page.locator("main").innerText(), /Revision 8/);
+  // The success banner is rendered before the API-hydrated revision text on
+  // slower engines. Wait for the observed configuration revision itself.
+  await page.getByText("Revision 8", { exact: true }).waitFor();
 
   // The operational console is part of the browser acceptance boundary, not
   // merely a collection of HTTP handlers. Visit every administrator directory,
@@ -1058,6 +1060,9 @@ try {
   await mentionsBuffer.click();
   await page.getByRole("button", { name: "Open #mentions" }).waitFor();
   assert.equal(await page.locator(".mention-badge").count(), 0);
+  // The following authoritative NAMES snapshot updates #room's member list,
+  // so return to its rendered conversation after proving the mention reset.
+  await page.getByRole("button", { name: "Open #room" }).click();
 
   // A later NAMES snapshot is authoritative: bob and alice disappear, carol
   // appears, and the list/count cannot retain stale members.
