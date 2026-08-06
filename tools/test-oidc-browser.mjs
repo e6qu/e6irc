@@ -1041,6 +1041,24 @@ try {
   await page.getByText("demo: upstream connected", { exact: true }).waitFor();
   assert.equal(socketConnections, 2, "manual retry created exactly one replacement socket");
 
+  // Inactive conversations distinguish ordinary unread traffic from messages
+  // that name us. Opening that conversation clears both indicators without
+  // affecting any other buffer.
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: ":alice!u@h PRIVMSG #mentions :webnick: please review this",
+    }),
+  );
+  const mentionsBuffer = page.getByRole("button", {
+    name: "Open #mentions, 1 unread message, 1 mention",
+  });
+  await mentionsBuffer.waitFor();
+  assert.equal(await mentionsBuffer.locator(".mention-badge").textContent(), "@1");
+  await mentionsBuffer.click();
+  await page.getByRole("button", { name: "Open #mentions" }).waitFor();
+  assert.equal(await page.locator(".mention-badge").count(), 0);
+
   // A later NAMES snapshot is authoritative: bob and alice disappear, carol
   // appears, and the list/count cannot retain stale members.
   mockSocket.send(

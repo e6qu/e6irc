@@ -198,6 +198,15 @@ body {
   border-radius: 0.7rem;
   padding: 0 0.4rem;
 }
+.mention-badge {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  background: var(--warn);
+  color: #111;
+  border-radius: 0.7rem;
+  padding: 0 0.4rem;
+  font-weight: 700;
+}
 
 #chatpane { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
 #bufhead {

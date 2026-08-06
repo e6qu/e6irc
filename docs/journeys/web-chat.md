@@ -28,8 +28,9 @@ available; at least one owned/shared network is enabled for chat.
 6. A skip link reaches the chat region, and conversation/member activation uses
    native buttons so keyboard and assistive-technology behavior follows the
    browser's standard interaction model.
-7. Each conversation control names its target and unread count; its decorative
-   numeric badge is not announced a second time.
+7. Each conversation control names its target, unread count, and any unread
+   direct mentions. Decorative numeric and mention badges are not announced a
+   second time; opening that conversation clears its own counters.
 
 **Visible failures and recovery.** An expired session redirects to login.
 REST failure, WebSocket authentication failure, absent/disabled network,
@@ -121,7 +122,9 @@ current network and conversation selection.
    labels.
 5. Direct messages create query buffers. Closing a query removes only the
    local view; leaving a channel sends PART and waits for the resulting state.
-6. Errors from the driver or IRC server appear in the relevant status path.
+6. Inactive conversations retain both unread traffic and unread direct-mention
+   counts, so attention-worthy traffic is distinguishable before switching.
+7. Errors from the driver or IRC server appear in the relevant status path.
 
 **Visible failures and recovery.** A disconnected composer cannot display a
 false successful send. CR/LF/NUL input, an over-limit complete line, more than

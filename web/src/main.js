@@ -134,7 +134,7 @@ function applyTheme() {
 }
 applyTheme();
 
-// name -> { name, kind: "server"|"channel"|"dm", lines: [], nicks: Map, topic, unread }
+// name -> { name, kind: "server"|"channel"|"dm", lines: [], nicks: Map, topic, unread, mentions }
 const buffers = new Map();
 const namesSnapshots = new Set();
 const namesRequested = new Set();
@@ -287,6 +287,7 @@ function ensureBuffer(name, kind) {
     nicks: new Map(),
     topic: "",
     unread: 0,
+    mentions: 0,
     historyLoaded: false,
     membershipKnown: false,
     membersTruncated: false,
@@ -329,18 +330,30 @@ function renderBufferList() {
     button.className = "buf" + (b.key === active ? " active" : "");
     button.setAttribute("aria-pressed", String(b.key === active));
     const bufferName = b.key === SERVER ? "server" : b.display;
-    const unreadLabel = b.unread > 0 && b.key !== active
+    const inactive = b.key !== active;
+    const unreadLabel = b.unread > 0 && inactive
       ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
       : "";
-    button.setAttribute("aria-label", `Open ${bufferName}${unreadLabel}`);
+    const mentionLabel = b.mentions > 0 && inactive
+      ? `, ${b.mentions} mention${b.mentions === 1 ? "" : "s"}`
+      : "";
+    button.setAttribute("aria-label", `Open ${bufferName}${unreadLabel}${mentionLabel}`);
     const label = document.createElement("span");
     label.className = "buf-name";
     label.textContent = bufferName;
     button.appendChild(label);
-    if (b.unread > 0 && b.key !== active) {
+    if (b.unread > 0 && inactive) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = String(b.unread);
+      badge.setAttribute("aria-hidden", "true");
+      button.appendChild(badge);
+    }
+    if (b.mentions > 0 && inactive) {
+      const badge = document.createElement("span");
+      badge.className = "mention-badge";
+      badge.textContent = `@${b.mentions}`;
+      badge.title = `${b.mentions} unread mention${b.mentions === 1 ? "" : "s"}`;
       badge.setAttribute("aria-hidden", "true");
       button.appendChild(badge);
     }
@@ -482,7 +495,10 @@ function renderNickList() {
 function setActive(name) {
   active = fold(name);
   const b = buffers.get(active);
-  if (b) b.unread = 0;
+  if (b) {
+    b.unread = 0;
+    b.mentions = 0;
+  }
   renderBufferList();
   renderActive();
   closeMobileSidebar();
@@ -563,6 +579,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
     if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
   } else {
     b.unread += 1;
+    if (line.mention) b.mentions += 1;
     renderBufferList();
   }
 }

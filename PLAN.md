@@ -185,7 +185,8 @@ identities wrap without making the document overflow; the real browser journey
 exercises both guarantees. Web chat likewise exposes a skip-to-chat target and
 uses native controls for buffer and member activation, retaining browser-native
 keyboard and assistive-technology interaction semantics; each conversation
-control announces its target and unread count without duplicating badge text.
+control announces its target, unread count, and direct-mention count without
+duplicating decorative badge text, and opening it clears only its own counters.
 Rejected composer requests retain no false local echo and expose a visible
 restore-for-review action rather than requiring users to discover input-history
 navigation or risking an automatic duplicate send.
