@@ -70,6 +70,9 @@ survive process restart.
 4. Server-time determines presentation ordering where supplied; arrival order
    remains the fallback.
 5. Channel and direct-message buffers are created on demand and remain bounded.
+6. When live traffic arrives below a reader's current scroll position, an
+   exact-count **jump to latest** control keeps it discoverable without
+   interrupting the reader or switching conversations.
 
 **Visible failures and recovery.** History failure is shown without discarding
 the working live stream. Socket closure marks the connection disconnected.
@@ -81,7 +84,9 @@ remains configuration recovery, not a retry loop.
 
 **Accessibility.** Replacing a historical transcript marks the log busy and
 temporarily mutes its live region, so a buffer switch does not announce old
-messages as new; subsequent live additions remain politely announced.
+messages as new; subsequent live additions remain politely announced. The
+new-message control is a native button with an exact accessible count and
+returns the reader to the latest line without moving them to another buffer.
 
 **Rejected sends.** A correlated server refusal never creates a local echo or
 automatically retries. It leaves the reason visible and offers a **Restore
@@ -93,8 +98,9 @@ authorization. Buffers, requested history, and deduplication indexes are
 bounded; upstream text is rendered as text, while replay/database failures are
 visible and classified without logging conversation bodies.
 
-**Evidence.** Browser tests exercise replay boundaries, history races, and
-deduplication with deterministic transport. The full-stack browser case also
+**Evidence.** Browser tests exercise replay boundaries, history races,
+deduplication, and the out-of-view live-message recovery control with
+deterministic transport. The full-stack browser case also
 drives a real upstream line through persistence, the multiplexer, and
 WebSocket into Chromium, gracefully restarts the daemon, and verifies that the
 same session can inspect the persisted line afterward.

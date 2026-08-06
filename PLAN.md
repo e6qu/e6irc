@@ -190,6 +190,9 @@ duplicating decorative badge text, and opening it clears only its own counters.
 Rejected composer requests retain no false local echo and expose a visible
 restore-for-review action rather than requiring users to discover input-history
 navigation or risking an automatic duplicate send.
+Readers who have scrolled away from the live edge receive an exact-count,
+keyboard-accessible control to return to new chat traffic without losing their
+place or switching conversations.
 Transient browser-socket closures likewise retain bounded automatic backoff
 while offering an explicit one-shot retry, without turning terminal network
 unavailability into a futile reconnect loop.
