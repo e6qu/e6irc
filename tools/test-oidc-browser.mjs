@@ -978,6 +978,42 @@ try {
     expectedTaggedTime,
   );
 
+  // Reading older content must not make new live traffic disappear below the
+  // viewport. The explicit control stays keyboard-accessible and returns to
+  // the newest line without changing conversations.
+  await page.evaluate(() => {
+    const messages = document.getElementById("messages");
+    messages.style.flex = "none";
+    messages.style.height = "5rem";
+  });
+  for (let index = 0; index < 12; index += 1) {
+    mockSocket.send(
+      JSON.stringify({
+        t: "line",
+        v: `:alice!u@h PRIVMSG #room :scrollback filler ${index}`,
+      }),
+    );
+  }
+  await page.getByText("scrollback filler 11", { exact: true }).waitFor();
+  await page.locator("#messages").evaluate((node) => { node.scrollTop = 0; });
+  mockSocket.send(
+    JSON.stringify({
+      t: "line",
+      v: ":alice!u@h PRIVMSG #room :new while reading",
+    }),
+  );
+  const jumpLatest = page.getByRole("button", {
+    name: "1 new message. Jump to latest messages.",
+  });
+  await jumpLatest.waitFor();
+  assert.equal(await jumpLatest.textContent(), "1 new message — jump to latest");
+  await jumpLatest.click();
+  await page.waitForFunction(() => {
+    const messages = document.getElementById("messages");
+    return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 1;
+  });
+  await page.locator("#jump-latest").waitFor({ state: "hidden" });
+
   let resolveHistoryRoute;
   const historyRouteReached = new Promise((resolve) => {
     resolveHistoryRoute = resolve;

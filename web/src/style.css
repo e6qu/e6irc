@@ -208,7 +208,7 @@ body {
   font-weight: 700;
 }
 
-#chatpane { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+#chatpane { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; position: relative; }
 #bufhead {
   flex: 0 0 auto;
   padding: 0.5rem 1rem;
@@ -252,6 +252,23 @@ body {
   background: transparent; color: var(--accent); cursor: pointer;
 }
 #load-earlier:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+#jump-latest {
+  position: absolute;
+  right: 1rem;
+  bottom: 4rem;
+  z-index: 2;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 650;
+}
+#jump-latest:hover { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
 .line-notice .text, .line-notice .from { color: var(--muted); }
 .line-event { color: var(--muted); font-size: 0.85rem; font-style: italic; }
 .line-server { color: var(--muted); }
@@ -350,6 +367,7 @@ body {
   .settings-menu { left: auto; right: 0; }
   #user-nav { width: 100%; margin-left: 0; justify-content: flex-end; }
   #alerts { padding: 0.45rem 0.65rem; }
+  #jump-latest { right: 0.65rem; bottom: 4.25rem; }
   #workspace { flex-direction: column; }
   #sidebar { display: none; flex: 0 0 auto; max-height: 38vh; width: 100%; border-right: none;
     border-bottom: 1px solid var(--border); }

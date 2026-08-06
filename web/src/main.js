@@ -52,6 +52,7 @@ const messageInput = el("message");
 const alertsEl = el("alerts");
 const networkSelect = el("network-select");
 const sidebarToggle = el("sidebar-toggle");
+const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
 const joinButton = el("join-form")?.querySelector("button[type=submit]");
 
@@ -288,6 +289,7 @@ function ensureBuffer(name, kind) {
     topic: "",
     unread: 0,
     mentions: 0,
+    pendingVisibleMessages: 0,
     historyLoaded: false,
     membershipKnown: false,
     membersTruncated: false,
@@ -441,11 +443,44 @@ function renderActive() {
   messagesEl.replaceChildren();
   if (b) for (const line of b.lines) messagesEl.appendChild(messageRow(line));
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  if (b) b.pendingVisibleMessages = 0;
+  renderJumpLatest();
   requestAnimationFrame(() => {
     messagesEl.setAttribute("aria-busy", "false");
     messagesEl.setAttribute("aria-live", "polite");
   });
   renderNickList();
+}
+
+function isNearLatest() {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
+}
+
+function renderJumpLatest() {
+  if (!jumpLatestButton) return;
+  const count = buffers.get(active)?.pendingVisibleMessages ?? 0;
+  jumpLatestButton.hidden = count === 0;
+  if (count === 0) return;
+  const label = `${count} new message${count === 1 ? "" : "s"}`;
+  jumpLatestButton.textContent = `${label} — jump to latest`;
+  jumpLatestButton.setAttribute("aria-label", `${label}. Jump to latest messages.`);
+}
+
+messagesEl.addEventListener("scroll", () => {
+  if (!isNearLatest()) return;
+  const b = buffers.get(active);
+  if (!b || b.pendingVisibleMessages === 0) return;
+  b.pendingVisibleMessages = 0;
+  renderJumpLatest();
+});
+
+if (jumpLatestButton) {
+  jumpLatestButton.addEventListener("click", () => {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    const b = buffers.get(active);
+    if (b) b.pendingVisibleMessages = 0;
+    renderJumpLatest();
+  });
 }
 
 function renderNickList() {
@@ -567,8 +602,7 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
   b.lines.push(line);
   if (b.lines.length > MAX_LINES) b.lines.shift();
   if (b.key === active) {
-    const nearBottom =
-      messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 40;
+    const nearBottom = isNearLatest();
     messagesEl.appendChild(messageRow(line));
     // Trim on the actual DOM node count — the model was already clamped above,
     // so a guard on `b.lines.length` would never fire and the DOM would grow
@@ -576,7 +610,13 @@ function addLine(bufName, kind, bufKind, from, text, tags = null) {
     while (messagesEl.children.length > MAX_LINES && messagesEl.firstChild) {
       messagesEl.removeChild(messagesEl.firstChild);
     }
-    if (nearBottom) messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (nearBottom) {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      b.pendingVisibleMessages = 0;
+    } else {
+      b.pendingVisibleMessages += 1;
+    }
+    renderJumpLatest();
   } else {
     b.unread += 1;
     if (line.mention) b.mentions += 1;
