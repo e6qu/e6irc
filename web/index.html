@@ -9,6 +9,7 @@
     <script type="module" src="/src/main.js"></script>
   </head>
   <body>
+    <a class="skip-link" href="#chatpane">Skip to chat</a>
     <main id="app">
       <header id="topbar">
         <a id="brand" href="/">e6irc</a>
@@ -63,7 +64,7 @@
           <ul id="buffers"></ul>
         </aside>
 
-        <section id="chatpane">
+        <section id="chatpane" tabindex="-1">
           <div id="bufhead">
             <span id="bufname">—</span>
             <span id="buftopic" class="topic"></span>

@@ -658,6 +658,16 @@ try {
 
   await page.goto(`${applicationOrigin}/?network=journey`);
   await page.locator(".buf-name").filter({ hasText: /^#journey$/ }).waitFor();
+  const journeyBuffer = page.getByRole("button", { name: "#journey", exact: true });
+  assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
+  assert.equal(await journeyBuffer.getAttribute("aria-pressed"), "true");
+  const skipToChat = page.getByRole("link", { name: "Skip to chat", exact: true });
+  await skipToChat.focus();
+  await skipToChat.press("Enter");
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "chatpane");
+  const peerMember = page.getByRole("button", { name: "peer", exact: true });
+  await peerMember.waitFor();
+  assert.equal(await peerMember.evaluate((button) => button.tagName), "BUTTON");
   await upstream.sendPeerMessage("#journey", "browser receives through the real stack");
   await page.getByText("browser receives through the real stack", { exact: true }).waitFor();
 

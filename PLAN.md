@@ -182,7 +182,9 @@ navigation exposes its current location and offers a keyboard skip link to the
 main API-hydrated document. At narrow-phone widths, the complete navigation is
 a contained horizontal rail rather than a tall preamble, and long account
 identities wrap without making the document overflow; the real browser journey
-exercises both guarantees.
+exercises both guarantees. Web chat likewise exposes a skip-to-chat target and
+uses native controls for buffer and member activation, retaining browser-native
+keyboard and assistive-technology interaction semantics.
 
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable
