@@ -236,7 +236,9 @@ jobs:
             sleep 1
           done
       - name: Install ${{ matrix.browser }} for Playwright
-        timeout-minutes: 8
+        # WebKit's Ubuntu dependency set can take longer than Chromium's on
+        # a cold package mirror; keep a bound without cutting off a healthy install.
+        timeout-minutes: 15
         run: pnpm -C web exec playwright install --with-deps "${{ matrix.browser }}"
       - run: cargo build -p e6ircd --features embed-web
       - name: Exercise the complete browser journey in ${{ matrix.browser }}

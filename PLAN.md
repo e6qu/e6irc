@@ -179,7 +179,10 @@ path. Its common controls expose a consistent keyboard focus indicator, live
 status animation respects reduced-motion preferences, and the core
 panel/control patterns retain a usable forced-colors rendering. Console
 navigation exposes its current location and offers a keyboard skip link to the
-main API-hydrated document.
+main API-hydrated document. At narrow-phone widths, the complete navigation is
+a contained horizontal rail rather than a tall preamble, and long account
+identities wrap without making the document overflow; the real browser journey
+exercises both guarantees.
 
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable
