@@ -855,10 +855,25 @@ function scheduleReconnect() {
     `reconnect ${reconnectAttempt} in ${Math.max(1, Math.round(wait / 1000))}s`,
     "error",
   );
+  showAlert(
+    "socket",
+    `The live connection to ${network} closed. e6irc will retry with bounded backoff.`,
+    "error",
+    { label: "Retry now", onClick: retryConnectionNow },
+  );
   reconnectTimer = window.setTimeout(() => {
     reconnectTimer = null;
     connect();
   }, wait);
+}
+
+function retryConnectionNow() {
+  if (terminalSocket) return;
+  if (reconnectTimer) {
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  connect();
 }
 
 async function reconcileUnavailableNetwork() {
@@ -940,6 +955,7 @@ function connect() {
       "socket",
       `The live connection to ${network} failed. e6irc will keep retrying with bounded backoff.`,
       "error",
+      { label: "Retry now", onClick: retryConnectionNow },
     );
   });
   liveSocket.addEventListener("close", (event) => {
@@ -1001,6 +1017,7 @@ function connect() {
       terminalSocket = true;
       upstreamConnected = false;
       setComposerAvailable(false);
+      clearAlert("socket");
       reconcileUnavailableNetwork();
     } else {
       showAlert(

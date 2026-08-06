@@ -73,7 +73,10 @@ survive process restart.
 **Visible failures and recovery.** History failure is shown without discarding
 the working live stream. Socket closure marks the connection disconnected.
 Malformed events are rejected or ignored according to their explicit protocol
-contract without corrupting other buffers.
+contract without corrupting other buffers. A transient socket closure keeps its
+bounded retry schedule but also offers **Retry now**; the control creates one
+fresh attachment and is removed on success. Terminal network unavailability
+remains configuration recovery, not a retry loop.
 
 **Accessibility.** Replacing a historical transcript marks the log busy and
 temporarily mutes its live region, so a buffer switch does not announce old

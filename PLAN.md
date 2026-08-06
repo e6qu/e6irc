@@ -189,6 +189,9 @@ control announces its target and unread count without duplicating badge text.
 Rejected composer requests retain no false local echo and expose a visible
 restore-for-review action rather than requiring users to discover input-history
 navigation or risking an automatic duplicate send.
+Transient browser-socket closures likewise retain bounded automatic backoff
+while offering an explicit one-shot retry, without turning terminal network
+unavailability into a futile reconnect loop.
 
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable
