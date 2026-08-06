@@ -79,6 +79,11 @@ contract without corrupting other buffers.
 temporarily mutes its live region, so a buffer switch does not announce old
 messages as new; subsequent live additions remain politely announced.
 
+**Rejected sends.** A correlated server refusal never creates a local echo or
+automatically retries. It leaves the reason visible and offers a **Restore
+message** control that places the exact text back in the composer for the user
+to review and deliberately send again.
+
 **Security and observability.** History and replay use the same owner/network
 authorization. Buffers, requested history, and deduplication indexes are
 bounded; upstream text is rendered as text, while replay/database failures are

@@ -186,6 +186,9 @@ exercises both guarantees. Web chat likewise exposes a skip-to-chat target and
 uses native controls for buffer and member activation, retaining browser-native
 keyboard and assistive-technology interaction semantics; each conversation
 control announces its target and unread count without duplicating badge text.
+Rejected composer requests retain no false local echo and expose a visible
+restore-for-review action rather than requiring users to discover input-history
+navigation or risking an automatic duplicate send.
 
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable
