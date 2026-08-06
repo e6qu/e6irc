@@ -299,26 +299,22 @@ function renderBufferList() {
   });
   for (const b of order) {
     const li = document.createElement("li");
-    li.className = "buf" + (b.key === active ? " active" : "");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "buf" + (b.key === active ? " active" : "");
+    button.setAttribute("aria-pressed", String(b.key === active));
     const label = document.createElement("span");
     label.className = "buf-name";
     label.textContent = b.key === SERVER ? "server" : b.display;
-    li.appendChild(label);
+    button.appendChild(label);
     if (b.unread > 0 && b.key !== active) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = String(b.unread);
-      li.appendChild(badge);
+      button.appendChild(badge);
     }
-    li.tabIndex = 0;
-    li.setAttribute("role", "button");
-    li.addEventListener("click", () => setActive(b.key));
-    li.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        setActive(b.key);
-      }
-    });
+    button.addEventListener("click", () => setActive(b.key));
+    li.appendChild(button);
     buffersEl.appendChild(li);
   }
 }
@@ -430,20 +426,15 @@ function renderNickList() {
   nicksEl.replaceChildren();
   for (const m of members) {
     const li = document.createElement("li");
-    li.className = "nick";
-    li.tabIndex = 0;
-    li.setAttribute("role", "button");
-    li.title = `Message ${m.name}`;
-    li.textContent = nickPrefix(m.modes) + m.name;
-    // Click / Enter opens a query buffer with this nick.
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "nick";
+    button.title = `Message ${m.name}`;
+    button.textContent = nickPrefix(m.modes) + m.name;
+    // Native button semantics make click, Enter, and Space equivalent.
     const open = () => setActive(ensureBuffer(m.name, "dm").display);
-    li.addEventListener("click", open);
-    li.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        open();
-      }
-    });
+    button.addEventListener("click", open);
+    li.appendChild(button);
     nicksEl.appendChild(li);
   }
 }
