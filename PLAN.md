@@ -184,7 +184,8 @@ a contained horizontal rail rather than a tall preamble, and long account
 identities wrap without making the document overflow; the real browser journey
 exercises both guarantees. Web chat likewise exposes a skip-to-chat target and
 uses native controls for buffer and member activation, retaining browser-native
-keyboard and assistive-technology interaction semantics.
+keyboard and assistive-technology interaction semantics; each conversation
+control announces its target and unread count without duplicating badge text.
 
 1. Establish a small in-repository design system: semantic color, spacing,
    typography, elevation, focus, status, density, and motion tokens; reusable

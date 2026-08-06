@@ -658,7 +658,7 @@ try {
 
   await page.goto(`${applicationOrigin}/?network=journey`);
   await page.locator(".buf-name").filter({ hasText: /^#journey$/ }).waitFor();
-  const journeyBuffer = page.getByRole("button", { name: "#journey", exact: true });
+  const journeyBuffer = page.getByRole("button", { name: "Open #journey", exact: true });
   assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
   assert.equal(await journeyBuffer.getAttribute("aria-pressed"), "true");
   const skipToChat = page.getByRole("link", { name: "Skip to chat", exact: true });
