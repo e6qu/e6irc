@@ -870,10 +870,17 @@ try {
   let mockSocket;
   const clientFrames = [];
   let rejectedSendAttempts = 0;
+  let socketConnections = 0;
+  let resolveManualReconnect;
+  const manualReconnect = new Promise((resolve) => {
+    resolveManualReconnect = resolve;
+  });
   let snapshotSent = false;
   let namesRequestedBeforeSnapshot = false;
   await page.routeWebSocket(/\/ws\/ui\?network=demo$/, (webSocket) => {
     mockSocket = webSocket;
+    socketConnections += 1;
+    if (socketConnections === 2) resolveManualReconnect();
     webSocket.onMessage((frame) => {
       const value = typeof frame === "string" ? frame : frame.toString();
       clientFrames.push(value);
@@ -919,31 +926,35 @@ try {
       }
     });
     webSocket.send(JSON.stringify({ t: "status", v: "connected" }));
-    webSocket.send(
-      JSON.stringify({
-        t: "line",
-        v: ":irc.example 001 webnick :Welcome",
-      }),
-    );
-    webSocket.send(
-      JSON.stringify({
-        t: "line",
-        v: ":webnick!u@h JOIN #room",
-      }),
-    );
-    webSocket.send(
-      JSON.stringify({
-        t: "line",
-        v: "@time=2026-07-28T20:00:00.000Z;msgid=shared :alice!u@h PRIVMSG #room :initial tagged",
-      }),
-    );
-    // Leave a real scheduling gap: a regression that requests NAMES while
-    // replay is still arriving is observable rather than hidden by a
-    // synchronous mock burst.
-    setTimeout(() => {
-      snapshotSent = true;
+    if (socketConnections === 1) {
+      webSocket.send(
+        JSON.stringify({
+          t: "line",
+          v: ":irc.example 001 webnick :Welcome",
+        }),
+      );
+      webSocket.send(
+        JSON.stringify({
+          t: "line",
+          v: ":webnick!u@h JOIN #room",
+        }),
+      );
+      webSocket.send(
+        JSON.stringify({
+          t: "line",
+          v: "@time=2026-07-28T20:00:00.000Z;msgid=shared :alice!u@h PRIVMSG #room :initial tagged",
+        }),
+      );
+      // Leave a real scheduling gap: a regression that requests NAMES while
+      // replay is still arriving is observable rather than hidden by a
+      // synchronous mock burst.
+      setTimeout(() => {
+        snapshotSent = true;
+        webSocket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
+      }, 25);
+    } else {
       webSocket.send(JSON.stringify({ t: "snapshot", v: "complete" }));
-    }, 25);
+    }
   });
   await page.goto(`${applicationOrigin}/?network=demo`);
   await page.getByText("#room", { exact: true }).first().waitFor();
@@ -1019,6 +1030,16 @@ try {
   await page.getByText("rejected without a false echo", { exact: true }).waitFor();
   assert.equal(await page.getByText("rejected without a false echo", { exact: true }).count(), 1);
   assert.equal(rejectedSendAttempts, 2, "the message was resent only after the explicit action");
+
+  // A user can skip the reconnect countdown after a transient browser-socket
+  // loss. One click creates one fresh attachment; terminal network failures
+  // use their separate configuration-recovery path.
+  mockSocket.close({ code: 1011, reason: "synthetic interruption" });
+  await page.getByRole("button", { name: "Retry now" }).waitFor();
+  await page.getByRole("button", { name: "Retry now" }).click();
+  await manualReconnect;
+  await page.getByText("demo: upstream connected", { exact: true }).waitFor();
+  assert.equal(socketConnections, 2, "manual retry created exactly one replacement socket");
 
   // A later NAMES snapshot is authoritative: bob and alice disappear, carol
   // appears, and the list/count cannot retain stale members.
