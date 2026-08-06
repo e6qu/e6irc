@@ -85,13 +85,19 @@ function showAlert(key, text, tone = "warning", action = null) {
   }
   alert.className = `alert alert-${tone}`;
   alert.firstElementChild.textContent = text;
-  const existingAction = alert.querySelector("a");
+  const existingAction = alert.querySelector(".alert-action");
   if (existingAction) existingAction.remove();
   if (action) {
-    const link = document.createElement("a");
-    link.href = action.href;
-    link.textContent = action.label;
-    alert.insertBefore(link, alert.lastElementChild);
+    const control = action.href ? document.createElement("a") : document.createElement("button");
+    control.className = "alert-action";
+    control.textContent = action.label;
+    if (action.href) {
+      control.href = action.href;
+    } else {
+      control.type = "button";
+      control.addEventListener("click", action.onClick);
+    }
+    alert.insertBefore(control, alert.lastElementChild);
   }
 }
 
@@ -169,8 +175,27 @@ function rejectPendingSend(requestId, message) {
   pendingSends.delete(requestId);
   rememberSentText(pending.text);
   addServer(message || "Message was not sent.");
-  showAlert("send", message || "Message was not sent.", "error");
+  showAlert(
+    "send",
+    message || "Message was not sent.",
+    "error",
+    {
+      label: "Restore message",
+      onClick: () => restoreRejectedMessage(pending.text),
+    },
+  );
   return true;
+}
+
+// A server rejection is an explicit no-send verdict, not permission to retry
+// automatically. Restore the exact text for review in the composer, where the
+// user remains in control of editing and sending it again.
+function restoreRejectedMessage(text) {
+  messageInput.value = text;
+  historyIdx = -1;
+  historyDraft = "";
+  messageInput.focus();
+  showAlert("send", "Message restored. Review it, then send when ready.", "warning");
 }
 
 function rejectAllPendingSends(reason) {

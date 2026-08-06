@@ -869,6 +869,7 @@ try {
   });
   let mockSocket;
   const clientFrames = [];
+  let rejectedSendAttempts = 0;
   let snapshotSent = false;
   let namesRequestedBeforeSnapshot = false;
   await page.routeWebSocket(/\/ws\/ui\?network=demo$/, (webSocket) => {
@@ -883,13 +884,16 @@ try {
           webSocket.send(JSON.stringify({ t: "sent", v: request.id }));
         }, 75);
       } else if (request.id && command === "rejected without a false echo") {
-        webSocket.send(
-          JSON.stringify({
-            t: "send-error",
-            v: request.id,
-            message: "synthetic upstream refusal; nothing was sent",
-          }),
-        );
+        rejectedSendAttempts += 1;
+        webSocket.send(JSON.stringify(
+          rejectedSendAttempts === 1
+            ? {
+                t: "send-error",
+                v: request.id,
+                message: "synthetic upstream refusal; nothing was sent",
+              }
+            : { t: "sent", v: request.id },
+        ));
       }
       if (command === "/raw NAMES #room") {
         if (!snapshotSent) namesRequestedBeforeSnapshot = true;
@@ -1006,6 +1010,15 @@ try {
   await page.locator("#composer button[type=submit]").click();
   await page.getByText("synthetic upstream refusal; nothing was sent", { exact: true }).waitFor();
   assert.equal(await page.getByText("rejected without a false echo", { exact: true }).count(), 0);
+  // A refusal never auto-retries (which could duplicate a message if a
+  // transport verdict arrived late). It exposes the exact text for deliberate
+  // review and resend instead.
+  await page.getByRole("button", { name: "Restore message" }).click();
+  assert.equal(await page.locator("#message").inputValue(), "rejected without a false echo");
+  await page.locator("#composer button[type=submit]").click();
+  await page.getByText("rejected without a false echo", { exact: true }).waitFor();
+  assert.equal(await page.getByText("rejected without a false echo", { exact: true }).count(), 1);
+  assert.equal(rejectedSendAttempts, 2, "the message was resent only after the explicit action");
 
   // A later NAMES snapshot is authoritative: bob and alice disappear, carol
   // appears, and the list/count cannot retain stale members.
