@@ -303,14 +303,20 @@ function renderBufferList() {
     button.type = "button";
     button.className = "buf" + (b.key === active ? " active" : "");
     button.setAttribute("aria-pressed", String(b.key === active));
+    const bufferName = b.key === SERVER ? "server" : b.display;
+    const unreadLabel = b.unread > 0 && b.key !== active
+      ? `, ${b.unread} unread message${b.unread === 1 ? "" : "s"}`
+      : "";
+    button.setAttribute("aria-label", `Open ${bufferName}${unreadLabel}`);
     const label = document.createElement("span");
     label.className = "buf-name";
-    label.textContent = b.key === SERVER ? "server" : b.display;
+    label.textContent = bufferName;
     button.appendChild(label);
     if (b.unread > 0 && b.key !== active) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = String(b.unread);
+      badge.setAttribute("aria-hidden", "true");
       button.appendChild(badge);
     }
     button.addEventListener("click", () => setActive(b.key));
