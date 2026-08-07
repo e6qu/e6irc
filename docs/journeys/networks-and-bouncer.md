@@ -91,6 +91,9 @@ credentials are supplied.
 - A transient owner-network directory read leaves the table semantics intact,
   announces the API problem, and offers an in-place **Retry**. It never asks
   the operator to reload the document or substitutes a rendered-list fallback.
+- A transient network-detail read leaves the shell and diagnostics visible,
+  announces the API problem, and offers an in-place **Retry** before exposing
+  stored configuration or mutation controls.
 
 **Security and observability.** The mutation is owner-scoped and
 CSRF-protected. Endpoints pass syntax, prohibited-address, DNS-result, and TLS
