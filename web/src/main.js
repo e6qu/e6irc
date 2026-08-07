@@ -52,6 +52,7 @@ const messageInput = el("message");
 const alertsEl = el("alerts");
 const networkSelect = el("network-select");
 const sidebarToggle = el("sidebar-toggle");
+const sidebarEl = el("sidebar");
 const jumpLatestButton = el("jump-latest");
 const sendButton = composer.querySelector("button[type=submit]");
 const joinButton = el("join-form")?.querySelector("button[type=submit]");
@@ -224,17 +225,26 @@ function setComposerAvailable(available) {
   if (joinButton) joinButton.disabled = !available;
 }
 
-function closeMobileSidebar() {
+function closeMobileSidebar({ restoreFocus = false } = {}) {
   document.body.classList.remove("sidebar-open");
   if (sidebarToggle) sidebarToggle.setAttribute("aria-expanded", "false");
+  if (restoreFocus) sidebarToggle?.focus();
 }
 
 if (sidebarToggle) {
   sidebarToggle.addEventListener("click", () => {
     const open = document.body.classList.toggle("sidebar-open");
     sidebarToggle.setAttribute("aria-expanded", String(open));
+    if (open) sidebarEl?.querySelector(".buf")?.focus();
   });
 }
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
+    event.preventDefault();
+    closeMobileSidebar({ restoreFocus: true });
+  }
+});
 
 function requestNames(buffer) {
   if (

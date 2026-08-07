@@ -1247,6 +1247,28 @@ try {
     { theme: "dark", notifications: false },
   );
 
+  // On a narrow screen, the conversation rail is a focused, dismissible
+  // destination instead of a permanently hidden list. Escape returns to the
+  // trigger; choosing a conversation closes the rail and restores the
+  // composer as the next chat action.
+  await page.setViewportSize({ width: 400, height: 700 });
+  const conversations = page.getByRole("button", { name: "Conversations" });
+  await conversations.click();
+  assert.equal(await conversations.getAttribute("aria-expanded"), "true");
+  assert.equal(
+    await page.evaluate(() => document.activeElement?.classList.contains("buf")),
+    true,
+    "opening Conversations did not focus a buffer",
+  );
+  await page.keyboard.press("Escape");
+  assert.equal(await conversations.getAttribute("aria-expanded"), "false");
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "sidebar-toggle");
+  await conversations.click();
+  await page.locator(".buf-name").filter({ hasText: /^#room$/ }).click();
+  assert.equal(await conversations.getAttribute("aria-expanded"), "false");
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "message");
+  await page.setViewportSize({ width: 1280, height: 720 });
+
   await page.locator(".buf-name").filter({ hasText: /^bob$/ }).click();
   assert.equal(await page.locator("#buffer-action").textContent(), "Close");
   await page.locator("#buffer-action").click();

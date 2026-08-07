@@ -31,6 +31,9 @@ available; at least one owned/shared network is enabled for chat.
 7. Each conversation control names its target, unread count, and any unread
    direct mentions. Decorative numeric and mention badges are not announced a
    second time; opening that conversation clears its own counters.
+8. On narrow screens, **Conversations** opens the buffer rail with focus on a
+   conversation. Escape closes it and restores the trigger; choosing a buffer
+   closes the rail and returns focus to the composer.
 
 **Visible failures and recovery.** An expired session redirects to login.
 REST failure, WebSocket authentication failure, absent/disabled network,
