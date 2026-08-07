@@ -223,7 +223,33 @@ try {
   // self-service form, sign out, and submit the actual local-login page in
   // Chromium. This closes the browser boundary that the HTTP credential tests
   // cannot cross.
+  let tokenDirectoryReads = 0;
+  const tokenFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/me/tokens`, async (route) => {
+    tokenDirectoryReads += 1;
+    if (tokenDirectoryReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Token storage unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
   await page.goto(`${applicationOrigin}/console/account`);
+  const tokenFailure = page.locator("#account-token-rows [role=status]");
+  await tokenFailure.waitFor();
+  assert.match(await tokenFailure.innerText(), /Token storage unavailable/);
+  await page.locator("#account-token-rows").getByRole("button", { name: "Retry", exact: true }).click();
+  await page.getByText("No personal access tokens.", { exact: true }).waitFor();
+  assert.equal(tokenDirectoryReads, 2, "Retry made exactly one replacement token request");
+  assert.deepEqual(
+    applicationErrors.splice(tokenFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/me/tokens`],
+    "the deliberate token failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/me/tokens`);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   // Console and chat deliberately share one typed local preference document.
   // Exercise the console's own control through a persisted choice, a reload,

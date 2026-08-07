@@ -211,6 +211,13 @@
     return parent;
   };
 
+  const retryButton = (retry) => {
+    const button = element("button", "secondary-link", "Retry");
+    button.type = "button";
+    button.addEventListener("click", retry);
+    return button;
+  };
+
   const tableLoadFailure = (body, columns, error, retry) => {
     body.replaceChildren();
     const row = document.createElement("tr");
@@ -221,12 +228,18 @@
     status.setAttribute("aria-live", "polite");
     const message = error instanceof Error ? error.message : "The directory failed to load.";
     status.textContent = `${message} `;
-    const button = element("button", "secondary-link", "Retry");
-    button.type = "button";
-    button.addEventListener("click", retry);
-    cell.append(status, button);
+    cell.append(status, retryButton(retry));
     row.append(cell);
     body.append(row);
+  };
+
+  const listLoadFailure = (host, error, retry) => {
+    host.replaceChildren();
+    const status = element("p", "empty");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = error instanceof Error ? error.message : "The section failed to load.";
+    host.append(status, retryButton(retry));
   };
 
   const monitoringEmpty = (message) => element("div", "chart-empty", message);
@@ -1296,6 +1309,14 @@
     accountResult.textContent = message;
     accountResult.className = success ? "banner-success" : "banner-error";
   };
+  const accountLoadFailure = (error, retry) => {
+    if (!accountResult) return;
+    accountResult.replaceChildren(
+      element("span", "", error instanceof Error ? error.message : "Account data failed to load."),
+      retryButton(retry),
+    );
+    accountResult.className = "banner-error";
+  };
 
   const showAccountSecret = (kind, value) => {
     if (!accountSecret) return;
@@ -1394,7 +1415,7 @@
               const credentials = Array.isArray(updated.credentials) ? updated.credentials : [];
               renderPassword(credentials.some((credential) => credential.kind === "local_password"));
               renderCredentials(credentials);
-            }).catch((error) => setAccountResult(error instanceof Error ? error.message : "Credential list failed to refresh.", false));
+            }).catch(() => void refreshAccountAccess());
           });
       });
       passwordPanel.replaceChildren(append(element("div", "panel-head"), append(element("div"), element("h2", "", title), element("p", "", description)), element("span", "tag", "Argon2id")), form);
@@ -1457,13 +1478,23 @@
         identityList.append(card);
       }
     };
-    void Promise.all([apiRead("/api/v1/me/credentials"), apiRead("/api/v1/me/identities")])
-      .then(([credentialResult, identityResult]) => {
+    const refreshAccountAccess = async () => {
+      try {
+        const [credentialResult, identityResult] = await Promise.all([
+          apiRead("/api/v1/me/credentials"),
+          apiRead("/api/v1/me/identities"),
+        ]);
         const credentials = Array.isArray(credentialResult.credentials) ? credentialResult.credentials : [];
         const hasLocalPassword = credentials.some((credential) => credential.kind === "local_password");
         renderPassword(hasLocalPassword); renderCredentials(credentials); renderIdentities(identityResult, hasLocalPassword);
-      })
-      .catch((error) => setAccountResult(error instanceof Error ? error.message : "Account data failed to load.", false));
+      } catch (error) {
+        if (passwordPanel instanceof HTMLElement) listLoadFailure(passwordPanel, error, () => void refreshAccountAccess());
+        if (credentialRows instanceof HTMLElement) tableLoadFailure(credentialRows, 5, error, () => void refreshAccountAccess());
+        if (identityList instanceof HTMLElement) listLoadFailure(identityList, error, () => void refreshAccountAccess());
+        if (linkProviders instanceof HTMLElement) linkProviders.replaceChildren();
+      }
+    };
+    void refreshAccountAccess();
   }
 
   for (const form of document.querySelectorAll("[data-api-account-profile]")) {
@@ -1477,12 +1508,15 @@
 
   const accountContactEmail = document.querySelector("[data-api-account-contact-email]");
   if (accountContactEmail instanceof HTMLInputElement) {
-    void apiRead("/api/v1/me/profile")
-      .then((profile) => { accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : ""; })
-      .catch((error) => setAccountResult(
-        error instanceof Error ? error.message : "Contact email failed to load.",
-        false,
-      ));
+    const refreshContactEmail = async () => {
+      try {
+        const profile = await apiRead("/api/v1/me/profile");
+        accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+      } catch (error) {
+        accountLoadFailure(error, () => void refreshContactEmail());
+      }
+    };
+    void refreshContactEmail();
   }
 
   for (const form of document.querySelectorAll("[data-api-account-password]")) {
@@ -1543,8 +1577,9 @@
 
   const accountTokenRows = document.querySelector("[data-api-account-token-list]");
   if (accountTokenRows instanceof HTMLElement) {
-    void apiRead("/api/v1/me/tokens")
-      .then((result) => {
+    const refreshTokens = async () => {
+      try {
+        const result = await apiRead("/api/v1/me/tokens");
         const tokens = Array.isArray(result.tokens) ? result.tokens : [];
         accountTokenRows.replaceChildren();
         const count = document.getElementById("account-token-count");
@@ -1587,12 +1622,11 @@
           row.append(actions);
           accountTokenRows.append(row);
         }
-      })
-      .catch((error) => {
-        accountTokenRows.textContent = error instanceof Error
-          ? error.message
-          : "Personal access tokens failed to load.";
-      });
+      } catch (error) {
+        tableLoadFailure(accountTokenRows, 5, error, () => void refreshTokens());
+      }
+    };
+    void refreshTokens();
   }
 
   for (const form of document.querySelectorAll("[data-api-account-delete]")) {
@@ -1614,8 +1648,9 @@
 
   const accountSecurityActivityRows = document.querySelector("[data-api-account-security-activity-list]");
   if (accountSecurityActivityRows instanceof HTMLElement) {
-    void apiRead("/api/v1/me/security-activity?limit=50")
-      .then((result) => {
+    const refreshSecurityActivity = async () => {
+      try {
+        const result = await apiRead("/api/v1/me/security-activity?limit=50");
         const activity = Array.isArray(result.activity) ? result.activity : [];
         accountSecurityActivityRows.replaceChildren();
         const count = document.getElementById("account-security-activity-count");
@@ -1641,18 +1676,18 @@
             });
           accountSecurityActivityRows.append(row);
         }
-      })
-      .catch((error) => {
-        accountSecurityActivityRows.textContent = error instanceof Error
-          ? error.message
-          : "Security activity failed to load.";
-      });
+      } catch (error) {
+        tableLoadFailure(accountSecurityActivityRows, 5, error, () => void refreshSecurityActivity());
+      }
+    };
+    void refreshSecurityActivity();
   }
 
   const accountReadMarkers = document.querySelector("[data-api-account-read-marker-list]");
   if (accountReadMarkers instanceof HTMLElement) {
-    void apiRead("/api/v1/me/read-markers")
-      .then((result) => {
+    const refreshReadMarkers = async () => {
+      try {
+        const result = await apiRead("/api/v1/me/read-markers");
         const markers = Array.isArray(result.markers) ? result.markers : [];
         accountReadMarkers.replaceChildren();
         const count = document.getElementById("account-read-marker-count");
@@ -1673,12 +1708,11 @@
           entry.append(target, timestamp);
           accountReadMarkers.append(entry);
         }
-      })
-      .catch((error) => {
-        accountReadMarkers.textContent = error instanceof Error
-          ? error.message
-          : "Read markers failed to load.";
-      });
+      } catch (error) {
+        listLoadFailure(accountReadMarkers, error, () => void refreshReadMarkers());
+      }
+    };
+    void refreshReadMarkers();
   }
 
   const adminAccountResult = document.getElementById("admin-account-api-result");
