@@ -70,8 +70,9 @@ creating the first durable administrator.
 **Visible failures and recovery.** Missing/invalid configuration, migration
 failure, unavailable PostgreSQL, unreadable/wrong secret key, persisted
 configuration incompatibility, bind failure, invalid bootstrap token, and an
-already-consumed bootstrap produce specific errors. First-account creation is
-atomic, and there is no in-memory fallback for a configured database.
+already-consumed bootstrap produce specific errors. A failed administrator
+configuration read is announced and retryable in place. First-account creation
+is atomic, and there is no in-memory fallback for a configured database.
 
 **Security and observability.** Secrets enter through files/environment or the
 external key source, never the image or managed configuration plaintext. Logs
