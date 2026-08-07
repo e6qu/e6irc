@@ -199,6 +199,28 @@
     return apiJson(response);
   };
 
+  const optionalString = (value) => value === null || typeof value === "string";
+
+  const parseOwnerNetwork = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The network response is invalid. Reload and try again.");
+    const network = value;
+    if (
+      typeof network.name !== "string"
+      || !["irc", "local", "matrix", "discord", "slack"].includes(network.kind)
+      || typeof network.addr !== "string"
+      || typeof network.nick !== "string"
+      || !Array.isArray(network.autojoin)
+      || !network.autojoin.every((channel) => typeof channel === "string")
+      || typeof network.tls !== "boolean"
+      || typeof network.enabled !== "boolean"
+      || !optionalString(network.realname)
+      || !optionalString(network.sasl_account)
+      || typeof network.has_sasl_account !== "boolean"
+      || typeof network.has_sasl_password !== "boolean"
+    ) throw new Error("The network response is invalid. Reload and try again.");
+    return network;
+  };
+
   const element = (name, className, text) => {
     const node = document.createElement(name);
     if (className) node.className = className;
@@ -2172,18 +2194,30 @@
   if (ownerNetworkEditor instanceof HTMLElement) {
     const name = ownerNetworkEditor.dataset.networkName || "";
     const form = ownerNetworkEditor.querySelector("[data-api-owner-network-update]");
-    const fail = (message) => setOwnerNetworkResult(message, false);
-    if (!name || !(form instanceof HTMLFormElement)) fail("This network editor has no resource ID. Return to the network directory and try again."); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
-      .then((network) => {
-        if (!network || network.kind !== "irc" || typeof network.name !== "string" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin) || typeof network.tls !== "boolean") { window.location.replace("/console/networks"); return; }
-        const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
-        set("addr", network.addr); set("nick", network.nick); set("realname", typeof network.realname === "string" ? network.realname : ""); set("autojoin", network.autojoin.join(", ")); set("sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
-        const tls = form.elements.namedItem("tls"); if (tls instanceof HTMLInputElement) tls.checked = network.tls;
-        form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
-        const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
-        form.hidden = false;
-      })
-      .catch((error) => fail(error instanceof Error ? error.message : "Network configuration failed to load."));
+    const showFailure = (error, retry) => {
+      if (!(ownerNetworkResult instanceof HTMLElement)) return;
+      ownerNetworkResult.replaceChildren(element("span", "", error instanceof Error ? error.message : "Network configuration failed to load."), retryButton(retry));
+      ownerNetworkResult.className = "banner-error";
+    };
+    const render = (network) => {
+      network = parseOwnerNetwork(network);
+      if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
+      if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
+      const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
+      set("addr", network.addr); set("nick", network.nick); set("realname", typeof network.realname === "string" ? network.realname : ""); set("autojoin", network.autojoin.join(", ")); set("sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
+      const tls = form.elements.namedItem("tls"); if (tls instanceof HTMLInputElement) tls.checked = network.tls;
+      form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
+      const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
+      form.hidden = false;
+    };
+    const refreshOwnerNetworkEditor = async () => {
+      try {
+        render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
+      } catch (error) {
+        showFailure(error, () => void refreshOwnerNetworkEditor());
+      }
+    };
+    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This network editor has no resource ID. Return to the network directory and try again.", false); else void refreshOwnerNetworkEditor();
   }
 
   const ownerBridgeEditor = document.querySelector("[data-api-owner-bridge-editor]");
@@ -2192,7 +2226,8 @@
     const form = ownerBridgeEditor.querySelector("[data-api-owner-bridge-update]");
     if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
       .then((network) => {
-        if (!network || typeof network.name !== "string" || typeof network.kind !== "string" || network.kind === "irc" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin)) { window.location.replace("/console/integrations"); return; }
+        network = parseOwnerNetwork(network);
+        if (!["matrix", "discord", "slack"].includes(network.kind)) { window.location.replace("/console/integrations"); return; }
         const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
         set("addr", network.addr); set("nick", network.nick); set("autojoin", network.autojoin.join(", "));
         const nick = ownerBridgeEditor.querySelector("[data-bridge-nick]"); if (nick instanceof HTMLElement) nick.hidden = !network.nick;
@@ -2236,7 +2271,7 @@
       detailResult.className = "banner-error";
     };
     const render = (network) => {
-      if (!network || typeof network.name !== "string" || typeof network.kind !== "string" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin) || typeof network.enabled !== "boolean" || typeof network.tls !== "boolean") throw new Error("The network response is invalid. Reload and try again.");
+      network = parseOwnerNetwork(network);
       if (detailResult instanceof HTMLElement) { detailResult.replaceChildren(); detailResult.className = ""; }
       const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
       const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;

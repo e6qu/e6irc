@@ -134,7 +134,11 @@ announced and retryable in place before the stored configuration or mutation
 controls are exposed.
 The owner IRC network editor follows the same boundary: its document contains
 only the authenticated shell and URL identifier, while the typed owner-network
-resource populates the editable fields and mutation target in the browser.
+resource populates the editable fields and mutation target in the browser. A
+temporary read failure is announced and retryable in place before fields or
+controls are exposed. Its editor, bridge-editor, and detail consumers parse the
+same closed owner-network wire shape at the API boundary, so malformed payloads
+have one explicit retryable failure path rather than divergent ad-hoc checks.
 Administrator bridge editors likewise hydrate their typed provider fields and
 credential-presence explanations from the canonical owner-network resource.
 The administrator integrations directory now reads its stored and shared bridge

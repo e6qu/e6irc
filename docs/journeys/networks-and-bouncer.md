@@ -251,7 +251,9 @@ are ready, and a master key exists for any credential replacement.
 
 **Visible failures and recovery.** Every transition reports conflict,
 validation, storage, or runtime failure. A stale runtime handle, leaked task,
-or partial rename is not an accepted state.
+or partial rename is not an accepted state. A transient editor read announces
+the API problem and offers an in-place **Retry** before exposing editable
+configuration or mutation controls.
 
 **Security and observability.** Console mutations are CSRF-protected and API
 mutations require owner authentication. The mutation gate serializes storage
