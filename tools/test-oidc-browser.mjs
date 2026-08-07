@@ -766,6 +766,34 @@ try {
   // directions. The local upstream is a protocol peer, not a browser route
   // replacement: this crosses browser → REST/console → PostgreSQL → registry →
   // IRC driver → TCP peer and back through the multiplexer/WebSocket.
+  let ownerNetworkReads = 0;
+  const ownerNetworkFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/me/networks`, async (route) => {
+    ownerNetworkReads += 1;
+    if (ownerNetworkReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Network directory unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.goto(`${applicationOrigin}/console/networks`);
+  const ownerNetworkFailure = page.locator("#network-rows [role=status]");
+  await ownerNetworkFailure.waitFor();
+  assert.match(await ownerNetworkFailure.innerText(), /Network directory unavailable/);
+  await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
+  await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
+  assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
+  assert.deepEqual(
+    applicationErrors.splice(ownerNetworkFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/me/networks`],
+    "the deliberate owner-network failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/me/networks`);
+
   const networkReadStart = applicationRequests.length;
   const networkListRead = page.waitForResponse(
     (response) => response.url() === `${applicationOrigin}/api/v1/me/networks` && response.status() === 200,

@@ -88,6 +88,9 @@ credentials are supplied.
   A stored row is not misreported as connected.
 - A synchronous driver-construction failure happens before insertion. Once
   storage succeeds, registry insertion owns the running/retrying driver.
+- A transient owner-network directory read leaves the table semantics intact,
+  announces the API problem, and offers an in-place **Retry**. It never asks
+  the operator to reload the document or substitutes a rendered-list fallback.
 
 **Security and observability.** The mutation is owner-scoped and
 CSRF-protected. Endpoints pass syntax, prohibited-address, DNS-result, and TLS

@@ -117,7 +117,9 @@ networks, registered channels, server bans, and audit history) share
 same-origin request helpers for authentication context, problem decoding, and
 bounded JSON response decoding. The owner-network list no longer has a
 parallel rendered refresh route; it renders solely from its canonical API
-resource.
+resource. A failed owner-network directory read preserves table semantics,
+announces the decoded API problem, and offers an in-place retry rather than
+requiring a document reload.
 The administrator overview likewise composes its bounded stats, directory,
 policy, and audit resources in the browser rather than rendering a parallel
 server-side snapshot.
