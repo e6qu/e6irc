@@ -138,6 +138,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     assertion panics on), an injection byte is data the core must handle rather
     than abort the shared worker on, so it is neutralized in all builds, not
     asserted against.
+  - `ComposerResult` — a web-composer response is either `Sent` or `Rejected`;
+    success cannot carry an error and rejection always has one.
   - `CredentialOrigin` — a credential-verify verdict (`PasswordVerified` /
     `PasswordRejected` / `Unavailable`) answers *either* a SASL `AUTHENTICATE`
     or a NickServ `IDENTIFY`; the request carries which, echoed onto the reply,
