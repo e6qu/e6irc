@@ -94,7 +94,8 @@ audit state.
 - **Audit log** filters immutable privileged/configuration actions by stable
   fields.
 - Overview presents bounded newest/recent slices and links to the full
-  explorers.
+  explorers; if any component API read fails, it announces the problem and
+  retries the complete bounded snapshot in place.
 
 **Visible failures and recovery.** Non-administrators are rejected at every
 handler/API. Filter sizes, page sizes, and cursor shapes are bounded and
