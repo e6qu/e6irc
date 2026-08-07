@@ -1008,9 +1008,17 @@
 
   const configurationRoot = document.querySelector("[data-api-configuration-read]");
   if (configurationRoot instanceof HTMLElement) {
-    void apiRead("/api/v1/admin/configuration")
-      .then((view) => renderConfiguration(configurationRoot, view))
-      .catch((error) => setConfigurationResult(`Configuration failed to load (${error instanceof Error ? error.message : "unknown error"}). Reload to retry.`, false));
+    const refreshConfiguration = async () => {
+      try {
+        renderConfiguration(configurationRoot, await apiRead("/api/v1/admin/configuration"));
+      } catch (error) {
+        const result = document.getElementById("configuration-api-result");
+        if (!(result instanceof HTMLElement)) return;
+        result.replaceChildren(element("span", "", error instanceof Error ? error.message : "Configuration failed to load."), retryButton(() => void refreshConfiguration()));
+        result.className = "banner-error";
+      }
+    };
+    void refreshConfiguration();
   }
 
   const banResult = document.getElementById("ban-api-result");
