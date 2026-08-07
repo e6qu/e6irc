@@ -772,9 +772,9 @@ try {
     ownerNetworkReads += 1;
     if (ownerNetworkReads === 1) {
       await route.fulfill({
-        status: 503,
-        contentType: "application/problem+json",
-        body: JSON.stringify({ status: 503, title: "Network directory unavailable" }),
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ networks: {} }),
       });
     } else {
       await route.continue();
@@ -783,14 +783,14 @@ try {
   await page.goto(`${applicationOrigin}/console/networks`);
   const ownerNetworkFailure = page.locator("#network-rows [role=status]");
   await ownerNetworkFailure.waitFor();
-  assert.match(await ownerNetworkFailure.innerText(), /Network directory unavailable/);
+  assert.match(await ownerNetworkFailure.innerText(), /network directory response is invalid/i);
   await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
   assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
   assert.deepEqual(
     applicationErrors.splice(ownerNetworkFailureErrorStart),
-    [`503 GET ${applicationOrigin}/api/v1/me/networks`],
-    "the deliberate owner-network failure was the only browser diagnostic during recovery",
+    [],
+    "the malformed successful response stayed an explicit in-document recovery state",
   );
   await page.unroute(`${applicationOrigin}/api/v1/me/networks`);
 
