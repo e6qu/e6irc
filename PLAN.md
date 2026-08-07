@@ -120,6 +120,9 @@ parallel rendered refresh route; it renders solely from its canonical API
 resource. A failed owner-network directory read preserves table semantics,
 announces the decoded API problem, and offers an in-place retry rather than
 requiring a document reload.
+Every API-hydrated console collection now parses its required array field at
+the boundary; a malformed successful response is a visible retryable contract
+failure, never a misleading empty state.
 The administrator overview likewise composes its bounded stats, directory,
 policy, and audit resources in the browser rather than rendering a parallel
 server-side snapshot.

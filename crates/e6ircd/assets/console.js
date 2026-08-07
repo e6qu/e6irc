@@ -221,6 +221,13 @@
     return network;
   };
 
+  const apiCollection = (value, field, label) => {
+    if (!value || typeof value !== "object" || Array.isArray(value) || !Array.isArray(value[field])) {
+      throw new Error(`The ${label} response is invalid. Reload and try again.`);
+    }
+    return value[field];
+  };
+
   const element = (name, className, text) => {
     const node = document.createElement(name);
     if (className) node.className = className;
@@ -1049,7 +1056,7 @@
     const refreshBanDirectory = async () => {
       try {
         const result = await apiRead(`/api/v1/admin/bans${window.location.search}`);
-        const bans = Array.isArray(result.bans) ? result.bans : [];
+        const bans = apiCollection(result, "bans", "server-ban directory");
         adminBanRows.replaceChildren();
         const count = document.getElementById("admin-ban-count");
         if (count) count.textContent = String(bans.length);
@@ -1859,7 +1866,7 @@
     const refreshAdminNetworks = async () => {
       try {
         const result = await apiRead("/api/v1/admin/networks");
-        renderAdminNetworks(Array.isArray(result.networks) ? result.networks : []);
+        renderAdminNetworks(apiCollection(result, "networks", "network directory"));
       } catch (error) {
         tableLoadFailure(adminNetworkRows, 9, error, () => void refreshAdminNetworks());
       }
@@ -2011,7 +2018,7 @@
     }
     try {
       const result = await apiRead("/api/v1/me/networks");
-      renderOwnerNetworks(Array.isArray(result.networks) ? result.networks : []);
+      renderOwnerNetworks(apiCollection(result, "networks", "network directory"));
       if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
     } catch (error) {
       renderOwnerNetworkFailure(error, () => void refreshOwnerNetworks());
@@ -2180,7 +2187,7 @@
     const refreshIntegrations = async () => {
       try {
         const result = await apiRead("/api/v1/admin/networks");
-        render(Array.isArray(result.networks) ? result.networks : []);
+        render(apiCollection(result, "networks", "integration directory"));
       } catch (error) {
         integrations.querySelectorAll("[data-integration-list]").forEach((target) => {
           if (target instanceof HTMLElement) listLoadFailure(target, error, () => void refreshIntegrations());
@@ -2302,7 +2309,7 @@
     const refreshChannelDirectory = async () => {
       try {
         const result = await apiRead(`/api/v1/admin/channels${window.location.search}`);
-        const channels = Array.isArray(result.channels) ? result.channels : [];
+        const channels = apiCollection(result, "channels", "channel directory");
         const pager = document.getElementById("admin-channel-pager");
         if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${query}`; link.textContent = "Older registrations"; pager.append(link); } }
         adminChannelRows.replaceChildren();
@@ -2321,7 +2328,7 @@
     const refreshAuditDirectory = async () => {
       try {
         const result = await apiRead(`/api/v1/admin/audit${window.location.search}`);
-        const entries = Array.isArray(result.audit) ? result.audit : [];
+        const entries = apiCollection(result, "audit", "audit directory");
         adminAuditRows.replaceChildren();
         const count = document.getElementById("admin-audit-count");
         if (count) count.textContent = String(entries.length);
@@ -2409,7 +2416,7 @@
       node.addEventListener("submit", (event) => { event.preventDefault(); void run(node); });
     };
     void apiRead("/api/v1/me/channels").then((result) => {
-      const channels = Array.isArray(result.channels) ? result.channels : [];
+      const channels = apiCollection(result, "channels", "channel directory");
       ownedChannelList.replaceChildren();
       const count = document.getElementById("owned-channel-count"); if (count) count.textContent = `${channels.length} owned`;
       if (!channels.length) { ownedChannelList.append(append(element("section", "panel"), element("h2", "", "No channels registered to this account"), element("p", "empty", "Channels registered above appear here after storage confirms ownership."))); return; }
