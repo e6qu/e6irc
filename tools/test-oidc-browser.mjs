@@ -957,6 +957,34 @@ try {
     "network Operations used a rendered console fragment instead of its API resource",
   );
 
+  let ownerNetworkEditorReads = 0;
+  const ownerNetworkEditorFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/me/networks/journey`, async (route) => {
+    ownerNetworkEditorReads += 1;
+    if (ownerNetworkEditorReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Network editor unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.goto(`${applicationOrigin}/console/networks/journey/edit`);
+  const ownerNetworkEditorFailure = page.locator("#network-api-result");
+  await ownerNetworkEditorFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  assert.match(await ownerNetworkEditorFailure.innerText(), /Network editor unavailable/);
+  await ownerNetworkEditorFailure.getByRole("button", { name: "Retry", exact: true }).click();
+  await page.locator('input[name="addr"]').waitFor({ state: "visible" });
+  assert.equal(ownerNetworkEditorReads, 2, "Retry made exactly one replacement owner-network-editor request");
+  assert.deepEqual(
+    applicationErrors.splice(ownerNetworkEditorFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/me/networks/journey`],
+    "the deliberate owner-network-editor failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/me/networks/journey`);
+
   const editorRead = page.waitForResponse(
     (response) =>
       response.url() === `${applicationOrigin}/api/v1/me/networks/journey` &&
