@@ -549,10 +549,10 @@
         const metrics = [["Live IRC connections", stats.live.connections, "Current core sessions"], ["Connected upstreams", `${stats.live.connected_upstreams} / ${stats.live.upstreams}`, "Always-on networks"], ["Traffic since start", formatBytes(stats.live.traffic), "IRC and BNC, both directions"], ["Operational errors", stats.live.errors, "Since process start"]];
         overviewRoot.querySelector("[data-overview-metrics]").replaceChildren(...metrics.map(([label, value, detail]) => append(element("div", "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail))));
         overviewRoot.querySelector("[data-overview-counts]").replaceChildren(...[[stats.accounts, "Accounts"], [stats.registered_channels, "Registered channels"], [stats.server_bans, "Server bans"]].map(([value, label]) => append(element("div", "card"), element("div", "n", value), element("div", "l", label))));
-        overviewSection(overviewRoot.querySelector("[data-overview-accounts]"), "Newest accounts", "/console/accounts", ["Name"], (accounts.accounts || []).map((entry) => [entry.name]));
-        overviewSection(overviewRoot.querySelector("[data-overview-channels]"), "Newest registered channels", "/console/admin/channels", ["Channel", "Founder", "Registered (UTC)"], (channels.channels || []).map((entry) => [entry.name, entry.founder, entry.created_at]));
-        overviewSection(overviewRoot.querySelector("[data-overview-bans]"), "Newest server bans", "/console/bans", ["Kind", "Mask", "Reason", "Set by", "Created (UTC)"], (bans.bans || []).map((entry) => [entry.kind, entry.mask, entry.reason, entry.set_by, entry.created_at]));
-        overviewSection(overviewRoot.querySelector("[data-overview-audit]"), "Recent audited actions", "/console/audit", ["When (UTC)", "Actor", "Action", "Target", "Detail"], (audit.audit || []).map((entry) => [entry.at, entry.actor, entry.action, entry.target, entry.detail]));
+        overviewSection(overviewRoot.querySelector("[data-overview-accounts]"), "Newest accounts", "/console/accounts", ["Name"], apiCollection(accounts, "accounts", "account directory").map((entry) => [entry.name]));
+        overviewSection(overviewRoot.querySelector("[data-overview-channels]"), "Newest registered channels", "/console/admin/channels", ["Channel", "Founder", "Registered (UTC)"], apiCollection(channels, "channels", "channel directory").map((entry) => [entry.name, entry.founder, entry.created_at]));
+        overviewSection(overviewRoot.querySelector("[data-overview-bans]"), "Newest server bans", "/console/bans", ["Kind", "Mask", "Reason", "Set by", "Created (UTC)"], apiCollection(bans, "bans", "server-ban directory").map((entry) => [entry.kind, entry.mask, entry.reason, entry.set_by, entry.created_at]));
+        overviewSection(overviewRoot.querySelector("[data-overview-audit]"), "Recent audited actions", "/console/audit", ["When (UTC)", "Actor", "Action", "Target", "Detail"], apiCollection(audit, "audit", "audit directory").map((entry) => [entry.at, entry.actor, entry.action, entry.target, entry.detail]));
       } catch (error) {
         const result = document.getElementById("overview-api-result");
         if (!(result instanceof HTMLElement)) return;
@@ -982,18 +982,18 @@
     configurationValue(form, "server_name", settings.server_name);
     configurationValue(form, "network_name", settings.network_name);
     configurationValue(form, "description", settings.description);
-    configurationValue(form, "motd", (settings.motd || []).join("\n"));
+    configurationValue(form, "motd", apiCollection(settings, "motd", "configuration").join("\n"));
     configurationValue(form, "storage_history_retention_days", settings.storage.history_retention_days);
     configurationValue(form, "storage_audit_retention_days", settings.storage.audit_retention_days);
     configurationChecked(form, "bnc_enabled", settings.bnc_addr !== null);
     configurationValue(form, "bnc_addr", settings.bnc_addr);
-    configurationValue(form, "listeners", configurationListeners(settings.listeners || []));
+    configurationValue(form, "listeners", configurationListeners(apiCollection(settings, "listeners", "configuration")));
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
-    configurationValue(form, "admin_accounts", (settings.admin_accounts || []).join("\n"));
+    configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
     for (const name of ["nicklen", "sendq", "core_queue", "max_hot_channels"]) configurationValue(form, name, settings[name]);
     for (const name of ["max_connections_per_ip", "command_burst", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
-    configurationValue(form, "trusted_proxies", (settings.limits.trusted_proxies || []).join("\n"));
+    configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "observability_enabled", settings.observability.enabled);
     configurationValue(form, "observability_sample_interval_seconds", settings.observability.sample_interval_seconds);
     configurationValue(form, "observability_retention_hours", settings.observability.retention_hours);
@@ -1004,7 +1004,7 @@
     if (runtime.bound_bnc_addr) bncStatus.append(element("code", "", runtime.bound_bnc_addr));
 
     const csrf = root.dataset.csrf || "";
-    const networks = (settings.networks || []).map((network) => {
+    const networks = apiCollection(settings, "networks", "configuration").map((network) => {
       const article = document.createElement("article");
       article.append(append(element("div"), element("strong", "", network.name), element("span", "tag", network.kind)), element("code", "", network.addr), element("span", "meta", `Available to ${network.owner || "all accounts"}`), configurationDeleteForm("network", network.name, revision, csrf, network.owner || ""));
       return article;
@@ -1014,18 +1014,19 @@
     const networkWarning = configurationCredentialWarning(settings, "Credential-bearing networks still come from bootstrap configuration. Configure the master key and restart once to enable UI changes.");
     if (networkWarning) networkTarget.prepend(networkWarning);
     const kinds = root.querySelector("[data-configuration-network-kinds]");
-    kinds.replaceChildren(...(runtime.network_drivers || []).map((kind) => element("option", "", kind.toUpperCase())));
+    kinds.replaceChildren(...apiCollection(runtime, "network_drivers", "configuration runtime").map((kind) => element("option", "", kind.toUpperCase())));
     for (const option of kinds.options) option.value = option.textContent.toLowerCase();
 
-    const opers = (settings.opers || []).map((oper) => append(element("div"), element("code", "", oper.name), configurationDeleteForm("oper", oper.name, revision, csrf)));
+    const opers = apiCollection(settings, "opers", "configuration").map((oper) => append(element("div"), element("code", "", oper.name), configurationDeleteForm("oper", oper.name, revision, csrf)));
     const operTarget = root.querySelector("[data-configuration-opers]");
     renderConfigurationList(operTarget, opers, "No IRC operators configured.");
     const operWarning = configurationCredentialWarning(settings, "Credentials still come from bootstrap configuration. Configure the deployment master key and restart once; e6irc will seal and import them before UI editing is enabled.");
     if (operWarning) operTarget.prepend(operWarning);
-    const providers = (settings.oidc_providers || []).map((provider) => {
+    const providers = apiCollection(settings, "oidc_providers", "configuration").map((provider) => {
       const article = document.createElement("article");
-      const domains = provider.allowed_email_domains?.length ? provider.allowed_email_domains.join(", ") : "any verified provider identity";
-      article.append(append(element("div"), element("strong", "", provider.name), element("span", "tag", provider.token_endpoint_auth_method)), element("code", "", provider.issuer_url), element("span", "meta", `Client ${provider.client_id} · scopes ${(provider.scopes || []).join(" ")}`), element("span", "meta", `Allowed email domains: ${domains}`), configurationDeleteForm("oidc", provider.name, revision, csrf));
+      const domains = apiCollection(provider, "allowed_email_domains", "identity-provider");
+      const scopes = apiCollection(provider, "scopes", "identity-provider");
+      article.append(append(element("div"), element("strong", "", provider.name), element("span", "tag", provider.token_endpoint_auth_method)), element("code", "", provider.issuer_url), element("span", "meta", `Client ${provider.client_id} · scopes ${scopes.join(" ")}`), element("span", "meta", `Allowed email domains: ${domains.length ? domains.join(", ") : "any verified provider identity"}`), configurationDeleteForm("oidc", provider.name, revision, csrf));
       return article;
     });
     const providerTarget = root.querySelector("[data-configuration-oidc-providers]");
@@ -1240,7 +1241,7 @@
     const renderBrowserSessions = (data) => {
       if (!(browserSessions instanceof HTMLElement)) return;
       browserSessions.replaceChildren();
-      const rows = Array.isArray(data.sessions) ? data.sessions : [];
+      const rows = apiCollection(data, "sessions", "browser-session directory");
       const heading = append(element("div", "panel-head"), append(
         element("div"),
         element("h2", "", "Browser sessions"),
@@ -1289,7 +1290,7 @@
     const renderConnections = (data, query) => {
       if (!(connections instanceof HTMLElement)) return;
       connections.replaceChildren();
-      const rows = Array.isArray(data.connections) ? data.connections : [];
+      const rows = apiCollection(data, "connections", "live-connection directory");
       const heading = append(element("div", "panel-head"), append(
         element("div"),
         element("h2", "", own ? "Your live IRC connections" : "Live IRC connections"),
@@ -1458,7 +1459,7 @@
             if (result === false) return;
             setAccountResult(current ? "Local password changed." : "Local password added.", true);
             void apiRead("/api/v1/me/credentials").then((updated) => {
-              const credentials = Array.isArray(updated.credentials) ? updated.credentials : [];
+              const credentials = apiCollection(updated, "credentials", "credential directory");
               renderPassword(credentials.some((credential) => credential.kind === "local_password"));
               renderCredentials(credentials);
             }).catch(() => void refreshAccountAccess());
@@ -1492,8 +1493,8 @@
     };
     const renderIdentities = (result, hasLocalPassword) => {
       if (!(identityList instanceof HTMLElement) || !(linkProviders instanceof HTMLElement)) return;
-      const identities = Array.isArray(result.identities) ? result.identities : [];
-      const providers = Array.isArray(result.link_providers) ? result.link_providers : [];
+      const identities = apiCollection(result, "identities", "identity directory");
+      const providers = apiCollection(result, "link_providers", "identity-provider directory");
       const count = accountRoot.querySelector("[data-api-account-identity-count]");
       if (count) count.textContent = String(identities.length);
       linkProviders.replaceChildren();
@@ -1530,7 +1531,7 @@
           apiRead("/api/v1/me/credentials"),
           apiRead("/api/v1/me/identities"),
         ]);
-        const credentials = Array.isArray(credentialResult.credentials) ? credentialResult.credentials : [];
+        const credentials = apiCollection(credentialResult, "credentials", "credential directory");
         const hasLocalPassword = credentials.some((credential) => credential.kind === "local_password");
         renderPassword(hasLocalPassword); renderCredentials(credentials); renderIdentities(identityResult, hasLocalPassword);
       } catch (error) {
@@ -1626,7 +1627,7 @@
     const refreshTokens = async () => {
       try {
         const result = await apiRead("/api/v1/me/tokens");
-        const tokens = Array.isArray(result.tokens) ? result.tokens : [];
+        const tokens = apiCollection(result, "tokens", "token directory");
         accountTokenRows.replaceChildren();
         const count = document.getElementById("account-token-count");
         if (count) count.textContent = String(tokens.length);
@@ -1697,7 +1698,7 @@
     const refreshSecurityActivity = async () => {
       try {
         const result = await apiRead("/api/v1/me/security-activity?limit=50");
-        const activity = Array.isArray(result.activity) ? result.activity : [];
+        const activity = apiCollection(result, "activity", "security-activity directory");
         accountSecurityActivityRows.replaceChildren();
         const count = document.getElementById("account-security-activity-count");
         if (count) count.textContent = String(activity.length);
@@ -1734,7 +1735,7 @@
     const refreshReadMarkers = async () => {
       try {
         const result = await apiRead("/api/v1/me/read-markers");
-        const markers = Array.isArray(result.markers) ? result.markers : [];
+        const markers = apiCollection(result, "markers", "read-marker directory");
         accountReadMarkers.replaceChildren();
         const count = document.getElementById("account-read-marker-count");
         if (count) count.textContent = String(markers.length);
@@ -1811,11 +1812,11 @@
     const query = () => { const params = new URLSearchParams(window.location.search); if (!params.get("limit")) params.set("limit", "50"); return params; };
     const pager = (text, cursor, parameter) => { const wrapper = element("div", "pager"); wrapper.append(element("span", "meta", cursor ? "Showing an older page." : "Showing the newest page.")); if (cursor) { const link = element("a", "", text); const params = query(); params.set(parameter, String(cursor)); link.href = `/console/accounts?${params}`; wrapper.append(link); } return wrapper; };
     const renderInvitations = (data) => {
-      if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = Array.isArray(data.invitations) ? data.invitations : [];
+      if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = apiCollection(data, "invitations", "invitation directory");
       if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Pending account invitations")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(append(element("div", "scroll"), table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
     };
     const renderAccounts = (data) => {
-      if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = Array.isArray(data.accounts) ? data.accounts : [];
+      if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
       if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication || {}; const resources = account.resources || {}; const sources = account.administrator_sources || {}; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
@@ -2423,7 +2424,7 @@
       for (const channel of channels) {
         const url = `/api/v1/me/channels/${encodeURIComponent(channel.name)}`;
         const card = element("article", "panel channel-control");
-        const access = Array.isArray(channel.access) ? channel.access : [];
+        const access = apiCollection(channel, "access", "channel access");
         card.append(append(element("div", "panel-head"), append(element("div"), element("p", "eyebrow", "Registered channel"), element("h2", "", channel.name), element("p", "", `Founder ${channel.founder} · ${access.length} access grants`)), element("span", channel.keeptopic ? "live-pill" : "revision", channel.keeptopic ? "Topic retained" : "Topic retention off")));
         const topic = form(url, "topic", (node) => { const field = element("label", "field"); const area = element("textarea"); area.name = "topic"; area.rows = 3; area.maxLength = 390; area.value = channel.topic || ""; append(field, element("span", "", "Retained topic"), area); node.append(field); }); submit(topic, "Save topic", (node) => mutateChannel(node, url, "PATCH", { action: "set_topic", topic: fieldValue(new FormData(node), "topic") || null }));
         const lock = form(url, "mlock", (node) => { const field = element("label", "field"); append(field, element("span", "", "Mode lock"), input("mlock", channel.mlock || "")); node.append(field); }); submit(lock, "Save mode lock", (node) => mutateChannel(node, url, "PATCH", { action: "set_mlock", mlock: fieldValue(new FormData(node), "mlock") || null }));

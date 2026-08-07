@@ -250,6 +250,33 @@ try {
     "the deliberate token failure was the only browser diagnostic during recovery",
   );
   await page.unroute(`${applicationOrigin}/api/v1/me/tokens`);
+  let malformedTokenDirectoryReads = 0;
+  const malformedTokenDirectoryErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/me/tokens`, async (route) => {
+    malformedTokenDirectoryReads += 1;
+    if (malformedTokenDirectoryReads === 1) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ tokens: {} }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.reload();
+  const malformedTokenDirectoryFailure = page.locator("#account-token-rows [role=status]");
+  await malformedTokenDirectoryFailure.waitFor();
+  assert.match(await malformedTokenDirectoryFailure.innerText(), /token directory response is invalid/i);
+  await page.locator("#account-token-rows").getByRole("button", { name: "Retry", exact: true }).click();
+  await page.getByText("No personal access tokens.", { exact: true }).waitFor();
+  assert.equal(malformedTokenDirectoryReads, 2, "Retry made exactly one replacement malformed-token request");
+  assert.deepEqual(
+    applicationErrors.splice(malformedTokenDirectoryErrorStart),
+    [],
+    "a malformed successful token response is an in-document contract failure, not a browser diagnostic",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/me/tokens`);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   // Console and chat deliberately share one typed local preference document.
   // Exercise the console's own control through a persisted choice, a reload,

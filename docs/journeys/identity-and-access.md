@@ -321,6 +321,8 @@ Exact-resource deletes are owner-scoped and idempotent only where the API
 contract says so. A failed Account & access API read remains an announced,
 in-place retryable state rather than appearing as empty profile, credential,
 token, identity, read-marker, or security-activity data.
+A syntactically successful response with a malformed required collection is
+the same explicit retryable contract failure, never an empty directory.
 
 **Security and observability.** New app passwords and tokens are rendered once;
 only hashes and secret-free posture remain. Rotation and revocation are
