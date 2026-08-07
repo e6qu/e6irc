@@ -499,9 +499,38 @@ try {
   // merely a collection of HTTP handlers. Visit every administrator directory,
   // prove queue pressure crosses the live JSON/UI boundary, and perform a
   // durable policy mutation through the rendered controls.
+  let administratorNetworkReads = 0;
+  const administratorNetworkFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/admin/networks`, async (route) => {
+    administratorNetworkReads += 1;
+    if (administratorNetworkReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Fleet inventory unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.goto(`${applicationOrigin}/console/admin/networks`);
+  const administratorNetworkFailure = page.locator("#admin-network-rows [role=status]");
+  await administratorNetworkFailure.waitFor();
+  assert.match(await administratorNetworkFailure.innerText(), /Fleet inventory unavailable/);
+  await page.locator("#admin-network-rows").getByRole("button", { name: "Retry", exact: true }).click();
+  await page.getByText("No networks configured by any account.", { exact: true }).waitFor();
+  assert.equal(administratorNetworkReads, 2, "Retry made exactly one replacement fleet request");
+  assert.deepEqual(
+    applicationErrors.splice(administratorNetworkFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/admin/networks`],
+    "the deliberate fleet failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/admin/networks`);
+
   for (const [path, heading] of [
     ["/console/accounts", "Account directory"],
     ["/console/admin/channels", "Registered-channel directory"],
+    ["/console/admin/networks", "All BNC networks"],
     ["/console/sessions", "Live connections"],
     ["/console/integrations", "Integrations"],
     ["/console/audit", "Audit log"],

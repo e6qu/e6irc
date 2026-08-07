@@ -1817,9 +1817,15 @@
     }
   };
   if (adminNetworkRows instanceof HTMLElement) {
-    void apiRead("/api/v1/admin/networks")
-      .then((result) => renderAdminNetworks(Array.isArray(result.networks) ? result.networks : []))
-      .catch((error) => { adminNetworkRows.textContent = error instanceof Error ? error.message : "Network list failed to load."; });
+    const refreshAdminNetworks = async () => {
+      try {
+        const result = await apiRead("/api/v1/admin/networks");
+        renderAdminNetworks(Array.isArray(result.networks) ? result.networks : []);
+      } catch (error) {
+        tableLoadFailure(adminNetworkRows, 9, error, () => void refreshAdminNetworks());
+      }
+    };
+    void refreshAdminNetworks();
   }
   document.addEventListener("submit", (event) => {
     const form = event.target;
@@ -2140,7 +2146,17 @@
         table.append(body); target.append(table);
       }
     };
-    void apiRead("/api/v1/admin/networks").then((result) => render(Array.isArray(result.networks) ? result.networks : [])).catch((error) => { integrations.querySelectorAll("[data-integration-list]").forEach((target) => { target.textContent = error instanceof Error ? error.message : "Bridge inventory failed to load."; }); });
+    const refreshIntegrations = async () => {
+      try {
+        const result = await apiRead("/api/v1/admin/networks");
+        render(Array.isArray(result.networks) ? result.networks : []);
+      } catch (error) {
+        integrations.querySelectorAll("[data-integration-list]").forEach((target) => {
+          if (target instanceof HTMLElement) listLoadFailure(target, error, () => void refreshIntegrations());
+        });
+      }
+    };
+    void refreshIntegrations();
   }
 
   const ownerNetworkEditor = document.querySelector("[data-api-owner-network-editor]");

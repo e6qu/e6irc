@@ -186,7 +186,9 @@ running, a disabled one as disabled; a flapping upstream shows its error
 count, last classified failure, and (on the owner's detail page) the
 scheduled next retry and bounded failure history. Driver lifecycle
 transitions are labeled log lines (`owner/network`), so an IRC upstream
-flap is as visible in the server log as a bridge's.
+flap is as visible in the server log as a bridge's. A failed fleet-inventory
+read remains an announced table state with an in-place retry, never an
+empty-looking fleet.
 
 **Security and observability.** The page and API are administrator-gated and
 non-cacheable; the toggle repeats role checks and CSRF; credentials never
