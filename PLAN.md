@@ -144,6 +144,8 @@ Administrator channel, ban, and audit directories preserve their table
 semantics on an API-read failure, announce the problem, and offer one explicit
 in-place retry rather than presenting an empty-looking result or requiring a
 full-page reload.
+The fleet Networks table and the typed bridge lists follow the same recovery
+contract when their shared administrator network inventory read fails.
 Account & access follows the same recovery contract for its profile,
 credentials, tokens, identities, read state, and security activity, so a transient failure
 does not turn any durable account state into an ambiguous empty result.

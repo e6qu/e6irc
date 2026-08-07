@@ -31,8 +31,10 @@ credentials/endpoints and owns the configured bridge network.
 **Visible failures and recovery.** A driver not compiled into the binary is
 shown and rejected explicitly. Invalid/rejected credentials are fatal until
 configuration changes rather than retried forever. Network/transient failures
-use bounded backoff and visible error categories. Inbound identities/channel
-names are sanitized and validated before entering IRC state.
+use bounded backoff and visible error categories. A failed bridge-inventory
+read is announced in each affected platform list and offers an in-place retry.
+Inbound identities/channel names are sanitized and validated before entering
+IRC state.
 
 **Security and observability.** Integration forms are administrator-only and
 CSRF-protected; platform credentials are sealed, write-only, and excluded from
