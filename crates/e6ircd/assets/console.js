@@ -1972,20 +1972,13 @@
     }
     table.replaceChild(body, previous);
   };
-  const renderOwnerNetworkFailure = (message) => {
+  const renderOwnerNetworkFailure = (error, retry) => {
     if (!(ownerNetworkRows instanceof HTMLElement)) return;
     const table = ownerNetworkRows.querySelector("table");
     const previous = table?.querySelector("tbody");
     if (!(table instanceof HTMLTableElement) || !(previous instanceof HTMLTableSectionElement)) return;
     if (ownerNetworkCount) ownerNetworkCount.textContent = "—";
-    const body = document.createElement("tbody");
-    const row = document.createElement("tr");
-    const cell = networkCell(message);
-    cell.colSpan = 7;
-    cell.className = "empty";
-    row.append(cell);
-    body.append(row);
-    table.replaceChild(body, previous);
+    tableLoadFailure(previous, 7, error, retry);
   };
   const refreshOwnerNetworks = async () => {
     if (!(ownerNetworkRows instanceof HTMLElement)) return;
@@ -1999,10 +1992,9 @@
       renderOwnerNetworks(Array.isArray(result.networks) ? result.networks : []);
       if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Network list failed to load.";
-      renderOwnerNetworkFailure(message);
+      renderOwnerNetworkFailure(error, () => void refreshOwnerNetworks());
       if (ownerNetworkRefreshStatus) {
-        ownerNetworkRefreshStatus.textContent = `Live refresh failed (${message}). Use Reload to retry.`;
+        ownerNetworkRefreshStatus.textContent = "Live refresh failed. Retry is available in the network list.";
         ownerNetworkRefreshStatus.classList.add("refresh-error");
       }
     } finally {
