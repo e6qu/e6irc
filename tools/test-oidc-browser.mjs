@@ -1044,6 +1044,11 @@ try {
   assert.equal(await page.getByText("initial tagged", { exact: true }).count(), 1);
   assert.equal(await page.getByText("older context", { exact: true }).count(), 1);
   assert.equal(await page.getByText("arrived while loading", { exact: true }).count(), 1);
+  assert.equal(
+    await page.locator("#messages").evaluate((node) => node.scrollTop),
+    0,
+    "loading earlier history returned the reader to the live edge",
+  );
 
   // Local echoes are request-correlated: socket admission alone is not
   // success. The accepted message appears only after the server's `sent`

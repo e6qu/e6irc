@@ -73,6 +73,8 @@ survive process restart.
 6. When live traffic arrives below a reader's current scroll position, an
    exact-count **jump to latest** control keeps it discoverable without
    interrupting the reader or switching conversations.
+7. Choosing **Load earlier messages** moves the reader to the newly loaded
+   older context rather than snapping them back to the live edge.
 
 **Visible failures and recovery.** History failure is shown without discarding
 the working live stream. Socket closure marks the connection disconnected.
@@ -99,7 +101,7 @@ bounded; upstream text is rendered as text, while replay/database failures are
 visible and classified without logging conversation bodies.
 
 **Evidence.** Browser tests exercise replay boundaries, history races,
-deduplication, and the out-of-view live-message recovery control with
+deduplication, older-history positioning, and the out-of-view live-message recovery control with
 deterministic transport. The full-stack browser case also
 drives a real upstream line through persistence, the multiplexer, and
 WebSocket into Chromium, gracefully restarts the daemon, and verifies that the
