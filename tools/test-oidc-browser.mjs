@@ -891,6 +891,34 @@ try {
 
   // The owner-facing configuration and diagnostics must reflect that same live
   // exchange through their canonical APIs rather than rendering the stored row.
+  let ownerNetworkDetailReads = 0;
+  const ownerNetworkDetailFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/me/networks/journey`, async (route) => {
+    ownerNetworkDetailReads += 1;
+    if (ownerNetworkDetailReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Network details unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.goto(`${applicationOrigin}/console/networks/journey`);
+  const ownerNetworkDetailFailure = page.locator("#network-api-result");
+  await ownerNetworkDetailFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  assert.match(await ownerNetworkDetailFailure.innerText(), /Network details unavailable/);
+  await ownerNetworkDetailFailure.getByRole("button", { name: "Retry", exact: true }).click();
+  await page.getByRole("heading", { name: "journey", exact: true }).waitFor();
+  assert.equal(ownerNetworkDetailReads, 2, "Retry made exactly one replacement owner-network-detail request");
+  assert.deepEqual(
+    applicationErrors.splice(ownerNetworkDetailFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/me/networks/journey`],
+    "the deliberate owner-network-detail failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/me/networks/journey`);
+
   const detailRead = page.waitForResponse(
     (response) =>
       response.url() === `${applicationOrigin}/api/v1/me/networks/journey` &&

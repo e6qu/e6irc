@@ -129,7 +129,9 @@ The revisioned administrator configuration read follows the same announced,
 in-place retry contract when its canonical resource is temporarily unavailable.
 Owner network-detail documents likewise contain only their authenticated shell
 and URL resource identifier; stored configuration and mutation targets hydrate
-from the canonical owner-network resource.
+from the canonical owner-network resource. A temporary resource failure is
+announced and retryable in place before the stored configuration or mutation
+controls are exposed.
 The owner IRC network editor follows the same boundary: its document contains
 only the authenticated shell and URL identifier, while the typed owner-network
 resource populates the editable fields and mutation target in the browser.

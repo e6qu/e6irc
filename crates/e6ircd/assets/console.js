@@ -2229,24 +2229,36 @@
   if (ownerNetworkDetail instanceof HTMLElement) {
     const name = ownerNetworkDetail.dataset.networkName || "";
     const setField = (field, value) => { const node = ownerNetworkDetail.querySelector(`[data-network-field="${field}"]`); if (node) node.textContent = value; };
-    const showFailure = (message) => { setOwnerNetworkResult(message, false); const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) { summary.hidden = false; summary.textContent = message; } };
-    if (!name) showFailure("This network page has no resource ID. Return to the network directory and try again."); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
-      .then((network) => {
-        if (!network || typeof network.name !== "string" || typeof network.kind !== "string" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin) || typeof network.enabled !== "boolean" || typeof network.tls !== "boolean") throw new Error("The network response is invalid. Reload and try again.");
-        const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
-        const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
-        const provider = network.addr || "Provider API";
-        setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", typeof network.realname === "string" && network.realname ? network.realname : "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account === true ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password === true ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
-        const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) summary.hidden = false;
-        const actions = ownerNetworkDetail.querySelector("[data-network-actions]"); if (actions instanceof HTMLElement) actions.hidden = false;
-        const destructive = ownerNetworkDetail.querySelector("[data-network-destructive]"); if (destructive instanceof HTMLElement) destructive.hidden = false;
-        const toggle = ownerNetworkDetail.querySelector("[data-network-toggle]"); if (toggle) toggle.textContent = network.enabled ? "Disable" : "Enable";
-        const enabled = ownerNetworkDetail.querySelector("[data-network-enabled]"); if (enabled instanceof HTMLInputElement) enabled.value = String(!network.enabled);
-        const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
-        const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
-        const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
-      })
-      .catch((error) => showFailure(error instanceof Error ? error.message : "Network details failed to load."));
+    const detailResult = document.getElementById("network-api-result");
+    const showFailure = (error, retry) => {
+      if (!(detailResult instanceof HTMLElement)) return;
+      detailResult.replaceChildren(element("span", "", error instanceof Error ? error.message : "Network details failed to load."), retryButton(retry));
+      detailResult.className = "banner-error";
+    };
+    const render = (network) => {
+      if (!network || typeof network.name !== "string" || typeof network.kind !== "string" || typeof network.addr !== "string" || typeof network.nick !== "string" || !Array.isArray(network.autojoin) || typeof network.enabled !== "boolean" || typeof network.tls !== "boolean") throw new Error("The network response is invalid. Reload and try again.");
+      if (detailResult instanceof HTMLElement) { detailResult.replaceChildren(); detailResult.className = ""; }
+      const title = ownerNetworkDetail.querySelector("[data-network-title]"); if (title) title.textContent = network.name;
+      const kind = ownerNetworkDetail.querySelector("[data-network-kind]"); if (kind) kind.textContent = `${network.kind} network`;
+      const provider = network.addr || "Provider API";
+      setField("kind", network.kind); setField("addr", provider); setField("transport", network.tls ? "TLS" : network.addr ? "Plaintext" : "Provider-managed"); setField("nick", network.nick || "Provider account"); setField("realname", typeof network.realname === "string" && network.realname ? network.realname : "Not set"); setField("autojoin", network.autojoin.length ? network.autojoin.join(", ") : "None"); setField("account-credential", network.has_sasl_account === true ? "Stored" : "Not set"); setField("secret-credential", network.has_sasl_password === true ? "Stored encrypted" : "Not set"); setField("enabled", network.enabled ? "Enabled" : "Disabled");
+      const summary = ownerNetworkDetail.querySelector("[data-network-summary]"); if (summary instanceof HTMLElement) summary.hidden = false;
+      const actions = ownerNetworkDetail.querySelector("[data-network-actions]"); if (actions instanceof HTMLElement) actions.hidden = false;
+      const destructive = ownerNetworkDetail.querySelector("[data-network-destructive]"); if (destructive instanceof HTMLElement) destructive.hidden = false;
+      const toggle = ownerNetworkDetail.querySelector("[data-network-toggle]"); if (toggle) toggle.textContent = network.enabled ? "Disable" : "Enable";
+      const enabled = ownerNetworkDetail.querySelector("[data-network-enabled]"); if (enabled instanceof HTMLInputElement) enabled.value = String(!network.enabled);
+      const toggleForm = ownerNetworkDetail.querySelector("[data-api-owner-network-toggle]"); if (toggleForm instanceof HTMLFormElement) toggleForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
+      const deleteForm = ownerNetworkDetail.querySelector("[data-api-owner-network-delete]"); if (deleteForm instanceof HTMLFormElement) { deleteForm.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; deleteForm.dataset.confirm = `Remove network ${network.name}? Its live connection and stored backlog will be deleted.`; }
+      const edit = ownerNetworkDetail.querySelector("[data-network-edit]"); if (edit instanceof HTMLAnchorElement) { if (network.kind === "irc") { edit.href = `/console/networks/${encodeURIComponent(network.name)}/edit`; edit.hidden = false; } else if (ownerNetworkDetail.dataset.isAdmin === "true") { edit.href = `/console/integrations/${encodeURIComponent(network.name)}/edit`; edit.textContent = "Edit integration"; edit.hidden = false; } }
+    };
+    const refreshOwnerNetworkDetail = async () => {
+      try {
+        render(await apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`));
+      } catch (error) {
+        showFailure(error, () => void refreshOwnerNetworkDetail());
+      }
+    };
+    if (!name) showFailure(new Error("This network page has no resource ID. Return to the network directory and try again."), () => void refreshOwnerNetworkDetail()); else void refreshOwnerNetworkDetail();
   }
 
   const channelResult = document.getElementById("channel-api-result");
