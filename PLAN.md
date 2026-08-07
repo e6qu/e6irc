@@ -121,6 +121,8 @@ resource.
 The administrator overview likewise composes its bounded stats, directory,
 policy, and audit resources in the browser rather than rendering a parallel
 server-side snapshot.
+Its composed read is announced and retryable in place when any required API
+resource is unavailable.
 Owner network-detail documents likewise contain only their authenticated shell
 and URL resource identifier; stored configuration and mutation targets hydrate
 from the canonical owner-network resource.

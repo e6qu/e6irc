@@ -527,6 +527,34 @@ try {
   );
   await page.unroute(`${applicationOrigin}/api/v1/admin/networks`);
 
+  let overviewStatsReads = 0;
+  const overviewFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/admin/stats`, async (route) => {
+    overviewStatsReads += 1;
+    if (overviewStatsReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Overview statistics unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.goto(`${applicationOrigin}/console`);
+  const overviewFailure = page.locator("#overview-api-result");
+  await overviewFailure.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  assert.match(await overviewFailure.innerText(), /Overview statistics unavailable/);
+  await overviewFailure.getByRole("button", { name: "Retry", exact: true }).click();
+  await page.getByRole("heading", { name: "Newest accounts", exact: false }).waitFor();
+  assert.equal(overviewStatsReads, 2, "Retry made exactly one replacement overview request");
+  assert.deepEqual(
+    applicationErrors.splice(overviewFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/admin/stats`],
+    "the deliberate overview failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/admin/stats`);
+
   for (const [path, heading] of [
     ["/console/accounts", "Account directory"],
     ["/console/admin/channels", "Registered-channel directory"],

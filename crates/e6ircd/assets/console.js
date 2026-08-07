@@ -512,17 +512,26 @@
 
   const overviewRoot = document.querySelector("[data-api-admin-overview]");
   if (overviewRoot instanceof HTMLElement) {
-    void Promise.all([apiRead("/api/v1/admin/stats"), apiRead("/api/v1/admin/accounts?limit=10"), apiRead("/api/v1/admin/channels?limit=10"), apiRead("/api/v1/admin/bans?limit=10"), apiRead("/api/v1/admin/audit?limit=10")]).then(([stats, accounts, channels, bans, audit]) => {
-      overviewRoot.querySelector("#overview").textContent = stats.server;
-      overviewRoot.querySelector("[data-overview-lede]").textContent = `Network ${stats.network} · e6ircd ${stats.version}`;
-      const metrics = [["Live IRC connections", stats.live.connections, "Current core sessions"], ["Connected upstreams", `${stats.live.connected_upstreams} / ${stats.live.upstreams}`, "Always-on networks"], ["Traffic since start", formatBytes(stats.live.traffic), "IRC and BNC, both directions"], ["Operational errors", stats.live.errors, "Since process start"]];
-      overviewRoot.querySelector("[data-overview-metrics]").replaceChildren(...metrics.map(([label, value, detail]) => append(element("div", "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail))));
-      overviewRoot.querySelector("[data-overview-counts]").replaceChildren(...[[stats.accounts, "Accounts"], [stats.registered_channels, "Registered channels"], [stats.server_bans, "Server bans"]].map(([value, label]) => append(element("div", "card"), element("div", "n", value), element("div", "l", label))));
-      overviewSection(overviewRoot.querySelector("[data-overview-accounts]"), "Newest accounts", "/console/accounts", ["Name"], (accounts.accounts || []).map((entry) => [entry.name]));
-      overviewSection(overviewRoot.querySelector("[data-overview-channels]"), "Newest registered channels", "/console/admin/channels", ["Channel", "Founder", "Registered (UTC)"], (channels.channels || []).map((entry) => [entry.name, entry.founder, entry.created_at]));
-      overviewSection(overviewRoot.querySelector("[data-overview-bans]"), "Newest server bans", "/console/bans", ["Kind", "Mask", "Reason", "Set by", "Created (UTC)"], (bans.bans || []).map((entry) => [entry.kind, entry.mask, entry.reason, entry.set_by, entry.created_at]));
-      overviewSection(overviewRoot.querySelector("[data-overview-audit]"), "Recent audited actions", "/console/audit", ["When (UTC)", "Actor", "Action", "Target", "Detail"], (audit.audit || []).map((entry) => [entry.at, entry.actor, entry.action, entry.target, entry.detail]));
-    }).catch((error) => { const result = document.getElementById("overview-api-result"); result.textContent = `Overview failed to load (${error instanceof Error ? error.message : "unknown error"}). Reload to retry.`; result.className = "banner-error"; });
+    const refreshOverview = async () => {
+      try {
+        const [stats, accounts, channels, bans, audit] = await Promise.all([apiRead("/api/v1/admin/stats"), apiRead("/api/v1/admin/accounts?limit=10"), apiRead("/api/v1/admin/channels?limit=10"), apiRead("/api/v1/admin/bans?limit=10"), apiRead("/api/v1/admin/audit?limit=10")]);
+        overviewRoot.querySelector("#overview").textContent = stats.server;
+        overviewRoot.querySelector("[data-overview-lede]").textContent = `Network ${stats.network} · e6ircd ${stats.version}`;
+        const metrics = [["Live IRC connections", stats.live.connections, "Current core sessions"], ["Connected upstreams", `${stats.live.connected_upstreams} / ${stats.live.upstreams}`, "Always-on networks"], ["Traffic since start", formatBytes(stats.live.traffic), "IRC and BNC, both directions"], ["Operational errors", stats.live.errors, "Since process start"]];
+        overviewRoot.querySelector("[data-overview-metrics]").replaceChildren(...metrics.map(([label, value, detail]) => append(element("div", "metric-card"), element("span", "metric-label", label), element("strong", "", value), element("small", "", detail))));
+        overviewRoot.querySelector("[data-overview-counts]").replaceChildren(...[[stats.accounts, "Accounts"], [stats.registered_channels, "Registered channels"], [stats.server_bans, "Server bans"]].map(([value, label]) => append(element("div", "card"), element("div", "n", value), element("div", "l", label))));
+        overviewSection(overviewRoot.querySelector("[data-overview-accounts]"), "Newest accounts", "/console/accounts", ["Name"], (accounts.accounts || []).map((entry) => [entry.name]));
+        overviewSection(overviewRoot.querySelector("[data-overview-channels]"), "Newest registered channels", "/console/admin/channels", ["Channel", "Founder", "Registered (UTC)"], (channels.channels || []).map((entry) => [entry.name, entry.founder, entry.created_at]));
+        overviewSection(overviewRoot.querySelector("[data-overview-bans]"), "Newest server bans", "/console/bans", ["Kind", "Mask", "Reason", "Set by", "Created (UTC)"], (bans.bans || []).map((entry) => [entry.kind, entry.mask, entry.reason, entry.set_by, entry.created_at]));
+        overviewSection(overviewRoot.querySelector("[data-overview-audit]"), "Recent audited actions", "/console/audit", ["When (UTC)", "Actor", "Action", "Target", "Detail"], (audit.audit || []).map((entry) => [entry.at, entry.actor, entry.action, entry.target, entry.detail]));
+      } catch (error) {
+        const result = document.getElementById("overview-api-result");
+        if (!(result instanceof HTMLElement)) return;
+        result.replaceChildren(element("span", "", error instanceof Error ? error.message : "Overview failed to load."), retryButton(() => void refreshOverview()));
+        result.className = "banner-error";
+      }
+    };
+    void refreshOverview();
   }
 
   const optionalValue = (value) => {
