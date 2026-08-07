@@ -144,6 +144,9 @@ Administrator channel, ban, and audit directories preserve their table
 semantics on an API-read failure, announce the problem, and offer one explicit
 in-place retry rather than presenting an empty-looking result or requiring a
 full-page reload.
+Account & access follows the same recovery contract for its profile,
+credentials, tokens, identities, read state, and security activity, so a transient failure
+does not turn any durable account state into an ambiguous empty result.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated
@@ -240,7 +243,8 @@ browser journeys for ordinary API behavior.
 **Current progress:** the real OpenID Connect browser journey verifies the
 shared console/chat theme preference through a persisted choice, reload, and
 system-theme reset. It also injects a failed administrator-directory API read
-and proves the announced table failure retries through the canonical resource.
+and failed account-token API read, proving each announced table failure retries
+through its canonical resource.
 API and template tests continue to cover the non-browser contract around it.
 
 1. Build exhaustive API contract tests for each resource: valid lifecycle,

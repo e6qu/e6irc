@@ -318,7 +318,9 @@ An app password cannot rotate the primary password. The primary credential
 cannot be deleted through generic revocation. Expired or under-scoped personal
 access tokens are rejected, and a bearer cannot mint broader credentials.
 Exact-resource deletes are owner-scoped and idempotent only where the API
-contract says so.
+contract says so. A failed Account & access API read remains an announced,
+in-place retryable state rather than appearing as empty profile, credential,
+token, identity, read-marker, or security-activity data.
 
 **Security and observability.** New app passwords and tokens are rendered once;
 only hashes and secret-free posture remain. Rotation and revocation are
@@ -327,4 +329,6 @@ excluded from pages, logs, metrics, and audit records.
 
 **Evidence.** Proven through the database, HTTP API, and server-rendered console
 by the credential, token, password-rotation, browser-session, live-connection,
-and OpenID Connect logout integration suites.
+and OpenID Connect logout integration suites. The real OpenID Connect browser
+journey injects a token-directory API failure and proves the rendered retry
+loads the canonical resource exactly once.
