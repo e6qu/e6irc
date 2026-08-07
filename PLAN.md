@@ -140,6 +140,10 @@ owner-scoped channel resource rather than a server-rendered channel snapshot.
 Administrator Accounts & policy now hydrates its bounded account and pending
 invitation directories from administrator API resources; its HTML response
 contains only the authenticated shell and CSRF capability.
+Administrator channel, ban, and audit directories preserve their table
+semantics on an API-read failure, announce the problem, and offer one explicit
+in-place retry rather than presenting an empty-looking result or requiring a
+full-page reload.
 
 1. Retain only thin server-rendered document shells where they add value
    (sign-in, bootstrap, initial document/security headers). Render authenticated
@@ -235,8 +239,9 @@ browser journeys for ordinary API behavior.
 
 **Current progress:** the real OpenID Connect browser journey verifies the
 shared console/chat theme preference through a persisted choice, reload, and
-system-theme reset. API and template tests continue to cover the non-browser
-contract around it.
+system-theme reset. It also injects a failed administrator-directory API read
+and proves the announced table failure retries through the canonical resource.
+API and template tests continue to cover the non-browser contract around it.
 
 1. Build exhaustive API contract tests for each resource: valid lifecycle,
    malformed input, authorization matrix, CSRF/bearer distinction, ownership

@@ -211,6 +211,24 @@
     return parent;
   };
 
+  const tableLoadFailure = (body, columns, error, retry) => {
+    body.replaceChildren();
+    const row = document.createElement("tr");
+    const cell = element("td", "empty");
+    cell.colSpan = columns;
+    const status = element("span");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    const message = error instanceof Error ? error.message : "The directory failed to load.";
+    status.textContent = `${message} `;
+    const button = element("button", "secondary-link", "Retry");
+    button.type = "button";
+    button.addEventListener("click", retry);
+    cell.append(status, button);
+    row.append(cell);
+    body.append(row);
+  };
+
   const monitoringEmpty = (message) => element("div", "chart-empty", message);
 
   const monitoringHealth = (view) => {
@@ -976,9 +994,70 @@
   const banResult = document.getElementById("ban-api-result");
   const adminBanRows = document.querySelector("[data-api-admin-ban-list]");
   if (adminBanRows instanceof HTMLElement) {
-    void apiRead(`/api/v1/admin/bans${window.location.search}`)
-      .then((result) => { const bans = Array.isArray(result.bans) ? result.bans : []; adminBanRows.replaceChildren(); const count = document.getElementById("admin-ban-count"); if (count) count.textContent = String(bans.length); const pager = document.getElementById("admin-ban-pager"); if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/bans?${query}`; link.textContent = "Older rules"; pager.append(link); } } if (!bans.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No server bans match this view."; row.append(cell); adminBanRows.append(row); return; } for (const ban of bans) { const row = document.createElement("tr"); [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at].forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value || ""); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/bans/${ban.id}`; form.dataset.apiBanDelete = ""; form.dataset.confirm = `Remove ${ban.kind} ${ban.mask}?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminBanRows.dataset.csrf || ""; const id = document.createElement("input"); id.type = "hidden"; id.name = "id"; id.value = String(ban.id); const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Remove"; form.append(csrf, id, button); actions.append(form); row.append(actions); adminBanRows.append(row); } })
-      .catch((error) => { adminBanRows.textContent = error instanceof Error ? error.message : "Server-ban directory failed to load."; });
+    const refreshBanDirectory = async () => {
+      try {
+        const result = await apiRead(`/api/v1/admin/bans${window.location.search}`);
+        const bans = Array.isArray(result.bans) ? result.bans : [];
+        adminBanRows.replaceChildren();
+        const count = document.getElementById("admin-ban-count");
+        if (count) count.textContent = String(bans.length);
+        const pager = document.getElementById("admin-ban-pager");
+        if (pager) {
+          pager.replaceChildren();
+          if (result.next_before_id) {
+            const link = document.createElement("a");
+            const query = new URLSearchParams(window.location.search);
+            query.set("before_id", String(result.next_before_id));
+            link.href = `/console/bans?${query}`;
+            link.textContent = "Older rules";
+            pager.append(link);
+          }
+        }
+        if (!bans.length) {
+          const row = document.createElement("tr");
+          const cell = document.createElement("td");
+          cell.colSpan = 7;
+          cell.className = "empty";
+          cell.textContent = "No server bans match this view.";
+          row.append(cell);
+          adminBanRows.append(row);
+          return;
+        }
+        for (const ban of bans) {
+          const row = document.createElement("tr");
+          [ban.id, ban.kind, ban.mask, ban.reason, ban.set_by, ban.created_at].forEach((value) => {
+            const cell = document.createElement("td");
+            cell.textContent = String(value || "");
+            row.append(cell);
+          });
+          const actions = document.createElement("td");
+          const form = document.createElement("form");
+          form.method = "post";
+          form.action = `/api/v1/admin/bans/${ban.id}`;
+          form.dataset.apiBanDelete = "";
+          form.dataset.confirm = `Remove ${ban.kind} ${ban.mask}?`;
+          const csrf = document.createElement("input");
+          csrf.type = "hidden";
+          csrf.name = "csrf";
+          csrf.value = adminBanRows.dataset.csrf || "";
+          const id = document.createElement("input");
+          id.type = "hidden";
+          id.name = "id";
+          id.value = String(ban.id);
+          const button = document.createElement("button");
+          button.type = "submit";
+          button.className = "danger";
+          button.textContent = "Remove";
+          form.append(csrf, id, button);
+          actions.append(form);
+          row.append(actions);
+          adminBanRows.append(row);
+        }
+      } catch (error) {
+        tableLoadFailure(adminBanRows, 7, error, () => void refreshBanDirectory());
+      }
+    };
+    void refreshBanDirectory();
   }
   const setBanResult = (message, success) => {
     if (!banResult) return;
@@ -2114,8 +2193,9 @@
   const channelResult = document.getElementById("channel-api-result");
   const adminChannelRows = document.querySelector("[data-api-admin-channel-list]");
   if (adminChannelRows instanceof HTMLElement) {
-    void apiRead(`/api/v1/admin/channels${window.location.search}`)
-      .then((result) => {
+    const refreshChannelDirectory = async () => {
+      try {
+        const result = await apiRead(`/api/v1/admin/channels${window.location.search}`);
         const channels = Array.isArray(result.channels) ? result.channels : [];
         const pager = document.getElementById("admin-channel-pager");
         if (pager) { pager.replaceChildren(); if (result.next_before_id) { const link = document.createElement("a"); const query = new URLSearchParams(window.location.search); query.set("before_id", String(result.next_before_id)); link.href = `/console/admin/channels?${query}`; link.textContent = "Older registrations"; pager.append(link); } }
@@ -2123,14 +2203,18 @@
         const count = document.getElementById("admin-channel-count"); if (count) count.textContent = String(channels.length);
         if (!channels.length) { const row = document.createElement("tr"); const cell = document.createElement("td"); cell.colSpan = 7; cell.className = "empty"; cell.textContent = "No registered channels match this view."; row.append(cell); adminChannelRows.append(row); return; }
         for (const channel of channels) { const row = document.createElement("tr"); const policy = channel.policy || {}; const values = [channel.id, channel.name, channel.founder, channel.created_at, `KEEP ${policy.keeptopic ? "on" : "off"}${policy.topic_retained ? "; topic retained" : ""}${policy.mlock ? `; MLOCK ${policy.mlock}` : ""}`, `${policy.access_entries || 0} grants`]; values.forEach((value) => { const cell = document.createElement("td"); cell.textContent = String(value); row.append(cell); }); const actions = document.createElement("td"); const form = document.createElement("form"); form.method = "post"; form.action = `/api/v1/admin/channels/${encodeURIComponent(channel.name)}`; form.dataset.apiAdminChannelDrop = ""; form.dataset.confirm = `Unregister ${channel.name} and delete its retained policy?`; const csrf = document.createElement("input"); csrf.type = "hidden"; csrf.name = "csrf"; csrf.value = adminChannelRows.dataset.csrf || ""; const button = document.createElement("button"); button.type = "submit"; button.className = "danger"; button.textContent = "Unregister"; form.append(csrf, button); actions.append(form); row.append(actions); adminChannelRows.append(row); }
-      })
-      .catch((error) => { adminChannelRows.textContent = error instanceof Error ? error.message : "Channel directory failed to load."; });
+      } catch (error) {
+        tableLoadFailure(adminChannelRows, 7, error, () => void refreshChannelDirectory());
+      }
+    };
+    void refreshChannelDirectory();
   }
 
   const adminAuditRows = document.querySelector("[data-api-admin-audit-list]");
   if (adminAuditRows instanceof HTMLElement) {
-    void apiRead(`/api/v1/admin/audit${window.location.search}`)
-      .then((result) => {
+    const refreshAuditDirectory = async () => {
+      try {
+        const result = await apiRead(`/api/v1/admin/audit${window.location.search}`);
         const entries = Array.isArray(result.audit) ? result.audit : [];
         adminAuditRows.replaceChildren();
         const count = document.getElementById("admin-audit-count");
@@ -2176,12 +2260,11 @@
             });
           adminAuditRows.append(row);
         }
-      })
-      .catch((error) => {
-        adminAuditRows.textContent = error instanceof Error
-          ? error.message
-          : "Audit history failed to load.";
-      });
+      } catch (error) {
+        tableLoadFailure(adminAuditRows, 6, error, () => void refreshAuditDirectory());
+      }
+    };
+    void refreshAuditDirectory();
   }
 
   const setChannelResult = (message, success) => {

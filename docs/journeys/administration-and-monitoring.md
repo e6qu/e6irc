@@ -102,6 +102,8 @@ validated. User strings are escaped in HTML and never become metric labels.
 Database failure is an error state, not an empty directory. Self-suspension,
 self-demotion, and suspending or demoting the last active effective
 durable-or-configured administrator are explicit conflicts.
+Channel registry, server-ban, and audit-table read failures retain their table
+structure, announce the API problem, and offer an explicit in-place retry.
 Invalid stored network configuration prevents reactivation before the durable
 state changes. A post-commit core/runtime reconciliation failure reports the
 exact safe partial state so retry can reconcile it.
@@ -123,7 +125,8 @@ grant/revoke, and authority-source projection. Administrator-only
 API/console integration tests also cover escaping and mutation actions. The
 real Chromium/PostgreSQL journey visits every full
 administrator directory, adds and removes a K-Line through the rendered
-policy controls, and confirms both actions in the audit explorer.
+policy controls, confirms both actions in the audit explorer, and exercises a
+transient audit-directory API failure followed by the rendered Retry control.
 
 ## Inspect and terminate live connections
 

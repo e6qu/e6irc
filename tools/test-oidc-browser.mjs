@@ -618,6 +618,41 @@ try {
   assert.match(await page.locator("main").innerText(), /browser-policy\.example/);
   assert.match(await page.locator("main").innerText(), /KLINE/);
 
+  // API-backed administrator directories retain their table semantics and
+  // offer an in-place retry when a transient read fails. This is browser-only
+  // behavior: the ordinary API contract suite already covers the 503 shape.
+  let auditDirectoryReads = 0;
+  const auditFailureErrorStart = applicationErrors.length;
+  await page.route(`${applicationOrigin}/api/v1/admin/audit`, async (route) => {
+    auditDirectoryReads += 1;
+    if (auditDirectoryReads === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/problem+json",
+        body: JSON.stringify({ status: 503, title: "Audit storage unavailable" }),
+      });
+    } else {
+      await route.continue();
+    }
+  });
+  await page.goto(`${applicationOrigin}/console/audit`);
+  const auditFailure = page.locator("#admin-audit-rows [role=status]");
+  await auditFailure.waitFor();
+  assert.match(await auditFailure.innerText(), /Audit storage unavailable/);
+  const retryAuditDirectory = page.locator("#admin-audit-rows").getByRole("button", {
+    name: "Retry",
+    exact: true,
+  });
+  await retryAuditDirectory.click();
+  await page.getByText("KLINE", { exact: true }).waitFor();
+  assert.equal(auditDirectoryReads, 2, "Retry made exactly one replacement API request");
+  assert.deepEqual(
+    applicationErrors.splice(auditFailureErrorStart),
+    [`503 GET ${applicationOrigin}/api/v1/admin/audit`],
+    "the deliberate API failure was the only browser diagnostic during recovery",
+  );
+  await page.unroute(`${applicationOrigin}/api/v1/admin/audit`);
+
   // Configure a custom IRC upstream entirely through the API-backed console,
   // then use the production web client and its real /ws/ui socket in both
   // directions. The local upstream is a protocol peer, not a browser route
