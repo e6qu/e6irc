@@ -1018,8 +1018,14 @@ try {
   await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
   await waitForBufferedLine(context.request, "journey", "browser replays through the real stack");
 
+  const initialBuffer = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,
+  );
   await page.goto(`${applicationOrigin}/?network=journey`);
-  await page.getByText("browser replays through the real stack", { exact: true }).waitFor();
+  assert.equal((await initialBuffer).status(), 200);
+  const replayedMessage = page.getByText("browser replays through the real stack", { exact: true });
+  await replayedMessage.waitFor();
+  assert.equal(await replayedMessage.count(), 1);
   const journeyBuffer = page.getByRole("button", { name: "Open #journey", exact: true });
   assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
   assert.equal(await journeyBuffer.getAttribute("aria-pressed"), "true");

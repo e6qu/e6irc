@@ -149,6 +149,7 @@ let myNick = null;
 let socket = null;
 let upstreamConnected = false;
 let snapshotComplete = false;
+let initialReplay = new Map();
 let memberTracking = true;
 let nextSendId = 0;
 const pendingSends = new Map();
@@ -904,6 +905,21 @@ function handleLine(raw) {
   }
 }
 
+function rememberInitialReplay(lines) {
+  initialReplay = new Map();
+  for (const line of lines) {
+    initialReplay.set(line, (initialReplay.get(line) ?? 0) + 1);
+  }
+}
+
+function isInitialReplay(line) {
+  const count = initialReplay.get(line) ?? 0;
+  if (count === 0) return false;
+  if (count === 1) initialReplay.delete(line);
+  else initialReplay.set(line, count - 1);
+  return true;
+}
+
 // ---- socket + composer --------------------------------------------------
 
 // Reconnect with exponential backoff + jitter: a transient drop (server
@@ -1056,7 +1072,9 @@ function connect() {
       );
       return;
     }
-    if (event.t === "line" && typeof event.v === "string") handleLine(event.v);
+    if (event.t === "line" && typeof event.v === "string") {
+      if (snapshotComplete || !isInitialReplay(event.v)) handleLine(event.v);
+    }
     else if (event.t === "sent" && typeof event.v === "string") {
       if (!acceptPendingSend(event.v)) {
         showAlert("protocol", "The server acknowledged an unknown composer request.", "error");
@@ -1083,6 +1101,7 @@ function connect() {
       setStatus(`${network}: upstream reconnecting${why}`, "error");
     } else if (event.t === "snapshot" && event.v === "complete") {
       snapshotComplete = true;
+      initialReplay.clear();
       if (upstreamConnected) resyncMemberships();
     } else if (event.t === "status" && event.v === "unavailable") {
       terminalSocket = true;
@@ -1359,6 +1378,24 @@ async function loadEarlier() {
   if (b.key === active) renderActive({ atLatest: false });
 }
 
+async function loadInitialBacklog() {
+  try {
+    const lines = backlogFrom(
+      await getJson(
+        window.fetch.bind(window),
+        `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
+      ),
+    );
+    rememberInitialReplay(lines);
+    for (const line of lines) handleLine(line);
+    clearAlert("history");
+  } catch (error) {
+    const message = errorMessage("load initial messages", error);
+    addServer(message);
+    showAlert("history", message, "error");
+  }
+}
+
 const loadEarlierBtn = el("load-earlier");
 if (loadEarlierBtn) loadEarlierBtn.addEventListener("click", loadEarlier);
 
@@ -1493,6 +1530,7 @@ async function boot() {
       selected.kind === "local";
   }
 
+  await loadInitialBacklog();
   connect();
 }
 
