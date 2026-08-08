@@ -4612,7 +4612,10 @@ async fn oidc_web_session_records_logout_hint() {
         .expect("plain");
     assert_eq!(
         db::session_logout_hint(&pool, &plain).await.expect("hint"),
-        (None, None)
+        db::SessionLogoutHint {
+            id_token: None,
+            provider: None,
+        }
     );
 
     // An OIDC session records the id token + provider for RP-initiated logout.
@@ -4634,7 +4637,10 @@ async fn oidc_web_session_records_logout_hint() {
     .expect("sso");
     assert_eq!(
         db::session_logout_hint(&pool, &sso).await.expect("hint"),
-        (Some("the.id.token".to_string()), Some("shauth".to_string()))
+        db::SessionLogoutHint {
+            id_token: Some("the.id.token".to_string()),
+            provider: Some("shauth".to_string()),
+        }
     );
     assert_eq!(
         db::session_identity(&pool, &sso).await.expect("identity"),

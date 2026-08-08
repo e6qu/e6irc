@@ -1543,25 +1543,27 @@ async fn hash_password(password: String) -> Result<String, DbError> {
     .expect("hashing task panicked")
 }
 
-/// Verify one password against every supplied credential without
-/// short-circuiting. Keeping the Argon2 gate and comparison loop here means
-/// primary-password-only web authentication cannot drift from SASL's
-/// all-credentials verification.
-async fn matching_credential_id(credentials: Vec<(i64, String)>, password: String) -> Option<i64> {
+struct CredentialHash {
+    credential_id: i64,
+    argon2_hash: String,
+}
+
+/// Verify every supplied credential without short-circuiting.
+async fn matching_credential_id(credentials: Vec<CredentialHash>, password: String) -> Option<i64> {
     let _permit = ARGON2_PERMITS
         .acquire()
         .await
         .expect("argon2 semaphore never closed");
     tokio::task::spawn_blocking(move || {
         let mut matched_id = None;
-        for (id, hash) in &credentials {
-            let matches = PasswordHash::new(hash).is_ok_and(|parsed| {
+        for credential in &credentials {
+            let matches = PasswordHash::new(&credential.argon2_hash).is_ok_and(|parsed| {
                 hasher()
                     .verify_password(password.as_bytes(), &parsed)
                     .is_ok()
             });
             if matches {
-                matched_id = Some(*id);
+                matched_id = Some(credential.credential_id);
             }
         }
         matched_id
@@ -2420,11 +2422,19 @@ pub enum UnlinkIdentityOutcome {
     NotFound,
 }
 
-/// Remove one linked identity owned by `account`, refusing to remove the last
-/// browser-login path. The account row serializes concurrent unlinks, so two
-/// requests cannot both observe a count of two and remove both identities.
-/// Sessions asserted by the removed identity are revoked in the same
-/// transaction; unlinking cannot leave an already-authenticated back door.
+#[derive(sqlx::FromRow)]
+struct OidcIdentityReference {
+    issuer: String,
+    subject: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct LoginMethodCounts {
+    identity_count: i64,
+    has_local_password: bool,
+}
+
+/// Remove one linked identity without removing the last login method.
 pub async fn unlink_oidc_identity(
     pool: &PgPool,
     account: &str,
@@ -2441,7 +2451,7 @@ pub async fn unlink_oidc_identity(
     let Some(account_id) = account_id else {
         return Ok(UnlinkIdentityOutcome::NotFound);
     };
-    let identity: Option<(String, String)> = sqlx::query_as(
+    let identity: Option<OidcIdentityReference> = sqlx::query_as(
         "SELECT issuer, subject FROM oidc_identities
          WHERE id = $1 AND account_id = $2",
     )
@@ -2450,16 +2460,19 @@ pub async fn unlink_oidc_identity(
     .fetch_optional(&mut *tx)
     .await
     .map_err(DbError::Query)?;
-    let Some((issuer, subject)) = identity else {
+    let Some(OidcIdentityReference { issuer, subject }) = identity else {
         return Ok(UnlinkIdentityOutcome::NotFound);
     };
-    let (identity_count, has_local_password): (i64, bool) = sqlx::query_as(
+    let LoginMethodCounts {
+        identity_count,
+        has_local_password,
+    } = sqlx::query_as(
         "SELECT
-             (SELECT count(*) FROM oidc_identities WHERE account_id = $1),
+             (SELECT count(*) FROM oidc_identities WHERE account_id = $1) AS identity_count,
              EXISTS(
                  SELECT 1 FROM account_credentials
                  WHERE account_id = $1 AND kind = 'local_password'
-             )",
+             ) AS has_local_password",
     )
     .bind(account_id)
     .fetch_one(&mut *tx)
@@ -4495,19 +4508,22 @@ fn dummy_verify_hash() -> &'static str {
     })
 }
 
-/// Verify `password` against `account`'s stored credentials (account
-/// password or app password — both are argon2id rows under the same
-/// account). Returns the account's canonical display name on success and
-/// `None` on rejection (no account/nick-existence oracle). A database
-/// failure is an `Err` — callers must not treat it as a rejection.
+#[derive(sqlx::FromRow)]
+struct CredentialVerificationRow {
+    display_name: String,
+    argon2_hash: String,
+    credential_id: i64,
+}
+
+/// Verify an account password or app password.
 pub async fn verify_credentials(
     pool: &PgPool,
     account: &str,
     password: &str,
 ) -> Result<Option<String>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
-        "SELECT a.name, c.argon2_hash, c.id FROM accounts a
+    let rows: Vec<CredentialVerificationRow> = sqlx::query_as(
+        "SELECT a.name AS display_name, c.argon2_hash, c.id AS credential_id FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
          WHERE a.name_folded = $1 AND (a.flags & $2) = 0",
     )
@@ -4520,8 +4536,14 @@ pub async fn verify_credentials(
         spend_dummy_verification(password.to_string()).await;
         return Ok(None);
     }
-    let display_name = rows[0].0.clone();
-    let creds: Vec<(i64, String)> = rows.into_iter().map(|(_, h, id)| (id, h)).collect();
+    let display_name = rows[0].display_name.clone();
+    let creds = rows
+        .into_iter()
+        .map(|row| CredentialHash {
+            credential_id: row.credential_id,
+            argon2_hash: row.argon2_hash,
+        })
+        .collect();
     let matched_id = matching_credential_id(creds, password.to_string()).await;
     if let Some(id) = matched_id {
         // Record the use so the credential list can show it. Best-effort: a
@@ -4539,17 +4561,15 @@ pub async fn verify_credentials(
     Ok(matched_id.map(|_| display_name))
 }
 
-/// Verify only the account's primary password. Browser login and password
-/// rotation deliberately do not accept app passwords, whose authority is
-/// limited to IRC client attachment.
+/// Verify only an account's primary password.
 pub async fn verify_local_password(
     pool: &PgPool,
     account: &str,
     password: &str,
 ) -> Result<Option<String>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
-    let row: Option<(String, String, i64)> = sqlx::query_as(
-        "SELECT a.name, c.argon2_hash, c.id FROM accounts a
+    let row: Option<CredentialVerificationRow> = sqlx::query_as(
+        "SELECT a.name AS display_name, c.argon2_hash, c.id AS credential_id FROM accounts a
          JOIN account_credentials c ON c.account_id = a.id
          WHERE a.name_folded = $1
            AND c.kind = 'local_password'
@@ -4560,14 +4580,26 @@ pub async fn verify_local_password(
     .fetch_optional(pool)
     .await
     .map_err(DbError::Query)?;
-    let Some((display_name, hash, id)) = row else {
+    let Some(CredentialVerificationRow {
+        display_name,
+        argon2_hash,
+        credential_id,
+    }) = row
+    else {
         spend_dummy_verification(password.to_string()).await;
         return Ok(None);
     };
-    let matched = matching_credential_id(vec![(id, hash)], password.to_string()).await;
+    let matched = matching_credential_id(
+        vec![CredentialHash {
+            credential_id,
+            argon2_hash,
+        }],
+        password.to_string(),
+    )
+    .await;
     if matched.is_some() {
         sqlx::query("UPDATE account_credentials SET last_used_at = now() WHERE id = $1")
-            .bind(id)
+            .bind(credential_id)
             .execute(pool)
             .await
             .map_err(DbError::Query)?;
@@ -4588,28 +4620,35 @@ async fn lock_account_id(
         .map_err(DbError::Query)
 }
 
-/// Begin a password-mutation transaction: hash the new password, fold the
-/// account, and lock the account row. Returns the transaction, folded name,
-/// new hash, and account id — `None` when the account does not exist (each
-/// caller decides how to answer that: a dummy verification or a plain error).
+struct PasswordMutation<'a> {
+    transaction: sqlx::Transaction<'a, sqlx::Postgres>,
+    folded: String,
+    new_hash: String,
+    account_id: Option<i64>,
+}
+
+/// Start a locked password-mutation transaction.
 async fn begin_password_mutation<'a>(
     pool: &'a PgPool,
     account: &str,
     new_password: &str,
-) -> Result<
-    (
-        sqlx::Transaction<'a, sqlx::Postgres>,
-        String,
-        String,
-        Option<i64>,
-    ),
-    DbError,
-> {
+) -> Result<PasswordMutation<'a>, DbError> {
     let new_hash = hash_password(new_password.to_string()).await?;
     let folded = CaseMapping::Rfc1459.casefold(account);
     let mut tx = pool.begin().await.map_err(DbError::Query)?;
     let account_id = lock_account_id(&mut tx, &folded).await?;
-    Ok((tx, folded, new_hash, account_id))
+    Ok(PasswordMutation {
+        transaction: tx,
+        folded,
+        new_hash,
+        account_id,
+    })
+}
+
+#[derive(sqlx::FromRow)]
+struct LocalCredentialRow {
+    credential_id: i64,
+    argon2_hash: String,
 }
 
 /// Replace an account's primary password after verifying the current primary
@@ -4621,27 +4660,38 @@ pub async fn change_local_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<(), DbError> {
-    let (mut tx, folded, new_hash, account_id) =
-        begin_password_mutation(pool, account, new_password).await?;
+    let PasswordMutation {
+        mut transaction,
+        folded,
+        new_hash,
+        account_id,
+    } = begin_password_mutation(pool, account, new_password).await?;
     let Some(account_id) = account_id else {
         spend_dummy_verification(current_password.to_string()).await;
         return Err(DbError::BadCredentials);
     };
-    let row: Option<(i64, String)> = sqlx::query_as(
-        "SELECT c.id, c.argon2_hash FROM account_credentials c
+    let row: Option<LocalCredentialRow> = sqlx::query_as(
+        "SELECT c.id AS credential_id, c.argon2_hash FROM account_credentials c
          WHERE c.account_id = $1 AND c.kind = 'local_password'
          FOR UPDATE OF c",
     )
     .bind(account_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    let Some((credential_id, current_hash)) = row else {
+    let Some(LocalCredentialRow {
+        credential_id,
+        argon2_hash,
+    }) = row
+    else {
         spend_dummy_verification(current_password.to_string()).await;
         return Err(DbError::BadCredentials);
     };
     if matching_credential_id(
-        vec![(credential_id, current_hash)],
+        vec![CredentialHash {
+            credential_id,
+            argon2_hash,
+        }],
         current_password.to_string(),
     )
     .await
@@ -4656,18 +4706,18 @@ pub async fn change_local_password(
     )
     .bind(new_hash)
     .bind(credential_id)
-    .execute(&mut *tx)
+    .execute(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
     insert_audit_log_with(
-        &mut *tx,
+        &mut *transaction,
         &folded,
         "ACCOUNT_PASSWORD_CHANGE",
         &folded,
         "primary password changed",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
 
@@ -4679,8 +4729,12 @@ pub async fn set_local_password(
     account: &str,
     new_password: &str,
 ) -> Result<(), DbError> {
-    let (mut tx, folded, new_hash, account_id) =
-        begin_password_mutation(pool, account, new_password).await?;
+    let PasswordMutation {
+        mut transaction,
+        folded,
+        new_hash,
+        account_id,
+    } = begin_password_mutation(pool, account, new_password).await?;
     let Some(account_id) = account_id else {
         return Err(DbError::BadCredentials);
     };
@@ -4691,22 +4745,22 @@ pub async fn set_local_password(
          )",
     )
     .bind(account_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
     if exists {
         return Err(DbError::LocalPasswordExists);
     }
-    insert_primary_password(&mut tx, account_id, &new_hash).await?;
+    insert_primary_password(&mut transaction, account_id, &new_hash).await?;
     insert_audit_log_with(
-        &mut *tx,
+        &mut *transaction,
         &folded,
         "ACCOUNT_PASSWORD_ADD",
         &folded,
         "primary password added",
     )
     .await?;
-    tx.commit().await.map_err(DbError::Query)?;
+    transaction.commit().await.map_err(DbError::Query)?;
     Ok(())
 }
 
@@ -6072,22 +6126,26 @@ pub async fn revoke_oidc_frontchannel_sessions(
     Ok(deleted.rows_affected())
 }
 
-/// The OIDC `(id_token, provider)` recorded with a session, for RP-initiated
-/// logout. `(None, None)` for a password/PAT session or an unknown/expired
-/// token — logout stays local in that case.
-pub async fn session_logout_hint(
-    pool: &PgPool,
-    token: &str,
-) -> Result<(Option<String>, Option<String>), DbError> {
-    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id_token, oidc_provider FROM web_sessions
+#[derive(sqlx::FromRow, Debug, PartialEq, Eq)]
+pub struct SessionLogoutHint {
+    pub id_token: Option<String>,
+    pub provider: Option<String>,
+}
+
+/// Return the OpenID Connect logout hint for a valid session.
+pub async fn session_logout_hint(pool: &PgPool, token: &str) -> Result<SessionLogoutHint, DbError> {
+    let row: Option<SessionLogoutHint> = sqlx::query_as(
+        "SELECT id_token, oidc_provider AS provider FROM web_sessions
          WHERE token_hash = $1 AND expires_at > now()",
     )
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
     .map_err(DbError::Query)?;
-    Ok(row.unwrap_or((None, None)))
+    Ok(row.unwrap_or(SessionLogoutHint {
+        id_token: None,
+        provider: None,
+    }))
 }
 
 /// Resolve a session token to its account name, if valid and unexpired.
