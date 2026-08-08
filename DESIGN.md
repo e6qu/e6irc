@@ -146,6 +146,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     projections prevent same-typed columns from being transposed at a caller.
   - `LockedAccountState` / `HistoryMarker` / `WhoRowData` / invitation rows —
     named rows preserve account, history, WHO, and invitation field meanings.
+  - `AccountDeletionTargetRow` / `HistoryTargetRow` / `ChannelMutationOwnerRow`
+    — named rows preserve deletion, history-target, and channel-control fields.
   - `CredentialOrigin` — a credential-verify verdict (`PasswordVerified` /
     `PasswordRejected` / `Unavailable`) answers *either* a SASL `AUTHENTICATE`
     or a NickServ `IDENTIFY`; the request carries which, echoed onto the reply,
