@@ -1831,11 +1831,21 @@ async function startIrcUpstream() {
   const lines = [];
   const lineWaiters = [];
   let outboundSequence = 0;
-  let joined;
-  let resolveJoined;
-  const joinedPromise = new Promise((resolve) => {
-    resolveJoined = resolve;
-  });
+  const joined = new Map();
+  const joinWaiters = new Map();
+  let activeConnection = null;
+
+  const joinedConnection = (channel) => {
+    const connection = joined.get(channel);
+    if (connection) return Promise.resolve(connection);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        joinWaiters.delete(channel);
+        reject(new Error(`upstream did not observe JOIN ${channel}`));
+      }, 10_000);
+      joinWaiters.set(channel, { resolve, timeout });
+    });
+  };
 
   const publishLine = (line) => {
     lines.push(line);
@@ -1888,9 +1898,15 @@ async function startIrcUpstream() {
         const channel = params[0];
         send(`:${nick}!web@journey JOIN ${channel}`);
         names(channel);
-        if (!joined) {
-          joined = { socket, nick, channel };
-          resolveJoined(joined);
+        if (!joined.has(channel)) {
+          const connection = { socket, nick, channel };
+          joined.set(channel, connection);
+          const waiter = joinWaiters.get(channel);
+          if (waiter) {
+            joinWaiters.delete(channel);
+            clearTimeout(waiter.timeout);
+            waiter.resolve(connection);
+          }
         }
       } else if (command === "NAMES" && params[0]) {
         names(params[0]);
@@ -1920,18 +1936,12 @@ async function startIrcUpstream() {
   return {
     address: `127.0.0.1:${address.port}`,
     async waitForJoin(channel) {
-      const connection = await Promise.race([
-        joinedPromise,
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`upstream did not observe JOIN ${channel}`)), 10_000),
-        ),
-      ]);
-      assert.equal(connection.channel, channel);
+      activeConnection = await joinedConnection(channel);
     },
     async sendPeerMessage(target, text) {
-      const connection = await joinedPromise;
+      assert.ok(activeConnection, "select an upstream connection before sending a peer message");
       outboundSequence += 1;
-      connection.socket.write(
+      activeConnection.socket.write(
         `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
       );
     },
