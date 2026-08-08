@@ -174,19 +174,8 @@
 
   const configurationResult = document.getElementById("configuration-api-result");
 
-  const apiProblem = async (response) => {
-    try {
-      const problem = await response.json();
-      if (typeof problem.detail === "string") return problem.detail;
-      if (typeof problem.title === "string") return problem.title;
-    } catch (_) {
-      // An intermediary may replace a problem response with a non-JSON body.
-    }
-    return `Request failed with HTTP ${response.status}.`;
-  };
-
   const MAX_API_JSON_BYTES = 1024 * 1024;
-  const apiJson = async (response) => {
+  const apiText = async (response) => {
     const length = Number(response.headers.get("content-length"));
     if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
       throw new Error("The API response is too large. Reload and try again.");
@@ -195,7 +184,26 @@
     if (text.length > MAX_API_JSON_BYTES) {
       throw new Error("The API response is too large. Reload and try again.");
     }
-    return text ? JSON.parse(text) : undefined;
+    return text;
+  };
+  const apiJson = async (response) => {
+    const text = await apiText(response);
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      throw new Error("The API response is invalid. Reload and try again.");
+    }
+  };
+  const apiProblem = async (response) => {
+    try {
+      const problem = await apiJson(response);
+      if (problem && typeof problem === "object") {
+        if (typeof problem.detail === "string") return problem.detail;
+        if (typeof problem.title === "string") return problem.title;
+      }
+    } catch (_) {}
+    return `Request failed with HTTP ${response.status}.`;
   };
 
   const apiRequest = async (form, url, method, body) => {

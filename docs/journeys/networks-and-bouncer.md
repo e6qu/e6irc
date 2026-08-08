@@ -91,8 +91,9 @@ credentials are supplied.
 - A transient owner-network directory read leaves the table semantics intact,
   announces the API problem, and offers an in-place **Retry**. It never asks
   the operator to reload the document or substitutes a rendered-list fallback.
-- A malformed successful directory response is not reinterpreted as an empty
-  list: it is an explicit, retryable API-contract failure.
+- A malformed successful directory response, including invalid JSON, is not
+  reinterpreted as an empty list: it is an explicit, retryable API-contract
+  failure.
 - A transient network-detail read leaves the shell and diagnostics visible,
   announces the API problem, and offers an in-place **Retry** before exposing
   stored configuration or mutation controls.

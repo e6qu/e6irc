@@ -894,7 +894,7 @@ try {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ networks: {} }),
+        body: "{",
       });
     } else {
       await route.continue();
@@ -903,7 +903,7 @@ try {
   await page.goto(`${applicationOrigin}/console/networks`);
   const ownerNetworkFailure = page.locator("#network-rows [role=status]");
   await ownerNetworkFailure.waitFor();
-  assert.match(await ownerNetworkFailure.innerText(), /network directory response is invalid/i);
+  assert.match(await ownerNetworkFailure.innerText(), /API response is invalid/i);
   await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
   assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
