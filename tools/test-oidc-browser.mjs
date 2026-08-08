@@ -1285,7 +1285,7 @@ try {
             nick: "webnick",
             enabled: true,
             connected: false,
-            runtime: { state: "reconnect_backoff" },
+            runtime: { state: "reconnecting" },
           },
         ],
       }),
@@ -1389,7 +1389,7 @@ try {
   assert.equal(namesRequestedBeforeSnapshot, false, "NAMES was requested before replay completed");
   assert.match(
     await page.locator("#network-select option:checked").textContent(),
-    /reconnect backoff/,
+    /reconnecting/,
   );
   const expectedTaggedTime = await page.evaluate(() => {
     const date = new Date("2026-07-28T20:00:00.000Z");
