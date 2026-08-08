@@ -53,8 +53,8 @@ browser-tested against a real daemon. The same journey verifies the semantic
 conversation and member controls plus the skip-to-chat focus target. Focused
 client-state fixtures cover identity recovery, loading, empty, populated,
 unavailable, expired-session, and forced-colors picker states with visual and
-axe checks. The primary entry journey uses the real network catalog and
-attachment.
+axe checks. The populated fixture proves reflow at a 200% equivalent layout
+width. The primary entry journey uses the real network catalog and attachment.
 
 ## Receive replay and live messages without gaps or duplicates
 

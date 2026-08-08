@@ -95,6 +95,25 @@ test("network picker renders typed network states on tablets", async ({ page }) 
   });
 });
 
+test("chat reflows at a 200 percent equivalent layout width", async ({ page }) => {
+  await page.setViewportSize({ width: 640, height: 800 });
+  await mockSession(page, [
+    {
+      name: "Libera",
+      enabled: true,
+      connected: false,
+      runtime: { state: "reconnecting" },
+    },
+  ]);
+  await page.goto("/");
+
+  await expect(page.getByRole("link", { name: /Libera.*reconnecting/ })).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth))
+    .toBe(true);
+  await expectAccessible(page);
+});
+
 test("network picker distinguishes an unavailable API on narrow dark screens", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 390, height: 844 });
