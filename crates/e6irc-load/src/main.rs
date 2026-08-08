@@ -21,18 +21,64 @@ use e6irc_client::Connection;
 use serde::Serialize;
 use tokio::sync::Barrier;
 
+const MAX_CLIENTS: usize = 100_000;
+const MAX_TRACKED_MESSAGES: usize = 10_000_000;
+
+#[derive(Clone)]
+struct Workload {
+    clients: usize,
+    channels: usize,
+    burst: usize,
+    sender_slots: usize,
+    expected_deliveries: u64,
+}
+
+impl Workload {
+    fn new(clients: usize, channels: usize, burst: usize) -> Result<Self, String> {
+        if clients > MAX_CLIENTS {
+            return Err(format!("--clients must not exceed {MAX_CLIENTS}"));
+        }
+        if channels == 0 {
+            return Err("--channels must be at least 1".into());
+        }
+        if burst == 0 {
+            return Err("--burst must be at least 1".into());
+        }
+        let receivers = clients
+            .checked_sub(channels)
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                "--clients must exceed --channels (each channel needs a sender + a receiver)"
+                    .to_string()
+            })?;
+        let sender_slots = channels
+            .checked_mul(burst)
+            .filter(|slots| *slots <= MAX_TRACKED_MESSAGES)
+            .ok_or_else(|| {
+                format!("--channels × --burst must not exceed {MAX_TRACKED_MESSAGES}")
+            })?;
+        let expected_deliveries = receivers
+            .checked_mul(burst)
+            .filter(|deliveries| *deliveries <= MAX_TRACKED_MESSAGES)
+            .ok_or_else(|| {
+                format!("(--clients − --channels) × --burst must not exceed {MAX_TRACKED_MESSAGES}")
+            })?;
+        Ok(Self {
+            clients,
+            channels,
+            burst,
+            sender_slots,
+            expected_deliveries: expected_deliveries as u64,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct Args {
     addr: String,
-    clients: usize,
+    workload: Workload,
     /// Channel-name prefix; the actual channel is `{channel}{index}`.
     channel: String,
-    /// Spread clients across this many channels (default 1). A realistic
-    /// large deployment has many channels — one giant channel makes the
-    /// join phase O(N²) (each join sends a NAMES list of all members) and
-    /// masks true throughput.
-    channels: usize,
-    burst: usize,
     tls: bool,
     minimum_connect_rate: Option<f64>,
     minimum_fanout_rate: Option<f64>,
@@ -48,11 +94,11 @@ struct Args {
 impl Args {
     /// The channel a client belongs to.
     fn channel_of(&self, id: usize) -> String {
-        format!("{}{}", self.channel, id % self.channels)
+        format!("{}{}", self.channel, id % self.workload.channels)
     }
     /// Clients `0..channels` are the per-channel senders.
     fn is_sender(&self, id: usize) -> bool {
-        id < self.channels
+        id < self.workload.channels
     }
 }
 
@@ -61,12 +107,13 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut clients = 100;
+    let mut channels = 1;
+    let mut burst = 10;
     let mut args = Args {
         addr: "127.0.0.1:6667".to_string(),
-        clients: 100,
+        workload: Workload::new(100, 1, 10).expect("default workload is valid"),
         channel: "#load".to_string(),
-        channels: 1,
-        burst: 10,
         tls: false,
         minimum_connect_rate: None,
         minimum_fanout_rate: None,
@@ -84,11 +131,11 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
                     .ok_or_else(|| "--addr needs a value".to_string())?
             }
             "--clients" => {
-                args.clients = parse_num(
+                clients = parse_num(
                     &it.next()
                         .ok_or_else(|| "--clients needs a value".to_string())?,
                     "--clients",
-                )?
+                )?;
             }
             "--channel" => {
                 args.channel = it
@@ -96,14 +143,14 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
                     .ok_or_else(|| "--channel needs a value".to_string())?
             }
             "--channels" => {
-                args.channels = parse_num(
+                channels = parse_num(
                     &it.next()
                         .ok_or_else(|| "--channels needs a value".to_string())?,
                     "--channels",
                 )?
             }
             "--burst" => {
-                args.burst = parse_num(
+                burst = parse_num(
                     &it.next()
                         .ok_or_else(|| "--burst needs a value".to_string())?,
                     "--burst",
@@ -159,18 +206,7 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    if args.channels < 1 {
-        return Err("--channels must be at least 1".into());
-    }
-    if args.burst < 1 {
-        return Err("--burst must be at least 1".into());
-    }
-    // Each channel needs its sender plus at least one receiver.
-    if args.clients <= args.channels {
-        return Err(
-            "--clients must exceed --channels (each channel needs a sender + a receiver)".into(),
-        );
-    }
+    args.workload = Workload::new(clients, channels, burst)?;
     if args.maximum_server_rss_per_connection_bytes.is_some() && args.server_pid.is_none() {
         return Err("--maximum-server-rss-per-connection-bytes requires --server-pid".to_string());
     }
@@ -409,7 +445,7 @@ async fn run(args: Args) -> Result<RunReport, String> {
     let args = Arc::new(args);
     println!(
         "e6irc-load: {} clients across {} channel(s) -> {} (burst {})",
-        args.clients, args.channels, args.addr, args.burst
+        args.workload.clients, args.workload.channels, args.addr, args.workload.burst
     );
 
     let rss_finished = Arc::new(AtomicBool::new(false));
@@ -431,19 +467,19 @@ async fn run(args: Args) -> Result<RunReport, String> {
         None => None,
     };
     let run_start = Instant::now();
-    let ready = Arc::new(Barrier::new(args.clients));
+    let ready = Arc::new(Barrier::new(args.workload.clients));
     let metrics = Arc::new(Metrics {
         connect_max_ns: AtomicU64::new(0),
         fanout_max_ns: AtomicU64::new(0),
         received: AtomicU64::new(0),
         // One send-time slot per (channel, seq).
-        sent_ns: (0..args.channels * args.burst)
+        sent_ns: (0..args.workload.sender_slots)
             .map(|_| AtomicU64::new(0))
             .collect(),
         latencies_ns: std::sync::Mutex::new(Vec::new()),
     });
-    let mut handles = Vec::with_capacity(args.clients);
-    for id in 0..args.clients {
+    let mut handles = Vec::with_capacity(args.workload.clients);
+    for id in 0..args.workload.clients {
         let args = args.clone();
         let ready = ready.clone();
         let metrics = metrics.clone();
@@ -484,12 +520,12 @@ async fn run(args: Args) -> Result<RunReport, String> {
         None => None,
     };
 
-    let ok = args.clients - failures;
+    let ok = args.workload.clients - failures;
     let connect_secs = metrics.connect_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
     let connect_rate = ok as f64 / connect_secs.max(1e-9);
     println!(
         "connect+register+join: {ok}/{} in {connect_secs:.2}s ({:.0} clients/s)",
-        args.clients, connect_rate,
+        args.workload.clients, connect_rate,
     );
     if failures > 0 {
         println!("{failures} client(s) failed");
@@ -498,7 +534,7 @@ async fn run(args: Args) -> Result<RunReport, String> {
     let delivered = metrics.received.load(Ordering::Relaxed);
     // Every non-sender receives its channel sender's burst; there is one
     // sender per channel.
-    let expected = (args.burst * (args.clients - args.channels)) as u64;
+    let expected = args.workload.expected_deliveries;
     let fanout_secs = metrics.fanout_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000_000.0;
     let fanout_rate = delivered as f64 / fanout_secs.max(1e-9);
     if fanout_secs > 0.0 {
@@ -540,8 +576,8 @@ async fn run(args: Args) -> Result<RunReport, String> {
     let mut thresholds_met = true;
     let server_rss = if let Some((baseline, peak)) = rss_report {
         let incremental = peak.saturating_sub(baseline);
-        let per_connection =
-            incremental.saturating_add(args.clients as u64 - 1) / args.clients as u64;
+        let per_connection = incremental.saturating_add(args.workload.clients as u64 - 1)
+            / args.workload.clients as u64;
         println!(
             "server RSS: baseline {baseline} bytes, peak {peak} bytes, \
              incremental {incremental} bytes ({per_connection} bytes/connection)"
@@ -592,9 +628,9 @@ async fn run(args: Args) -> Result<RunReport, String> {
     Ok(RunReport {
         format_version: 1,
         addr: args.addr.clone(),
-        clients: args.clients,
-        channels: args.channels,
-        burst: args.burst,
+        clients: args.workload.clients,
+        channels: args.workload.channels,
+        burst: args.workload.burst,
         tls: args.tls,
         successful_clients: ok,
         failed_clients: failures,
@@ -667,10 +703,10 @@ async fn client(
 
     // The channel index doubles as this channel's sender id (ids
     // `0..channels` are senders) and as the sent-time base.
-    let chan_idx = id % args.channels;
+    let chan_idx = id % args.workload.channels;
     if args.is_sender(id) {
-        let base = chan_idx * args.burst;
-        for n in 0..args.burst {
+        let base = chan_idx * args.workload.burst;
+        for n in 0..args.workload.burst {
             // Stamp the send time before emitting so receivers can
             // compute end-to-end latency for this (channel, seq).
             metrics.sent_ns[base + n].store(elapsed_nanos(run_start) + 1, Ordering::Relaxed);
@@ -688,7 +724,7 @@ async fn client(
     // Receiver: count this channel's sender's burst until complete or a
     // timeout, recording end-to-end latency per delivery.
     let sender_prefix = format!("load{chan_idx}!");
-    let base = chan_idx * args.burst;
+    let base = chan_idx * args.workload.burst;
     let mut count = 0u64;
     // Elapsed at the *last message actually counted*, not at loop exit: an
     // incomplete run exits via the 30s timeout, and recording that deadline
@@ -697,8 +733,8 @@ async fn client(
     // near-capacity regime the harness exists to measure. This tracks the real
     // delivery time instead.
     let mut last_delivery_ns = 0u64;
-    let mut latencies = Vec::with_capacity(args.burst);
-    let mut deliveries = DeliverySet::new(args.burst);
+    let mut latencies = Vec::with_capacity(args.workload.burst);
+    let mut deliveries = DeliverySet::new(args.workload.burst);
     let receive = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             match conn.next_message().await {
@@ -712,10 +748,10 @@ async fn client(
                     let recv_ns = elapsed_nanos(run_start);
                     let body = m.params.get(1).map(String::as_str).unwrap_or("");
                     if body == "load-complete" {
-                        if count != args.burst as u64 {
+                        if count != args.workload.burst as u64 {
                             return Err(std::io::Error::other(format!(
                                 "incomplete sequence set at sender fence: received {count} of {}",
-                                args.burst
+                                args.workload.burst
                             )));
                         }
                         break;
@@ -773,7 +809,10 @@ async fn client(
         Ok(result) => result,
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("fan-out timed out after {count}/{} deliveries", args.burst),
+            format!(
+                "fan-out timed out after {count}/{} deliveries",
+                args.workload.burst
+            ),
         )),
     }
 }
@@ -843,7 +882,7 @@ mod tests {
             "result.json",
         ])
         .unwrap();
-        assert_eq!(parsed.clients, 64);
+        assert_eq!(parsed.workload.clients, 64);
         assert_eq!(parsed.minimum_connect_rate, Some(10.0));
         assert_eq!(parsed.minimum_fanout_rate, Some(100.0));
         assert_eq!(parsed.maximum_p99_ms, Some(5000.0));
@@ -853,6 +892,18 @@ mod tests {
             Some(1_048_576)
         );
         assert_eq!(parsed.report_json, Some(PathBuf::from("result.json")));
+    }
+
+    #[test]
+    fn workload_rejects_unrepresentable_measurements() {
+        assert!(args(&["--clients", "100001"]).is_err());
+        assert!(args(&["--clients", "100000", "--channels", "100000"]).is_err());
+        assert!(args(&["--clients", "2", "--channels", "1", "--burst", "10000001"]).is_err());
+        assert!(args(&["--clients", "100000", "--channels", "1", "--burst", "102"]).is_err());
+
+        let workload = Workload::new(100_000, 200, 20).expect("target workload is valid");
+        assert_eq!(workload.sender_slots, 4_000);
+        assert_eq!(workload.expected_deliveries, 1_996_000);
     }
 
     #[test]
