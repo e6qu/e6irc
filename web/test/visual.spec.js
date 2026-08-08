@@ -43,6 +43,35 @@ test("network picker renders the empty account state", async ({ page }) => {
   });
 });
 
+test("chat stays non-interactive while the network catalog loads", async ({ page }) => {
+  let releaseRequest;
+  const release = new Promise((resolve) => {
+    releaseRequest = resolve;
+  });
+  let markRequested;
+  const requested = new Promise((resolve) => {
+    markRequested = resolve;
+  });
+  await page.route(/\/api\/v1\/me$/, (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(identity) }),
+  );
+  await page.route(/\/api\/v1\/me\/networks$/, async (route) => {
+    markRequested();
+    await release;
+    await route.fulfill({ contentType: "application/json", body: JSON.stringify({ networks: [] }) });
+  });
+  await page.goto("/");
+  await requested;
+
+  await expect(page.locator("#status")).toHaveText("starting…");
+  await expect(page.locator("#message")).toBeDisabled();
+  await expect(page.locator("#composer button")).toBeDisabled();
+  await expectAccessible(page);
+
+  releaseRequest();
+  await expect(page.getByText("No networks are configured for this account.")).toBeVisible();
+});
+
 test("network picker renders typed network states on tablets", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 768, height: 1024 });
