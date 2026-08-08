@@ -638,6 +638,7 @@ try {
   ]) {
     await page.goto(`${applicationOrigin}${path}`);
     await page.getByRole("heading", { name: heading, exact: true }).waitFor();
+    await expectAccessible(page, "main");
   }
 
   await page.goto(`${applicationOrigin}/console`);
