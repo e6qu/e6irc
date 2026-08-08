@@ -137,16 +137,33 @@ test("JSON requests reject oversized API responses before parsing", async () => 
 
 test("network collection validation separates an empty list from a broken contract", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
-  assert.deepEqual(networksFrom({ networks: [{ name: "Libera", enabled: true, connected: null, runtime: null }] }), [
-    { name: "Libera", enabled: true, connected: null, state: null },
+  const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
+  assert.deepEqual(networksFrom({ networks: [offline] }), [
+    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, runtime: null },
   ]);
+  assert.deepEqual(
+    networksFrom({ networks: [{ ...offline, connected: true, runtime: { state: "connected" } }] }),
+    [{
+      name: "Libera",
+      kind: "irc",
+      nick: "alice",
+      enabled: true,
+      connected: true,
+      state: "connected",
+      runtime: { state: "connected" },
+    }],
+  );
   assert.throws(() => networksFrom({ networks: [{ enabled: true }] }), /invalid network list/);
   assert.throws(
-    () => networksFrom({ networks: [{ name: "Libera", enabled: true, connected: true, runtime: null }] }),
+    () => networksFrom({ networks: [{ ...offline, connected: true }] }),
     /invalid network list/,
   );
   assert.throws(
-    () => networksFrom({ networks: [{ name: "Libera", enabled: true, connected: false, runtime: { state: "connected" } }] }),
+    () => networksFrom({ networks: [{ ...offline, connected: false, runtime: { state: "connected" } }] }),
+    /invalid network list/,
+  );
+  assert.throws(
+    () => networksFrom({ networks: [{ ...offline, kind: "unknown" }] }),
     /invalid network list/,
   );
   assert.throws(() => networksFrom({ networks: [], next: "not part of this response" }), /invalid network list/);

@@ -14,6 +14,7 @@ const NETWORK_STATES = new Set([
   "authentication_failed",
   "registration_failed",
 ]);
+const NETWORK_KINDS = new Set(["irc", "local", "matrix", "discord", "slack"]);
 const IDENTITY_KEYS = new Set([
   "account",
   "email",
@@ -175,10 +176,14 @@ export function identityFrom(payload) {
 
 function networkSummary(value) {
   if (value === null || typeof value !== "object") return null;
-  const { name, enabled, connected, runtime } = value;
+  const { name, kind, nick, enabled, connected, runtime } = value;
   if (
     typeof name !== "string" ||
     !name.trim() ||
+    typeof kind !== "string" ||
+    !NETWORK_KINDS.has(kind) ||
+    typeof nick !== "string" ||
+    !nick.trim() ||
     typeof enabled !== "boolean" ||
     (connected !== null && typeof connected !== "boolean") ||
     (runtime !== null && (typeof runtime !== "object" || Array.isArray(runtime)))
@@ -186,11 +191,21 @@ function networkSummary(value) {
     return null;
   }
   if (runtime === null) {
-    return connected === null ? Object.freeze({ name, enabled, connected, state: null }) : null;
+    return connected === null
+      ? Object.freeze({ name, kind, nick, enabled, connected, state: null, runtime: null })
+      : null;
   }
   if (typeof runtime.state !== "string" || !NETWORK_STATES.has(runtime.state)) return null;
   if (connected !== (runtime.state === "connected")) return null;
-  return Object.freeze({ name, enabled, connected, state: runtime.state });
+  return Object.freeze({
+    name,
+    kind,
+    nick,
+    enabled,
+    connected,
+    state: runtime.state,
+    runtime: Object.freeze({ state: runtime.state }),
+  });
 }
 
 export function networksFrom(payload) {
