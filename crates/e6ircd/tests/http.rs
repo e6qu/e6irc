@@ -907,6 +907,18 @@ async fn openapi_spec_is_served() {
         ("/api/v1/me/tokens", "post"),
         ("/api/v1/auth/device/token", "post"),
         ("/api/v1/auth/device/approve", "post"),
+        ("/api/v1/admin/bans", "post"),
+        ("/api/v1/admin/configuration", "patch"),
+        ("/api/v1/admin/configuration/opers", "post"),
+        ("/api/v1/admin/configuration/opers/{name}", "delete"),
+        ("/api/v1/admin/configuration/oidc-providers", "post"),
+        (
+            "/api/v1/admin/configuration/oidc-providers/{name}",
+            "delete",
+        ),
+        ("/api/v1/admin/configuration/networks", "post"),
+        ("/api/v1/admin/configuration/networks/{name}", "delete"),
+        ("/api/v1/admin/networks/{owner}/{name}", "patch"),
     ] {
         let schema =
             &v["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"];
