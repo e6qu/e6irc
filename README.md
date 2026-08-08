@@ -9,8 +9,8 @@ non-IRC services such as Matrix) — shipped alongside native **CLI** and
 
 Single server = the whole network (no server-to-server linking).
 Designed for **~100k+ concurrent connections** on one machine, with
-**Libera.Chat compatibility** as an explicit target: clients and scripts
-written against Libera should work unchanged against e6ircd.
+**Libera.Chat compatibility** as an explicit target for the shared protocol
+surface. See the [client capability matrix](docs/client-capabilities.md).
 
 > License: **AGPL-3.0-or-later**. Every compiled-in dependency must be
 > AGPL-compatible; compliance is enforced in CI with `cargo-deny`.
@@ -33,7 +33,7 @@ written against Libera should work unchanged against e6ircd.
   batch, CHATHISTORY, MONITOR, echo-message, account-tag, extended-join,
   setname, away-notify, bot mode, and the common channel modes —
   conformance-tested against the [irctest](https://github.com/progval/irctest)
-  suite in CI and live-verified against Libera/OFTC/Ergo.
+  suite in CI, with opt-in live probes for Libera/OFTC/Ergo.
 - **HTTP layer**: local-account and OIDC code+PKCE multi-provider login,
   opaque and individually revocable browser sessions with a concurrent-safe
   per-account cap, bounded administrator/owner live-connection directories
@@ -113,6 +113,8 @@ binary), plus the independently selectable `matrix`, `discord`, and
 `PLAN.md` for the phase-by-phase status,
 [`docs/journeys/`](docs/journeys/README.md) for the user journeys and
 their automated evidence, and
+[`docs/client-capabilities.md`](docs/client-capabilities.md) for client and
+public-network qualification boundaries, and
 [`docs/terminology.md`](docs/terminology.md) for a glossary of the IRC,
 OpenID Connect, and deployment vocabulary used throughout.
 

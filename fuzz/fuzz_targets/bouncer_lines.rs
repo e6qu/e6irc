@@ -26,6 +26,7 @@ fuzz_target!(|data: &[u8]| {
     // First byte selects which tag families the attaching client negotiated.
     let sel = data.first().copied().unwrap_or(0);
     let caps = AttachCaps {
+        sasl: false,
         server_time: sel & 1 != 0,
         message_tags: sel & 2 != 0,
         account_tag: sel & 4 != 0,

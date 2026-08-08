@@ -1038,6 +1038,7 @@ impl BoundedJson for reqwest::Response {
 /// negotiate must not appear in its stream.
 #[derive(Default, Clone, Copy)]
 pub struct AttachCaps {
+    pub sasl: bool,
     pub server_time: bool,
     pub message_tags: bool,
     pub account_tag: bool,

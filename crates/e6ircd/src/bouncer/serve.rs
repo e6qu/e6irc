@@ -540,6 +540,10 @@ where
                 }
                 "AUTHENTICATE" => {
                     let arg = msg.params.first().copied().unwrap_or("");
+                    if !caps.sasl {
+                        reject_sasl(write, server_name).await?;
+                        continue;
+                    }
                     if !awaiting_payload {
                         // Mechanism selection. Only PLAIN is offered.
                         if arg.eq_ignore_ascii_case("PLAIN") {
@@ -634,8 +638,102 @@ where
     })
 }
 
-/// Answer a CAP command. Advertises only `sasl`; `cap_open` tracks
-/// whether negotiation is still in progress (cleared on CAP END).
+#[derive(Clone, Copy)]
+enum AttachCapability {
+    Sasl,
+    ServerTime,
+    MessageTags,
+    AccountTag,
+    EchoMessage,
+    Batch,
+    Chathistory,
+    ReadMarker,
+}
+
+impl AttachCapability {
+    const ALL: [Self; 8] = [
+        Self::Sasl,
+        Self::ServerTime,
+        Self::MessageTags,
+        Self::AccountTag,
+        Self::EchoMessage,
+        Self::Batch,
+        Self::Chathistory,
+        Self::ReadMarker,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Sasl => "sasl",
+            Self::ServerTime => "server-time",
+            Self::MessageTags => "message-tags",
+            Self::AccountTag => "account-tag",
+            Self::EchoMessage => "echo-message",
+            Self::Batch => "batch",
+            Self::Chathistory => "draft/chathistory",
+            Self::ReadMarker => "draft/read-marker",
+        }
+    }
+
+    fn parse(token: &str) -> Option<(Self, bool)> {
+        let (name, enabled) = match token.strip_prefix('-') {
+            Some(name) => (name, false),
+            None => (token, true),
+        };
+        let capability = Self::ALL
+            .into_iter()
+            .find(|capability| capability.name() == name)?;
+        Some((capability, enabled))
+    }
+
+    fn set(self, caps: &mut super::AttachCaps, enabled: bool) {
+        match self {
+            Self::Sasl => caps.sasl = enabled,
+            Self::ServerTime => caps.server_time = enabled,
+            Self::MessageTags => caps.message_tags = enabled,
+            Self::AccountTag => caps.account_tag = enabled,
+            Self::EchoMessage => caps.echo_message = enabled,
+            Self::Batch => caps.batch = enabled,
+            Self::Chathistory => caps.chathistory = enabled,
+            Self::ReadMarker => caps.read_marker = enabled,
+        }
+    }
+
+    fn enabled(self, caps: super::AttachCaps) -> bool {
+        match self {
+            Self::Sasl => caps.sasl,
+            Self::ServerTime => caps.server_time,
+            Self::MessageTags => caps.message_tags,
+            Self::AccountTag => caps.account_tag,
+            Self::EchoMessage => caps.echo_message,
+            Self::Batch => caps.batch,
+            Self::Chathistory => caps.chathistory,
+            Self::ReadMarker => caps.read_marker,
+        }
+    }
+}
+
+fn cap_names(caps: Option<super::AttachCaps>) -> String {
+    AttachCapability::ALL
+        .into_iter()
+        .filter(|capability| caps.is_none_or(|caps| capability.enabled(caps)))
+        .map(AttachCapability::name)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn cap_reply(server_name: &str, verb: &str, request: &str) -> (bool, String) {
+    let head = format!(":{server_name} CAP * {verb} :");
+    let budget = e6irc_proto::message::MAX_LINE_LEN - 2 - head.len();
+    let fitted = request
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= budget)
+        .map(|(_, character)| character)
+        .collect::<String>();
+    (fitted.len() == request.len(), format!("{head}{fitted}\r\n"))
+}
+
+/// Answer a CAP command during BNC attach negotiation.
 async fn handle_cap<W>(
     write: &mut W,
     server_name: &str,
@@ -646,62 +744,47 @@ async fn handle_cap<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    // `server-time`/`message-tags`/`account-tag` gate which tags a client is
-    // sent from the (fully-tagged) backlog; `sasl` authenticates the attach;
-    // `echo-message` opts the client into receiving its own synthesized echo;
-    // `batch`/`draft/chathistory`/`draft/read-marker` enable backlog paging
-    // and per-target read positions on the attach listener.
-    let known = |c: &str| {
-        matches!(
-            c,
-            "sasl"
-                | "server-time"
-                | "message-tags"
-                | "account-tag"
-                | "echo-message"
-                | "batch"
-                | "draft/chathistory"
-                | "draft/read-marker"
-        )
-    };
     match msg
         .params
         .first()
         .map(|s| s.to_ascii_uppercase())
         .as_deref()
     {
-        Some("LS") | Some("LIST") => {
+        Some("LS") => {
+            write
+                .write_all(format!(":{server_name} CAP * LS :{}\r\n", cap_names(None)).as_bytes())
+                .await?;
+        }
+        Some("LIST") => {
             write
                 .write_all(
-                    format!(
-                        ":{server_name} CAP * LS :sasl server-time message-tags account-tag echo-message batch draft/chathistory draft/read-marker\r\n"
-                    )
-                    .as_bytes(),
+                    format!(":{server_name} CAP * LIST :{}\r\n", cap_names(Some(*caps))).as_bytes(),
                 )
                 .await?;
         }
         Some("REQ") => {
             let req = msg.params.get(1).copied().unwrap_or("");
-            // REQ is atomic: ACK only when every requested cap is known.
-            let all_known = !req.is_empty() && req.split_whitespace().all(known);
-            if all_known {
-                for c in req.split_whitespace() {
-                    match c {
-                        "server-time" => caps.server_time = true,
-                        "message-tags" => caps.message_tags = true,
-                        "account-tag" => caps.account_tag = true,
-                        "echo-message" => caps.echo_message = true,
-                        "batch" => caps.batch = true,
-                        "draft/chathistory" => caps.chathistory = true,
-                        "draft/read-marker" => caps.read_marker = true,
-                        _ => {}
-                    }
-                }
+            let mut requested = *caps;
+            let all_known = !req.is_empty()
+                && req
+                    .split_whitespace()
+                    .all(|token| match AttachCapability::parse(token) {
+                        Some((capability, enabled)) => {
+                            capability.set(&mut requested, enabled);
+                            true
+                        }
+                        None => false,
+                    });
+            let (fits, ack) = cap_reply(server_name, "ACK", req);
+            if all_known && fits {
+                *caps = requested;
             }
-            let verb = if all_known { "ACK" } else { "NAK" };
-            write
-                .write_all(format!(":{server_name} CAP * {verb} :{req}\r\n").as_bytes())
-                .await?;
+            let reply = if all_known && fits {
+                ack
+            } else {
+                cap_reply(server_name, "NAK", req).1
+            };
+            write.write_all(reply.as_bytes()).await?;
         }
         Some("END") => *cap_open = false,
         _ => {}
@@ -735,6 +818,67 @@ async fn verify_plain(pool: &PgPool, payload: &str) -> Option<String> {
             eprintln!("bnc: credential check failed (database error): {e}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn attach_capabilities_have_one_advertised_and_requested_set() {
+        let mut caps = super::super::AttachCaps::default();
+        for capability in AttachCapability::ALL {
+            let (parsed, enabled) = AttachCapability::parse(capability.name()).expect("known cap");
+            parsed.set(&mut caps, enabled);
+        }
+        assert_eq!(cap_names(Some(caps)), cap_names(None));
+
+        let (capability, enabled) = AttachCapability::parse("-echo-message").expect("known cap");
+        capability.set(&mut caps, enabled);
+        assert!(!cap_names(Some(caps)).contains("echo-message"));
+        assert!(AttachCapability::parse("unknown").is_none());
+    }
+
+    #[test]
+    fn cap_reply_never_exceeds_the_wire_limit() {
+        let request = std::iter::repeat_n("server-time", 80)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (fits, reply) = cap_reply("bnc.example", "ACK", &request);
+        assert!(!fits);
+        assert!(reply.len() <= e6irc_proto::message::MAX_LINE_LEN);
+    }
+
+    #[tokio::test]
+    async fn cap_list_reports_only_enabled_attach_capabilities() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let mut caps = super::super::AttachCaps::default();
+        let mut cap_open = false;
+        let request = Message::parse("CAP REQ :sasl echo-message").expect("CAP request");
+        handle_cap(
+            &mut server,
+            "bnc.example",
+            &request,
+            &mut cap_open,
+            &mut caps,
+        )
+        .await
+        .expect("CAP request reply");
+        let list = Message::parse("CAP LIST").expect("CAP list");
+        handle_cap(&mut server, "bnc.example", &list, &mut cap_open, &mut caps)
+            .await
+            .expect("CAP list reply");
+        server.shutdown().await.expect("close server half");
+
+        let mut replies = String::new();
+        client
+            .read_to_string(&mut replies)
+            .await
+            .expect("read replies");
+        assert!(replies.contains(" CAP * ACK :sasl echo-message\r\n"));
+        assert!(replies.contains(" CAP * LIST :sasl echo-message\r\n"));
     }
 }
 
