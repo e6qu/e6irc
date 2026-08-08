@@ -56,6 +56,19 @@ async function waitForConfigurationServerName(page, value) {
   );
 }
 
+async function waitForBufferedLine(request, network, text) {
+  const url = `${applicationOrigin}/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await request.get(url);
+    if (response.ok()) {
+      const body = await response.json();
+      if (Array.isArray(body.lines) && body.lines.some((line) => line.includes(text))) return;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  assert.fail(`buffer did not contain ${JSON.stringify(text)}`);
+}
+
 const databaseURL = process.env.E6IRC_TEST_DATABASE_URL;
 const issuerURL = process.env.E6IRC_TEST_DEX_URL;
 assert.ok(databaseURL, "E6IRC_TEST_DATABASE_URL is required");
@@ -1003,6 +1016,7 @@ try {
   await page.getByRole("link", { name: "journey", exact: true }).waitFor();
   await upstream.waitForJoin("#journey");
   await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
+  await waitForBufferedLine(context.request, "journey", "browser replays through the real stack");
 
   await page.goto(`${applicationOrigin}/?network=journey`);
   await page.getByText("browser replays through the real stack", { exact: true }).waitFor();
