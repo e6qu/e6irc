@@ -682,6 +682,21 @@ try {
     await guest.goto(`${applicationOrigin}/console/account`);
     await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
     await guest.getByText("ACCOUNT_LOGIN", { exact: true }).waitFor();
+    await guest.emulateMedia({ forcedColors: "active" });
+    assert.equal(
+      await guest.evaluate(() => matchMedia("(forced-colors: active)").matches),
+      true,
+    );
+    const saveContactEmail = guest.getByRole("button", { name: "Save contact email", exact: true });
+    await saveContactEmail.focus();
+    assert.equal(
+      await saveContactEmail.evaluate((button) => ({
+        focused: button === document.activeElement,
+        forcedColorAdjust: getComputedStyle(button).forcedColorAdjust,
+      })),
+      { focused: true, forcedColorAdjust: "none" },
+    );
+    await expectAccessible(guest, "main");
     const exportResponse = await guestContext.request.get(`${applicationOrigin}/api/v1/me/export`);
     assert.equal(exportResponse.status(), 200);
     assert.match(exportResponse.headers()["content-disposition"], /e6irc-account-export\.json/);
