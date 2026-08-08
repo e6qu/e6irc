@@ -895,6 +895,15 @@ async fn openapi_spec_is_served() {
             "registration_failed",
         ])
     );
+    let create_network_schema = &v["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(create_network_schema["additionalProperties"], false);
+    let app_password_schema = &v["paths"]["/api/v1/auth/app-passwords"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(app_password_schema["additionalProperties"], false);
+    let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(patch_network_schema["additionalProperties"], false);
     let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"];
     assert_eq!(buffer_schema["additionalProperties"], false);

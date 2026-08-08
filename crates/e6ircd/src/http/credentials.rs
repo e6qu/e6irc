@@ -141,10 +141,26 @@ fn owner_scoped_delete_response(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct AppPasswordRequest {
     pub(super) account: String,
     pub(super) password: String,
     pub(super) label: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_password_request_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<AppPasswordRequest>(
+                r#"{"account":"alice","password":"secret","label":"desktop","extra":true}"#
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Exchange an account's password for a fresh app password (shown once;

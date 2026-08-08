@@ -202,7 +202,7 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Exchange an account password for a new app password",
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object",
+                        "schema": { "type": "object", "additionalProperties": false,
                             "required": ["account", "password", "label"],
                             "properties": {
                                 "account": { "type": "string", "minLength": 1, "maxLength": 64 },
@@ -718,7 +718,7 @@ fn document() -> serde_json::Value {
                     "description": "kind defaults to `irc`. IRC requires addr/nick and optional paired SASL credentials. Matrix requires an HTTP(S) homeserver in addr, a provider user in nick, tls=true, and sasl_password. Discord requires tls=true, empty nick, a bot token in sasl_password, and an optional HTTP(S) API base in addr. Slack requires tls=true, empty nick, a bot token in sasl_account, an app token in sasl_password, and an optional HTTP(S) API base in addr. realname is IRC-only.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object",
+                        "schema": { "type": "object", "additionalProperties": false,
                             "required": ["name", "addr", "nick"],
                             "properties": {
                                 "kind": { "type": "string", "enum": ["irc", "matrix", "discord", "slack"], "default": "irc" },
@@ -816,7 +816,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object", "required": ["enabled"],
+                        "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"],
                             "properties": { "enabled": { "type": "boolean" } } } } } },
                     "responses": { "200": { "description": "new enabled state" },
                         "404": { "description": "no such network" },
