@@ -4,6 +4,9 @@
   const SETTINGS_KEY = "e6irc.settings";
   const consoleTheme = document.querySelector("[data-console-theme]");
   const consoleThemeResult = document.querySelector("[data-console-theme-result]");
+  const confirmationDialog = document.querySelector("[data-console-confirm]");
+  const confirmationMessage = document.querySelector("[data-console-confirm-message]");
+  let pendingConfirmation = null;
   const showConsoleThemeResult = (message) => {
     if (consoleThemeResult) consoleThemeResult.textContent = message;
   };
@@ -56,11 +59,36 @@
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     const message = form.dataset.confirm;
-    if (message && !window.confirm(message)) {
-      event.preventDefault();
-      event.stopPropagation();
+    if (!message || form.dataset.confirmed === "true") {
+      delete form.dataset.confirmed;
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (
+      confirmationDialog instanceof HTMLDialogElement
+      && confirmationMessage instanceof HTMLElement
+    ) {
+      pendingConfirmation = form;
+      confirmationMessage.textContent = message;
+      confirmationDialog.showModal();
+      return;
+    }
+    if (window.confirm(message)) {
+      form.dataset.confirmed = "true";
+      queueMicrotask(() => form.requestSubmit());
     }
   }, true);
+
+  if (confirmationDialog instanceof HTMLDialogElement) {
+    confirmationDialog.addEventListener("close", () => {
+      const form = pendingConfirmation;
+      pendingConfirmation = null;
+      if (!form || confirmationDialog.returnValue !== "confirm") return;
+      form.dataset.confirmed = "true";
+      form.requestSubmit();
+    });
+  }
 
   for (const button of document.querySelectorAll("[data-copy-target]")) {
     button.addEventListener("click", async () => {
