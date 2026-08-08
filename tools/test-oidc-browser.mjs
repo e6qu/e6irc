@@ -709,8 +709,16 @@ try {
       true,
       "confirmation did not move focus into its modal dialog",
     );
-    await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+    await confirmation.press("Escape");
     await confirmation.waitFor({ state: "hidden" });
+    assert.equal(
+      await deleteAccount.getByRole("button", {
+        name: "Delete my account permanently",
+        exact: true,
+      }).evaluate((button) => button === document.activeElement),
+      true,
+      "closing confirmation did not restore focus to its trigger",
+    );
     assert.equal(
       await deleteAccount.getByLabel("Type browserguest to confirm", { exact: true }).inputValue(),
       "browserguest",
