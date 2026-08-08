@@ -12,6 +12,21 @@ fn document() -> serde_json::Value {
     let ok_json = serde_json::json!({
         "200": { "description": "OK", "content": { "application/json": {} } }
     });
+    let identity_response = serde_json::json!({
+        "200": { "description": "authenticated identity", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["account"], "additionalProperties": false,
+                "properties": {
+                    "account": { "type": "string", "minLength": 1 },
+                    "email": { "type": ["string", "null"] },
+                    "role": { "type": ["string", "null"] },
+                    "provider": { "type": ["string", "null"] },
+                    "release_revision": { "type": ["string", "null"] },
+                    "csrf_token": { "type": "string" },
+                    "logout_url": { "type": "string", "pattern": "^/[^/]" }
+                }
+            }
+        } } }
+    });
     let channel_name_parameter = serde_json::json!([
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } }
@@ -172,7 +187,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me": {
                 "get": { "summary": "The authenticated account", "security": authenticated,
-                    "responses": ok_json }
+                    "responses": identity_response }
             },
             "/api/v1/me/profile": {
                 "get": {
