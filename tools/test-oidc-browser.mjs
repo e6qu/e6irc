@@ -355,6 +355,11 @@ try {
     await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
     true,
   );
+  await page.setViewportSize({ width: 640, height: 800 });
+  assert.equal(
+    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    true,
+  );
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto(`${applicationOrigin}/console/account`);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
