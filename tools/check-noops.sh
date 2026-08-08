@@ -48,10 +48,8 @@ report "todo!()/unimplemented!() in shipped source (implement or reject loudly)"
 report "unmessaged unreachable!()/panic!() (state the invariant that broke)" \
 	'\b(unreachable!|panic!)[[:space:]]*\([[:space:]]*\)'
 
-# 3. Deferred-work markers do not belong in shipped source — the "why"
-#    goes in a commit message, the "what remains" in PLAN.md, never a
-#    rotting in-code TODO (AGENTS.md, feedback_no_phase_or_bug_refs).
-report "TODO/FIXME/XXX marker in shipped source (track it in PLAN.md, not the code)" \
+# 3. Deferred-work markers do not belong in shipped source.
+report "TODO/FIXME/XXX marker in shipped source (fix it or ask the human)" \
 	'\b(TODO|FIXME|XXX)\b'
 
 if [ "$fail" -ne 0 ]; then
