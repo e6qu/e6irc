@@ -756,7 +756,23 @@ pub(super) struct AdminNetworkBody {
 #[serde(deny_unknown_fields)]
 pub(super) struct AdminNetworkDeleteBody {
     revision: i64,
-    owner: Option<String>,
+    owner: ManagedNetworkOwner,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ManagedNetworkOwner {
+    Owner(String),
+    Shared(()),
+}
+
+impl ManagedNetworkOwner {
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Owner(owner) => Some(owner),
+            Self::Shared(()) => None,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -994,7 +1010,7 @@ pub(super) async fn admin_delete_network(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let owner = optional_config_string(body.owner);
+    let owner = optional_config_string(body.owner.into_option());
     mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
         reject_bootstrap_credential_change(settings, "network")?;
         let before = settings.networks.len();
@@ -1676,6 +1692,25 @@ mod admin_query_tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn managed_network_delete_names_an_owner_or_shared_scope() {
+        assert!(matches!(
+            serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1,"owner":"alice"}"#),
+            Ok(AdminNetworkDeleteBody {
+                owner: ManagedNetworkOwner::Owner(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1,"owner":null}"#),
+            Ok(AdminNetworkDeleteBody {
+                owner: ManagedNetworkOwner::Shared(()),
+                ..
+            })
+        ));
+        assert!(serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1}"#).is_err());
     }
 
     #[test]

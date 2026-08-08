@@ -1140,7 +1140,7 @@ fn document() -> serde_json::Value {
             "/api/v1/admin/configuration/networks/{name}": {
                 "delete": { "summary": "Remove a managed server network", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" }, "owner": { "type": "string" } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "owner"], "properties": { "revision": { "type": "integer" }, "owner": { "type": ["string", "null"] } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/networks": {

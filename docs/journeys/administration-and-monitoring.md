@@ -39,7 +39,8 @@ missing/invalid bootstrap token, mismatched password confirmation, a consumed
 bootstrap, stale revisions, listener bind errors, provider validation errors,
 and database errors fail explicitly. A failed bootstrap creates no partial
 account or authority. A failed stale write creates no audit row. A failed BNC
-rebind preserves the working listener.
+rebind preserves the working listener. Server-network removal names its owner;
+JSON null selects a shared network.
 
 **Security and observability.** Bootstrap is per-IP rate-limited, binds an
 expiring `HttpOnly; SameSite=Strict` browser state, compares only a retained

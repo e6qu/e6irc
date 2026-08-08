@@ -915,6 +915,13 @@ async fn openapi_spec_is_served() {
     let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"];
     assert_eq!(patch_network_schema["additionalProperties"], false);
+    let managed_network_delete_schema = &v["paths"]["/api/v1/admin/configuration/networks/{name}"]
+        ["delete"]["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(managed_network_delete_schema["additionalProperties"], false);
+    assert_eq!(
+        managed_network_delete_schema["required"],
+        serde_json::json!(["revision", "owner"])
+    );
     let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"];
     assert_eq!(buffer_schema["additionalProperties"], false);
