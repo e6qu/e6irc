@@ -12,26 +12,17 @@ and integration claims.
 
 ## Current work
 
-### Stage C — Product-design and interaction quality
+### Stage E — Compatibility qualification
 
-- Use one semantic visual and interaction vocabulary across chat and console.
-- Keep role-aware navigation, responsive layouts, safe confirmations, and
-  edit-preserving refresh behavior usable across supported display modes.
-- Prove chat recovery, history, network selection, and dense operations flows.
-
-### Stage D — UI, accessibility, and contract evidence
-
-- Make API contract tests the primary evidence for resource behavior.
-- Cover UI state, keyboard/focus/dialog behavior, and browser-only boundaries.
-- Gate accessibility, visual regressions, and actionable failed-run artifacts.
+- Publish a checked client capability matrix and keep public-network claims
+  within their evidence.
+- Qualify or narrow service, identity-provider, and public-network claims.
 
 ## Remaining qualification
 
-- Publish and test a client capability matrix; finish or narrow service and
-  public-network interoperability claims.
 - Define hardware budgets and run reproducible tuned-Linux scale campaigns.
-- Qualify Discord, Slack, more identity providers, upgrade/rollback, backup,
-  restore, and release artifacts with controlled environments.
+- Run controlled external qualification for Discord, Slack, additional identity
+  providers, and public IRC networks.
 
 ## Rules
 
