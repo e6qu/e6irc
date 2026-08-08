@@ -298,10 +298,10 @@ pub(super) async fn admin_accounts(
 }
 
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AccountStateBody {
-    suspended: Option<bool>,
-    administrator: Option<bool>,
+#[serde(untagged, deny_unknown_fields)]
+pub(super) enum AccountStateBody {
+    Suspension { suspended: bool },
+    Administrator { administrator: bool },
 }
 
 pub(super) async fn admin_account_state(
@@ -311,23 +311,16 @@ pub(super) async fn admin_account_state(
     body: Result<axum::Json<AccountStateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = json_or_response!(body);
-    let mutation = match (body.suspended, body.administrator) {
-        (Some(suspended), None) => {
+    let mutation = match body {
+        AccountStateBody::Suspension { suspended } => {
             super::mutate_account_suspension(&state, &actor, account_id, suspended)
                 .await
                 .map(|message| ("suspended", suspended, message))
         }
-        (None, Some(administrator)) => {
+        AccountStateBody::Administrator { administrator } => {
             super::mutate_account_administrator(&state, &actor, account_id, administrator)
                 .await
                 .map(|message| ("administrator", administrator, message))
-        }
-        _ => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid account state change",
-                Some("Set exactly one of suspended or administrator."),
-            );
         }
     };
     match mutation {
@@ -1660,6 +1653,30 @@ pub(super) async fn admin_audit(
 #[cfg(test)]
 mod admin_query_tests {
     use super::*;
+
+    #[test]
+    fn account_state_request_has_exactly_one_change() {
+        assert!(matches!(
+            serde_json::from_str::<AccountStateBody>(r#"{"suspended":true}"#),
+            Ok(AccountStateBody::Suspension { suspended: true })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AccountStateBody>(r#"{"administrator":false}"#),
+            Ok(AccountStateBody::Administrator {
+                administrator: false
+            })
+        ));
+        for body in [
+            r#"{}"#,
+            r#"{"suspended":true,"administrator":false}"#,
+            r#"{"suspended":true,"extra":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AccountStateBody>(body).is_err(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn account_directory_query_validation_preserves_exact_bounded_values() {
