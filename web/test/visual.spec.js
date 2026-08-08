@@ -43,6 +43,29 @@ test("network picker renders the empty account state", async ({ page }) => {
   });
 });
 
+test("network picker renders typed network states on tablets", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await mockSession(page, [
+    {
+      name: "Libera",
+      enabled: true,
+      connected: false,
+      runtime: { state: "reconnecting" },
+    },
+    { name: "Archive", enabled: false, connected: null, runtime: null },
+  ]);
+  await page.goto("/");
+
+  await expect(page.getByRole("link", { name: /Libera.*reconnecting/ })).toBeVisible();
+  await expect(page.getByRole("link", { name: /Archive.*disabled/ })).toBeVisible();
+  await expectAccessible(page);
+  await expect(page).toHaveScreenshot("network-picker-tablet.png", {
+    animations: "disabled",
+    fullPage: true,
+  });
+});
+
 test("network picker distinguishes an unavailable API on narrow dark screens", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 390, height: 844 });

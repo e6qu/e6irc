@@ -85,7 +85,7 @@ body {
 }
 #brand { color: var(--fg); font-weight: 750; letter-spacing: 0.02em; text-decoration: none; }
 #user-nav { margin-left: auto; display: flex; gap: 0.9rem; align-items: center; }
-#user-nav a { color: var(--accent); text-decoration: none; }
+#user-nav a { color: var(--accent); text-decoration: none; white-space: nowrap; }
 .user-role { color: var(--muted); font-size: 0.8rem; margin-left: 0.3rem; }
 .status {
   font-size: 0.78rem;
@@ -398,8 +398,12 @@ body {
 
 @media (max-width: 42rem) {
   #sidebar, #nicklist { flex-basis: 8rem; }
+}
+
+@media (max-width: 52rem) {
   #network-control > span, #account-role { display: none; }
   #network-select { max-width: 9rem; }
+  #user-nav { gap: 0.65rem; }
 }
 /* Narrow / phone: stack the panes and let the member list collapse so the
    chat pane is usable instead of a sliver. */
