@@ -5200,6 +5200,25 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert_eq!(profile["account"], "alice");
     assert_eq!(profile["contact_email"], "Alice+IRC@example.com");
 
+    let missing_profile_field = "{}";
+    let missing_profile_field_request = format!(
+        "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{missing_profile_field}",
+        missing_profile_field.len()
+    );
+    let (status, _, body) = request(http, &missing_profile_field_request).await;
+    assert_eq!(
+        status, 400,
+        "a profile update must name contact_email: {body}"
+    );
+    assert_eq!(
+        e6ircd::db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email after rejected update"),
+        Some("Alice+IRC@example.com".into())
+    );
+
     let api_profile = r#"{"contact_email":"Second@New.Example"}"#;
     let missing_csrf = format!(
         "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\n\
