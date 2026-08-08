@@ -729,7 +729,7 @@ try {
       );
       const saveContactEmail = guest.getByRole("button", { name: "Save contact email", exact: true });
       await saveContactEmail.focus();
-      assert.equal(
+      assert.deepEqual(
         await saveContactEmail.evaluate((button) => ({
           focused: button === document.activeElement,
           forcedColorAdjust: getComputedStyle(button).forcedColorAdjust,
@@ -1002,9 +1002,10 @@ try {
   );
   await page.getByRole("link", { name: "journey", exact: true }).waitFor();
   await upstream.waitForJoin("#journey");
+  await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
 
   await page.goto(`${applicationOrigin}/?network=journey`);
-  await page.locator(".buf-name").filter({ hasText: /^#journey$/ }).waitFor();
+  await page.getByText("browser replays through the real stack", { exact: true }).waitFor();
   const journeyBuffer = page.getByRole("button", { name: "Open #journey", exact: true });
   assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
   assert.equal(await journeyBuffer.getAttribute("aria-pressed"), "true");

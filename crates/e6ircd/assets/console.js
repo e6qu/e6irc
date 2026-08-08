@@ -8,6 +8,7 @@
   const confirmationMessage = document.querySelector("[data-console-confirm-message]");
   const panelRefreshers = new WeakMap();
   let pendingConfirmation = null;
+  let confirmationTrigger = null;
   const showConsoleThemeResult = (message) => {
     if (consoleThemeResult) consoleThemeResult.textContent = message;
   };
@@ -89,6 +90,11 @@
       && confirmationMessage instanceof HTMLElement
     ) {
       pendingConfirmation = form;
+      confirmationTrigger = event.submitter instanceof HTMLElement
+        ? event.submitter
+        : document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
       confirmationMessage.textContent = message;
       confirmationDialog.showModal();
       return;
@@ -102,8 +108,13 @@
   if (confirmationDialog instanceof HTMLDialogElement) {
     confirmationDialog.addEventListener("close", () => {
       const form = pendingConfirmation;
+      const trigger = confirmationTrigger;
       pendingConfirmation = null;
-      if (!form || confirmationDialog.returnValue !== "confirm") return;
+      confirmationTrigger = null;
+      if (!form || confirmationDialog.returnValue !== "confirm") {
+        trigger?.focus();
+        return;
+      }
       form.dataset.confirmed = "true";
       form.requestSubmit();
     });

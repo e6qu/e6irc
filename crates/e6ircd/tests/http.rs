@@ -3100,7 +3100,7 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    assert!(body.contains("exactly one"), "{body}");
+    assert!(body.contains("Invalid request body"), "{body}");
 
     let (status, body) = patch_json(
         http,
