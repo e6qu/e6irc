@@ -311,11 +311,21 @@ try {
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   assert.equal(await consoleTheme.inputValue(), "light");
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
+  await page.emulateMedia({ colorScheme: "light" });
   await consoleTheme.selectOption("auto");
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
     { theme: "auto", notifications: false },
+  );
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
+    "#f5f7fa",
+  );
+  await page.emulateMedia({ colorScheme: "dark" });
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
+    "#0d1015",
   );
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
