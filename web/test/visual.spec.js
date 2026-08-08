@@ -90,3 +90,15 @@ test("network picker directs an expired session to sign in", async ({ page }) =>
   await expect(page.getByRole("link", { name: "Retry" })).toHaveCount(0);
   await expectAccessible(page);
 });
+
+test("network picker keeps recovery controls usable in forced colors", async ({ page }) => {
+  await page.emulateMedia({ forcedColors: "active" });
+  await mockSession(page, new Error("Network service unavailable"));
+  await page.goto("/");
+
+  const retry = page.getByRole("link", { name: "Retry" });
+  await expect(retry).toBeVisible();
+  await retry.focus();
+  await expect(retry).toBeFocused();
+  await expectAccessible(page);
+});
