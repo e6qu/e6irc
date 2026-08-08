@@ -75,6 +75,7 @@ function showAlert(key, text, tone = "warning", action = null) {
     alert = document.createElement("div");
     alert.dataset.alert = key;
     alert.className = `alert alert-${tone}`;
+    alert.setAttribute("role", tone === "error" ? "alert" : "status");
     const copy = document.createElement("span");
     alert.appendChild(copy);
     const dismiss = document.createElement("button");
@@ -86,6 +87,7 @@ function showAlert(key, text, tone = "warning", action = null) {
     alertsEl.appendChild(alert);
   }
   alert.className = `alert alert-${tone}`;
+  alert.setAttribute("role", tone === "error" ? "alert" : "status");
   alert.firstElementChild.textContent = text;
   const existingAction = alert.querySelector(".alert-action");
   if (existingAction) existingAction.remove();
