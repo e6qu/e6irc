@@ -14,6 +14,7 @@
     "test:oidc-browser": "node ../tools/test-oidc-browser.mjs"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "playwright": "1.61.1",
     "vite": "8.1.5"
   }

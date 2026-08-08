@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const require = createRequire(new URL("../web/package.json", import.meta.url));
 const playwright = require("playwright");
+const AxeBuilder = require("@axe-core/playwright").default;
 const browserName = process.env.E6IRC_TEST_BROWSER ?? "chromium";
 assert.ok(
   ["chromium", "firefox", "webkit"].includes(browserName),
@@ -26,6 +27,15 @@ async function clickAndWaitForURL(page, locator, expectedURL) {
   );
   await Promise.all([navigation, locator.click()]);
   assert.equal(page.url(), expectedURL);
+}
+
+async function expectAccessible(page, selector) {
+  const results = await new AxeBuilder({ page }).include(selector).analyze();
+  assert.deepEqual(
+    results.violations,
+    [],
+    results.violations.map(({ id, help, nodes }) => `${id}: ${help}\n${nodes.map((node) => node.html).join("\n")}`).join("\n\n"),
+  );
 }
 
 // A configuration form POST navigates to a re-rendered page, but the old
@@ -106,7 +116,14 @@ const watchdog = setTimeout(() => {
   process.exit(1);
 }, 180_000);
 
+const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR;
+const applicationErrors = [];
+const applicationRequests = [];
+const navigationTrace = [];
 let browser;
+let context;
+let page;
+let tracing = false;
 try {
   await waitForHealthyServer();
   // Playwright's default Chromium headless shell accepts a notification
@@ -118,12 +135,14 @@ try {
     headless: true,
     ...(browserName === "chromium" ? { channel: "chromium" } : {}),
   });
-  const context = await browser.newContext();
+  context = await browser.newContext();
+  if (artifactDirectory) {
+    await mkdir(artifactDirectory, { recursive: true });
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+    tracing = true;
+  }
   await context.grantPermissions(["notifications"], { origin: applicationOrigin });
-  const page = await context.newPage();
-  const applicationErrors = [];
-  const applicationRequests = [];
-  const navigationTrace = [];
+  page = await context.newPage();
   page.on("request", (request) => {
     if (isApplicationURL(request.url())) {
       applicationRequests.push(`${request.method()} ${sanitizeURL(request.url())}`);
@@ -201,6 +220,7 @@ try {
   // resolves; reading #messages before then races the fetch (and loses on
   // slower runners), so wait for the render itself.
   await page.locator("#messages").getByText("No networks are configured").waitFor();
+  await expectAccessible(page, "#app");
   assert.equal(await page.locator("#network-select").inputValue(), "");
   assert.equal(await page.locator("#message").isDisabled(), true);
   assert.equal(await page.locator("#composer button").isDisabled(), true);
@@ -238,6 +258,7 @@ try {
     }
   });
   await page.goto(`${applicationOrigin}/console/account`);
+  await expectAccessible(page, "body");
   const tokenFailure = page.locator("#account-token-rows [role=status]");
   await tokenFailure.waitFor();
   assert.match(await tokenFailure.innerText(), /Token storage unavailable/);
@@ -682,6 +703,7 @@ try {
     }).click();
     const confirmation = guest.getByRole("dialog", { name: "Confirm action", exact: true });
     await confirmation.waitFor();
+    await expectAccessible(guest, "[data-console-confirm]");
     assert.equal(
       await confirmation.evaluate((dialog) => dialog.contains(document.activeElement)),
       true,
@@ -1607,8 +1629,27 @@ try {
     applicationErrors.filter((error) => error !== expectedSignedOutNetworkRead),
     [],
   );
+} catch (error) {
+  if (artifactDirectory && context) {
+    const results = await Promise.allSettled([
+      page?.screenshot({ path: join(artifactDirectory, `${browserName}-failure.png`), fullPage: true }),
+      tracing
+        ? context.tracing.stop({ path: join(artifactDirectory, `${browserName}-trace.zip`) })
+        : Promise.resolve(),
+      writeFile(
+        join(artifactDirectory, `${browserName}-diagnostics.json`),
+        JSON.stringify({ applicationErrors, applicationRequests, navigationTrace, serverOutput }, null, 2),
+      ),
+    ]);
+    tracing = false;
+    for (const result of results) {
+      if (result.status === "rejected") console.error(`failed to write browser artifact: ${result.reason}`);
+    }
+  }
+  throw error;
 } finally {
   clearTimeout(watchdog);
+  if (tracing && context) await context.tracing.stop();
   // `browser.close()` can itself hang on a wedged engine; bound it so teardown
   // never becomes the thing that hangs the run.
   if (browser) {
