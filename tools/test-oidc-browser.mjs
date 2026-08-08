@@ -676,13 +676,15 @@ try {
       }),
     });
     await deleteAccount.getByLabel("Type browserguest to confirm", { exact: true }).fill("browserguest");
-    guest.once("dialog", (dialog) => dialog.accept());
+    await deleteAccount.getByRole("button", {
+      name: "Delete my account permanently",
+      exact: true,
+    }).click();
+    const confirmation = guest.getByRole("dialog", { name: "Confirm action", exact: true });
+    await confirmation.waitFor();
     await clickAndWaitForURL(
       guest,
-      deleteAccount.getByRole("button", {
-        name: "Delete my account permanently",
-        exact: true,
-      }),
+      confirmation.getByRole("button", { name: "Continue", exact: true }),
       `${applicationOrigin}/auth/signed-out`,
     );
     assert.equal((await guestContext.request.get(`${applicationOrigin}/api/v1/me`)).status(), 401);
