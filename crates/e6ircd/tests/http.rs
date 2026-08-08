@@ -859,6 +859,24 @@ async fn openapi_spec_is_served() {
         identity_schema["properties"]["logout_url"]["pattern"],
         "^/[^/]"
     );
+    let network_list_schema = &v["paths"]["/api/v1/me/networks"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(network_list_schema["additionalProperties"], false);
+    assert_eq!(
+        network_list_schema["properties"]["networks"]["items"]["required"],
+        serde_json::json!(["name", "enabled", "connected", "runtime"])
+    );
+    assert_eq!(
+        network_list_schema["properties"]["networks"]["items"]["properties"]["runtime"]["oneOf"][1]
+            ["properties"]["state"]["enum"],
+        serde_json::json!([
+            "connecting",
+            "connected",
+            "reconnecting",
+            "authentication_failed",
+            "registration_failed",
+        ])
+    );
     // Method/path completeness is enforced mechanically by the route catalog's
     // unit test. These assertions protect the richer request-schema contract
     // that cannot be inferred from an axum handler.

@@ -27,6 +27,28 @@ fn document() -> serde_json::Value {
             }
         } } }
     });
+    let network_summary = serde_json::json!({
+        "type": "object", "required": ["name", "enabled", "connected", "runtime"],
+        "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "enabled": { "type": "boolean" },
+            "connected": { "type": ["boolean", "null"] },
+            "runtime": { "oneOf": [
+                { "type": "null" },
+                { "type": "object", "required": ["state"], "additionalProperties": true,
+                    "properties": { "state": { "type": "string", "enum": [
+                        "connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"
+                    ] } } }
+            ] }
+        }
+    });
+    let network_list_response = serde_json::json!({
+        "200": { "description": "owner-scoped network summaries", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["networks"], "additionalProperties": false,
+                "properties": { "networks": { "type": "array", "items": network_summary } }
+            }
+        } } }
+    });
     let channel_name_parameter = serde_json::json!([
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } }
@@ -684,7 +706,7 @@ fn document() -> serde_json::Value {
             "/api/v1/me/networks": {
                 "get": { "summary": "List the account's BNC networks with live upstream status",
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
-                    "security": authenticated, "responses": ok_json },
+                    "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "description": "kind defaults to `irc`. IRC requires addr/nick and optional paired SASL credentials. Matrix requires an HTTP(S) homeserver in addr, a provider user in nick, tls=true, and sasl_password. Discord requires tls=true, empty nick, a bot token in sasl_password, and an optional HTTP(S) API base in addr. Slack requires tls=true, empty nick, a bot token in sasl_account, an app token in sasl_password, and an optional HTTP(S) API base in addr. realname is IRC-only.",
                     "security": authenticated,
