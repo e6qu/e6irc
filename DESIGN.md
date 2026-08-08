@@ -1535,12 +1535,12 @@ refuses to serve a plausible but incomplete contract.
 
 Two surfaces, both without an SPA framework. The **management** pages —
 login, the user account section, and the `/console` admin/BNC/integrations
-console — are server-rendered askama pages using standard form submissions and
-Post/Redirect/Get. An always-served, same-origin `/console.js` handles only
-progressive enhancements: destructive-action confirmation, one-time-secret
-copying, and monitoring refresh with explicit failure state. The console
-therefore works in the default build as well as `embed-web`, and its private
-pages use a CSP that permits only that same-origin script.
+console — are server-rendered Askama document shells. Their authenticated
+reads and mutations use `/api/v1`; no `/console` mutation route exists. The
+always-served, same-origin `/console.js` hydrates those API-backed controls,
+including explicit confirmation, retry, and failure states. The console works
+in the default build and `embed-web`; its private pages permit only that
+same-origin script.
 `/console/channels` lets an identified live channel operator register it, then
 manage the retained topic, KEEPTOPIC, canonical mode lock,
 auto-op/auto-voice grants, ownership transfer, and unregister lifecycle

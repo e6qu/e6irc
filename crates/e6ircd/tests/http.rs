@@ -1184,6 +1184,7 @@ async fn account_url_redirects_to_the_complete_account_console() {
     );
     assert!(body.contains("forced-colors: active"), "{body}");
     assert!(body.contains("data-console-confirm"), "{body}");
+    assert!(body.contains("danger-panel, .confirm-dialog"), "{body}");
     assert!(
         head.to_ascii_lowercase()
             .contains("content-security-policy: default-src 'none'; script-src 'self'"),

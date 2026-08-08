@@ -682,6 +682,11 @@ try {
     }).click();
     const confirmation = guest.getByRole("dialog", { name: "Confirm action", exact: true });
     await confirmation.waitFor();
+    assert.equal(
+      await confirmation.evaluate((dialog) => dialog.contains(document.activeElement)),
+      true,
+      "confirmation did not move focus into its modal dialog",
+    );
     await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
     await confirmation.waitFor({ state: "hidden" });
     assert.equal(
