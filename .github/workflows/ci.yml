@@ -55,8 +55,7 @@ jobs:
       # Structural server-rendered accessibility: every data table keeps an
       # accessible caption and every navigation landmark keeps a name.
       - run: python3 tools/check-template-accessibility.py
-      # API-first migration guard: every console mutation is explicitly mapped
-      # to its public API operation or recorded as an API gap.
+      # API-first guard: console forms may not bypass the public API.
       - run: python3 tools/check-api-first-inventory.py
       # No-deferral guard (AGENTS.md): BUGS.md must stay empty and no
       # file-it-for-later idiom may be added to PLAN.md. The checkout is
@@ -194,6 +193,14 @@ jobs:
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
+          E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
+      - name: Retain failed browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-diagnostics-chromium
+          path: test-results/browser
+          if-no-files-found: ignore
       - run: cargo test -p e6ircd --all-features --test http -- --ignored --test-threads=1
         env:
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
@@ -248,6 +255,31 @@ jobs:
           E6IRC_TEST_BROWSER: ${{ matrix.browser }}
           E6IRC_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/e6irc_test
           E6IRC_TEST_DEX_URL: http://127.0.0.1:15556/dex
+          E6IRC_BROWSER_ARTIFACTS_DIR: test-results/browser
+      - name: Retain failed browser diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-diagnostics-${{ matrix.browser }}
+          path: test-results/browser
+          if-no-files-found: ignore
+
+  visual-regression:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile
+      - name: Install Chromium for visual regression
+        run: pnpm -C web exec playwright install chromium
+      - run: pnpm -C web test:visual
+      - name: Retain failed visual diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-diagnostics
+          path: web/test-results
+          if-no-files-found: ignore
 
   # A service-container job cannot stop its own PostgreSQL dependency safely.
   # This isolated process journey owns a named disposable container so it can

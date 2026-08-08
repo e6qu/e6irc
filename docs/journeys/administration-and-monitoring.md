@@ -39,7 +39,8 @@ missing/invalid bootstrap token, mismatched password confirmation, a consumed
 bootstrap, stale revisions, listener bind errors, provider validation errors,
 and database errors fail explicitly. A failed bootstrap creates no partial
 account or authority. A failed stale write creates no audit row. A failed BNC
-rebind preserves the working listener.
+rebind preserves the working listener. Server-network removal names its owner;
+JSON null selects a shared network.
 
 **Security and observability.** Bootstrap is per-IP rate-limited, binds an
 expiring `HttpOnly; SameSite=Strict` browser state, compares only a retained
@@ -245,7 +246,8 @@ fixed: only the statically
 registered `core` and `db` queues become process-wide queue labels.
 Per-connection SendQ names, account/network/channel names, and secrets cannot
 create unbounded cardinality or disclosure. Historical schema-v2 samples
-remain readable and simply have no queue series.
+remain readable and simply have no queue series. Concurrent automatic and
+manual refreshes serialize; a manual request queues one replacement read.
 
 **Security and observability.** Liveness/readiness disclose only dependency
 state; detailed JSON, metrics, and console history are administrator-only and
@@ -262,7 +264,8 @@ HTTP/PostgreSQL tests. The real Chromium/PostgreSQL journey opens Monitoring
 through its JSON API, verifies both runtime
 queues in the rendered page, proves a restart-required core-capacity edit does
 not misrepresent the still-active queue, then checks the configured capacity
-appears in schema-v3 JSON after restart.
+appears in schema-v3 JSON after restart, and proves overlapping refreshes
+coalesce to one replacement API read.
 There is no alerting or external dashboard shipped; Prometheus is an export
 surface.
 

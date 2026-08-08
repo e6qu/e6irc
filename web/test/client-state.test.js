@@ -7,8 +7,10 @@ import {
   ApiError,
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
+  backlogFrom,
   errorMessage,
   getJson,
+  identityFrom,
   loadSettings,
   networksFrom,
   networkStateLabel,
@@ -78,7 +80,8 @@ test("JSON requests preserve problem details and reject malformed success bodies
       async () => ({
         ok: false,
         status: 503,
-        json: async () => ({ title: "Database unavailable" }),
+        headers: new Headers(),
+        text: async () => '{"title":"Database unavailable"}',
       }),
       "/api/v1/me/networks",
     ),
@@ -93,9 +96,8 @@ test("JSON requests preserve problem details and reject malformed success bodies
       async () => ({
         ok: true,
         status: 200,
-        json: async () => {
-          throw new SyntaxError("bad json");
-        },
+        headers: new Headers(),
+        text: async () => "not JSON",
       }),
       "/api/v1/me",
     ),
@@ -103,12 +105,94 @@ test("JSON requests preserve problem details and reject malformed success bodies
   );
 });
 
+test("JSON requests reject oversized API responses before parsing", async () => {
+  await assert.rejects(
+    getJson(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": "1048577" }),
+        text: async () => {
+          throw new Error("must not read an oversized response");
+        },
+      }),
+      "/api/v1/me",
+    ),
+    /too large/,
+  );
+
+  await assert.rejects(
+    getJson(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        text: async () => `"${"€".repeat(524289)}"`,
+      }),
+      "/api/v1/me",
+    ),
+    /too large/,
+  );
+});
+
 test("network collection validation separates an empty list from a broken contract", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
-  assert.deepEqual(networksFrom({ networks: [{ name: "Libera", enabled: true }] }), [
-    { name: "Libera", enabled: true },
+  const offline = { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, runtime: null };
+  assert.deepEqual(networksFrom({ networks: [offline] }), [
+    { name: "Libera", kind: "irc", nick: "alice", enabled: true, connected: null, state: null, runtime: null },
   ]);
+  assert.deepEqual(
+    networksFrom({ networks: [{ ...offline, connected: true, runtime: { state: "connected" } }] }),
+    [{
+      name: "Libera",
+      kind: "irc",
+      nick: "alice",
+      enabled: true,
+      connected: true,
+      state: "connected",
+      runtime: { state: "connected" },
+    }],
+  );
   assert.throws(() => networksFrom({ networks: [{ enabled: true }] }), /invalid network list/);
+  assert.throws(
+    () => networksFrom({ networks: [{ ...offline, connected: true }] }),
+    /invalid network list/,
+  );
+  assert.throws(
+    () => networksFrom({ networks: [{ ...offline, connected: false, runtime: { state: "connected" } }] }),
+    /invalid network list/,
+  );
+  assert.throws(
+    () => networksFrom({ networks: [{ ...offline, kind: "unknown" }] }),
+    /invalid network list/,
+  );
+  assert.throws(() => networksFrom({ networks: [], next: "not part of this response" }), /invalid network list/);
+});
+
+test("backlog parsing accepts only the closed lines response", () => {
+  assert.deepEqual(backlogFrom({ lines: [":a PRIVMSG #chat :hello"] }), [":a PRIVMSG #chat :hello"]);
+  assert.throws(() => backlogFrom({ lines: ["ok"], cursor: "unexpected" }), /invalid backlog/);
+  assert.throws(() => backlogFrom({ lines: [1] }), /invalid backlog/);
+});
+
+test("identity parsing keeps only a safe, complete projection", () => {
+  assert.deepEqual(identityFrom({ account: "alice", email: "a@example.test", role: "operator", logout_url: "/logout" }), {
+    account: "alice",
+    email: "a@example.test",
+    role: "operator",
+    logoutURL: "/logout",
+  });
+  assert.deepEqual(identityFrom({ account: "token-user" }), {
+    account: "token-user",
+    email: null,
+    role: null,
+    logoutURL: null,
+  });
+  assert.throws(() => identityFrom({ account: "", email: null }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", role: 1 }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", logout_url: "//other.test/logout" }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", csrf_token: 1 }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", unexpected: true }), /invalid identity/);
 });
 
 test("network labels use the API's typed runtime state", () => {
@@ -118,11 +202,11 @@ test("network labels use the API's typed runtime state", () => {
     networkStateLabel({
       enabled: true,
       connected: false,
-      runtime: { state: "reconnect_backoff" },
+      state: "reconnecting",
     }),
-    "reconnect backoff",
+    "reconnecting",
   );
-  assert.equal(networkStateLabel({ enabled: true, connected: false, runtime: {} }), "starting");
+  assert.equal(networkStateLabel({ enabled: true, connected: null, state: null }), "starting");
 });
 
 test("API error messages distinguish expired sessions", () => {

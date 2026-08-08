@@ -13,8 +13,10 @@
 import "./style.css";
 import {
   ApiError,
+  backlogFrom,
   errorMessage,
   getJson,
+  identityFrom,
   loadSettings,
   networkStateLabel,
   networksFrom,
@@ -75,6 +77,7 @@ function showAlert(key, text, tone = "warning", action = null) {
     alert = document.createElement("div");
     alert.dataset.alert = key;
     alert.className = `alert alert-${tone}`;
+    alert.setAttribute("role", tone === "error" ? "alert" : "status");
     const copy = document.createElement("span");
     alert.appendChild(copy);
     const dismiss = document.createElement("button");
@@ -86,6 +89,7 @@ function showAlert(key, text, tone = "warning", action = null) {
     alertsEl.appendChild(alert);
   }
   alert.className = `alert alert-${tone}`;
+  alert.setAttribute("role", tone === "error" ? "alert" : "status");
   alert.firstElementChild.textContent = text;
   const existingAction = alert.querySelector(".alert-action");
   if (existingAction) existingAction.remove();
@@ -145,6 +149,7 @@ let myNick = null;
 let socket = null;
 let upstreamConnected = false;
 let snapshotComplete = false;
+let initialReplay = new Map();
 let memberTracking = true;
 let nextSendId = 0;
 const pendingSends = new Map();
@@ -900,6 +905,21 @@ function handleLine(raw) {
   }
 }
 
+function rememberInitialReplay(lines) {
+  initialReplay = new Map();
+  for (const line of lines) {
+    initialReplay.set(line, (initialReplay.get(line) ?? 0) + 1);
+  }
+}
+
+function isInitialReplay(line) {
+  const count = initialReplay.get(line) ?? 0;
+  if (count === 0) return false;
+  if (count === 1) initialReplay.delete(line);
+  else initialReplay.set(line, count - 1);
+  return true;
+}
+
 // ---- socket + composer --------------------------------------------------
 
 // Reconnect with exponential backoff + jitter: a transient drop (server
@@ -1052,7 +1072,9 @@ function connect() {
       );
       return;
     }
-    if (event.t === "line" && typeof event.v === "string") handleLine(event.v);
+    if (event.t === "line" && typeof event.v === "string") {
+      if (snapshotComplete || !isInitialReplay(event.v)) handleLine(event.v);
+    }
     else if (event.t === "sent" && typeof event.v === "string") {
       if (!acceptPendingSend(event.v)) {
         showAlert("protocol", "The server acknowledged an unknown composer request.", "error");
@@ -1079,6 +1101,7 @@ function connect() {
       setStatus(`${network}: upstream reconnecting${why}`, "error");
     } else if (event.t === "snapshot" && event.v === "complete") {
       snapshotComplete = true;
+      initialReplay.clear();
       if (upstreamConnected) resyncMemberships();
     } else if (event.t === "status" && event.v === "unavailable") {
       terminalSocket = true;
@@ -1225,9 +1248,6 @@ networkSelect.addEventListener("change", () => {
   }
 });
 
-// The network picker shown when the page is opened without ?network=<name>:
-// list the caller's networks as links, so the client has a real entry point
-// instead of requiring a hand-crafted URL.
 function renderNetworkPicker(networks, failure = null) {
   setStatus(failure ? "network list unavailable" : "choose a network", failure ? "error" : "connecting");
   bufnameEl.textContent = "Select a network";
@@ -1235,13 +1255,23 @@ function renderNetworkPicker(networks, failure = null) {
   nicklistEl.hidden = true;
   messagesEl.replaceChildren();
   const intro = document.createElement("li");
-  intro.className = "line line-server";
-  intro.textContent = failure
-    ? "e6irc could not load your networks. This is an API failure, not an empty account."
+  intro.className = "network-picker-intro";
+  const panel = document.createElement("div");
+  if (failure) {
+    panel.setAttribute("role", "alert");
+    panel.dataset.alert = "networks";
+  }
+  const title = document.createElement("h2");
+  title.textContent = failure ? "Network list unavailable" : "Your chat networks";
+  const copy = document.createElement("p");
+  copy.textContent = failure
+    ? `${errorMessage("load your networks", failure)} This is an API failure, not an empty account.`
     : networks.length
       ? "Choose an always-on network:"
       : "No networks are configured for this account.";
-  messagesEl.appendChild(intro);
+  panel.append(title, copy);
+  intro.appendChild(panel);
+  if (!failure && networks.length) messagesEl.appendChild(intro);
   for (const item of networks) {
     const li = document.createElement("li");
     li.className = "line";
@@ -1259,20 +1289,31 @@ function renderNetworkPicker(networks, failure = null) {
   const manageLi = document.createElement("li");
   manageLi.className = "line picker-actions";
   const manage = document.createElement("a");
-  manage.href = "/console/networks";
-  manage.textContent = failure
-    ? "Open network console"
+  const signInRequired = failure instanceof ApiError && failure.status === 401;
+  manage.href = signInRequired ? "/login" : "/console/networks";
+  manage.textContent = signInRequired
+    ? "Sign in"
+    : failure
+      ? "Open network console"
     : networks.length
       ? "Manage networks"
       : "Add a network";
   manageLi.appendChild(manage);
-  if (failure) {
+  if (failure && !signInRequired) {
     const retry = document.createElement("a");
     retry.href = "/";
     retry.textContent = "Retry";
     manageLi.appendChild(retry);
   }
-  messagesEl.appendChild(manageLi);
+  if (failure || networks.length === 0) {
+    const actions = document.createElement("div");
+    actions.className = "picker-actions";
+    for (const control of Array.from(manageLi.children)) actions.appendChild(control);
+    panel.appendChild(actions);
+  } else {
+    messagesEl.appendChild(manageLi);
+  }
+  if (failure || networks.length === 0) messagesEl.appendChild(intro);
 }
 
 // ---- load earlier history ----------------------------------------------
@@ -1291,14 +1332,12 @@ async function loadEarlier() {
   }
   let lines = [];
   try {
-    const payload = await getJson(
-      window.fetch.bind(window),
-      `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
+    lines = backlogFrom(
+      await getJson(
+        window.fetch.bind(window),
+        `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
+      ),
     );
-    if (!Array.isArray(payload.lines) || payload.lines.some((line) => typeof line !== "string")) {
-      throw new ApiError(200, "The server returned an invalid backlog");
-    }
-    lines = payload.lines;
     clearAlert("history");
   } catch (error) {
     const message = errorMessage("load earlier messages", error);
@@ -1340,6 +1379,24 @@ async function loadEarlier() {
   // Loading older context is an explicit reader action. Keep that context in
   // view instead of snapping back to the live edge where it cannot be seen.
   if (b.key === active) renderActive({ atLatest: false });
+}
+
+async function loadInitialBacklog() {
+  try {
+    const lines = backlogFrom(
+      await getJson(
+        window.fetch.bind(window),
+        `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
+      ),
+    );
+    rememberInitialReplay(lines);
+    for (const line of lines) handleLine(line);
+    clearAlert("history");
+  } catch (error) {
+    const message = errorMessage("load initial messages", error);
+    addServer(message);
+    showAlert("history", message, "error");
+  }
 }
 
 const loadEarlierBtn = el("load-earlier");
@@ -1404,26 +1461,12 @@ async function boot() {
   setComposerAvailable(false);
 
   try {
-    const me = await getJson(window.fetch.bind(window), "/api/v1/me");
-    if (me === null || typeof me !== "object" || typeof me.account !== "string") {
-      throw new ApiError(200, "The server returned an invalid identity");
-    }
+    const me = identityFrom(await getJson(window.fetch.bind(window), "/api/v1/me"));
     el("account-name").textContent = me.account;
     el("account-link").dataset.shauthUser = me.account;
-    // The email rides the account name's title attribute (the SSO validator
-    // reads it there); role and the coordinated-logout coordinate likewise.
-    el("account-name").title = typeof me.email === "string" ? me.email : "";
-    if (typeof me.role === "string") el("account-role").textContent = me.role;
-    // Only accept a same-origin relative path, so a hostile value can't turn the
-    // sign-out control into a `javascript:` / cross-origin link. Reject a
-    // protocol-relative `//host` (which starts with "/" but is cross-origin).
-    if (
-      typeof me.logout_url === "string" &&
-      me.logout_url.startsWith("/") &&
-      !me.logout_url.startsWith("//")
-    ) {
-      el("logout-link").href = me.logout_url;
-    }
+    el("account-name").title = me.email || "";
+    el("account-role").textContent = me.role || "";
+    if (me.logoutURL) el("logout-link").href = me.logoutURL;
     clearAlert("identity");
   } catch (error) {
     el("account-name").textContent = "identity unavailable";
@@ -1446,14 +1489,6 @@ async function boot() {
     clearAlert("networks");
   } catch (error) {
     networkFailure = error;
-    showAlert(
-      "networks",
-      errorMessage("load your networks", error),
-      "error",
-      error instanceof ApiError && error.status === 401
-        ? { href: "/login", label: "Sign in" }
-        : { href: "/console/networks", label: "Open network console" },
-    );
   }
   populateNetworkSelector(networks, networkFailure);
 
@@ -1498,6 +1533,7 @@ async function boot() {
       selected.kind === "local";
   }
 
+  await loadInitialBacklog();
   connect();
 }
 

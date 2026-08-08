@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const require = createRequire(new URL("../web/package.json", import.meta.url));
 const playwright = require("playwright");
+const AxeBuilder = require("@axe-core/playwright").default;
 const browserName = process.env.E6IRC_TEST_BROWSER ?? "chromium";
 assert.ok(
   ["chromium", "firefox", "webkit"].includes(browserName),
@@ -26,6 +27,15 @@ async function clickAndWaitForURL(page, locator, expectedURL) {
   );
   await Promise.all([navigation, locator.click()]);
   assert.equal(page.url(), expectedURL);
+}
+
+async function expectAccessible(page, selector) {
+  const results = await new AxeBuilder({ page }).include(selector).analyze();
+  assert.deepEqual(
+    results.violations,
+    [],
+    results.violations.map(({ id, help, nodes }) => `${id}: ${help}\n${nodes.map((node) => node.html).join("\n")}`).join("\n\n"),
+  );
 }
 
 // A configuration form POST navigates to a re-rendered page, but the old
@@ -44,6 +54,19 @@ async function waitForConfigurationServerName(page, value) {
     (expected) => document.querySelector('form.settings-form input[name="server_name"]')?.value === expected,
     value,
   );
+}
+
+async function waitForBufferedLine(request, network, text) {
+  const url = `${applicationOrigin}/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await request.get(url);
+    if (response.ok()) {
+      const body = await response.json();
+      if (Array.isArray(body.lines) && body.lines.some((line) => line.includes(text))) return;
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+  }
+  assert.fail(`buffer did not contain ${JSON.stringify(text)}`);
 }
 
 const databaseURL = process.env.E6IRC_TEST_DATABASE_URL;
@@ -106,7 +129,14 @@ const watchdog = setTimeout(() => {
   process.exit(1);
 }, 180_000);
 
+const artifactDirectory = process.env.E6IRC_BROWSER_ARTIFACTS_DIR;
+const applicationErrors = [];
+const applicationRequests = [];
+const navigationTrace = [];
 let browser;
+let context;
+let page;
+let tracing = false;
 try {
   await waitForHealthyServer();
   // Playwright's default Chromium headless shell accepts a notification
@@ -118,12 +148,14 @@ try {
     headless: true,
     ...(browserName === "chromium" ? { channel: "chromium" } : {}),
   });
-  const context = await browser.newContext();
+  context = await browser.newContext();
+  if (artifactDirectory) {
+    await mkdir(artifactDirectory, { recursive: true });
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+    tracing = true;
+  }
   await context.grantPermissions(["notifications"], { origin: applicationOrigin });
-  const page = await context.newPage();
-  const applicationErrors = [];
-  const applicationRequests = [];
-  const navigationTrace = [];
+  page = await context.newPage();
   page.on("request", (request) => {
     if (isApplicationURL(request.url())) {
       applicationRequests.push(`${request.method()} ${sanitizeURL(request.url())}`);
@@ -175,9 +207,7 @@ try {
   await page.goto(`${applicationOrigin}/api/v1/auth/oidc/dex/start`);
   assert.equal(page.url(), `${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
-  // The client fills #account-name from an async /api/v1/me fetch on boot, so
-  // wait for it to be populated rather than racing the placeholder — the
-  // element exists in the served HTML immediately, but its identity does not.
+  // Wait for identity API hydration.
   await page.waitForFunction(
     () => document.getElementById("account-name")?.textContent !== "signed in",
   );
@@ -201,6 +231,7 @@ try {
   // resolves; reading #messages before then races the fetch (and loses on
   // slower runners), so wait for the render itself.
   await page.locator("#messages").getByText("No networks are configured").waitFor();
+  await expectAccessible(page, "#app");
   assert.equal(await page.locator("#network-select").inputValue(), "");
   assert.equal(await page.locator("#message").isDisabled(), true);
   assert.equal(await page.locator("#composer button").isDisabled(), true);
@@ -238,6 +269,7 @@ try {
     }
   });
   await page.goto(`${applicationOrigin}/console/account`);
+  await expectAccessible(page, "body");
   const tokenFailure = page.locator("#account-token-rows [role=status]");
   await tokenFailure.waitFor();
   assert.match(await tokenFailure.innerText(), /Token storage unavailable/);
@@ -292,11 +324,21 @@ try {
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   assert.equal(await consoleTheme.inputValue(), "light");
   assert.equal(await page.locator("html").getAttribute("data-theme"), "light");
+  await page.emulateMedia({ colorScheme: "light" });
   await consoleTheme.selectOption("auto");
   await page.waitForFunction(() => !document.documentElement.hasAttribute("data-theme"));
   assert.deepEqual(
     await page.evaluate(() => JSON.parse(localStorage.getItem("e6irc.settings"))),
     { theme: "auto", notifications: false },
+  );
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
+    "#f5f7fa",
+  );
+  await page.emulateMedia({ colorScheme: "dark" });
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()),
+    "#0d1015",
   );
   await consoleTheme.selectOption("dark");
   await page.waitForFunction(() => document.documentElement.dataset.theme === "dark");
@@ -336,8 +378,37 @@ try {
     await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
     true,
   );
+  await page.setViewportSize({ width: 640, height: 800 });
+  assert.equal(
+    await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    true,
+  );
   await page.setViewportSize({ width: 1280, height: 720 });
+  const profileURL = `${applicationOrigin}/api/v1/me/profile`;
+  let releaseProfile;
+  const profileReleased = new Promise((resolve) => {
+    releaseProfile = resolve;
+  });
+  let profileRequested;
+  const profileRequest = new Promise((resolve) => {
+    profileRequested = resolve;
+  });
+  await page.route(profileURL, async (route) => {
+    profileRequested();
+    await profileReleased;
+    await route.continue();
+  });
+  const profileResponse = page.waitForResponse(
+    (response) => response.url() === profileURL && response.request().method() === "GET",
+  );
   await page.goto(`${applicationOrigin}/console/account`);
+  await profileRequest;
+  const contactEmail = page.getByLabel("Email address", { exact: true });
+  await contactEmail.fill("draft-contact@example.test");
+  releaseProfile();
+  await profileResponse;
+  assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
+  await page.unroute(profileURL);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");
@@ -617,6 +688,7 @@ try {
   ]) {
     await page.goto(`${applicationOrigin}${path}`);
     await page.getByRole("heading", { name: heading, exact: true }).waitFor();
+    await expectAccessible(page, "main");
   }
 
   await page.goto(`${applicationOrigin}/console`);
@@ -662,6 +734,23 @@ try {
     await guest.goto(`${applicationOrigin}/console/account`);
     await guest.getByRole("heading", { name: "Security activity", exact: true }).waitFor();
     await guest.getByText("ACCOUNT_LOGIN", { exact: true }).waitFor();
+    if (browserName === "chromium") {
+      await guest.emulateMedia({ forcedColors: "active" });
+      assert.equal(
+        await guest.evaluate(() => matchMedia("(forced-colors: active)").matches),
+        true,
+      );
+      const saveContactEmail = guest.getByRole("button", { name: "Save contact email", exact: true });
+      await saveContactEmail.focus();
+      assert.deepEqual(
+        await saveContactEmail.evaluate((button) => ({
+          focused: button === document.activeElement,
+          forcedColorAdjust: getComputedStyle(button).forcedColorAdjust,
+        })),
+        { focused: true, forcedColorAdjust: "none" },
+      );
+      await expectAccessible(guest, "main");
+    }
     const exportResponse = await guestContext.request.get(`${applicationOrigin}/api/v1/me/export`);
     assert.equal(exportResponse.status(), 200);
     assert.match(exportResponse.headers()["content-disposition"], /e6irc-account-export\.json/);
@@ -682,13 +771,22 @@ try {
     }).click();
     const confirmation = guest.getByRole("dialog", { name: "Confirm action", exact: true });
     await confirmation.waitFor();
+    await expectAccessible(guest, "[data-console-confirm]");
     assert.equal(
       await confirmation.evaluate((dialog) => dialog.contains(document.activeElement)),
       true,
       "confirmation did not move focus into its modal dialog",
     );
-    await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+    await confirmation.press("Escape");
     await confirmation.waitFor({ state: "hidden" });
+    assert.equal(
+      await deleteAccount.getByRole("button", {
+        name: "Delete my account permanently",
+        exact: true,
+      }).evaluate((button) => button === document.activeElement),
+      true,
+      "closing confirmation did not restore focus to its trigger",
+    );
     assert.equal(
       await deleteAccount.getByLabel("Type browserguest to confirm", { exact: true }).inputValue(),
       "browserguest",
@@ -708,16 +806,58 @@ try {
     await guestContext.close();
   }
 
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  assert.equal(
+    await page.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches),
+    true,
+  );
+  const monitoringURL = `${applicationOrigin}/api/v1/admin/monitoring?minutes=60`;
+  let releaseInitialMonitoring;
+  const initialMonitoringReleased = new Promise((resolve) => {
+    releaseInitialMonitoring = resolve;
+  });
+  let initialMonitoringSeen;
+  const initialMonitoringRequest = new Promise((resolve) => {
+    initialMonitoringSeen = resolve;
+  });
+  let queuedMonitoringSeen;
+  const queuedMonitoringRequest = new Promise((resolve) => {
+    queuedMonitoringSeen = resolve;
+  });
+  let monitoringRequests = 0;
+  await page.route(monitoringURL, async (route) => {
+    monitoringRequests += 1;
+    if (monitoringRequests === 1) {
+      initialMonitoringSeen();
+      await initialMonitoringReleased;
+    } else if (monitoringRequests === 2) {
+      queuedMonitoringSeen();
+    }
+    await route.continue();
+  });
   const monitoringRead = page.waitForResponse(
     (response) =>
-      response.url() === `${applicationOrigin}/api/v1/admin/monitoring?minutes=60` &&
+      response.url() === monitoringURL &&
       response.request().method() === "GET",
   );
   await page.goto(`${applicationOrigin}/console/monitoring`);
+  await initialMonitoringRequest;
+  const refreshMonitoring = page.getByRole("button", { name: "Refresh", exact: true });
+  await refreshMonitoring.click();
+  await refreshMonitoring.click();
+  releaseInitialMonitoring();
   assert.equal((await monitoringRead).status(), 200);
+  await queuedMonitoringRequest;
+  assert.equal(monitoringRequests, 2, "overlapping refreshes must coalesce to one queued request");
   await page.getByRole("heading", { name: "Monitoring", exact: true }).waitFor();
   await page.getByRole("heading", { name: "Queue pressure", exact: true }).waitFor();
   await page.getByText("Live data refreshed.", { exact: true }).waitFor();
+  assert.equal(
+    await page.locator(".pulse").evaluate((pulse) => getComputedStyle(pulse).animationName),
+    "none",
+    "reduced motion must disable the live-status pulse",
+  );
+  await page.unroute(monitoringURL);
   const runtimeQueues = page.locator("section").filter({
     has: page.getByRole("heading", { name: "Runtime queues", exact: true }),
   });
@@ -821,7 +961,7 @@ try {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ networks: {} }),
+        body: "{",
       });
     } else {
       await route.continue();
@@ -830,7 +970,7 @@ try {
   await page.goto(`${applicationOrigin}/console/networks`);
   const ownerNetworkFailure = page.locator("#network-rows [role=status]");
   await ownerNetworkFailure.waitFor();
-  assert.match(await ownerNetworkFailure.innerText(), /network directory response is invalid/i);
+  assert.match(await ownerNetworkFailure.innerText(), /API response is invalid/i);
   await page.locator("#network-rows").getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByText("No networks yet. Add one above.", { exact: true }).waitFor();
   assert.equal(ownerNetworkReads, 2, "Retry made exactly one replacement owner-network request");
@@ -875,9 +1015,17 @@ try {
   );
   await page.getByRole("link", { name: "journey", exact: true }).waitFor();
   await upstream.waitForJoin("#journey");
+  await upstream.sendPeerMessage("#journey", "browser replays through the real stack");
+  await waitForBufferedLine(context.request, "journey", "browser replays through the real stack");
 
+  const initialBuffer = page.waitForResponse(
+    (response) => response.url() === `${applicationOrigin}/api/v1/me/networks/journey/buffer?limit=1000`,
+  );
   await page.goto(`${applicationOrigin}/?network=journey`);
-  await page.locator(".buf-name").filter({ hasText: /^#journey$/ }).waitFor();
+  assert.equal((await initialBuffer).status(), 200);
+  const replayedMessage = page.getByText("browser replays through the real stack", { exact: true });
+  await replayedMessage.waitFor();
+  assert.equal(await replayedMessage.count(), 1);
   const journeyBuffer = page.getByRole("button", { name: "Open #journey", exact: true });
   assert.equal(await journeyBuffer.evaluate((button) => button.tagName), "BUTTON");
   assert.equal(await journeyBuffer.getAttribute("aria-pressed"), "true");
@@ -1137,12 +1285,19 @@ try {
             nick: "webnick",
             enabled: true,
             connected: false,
-            runtime: { state: "reconnect_backoff" },
+            runtime: { state: "reconnecting" },
           },
         ],
       }),
     });
   });
+  await page.route(historyURL, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ lines: [] }),
+    }),
+  );
   let mockSocket;
   const clientFrames = [];
   let rejectedSendAttempts = 0;
@@ -1241,7 +1396,7 @@ try {
   assert.equal(namesRequestedBeforeSnapshot, false, "NAMES was requested before replay completed");
   assert.match(
     await page.locator("#network-select option:checked").textContent(),
-    /reconnect backoff/,
+    /reconnecting/,
   );
   const expectedTaggedTime = await page.evaluate(() => {
     const date = new Date("2026-07-28T20:00:00.000Z");
@@ -1292,6 +1447,7 @@ try {
   const historyRouteReached = new Promise((resolve) => {
     resolveHistoryRoute = resolve;
   });
+  await page.unroute(historyURL);
   await page.route(historyURL, (route) => {
     resolveHistoryRoute(route);
   });
@@ -1607,8 +1763,27 @@ try {
     applicationErrors.filter((error) => error !== expectedSignedOutNetworkRead),
     [],
   );
+} catch (error) {
+  if (artifactDirectory && context) {
+    const results = await Promise.allSettled([
+      page?.screenshot({ path: join(artifactDirectory, `${browserName}-failure.png`), fullPage: true }),
+      tracing
+        ? context.tracing.stop({ path: join(artifactDirectory, `${browserName}-trace.zip`) })
+        : Promise.resolve(),
+      writeFile(
+        join(artifactDirectory, `${browserName}-diagnostics.json`),
+        JSON.stringify({ applicationErrors, applicationRequests, navigationTrace, serverOutput }, null, 2),
+      ),
+    ]);
+    tracing = false;
+    for (const result of results) {
+      if (result.status === "rejected") console.error(`failed to write browser artifact: ${result.reason}`);
+    }
+  }
+  throw error;
 } finally {
   clearTimeout(watchdog);
+  if (tracing && context) await context.tracing.stop();
   // `browser.close()` can itself hang on a wedged engine; bound it so teardown
   // never becomes the thing that hangs the run.
   if (browser) {
@@ -1684,11 +1859,21 @@ async function startIrcUpstream() {
   const lines = [];
   const lineWaiters = [];
   let outboundSequence = 0;
-  let joined;
-  let resolveJoined;
-  const joinedPromise = new Promise((resolve) => {
-    resolveJoined = resolve;
-  });
+  const joined = new Map();
+  const joinWaiters = new Map();
+  let activeConnection = null;
+
+  const joinedConnection = (channel) => {
+    const connection = joined.get(channel);
+    if (connection) return Promise.resolve(connection);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        joinWaiters.delete(channel);
+        reject(new Error(`upstream did not observe JOIN ${channel}`));
+      }, 10_000);
+      joinWaiters.set(channel, { resolve, timeout });
+    });
+  };
 
   const publishLine = (line) => {
     lines.push(line);
@@ -1741,9 +1926,15 @@ async function startIrcUpstream() {
         const channel = params[0];
         send(`:${nick}!web@journey JOIN ${channel}`);
         names(channel);
-        if (!joined) {
-          joined = { socket, nick, channel };
-          resolveJoined(joined);
+        if (!joined.has(channel)) {
+          const connection = { socket, nick, channel };
+          joined.set(channel, connection);
+          const waiter = joinWaiters.get(channel);
+          if (waiter) {
+            joinWaiters.delete(channel);
+            clearTimeout(waiter.timeout);
+            waiter.resolve(connection);
+          }
         }
       } else if (command === "NAMES" && params[0]) {
         names(params[0]);
@@ -1773,18 +1964,12 @@ async function startIrcUpstream() {
   return {
     address: `127.0.0.1:${address.port}`,
     async waitForJoin(channel) {
-      const connection = await Promise.race([
-        joinedPromise,
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(`upstream did not observe JOIN ${channel}`)), 10_000),
-        ),
-      ]);
-      assert.equal(connection.channel, channel);
+      activeConnection = await joinedConnection(channel);
     },
     async sendPeerMessage(target, text) {
-      const connection = await joinedPromise;
+      assert.ok(activeConnection, "select an upstream connection before sending a peer message");
       outboundSequence += 1;
-      connection.socket.write(
+      activeConnection.socket.write(
         `@time=2026-07-30T02:00:00.000Z;msgid=browser-receive-${outboundSequence} :peer!user@journey PRIVMSG ${target} :${text}\r\n`,
       );
     },

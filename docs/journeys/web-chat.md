@@ -51,8 +51,11 @@ labels.
 REST-failure, network-creation, and authenticated WebSocket states are
 browser-tested against a real daemon. The same journey verifies the semantic
 conversation and member controls plus the skip-to-chat focus target. Focused
-client-state cases use browser doubles; the primary entry journey uses the real
-network catalog and attachment.
+client-state fixtures reject malformed, oversized, or contract-drift identity,
+catalog, and backlog responses, and cover loading, empty, populated, unavailable,
+expired-session, and forced-colors picker states with visual and axe checks.
+The populated fixture proves reflow at a 200% equivalent layout width. The
+primary entry journey uses the real network catalog and attachment.
 
 ## Receive replay and live messages without gaps or duplicates
 
@@ -240,6 +243,7 @@ administrator set.
 boundary at the handler, regardless of whether a link was hidden. Server
 errors render an error state rather than an empty collection. Expired sessions
 return to authentication, and sign-out ends at the reload-safe signed-out page.
+Delayed API reads do not overwrite a field edited before the response arrives.
 
 **Security and observability.** Navigation visibility is only presentation;
 each destination independently authenticates, authorizes, and applies CSRF to
@@ -250,8 +254,10 @@ database/provider text.
 **Evidence.** Role gating and each server-rendered page are covered at HTTP
 level. The real Chromium journey crosses OpenID Connect and local
 authentication, visits account/network/channel and every administrator
-directory, edits every managed-configuration subsection and credential
-collection, adds and removes a server ban, verifies its audit trail, inspects
-live queue monitoring, and completes the reload-safe sign-out/recovery flow.
+directory, proves narrow and high-zoom layouts plus forced-color focus and
+accessibility, preserves an in-progress profile edit across a delayed API
+read, edits every managed-configuration subsection and credential collection,
+adds and removes a server ban, verifies its audit trail, inspects live queue
+monitoring, and completes the reload-safe sign-out/recovery flow.
 Focused HTTP journeys prove the remaining owner and administrator mutation
 families with their role and CSRF boundaries.

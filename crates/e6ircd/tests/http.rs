@@ -847,6 +847,168 @@ async fn openapi_spec_is_served() {
     assert!(head.to_lowercase().contains("application/json"), "{head}");
     let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON spec");
     assert_eq!(v["openapi"], "3.1.0");
+    let identity_schema = &v["paths"]["/api/v1/me"]["get"]["responses"]["200"]["content"]["application/json"]
+        ["schema"];
+    assert_eq!(identity_schema["additionalProperties"], false);
+    assert!(
+        identity_schema["required"]
+            .as_array()
+            .is_some_and(|fields| fields.iter().any(|field| field == "account"))
+    );
+    assert_eq!(
+        identity_schema["properties"]["logout_url"]["pattern"],
+        "^/[^/]"
+    );
+    assert_eq!(
+        identity_schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>()),
+        Some(vec![
+            "account".into(),
+            "csrf_token".into(),
+            "email".into(),
+            "logout_url".into(),
+            "provider".into(),
+            "release_revision".into(),
+            "role".into(),
+        ])
+    );
+    assert_eq!(
+        identity_schema["properties"]["csrf_token"]["type"],
+        "string"
+    );
+    let network_list_schema = &v["paths"]["/api/v1/me/networks"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(network_list_schema["additionalProperties"], false);
+    assert_eq!(
+        network_list_schema["properties"]["networks"]["items"]["required"],
+        serde_json::json!(["name", "enabled", "connected", "runtime"])
+    );
+    assert_eq!(
+        network_list_schema["properties"]["networks"]["items"]["properties"]["runtime"]["oneOf"][1]
+            ["properties"]["state"]["enum"],
+        serde_json::json!([
+            "connecting",
+            "connected",
+            "reconnecting",
+            "authentication_failed",
+            "registration_failed",
+        ])
+    );
+    let create_network_schema = &v["paths"]["/api/v1/me/networks"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(create_network_schema["additionalProperties"], false);
+    let app_password_schema = &v["paths"]["/api/v1/auth/app-passwords"]["post"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(app_password_schema["additionalProperties"], false);
+    for (path, method) in [
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/me/tokens", "post"),
+        ("/api/v1/auth/device/token", "post"),
+        ("/api/v1/auth/device/approve", "post"),
+        ("/api/v1/admin/bans", "post"),
+        ("/api/v1/admin/configuration", "patch"),
+        ("/api/v1/admin/configuration/opers", "post"),
+        ("/api/v1/admin/configuration/opers/{name}", "delete"),
+        ("/api/v1/admin/configuration/oidc-providers", "post"),
+        (
+            "/api/v1/admin/configuration/oidc-providers/{name}",
+            "delete",
+        ),
+        ("/api/v1/admin/configuration/networks", "post"),
+        ("/api/v1/admin/configuration/networks/{name}", "delete"),
+        ("/api/v1/admin/networks/{owner}/{name}", "patch"),
+    ] {
+        let schema =
+            &v["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+    }
+    let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(patch_network_schema["additionalProperties"], false);
+    let managed_network_delete_schema = &v["paths"]["/api/v1/admin/configuration/networks/{name}"]
+        ["delete"]["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(managed_network_delete_schema["additionalProperties"], false);
+    assert_eq!(
+        managed_network_delete_schema["required"],
+        serde_json::json!(["revision", "owner"])
+    );
+    let scalar_settings_schema = &v["paths"]["/api/v1/admin/configuration"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["settings"];
+    assert_eq!(scalar_settings_schema["additionalProperties"], false);
+    assert_eq!(
+        scalar_settings_schema["required"],
+        serde_json::json!([
+            "server_name",
+            "network_name",
+            "description",
+            "motd",
+            "nicklen",
+            "sendq",
+            "core_queue",
+            "max_hot_channels",
+            "listeners",
+            "registration",
+            "limits",
+            "observability",
+            "storage",
+            "bnc_addr",
+            "public_url",
+            "secure_cookies",
+            "admin_accounts",
+        ])
+    );
+    for field in ["registration", "limits", "observability", "storage"] {
+        assert_eq!(
+            scalar_settings_schema["properties"][field]["additionalProperties"], false,
+            "{field}"
+        );
+    }
+    let listener_schema = &scalar_settings_schema["properties"]["listeners"]["items"];
+    assert_eq!(listener_schema["additionalProperties"], false);
+    assert_eq!(listener_schema["required"], serde_json::json!(["addr"]));
+    assert_eq!(
+        listener_schema["properties"]["tls"]["oneOf"][0]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        scalar_settings_schema["properties"]["nicklen"]["maximum"],
+        64
+    );
+    let limits_schema = &scalar_settings_schema["properties"]["limits"]["properties"];
+    for field in [
+        "max_connections_per_ip",
+        "command_burst",
+        "auth_rate_burst",
+        "api_rate_burst",
+        "administrator_api_rate_burst",
+        "registration_burst",
+    ] {
+        assert_eq!(limits_schema[field]["minimum"], 1, "{field}");
+    }
+    let observability_schema = &scalar_settings_schema["properties"]["observability"]["properties"];
+    assert_eq!(
+        observability_schema["sample_interval_seconds"],
+        serde_json::json!({ "type": "integer", "minimum": 5, "maximum": 300 })
+    );
+    assert_eq!(
+        observability_schema["retention_hours"],
+        serde_json::json!({ "type": "integer", "minimum": 1, "maximum": 2160 })
+    );
+    let storage_schema = &scalar_settings_schema["properties"]["storage"]["properties"];
+    for field in ["history_retention_days", "audit_retention_days"] {
+        assert_eq!(storage_schema[field]["minimum"], 1, "{field}");
+        assert_eq!(storage_schema[field]["maximum"], 3650, "{field}");
+    }
+    let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"];
+    assert_eq!(buffer_schema["additionalProperties"], false);
+    assert_eq!(buffer_schema["required"], serde_json::json!(["lines"]));
+    assert_eq!(
+        buffer_schema["properties"]["lines"]["items"]["type"],
+        "string"
+    );
     // Method/path completeness is enforced mechanically by the route catalog's
     // unit test. These assertions protect the richer request-schema contract
     // that cannot be inferred from an axum handler.
@@ -2938,7 +3100,7 @@ async fn durable_admin_can_suspend_and_reactivate_an_account_end_to_end() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    assert!(body.contains("exactly one"), "{body}");
+    assert!(body.contains("Invalid request body"), "{body}");
 
     let (status, body) = patch_json(
         http,
@@ -5124,6 +5286,25 @@ async fn account_console_manages_credentials_tokens_and_identities() {
     assert_eq!(profile["account"], "alice");
     assert_eq!(profile["contact_email"], "Alice+IRC@example.com");
 
+    let missing_profile_field = "{}";
+    let missing_profile_field_request = format!(
+        "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\n\
+         X-E6IRC-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{missing_profile_field}",
+        missing_profile_field.len()
+    );
+    let (status, _, body) = request(http, &missing_profile_field_request).await;
+    assert_eq!(
+        status, 400,
+        "a profile update must name contact_email: {body}"
+    );
+    assert_eq!(
+        e6ircd::db::account_contact_email(&pool, "alice")
+            .await
+            .expect("contact email after rejected update"),
+        Some("Alice+IRC@example.com".into())
+    );
+
     let api_profile = r#"{"contact_email":"Second@New.Example"}"#;
     let missing_csrf = format!(
         "PATCH /api/v1/me/profile HTTP/1.1\r\nHost: t\r\n\
@@ -5329,6 +5510,9 @@ async fn device_authorization_grant_flow() {
     let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
+    let bearer = e6ircd::db::issue_api_token(&pool, "alice", "device approval")
+        .await
+        .expect("bearer");
     drop(pool);
 
     let config = Config {
@@ -5369,6 +5553,17 @@ async fn device_authorization_grant_flow() {
     let user_code = v["user_code"].as_str().unwrap().to_string();
     assert!(v["verification_uri"].as_str().unwrap().ends_with("/device"));
 
+    let (status, _, _) = request(
+        http,
+        &post(
+            "/api/v1/auth/device/token",
+            "",
+            &format!(r#"{{"device_code":"{device_code}","extra":true}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown device-token fields must be rejected");
+
     // poll before approval -> authorization_pending
     let tok_body = format!(r#"{{"device_code":"{device_code}"}}"#);
     let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body)).await;
@@ -5385,6 +5580,38 @@ async fn device_authorization_grant_flow() {
     let me_json: serde_json::Value = serde_json::from_str(&me_body).expect("me JSON");
     let csrf = me_json["csrf_token"].as_str().expect("session CSRF token");
     let browser_headers = format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n");
+    let (status, _, _) = request(
+        http,
+        &post("/api/v1/auth/device/approve", &cookie, &ap_body),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "device approval requires the session CSRF token"
+    );
+    let (status, _, _) = request(
+        http,
+        &post(
+            "/api/v1/auth/device/approve",
+            &format!("Authorization: Bearer {bearer}\r\n"),
+            &ap_body,
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "a bearer cannot approve a device grant");
+    let (status, _, _) = request(
+        http,
+        &post(
+            "/api/v1/auth/device/approve",
+            &browser_headers,
+            &format!(r#"{{"user_code":"{user_code}","extra":true}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unknown device-approval fields must be rejected"
+    );
     let (status, _, _) = request(
         http,
         &post("/api/v1/auth/device/approve", &browser_headers, &ap_body),
@@ -5432,6 +5659,7 @@ async fn device_authorization_grant_flow() {
     .await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("name=\"user_code\""), "{page}");
+    assert!(page.contains("Device code"), "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
         .nth(1)

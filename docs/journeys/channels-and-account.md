@@ -111,7 +111,8 @@ when registration policy requested it.
 1. Open **Account & access** or read `/api/v1/me/profile`.
 2. View the account name and current contact email; the response is private and
    non-cacheable.
-3. Submit a replacement email or an empty value to remove it.
+3. Submit a replacement email. The request must include `contact_email`; use
+   JSON null to remove it.
 4. The server parses the mailbox once, canonicalizes its DNS domain, stores the
    typed value, and returns the updated private profile.
 

@@ -3,8 +3,25 @@
 use super::*;
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum ContactEmailUpdate {
+    Set(String),
+    Remove(()),
+}
+
+impl ContactEmailUpdate {
+    fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Set(value) => Some(value),
+            Self::Remove(()) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProfileRequest {
-    pub(super) contact_email: Option<String>,
+    pub(super) contact_email: ContactEmailUpdate,
 }
 
 pub(super) async fn me_profile(
@@ -28,7 +45,9 @@ pub(super) async fn update_me_profile(
     let contact_email = match super::parse_optional_contact_email(request.contact_email.as_deref())
     {
         Ok(ce) => ce,
-        Err(msg) => return problem(StatusCode::BAD_REQUEST, "Invalid contact email", Some(&msg)),
+        Err(msg) => {
+            return problem(StatusCode::BAD_REQUEST, "Invalid contact email", Some(&msg));
+        }
     };
     match crate::db::set_account_contact_email(pool_of(&state), &account, contact_email.as_ref())
         .await
@@ -141,10 +160,49 @@ fn owner_scoped_delete_response(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct AppPasswordRequest {
     pub(super) account: String,
     pub(super) password: String,
     pub(super) label: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_password_request_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<AppPasswordRequest>(
+                r#"{"account":"alice","password":"secret","label":"desktop","extra":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn profile_and_password_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<ProfileRequest>(
+                r#"{"contact_email":"alice@example.test","extra":true}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<ProfileRequest>(r#"{}"#).is_err());
+        let removal = serde_json::from_str::<ProfileRequest>(r#"{"contact_email":null}"#)
+            .expect("explicit null profile removal");
+        assert!(matches!(
+            removal.contact_email,
+            ContactEmailUpdate::Remove(())
+        ));
+        assert!(
+            serde_json::from_str::<ChangePasswordRequest>(
+                r#"{"current_password":"old","new_password":"new","extra":true}"#
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Exchange an account's password for a fresh app password (shown once;
@@ -239,6 +297,7 @@ pub(super) async fn create_session_app_password(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChangePasswordRequest {
     #[serde(default)]
     pub(super) current_password: Option<String>,

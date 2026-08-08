@@ -12,6 +12,50 @@ fn document() -> serde_json::Value {
     let ok_json = serde_json::json!({
         "200": { "description": "OK", "content": { "application/json": {} } }
     });
+    let identity_response = serde_json::json!({
+        "200": { "description": "authenticated identity", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["account"], "additionalProperties": false,
+                "properties": {
+                    "account": { "type": "string", "minLength": 1 },
+                    "email": { "type": ["string", "null"] },
+                    "role": { "type": ["string", "null"] },
+                    "provider": { "type": ["string", "null"] },
+                    "release_revision": { "type": ["string", "null"] },
+                    "csrf_token": { "type": "string" },
+                    "logout_url": { "type": "string", "pattern": "^/[^/]" }
+                }
+            }
+        } } }
+    });
+    let network_summary = serde_json::json!({
+        "type": "object", "required": ["name", "enabled", "connected", "runtime"],
+        "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "enabled": { "type": "boolean" },
+            "connected": { "type": ["boolean", "null"] },
+            "runtime": { "oneOf": [
+                { "type": "null" },
+                { "type": "object", "required": ["state"], "additionalProperties": true,
+                    "properties": { "state": { "type": "string", "enum": [
+                        "connecting", "connected", "reconnecting", "authentication_failed", "registration_failed"
+                    ] } } }
+            ] }
+        }
+    });
+    let network_list_response = serde_json::json!({
+        "200": { "description": "owner-scoped network summaries", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["networks"], "additionalProperties": false,
+                "properties": { "networks": { "type": "array", "items": network_summary } }
+            }
+        } } }
+    });
+    let buffer_response = serde_json::json!({
+        "200": { "description": "buffered lines", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["lines"], "additionalProperties": false,
+                "properties": { "lines": { "type": "array", "items": { "type": "string" } } }
+            }
+        } } }
+    });
     let channel_name_parameter = serde_json::json!([
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } }
@@ -104,6 +148,92 @@ fn document() -> serde_json::Value {
             }
         } }
     });
+    let tls_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cert_path", "key_path"],
+        "properties": {
+            "cert_path": { "type": "string" },
+            "key_path": { "type": "string" }
+        }
+    });
+    let listener_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["addr"],
+        "properties": {
+            "addr": { "type": "string" },
+            "tls": { "oneOf": [tls_schema, { "type": "null" }] },
+            "websocket": { "type": "boolean" }
+        }
+    });
+    let registration_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "before_connect": { "type": "boolean" },
+            "require_email": { "type": "boolean" }
+        }
+    });
+    let limits_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "max_connections_per_ip": { "type": ["integer", "null"], "minimum": 1 },
+            "command_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "trusted_proxies": { "type": "array", "items": { "type": "string" } },
+            "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "api_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "administrator_api_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "registration_burst": { "type": ["integer", "null"], "minimum": 1 }
+        }
+    });
+    let observability_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "enabled": { "type": "boolean" },
+            "sample_interval_seconds": { "type": "integer", "minimum": 5, "maximum": 300 },
+            "retention_hours": { "type": "integer", "minimum": 1, "maximum": 2160 }
+        }
+    });
+    let storage_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "history_retention_days": { "type": "integer", "minimum": 1, "maximum": 3650 },
+            "audit_retention_days": { "type": "integer", "minimum": 1, "maximum": 3650 }
+        }
+    });
+    let scalar_settings_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "server_name", "network_name", "description", "motd", "nicklen", "sendq",
+            "core_queue", "max_hot_channels", "listeners", "registration", "limits",
+            "observability", "storage", "bnc_addr", "public_url", "secure_cookies",
+            "admin_accounts"
+        ],
+        "properties": {
+            "server_name": { "type": "string" },
+            "network_name": { "type": "string" },
+            "description": { "type": "string" },
+            "motd": { "type": "array", "items": { "type": "string" } },
+            "nicklen": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "sendq": { "type": "integer", "minimum": 1 },
+            "core_queue": { "type": "integer", "minimum": 1 },
+            "max_hot_channels": { "type": "integer", "minimum": 1 },
+            "listeners": { "type": "array", "items": listener_schema },
+            "registration": registration_schema,
+            "limits": limits_schema,
+            "observability": observability_schema,
+            "storage": storage_schema,
+            "bnc_addr": { "type": ["string", "null"] },
+            "public_url": { "type": ["string", "null"] },
+            "secure_cookies": { "type": "boolean" },
+            "admin_accounts": { "type": "array", "items": { "type": "string" } }
+        }
+    });
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -158,7 +288,7 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Exchange an account password for a new app password",
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object",
+                        "schema": { "type": "object", "additionalProperties": false,
                             "required": ["account", "password", "label"],
                             "properties": {
                                 "account": { "type": "string", "minLength": 1, "maxLength": 64 },
@@ -172,7 +302,7 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/me": {
                 "get": { "summary": "The authenticated account", "security": authenticated,
-                    "responses": ok_json }
+                    "responses": identity_response }
             },
             "/api/v1/me/profile": {
                 "get": {
@@ -187,6 +317,7 @@ fn document() -> serde_json::Value {
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["contact_email"],
                             "properties": {
                                 "contact_email": {
@@ -410,6 +541,13 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/device/token": {
                 "post": { "summary": "Poll for the device grant's token",
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["device_code"],
+                            "properties": { "device_code": { "type": "string", "minLength": 1 } }
+                        }
+                    } } },
                     "responses": { "200": { "description": "access_token once approved" },
                         "400": { "description": "authorization_pending / expired_token / invalid_grant" } } }
             },
@@ -417,6 +555,13 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Approve a device grant from a browser session",
                     "description": "Requires the cookie-authenticated session and its X-E6IRC-CSRF header. Personal access tokens cannot mint a replacement bearer through device approval.",
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["user_code"],
+                            "properties": { "user_code": { "type": "string", "minLength": 1 } }
+                        }
+                    } } },
                     "responses": { "204": { "description": "approved" },
                         "401": { "description": "browser session required" },
                         "403": { "description": "invalid or missing CSRF token" },
@@ -433,6 +578,7 @@ fn document() -> serde_json::Value {
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["label"],
                             "properties": {
                                 "label": { "type": "string", "minLength": 1, "maxLength": 64 },
@@ -669,12 +815,12 @@ fn document() -> serde_json::Value {
             "/api/v1/me/networks": {
                 "get": { "summary": "List the account's BNC networks with live upstream status",
                     "description": "Each network includes stored configuration, `connected` (true/false, or null with no running handle), and an owner-safe `runtime` object when its driver is active: lifecycle/timestamps, a credential-safe last-error code and summary, connect latency, attempts/errors, attached clients, traffic, and in-memory buffer usage.",
-                    "security": authenticated, "responses": ok_json },
+                    "security": authenticated, "responses": network_list_response },
                 "post": { "summary": "Create a BNC network and start its driver",
                     "description": "kind defaults to `irc`. IRC requires addr/nick and optional paired SASL credentials. Matrix requires an HTTP(S) homeserver in addr, a provider user in nick, tls=true, and sasl_password. Discord requires tls=true, empty nick, a bot token in sasl_password, and an optional HTTP(S) API base in addr. Slack requires tls=true, empty nick, a bot token in sasl_account, an app token in sasl_password, and an optional HTTP(S) API base in addr. realname is IRC-only.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object",
+                        "schema": { "type": "object", "additionalProperties": false,
                             "required": ["name", "addr", "nick"],
                             "properties": {
                                 "kind": { "type": "string", "enum": ["irc", "matrix", "discord", "slack"], "default": "irc" },
@@ -772,7 +918,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "parameters": network_name_parameter,
                     "requestBody": { "required": true, "content": { "application/json": {
-                        "schema": { "type": "object", "required": ["enabled"],
+                        "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"],
                             "properties": { "enabled": { "type": "boolean" } } } } } },
                     "responses": { "200": { "description": "new enabled state" },
                         "404": { "description": "no such network" },
@@ -791,7 +937,7 @@ fn document() -> serde_json::Value {
                             "schema": { "type": "string" } },
                         { "name": "limit", "in": "query", "required": false,
                             "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }],
-                    "responses": { "200": { "description": "buffered lines" },
+                    "responses": { "200": buffer_response["200"],
                         "400": { "description": "limit outside 1–1000" },
                         "404": { "description": "no such network" } } }
             },
@@ -1014,7 +1160,7 @@ fn document() -> serde_json::Value {
                     "description": "Uses the core-owned oper policy path, so persistence, immediate enforcement, matching-session disconnects, and audit provenance commit together.",
                     "security": authenticated,
                     "requestBody": { "required": true, "content": { "application/json": { "schema": {
-                        "type": "object", "required": ["kind", "mask"],
+                        "type": "object", "additionalProperties": false, "required": ["kind", "mask"],
                         "properties": { "kind": { "type": "string", "enum": ["kline", "dline", "xline"] }, "mask": { "type": "string" }, "reason": { "type": "string" } }
                     } } } },
                     "responses": { "201": { "description": "server ban created" }, "400": { "description": "invalid kind or mask" }, "403": { "description": "not an admin account" }, "409": { "description": "conflicting policy mutation" }, "503": { "description": "server-ban control unavailable" } } }
@@ -1047,40 +1193,40 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "responses": { "200": { "description": "redacted settings, revision, and runtime/bootstrap status" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
                 "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": { "type": "object", "description": "Scalar managed settings; credential collections are not accepted here." } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": scalar_settings_schema } } } } },
                     "responses": { "200": { "description": "configuration revision advanced and restart_required indicator" }, "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
             },
             "/api/v1/admin/configuration/opers": {
                 "post": { "summary": "Add an IRC operator to managed configuration", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "password"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "password": { "type": "string", "writeOnly": true } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "password"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "password": { "type": "string", "writeOnly": true } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/opers/{name}": {
                 "delete": { "summary": "Remove an IRC operator from managed configuration", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid operator" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/oidc-providers": {
                 "post": { "summary": "Add an OIDC provider to managed configuration", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "issuer_url", "client_id", "client_secret", "token_endpoint_auth_method"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string", "writeOnly": true }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": "string" }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "issuer_url", "client_id", "client_secret", "token_endpoint_auth_method"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "issuer_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": { "type": "string", "writeOnly": true }, "scopes": { "type": "array", "items": { "type": "string" } }, "allowed_email_domains": { "type": "array", "items": { "type": "string" } }, "end_session_endpoint": { "type": "string" }, "token_endpoint_auth_method": { "type": "string", "enum": ["client_secret_basic", "client_secret_post"] } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/oidc-providers/{name}": {
                 "delete": { "summary": "Remove an OIDC provider from managed configuration", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision"], "properties": { "revision": { "type": "integer" } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid provider" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/networks": {
                 "post": { "summary": "Add a managed server network", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision", "name", "kind", "tls", "buffer_cap"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": "string" }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "name", "kind", "tls", "buffer_cap"], "properties": { "revision": { "type": "integer" }, "name": { "type": "string" }, "owner": { "type": "string" }, "kind": { "type": "string", "enum": ["irc", "local", "matrix", "discord", "slack"] }, "addr": { "type": "string" }, "tls": { "type": "boolean" }, "nick": { "type": "string" }, "realname": { "type": "string" }, "autojoin": { "type": "array", "items": { "type": "string" } }, "buffer_cap": { "type": "integer", "minimum": 1 }, "sasl_account": { "type": "string", "writeOnly": true }, "sasl_password": { "type": "string", "writeOnly": true } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision or master key unavailable" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/configuration/networks/{name}": {
                 "delete": { "summary": "Remove a managed server network", "security": authenticated,
                     "parameters": [{ "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["revision"], "properties": { "revision": { "type": "integer" }, "owner": { "type": "string" } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "owner"], "properties": { "revision": { "type": "integer" }, "owner": { "type": ["string", "null"] } } } } } },
                     "responses": { "200": { "description": "configuration revision advanced" }, "400": { "description": "invalid network" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration unavailable" } } }
             },
             "/api/v1/admin/networks": {
@@ -1095,7 +1241,7 @@ fn document() -> serde_json::Value {
                     "description": "Persists the enabled state and starts or stops the same always-on driver as the owner API. The administrator is retained as the audit actor.",
                     "security": authenticated,
                     "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["enabled"], "properties": { "enabled": { "type": "boolean" } } } } } },
                     "responses": { "200": { "description": "network lifecycle updated" }, "403": { "description": "not an admin account" }, "404": { "description": "network or bouncer missing" }, "503": { "description": "database unavailable" } } }
             },
             "/api/v1/admin/observability": {

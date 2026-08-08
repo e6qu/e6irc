@@ -54,6 +54,7 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DeviceTokenReq {
     pub(super) device_code: String,
 }
@@ -99,6 +100,7 @@ pub(super) async fn device_token(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DeviceApproveReq {
     pub(super) user_code: String,
 }
@@ -296,10 +298,10 @@ pub(super) async fn admin_accounts(
 }
 
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct AccountStateBody {
-    suspended: Option<bool>,
-    administrator: Option<bool>,
+#[serde(untagged, deny_unknown_fields)]
+pub(super) enum AccountStateBody {
+    Suspension { suspended: bool },
+    Administrator { administrator: bool },
 }
 
 pub(super) async fn admin_account_state(
@@ -309,23 +311,16 @@ pub(super) async fn admin_account_state(
     body: Result<axum::Json<AccountStateBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let body = json_or_response!(body);
-    let mutation = match (body.suspended, body.administrator) {
-        (Some(suspended), None) => {
+    let mutation = match body {
+        AccountStateBody::Suspension { suspended } => {
             super::mutate_account_suspension(&state, &actor, account_id, suspended)
                 .await
                 .map(|message| ("suspended", suspended, message))
         }
-        (None, Some(administrator)) => {
+        AccountStateBody::Administrator { administrator } => {
             super::mutate_account_administrator(&state, &actor, account_id, administrator)
                 .await
                 .map(|message| ("administrator", administrator, message))
-        }
-        _ => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "Invalid account state change",
-                Some("Set exactly one of suspended or administrator."),
-            );
         }
     };
     match mutation {
@@ -761,7 +756,23 @@ pub(super) struct AdminNetworkBody {
 #[serde(deny_unknown_fields)]
 pub(super) struct AdminNetworkDeleteBody {
     revision: i64,
-    owner: Option<String>,
+    owner: ManagedNetworkOwner,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ManagedNetworkOwner {
+    Owner(String),
+    Shared(()),
+}
+
+impl ManagedNetworkOwner {
+    fn into_option(self) -> Option<String> {
+        match self {
+            Self::Owner(owner) => Some(owner),
+            Self::Shared(()) => None,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -999,7 +1010,7 @@ pub(super) async fn admin_delete_network(
         Ok(body) => body,
         Err(response) => return response,
     };
-    let owner = optional_config_string(body.owner);
+    let owner = optional_config_string(body.owner.into_option());
     mutate_managed_configuration(&state, &actor, body.revision, move |settings| {
         reject_bootstrap_credential_change(settings, "network")?;
         let before = settings.networks.len();
@@ -1660,6 +1671,49 @@ mod admin_query_tests {
     use super::*;
 
     #[test]
+    fn account_state_request_has_exactly_one_change() {
+        assert!(matches!(
+            serde_json::from_str::<AccountStateBody>(r#"{"suspended":true}"#),
+            Ok(AccountStateBody::Suspension { suspended: true })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AccountStateBody>(r#"{"administrator":false}"#),
+            Ok(AccountStateBody::Administrator {
+                administrator: false
+            })
+        ));
+        for body in [
+            r#"{}"#,
+            r#"{"suspended":true,"administrator":false}"#,
+            r#"{"suspended":true,"extra":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AccountStateBody>(body).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_network_delete_names_an_owner_or_shared_scope() {
+        assert!(matches!(
+            serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1,"owner":"alice"}"#),
+            Ok(AdminNetworkDeleteBody {
+                owner: ManagedNetworkOwner::Owner(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1,"owner":null}"#),
+            Ok(AdminNetworkDeleteBody {
+                owner: ManagedNetworkOwner::Shared(()),
+                ..
+            })
+        ));
+        assert!(serde_json::from_str::<AdminNetworkDeleteBody>(r#"{"revision":1}"#).is_err());
+    }
+
+    #[test]
     fn account_directory_query_validation_preserves_exact_bounded_values() {
         let query = validate_account_directory_query(
             AccountDirectoryQuery {
@@ -1896,6 +1950,7 @@ pub(super) async fn me(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TokenRequest {
     pub(super) label: String,
     #[serde(default = "default_token_scopes")]
@@ -1914,6 +1969,30 @@ fn default_token_scopes() -> Vec<crate::identity::ApiTokenScope> {
 
 const fn default_token_lifetime_days() -> u16 {
     crate::identity::ApiTokenLifetimeDays::DEFAULT.value()
+}
+
+#[cfg(test)]
+mod token_request_tests {
+    use super::*;
+
+    #[test]
+    fn token_request_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<TokenRequest>(r#"{"label":"desktop","extra":true}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn device_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<DeviceTokenReq>(r#"{"device_code":"code","extra":true}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<DeviceApproveReq>(r#"{"user_code":"ABCD-EFGH","extra":true}"#)
+                .is_err()
+        );
+    }
 }
 
 /// Mint a PAT for the authenticated account (shown once).

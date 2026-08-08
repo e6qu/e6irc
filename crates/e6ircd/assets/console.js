@@ -6,7 +6,9 @@
   const consoleThemeResult = document.querySelector("[data-console-theme-result]");
   const confirmationDialog = document.querySelector("[data-console-confirm]");
   const confirmationMessage = document.querySelector("[data-console-confirm-message]");
+  const panelRefreshers = new WeakMap();
   let pendingConfirmation = null;
+  let confirmationTrigger = null;
   const showConsoleThemeResult = (message) => {
     if (consoleThemeResult) consoleThemeResult.textContent = message;
   };
@@ -27,6 +29,24 @@
     theme,
     notifications: typeof settings.notifications === "boolean" ? settings.notifications : false,
   });
+  const preserveFormEdits = (form) => {
+    const mark = (event) => {
+      const field = event.target;
+      if (field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement) {
+        field.dataset.apiEdited = "true";
+      }
+    };
+    form.addEventListener("input", mark);
+    form.addEventListener("change", mark);
+  };
+  const hydrateTextInput = (form, name, value) => {
+    const field = form.elements.namedItem(name);
+    if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.value = value;
+  };
+  const hydrateCheckbox = (form, name, checked) => {
+    const field = form.elements.namedItem(name);
+    if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.checked = checked;
+  };
   if (consoleTheme instanceof HTMLSelectElement) {
     let theme = "auto";
     try {
@@ -70,6 +90,11 @@
       && confirmationMessage instanceof HTMLElement
     ) {
       pendingConfirmation = form;
+      confirmationTrigger = event.submitter instanceof HTMLElement
+        ? event.submitter
+        : document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
       confirmationMessage.textContent = message;
       confirmationDialog.showModal();
       return;
@@ -83,8 +108,13 @@
   if (confirmationDialog instanceof HTMLDialogElement) {
     confirmationDialog.addEventListener("close", () => {
       const form = pendingConfirmation;
+      const trigger = confirmationTrigger;
       pendingConfirmation = null;
-      if (!form || confirmationDialog.returnValue !== "confirm") return;
+      confirmationTrigger = null;
+      if (!form || confirmationDialog.returnValue !== "confirm") {
+        trigger?.focus();
+        return;
+      }
       form.dataset.confirmed = "true";
       form.requestSubmit();
     });
@@ -166,38 +196,43 @@
     button.addEventListener("click", () => {
       const panel = document.querySelector(button.dataset.refreshTarget);
       if (!panel) return;
-      if (panel.matches("[data-api-admin-monitoring]")) {
-        void refreshMonitoring(panel);
-      } else if (panel.matches("[data-api-network-operations]")) {
-        void refreshNetworkOperations(panel);
-      }
+      const refresh = panelRefreshers.get(panel);
+      if (refresh) void refresh(true);
     });
   }
 
   const configurationResult = document.getElementById("configuration-api-result");
 
-  const apiProblem = async (response) => {
-    try {
-      const problem = await response.json();
-      if (typeof problem.detail === "string") return problem.detail;
-      if (typeof problem.title === "string") return problem.title;
-    } catch (_) {
-      // An intermediary may replace a problem response with a non-JSON body.
-    }
-    return `Request failed with HTTP ${response.status}.`;
-  };
-
   const MAX_API_JSON_BYTES = 1024 * 1024;
-  const apiJson = async (response) => {
+  const apiText = async (response) => {
     const length = Number(response.headers.get("content-length"));
     if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
       throw new Error("The API response is too large. Reload and try again.");
     }
     const text = await response.text();
-    if (text.length > MAX_API_JSON_BYTES) {
+    if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
       throw new Error("The API response is too large. Reload and try again.");
     }
-    return text ? JSON.parse(text) : undefined;
+    return text;
+  };
+  const apiJson = async (response) => {
+    const text = await apiText(response);
+    if (!text) return undefined;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      throw new Error("The API response is invalid. Reload and try again.");
+    }
+  };
+  const apiProblem = async (response) => {
+    try {
+      const problem = await apiJson(response);
+      if (problem && typeof problem === "object") {
+        if (typeof problem.detail === "string") return problem.detail;
+        if (typeof problem.title === "string") return problem.title;
+      }
+    } catch (_) {}
+    return `Request failed with HTTP ${response.status}.`;
   };
 
   const apiRequest = async (form, url, method, body) => {
@@ -256,9 +291,31 @@
     return value[field];
   };
 
+  const serializeRefresh = (refresh, reportQueued) => {
+    let running = false;
+    let queued = false;
+    return async (announceQueue = false) => {
+      if (running) {
+        queued = true;
+        if (announceQueue) reportQueued();
+        return;
+      }
+      running = true;
+      try {
+        do {
+          queued = false;
+          await refresh();
+        } while (queued);
+      } finally {
+        running = false;
+      }
+    };
+  };
+
   const element = (name, className, text) => {
     const node = document.createElement(name);
     if (className) node.className = className;
+    if (name === "th" && text === undefined) text = "Actions";
     if (text !== undefined) node.textContent = String(text);
     return node;
   };
@@ -266,6 +323,13 @@
   const append = (parent, ...children) => {
     for (const child of children) parent.append(child);
     return parent;
+  };
+  const scrollRegion = (label, child) => {
+    const region = element("div", "scroll");
+    region.tabIndex = 0;
+    region.setAttribute("aria-label", label);
+    region.append(child);
+    return region;
   };
 
   const retryButton = (retry) => {
@@ -421,7 +485,7 @@
     panel.replaceChildren(fragment);
   };
 
-  const refreshMonitoring = async (panel) => {
+  const refreshMonitoringNow = async (panel) => {
     const status = document.getElementById(panel.dataset.refreshStatus);
     panel.setAttribute("aria-busy", "true");
     if (status) {
@@ -446,10 +510,18 @@
   };
 
   for (const panel of document.querySelectorAll("[data-api-admin-monitoring]")) {
-    void refreshMonitoring(panel);
+    const refresh = serializeRefresh(
+      () => refreshMonitoringNow(panel),
+      () => {
+        const status = document.getElementById(panel.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(panel, refresh);
+    void refresh();
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => void refreshMonitoring(panel), seconds * 1000);
+      window.setInterval(() => void refresh(), seconds * 1000);
     }
   }
 
@@ -514,7 +586,7 @@
     panel.replaceChildren(fragment);
   };
 
-  const refreshNetworkOperations = async (panel) => {
+  const refreshNetworkOperationsNow = async (panel) => {
     const status = document.getElementById(panel.dataset.refreshStatus);
     panel.setAttribute("aria-busy", "true");
     if (status) {
@@ -539,10 +611,18 @@
   };
 
   for (const panel of document.querySelectorAll("[data-api-network-operations]")) {
-    void refreshNetworkOperations(panel);
+    const refresh = serializeRefresh(
+      () => refreshNetworkOperationsNow(panel),
+      () => {
+        const status = document.getElementById(panel.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(panel, refresh);
+    void refresh();
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => void refreshNetworkOperations(panel), seconds * 1000);
+      window.setInterval(() => void refresh(), seconds * 1000);
     }
   }
 
@@ -558,7 +638,7 @@
     thead.append(header); table.append(thead);
     const body = document.createElement("tbody");
     for (const row of rows) { const tr = document.createElement("tr"); for (const value of row) tr.append(element("td", "", value)); body.append(tr); }
-    table.append(body); target.append(append(element("div", "scroll"), table));
+    table.append(body); target.append(scrollRegion(`${title} table`, table));
   };
 
   const formatBytes = (value) => {
@@ -1312,8 +1392,8 @@
         expires.dateTime = row.expires_at || "";
         body.append(append(element("tr"), element("td", "session-agent", row.user_agent || "Unknown browser"), element("td", "", sessionMethod(row)), element("td", "", created), element("td", "", expires), action));
       }
-      const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "Browser"), element("th", "", "Sign-in method"), element("th", "", "Created"), element("th", "", "Expires"), element("th", "", ""))), body);
-      browserSessions.append(append(element("div", "scroll"), table));
+      const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "Browser"), element("th", "", "Sign-in method"), element("th", "", "Created"), element("th", "", "Expires"), element("th", "", "Actions"))), body);
+      browserSessions.append(scrollRegion("Browser sessions", table));
     };
     const renderConnections = (data, query) => {
       if (!(connections instanceof HTMLElement)) return;
@@ -1350,8 +1430,8 @@
           });
           body.append(append(element("tr"), element("td", "meta", row.id), client, append(element("td"), element("span", "tag", row.transport)), element("td", "", account), append(element("td"), connected, element("div", "meta", `${row.idle_seconds} seconds idle`)), element("td", "", Array.isArray(row.channels) && row.channels.length ? element("code", "", row.channels.join(", ")) : element("span", "meta", "—")), append(element("td"), disconnect)));
         }
-        const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Transport"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", ""))), body);
-        connections.append(append(element("div", "scroll"), table));
+        const table = append(document.createElement("table"), append(document.createElement("thead"), append(document.createElement("tr"), element("th", "", "ID"), element("th", "", "Client"), element("th", "", "Transport"), element("th", "", "Account"), element("th", "", "Connected / idle"), element("th", "", "Channels"), element("th", "", "Actions"))), body);
+        connections.append(scrollRegion("Live connections", table));
       }
       const pager = element("div", "pager");
       pager.append(element("span", "meta", query.has("before_id") ? "Showing an older page." : "Showing the newest matching connections."));
@@ -1583,10 +1663,14 @@
 
   const accountContactEmail = document.querySelector("[data-api-account-contact-email]");
   if (accountContactEmail instanceof HTMLInputElement) {
+    const form = accountContactEmail.form;
+    if (form instanceof HTMLFormElement) preserveFormEdits(form);
     const refreshContactEmail = async () => {
       try {
         const profile = await apiRead("/api/v1/me/profile");
-        accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+        if (accountContactEmail.dataset.apiEdited !== "true") {
+          accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+        }
       } catch (error) {
         accountLoadFailure(error, () => void refreshContactEmail());
       }
@@ -1841,14 +1925,14 @@
     const pager = (text, cursor, parameter) => { const wrapper = element("div", "pager"); wrapper.append(element("span", "meta", cursor ? "Showing an older page." : "Showing the newest page.")); if (cursor) { const link = element("a", "", text); const params = query(); params.set(parameter, String(cursor)); link.href = `/console/accounts?${params}`; wrapper.append(link); } return wrapper; };
     const renderInvitations = (data) => {
       if (!(invitationHost instanceof HTMLElement)) return; invitationHost.replaceChildren(); const rows = apiCollection(data, "invitations", "invitation directory");
-      if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Pending account invitations")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(append(element("div", "scroll"), table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
+      if (!rows.length) invitationHost.append(element("p", "empty", "No pending invitations.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Pending account invitations")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "Account"), element("th", "", "Contact"), element("th", "", "Authority"), element("th", "", "Issued by"), element("th", "", "Expires (UTC)"), element("th", "", "Actions"))); const body = document.createElement("tbody"); for (const invitation of rows) { const revoke = document.createElement("form"); revoke.className = "cell-form"; revoke.dataset.apiAdminInvitationDelete = ""; revoke.dataset.confirm = `Revoke the invitation for ${invitation.account}?`; revoke.action = `/api/v1/admin/invitations/${encodeURIComponent(invitation.id)}`; revoke.append(capability(), button("Revoke", "danger")); const expires = element("time", "", invitation.expires_at); expires.dateTime = invitation.expires_at; body.append(append(element("tr"), append(element("td"), append(element("strong"), element("code", "", invitation.account))), element("td", "", invitation.contact_email || "Not supplied"), element("td", "", invitation.administrator ? "administrator" : "member"), append(element("td"), element("code", "", invitation.created_by)), append(element("td"), expires), append(element("td"), revoke))); } table.append(head, body); invitationHost.append(scrollRegion("Pending account invitations", table)); } invitationHost.append(pager("Older invitations", data.next_before_id, "invitation_before_id"));
     };
     const renderAccounts = (data) => {
       if (!(accountHost instanceof HTMLElement)) return; accountHost.replaceChildren(); const rows = apiCollection(data, "accounts", "account directory");
       const section = append(element("div", "panel-head"), append(element("div"), element("h2", "", "Accounts"), element("p", "", "Only active browser sessions and unexpired personal access tokens are counted.")), element("span", "count", rows.length)); accountHost.append(section);
       if (!rows.length) accountHost.append(element("p", "empty", "No account matches this exact name.")); else { const table = document.createElement("table"); table.append(element("caption", "sr-only", "Account directory")); const head = document.createElement("thead"); head.append(append(element("tr"), element("th", "", "ID"), element("th", "", "Account"), element("th", "", "Created (UTC)"), element("th", "", "Login methods"), element("th", "", "Status"), element("th", "", "Active access"), element("th", "", "Resources"), element("th"))); const body = document.createElement("tbody"); for (const account of rows) { const auth = account.authentication || {}; const resources = account.resources || {}; const sources = account.administrator_sources || {}; const actions = element("td"); if (account.current) actions.append(element("span", "meta", "Current account")); else { for (const [key, value, label, confirmation] of [["suspension", !account.suspended, account.suspended ? "Reactivate" : "Suspend", account.suspended ? `Reactivate ${account.name} and restart its enabled networks?` : `Suspend ${account.name}, revoke its sessions and tokens, disconnect its clients, and stop its networks?`], ["administrator", !sources.durable, sources.durable ? "Revoke durable admin" : "Grant durable admin", sources.durable ? `Remove durable administrator authority from ${account.name}?` : `Grant durable administrator authority to ${account.name}?`]]) { const form = document.createElement("form"); form.className = "cell-form"; form.dataset.apiAdminAccountState = key; form.dataset.confirm = confirmation; form.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const state = document.createElement("input"); state.type = "hidden"; state.name = key === "suspension" ? "suspended" : "administrator"; state.value = String(value); form.append(capability(), state, button(label, value ? "" : "danger")); actions.append(form); } const deletion = document.createElement("form"); deletion.className = "cell-form account-delete-form"; deletion.dataset.apiAdminAccountDelete = ""; deletion.dataset.confirm = `Permanently delete ${account.name}, revoke every credential and session, erase its private history, stop its networks, and retire the account name? This cannot be undone.`; deletion.action = `/api/v1/admin/accounts/${encodeURIComponent(account.id)}`; const confirmation = document.createElement("input"); confirmation.name = "confirmation"; confirmation.autocomplete = "off"; confirmation.required = true; const deletionLabel = append(element("label", "field"), element("span", "", `Type ${account.name} to delete`), confirmation); deletion.append(capability(), deletionLabel, button("Delete permanently", "danger")); actions.append(deletion); } const created = element("time", "", account.created_at); created.dateTime = account.created_at; const loginMethods = `${auth.local_password ? "local password · " : ""}${auth.oidc_identities} OIDC · ${auth.app_passwords} app passwords`; const status = `${account.suspended ? "suspended" : "active"}${account.administrator ? " · administrator" : ""}${sources.durable ? " · durable grant" : ""}${sources.configuration ? " · configuration grant" : ""}`; body.append(append(element("tr"), element("td", "meta", account.id), append(element("td"), append(element("strong"), element("code", "", account.name))), append(element("td", "meta"), created), element("td", "", loginMethods), element("td", "", status), element("td", "", `${auth.browser_sessions} browsers · ${auth.api_tokens} API tokens`), element("td", "", `${resources.networks} networks · ${resources.founded_channels} channels`), actions)); } table.append(head, body); accountHost.append(append(element("div", "scroll"), table)); } accountHost.append(pager("Older accounts", data.next_before_id, "before_id")); accountHost.append(element("p", "section-note", "An account that founded registered channels cannot be deleted. Transfer or drop those channels first. Deleted account names remain permanently retired so old credentials and identity links can never resolve to a different person."));
     };
-    const refresh = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); };
+    const refresh = async () => { const params = query(); const invitations = new URLSearchParams(); invitations.set("limit", params.get("limit") || "50"); if (params.get("invitation_before_id")) invitations.set("before_id", params.get("invitation_before_id")); const [accounts, invitationData] = await Promise.all([apiRead(`/api/v1/admin/accounts?${params}`), apiRead(`/api/v1/admin/invitations?${invitations}`)]); renderAccounts(accounts); renderInvitations(invitationData); for (const region of adminAccountsPage.querySelectorAll(".scroll")) { region.tabIndex = 0; region.setAttribute("aria-label", "Account directory table"); } };
     if (filters instanceof HTMLFormElement) for (const input of filters.elements) if ((input instanceof HTMLInputElement || input instanceof HTMLSelectElement) && input.name) input.value = new URLSearchParams(window.location.search).get(input.name) || (input.name === "limit" ? "50" : "");
     void refresh().catch((error) => setAdminAccountResult(error instanceof Error ? error.message : "Account directory failed to load.", false));
   }
@@ -2038,7 +2122,8 @@
     if (ownerNetworkCount) ownerNetworkCount.textContent = "—";
     tableLoadFailure(previous, 7, error, retry);
   };
-  const refreshOwnerNetworks = async () => {
+  let refreshOwnerNetworks;
+  const refreshOwnerNetworksNow = async () => {
     if (!(ownerNetworkRows instanceof HTMLElement)) return;
     ownerNetworkRows.setAttribute("aria-busy", "true");
     if (ownerNetworkRefreshStatus) {
@@ -2050,7 +2135,7 @@
       renderOwnerNetworks(apiCollection(result, "networks", "network directory"));
       if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
     } catch (error) {
-      renderOwnerNetworkFailure(error, () => void refreshOwnerNetworks());
+      renderOwnerNetworkFailure(error, () => { if (refreshOwnerNetworks) void refreshOwnerNetworks(true); });
       if (ownerNetworkRefreshStatus) {
         ownerNetworkRefreshStatus.textContent = "Live refresh failed. Retry is available in the network list.";
         ownerNetworkRefreshStatus.classList.add("refresh-error");
@@ -2060,6 +2145,12 @@
     }
   };
   if (ownerNetworkRows instanceof HTMLElement) {
+    refreshOwnerNetworks = serializeRefresh(
+      refreshOwnerNetworksNow,
+      () => {
+        if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Refresh queued.";
+      },
+    );
     void refreshOwnerNetworks();
     const seconds = Number(ownerNetworkRows.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
@@ -2194,7 +2285,7 @@
         if (count) count.textContent = String(entries.length);
         target.replaceChildren();
         if (!entries.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = `No ${kind} bridges configured.`; target.append(empty); continue; }
-        const table = document.createElement("table"); table.innerHTML = "<thead><tr><th>Status</th><th>Network</th><th>Owner</th><th></th></tr></thead>";
+        const table = document.createElement("table"); table.innerHTML = "<thead><tr><th>Status</th><th>Network</th><th>Owner</th><th>Actions</th></tr></thead>";
         const body = document.createElement("tbody");
         for (const network of entries) {
           if (typeof network.name !== "string" || typeof network.owner !== "string") continue;
@@ -2235,13 +2326,13 @@
       ownerNetworkResult.replaceChildren(element("span", "", error instanceof Error ? error.message : "Network configuration failed to load."), retryButton(retry));
       ownerNetworkResult.className = "banner-error";
     };
+    if (form instanceof HTMLFormElement) preserveFormEdits(form);
     const render = (network) => {
       network = parseOwnerNetwork(network);
       if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
       if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
-      const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
-      set("addr", network.addr); set("nick", network.nick); set("realname", typeof network.realname === "string" ? network.realname : ""); set("autojoin", network.autojoin.join(", ")); set("sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
-      const tls = form.elements.namedItem("tls"); if (tls instanceof HTMLInputElement) tls.checked = network.tls;
+      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", typeof network.realname === "string" ? network.realname : ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
+      hydrateCheckbox(form, "tls", network.tls);
       form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
       form.hidden = false;
@@ -2260,12 +2351,13 @@
   if (ownerBridgeEditor instanceof HTMLElement) {
     const name = ownerBridgeEditor.dataset.networkName || "";
     const form = ownerBridgeEditor.querySelector("[data-api-owner-bridge-update]");
-    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
+    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else {
+      preserveFormEdits(form);
+      void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
       .then((network) => {
         network = parseOwnerNetwork(network);
         if (!["matrix", "discord", "slack"].includes(network.kind)) { window.location.replace("/console/integrations"); return; }
-        const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
-        set("addr", network.addr); set("nick", network.nick); set("autojoin", network.autojoin.join(", "));
+        hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "autojoin", network.autojoin.join(", "));
         const nick = ownerBridgeEditor.querySelector("[data-bridge-nick]"); if (nick instanceof HTMLElement) nick.hidden = !network.nick;
         const account = ownerBridgeEditor.querySelector("[data-bridge-account]"); if (account instanceof HTMLElement) account.hidden = network.kind !== "slack";
         const accountStatus = ownerBridgeEditor.querySelector("[data-bridge-account-status]"); if (accountStatus) accountStatus.textContent = network.has_sasl_account === true ? "A token is stored. Leave blank to keep it." : "No token is stored; enter one before saving.";
@@ -2275,6 +2367,7 @@
         form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; form.hidden = false;
       })
       .catch((error) => setOwnerNetworkResult(error instanceof Error ? error.message : "Bridge configuration failed to load.", false));
+    }
   }
 
   // The network-list fragment is replaced during live refreshes, so lifecycle

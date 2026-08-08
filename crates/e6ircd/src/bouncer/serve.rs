@@ -318,6 +318,7 @@ fn spawn_persistence(
                 eprintln!("bnc: buffer restore failed for {owner_key}/{network}: {e}");
             }
         }
+        handle.history_restored();
         // This task is the only writer for this network, so counting its own
         // appends is what makes the amortized trim reach every network — see
         // `db::BNC_TRIM_INTERVAL`.

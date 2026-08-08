@@ -30,11 +30,7 @@ const WHITELIST: &[&str] = &[
     // ACCEPT/MONITOR. Advertising limits we do not enforce would be a false
     // claim, so the token legitimately differs.
     "TARGMAX",
-    // Libera: eIbq,k,flj,CFLMPQRSTcgimnprstuz. We implement eIbq,k,l,
-    // imnst so far; the missing type-C (f forward, j join-throttle) and
-    // type-D flags are rejected loudly with 472 until implemented, so
-    // the divergence is visible, never silent. Full parity is this
-    // phase's exit criterion, tracked in PLAN.md.
+    // Libera advertises additional modes. Unsupported modes return 472.
     "CHANMODES",
 ];
 

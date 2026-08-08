@@ -51,10 +51,10 @@
       </div>
       <span class="count" id="admin-channel-count">…</span>
     </div>
-    <div class="scroll">
+    <div class="scroll" tabindex="0" aria-label="Registered channel directory">
       <table>
         <caption class="sr-only">Registered channel directory</caption>
-        <thead><tr><th>ID</th><th>Channel</th><th>Founder</th><th>Registered (UTC)</th><th>Retained policy</th><th>Access</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>Channel</th><th>Founder</th><th>Registered (UTC)</th><th>Retained policy</th><th>Access</th><th>Actions</th></tr></thead>
         <tbody id="admin-channel-rows" data-api-admin-channel-list data-csrf="{{ shell.csrf }}">
           <tr><td colspan="7" class="empty">Loading registered channels…</td></tr>
         </tbody>

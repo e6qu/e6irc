@@ -88,6 +88,30 @@ h1 {
   margin-top: 2rem;
 }
 
+.device-code {
+  display: grid;
+  width: min(20rem, 100%);
+  gap: 0.45rem;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.device-code input {
+  min-height: 3.25rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  padding: 0.7rem 0.85rem;
+}
+
+.device-code input:focus-visible {
+  border-color: var(--focus);
+  outline: 0.2rem solid color-mix(in srgb, var(--focus) 30%, transparent);
+  outline-offset: 0.1rem;
+}
+
 .login-form {
   display: grid;
   gap: 1rem;

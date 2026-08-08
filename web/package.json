@@ -11,9 +11,11 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test test/*.test.js",
-    "test:oidc-browser": "node ../tools/test-oidc-browser.mjs"
+    "test:oidc-browser": "node ../tools/test-oidc-browser.mjs",
+    "test:visual": "playwright test --config playwright.visual.config.js"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
     "playwright": "1.61.1",
     "vite": "8.1.5"
   }

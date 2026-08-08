@@ -2,13 +2,17 @@
   color-scheme: light dark;
   --border: #d9dde3;
   --muted: #5b6470;
-  --accent: #2f6feb;
+  --accent: #2563eb;
+  --accent-strong: #1d4ed8;
   --bg: #f6f7f9;
   --fg: #16181d;
   --panel: #fff;
+  --panel-subtle: #f9fafb;
   --ok: #1a8f4c;
   --off: #b23b3b;
   --warn: #b05c00;
+  --info: #245ea8;
+  --focus: color-mix(in srgb, var(--accent) 58%, transparent);
   --shadow: 0 10px 28px rgb(15 23 42 / 0.1);
 }
 /* Dark palette: applied by the OS preference under "auto", or forced by the
@@ -16,11 +20,14 @@
    specific than the bare :root, so a manual choice always wins over the OS. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    --accent: #60a5fa;
+    --accent-strong: #93c5fd;
     --border: #262b33;
     --muted: #9aa3b1;
     --bg: #0f1115;
     --fg: #e6e8ec;
     --panel: #14171d;
+    --panel-subtle: #11151b;
     --ok: #3fbf72;
     --off: #e06666;
     --warn: #f0a54a;
@@ -28,11 +35,14 @@
   }
 }
 :root[data-theme="dark"] {
+  --accent: #60a5fa;
+  --accent-strong: #93c5fd;
   --border: #262b33;
   --muted: #9aa3b1;
   --bg: #0f1115;
   --fg: #e6e8ec;
   --panel: #14171d;
+  --panel-subtle: #11151b;
   --ok: #3fbf72;
   --off: #e06666;
   --warn: #f0a54a;
@@ -75,7 +85,7 @@ body {
 }
 #brand { color: var(--fg); font-weight: 750; letter-spacing: 0.02em; text-decoration: none; }
 #user-nav { margin-left: auto; display: flex; gap: 0.9rem; align-items: center; }
-#user-nav a { color: var(--accent); text-decoration: none; }
+#user-nav a { color: var(--accent); text-decoration: none; white-space: nowrap; }
 .user-role { color: var(--muted); font-size: 0.8rem; margin-left: 0.3rem; }
 .status {
   font-size: 0.78rem;
@@ -305,6 +315,7 @@ body {
   font-weight: 600;
   cursor: pointer;
 }
+#composer button:not(:disabled):hover { background: var(--accent-strong); }
 #composer :disabled, #join-form :disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -332,8 +343,8 @@ body {
   text-align: left;
 }
 .nick:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-:is(a, button, input, select, summary):focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 58%, transparent); outline-offset: 2px; }
-#chatpane:focus { outline: 3px solid color-mix(in srgb, var(--accent) 58%, transparent); outline-offset: -3px; }
+:is(a, button, input, select, summary):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+#chatpane:focus { outline: 3px solid var(--focus); outline-offset: -3px; }
 .picker-net {
   display: flex;
   justify-content: space-between;
@@ -351,11 +362,48 @@ body {
 .picker-net small { color: var(--muted); font-weight: 400; }
 .picker-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 0.6rem; }
 .picker-actions a { color: var(--accent); text-decoration: none; font-weight: 650; }
+.network-picker-intro {
+  align-self: center;
+  width: min(34rem, 100%);
+  margin: auto;
+  padding: clamp(1.25rem, 5vw, 2.25rem);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.network-picker-intro h2 { margin: 0; font-size: 1.15rem; }
+.network-picker-intro p { margin: 0.45rem 0 0; color: var(--muted); }
+.network-picker-intro .picker-actions a {
+  padding: 0.4rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--panel-subtle);
+}
+.network-picker-intro .picker-actions a:hover { border-color: var(--accent); }
+
+@media (forced-colors: active) {
+  :is(#topbar, #sidebar, #nicklist, #bufhead, #composer, .alert, .picker-net) {
+    border-color: CanvasText;
+    box-shadow: none;
+  }
+  :is(#composer button, .badge, .mention-badge) {
+    forced-color-adjust: none;
+    background: Highlight;
+    border-color: Highlight;
+    color: HighlightText;
+  }
+  :is(a, button, input, select, summary):focus-visible { outline-color: Highlight; }
+}
 
 @media (max-width: 42rem) {
   #sidebar, #nicklist { flex-basis: 8rem; }
+}
+
+@media (max-width: 52rem) {
   #network-control > span, #account-role { display: none; }
   #network-select { max-width: 9rem; }
+  #user-nav { gap: 0.65rem; }
 }
 /* Narrow / phone: stack the panes and let the member list collapse so the
    chat pane is usable instead of a sliver. */
