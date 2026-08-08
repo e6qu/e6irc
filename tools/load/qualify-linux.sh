@@ -33,9 +33,16 @@ validate_qualification_arguments "$clients" "$channels" "$burst" || {
   echo "workload must fit e6irc-load's 100000-client and 10000000-message limits" >&2
   exit 2
 }
+target_port="$(target_port "$addr")" || { echo "ADDR must be host:port or [ipv6]:port" >&2; exit 2; }
 [[ -r "/proc/$server_pid/limits" ]] || { echo "cannot inspect server PID $server_pid" >&2; exit 2; }
 server_executable="$(readlink -f "/proc/$server_pid/exe")"
 [[ "$(basename "$server_executable")" == e6ircd ]] || { echo "PID $server_pid is not e6ircd" >&2; exit 2; }
+command -v ss >/dev/null || { echo "ss is required to verify the target listener" >&2; exit 2; }
+listener="$(ss -H -ltnp "sport = :$target_port" 2>/dev/null || true)"
+grep -Fq "pid=$server_pid," <<<"$listener" || {
+  echo "PID $server_pid is not listening on target port $target_port" >&2
+  exit 2
+}
 
 required_fds=$((clients + 1024))
 load_nofile="$(ulimit -n)"

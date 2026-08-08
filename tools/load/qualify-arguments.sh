@@ -16,6 +16,19 @@ positive_decimal() {
   [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ && "${1//[.0]/}" ]]
 }
 
+target_port() {
+  local target="$1" port
+  if [[ "$target" =~ ^\[[^]]+\]:([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  elif [[ "$target" =~ ^[^:]+:([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+  positive_integer "$port" && decimal_at_most "$port" 65535 || return 1
+  printf '%s\n' "$port"
+}
+
 validate_qualification_arguments() {
   local clients="$1" channels="$2" burst="$3"
   positive_integer "$clients" && positive_integer "$channels" && positive_integer "$burst" || return 1
