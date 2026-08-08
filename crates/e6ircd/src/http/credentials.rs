@@ -300,13 +300,13 @@ pub(super) async fn list_credentials(
         Ok(rows) => {
             let creds: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(|(id, kind, label, created_at, last_used_at)| {
+                .map(|row| {
                     serde_json::json!({
-                        "id": id,
-                        "kind": kind,
-                        "label": label,
-                        "created_at": created_at,
-                        "last_used_at": last_used_at,
+                        "id": row.id,
+                        "kind": row.kind,
+                        "label": row.label,
+                        "created_at": row.created_at,
+                        "last_used_at": row.last_used_at,
                     })
                 })
                 .collect();
@@ -327,12 +327,12 @@ pub(super) async fn me_identities(
         Ok(rows) => {
             let identities: Vec<serde_json::Value> = rows
                 .into_iter()
-                .map(|(id, issuer, subject, created_at)| {
+                .map(|row| {
                     serde_json::json!({
-                        "id": id,
-                        "issuer": issuer,
-                        "subject": subject,
-                        "created_at": created_at,
+                        "id": row.id,
+                        "issuer": row.issuer,
+                        "subject": row.subject,
+                        "created_at": row.created_at,
                     })
                 })
                 .collect();

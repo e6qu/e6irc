@@ -2349,8 +2349,13 @@ pub enum LinkOutcome {
     Conflict,
 }
 
-/// One linked OIDC identity: `(id, issuer, subject, created_at RFC3339)`.
-pub type OidcIdentityRow = (i64, String, String, String);
+#[derive(Debug, sqlx::FromRow)]
+pub struct OidcIdentityRow {
+    pub id: i64,
+    pub issuer: String,
+    pub subject: String,
+    pub created_at: String,
+}
 
 /// Every OIDC identity linked to `account`, ordered for stable listing.
 pub async fn list_oidc_identities(
@@ -2361,7 +2366,7 @@ pub async fn list_oidc_identities(
     sqlx::query_as(
         "SELECT o.id, o.issuer, o.subject,
                 to_char(o.created_at AT TIME ZONE 'UTC',
-                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
          FROM oidc_identities o JOIN accounts a ON a.id = o.account_id
          WHERE a.name_folded = $1 ORDER BY o.issuer, o.subject, o.id",
     )
@@ -5841,7 +5846,7 @@ pub async fn create_web_session_with_identity(
     Ok(token)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct WebSessionIdentity {
     pub account: String,
     pub email: Option<String>,
@@ -5855,23 +5860,13 @@ pub async fn session_identity(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<WebSessionIdentity>, DbError> {
-    // (account name, email, role, provider) as selected below.
-    type IdentityRow = (String, Option<String>, Option<String>, Option<String>);
-    let row: Option<IdentityRow> = sqlx::query_as(session_lookup!(
-        "a.name, s.oidc_email, s.oidc_role, s.oidc_provider"
+    sqlx::query_as(session_lookup!(
+        "a.name AS account, s.oidc_email AS email, s.oidc_role AS role, s.oidc_provider AS provider"
     ))
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
-    Ok(
-        row.map(|(account, email, role, provider)| WebSessionIdentity {
-            account,
-            email,
-            role,
-            provider,
-        }),
-    )
+    .map_err(DbError::Query)
 }
 
 /// Atomically consumes a signed back-channel logout token and revokes only
@@ -6446,16 +6441,22 @@ async fn delete_scoped_credential(
 
 // ---- credential management ----------------------------------------------
 
-/// (id, kind, label, created_at RFC3339, last_used RFC3339|null).
-pub type CredentialRow = (i64, String, Option<String>, String, Option<String>);
+#[derive(Debug, sqlx::FromRow)]
+pub struct CredentialRow {
+    pub id: i64,
+    pub kind: String,
+    pub label: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
 
 /// List an account's credentials (never the hashes).
 pub async fn list_credentials(pool: &PgPool, account: &str) -> Result<Vec<CredentialRow>, DbError> {
     let folded = CaseMapping::Rfc1459.casefold(account);
     sqlx::query_as(
         "SELECT c.id, c.kind, c.label,
-                to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                to_char(c.last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                to_char(c.last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_used_at
          FROM account_credentials c
          JOIN accounts a ON a.id = c.account_id
          WHERE a.name_folded = $1
