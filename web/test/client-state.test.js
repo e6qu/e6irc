@@ -7,6 +7,7 @@ import {
   ApiError,
   DEFAULT_SETTINGS,
   SETTINGS_KEY,
+  backlogFrom,
   errorMessage,
   getJson,
   identityFrom,
@@ -119,6 +120,12 @@ test("network collection validation separates an empty list from a broken contra
     /invalid network list/,
   );
   assert.throws(() => networksFrom({ networks: [], next: "not part of this response" }), /invalid network list/);
+});
+
+test("backlog parsing accepts only the closed lines response", () => {
+  assert.deepEqual(backlogFrom({ lines: [":a PRIVMSG #chat :hello"] }), [":a PRIVMSG #chat :hello"]);
+  assert.throws(() => backlogFrom({ lines: ["ok"], cursor: "unexpected" }), /invalid backlog/);
+  assert.throws(() => backlogFrom({ lines: [1] }), /invalid backlog/);
 });
 
 test("identity parsing keeps only a safe, complete projection", () => {

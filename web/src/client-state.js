@@ -24,6 +24,7 @@ const IDENTITY_KEYS = new Set([
   "logout_url",
 ]);
 const NETWORK_LIST_KEYS = new Set(["networks"]);
+const BACKLOG_KEYS = new Set(["lines"]);
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -194,6 +195,20 @@ export function networksFrom(payload) {
     throw new ApiError(200, "The server returned an invalid network list");
   }
   return Object.freeze(networks);
+}
+
+export function backlogFrom(payload) {
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    !hasOnlyKeys(payload, BACKLOG_KEYS) ||
+    !Array.isArray(payload.lines) ||
+    payload.lines.some((line) => typeof line !== "string")
+  ) {
+    throw new ApiError(200, "The server returned an invalid backlog");
+  }
+  return Object.freeze([...payload.lines]);
 }
 
 export function networkStateLabel(network) {

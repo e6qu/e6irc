@@ -898,6 +898,7 @@ async fn openapi_spec_is_served() {
     let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"];
     assert_eq!(buffer_schema["additionalProperties"], false);
+    assert_eq!(buffer_schema["required"], serde_json::json!(["lines"]));
     assert_eq!(
         buffer_schema["properties"]["lines"]["items"]["type"],
         "string"

@@ -13,6 +13,7 @@
 import "./style.css";
 import {
   ApiError,
+  backlogFrom,
   errorMessage,
   getJson,
   identityFrom,
@@ -1309,14 +1310,12 @@ async function loadEarlier() {
   }
   let lines = [];
   try {
-    const payload = await getJson(
-      window.fetch.bind(window),
-      `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
+    lines = backlogFrom(
+      await getJson(
+        window.fetch.bind(window),
+        `/api/v1/me/networks/${encodeURIComponent(network)}/buffer?limit=1000`,
+      ),
     );
-    if (!Array.isArray(payload.lines) || payload.lines.some((line) => typeof line !== "string")) {
-      throw new ApiError(200, "The server returned an invalid backlog");
-    }
-    lines = payload.lines;
     clearAlert("history");
   } catch (error) {
     const message = errorMessage("load earlier messages", error);
