@@ -245,7 +245,7 @@ are rate-limited; live grants are bounded and stale grants are pruned.
 **Security and observability.** Device and user codes are random, bounded,
 short-lived, and stored separately from the resulting token. Approval is
 session-authenticated and CSRF-protected; polling metrics use fixed outcomes
-without codes, tokens, or account names.
+without codes, tokens, or account names. A bearer cannot approve a grant.
 
 **Evidence.** Proven at HTTP/PostgreSQL level by
 `device_authorization_grant_flow`,

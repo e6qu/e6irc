@@ -5405,6 +5405,9 @@ async fn device_authorization_grant_flow() {
     let session = e6ircd::db::create_web_session(&pool, "alice", None)
         .await
         .expect("session");
+    let bearer = e6ircd::db::issue_api_token(&pool, "alice", "device approval")
+        .await
+        .expect("bearer");
     drop(pool);
 
     let config = Config {
@@ -5472,6 +5475,25 @@ async fn device_authorization_grant_flow() {
     let me_json: serde_json::Value = serde_json::from_str(&me_body).expect("me JSON");
     let csrf = me_json["csrf_token"].as_str().expect("session CSRF token");
     let browser_headers = format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n");
+    let (status, _, _) = request(
+        http,
+        &post("/api/v1/auth/device/approve", &cookie, &ap_body),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "device approval requires the session CSRF token"
+    );
+    let (status, _, _) = request(
+        http,
+        &post(
+            "/api/v1/auth/device/approve",
+            &format!("Authorization: Bearer {bearer}\r\n"),
+            &ap_body,
+        ),
+    )
+    .await;
+    assert_eq!(status, 401, "a bearer cannot approve a device grant");
     let (status, _, _) = request(
         http,
         &post(
