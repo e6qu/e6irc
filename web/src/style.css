@@ -358,6 +358,25 @@ body {
 .picker-net small { color: var(--muted); font-weight: 400; }
 .picker-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; margin-top: 0.6rem; }
 .picker-actions a { color: var(--accent); text-decoration: none; font-weight: 650; }
+.network-picker-intro {
+  align-self: center;
+  width: min(34rem, 100%);
+  margin: auto;
+  padding: clamp(1.25rem, 5vw, 2.25rem);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.network-picker-intro h2 { margin: 0; font-size: 1.15rem; }
+.network-picker-intro p { margin: 0.45rem 0 0; color: var(--muted); }
+.network-picker-intro .picker-actions a {
+  padding: 0.4rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--panel-subtle);
+}
+.network-picker-intro .picker-actions a:hover { border-color: var(--accent); }
 
 @media (forced-colors: active) {
   :is(#topbar, #sidebar, #nicklist, #bufhead, #composer, .alert, .picker-net) {

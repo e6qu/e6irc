@@ -4,14 +4,14 @@ const { expect, test } = playwrightTest;
 
 const identity = { account: "visual-test", email: "visual@example.test", role: "operator" };
 
-async function mockSession(page, networks) {
+async function mockSession(page, networks, failureStatus = 503) {
   await page.route(/\/api\/v1\/me$/, (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(identity) }),
   );
   await page.route(/\/api\/v1\/me\/networks$/, (route) => {
     if (networks instanceof Error) {
       return route.fulfill({
-        status: 503,
+        status: failureStatus,
         contentType: "application/problem+json",
         body: JSON.stringify({ title: networks.message }),
       });
@@ -48,4 +48,13 @@ test("network picker distinguishes an unavailable API on narrow dark screens", a
     animations: "disabled",
     fullPage: true,
   });
+});
+
+test("network picker directs an expired session to sign in", async ({ page }) => {
+  await mockSession(page, new Error("Unauthorized"), 401);
+  await page.goto("/");
+
+  await expect(page.getByRole("alert")).toContainText("Could not load your networks");
+  await expect(page.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login");
+  await expect(page.getByRole("link", { name: "Retry" })).toHaveCount(0);
 });

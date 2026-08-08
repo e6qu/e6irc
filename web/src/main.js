@@ -1227,9 +1227,6 @@ networkSelect.addEventListener("change", () => {
   }
 });
 
-// The network picker shown when the page is opened without ?network=<name>:
-// list the caller's networks as links, so the client has a real entry point
-// instead of requiring a hand-crafted URL.
 function renderNetworkPicker(networks, failure = null) {
   setStatus(failure ? "network list unavailable" : "choose a network", failure ? "error" : "connecting");
   bufnameEl.textContent = "Select a network";
@@ -1237,13 +1234,18 @@ function renderNetworkPicker(networks, failure = null) {
   nicklistEl.hidden = true;
   messagesEl.replaceChildren();
   const intro = document.createElement("li");
-  intro.className = "line line-server";
-  intro.textContent = failure
-    ? "e6irc could not load your networks. This is an API failure, not an empty account."
+  intro.className = "network-picker-intro";
+  if (failure) intro.setAttribute("role", "alert");
+  const title = document.createElement("h2");
+  title.textContent = failure ? "Network list unavailable" : "Your chat networks";
+  const copy = document.createElement("p");
+  copy.textContent = failure
+    ? "Could not load your networks. This is an API failure, not an empty account."
     : networks.length
       ? "Choose an always-on network:"
       : "No networks are configured for this account.";
-  messagesEl.appendChild(intro);
+  intro.append(title, copy);
+  if (!failure && networks.length) messagesEl.appendChild(intro);
   for (const item of networks) {
     const li = document.createElement("li");
     li.className = "line";
@@ -1261,20 +1263,31 @@ function renderNetworkPicker(networks, failure = null) {
   const manageLi = document.createElement("li");
   manageLi.className = "line picker-actions";
   const manage = document.createElement("a");
-  manage.href = "/console/networks";
-  manage.textContent = failure
-    ? "Open network console"
+  const signInRequired = failure instanceof ApiError && failure.status === 401;
+  manage.href = signInRequired ? "/login" : "/console/networks";
+  manage.textContent = signInRequired
+    ? "Sign in"
+    : failure
+      ? "Open network console"
     : networks.length
       ? "Manage networks"
       : "Add a network";
   manageLi.appendChild(manage);
-  if (failure) {
+  if (failure && !signInRequired) {
     const retry = document.createElement("a");
     retry.href = "/";
     retry.textContent = "Retry";
     manageLi.appendChild(retry);
   }
-  messagesEl.appendChild(manageLi);
+  if (failure || networks.length === 0) {
+    const actions = document.createElement("div");
+    actions.className = "picker-actions";
+    for (const control of Array.from(manageLi.children)) actions.appendChild(control);
+    intro.appendChild(actions);
+  } else {
+    messagesEl.appendChild(manageLi);
+  }
+  if (failure || networks.length === 0) messagesEl.appendChild(intro);
 }
 
 // ---- load earlier history ----------------------------------------------
@@ -1448,14 +1461,6 @@ async function boot() {
     clearAlert("networks");
   } catch (error) {
     networkFailure = error;
-    showAlert(
-      "networks",
-      errorMessage("load your networks", error),
-      "error",
-      error instanceof ApiError && error.status === 401
-        ? { href: "/login", label: "Sign in" }
-        : { href: "/console/networks", label: "Open network console" },
-    );
   }
   populateNetworkSelector(networks, networkFailure);
 
