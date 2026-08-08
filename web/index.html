@@ -54,7 +54,6 @@
       <div id="alerts"></div>
 
       <div id="workspace">
-        <!-- Buffer list: the server buffer plus one per channel / DM. -->
         <aside id="sidebar" aria-label="Buffers">
           <div class="side-head">Buffers</div>
           <form id="join-form" autocomplete="off">
@@ -78,6 +77,7 @@
               type="text"
               id="message"
               placeholder="message… (/join #chan, /msg nick text, /raw LINE)"
+              aria-label="Message"
               maxlength="510"
               autocomplete="off"
               autofocus
@@ -87,7 +87,6 @@
           </form>
         </section>
 
-        <!-- Channel member list; hidden for the server buffer and DMs. -->
         <aside id="nicklist" aria-label="Members" hidden>
           <div class="side-head"><span id="nickcount">0</span> members</div>
           <ul id="nicks"></ul>

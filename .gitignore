@@ -5,6 +5,7 @@
 node_modules/
 /.pnpm-store/
 /web/dist
+/web/test-results
 .DS_Store
 
 # Web client build artifacts (built by `pnpm build` in web/; CI rebuilds
