@@ -12,7 +12,10 @@ async function expectAccessible(page) {
 
 async function mockSession(page, networks, failureStatus = 503, identityPayload = identity) {
   await page.route(/\/api\/v1\/me$/, (route) =>
-    route.fulfill({ contentType: "application/json", body: JSON.stringify(identityPayload) }),
+    route.fulfill({
+      contentType: "application/json",
+      body: typeof identityPayload === "string" ? identityPayload : JSON.stringify(identityPayload),
+    }),
   );
   await page.route(/\/api\/v1\/me\/networks$/, (route) => {
     if (networks instanceof Error) {
@@ -141,6 +144,15 @@ test("network picker directs an expired session to sign in", async ({ page }) =>
 
 test("malformed identity response stays an explicit recovery state", async ({ page }) => {
   await mockSession(page, [], 503, { account: 1 });
+  await page.goto("/");
+
+  await expect(page.getByRole("alert")).toContainText("Could not load your signed-in identity");
+  await expect(page.locator("#account-name")).toHaveText("identity unavailable");
+  await expectAccessible(page);
+});
+
+test("oversized identity response stays an explicit recovery state", async ({ page }) => {
+  await mockSession(page, [], 503, `"${"€".repeat(524289)}"`);
   await page.goto("/");
 
   await expect(page.getByRole("alert")).toContainText("Could not load your signed-in identity");
