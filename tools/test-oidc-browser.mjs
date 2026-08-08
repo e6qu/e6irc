@@ -746,8 +746,10 @@ try {
   await addBan.getByRole("button", { name: "Add and enforce ban" }).click();
   await page.getByText("*@browser-policy.example", { exact: true }).waitFor();
   const banRow = page.locator("tbody tr").filter({ hasText: "*@browser-policy.example" });
-  page.once("dialog", (dialog) => dialog.accept());
   await banRow.getByRole("button", { name: "Remove", exact: true }).click();
+  const banConfirmation = page.getByRole("dialog", { name: "Confirm action", exact: true });
+  await banConfirmation.waitFor();
+  await banConfirmation.getByRole("button", { name: "Continue", exact: true }).click();
   await page.getByText("*@browser-policy.example", { exact: true }).waitFor({ state: "detached" });
 
   await page.goto(`${applicationOrigin}/console/audit`);
