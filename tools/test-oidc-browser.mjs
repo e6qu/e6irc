@@ -682,6 +682,17 @@ try {
     }).click();
     const confirmation = guest.getByRole("dialog", { name: "Confirm action", exact: true });
     await confirmation.waitFor();
+    await confirmation.getByRole("button", { name: "Cancel", exact: true }).click();
+    await confirmation.waitFor({ state: "hidden" });
+    assert.equal(
+      await deleteAccount.getByLabel("Type browserguest to confirm", { exact: true }).inputValue(),
+      "browserguest",
+    );
+    await deleteAccount.getByRole("button", {
+      name: "Delete my account permanently",
+      exact: true,
+    }).click();
+    await confirmation.waitFor();
     await clickAndWaitForURL(
       guest,
       confirmation.getByRole("button", { name: "Continue", exact: true }),
