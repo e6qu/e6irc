@@ -2110,6 +2110,7 @@
     if (ownerNetworkCount) ownerNetworkCount.textContent = "—";
     tableLoadFailure(previous, 7, error, retry);
   };
+  let refreshOwnerNetworks;
   const refreshOwnerNetworksNow = async () => {
     if (!(ownerNetworkRows instanceof HTMLElement)) return;
     ownerNetworkRows.setAttribute("aria-busy", "true");
@@ -2122,7 +2123,7 @@
       renderOwnerNetworks(apiCollection(result, "networks", "network directory"));
       if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
     } catch (error) {
-      renderOwnerNetworkFailure(error, () => void refreshOwnerNetworks(true));
+      renderOwnerNetworkFailure(error, () => { if (refreshOwnerNetworks) void refreshOwnerNetworks(true); });
       if (ownerNetworkRefreshStatus) {
         ownerNetworkRefreshStatus.textContent = "Live refresh failed. Retry is available in the network list.";
         ownerNetworkRefreshStatus.classList.add("refresh-error");
@@ -2132,7 +2133,7 @@
     }
   };
   if (ownerNetworkRows instanceof HTMLElement) {
-    const refreshOwnerNetworks = serializeRefresh(
+    refreshOwnerNetworks = serializeRefresh(
       refreshOwnerNetworksNow,
       () => {
         if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Refresh queued.";
