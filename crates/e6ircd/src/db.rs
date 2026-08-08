@@ -403,8 +403,7 @@ pub(crate) async fn list_observability_samples(
         .collect()
 }
 
-/// One immutable view of the settings row. Callers must present `revision` on a
-/// write, making lost updates impossible instead of relying on timing.
+/// Immutable settings with its write revision.
 #[derive(Debug, Clone)]
 pub struct ManagedConfigSnapshot {
     pub revision: i64,
@@ -1077,26 +1076,37 @@ pub struct AccountDeletionTarget {
     pub folded: String,
 }
 
-/// Resolve and validate a deletion target without changing it. The final
-/// transaction repeats every invariant after the live core has installed its
-/// authentication gate, so a concurrent channel/admin mutation cannot cross
-/// the boundary.
+#[derive(sqlx::FromRow)]
+struct AccountDeletionTargetRow {
+    name: String,
+    folded: String,
+    flags: i64,
+    founded_channels: i64,
+}
+
+/// Resolve a deletion target before the core authentication gate.
 pub async fn account_deletion_target(
     pool: &PgPool,
     account_id: i64,
     configured_administrators: &[String],
 ) -> Result<Option<AccountDeletionTarget>, DbError> {
-    let row: Option<(String, String, i64, i64)> = sqlx::query_as(
-        "SELECT a.name, a.name_folded, a.flags,
+    let row: Option<AccountDeletionTargetRow> = sqlx::query_as(
+        "SELECT a.name, a.name_folded AS folded, a.flags,
                 (SELECT count(*) FROM channels c
-                 WHERE c.founder_account_id = a.id)
+                 WHERE c.founder_account_id = a.id) AS founded_channels
          FROM accounts a WHERE a.id = $1",
     )
     .bind(account_id)
     .fetch_optional(pool)
     .await
     .map_err(DbError::Query)?;
-    let Some((name, folded, flags, founded_channels)) = row else {
+    let Some(AccountDeletionTargetRow {
+        name,
+        folded,
+        flags,
+        founded_channels,
+    }) = row
+    else {
         return Ok(None);
     };
     if founded_channels != 0 {
@@ -2937,16 +2947,18 @@ async fn query_between_selectors(
         .await;
     let mut rows = rows?;
     if newest_first {
-        rows.reverse(); // the batch replays oldest-first
+        rows.reverse();
     }
     Ok(rows.into_iter().map(history_row_from_db).collect())
 }
 
-/// CHATHISTORY TARGETS: buffers whose latest message falls strictly between
-/// `min_ts` and `max_ts` — among the `channels` (casefolded) the requester can
-/// see, plus every direct-message conversation `me` takes part in, reported as
-/// the correspondent's casefolded nick. Oldest activity first, so a `limit` keeps
-/// the oldest buffers. Empty on a query error (logged loudly).
+#[derive(sqlx::FromRow)]
+struct HistoryTargetRow {
+    name: String,
+    latest: i64,
+}
+
+/// Return visible targets with latest activity in the requested window.
 pub async fn query_targets(
     pool: &PgPool,
     channels: &[String],
@@ -2955,14 +2967,7 @@ pub async fn query_targets(
     max_ts: e6irc_proto::time::Millis,
     limit: usize,
 ) -> Result<Vec<(String, e6irc_proto::time::Millis)>, sqlx::Error> {
-    // A conversation is keyed by both participants, so it is reported under the
-    // *other* one — and under `me` for a conversation with oneself, whose key
-    // has only the single participant.
-    // The window is tested against each buffer's *latest* message, not against
-    // any message it happens to contain: a buffer whose newest activity is
-    // outside the window has already been read past, so reporting it would
-    // hand a reconnecting client backlog it does not need.
-    let rows: Result<Vec<(String, i64)>, sqlx::Error> = sqlx::query_as(
+    let rows: Result<Vec<HistoryTargetRow>, sqlx::Error> = sqlx::query_as(
         "SELECT name, (EXTRACT(EPOCH FROM MAX(latest)) * 1000)::bigint AS latest FROM (
              SELECT target AS name, MAX(ts) AS latest
              FROM messages
@@ -2993,7 +2998,12 @@ pub async fn query_targets(
     .await;
     Ok(rows?
         .into_iter()
-        .map(|(t, ts)| (t, e6irc_proto::time::Millis::from_millis(ts as u64)))
+        .map(|row| {
+            (
+                row.name,
+                e6irc_proto::time::Millis::from_millis(row.latest as u64),
+            )
+        })
         .collect())
 }
 
@@ -3090,9 +3100,14 @@ pub async fn set_channel_access(
     }
 }
 
-/// Persist and audit one founder-owned channel mutation in a transaction.
-/// Locking the channel row makes ownership authorization, the write, and its
-/// audit record one indivisible transition.
+#[derive(sqlx::FromRow)]
+struct ChannelMutationOwnerRow {
+    channel_id: i64,
+    founder: String,
+    keeptopic: bool,
+}
+
+/// Persist and audit one founder-owned channel mutation.
 pub async fn persist_owned_channel_mutation(
     pool: &PgPool,
     channel: &str,
@@ -3104,8 +3119,8 @@ pub async fn persist_owned_channel_mutation(
     let channel_folded = CaseMapping::Rfc1459.casefold(channel);
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let row: Option<(i64, String, bool)> = sqlx::query_as(
-        "SELECT c.id, a.name_folded, c.keeptopic
+    let row: Option<ChannelMutationOwnerRow> = sqlx::query_as(
+        "SELECT c.id AS channel_id, a.name_folded AS founder, c.keeptopic
          FROM channels c JOIN accounts a ON a.id = c.founder_account_id
          WHERE c.name_folded = $1
          FOR UPDATE OF c",
@@ -3114,7 +3129,12 @@ pub async fn persist_owned_channel_mutation(
     .fetch_optional(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    let Some((channel_id, founder, keeptopic)) = row else {
+    let Some(ChannelMutationOwnerRow {
+        channel_id,
+        founder,
+        keeptopic,
+    }) = row
+    else {
         return Ok(ChannelControlResult::MissingOrNotOwner);
     };
     if founder != actor_folded {

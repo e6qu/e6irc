@@ -1,21 +1,11 @@
 # Terminology
 
-A reference for the vocabulary that appears across e6irc — the IRC daemon,
-its authentication and single sign-on surface, the bouncer and bridges, and
-the deployment. It spans several domains (IRC, OpenID Connect, AWS), so this
-page is the one place to look up an unfamiliar term.
+This glossary defines e6irc terms.
 
-**On abbreviations.** Prefer the spelled-out term in prose, comments, and
-identifiers. This project keeps abbreviations to the unavoidable ones —
-protocol and industry acronyms (IRC, OpenID Connect, JSON Web Token) and a
-small set of IRC command names that are effectively their own words (WHOIS,
-CHATHISTORY). Do not invent new abbreviations; if a term below is not here,
-write it out. Every acronym in the codebase should be defined on this page.
+Prefer spelled-out terms. Define each new abbreviation here.
 
-See also: [`DESIGN.md`](../DESIGN.md) for the architecture and the
-engineering laws, [`AGENTS.md`](../AGENTS.md) for working conventions, and
-[`PLAN.md`](../PLAN.md) for build status. End-to-end product outcomes and
-their test evidence are in [`docs/journeys/`](journeys/README.md).
+See [DESIGN.md](../DESIGN.md), [AGENTS.md](../AGENTS.md), [PLAN.md](../PLAN.md),
+and [journeys](journeys/README.md).
 
 ---
 
