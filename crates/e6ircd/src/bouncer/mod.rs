@@ -1159,6 +1159,8 @@ pub struct NetworkHandle {
     /// PG-backed history context for CHATHISTORY/MARKREAD on the attach
     /// listener, set when the network is registered with a database.
     history: std::sync::Arc<std::sync::Mutex<Option<NetworkHistory>>>,
+    /// Becomes true after persisted history has been restored into `buffer`.
+    history_ready: tokio::sync::watch::Sender<bool>,
     telemetry:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::observability::Telemetry>>>>,
 }
@@ -1867,12 +1869,14 @@ impl NetworkHandle {
         let runtime = std::sync::Arc::new(NetworkRuntime::new());
         let telemetry = std::sync::Arc::new(std::sync::Mutex::new(None));
         let history = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (history_ready, _) = tokio::sync::watch::channel(true);
         let handle = NetworkHandle {
             events: events.clone(),
             commands: command_tx,
             attach_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             shutdown: shutdown_tx,
             history: history.clone(),
+            history_ready,
             buffer: buffer.clone(),
             runtime: runtime.clone(),
             telemetry: telemetry.clone(),
@@ -1912,6 +1916,7 @@ impl NetworkHandle {
     /// Assign the PG history context (pool + owner/network keys) so the
     /// attach listener can serve CHATHISTORY and MARKREAD.
     pub(crate) fn set_history(&self, pool: sqlx::PgPool, owner: Option<String>, network: String) {
+        self.history_ready.send_replace(false);
         *self.history.lock().expect("history context poisoned") = Some(NetworkHistory {
             pool,
             owner: owner.unwrap_or_else(|| "*".to_string()),
@@ -1925,6 +1930,37 @@ impl NetworkHandle {
             .lock()
             .expect("history context poisoned")
             .clone()
+    }
+
+    /// Wait for persisted backlog restore, unless the network is stopped first.
+    pub async fn wait_for_history(&self) -> bool {
+        let mut history_ready = self.history_ready.subscribe();
+        let mut shutdown = self.shutdown.subscribe();
+        loop {
+            if *history_ready.borrow() {
+                return true;
+            }
+            if *shutdown.borrow() {
+                return false;
+            }
+            tokio::select! {
+                changed = history_ready.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Complete the initial history restore after loading succeeds or fails.
+    pub(crate) fn history_restored(&self) {
+        self.history_ready.send_replace(true);
     }
 
     pub(crate) fn record_error(&self, failure: NetworkFailure) {
@@ -2210,6 +2246,13 @@ where
     // seen, so `changed()` below would never fire and the client would linger
     // forever on a dead network. Check the current value once, up front.
     if *shutdown.borrow() {
+        write
+            .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
+            .await?;
+        write.flush().await?;
+        return Ok(());
+    }
+    if !handle.wait_for_history().await {
         write
             .write_all(b":*bnc* NOTICE * :network removed; detaching\r\n")
             .await?;
@@ -2586,6 +2629,29 @@ mod tests {
             "{runtime:?}"
         );
         assert_eq!(telemetry.snapshot(0, 0).errors["bouncer"], 1);
+    }
+
+    #[tokio::test]
+    async fn history_restore_blocks_attach_snapshot_until_ready_or_shutdown() {
+        let (handle, _ends) = NetworkHandle::channels(8);
+        let handle = std::sync::Arc::new(handle);
+        handle.history_ready.send_replace(false);
+        let waiting = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.wait_for_history().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        handle.history_restored();
+        assert!(waiting.await.expect("history wait task panicked"));
+
+        handle.history_ready.send_replace(false);
+        let waiting = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.wait_for_history().await }
+        });
+        handle.shutdown();
+        assert!(!waiting.await.expect("history wait task panicked"));
     }
 
     /// A driver must stop when the registry signals shutdown, even while a

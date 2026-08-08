@@ -287,6 +287,10 @@ pub(super) async fn ws_ui_conn(
         send_unavailable(&mut socket).await;
         return;
     }
+    if !handle.wait_for_history().await {
+        send_unavailable(&mut socket).await;
+        return;
+    }
     let _attachment = handle.track_attachment();
     let attach_id = handle.next_attachment_id();
 
