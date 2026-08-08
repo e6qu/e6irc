@@ -1933,7 +1933,7 @@ impl NetworkHandle {
     }
 
     /// Wait for persisted backlog restore, unless the network is stopped first.
-    pub async fn wait_for_history(&self) -> bool {
+    pub(crate) async fn wait_for_history(&self) -> bool {
         let mut history_ready = self.history_ready.subscribe();
         let mut shutdown = self.shutdown.subscribe();
         loop {
