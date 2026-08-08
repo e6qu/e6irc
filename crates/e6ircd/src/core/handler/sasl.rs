@@ -92,9 +92,7 @@ pub(super) fn credential_attempt_ok(state: &mut ServerState, conn: ConnId) -> bo
     true
 }
 
-/// Take the in-flight NickServ IDENTIFY label, draining the session slot.
-/// `None` means no IDENTIFY was pending (a stale reply for one already
-/// superseded or aborted) — the caller drops it.
+/// Take the pending NickServ IDENTIFY label.
 fn take_identify_label(state: &mut ServerState, conn: ConnId) -> Option<Option<String>> {
     state
         .sessions
@@ -102,10 +100,10 @@ fn take_identify_label(state: &mut ServerState, conn: ConnId) -> Option<Option<S
         .expect("checked")
         .pending_identify
         .take()
+        .map(crate::core::state::PendingServiceReply::into_label)
 }
 
-/// Take the in-flight REGISTER label and flatten it: the outer Option is "a
-/// registration is pending", the inner the client's correlation label.
+/// Take the pending REGISTER label.
 fn take_register_label(state: &mut ServerState, conn: ConnId) -> Option<String> {
     state
         .sessions
@@ -113,7 +111,7 @@ fn take_register_label(state: &mut ServerState, conn: ConnId) -> Option<String> 
         .expect("checked")
         .pending_register
         .take()
-        .flatten()
+        .and_then(crate::core::state::PendingServiceReply::into_label)
 }
 
 /// Upper bound on a reassembled SASL response (across 400-byte continuation
@@ -384,11 +382,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         return;
     }
     match reply {
-        // The verdict routes on the origin the *request* carried, never on the
-        // session flags: `sasl == Verifying` and `pending_identify` can both be
-        // set at once (interleaved AUTHENTICATE + NickServ IDENTIFY), and the
-        // old flag-inference could fire an IDENTIFY success off a SASL reply, or
-        // vice versa. The flag now only says whether that path is still live.
+        // Route credential verdicts by request origin.
         crate::core::DbReply::PasswordVerified {
             account,
             origin: crate::core::CredentialOrigin::Sasl,

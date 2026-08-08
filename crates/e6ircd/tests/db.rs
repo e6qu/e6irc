@@ -852,8 +852,8 @@ async fn verify_records_credential_last_used() {
     let app_last_used = |creds: &[db::CredentialRow]| -> Option<Option<String>> {
         creds
             .iter()
-            .find(|(_, kind, _, _, _)| kind == "app_password")
-            .map(|(_, _, _, _, last_used)| last_used.clone())
+            .find(|row| row.kind == "app_password")
+            .map(|row| row.last_used_at.clone())
     };
     let before = db::list_credentials(&pool, "lu").await.expect("list");
     assert_eq!(
@@ -899,13 +899,13 @@ async fn revoke_credential_cannot_delete_the_primary_password() {
     let creds = db::list_credentials(&pool, "rc").await.expect("list");
     let local_id = creds
         .iter()
-        .find(|(_, kind, ..)| kind == "local_password")
-        .map(|(id, ..)| *id)
+        .find(|row| row.kind == "local_password")
+        .map(|row| row.id)
         .expect("local_password present");
     let app_id = creds
         .iter()
-        .find(|(_, kind, ..)| kind == "app_password")
-        .map(|(id, ..)| *id)
+        .find(|row| row.kind == "app_password")
+        .map(|row| row.id)
         .expect("app_password present");
 
     // Attempting to revoke the primary password is a no-op.
@@ -4470,12 +4470,12 @@ async fn oidc_identity_link_list_and_conflict() {
         .await
         .expect("list");
     assert_eq!(identities.len(), 2);
-    assert_eq!(identities[0].1, "https://idp.example");
-    assert_eq!(identities[0].2, "sub-0");
-    assert!(identities[0].3.ends_with('Z'), "{identities:?}");
-    assert_eq!(identities[1].1, "https://idp.example");
-    assert_eq!(identities[1].2, "sub-1");
-    assert!(identities[1].3.ends_with('Z'), "{identities:?}");
+    assert_eq!(identities[0].issuer, "https://idp.example");
+    assert_eq!(identities[0].subject, "sub-0");
+    assert!(identities[0].created_at.ends_with('Z'), "{identities:?}");
+    assert_eq!(identities[1].issuer, "https://idp.example");
+    assert_eq!(identities[1].subject, "sub-1");
+    assert!(identities[1].created_at.ends_with('Z'), "{identities:?}");
     // bob got nothing.
     assert!(
         db::list_oidc_identities(&pool, "bob")
@@ -4514,7 +4514,7 @@ async fn oidc_identity_link_list_and_conflict() {
         .await
         .expect("local session");
     assert_eq!(
-        db::unlink_oidc_identity(&pool, "alice", identities[0].0)
+        db::unlink_oidc_identity(&pool, "alice", identities[0].id)
             .await
             .expect("unlink"),
         db::UnlinkIdentityOutcome::Unlinked
@@ -4534,7 +4534,7 @@ async fn oidc_identity_link_list_and_conflict() {
         );
     }
     assert_eq!(
-        db::unlink_oidc_identity(&pool, "alice", identities[1].0)
+        db::unlink_oidc_identity(&pool, "alice", identities[1].id)
             .await
             .expect("last identity"),
         db::UnlinkIdentityOutcome::Unlinked,
@@ -4566,8 +4566,8 @@ async fn oidc_identity_link_list_and_conflict() {
         .await
         .expect("OIDC-only identities");
     let (first, second) = tokio::join!(
-        db::unlink_oidc_identity(&pool, &oidc_only, oidc_identities[0].0),
-        db::unlink_oidc_identity(&pool, &oidc_only, oidc_identities[1].0),
+        db::unlink_oidc_identity(&pool, &oidc_only, oidc_identities[0].id),
+        db::unlink_oidc_identity(&pool, &oidc_only, oidc_identities[1].id),
     );
     let outcomes = [first.expect("first unlink"), second.expect("second unlink")];
     assert_eq!(

@@ -263,6 +263,21 @@ pub(crate) enum Registration {
     },
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingServiceReply {
+    label: Option<String>,
+}
+
+impl PendingServiceReply {
+    pub(crate) fn new(label: Option<String>) -> Self {
+        Self { label }
+    }
+
+    pub(crate) fn into_label(self) -> Option<String> {
+        self.label
+    }
+}
+
 pub(crate) struct Session {
     pub tx: Sender<Output>,
     pub host: String,
@@ -290,26 +305,10 @@ pub(crate) struct Session {
     /// single socket can't drive unbounded argon2 work (unauth CPU DoS / online
     /// brute-force). Never reset — the budget is per connection lifetime.
     pub credential_attempts: u32,
-    /// A NickServ IDENTIFY is awaiting its DB verdict, with a deferred reply held
-    /// open for it — same shape and meaning as [`Self::pending_register`]: `Some`
-    /// while the verdict is outstanding, the inner value the escaped
-    /// labeled-response label the `PRIVMSG NickServ :IDENTIFY` carried (`Some` for
-    /// a labeled command, `None` for an unlabeled one). The deferred
-    /// success/failure NOTICE is then framed under the same label a synchronous
-    /// reply would carry, so a label-tracking client can correlate the verdict —
-    /// matching REGISTER rather than answering the label with a bare empty ACK and
-    /// leaving the verdict unlabeled.
-    pub pending_identify: Option<Option<String>>,
-    /// A `REGISTER`-command account creation is awaiting its DB verdict, with a
-    /// deferred reply held open for it. `Some` while that reply is outstanding;
-    /// the inner value is the escaped labeled-response label the command carried
-    /// (`Some` for a labeled REGISTER, `None` for an unlabeled one), so the
-    /// deferred `SUCCESS`/`FAIL` that lands later is framed under the same label
-    /// as a synchronous command would be. Routing the reply back to REGISTER no
-    /// longer needs this flag — `CreateAccount` only ever yields the
-    /// origin-carrying `AccountCreated`/`AccountExists`/`AccountRegisterUnavailable`
-    /// replies (never a bare `Unavailable`), so the origin alone routes it.
-    pub pending_register: Option<Option<String>>,
+    /// Deferred NickServ IDENTIFY reply.
+    pub pending_identify: Option<PendingServiceReply>,
+    /// Deferred NickServ REGISTER reply.
+    pub pending_register: Option<PendingServiceReply>,
     /// Away message, when set.
     pub away: Option<String>,
     /// IRC operator (umode +o).

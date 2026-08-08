@@ -125,16 +125,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     return;
                 }
             };
-            // At most one credential verify (SASL *or* IDENTIFY) may be in flight
-            // for one connection: both are offloaded and their verdicts routed by
-            // the single `pending_identify` / `sasl_verify_pending` flags, so a
-            // second verify in flight shares a flag the first verdict to land
-            // clears — the later, possibly-*valid* verdict then hits the "flag
-            // already cleared → stale, drop" guard and is silently discarded (no
-            // login, no notice). This holds for two IDENTIFYs just as for an
-            // IDENTIFY racing a SASL verify (an earlier comment wrongly called
-            // overlapping IDENTIFYs harmless). Refuse a second while either is
-            // pending; the SASL verify-start refuses symmetrically.
+            // One credential verification may be in flight per connection.
             if state.sessions[&conn].sasl_verify_pending
                 || state.sessions[&conn].pending_identify.is_some()
             {
@@ -167,13 +158,6 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     "Services are temporarily unavailable. Try again later.",
                 );
             } else {
-                // The verdict arrives asynchronously from the DB worker. If the
-                // IDENTIFY was labeled, tell the synchronous framer not to ACK it
-                // as an empty response and stash the label, so the deferred verdict
-                // NOTICE carries it (`emit_labeled_unheld` at reply time). Unlike
-                // REGISTER, no `defer_reply` hold is taken: a NickServ verdict
-                // interleaves with the client's other output the way a real server
-                // sends it, rather than gating every later reply on the verify.
                 let label = state.capture.as_mut().and_then(|cap| {
                     cap.label.clone().inspect(|_| {
                         cap.deferred = true;
@@ -183,7 +167,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                     .sessions
                     .get_mut(&conn)
                     .expect("checked")
-                    .pending_identify = Some(label);
+                    .pending_identify = Some(crate::core::state::PendingServiceReply::new(label));
             }
         }
         "GHOST" => {

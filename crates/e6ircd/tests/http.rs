@@ -5198,8 +5198,8 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .expect("credentials");
     let app_id = credentials
         .iter()
-        .find(|(_, kind, label, _, _)| kind == "app_password" && label.as_deref() == Some("Laptop"))
-        .map(|row| row.0)
+        .find(|row| row.kind == "app_password" && row.label.as_deref() == Some("Laptop"))
+        .map(|row| row.id)
         .expect("created app password");
 
     let token_body = r#"{"label":"Automation","expires_in_days":90,"scopes":["read","irc"]}"#;
@@ -5263,7 +5263,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
             .await
             .expect("credentials after revoke")
             .iter()
-            .all(|row| row.0 != app_id)
+            .all(|row| row.id != app_id)
     );
     assert!(
         e6ircd::db::list_api_tokens(&pool, "alice")
@@ -5278,8 +5278,8 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         .expect("identities");
     let unlink_id = identities
         .iter()
-        .find(|row| row.2 == "alice-secondary")
-        .map(|row| row.0)
+        .find(|row| row.subject == "alice-secondary")
+        .map(|row| row.id)
         .expect("secondary identity");
     let unlink = format!(
         "DELETE /api/v1/me/identities/{unlink_id} HTTP/1.1\r\nHost: t\r\n\
@@ -5300,7 +5300,7 @@ async fn account_console_manages_credentials_tokens_and_identities() {
         "DELETE /api/v1/me/identities/{} HTTP/1.1\r\nHost: t\r\n\
          Cookie: e6irc_session={session}\r\nX-E6IRC-CSRF: {csrf}\r\n\
          Connection: close\r\n\r\n",
-        remaining[0].0
+        remaining[0].id
     );
     let (status, _, body) = request(http, &last_delete).await;
     assert_eq!(status, 204, "{body}");

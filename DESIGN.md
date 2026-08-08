@@ -140,6 +140,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
     asserted against.
   - `ComposerResult` — a web-composer response is either `Sent` or `Rejected`;
     success cannot carry an error and rejection always has one.
+  - `PendingServiceReply` — a deferred NickServ reply is a value, so no pending
+    request cannot be confused with an unlabeled one.
+  - `CredentialRow` / `OidcIdentityRow` / `WebSessionIdentity` — named SQL
+    projections prevent same-typed columns from being transposed at a caller.
   - `CredentialOrigin` — a credential-verify verdict (`PasswordVerified` /
     `PasswordRejected` / `Unavailable`) answers *either* a SASL `AUTHENTICATE`
     or a NickServ `IDENTIFY`; the request carries which, echoed onto the reply,

@@ -254,11 +254,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    // One account creation may be in flight per connection. A second REGISTER
-    // while the first still awaits its DB verdict would spawn a second argon2
-    // hash and a second deferred reply, and its label would overwrite the
-    // first's `pending_register` — the earlier reply would then be framed under
-    // the wrong label. Refuse the duplicate instead.
+    // One account creation may be in flight per connection.
     if state.sessions[&conn].pending_register.is_some() {
         register_fail(
             state,
@@ -307,15 +303,8 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             "Account registration is temporarily unavailable",
         );
     } else {
-        // The answer needs a database round trip; hold this connection's later
-        // output behind it so the reply cannot be overtaken by, say, the PONG
-        // to a PING the client pipelined after REGISTER.
+        // Hold later output until the database replies.
         state.defer_reply(conn);
-        // If this REGISTER was labeled, the answer is produced asynchronously,
-        // so tell the synchronous framer not to ACK it as an empty response —
-        // and stash the label so the deferred SUCCESS/FAIL is framed under it.
-        // `None` (unlabeled) still marks the register pending; the inner option
-        // distinguishes "labeled" from "unlabeled", both from "not pending".
         let label = state.capture.as_mut().and_then(|cap| {
             cap.label.clone().inspect(|_| {
                 cap.deferred = true;
@@ -325,7 +314,7 @@ pub(super) fn cmd_register(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             .sessions
             .get_mut(&conn)
             .expect("checked")
-            .pending_register = Some(label);
+            .pending_register = Some(crate::core::state::PendingServiceReply::new(label));
     }
 }
 
