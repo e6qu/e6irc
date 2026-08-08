@@ -1486,6 +1486,7 @@ async function boot() {
     clearAlert("networks");
   } catch (error) {
     networkFailure = error;
+    showAlert("networks", errorMessage("load your networks", error), "error");
   }
   populateNetworkSelector(networks, networkFailure);
 
