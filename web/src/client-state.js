@@ -109,6 +109,31 @@ export async function getJson(fetcher, url) {
   }
 }
 
+function optionalString(value) {
+  return value === undefined || value === null ? null : typeof value === "string" ? value : undefined;
+}
+
+export function identityFrom(payload) {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new ApiError(200, "The server returned an invalid identity");
+  }
+  const { account } = payload;
+  const email = optionalString(payload.email);
+  const role = optionalString(payload.role);
+  const logoutURL = optionalString(payload.logout_url);
+  if (
+    typeof account !== "string" ||
+    !account.trim() ||
+    email === undefined ||
+    role === undefined ||
+    logoutURL === undefined ||
+    (logoutURL !== null && (!logoutURL.startsWith("/") || logoutURL.startsWith("//")))
+  ) {
+    throw new ApiError(200, "The server returned an invalid identity");
+  }
+  return Object.freeze({ account, email, role, logoutURL });
+}
+
 function networkSummary(value) {
   if (value === null || typeof value !== "object") return null;
   const { name, enabled, connected, runtime } = value;

@@ -15,6 +15,7 @@ import {
   ApiError,
   errorMessage,
   getJson,
+  identityFrom,
   loadSettings,
   networkStateLabel,
   networksFrom,
@@ -1421,26 +1422,12 @@ async function boot() {
   setComposerAvailable(false);
 
   try {
-    const me = await getJson(window.fetch.bind(window), "/api/v1/me");
-    if (me === null || typeof me !== "object" || typeof me.account !== "string") {
-      throw new ApiError(200, "The server returned an invalid identity");
-    }
+    const me = identityFrom(await getJson(window.fetch.bind(window), "/api/v1/me"));
     el("account-name").textContent = me.account;
     el("account-link").dataset.shauthUser = me.account;
-    // The email rides the account name's title attribute (the SSO validator
-    // reads it there); role and the coordinated-logout coordinate likewise.
-    el("account-name").title = typeof me.email === "string" ? me.email : "";
-    if (typeof me.role === "string") el("account-role").textContent = me.role;
-    // Only accept a same-origin relative path, so a hostile value can't turn the
-    // sign-out control into a `javascript:` / cross-origin link. Reject a
-    // protocol-relative `//host` (which starts with "/" but is cross-origin).
-    if (
-      typeof me.logout_url === "string" &&
-      me.logout_url.startsWith("/") &&
-      !me.logout_url.startsWith("//")
-    ) {
-      el("logout-link").href = me.logout_url;
-    }
+    el("account-name").title = me.email || "";
+    el("account-role").textContent = me.role || "";
+    if (me.logoutURL) el("logout-link").href = me.logoutURL;
     clearAlert("identity");
   } catch (error) {
     el("account-name").textContent = "identity unavailable";

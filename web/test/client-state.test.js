@@ -9,6 +9,7 @@ import {
   SETTINGS_KEY,
   errorMessage,
   getJson,
+  identityFrom,
   loadSettings,
   networksFrom,
   networkStateLabel,
@@ -117,6 +118,24 @@ test("network collection validation separates an empty list from a broken contra
     () => networksFrom({ networks: [{ name: "Libera", enabled: true, connected: false, runtime: { state: "connected" } }] }),
     /invalid network list/,
   );
+});
+
+test("identity parsing keeps only a safe, complete projection", () => {
+  assert.deepEqual(identityFrom({ account: "alice", email: "a@example.test", role: "operator", logout_url: "/logout" }), {
+    account: "alice",
+    email: "a@example.test",
+    role: "operator",
+    logoutURL: "/logout",
+  });
+  assert.deepEqual(identityFrom({ account: "token-user" }), {
+    account: "token-user",
+    email: null,
+    role: null,
+    logoutURL: null,
+  });
+  assert.throws(() => identityFrom({ account: "", email: null }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", role: 1 }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", logout_url: "//other.test/logout" }), /invalid identity/);
 });
 
 test("network labels use the API's typed runtime state", () => {
