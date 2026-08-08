@@ -1265,7 +1265,7 @@ function renderNetworkPicker(networks, failure = null) {
   title.textContent = failure ? "Network list unavailable" : "Your chat networks";
   const copy = document.createElement("p");
   copy.textContent = failure
-    ? "Could not load your networks. This is an API failure, not an empty account."
+    ? `${errorMessage("load your networks", failure)} This is an API failure, not an empty account.`
     : networks.length
       ? "Choose an always-on network:"
       : "No networks are configured for this account.";

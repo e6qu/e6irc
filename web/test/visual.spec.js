@@ -127,7 +127,7 @@ test("network picker distinguishes an unavailable API on narrow dark screens", a
   await mockSession(page, new Error("Network service unavailable"));
   await page.goto("/");
 
-  await expect(page.getByRole("alert")).toContainText("Could not load your networks");
+  await expect(page.getByRole("alert")).toContainText("Network service unavailable");
   await expect(page.getByRole("link", { name: "Retry" })).toBeVisible();
   await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-unavailable-dark-narrow.png", {
@@ -140,7 +140,7 @@ test("network picker directs an expired session to sign in", async ({ page }) =>
   await mockSession(page, new Error("Unauthorized"), 401);
   await page.goto("/");
 
-  await expect(page.getByRole("alert")).toContainText("Could not load your networks");
+  await expect(page.getByRole("alert")).toContainText("Your session expired while trying to load your networks");
   await expect(page.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login");
   await expect(page.getByRole("link", { name: "Retry" })).toHaveCount(0);
   await expectAccessible(page);
