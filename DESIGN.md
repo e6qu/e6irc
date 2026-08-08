@@ -25,10 +25,9 @@ product outcomes and their automated evidence are mapped in
   - a BNC host: always-on sessions on the local server, ZNC/soju-style
     bouncer connections to **external IRC networks**, and (via the same
     abstraction) bridges to non-IRC services (Matrix, Discord, Slack).
-- **Libera.Chat compatibility** as an explicit target (§7.7): clients and
-  scripts written against Libera (Solanum ircd + Atheme services) must work
-  against e6ircd, and the BNC upstream connector must interoperate cleanly
-  with Libera as the primary external network.
+- **Libera.Chat compatibility** as an explicit target (§7.7): e6ircd matches
+  the shared Libera protocol surface, and the BNC connector targets Libera as
+  its primary external network. The client matrix records qualification limits.
 - Designed for **~100k+ concurrent connections** on one machine.
 - **Small binary, high performance**: no needless dependencies, one TLS stack,
   one async runtime, compile-time templates, feature flags for optional
@@ -197,6 +196,10 @@ These are project-wide rules, enforced in review and (where possible) CI:
   - `ConnectionEvent` — the bouncer SPI's connection-state event *cannot
     carry a line*, so a driver can't route text past the CR/LF sanitizer and
     the detached-buffer append; the bypass is a compile error, not a lint.
+  - `AttachCapability` — BNC attach capability names, state changes, `CAP LS`,
+    and `CAP LIST` derive from one closed set. An attach cannot use SASL without
+    negotiating it, and a new capability cannot be accepted but omitted from
+    discovery or state reporting.
   - `MessageKind` (PRIVMSG/NOTICE) — one type with `wire()`, `db()` and
     `is_loud()`, so the uppercase verb, the lowercase storage token, and the
     "does it auto-reply" rule cannot drift; before, the ring and the database

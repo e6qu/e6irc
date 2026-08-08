@@ -522,9 +522,11 @@ async fn bnc_listener_accepts_chunked_sasl_plain() {
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let mut sock = tokio::net::TcpStream::connect(bnc).await.unwrap();
-    sock.write_all(b"NICK alice/up\r\nUSER x 0 * :x\r\nAUTHENTICATE PLAIN\r\n")
-        .await
-        .unwrap();
+    sock.write_all(
+        b"CAP LS 302\r\nCAP REQ :sasl\r\nNICK alice/up\r\nUSER x 0 * :x\r\nAUTHENTICATE PLAIN\r\n",
+    )
+    .await
+    .unwrap();
 
     // Wait for the server's "AUTHENTICATE +" go-ahead.
     let mut b = [0u8; 2048];
