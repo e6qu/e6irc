@@ -1,8 +1,4 @@
--- Message history (DESIGN §8, §11). Starts as a single table with a
--- BRIN index on the time column; native monthly range partitions are a
--- deliberate deferral to the scale-hardening phase (PLAN.md) — the
--- write path and queries are partition-shaped already (append-only,
--- time-bounded scans).
+-- Message history with a BRIN index for time-bounded scans.
 
 CREATE TABLE messages (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

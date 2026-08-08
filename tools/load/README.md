@@ -35,9 +35,8 @@ large deployment spreads users across many channels. Measured locally
 | 1 channel     | 290 c/s  | 59k msg/s   | 131 ms      |
 | 200 channels  | 6042 c/s | 122k msg/s  | 37 ms       |
 
-The residual latency at scale is the single core worker (the N=1 case of
-the sharded design, DESIGN §7.3) serializing every channel's fan-out —
-core sharding is the open scale-hardening item.
+The residual latency at scale comes from the single core worker serializing
+every channel's fan-out.
 
 Output:
 

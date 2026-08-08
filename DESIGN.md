@@ -712,10 +712,8 @@ nontrivial optimization lands with evidence that proves it:
   is the loom-verified baseline; a padded-atomic ring (SPSC fast paths,
   seqlock reads) may replace it *if* benchmarks demand — the loom suite
   and public API are the gate any such change must pass unchanged.
-- **Build-level**: fat LTO, `codegen-units = 1` (§6); PGO and BOLT
-  evaluated in the scale-hardening phase; allocator swap
-  (mimalloc/jemalloc) decided by benchmark behind a feature flag, not by
-  fashion.
+- **Build-level**: fat LTO, `codegen-units = 1` (§6). Benchmark evidence
+  decides PGO, BOLT, and any allocator change.
 - **Measured, always**: microbenchmarks live beside hot modules; `tools/load`
   macrobenchmarks track connect rate, exact fan-out sequence membership, and
   p50/p90/p99/max latency under a controlled environment. The harness accepts
