@@ -155,15 +155,14 @@ function networkSummary(value) {
 }
 
 export function networksFrom(payload) {
-  if (
-    payload === null ||
-    typeof payload !== "object" ||
-    !Array.isArray(payload.networks) ||
-    payload.networks.some((network) => networkSummary(network) === null)
-  ) {
+  if (payload === null || typeof payload !== "object" || !Array.isArray(payload.networks)) {
     throw new ApiError(200, "The server returned an invalid network list");
   }
-  return Object.freeze(payload.networks.map(networkSummary));
+  const networks = payload.networks.map(networkSummary);
+  if (networks.some((network) => network === null)) {
+    throw new ApiError(200, "The server returned an invalid network list");
+  }
+  return Object.freeze(networks);
 }
 
 export function networkStateLabel(network) {
