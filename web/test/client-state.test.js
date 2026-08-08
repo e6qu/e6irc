@@ -105,10 +105,18 @@ test("JSON requests preserve problem details and reject malformed success bodies
 
 test("network collection validation separates an empty list from a broken contract", () => {
   assert.deepEqual(networksFrom({ networks: [] }), []);
-  assert.deepEqual(networksFrom({ networks: [{ name: "Libera", enabled: true }] }), [
-    { name: "Libera", enabled: true },
+  assert.deepEqual(networksFrom({ networks: [{ name: "Libera", enabled: true, connected: null, runtime: null }] }), [
+    { name: "Libera", enabled: true, connected: null, state: null },
   ]);
   assert.throws(() => networksFrom({ networks: [{ enabled: true }] }), /invalid network list/);
+  assert.throws(
+    () => networksFrom({ networks: [{ name: "Libera", enabled: true, connected: true, runtime: null }] }),
+    /invalid network list/,
+  );
+  assert.throws(
+    () => networksFrom({ networks: [{ name: "Libera", enabled: true, connected: false, runtime: { state: "connected" } }] }),
+    /invalid network list/,
+  );
 });
 
 test("network labels use the API's typed runtime state", () => {
@@ -118,11 +126,11 @@ test("network labels use the API's typed runtime state", () => {
     networkStateLabel({
       enabled: true,
       connected: false,
-      runtime: { state: "reconnect_backoff" },
+      state: "reconnecting",
     }),
-    "reconnect backoff",
+    "reconnecting",
   );
-  assert.equal(networkStateLabel({ enabled: true, connected: false, runtime: {} }), "starting");
+  assert.equal(networkStateLabel({ enabled: true, connected: null, state: null }), "starting");
 });
 
 test("API error messages distinguish expired sessions", () => {

@@ -7,6 +7,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
 });
 
 const THEMES = new Set(["auto", "light", "dark"]);
+const NETWORK_STATES = new Set([
+  "connecting",
+  "connected",
+  "reconnecting",
+  "authentication_failed",
+  "registration_failed",
+]);
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -31,9 +38,6 @@ function normalizeSettings(value) {
   return { settings, repaired };
 }
 
-// Load and validate browser preferences without hiding storage corruption or
-// denial. The caller owns presentation, so this pure boundary returns a
-// warning rather than touching the DOM.
 export function loadSettings(storage) {
   let raw;
   try {
@@ -63,8 +67,6 @@ export function loadSettings(storage) {
   };
 }
 
-// Persist already-normalized preferences. A null result is success; a string
-// is an actionable user-facing failure that the caller must surface.
 export function saveSettings(storage, settings) {
   try {
     resolveStorage(storage).setItem(
@@ -85,9 +87,6 @@ export class ApiError extends Error {
   }
 }
 
-// Fetch one JSON document and preserve the HTTP failure's status and
-// problem+json detail. Callers can distinguish "empty data" from "the API
-// failed" without repeating response checks at every request site.
 export async function getJson(fetcher, url) {
   const response = await fetcher(url, { headers: { Accept: "application/json" } });
   if (!response.ok) {
@@ -100,10 +99,7 @@ export async function getJson(fetcher, url) {
           : typeof problem.title === "string"
             ? problem.title
             : "";
-    } catch {
-      // The status remains authoritative when an intermediary returns HTML or
-      // an empty body; this is an explicit degraded error, not a success path.
-    }
+    } catch {}
     throw new ApiError(response.status, detail || `Request failed with HTTP ${response.status}`);
   }
   try {
@@ -113,29 +109,42 @@ export async function getJson(fetcher, url) {
   }
 }
 
+function networkSummary(value) {
+  if (value === null || typeof value !== "object") return null;
+  const { name, enabled, connected, runtime } = value;
+  if (
+    typeof name !== "string" ||
+    !name.trim() ||
+    typeof enabled !== "boolean" ||
+    (connected !== null && typeof connected !== "boolean") ||
+    (runtime !== null && (typeof runtime !== "object" || Array.isArray(runtime)))
+  ) {
+    return null;
+  }
+  if (runtime === null) {
+    return connected === null ? Object.freeze({ name, enabled, connected, state: null }) : null;
+  }
+  if (typeof runtime.state !== "string" || !NETWORK_STATES.has(runtime.state)) return null;
+  if (connected !== (runtime.state === "connected")) return null;
+  return Object.freeze({ name, enabled, connected, state: runtime.state });
+}
+
 export function networksFrom(payload) {
   if (
     payload === null ||
     typeof payload !== "object" ||
     !Array.isArray(payload.networks) ||
-    payload.networks.some(
-      (network) =>
-        network === null ||
-        typeof network !== "object" ||
-        typeof network.name !== "string" ||
-        !network.name,
-    )
+    payload.networks.some((network) => networkSummary(network) === null)
   ) {
     throw new ApiError(200, "The server returned an invalid network list");
   }
-  return payload.networks;
+  return Object.freeze(payload.networks.map(networkSummary));
 }
 
 export function networkStateLabel(network) {
   if (network.enabled === false) return "disabled";
   if (network.connected === true) return "connected";
-  const state = network.runtime?.state;
-  return typeof state === "string" ? state.replaceAll("_", " ") : "starting";
+  return network.state?.replaceAll("_", " ") || "starting";
 }
 
 export function errorMessage(action, error) {
