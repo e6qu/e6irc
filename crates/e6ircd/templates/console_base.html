@@ -84,6 +84,13 @@
       button.primary:hover, .button-link:hover { background: var(--accent-strong); }
       form.add button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
       button.danger { color: var(--off); border-color: var(--off); background: transparent; }
+      .confirm-dialog { width: min(32rem, calc(100vw - 2rem)); border: 1px solid var(--border);
+        border-radius: 0.75rem; background: var(--panel); color: var(--fg); box-shadow: var(--shadow); padding: 0; }
+      .confirm-dialog::backdrop { background: rgb(15 23 42 / 0.55); }
+      .confirm-dialog form { display: grid; gap: 1rem; padding: 1.25rem; }
+      .confirm-dialog h2 { font-size: 1.15rem; }
+      .confirm-dialog p { color: var(--muted); margin: 0; }
+      .confirm-dialog-menu { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 0.65rem; }
       form.add select { padding: 0.4rem 0.6rem; border: 1px solid var(--border);
         border-radius: 0.4rem; background: transparent; color: inherit; }
       .cell-form { display: inline; margin: 0; }
@@ -401,5 +408,15 @@
         {% block main %}{% endblock %}
       </main>
     </div>
+    <dialog class="confirm-dialog" data-console-confirm aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <form method="dialog">
+        <h2 id="confirm-title">Confirm action</h2>
+        <p id="confirm-message" data-console-confirm-message></p>
+        <div class="confirm-dialog-menu">
+          <button type="submit" value="cancel">Cancel</button>
+          <button class="danger" type="submit" value="confirm" data-console-confirm-action>Continue</button>
+        </div>
+      </form>
+    </dialog>
   </body>
 </html>

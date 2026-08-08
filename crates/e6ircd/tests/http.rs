@@ -817,6 +817,8 @@ async fn console_runtime_is_served_in_every_build() {
         "{headers}"
     );
     assert!(body.contains("dataset.confirm"), "{body}");
+    assert!(body.contains("data-console-confirm"), "{body}");
+    assert!(body.contains("showModal"), "{body}");
     assert!(body.contains("data-api-network-operations"), "{body}");
     assert!(body.contains("data-api-network-create"), "{body}");
     assert!(body.contains("data-api-oper-create"), "{body}");
@@ -1181,6 +1183,7 @@ async fn account_url_redirects_to_the_complete_account_console() {
         "{body}"
     );
     assert!(body.contains("forced-colors: active"), "{body}");
+    assert!(body.contains("data-console-confirm"), "{body}");
     assert!(
         head.to_ascii_lowercase()
             .contains("content-security-policy: default-src 'none'; script-src 'self'"),
