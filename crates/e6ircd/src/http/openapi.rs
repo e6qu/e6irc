@@ -148,6 +148,92 @@ fn document() -> serde_json::Value {
             }
         } }
     });
+    let tls_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cert_path", "key_path"],
+        "properties": {
+            "cert_path": { "type": "string" },
+            "key_path": { "type": "string" }
+        }
+    });
+    let listener_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["addr"],
+        "properties": {
+            "addr": { "type": "string" },
+            "tls": { "oneOf": [tls_schema, { "type": "null" }] },
+            "websocket": { "type": "boolean" }
+        }
+    });
+    let registration_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "before_connect": { "type": "boolean" },
+            "require_email": { "type": "boolean" }
+        }
+    });
+    let limits_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "max_connections_per_ip": { "type": ["integer", "null"], "minimum": 1 },
+            "command_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "trusted_proxies": { "type": "array", "items": { "type": "string" } },
+            "auth_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "api_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "administrator_api_rate_burst": { "type": ["integer", "null"], "minimum": 1 },
+            "registration_burst": { "type": ["integer", "null"], "minimum": 1 }
+        }
+    });
+    let observability_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "enabled": { "type": "boolean" },
+            "sample_interval_seconds": { "type": "integer", "minimum": 5, "maximum": 300 },
+            "retention_hours": { "type": "integer", "minimum": 1, "maximum": 2160 }
+        }
+    });
+    let storage_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "history_retention_days": { "type": "integer", "minimum": 1, "maximum": 3650 },
+            "audit_retention_days": { "type": "integer", "minimum": 1, "maximum": 3650 }
+        }
+    });
+    let scalar_settings_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "server_name", "network_name", "description", "motd", "nicklen", "sendq",
+            "core_queue", "max_hot_channels", "listeners", "registration", "limits",
+            "observability", "storage", "bnc_addr", "public_url", "secure_cookies",
+            "admin_accounts"
+        ],
+        "properties": {
+            "server_name": { "type": "string" },
+            "network_name": { "type": "string" },
+            "description": { "type": "string" },
+            "motd": { "type": "array", "items": { "type": "string" } },
+            "nicklen": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "sendq": { "type": "integer", "minimum": 1 },
+            "core_queue": { "type": "integer", "minimum": 1 },
+            "max_hot_channels": { "type": "integer", "minimum": 1 },
+            "listeners": { "type": "array", "items": listener_schema },
+            "registration": registration_schema,
+            "limits": limits_schema,
+            "observability": observability_schema,
+            "storage": storage_schema,
+            "bnc_addr": { "type": ["string", "null"] },
+            "public_url": { "type": ["string", "null"] },
+            "secure_cookies": { "type": "boolean" },
+            "admin_accounts": { "type": "array", "items": { "type": "string" } }
+        }
+    });
     serde_json::json!({
         "openapi": "3.1.0",
         "info": {
@@ -1107,7 +1193,7 @@ fn document() -> serde_json::Value {
                     "security": authenticated,
                     "responses": { "200": { "description": "redacted settings, revision, and runtime/bootstrap status" }, "403": { "description": "not an admin account" }, "503": { "description": "managed configuration unavailable" } } },
                 "patch": { "summary": "Update revisioned scalar managed configuration", "description": "Updates typed scalar settings while retaining OIDC, operator, and network credential collections from the current revision. A live BNC listener change is applied before persistence and rolled back if persistence fails.", "security": authenticated,
-                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": { "type": "object", "description": "Scalar managed settings; credential collections are not accepted here." } } } } } },
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["revision", "settings"], "properties": { "revision": { "type": "integer" }, "settings": scalar_settings_schema } } } } },
                     "responses": { "200": { "description": "configuration revision advanced and restart_required indicator" }, "400": { "description": "invalid settings or BNC listener" }, "403": { "description": "not an admin account" }, "409": { "description": "stale revision" }, "503": { "description": "configuration or BNC listener unavailable" } } }
             },
             "/api/v1/admin/configuration/opers": {

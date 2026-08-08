@@ -934,6 +934,43 @@ async fn openapi_spec_is_served() {
         managed_network_delete_schema["required"],
         serde_json::json!(["revision", "owner"])
     );
+    let scalar_settings_schema = &v["paths"]["/api/v1/admin/configuration"]["patch"]["requestBody"]
+        ["content"]["application/json"]["schema"]["properties"]["settings"];
+    assert_eq!(scalar_settings_schema["additionalProperties"], false);
+    assert_eq!(
+        scalar_settings_schema["required"],
+        serde_json::json!([
+            "server_name",
+            "network_name",
+            "description",
+            "motd",
+            "nicklen",
+            "sendq",
+            "core_queue",
+            "max_hot_channels",
+            "listeners",
+            "registration",
+            "limits",
+            "observability",
+            "storage",
+            "bnc_addr",
+            "public_url",
+            "secure_cookies",
+            "admin_accounts",
+        ])
+    );
+    for field in ["registration", "limits", "observability", "storage"] {
+        assert_eq!(
+            scalar_settings_schema["properties"][field]["additionalProperties"], false,
+            "{field}"
+        );
+    }
+    let listener_schema = &scalar_settings_schema["properties"]["listeners"]["items"];
+    assert_eq!(listener_schema["additionalProperties"], false);
+    assert_eq!(
+        listener_schema["properties"]["tls"]["oneOf"][0]["additionalProperties"],
+        false
+    );
     let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"];
     assert_eq!(buffer_schema["additionalProperties"], false);
