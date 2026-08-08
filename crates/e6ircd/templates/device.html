@@ -19,14 +19,16 @@
       {% endif %}
       <form method="post" action="/device" class="actions">
         <input type="hidden" name="csrf" value="{{ csrf }}" />
-        <input
-          type="text"
-          name="user_code"
-          placeholder="ABCD2345"
-          autocomplete="one-time-code"
-          autofocus
-          required
-        />
+        <label class="device-code">Device code
+          <input
+            type="text"
+            name="user_code"
+            placeholder="ABCD2345"
+            autocomplete="one-time-code"
+            autofocus
+            required
+          />
+        </label>
         <button class="primary-action" type="submit">Approve</button>
       </form>
       </section>

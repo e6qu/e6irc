@@ -5432,6 +5432,7 @@ async fn device_authorization_grant_flow() {
     .await;
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("name=\"user_code\""), "{page}");
+    assert!(page.contains("Device code"), "{page}");
     let csrf = page
         .split("name=\"csrf\" value=\"")
         .nth(1)

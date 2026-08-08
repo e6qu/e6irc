@@ -16,6 +16,7 @@ class TemplateParser(HTMLParser):
         self.path = path
         self.table_lines: list[int] = []
         self.table_has_caption: list[bool] = []
+        self.label_depth = 0
         self.errors: list[str] = []
 
     def handle_starttag(
@@ -34,8 +35,34 @@ class TemplateParser(HTMLParser):
                 f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
                 "navigation landmark has no accessible name"
             )
+        elif tag == "label":
+            self.label_depth += 1
+        elif tag in {"input", "select", "textarea"}:
+            if attributes.get("type") == "hidden":
+                return
+            if self.label_depth or any(
+                attributes.get(name) for name in ("aria-label", "aria-labelledby", "title")
+            ):
+                return
+            self.errors.append(
+                f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
+                "form control has no accessible name"
+            )
+        elif tag == "img" and "alt" not in attributes:
+            self.errors.append(
+                f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: image has no alt text"
+            )
+        elif tag == "dialog" and not (
+            attributes.get("aria-label") or attributes.get("aria-labelledby")
+        ):
+            self.errors.append(
+                f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: dialog has no accessible name"
+            )
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "label":
+            self.label_depth -= 1
+            return
         if tag != "table" or not self.table_lines:
             return
         line = self.table_lines.pop()
