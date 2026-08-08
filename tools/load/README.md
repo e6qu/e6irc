@@ -59,6 +59,8 @@ a successful qualification.
 
 `--report-json PATH` writes the versioned result contract: requested load,
 measured rates and latency, server RSS, thresholds, and pass/fail state.
+The harness rejects workloads above 100,000 clients or 10 million tracked
+messages before it allocates tasks or measurement buffers.
 
 ## Toward the 100k-connection target (DESIGN §7.3, §17)
 
