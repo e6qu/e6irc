@@ -371,7 +371,31 @@ try {
     true,
   );
   await page.setViewportSize({ width: 1280, height: 720 });
+  const profileURL = `${applicationOrigin}/api/v1/me/profile`;
+  let releaseProfile;
+  const profileReleased = new Promise((resolve) => {
+    releaseProfile = resolve;
+  });
+  let profileRequested;
+  const profileRequest = new Promise((resolve) => {
+    profileRequested = resolve;
+  });
+  await page.route(profileURL, async (route) => {
+    profileRequested();
+    await profileReleased;
+    await route.continue();
+  });
+  const profileResponse = page.waitForResponse(
+    (response) => response.url() === profileURL && response.request().method() === "GET",
+  );
   await page.goto(`${applicationOrigin}/console/account`);
+  await profileRequest;
+  const contactEmail = page.getByLabel("Email address", { exact: true });
+  await contactEmail.fill("draft-contact@example.test");
+  releaseProfile();
+  await profileResponse;
+  assert.equal(await contactEmail.inputValue(), "draft-contact@example.test");
+  await page.unroute(profileURL);
   await page.getByRole("heading", { name: "Add a local password", exact: true }).waitFor();
   await page.getByLabel("New password", { exact: true }).fill("browser-local-password");
   await page.getByLabel("Confirm new password", { exact: true }).fill("browser-local-password");

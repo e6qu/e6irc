@@ -28,6 +28,24 @@
     theme,
     notifications: typeof settings.notifications === "boolean" ? settings.notifications : false,
   });
+  const preserveFormEdits = (form) => {
+    const mark = (event) => {
+      const field = event.target;
+      if (field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement) {
+        field.dataset.apiEdited = "true";
+      }
+    };
+    form.addEventListener("input", mark);
+    form.addEventListener("change", mark);
+  };
+  const hydrateTextInput = (form, name, value) => {
+    const field = form.elements.namedItem(name);
+    if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.value = value;
+  };
+  const hydrateCheckbox = (form, name, checked) => {
+    const field = form.elements.namedItem(name);
+    if (field instanceof HTMLInputElement && field.dataset.apiEdited !== "true") field.checked = checked;
+  };
   if (consoleTheme instanceof HTMLSelectElement) {
     let theme = "auto";
     try {
@@ -1626,10 +1644,14 @@
 
   const accountContactEmail = document.querySelector("[data-api-account-contact-email]");
   if (accountContactEmail instanceof HTMLInputElement) {
+    const form = accountContactEmail.form;
+    if (form instanceof HTMLFormElement) preserveFormEdits(form);
     const refreshContactEmail = async () => {
       try {
         const profile = await apiRead("/api/v1/me/profile");
-        accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+        if (accountContactEmail.dataset.apiEdited !== "true") {
+          accountContactEmail.value = typeof profile.contact_email === "string" ? profile.contact_email : "";
+        }
       } catch (error) {
         accountLoadFailure(error, () => void refreshContactEmail());
       }
@@ -2284,13 +2306,13 @@
       ownerNetworkResult.replaceChildren(element("span", "", error instanceof Error ? error.message : "Network configuration failed to load."), retryButton(retry));
       ownerNetworkResult.className = "banner-error";
     };
+    if (form instanceof HTMLFormElement) preserveFormEdits(form);
     const render = (network) => {
       network = parseOwnerNetwork(network);
       if (network.kind !== "irc") { window.location.replace("/console/networks"); return; }
       if (ownerNetworkResult instanceof HTMLElement) { ownerNetworkResult.replaceChildren(); ownerNetworkResult.className = ""; }
-      const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
-      set("addr", network.addr); set("nick", network.nick); set("realname", typeof network.realname === "string" ? network.realname : ""); set("autojoin", network.autojoin.join(", ")); set("sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
-      const tls = form.elements.namedItem("tls"); if (tls instanceof HTMLInputElement) tls.checked = network.tls;
+      hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "realname", typeof network.realname === "string" ? network.realname : ""); hydrateTextInput(form, "autojoin", network.autojoin.join(", ")); hydrateTextInput(form, "sasl_account", typeof network.sasl_account === "string" ? network.sasl_account : "");
+      hydrateCheckbox(form, "tls", network.tls);
       form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`;
       const title = ownerNetworkEditor.querySelector("[data-network-editor-title]"); if (title) title.textContent = `Edit ${network.name}`;
       form.hidden = false;
@@ -2309,12 +2331,13 @@
   if (ownerBridgeEditor instanceof HTMLElement) {
     const name = ownerBridgeEditor.dataset.networkName || "";
     const form = ownerBridgeEditor.querySelector("[data-api-owner-bridge-update]");
-    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
+    if (!name || !(form instanceof HTMLFormElement)) setOwnerNetworkResult("This bridge editor has no resource ID. Return to integrations and try again.", false); else {
+      preserveFormEdits(form);
+      void apiRead(`/api/v1/me/networks/${encodeURIComponent(name)}`)
       .then((network) => {
         network = parseOwnerNetwork(network);
         if (!["matrix", "discord", "slack"].includes(network.kind)) { window.location.replace("/console/integrations"); return; }
-        const set = (field, value) => { const input = form.elements.namedItem(field); if (input instanceof HTMLInputElement) input.value = value; };
-        set("addr", network.addr); set("nick", network.nick); set("autojoin", network.autojoin.join(", "));
+        hydrateTextInput(form, "addr", network.addr); hydrateTextInput(form, "nick", network.nick); hydrateTextInput(form, "autojoin", network.autojoin.join(", "));
         const nick = ownerBridgeEditor.querySelector("[data-bridge-nick]"); if (nick instanceof HTMLElement) nick.hidden = !network.nick;
         const account = ownerBridgeEditor.querySelector("[data-bridge-account]"); if (account instanceof HTMLElement) account.hidden = network.kind !== "slack";
         const accountStatus = ownerBridgeEditor.querySelector("[data-bridge-account-status]"); if (accountStatus) accountStatus.textContent = network.has_sasl_account === true ? "A token is stored. Leave blank to keep it." : "No token is stored; enter one before saving.";
@@ -2324,6 +2347,7 @@
         form.action = `/api/v1/me/networks/${encodeURIComponent(network.name)}`; form.hidden = false;
       })
       .catch((error) => setOwnerNetworkResult(error instanceof Error ? error.message : "Bridge configuration failed to load.", false));
+    }
   }
 
   // The network-list fragment is replaced during live refreshes, so lifecycle
