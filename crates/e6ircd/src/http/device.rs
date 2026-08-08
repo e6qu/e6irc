@@ -2033,9 +2033,7 @@ pub(super) async fn logout_sso(
         )
             .into_response();
     };
-    // Bind this destructive GET to the session's CSRF token, so a cross-site
-    // top-level navigation can't force-logout the victim. RP-initiated OIDC
-    // logout must stay a GET navigation, so the token rides the query string.
+    // Require CSRF for this destructive GET; OIDC logout uses query parameters.
     if !query
         .csrf
         .as_deref()
@@ -2043,26 +2041,22 @@ pub(super) async fn logout_sso(
     {
         return problem(StatusCode::FORBIDDEN, "Invalid or missing CSRF token", None);
     }
-    let (id_token, provider) = match crate::db::session_logout_hint(pool, &token).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("http: logout hint lookup failed: {e}");
-            return problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Session storage failed",
-                None,
-            );
-        }
-    };
+    let crate::db::SessionLogoutHint { id_token, provider } =
+        match crate::db::session_logout_hint(pool, &token).await {
+            Ok(hint) => hint,
+            Err(e) => {
+                eprintln!("http: logout hint lookup failed: {e}");
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session storage failed",
+                    None,
+                );
+            }
+        };
     let provider_config = provider
         .as_deref()
         .and_then(|name| state.oidc_providers.iter().find(|p| p.name == name));
-    // Coordinated logout is all-or-nothing *by design*: if the upstream provider
-    // session cannot be ended too, this fails loudly (503) and preserves BOTH
-    // the local and upstream sessions rather than tearing down the local one
-    // while silently leaving the user signed in at the identity provider. The
-    // loud failure lets the user act on it; `oidc_logout_without_end_session_...`
-    // pins this contract (a failed logout keeps /me at 200).
+    // Keep both sessions when coordinated logout cannot end the upstream session.
     let location = match (id_token, provider, provider_config) {
         (Some(hint), Some(_), Some(provider)) => {
             let Some(endpoint) = provider.end_session_endpoint.as_deref() else {
