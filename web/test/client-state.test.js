@@ -80,7 +80,8 @@ test("JSON requests preserve problem details and reject malformed success bodies
       async () => ({
         ok: false,
         status: 503,
-        json: async () => ({ title: "Database unavailable" }),
+        headers: new Headers(),
+        text: async () => '{"title":"Database unavailable"}',
       }),
       "/api/v1/me/networks",
     ),
@@ -95,13 +96,42 @@ test("JSON requests preserve problem details and reject malformed success bodies
       async () => ({
         ok: true,
         status: 200,
-        json: async () => {
-          throw new SyntaxError("bad json");
-        },
+        headers: new Headers(),
+        text: async () => "not JSON",
       }),
       "/api/v1/me",
     ),
     /invalid JSON/,
+  );
+});
+
+test("JSON requests reject oversized API responses before parsing", async () => {
+  await assert.rejects(
+    getJson(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": "1048577" }),
+        text: async () => {
+          throw new Error("must not read an oversized response");
+        },
+      }),
+      "/api/v1/me",
+    ),
+    /too large/,
+  );
+
+  await assert.rejects(
+    getJson(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        text: async () => `"${"€".repeat(524289)}"`,
+      }),
+      "/api/v1/me",
+    ),
+    /too large/,
   );
 });
 

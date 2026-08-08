@@ -181,7 +181,7 @@
       throw new Error("The API response is too large. Reload and try again.");
     }
     const text = await response.text();
-    if (text.length > MAX_API_JSON_BYTES) {
+    if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
       throw new Error("The API response is too large. Reload and try again.");
     }
     return text;

@@ -25,6 +25,7 @@ const IDENTITY_KEYS = new Set([
 ]);
 const NETWORK_LIST_KEYS = new Set(["networks"]);
 const BACKLOG_KEYS = new Set(["lines"]);
+const MAX_API_JSON_BYTES = 1024 * 1024;
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -98,12 +99,28 @@ export class ApiError extends Error {
   }
 }
 
+async function apiJson(response) {
+  const length = Number(response.headers.get("content-length"));
+  if (Number.isFinite(length) && length > MAX_API_JSON_BYTES) {
+    throw new ApiError(response.status, "The API response is too large. Reload and try again.");
+  }
+  const text = await response.text();
+  if (new TextEncoder().encode(text).byteLength > MAX_API_JSON_BYTES) {
+    throw new ApiError(response.status, "The API response is too large. Reload and try again.");
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ApiError(response.status, "The API response contains invalid JSON. Reload and try again.");
+  }
+}
+
 export async function getJson(fetcher, url) {
   const response = await fetcher(url, { headers: { Accept: "application/json" } });
   if (!response.ok) {
     let detail = "";
     try {
-      const problem = await response.json();
+      const problem = await apiJson(response);
       detail =
         typeof problem.detail === "string"
           ? problem.detail
@@ -113,11 +130,7 @@ export async function getJson(fetcher, url) {
     } catch {}
     throw new ApiError(response.status, detail || `Request failed with HTTP ${response.status}`);
   }
-  try {
-    return await response.json();
-  } catch {
-    throw new ApiError(response.status, "The server returned invalid JSON");
-  }
+  return apiJson(response);
 }
 
 function optionalString(value) {
