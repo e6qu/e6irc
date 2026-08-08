@@ -99,11 +99,11 @@ must name a new directory; it creates one JSON result per client count.
 
 `qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`
 and `host.txt`. It rejects a non-e6ircd PID, insufficient file-descriptor
-limits, ephemeral-port capacity, or listen backlog before it starts. It is a
-single-load-host tool; its client count cannot exceed that host's ephemeral
-port range or the harness workload limit. Its output directory must not exist,
-so it cannot overwrite prior evidence. `--report-json` also refuses an
-existing file.
+limits, a target listener owned by another process, ephemeral-port capacity,
+or listen backlog before it starts. It is a single-load-host tool; its client
+count cannot exceed that host's ephemeral port range or the harness workload
+limit. Its output directory must not exist, so it cannot overwrite prior
+evidence. `--report-json` also refuses an existing file.
 
 ```
 tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 20000 200 20 results/20000 \
