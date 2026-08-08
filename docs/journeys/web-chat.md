@@ -51,9 +51,9 @@ labels.
 REST-failure, network-creation, and authenticated WebSocket states are
 browser-tested against a real daemon. The same journey verifies the semantic
 conversation and member controls plus the skip-to-chat focus target. Focused
-client-state fixtures cover empty, populated, unavailable, expired-session,
-and forced-colors picker states with visual and axe checks. The primary entry
-journey uses the real network catalog and attachment.
+client-state fixtures cover malformed identity, empty, populated, unavailable,
+expired-session, and forced-colors picker states with visual and axe checks.
+The primary entry journey uses the real network catalog and attachment.
 
 ## Receive replay and live messages without gaps or duplicates
 
