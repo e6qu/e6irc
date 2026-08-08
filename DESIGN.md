@@ -305,9 +305,8 @@ These are project-wide rules, enforced in review and (where possible) CI:
     from the open-time `MonoMillis`, never `MonoMillis(0)`. Because the mono
     clock's epoch is process start, a zero is indistinguishable from a real early
     reading, so a `now − 0 = uptime` computation misbehaves in the first moments
-    of uptime — the class that flood-killed fresh clients (sweep 79). Seeding
-    from the open time removes the sentinel so the class cannot recur on a new
-    watermark field.
+    of uptime. Seeding from the open time removes the sentinel so the class
+    cannot recur on a new watermark field.
   - `bridge_send` — every reverse-direction (IRC→upstream) bridge HTTP send
     whose failure is an HTTP status funnels through one checked helper that
     rejects a non-2xx. The raw `reqwest::Response` from a bare `.send()` never
@@ -362,9 +361,9 @@ holding the router, `AppState`, the extractors and the shared response helpers.
 The core worker's command handling lives in
 `core/handler/`, one module per command family — registration, sasl, services,
 channel, message, chanops, query, history, monitor, read_marker, oper — with
-`mod.rs` holding dispatch and the helpers they share. It was a single 6,400-line
-file until sweep 26; the split is by *what a command does*, so the module a
-change belongs in follows from the command being changed. Submodules reach
+`mod.rs` holding dispatch and the helpers they share. The split is by *what a
+command does*, so the module a change belongs in follows from the command being
+changed. Submodules reach
 shared helpers through `use super::*`, and items crossing a module boundary are
 `pub(super)`, which keeps the dead-code guard able to see unused ones.
 
