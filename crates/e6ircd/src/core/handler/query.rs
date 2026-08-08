@@ -96,10 +96,15 @@ pub(super) fn who_flags(session: &crate::core::state::Session, sigil: &str) -> S
     format!("{here}{star}{bot}{sigil}")
 }
 
-/// One channel-WHO row, materialized so the `Session` borrow is released
-/// before the reply is sent: (user, host, nick, flags, realname, account,
-/// idle seconds).
-pub(super) type WhoRowData = (String, String, String, String, String, Option<String>, u64);
+struct WhoRowData {
+    user: String,
+    host: String,
+    nick: String,
+    flags: String,
+    realname: String,
+    account: Option<String>,
+    idle_secs: u64,
+}
 
 pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some(&mask) = p.first() else {
@@ -151,20 +156,19 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             (false, true, _) => "+",
                             _ => "",
                         };
-                        (
-                            s.user().map(String::from).expect("registered"),
-                            s.host.clone(),
-                            s.nick().map(String::from).expect("registered"),
-                            who_flags(s, sigil),
-                            s.realname().map(String::from).expect("registered"),
-                            s.account.clone(),
-                            // The clock is milliseconds; WHOX `l` is seconds.
-                            now.saturating_sub(s.last_active).as_secs(),
-                        )
+                        WhoRowData {
+                            user: s.user().map(String::from).expect("registered"),
+                            host: s.host.clone(),
+                            nick: s.nick().map(String::from).expect("registered"),
+                            flags: who_flags(s, sigil),
+                            realname: s.realname().map(String::from).expect("registered"),
+                            account: s.account.clone(),
+                            idle_secs: now.saturating_sub(s.last_active).as_secs(),
+                        }
                     })
                     .collect()
             };
-            for (user, host, nick, flags, realname, account, idle_secs) in rows {
+            for row in rows {
                 match &whox {
                     Some(req) => send_whox_row(
                         state,
@@ -172,21 +176,23 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                         req,
                         &WhoxRow {
                             channel: &display,
-                            user: &user,
-                            host: &host,
+                            user: &row.user,
+                            host: &row.host,
                             server: &server,
-                            nick: &nick,
-                            flags: &flags,
-                            account: account.as_deref(),
-                            realname: &realname,
-                            idle_secs,
+                            nick: &row.nick,
+                            flags: &row.flags,
+                            account: row.account.as_deref(),
+                            realname: &row.realname,
+                            idle_secs: row.idle_secs,
                         },
                     ),
                     None => state.numeric(
                         conn,
                         RPL_WHOREPLY,
-                        &[&display, &user, &host, &server, &nick, &flags],
-                        Some(&format!("0 {realname}")),
+                        &[
+                            &display, &row.user, &row.host, &server, &row.nick, &row.flags,
+                        ],
+                        Some(&format!("0 {}", row.realname)),
                     ),
                 }
             }
@@ -228,16 +234,15 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             .collect();
         for peer in targets {
             let s = &state.sessions[&peer];
-            let (user, host, nick, realname, account, flags, idle_secs) = (
-                s.user().map(String::from).expect("registered"),
-                s.host.clone(),
-                s.nick().map(String::from).expect("registered"),
-                s.realname().map(String::from).expect("registered"),
-                s.account.clone(),
-                who_flags(s, ""),
-                // The clock is milliseconds; WHOX `l` is seconds.
-                now.saturating_sub(s.last_active).as_secs(),
-            );
+            let row = WhoRowData {
+                user: s.user().map(String::from).expect("registered"),
+                host: s.host.clone(),
+                nick: s.nick().map(String::from).expect("registered"),
+                realname: s.realname().map(String::from).expect("registered"),
+                account: s.account.clone(),
+                flags: who_flags(s, ""),
+                idle_secs: now.saturating_sub(s.last_active).as_secs(),
+            };
             match &whox {
                 Some(req) => send_whox_row(
                     state,
@@ -245,21 +250,21 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     req,
                     &WhoxRow {
                         channel: "*",
-                        user: &user,
-                        host: &host,
+                        user: &row.user,
+                        host: &row.host,
                         server: &server,
-                        nick: &nick,
-                        flags: &flags,
-                        account: account.as_deref(),
-                        realname: &realname,
-                        idle_secs,
+                        nick: &row.nick,
+                        flags: &row.flags,
+                        account: row.account.as_deref(),
+                        realname: &row.realname,
+                        idle_secs: row.idle_secs,
                     },
                 ),
                 None => state.numeric(
                     conn,
                     RPL_WHOREPLY,
-                    &["*", &user, &host, &server, &nick, &flags],
-                    Some(&format!("0 {realname}")),
+                    &["*", &row.user, &row.host, &server, &row.nick, &row.flags],
+                    Some(&format!("0 {}", row.realname)),
                 ),
             }
         }

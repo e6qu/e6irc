@@ -670,7 +670,7 @@ pub struct AccountInvitationRow {
     pub expires_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct AccountInvitationPreview {
     pub account_name: String,
     pub administrator: bool,
@@ -868,23 +868,16 @@ pub async fn account_invitation_preview(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<AccountInvitationPreview>, DbError> {
-    let row: Option<(String, bool, String)> = sqlx::query_as(
+    sqlx::query_as(
         "SELECT account_name, administrator,
-                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS expires_at
          FROM account_invitations
          WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()",
     )
     .bind(token_hash(token))
     .fetch_optional(pool)
     .await
-    .map_err(DbError::Query)?;
-    Ok(row.map(
-        |(account_name, administrator, expires_at)| AccountInvitationPreview {
-            account_name,
-            administrator,
-            expires_at,
-        },
-    ))
+    .map_err(DbError::Query)
 }
 
 /// Consume an invitation and create its account/password in one transaction.
@@ -895,9 +888,17 @@ pub async fn accept_account_invitation(
 ) -> Result<String, DbError> {
     let hash = hash_password(password.to_string()).await?;
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    type Invitation = (i64, String, String, Option<String>, bool);
+    #[derive(sqlx::FromRow)]
+    struct Invitation {
+        id: i64,
+        name: String,
+        folded: String,
+        contact_email: Option<String>,
+        administrator: bool,
+    }
+
     let invitation: Option<Invitation> = sqlx::query_as(
-        "SELECT id, account_name, name_folded, contact_email, administrator
+        "SELECT id, account_name AS name, name_folded AS folded, contact_email, administrator
          FROM account_invitations
          WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now()
          FOR UPDATE",
@@ -906,7 +907,14 @@ pub async fn accept_account_invitation(
     .fetch_optional(&mut *transaction)
     .await
     .map_err(DbError::Query)?;
-    let Some((invitation_id, name, folded, contact_email, administrator)) = invitation else {
+    let Some(Invitation {
+        id: invitation_id,
+        name,
+        folded,
+        contact_email,
+        administrator,
+    }) = invitation
+    else {
         return Err(DbError::InvitationUnavailable);
     };
     lock_account_name(&mut transaction, &folded).await?;
@@ -1117,7 +1125,11 @@ pub async fn delete_account_permanently(
 ) -> Result<Option<AccountDeletionTarget>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let Some((name, folded, flags)) = lock_account_state(&mut transaction, account_id).await?
+    let Some(LockedAccountState {
+        name,
+        folded,
+        flags,
+    }) = lock_account_state(&mut transaction, account_id).await?
     else {
         return Ok(None);
     };
@@ -1271,17 +1283,24 @@ pub struct AccountAuthorityChange {
     pub administrator: bool,
 }
 
-type LockedAccountState = (String, String, i64);
+#[derive(sqlx::FromRow)]
+struct LockedAccountState {
+    name: String,
+    folded: String,
+    flags: i64,
+}
 
 async fn lock_account_state(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: i64,
 ) -> Result<Option<LockedAccountState>, DbError> {
-    sqlx::query_as("SELECT name, name_folded, flags FROM accounts WHERE id = $1 FOR UPDATE")
-        .bind(account_id)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(DbError::Query)
+    sqlx::query_as(
+        "SELECT name, name_folded AS folded, flags FROM accounts WHERE id = $1 FOR UPDATE",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Query)
 }
 
 /// Preserve the system-wide invariant that an account mutation cannot remove
@@ -1361,7 +1380,11 @@ pub async fn set_account_administrator(
 ) -> Result<Option<AccountAuthorityChange>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let Some((name, folded, flags)) = lock_account_state(&mut transaction, account_id).await?
+    let Some(LockedAccountState {
+        name,
+        folded,
+        flags,
+    }) = lock_account_state(&mut transaction, account_id).await?
     else {
         return Ok(None);
     };
@@ -1411,7 +1434,11 @@ pub async fn set_account_suspended(
 ) -> Result<Option<AccountStateChange>, DbError> {
     let actor_folded = CaseMapping::Rfc1459.casefold(actor);
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
-    let Some((name, folded, flags)) = lock_account_state(&mut transaction, account_id).await?
+    let Some(LockedAccountState {
+        name,
+        folded,
+        flags,
+    }) = lock_account_state(&mut transaction, account_id).await?
     else {
         return Ok(None);
     };
@@ -2809,25 +2836,43 @@ async fn query_between_selectors(
     limit: usize,
 ) -> Result<Vec<crate::core::HistoryRow>, sqlx::Error> {
     use crate::core::SelectorBound;
-    // Resolve a selector to `(ts_ms, ordering_id, is_timestamp)`. A missing msgid
-    // is `None` → the whole window is empty.
+    struct HistoryMarker {
+        ts_millis: i64,
+        id: i64,
+        is_timestamp: bool,
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct HistoryMarkerRow {
+        ts_millis: i64,
+        id: i64,
+    }
+
     async fn marker(
         pool: &PgPool,
         target: &str,
         b: &SelectorBound,
-    ) -> Result<Option<(i64, i64, bool)>, sqlx::Error> {
+    ) -> Result<Option<HistoryMarker>, sqlx::Error> {
         match b {
-            SelectorBound::Timestamp(t) => Ok(Some((t.as_millis() as i64, 0, true))),
+            SelectorBound::Timestamp(t) => Ok(Some(HistoryMarker {
+                ts_millis: t.as_millis() as i64,
+                id: 0,
+                is_timestamp: true,
+            })),
             SelectorBound::Msgid(m) => {
-                let row: Option<(i64, i64)> = sqlx::query_as(
-                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint, id \
+                let row: Option<HistoryMarkerRow> = sqlx::query_as(
+                    "SELECT (EXTRACT(EPOCH FROM ts) * 1000)::bigint AS ts_millis, id \
                      FROM messages WHERE msgid = $1 AND target = $2",
                 )
                 .bind(m)
                 .bind(target)
                 .fetch_optional(pool)
                 .await?;
-                Ok(row.map(|(ts, id)| (ts, id, false)))
+                Ok(row.map(|row| HistoryMarker {
+                    ts_millis: row.ts_millis,
+                    id: row.id,
+                    is_timestamp: false,
+                }))
             }
         }
     }
@@ -2845,13 +2890,27 @@ async fn query_between_selectors(
     };
     // Order the two pivots; the first selector being the newer bound means the
     // `limit` cuts from the newest end (CHATHISTORY walks first → second).
-    let newest_first = (m1.0, m1.1) > (m2.0, m2.1);
+    let newest_first = (m1.ts_millis, m1.id) > (m2.ts_millis, m2.id);
     let (older, newer) = if newest_first { (m2, m1) } else { (m1, m2) };
     // Lower bound (strictly after the older pivot): a timestamp uses id = MAX so
     // `(ts,id) > (T, MAX)` is `ts > T`. Upper bound (strictly before the newer
     // pivot): a timestamp uses id = MIN so `(ts,id) < (T, MIN)` is `ts < T`.
-    let (lo_ts, lo_id) = (older.0, if older.2 { i64::MAX } else { older.1 });
-    let (hi_ts, hi_id) = (newer.0, if newer.2 { i64::MIN } else { newer.1 });
+    let (lo_ts, lo_id) = (
+        older.ts_millis,
+        if older.is_timestamp {
+            i64::MAX
+        } else {
+            older.id
+        },
+    );
+    let (hi_ts, hi_id) = (
+        newer.ts_millis,
+        if newer.is_timestamp {
+            i64::MIN
+        } else {
+            newer.id
+        },
+    );
     let sql = if newest_first {
         history_select!(
             "WHERE target = $1 \
