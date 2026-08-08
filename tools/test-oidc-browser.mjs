@@ -744,13 +744,44 @@ try {
     await page.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches),
     true,
   );
+  const monitoringURL = `${applicationOrigin}/api/v1/admin/monitoring?minutes=60`;
+  let releaseInitialMonitoring;
+  const initialMonitoringReleased = new Promise((resolve) => {
+    releaseInitialMonitoring = resolve;
+  });
+  let initialMonitoringSeen;
+  const initialMonitoringRequest = new Promise((resolve) => {
+    initialMonitoringSeen = resolve;
+  });
+  let queuedMonitoringSeen;
+  const queuedMonitoringRequest = new Promise((resolve) => {
+    queuedMonitoringSeen = resolve;
+  });
+  let monitoringRequests = 0;
+  await page.route(monitoringURL, async (route) => {
+    monitoringRequests += 1;
+    if (monitoringRequests === 1) {
+      initialMonitoringSeen();
+      await initialMonitoringReleased;
+    } else if (monitoringRequests === 2) {
+      queuedMonitoringSeen();
+    }
+    await route.continue();
+  });
   const monitoringRead = page.waitForResponse(
     (response) =>
-      response.url() === `${applicationOrigin}/api/v1/admin/monitoring?minutes=60` &&
+      response.url() === monitoringURL &&
       response.request().method() === "GET",
   );
   await page.goto(`${applicationOrigin}/console/monitoring`);
+  await initialMonitoringRequest;
+  const refreshMonitoring = page.getByRole("button", { name: "Refresh", exact: true });
+  await refreshMonitoring.click();
+  await refreshMonitoring.click();
+  releaseInitialMonitoring();
   assert.equal((await monitoringRead).status(), 200);
+  await queuedMonitoringRequest;
+  assert.equal(monitoringRequests, 2, "overlapping refreshes must coalesce to one queued request");
   await page.getByRole("heading", { name: "Monitoring", exact: true }).waitFor();
   await page.getByRole("heading", { name: "Queue pressure", exact: true }).waitFor();
   await page.getByText("Live data refreshed.", { exact: true }).waitFor();
@@ -759,6 +790,7 @@ try {
     "none",
     "reduced motion must disable the live-status pulse",
   );
+  await page.unroute(monitoringURL);
   const runtimeQueues = page.locator("section").filter({
     has: page.getByRole("heading", { name: "Runtime queues", exact: true }),
   });

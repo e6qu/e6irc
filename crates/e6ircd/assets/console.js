@@ -6,6 +6,7 @@
   const consoleThemeResult = document.querySelector("[data-console-theme-result]");
   const confirmationDialog = document.querySelector("[data-console-confirm]");
   const confirmationMessage = document.querySelector("[data-console-confirm-message]");
+  const panelRefreshers = new WeakMap();
   let pendingConfirmation = null;
   const showConsoleThemeResult = (message) => {
     if (consoleThemeResult) consoleThemeResult.textContent = message;
@@ -166,11 +167,8 @@
     button.addEventListener("click", () => {
       const panel = document.querySelector(button.dataset.refreshTarget);
       if (!panel) return;
-      if (panel.matches("[data-api-admin-monitoring]")) {
-        void refreshMonitoring(panel);
-      } else if (panel.matches("[data-api-network-operations]")) {
-        void refreshNetworkOperations(panel);
-      }
+      const refresh = panelRefreshers.get(panel);
+      if (refresh) void refresh(true);
     });
   }
 
@@ -254,6 +252,27 @@
       throw new Error(`The ${label} response is invalid. Reload and try again.`);
     }
     return value[field];
+  };
+
+  const serializeRefresh = (refresh, reportQueued) => {
+    let running = false;
+    let queued = false;
+    return async (announceQueue = false) => {
+      if (running) {
+        queued = true;
+        if (announceQueue) reportQueued();
+        return;
+      }
+      running = true;
+      try {
+        do {
+          queued = false;
+          await refresh();
+        } while (queued);
+      } finally {
+        running = false;
+      }
+    };
   };
 
   const element = (name, className, text) => {
@@ -421,7 +440,7 @@
     panel.replaceChildren(fragment);
   };
 
-  const refreshMonitoring = async (panel) => {
+  const refreshMonitoringNow = async (panel) => {
     const status = document.getElementById(panel.dataset.refreshStatus);
     panel.setAttribute("aria-busy", "true");
     if (status) {
@@ -446,10 +465,18 @@
   };
 
   for (const panel of document.querySelectorAll("[data-api-admin-monitoring]")) {
-    void refreshMonitoring(panel);
+    const refresh = serializeRefresh(
+      () => refreshMonitoringNow(panel),
+      () => {
+        const status = document.getElementById(panel.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(panel, refresh);
+    void refresh();
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => void refreshMonitoring(panel), seconds * 1000);
+      window.setInterval(() => void refresh(), seconds * 1000);
     }
   }
 
@@ -514,7 +541,7 @@
     panel.replaceChildren(fragment);
   };
 
-  const refreshNetworkOperations = async (panel) => {
+  const refreshNetworkOperationsNow = async (panel) => {
     const status = document.getElementById(panel.dataset.refreshStatus);
     panel.setAttribute("aria-busy", "true");
     if (status) {
@@ -539,10 +566,18 @@
   };
 
   for (const panel of document.querySelectorAll("[data-api-network-operations]")) {
-    void refreshNetworkOperations(panel);
+    const refresh = serializeRefresh(
+      () => refreshNetworkOperationsNow(panel),
+      () => {
+        const status = document.getElementById(panel.dataset.refreshStatus);
+        if (status) status.textContent = "Refresh queued.";
+      },
+    );
+    panelRefreshers.set(panel, refresh);
+    void refresh();
     const seconds = Number(panel.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
-      window.setInterval(() => void refreshNetworkOperations(panel), seconds * 1000);
+      window.setInterval(() => void refresh(), seconds * 1000);
     }
   }
 
@@ -2038,7 +2073,7 @@
     if (ownerNetworkCount) ownerNetworkCount.textContent = "—";
     tableLoadFailure(previous, 7, error, retry);
   };
-  const refreshOwnerNetworks = async () => {
+  const refreshOwnerNetworksNow = async () => {
     if (!(ownerNetworkRows instanceof HTMLElement)) return;
     ownerNetworkRows.setAttribute("aria-busy", "true");
     if (ownerNetworkRefreshStatus) {
@@ -2050,7 +2085,7 @@
       renderOwnerNetworks(apiCollection(result, "networks", "network directory"));
       if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Live data refreshed.";
     } catch (error) {
-      renderOwnerNetworkFailure(error, () => void refreshOwnerNetworks());
+      renderOwnerNetworkFailure(error, () => void refreshOwnerNetworks(true));
       if (ownerNetworkRefreshStatus) {
         ownerNetworkRefreshStatus.textContent = "Live refresh failed. Retry is available in the network list.";
         ownerNetworkRefreshStatus.classList.add("refresh-error");
@@ -2060,6 +2095,12 @@
     }
   };
   if (ownerNetworkRows instanceof HTMLElement) {
+    const refreshOwnerNetworks = serializeRefresh(
+      refreshOwnerNetworksNow,
+      () => {
+        if (ownerNetworkRefreshStatus) ownerNetworkRefreshStatus.textContent = "Refresh queued.";
+      },
+    );
     void refreshOwnerNetworks();
     const seconds = Number(ownerNetworkRows.dataset.refreshSeconds);
     if (Number.isFinite(seconds) && seconds >= 5) {
