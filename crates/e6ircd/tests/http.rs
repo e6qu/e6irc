@@ -877,6 +877,13 @@ async fn openapi_spec_is_served() {
             "registration_failed",
         ])
     );
+    let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"];
+    assert_eq!(buffer_schema["additionalProperties"], false);
+    assert_eq!(
+        buffer_schema["properties"]["lines"]["items"]["type"],
+        "string"
+    );
     // Method/path completeness is enforced mechanically by the route catalog's
     // unit test. These assertions protect the richer request-schema contract
     // that cannot be inferred from an axum handler.

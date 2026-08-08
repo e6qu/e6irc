@@ -49,6 +49,13 @@ fn document() -> serde_json::Value {
             }
         } } }
     });
+    let buffer_response = serde_json::json!({
+        "200": { "description": "buffered lines", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["lines"], "additionalProperties": false,
+                "properties": { "lines": { "type": "array", "items": { "type": "string" } } }
+            }
+        } } }
+    });
     let channel_name_parameter = serde_json::json!([
         { "name": "name", "in": "path", "required": true,
             "schema": { "type": "string" } }
@@ -828,7 +835,7 @@ fn document() -> serde_json::Value {
                             "schema": { "type": "string" } },
                         { "name": "limit", "in": "query", "required": false,
                             "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } }],
-                    "responses": { "200": { "description": "buffered lines" },
+                    "responses": { "200": buffer_response["200"],
                         "400": { "description": "limit outside 1–1000" },
                         "404": { "description": "no such network" } } }
             },
