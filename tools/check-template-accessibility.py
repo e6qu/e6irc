@@ -3,6 +3,7 @@
 
 from html.parser import HTMLParser
 from pathlib import Path
+import re
 import sys
 
 
@@ -35,6 +36,12 @@ class TemplateParser(HTMLParser):
                 f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
                 "navigation landmark has no accessible name"
             )
+        elif tag == "div" and "scroll" in attributes.get("class", "").split():
+            if attributes.get("tabindex") != "0" or not attributes.get("aria-label"):
+                self.errors.append(
+                    f"{self.path.relative_to(ROOT)}:{self.getpos()[0]}: "
+                    "scroll region must be focusable and named"
+                )
         elif tag == "label":
             self.label_depth += 1
         elif tag in {"input", "select", "textarea"}:
@@ -85,12 +92,18 @@ def main() -> int:
     files = sorted(TEMPLATES.glob("*.html"))
     for path in files:
         parser = TemplateParser(path)
+        source = path.read_text(encoding="utf-8")
         try:
-            parser.feed(path.read_text(encoding="utf-8"))
+            parser.feed(source)
             parser.close()
         except Exception as error:
             errors.append(f"{path.relative_to(ROOT)}: parse failed: {error}")
         errors.extend(parser.finish())
+        for match in re.finditer(r"<th(?:\s[^>]*)?>\s*</th>", source):
+            line = source.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"{path.relative_to(ROOT)}:{line}: table header has no accessible name"
+            )
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

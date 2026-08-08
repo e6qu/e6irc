@@ -98,11 +98,11 @@
           </div>
           <span class="count" id="owner-network-count">…</span>
         </div>
-        <div class="scroll" id="network-rows" data-api-owner-network-list data-csrf="{{ shell.csrf }}" data-refresh-seconds="10" data-refresh-status="network-rows-status">
+        <div class="scroll" id="network-rows" tabindex="0" aria-label="Configured networks" data-api-owner-network-list data-csrf="{{ shell.csrf }}" data-refresh-seconds="10" data-refresh-status="network-rows-status">
           <table>
             <caption class="sr-only">Configured networks</caption>
             <thead>
-              <tr><th>Status</th><th>Name</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th></th></tr>
+              <tr><th>Status</th><th>Name</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th>Actions</th></tr>
             </thead>
             <tbody><tr><td colspan="7" class="empty">Loading configured networks…</td></tr></tbody>
           </table>

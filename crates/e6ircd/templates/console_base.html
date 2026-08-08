@@ -7,20 +7,20 @@
     <title>e6irc — console</title>
     <script src="/console.js" defer></script>
     <style>
-      :root { color-scheme: light dark; --border: #d9dde3; --muted: #5b6470; --accent: #2563eb;
+      :root { color-scheme: light dark; --border: #d9dde3; --muted: #58616d; --accent: #2563eb;
         --accent-strong: #1d4ed8; --bg: #f5f7fa; --fg: #16181d; --panel: #fff;
         --panel-subtle: #f9fafb; --ok: #168447; --off: #b33434; --warn: #d97706; --info: #245ea8;
-        --violet: #7c3aed;
+        --violet: #7c3aed; --accent-text: #fff;
         --shadow: 0 1px 2px rgb(15 23 42 / 0.05), 0 8px 24px rgb(15 23 42 / 0.04); }
       @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --accent: #60a5fa; --accent-strong: #93c5fd; --border: #262b33; --muted: #9aa3b1;
         --bg: #0d1015; --fg: #e6e8ec; --panel: #151920; --panel-subtle: #11151b;
         --ok: #3fbf72; --off: #e06666; --warn: #f3a93b; --info: #78aaf2;
-        --violet: #a78bfa;
+        --violet: #a78bfa; --accent-text: #0d1015;
         --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 30px rgb(0 0 0 / 0.18); } }
       :root[data-theme="dark"] { --accent: #60a5fa; --accent-strong: #93c5fd; --border: #262b33; --muted: #9aa3b1;
         --bg: #0d1015; --fg: #e6e8ec; --panel: #151920; --panel-subtle: #11151b;
         --ok: #3fbf72; --off: #e06666; --warn: #f3a93b; --info: #78aaf2;
-        --violet: #a78bfa;
+        --violet: #a78bfa; --accent-text: #0d1015;
         --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 30px rgb(0 0 0 / 0.18); }
       * { box-sizing: border-box; }
       .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
@@ -79,10 +79,10 @@
       :is(a, button, input, select, textarea, summary):focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 58%, transparent); outline-offset: 2px; }
       button:disabled, input:disabled, select:disabled, textarea:disabled { cursor: not-allowed; opacity: 0.62; }
       button:hover, .button-link:hover { border-color: var(--accent); }
-      button.primary, .button-link { background: var(--accent); color: #fff; border-color: var(--accent);
+      button.primary, .button-link { background: var(--accent); color: var(--accent-text); border-color: var(--accent);
         font-weight: 650; text-decoration: none; }
       button.primary:hover, .button-link:hover { background: var(--accent-strong); }
-      form.add button { background: var(--accent); color: #fff; border: none; font-weight: 600; }
+      form.add button { background: var(--accent); color: var(--accent-text); border: none; font-weight: 600; }
       button.danger { color: var(--off); border-color: var(--off); background: transparent; }
       .confirm-dialog { width: min(32rem, calc(100vw - 2rem)); border: 1px solid var(--border);
         border-radius: 0.75rem; background: var(--panel); color: var(--fg); box-shadow: var(--shadow); padding: 0; }
@@ -346,13 +346,13 @@
         main { padding: 1rem; }
         .page-head, .banner-info, .provenance { align-items: stretch; flex-direction: column; }
         .network-form, .field-grid, .settings-section, .connection-card,
-        .inline-config-form, .oidc-form { grid-template-columns: 1fr; }
+        .inline-config-form, .oidc-form { grid-template-columns: minmax(0, 1fr); }
         .bootstrap-card, .health-strip, .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .monitoring-history-grid, .access-grid, .secret-reveal, .channel-control-grid,
-        .access-create, .danger-zone { grid-template-columns: 1fr; }
+        .access-create, .danger-zone { grid-template-columns: minmax(0, 1fr); }
         .monitoring-toolbar { align-items: stretch; flex-direction: column; }
         .error-grid { grid-template-columns: 1fr; }
-        .inline-create, .marker-grid { grid-template-columns: 1fr; }
+        .inline-create, .marker-grid { grid-template-columns: minmax(0, 1fr); }
         .network-summary { grid-template-columns: 1fr; }
         .identity-list article, .secret-value { align-items: stretch; flex-direction: column; }
         .danger-actions, .danger-actions form { align-items: stretch; flex-direction: column; }

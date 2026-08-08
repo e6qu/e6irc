@@ -11,11 +11,11 @@
           <span class="count" id="admin-network-count">…</span>
         </div>
 
-        <div class="scroll">
+        <div class="scroll" tabindex="0" aria-label="All accounts BNC networks">
           <table>
             <caption class="sr-only">All accounts' BNC networks with live state</caption>
             <thead>
-              <tr><th>Status</th><th>Owner</th><th>Network</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th>Last failure</th><th></th></tr>
+              <tr><th>Status</th><th>Owner</th><th>Network</th><th>Driver</th><th>Upstream</th><th>Clients</th><th>Errors</th><th>Last failure</th><th>Actions</th></tr>
             </thead>
             <tbody id="admin-network-rows" data-api-admin-network-list data-csrf="{{ shell.csrf }}">
               <tr><td colspan="9" class="empty">Loading networks…</td></tr>
