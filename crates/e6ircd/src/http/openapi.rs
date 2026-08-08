@@ -231,6 +231,7 @@ fn document() -> serde_json::Value {
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["contact_email"],
                             "properties": {
                                 "contact_email": {
@@ -454,6 +455,13 @@ fn document() -> serde_json::Value {
             },
             "/api/v1/auth/device/token": {
                 "post": { "summary": "Poll for the device grant's token",
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["device_code"],
+                            "properties": { "device_code": { "type": "string", "minLength": 1 } }
+                        }
+                    } } },
                     "responses": { "200": { "description": "access_token once approved" },
                         "400": { "description": "authorization_pending / expired_token / invalid_grant" } } }
             },
@@ -461,6 +469,13 @@ fn document() -> serde_json::Value {
                 "post": {
                     "summary": "Approve a device grant from a browser session",
                     "description": "Requires the cookie-authenticated session and its X-E6IRC-CSRF header. Personal access tokens cannot mint a replacement bearer through device approval.",
+                    "requestBody": { "required": true, "content": { "application/json": {
+                        "schema": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["user_code"],
+                            "properties": { "user_code": { "type": "string", "minLength": 1 } }
+                        }
+                    } } },
                     "responses": { "204": { "description": "approved" },
                         "401": { "description": "browser session required" },
                         "403": { "description": "invalid or missing CSRF token" },
@@ -477,6 +492,7 @@ fn document() -> serde_json::Value {
                     "requestBody": { "required": true, "content": { "application/json": {
                         "schema": {
                             "type": "object",
+                            "additionalProperties": false,
                             "required": ["label"],
                             "properties": {
                                 "label": { "type": "string", "minLength": 1, "maxLength": 64 },

@@ -901,6 +901,17 @@ async fn openapi_spec_is_served() {
     let app_password_schema = &v["paths"]["/api/v1/auth/app-passwords"]["post"]["requestBody"]["content"]
         ["application/json"]["schema"];
     assert_eq!(app_password_schema["additionalProperties"], false);
+    for (path, method) in [
+        ("/api/v1/me/profile", "patch"),
+        ("/api/v1/me/password", "put"),
+        ("/api/v1/me/tokens", "post"),
+        ("/api/v1/auth/device/token", "post"),
+        ("/api/v1/auth/device/approve", "post"),
+    ] {
+        let schema =
+            &v["paths"][path][method]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(schema["additionalProperties"], false, "{method} {path}");
+    }
     let patch_network_schema = &v["paths"]["/api/v1/me/networks/{name}"]["patch"]["requestBody"]["content"]
         ["application/json"]["schema"];
     assert_eq!(patch_network_schema["additionalProperties"], false);
@@ -5434,6 +5445,17 @@ async fn device_authorization_grant_flow() {
     let user_code = v["user_code"].as_str().unwrap().to_string();
     assert!(v["verification_uri"].as_str().unwrap().ends_with("/device"));
 
+    let (status, _, _) = request(
+        http,
+        &post(
+            "/api/v1/auth/device/token",
+            "",
+            &format!(r#"{{"device_code":"{device_code}","extra":true}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "unknown device-token fields must be rejected");
+
     // poll before approval -> authorization_pending
     let tok_body = format!(r#"{{"device_code":"{device_code}"}}"#);
     let (status, _, body) = request(http, &post("/api/v1/auth/device/token", "", &tok_body)).await;
@@ -5450,6 +5472,19 @@ async fn device_authorization_grant_flow() {
     let me_json: serde_json::Value = serde_json::from_str(&me_body).expect("me JSON");
     let csrf = me_json["csrf_token"].as_str().expect("session CSRF token");
     let browser_headers = format!("{cookie}X-E6IRC-CSRF: {csrf}\r\n");
+    let (status, _, _) = request(
+        http,
+        &post(
+            "/api/v1/auth/device/approve",
+            &browser_headers,
+            &format!(r#"{{"user_code":"{user_code}","extra":true}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "unknown device-approval fields must be rejected"
+    );
     let (status, _, _) = request(
         http,
         &post("/api/v1/auth/device/approve", &browser_headers, &ap_body),

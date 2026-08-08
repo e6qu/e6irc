@@ -54,6 +54,7 @@ pub(super) async fn device_start(State(state): State<Arc<AppState>>, _rl: RateLi
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DeviceTokenReq {
     pub(super) device_code: String,
 }
@@ -99,6 +100,7 @@ pub(super) async fn device_token(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct DeviceApproveReq {
     pub(super) user_code: String,
 }
@@ -1896,6 +1898,7 @@ pub(super) async fn me(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TokenRequest {
     pub(super) label: String,
     #[serde(default = "default_token_scopes")]
@@ -1914,6 +1917,30 @@ fn default_token_scopes() -> Vec<crate::identity::ApiTokenScope> {
 
 const fn default_token_lifetime_days() -> u16 {
     crate::identity::ApiTokenLifetimeDays::DEFAULT.value()
+}
+
+#[cfg(test)]
+mod token_request_tests {
+    use super::*;
+
+    #[test]
+    fn token_request_rejects_unknown_fields() {
+        assert!(
+            serde_json::from_str::<TokenRequest>(r#"{"label":"desktop","extra":true}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn device_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<DeviceTokenReq>(r#"{"device_code":"code","extra":true}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<DeviceApproveReq>(r#"{"user_code":"ABCD-EFGH","extra":true}"#)
+                .is_err()
+        );
+    }
 }
 
 /// Mint a PAT for the authenticated account (shown once).

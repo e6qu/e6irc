@@ -3,6 +3,7 @@
 use super::*;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ProfileRequest {
     pub(super) contact_email: Option<String>,
 }
@@ -161,6 +162,22 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn profile_and_password_requests_reject_unknown_fields() {
+        assert!(
+            serde_json::from_str::<ProfileRequest>(
+                r#"{"contact_email":"alice@example.test","extra":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ChangePasswordRequest>(
+                r#"{"current_password":"old","new_password":"new","extra":true}"#
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Exchange an account's password for a fresh app password (shown once;
@@ -255,6 +272,7 @@ pub(super) async fn create_session_app_password(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ChangePasswordRequest {
     #[serde(default)]
     pub(super) current_password: Option<String>,

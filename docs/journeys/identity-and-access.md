@@ -317,7 +317,8 @@ credential exists yet.
 An app password cannot rotate the primary password. The primary credential
 cannot be deleted through generic revocation. Expired or under-scoped personal
 access tokens are rejected, and a bearer cannot mint broader credentials.
-Credential request objects reject unknown fields instead of ignoring them.
+Account and credential request objects reject unknown fields instead of ignoring them.
+Device-grant request objects use the same closed contract.
 Exact-resource deletes are owner-scoped and idempotent only where the API
 contract says so. A failed Account & access API read remains an announced,
 in-place retryable state rather than appearing as empty profile, credential,
