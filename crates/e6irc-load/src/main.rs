@@ -24,6 +24,18 @@ use tokio::sync::Barrier;
 const MAX_CLIENTS: usize = 100_000;
 const MAX_TRACKED_MESSAGES: usize = 10_000_000;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct Sha256Digest(String);
+
+impl Sha256Digest {
+    fn parse(value: String, flag: &str) -> Result<Self, String> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("{flag} needs a 64-character SHA-256 hex digest"));
+        }
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+}
+
 #[derive(Clone)]
 struct Workload {
     clients: usize,
@@ -88,6 +100,7 @@ struct Args {
     /// Maximum incremental peak resident bytes divided by the requested
     /// connection count. Requires `server_pid`.
     maximum_server_rss_per_connection_bytes: Option<u64>,
+    host_provenance_sha256: Option<Sha256Digest>,
     report_json: Option<PathBuf>,
 }
 
@@ -120,6 +133,7 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
         maximum_p99_ms: None,
         server_pid: None,
         maximum_server_rss_per_connection_bytes: None,
+        host_provenance_sha256: None,
         report_json: None,
     };
     let mut it = arguments.into_iter();
@@ -195,6 +209,13 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
                         "--maximum-server-rss-per-connection-bytes needs a value".to_string()
                     })?,
                     "--maximum-server-rss-per-connection-bytes",
+                )?);
+            }
+            "--host-provenance-sha256" => {
+                args.host_provenance_sha256 = Some(Sha256Digest::parse(
+                    it.next()
+                        .ok_or_else(|| "--host-provenance-sha256 needs a value".to_string())?,
+                    "--host-provenance-sha256",
                 )?);
             }
             "--report-json" => {
@@ -323,6 +344,7 @@ struct RunReport {
     fanout_rate: f64,
     latency: Option<LatencyReport>,
     server_rss: Option<ServerRssReport>,
+    host_provenance_sha256: Option<Sha256Digest>,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -642,6 +664,7 @@ async fn run(args: Args) -> Result<RunReport, String> {
         fanout_rate,
         latency,
         server_rss,
+        host_provenance_sha256: args.host_provenance_sha256.clone(),
         thresholds: Thresholds {
             minimum_connect_rate: args.minimum_connect_rate,
             minimum_fanout_rate: args.minimum_fanout_rate,
@@ -843,6 +866,7 @@ mod tests {
             fanout_rate: 224.0,
             latency: None,
             server_rss: None,
+            host_provenance_sha256: None,
             thresholds: Thresholds {
                 minimum_connect_rate: Some(10.0),
                 minimum_fanout_rate: Some(100.0),
@@ -878,6 +902,8 @@ mod tests {
             "123",
             "--maximum-server-rss-per-connection-bytes",
             "1048576",
+            "--host-provenance-sha256",
+            "A3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910",
             "--report-json",
             "result.json",
         ])
@@ -892,6 +918,13 @@ mod tests {
             Some(1_048_576)
         );
         assert_eq!(parsed.report_json, Some(PathBuf::from("result.json")));
+        assert_eq!(
+            parsed.host_provenance_sha256,
+            Some(Sha256Digest(
+                "a3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910a3b4c5d6e7f80910".into()
+            ))
+        );
+        assert!(args(&["--host-provenance-sha256", "not-a-digest"]).is_err());
     }
 
     #[test]
@@ -953,6 +986,7 @@ mod tests {
         assert_eq!(json["expected_deliveries"], 224);
         assert_eq!(json["thresholds"]["maximum_p99_ms"], 5_000.0);
         assert_eq!(json["passed"], true);
+        assert!(json["host_provenance_sha256"].is_null());
     }
 
     #[test]

@@ -78,6 +78,7 @@ host="$output_dir/host.txt"
   printf 'load_nofile=%s\nserver_nofile=%s\nrequired_fds=%s\n' "$load_nofile" "$server_nofile" "$required_fds"
   printf 'ephemeral_port_range=%s %s\nephemeral_port_capacity=%s\nsomaxconn=%s\n' "$port_low" "$port_high" "$port_capacity" "$somaxconn"
 } > "$host"
+host_sha256="$(sha256sum "$host" | awk '{print $1}')"
 
 "$load_bin" \
   --addr "$addr" \
@@ -89,6 +90,7 @@ host="$output_dir/host.txt"
   --minimum-fanout-rate "$minimum_fanout_rate" \
   --maximum-p99-ms "$maximum_p99_ms" \
   --maximum-server-rss-per-connection-bytes "$maximum_rss_per_connection" \
+  --host-provenance-sha256 "$host_sha256" \
   --report-json "$result"
 
 echo "qualification evidence: $result and $host"
