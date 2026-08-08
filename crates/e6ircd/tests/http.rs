@@ -967,10 +967,40 @@ async fn openapi_spec_is_served() {
     }
     let listener_schema = &scalar_settings_schema["properties"]["listeners"]["items"];
     assert_eq!(listener_schema["additionalProperties"], false);
+    assert_eq!(listener_schema["required"], serde_json::json!(["addr"]));
     assert_eq!(
         listener_schema["properties"]["tls"]["oneOf"][0]["additionalProperties"],
         false
     );
+    assert_eq!(
+        scalar_settings_schema["properties"]["nicklen"]["maximum"],
+        64
+    );
+    let limits_schema = &scalar_settings_schema["properties"]["limits"]["properties"];
+    for field in [
+        "max_connections_per_ip",
+        "command_burst",
+        "auth_rate_burst",
+        "api_rate_burst",
+        "administrator_api_rate_burst",
+        "registration_burst",
+    ] {
+        assert_eq!(limits_schema[field]["minimum"], 1, "{field}");
+    }
+    let observability_schema = &scalar_settings_schema["properties"]["observability"]["properties"];
+    assert_eq!(
+        observability_schema["sample_interval_seconds"],
+        serde_json::json!({ "type": "integer", "minimum": 5, "maximum": 300 })
+    );
+    assert_eq!(
+        observability_schema["retention_hours"],
+        serde_json::json!({ "type": "integer", "minimum": 1, "maximum": 2160 })
+    );
+    let storage_schema = &scalar_settings_schema["properties"]["storage"]["properties"];
+    for field in ["history_retention_days", "audit_retention_days"] {
+        assert_eq!(storage_schema[field]["minimum"], 1, "{field}");
+        assert_eq!(storage_schema[field]["maximum"], 3650, "{field}");
+    }
     let buffer_schema = &v["paths"]["/api/v1/me/networks/{name}/buffer"]["get"]["responses"]["200"]
         ["content"]["application/json"]["schema"];
     assert_eq!(buffer_schema["additionalProperties"], false);
