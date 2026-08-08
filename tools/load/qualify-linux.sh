@@ -2,6 +2,8 @@
 # Run one budgeted Linux load qualification and retain its evidence.
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qualify-arguments.sh"
+
 usage() {
   echo "usage: $0 ADDR SERVER_PID CLIENTS CHANNELS BURST OUTPUT_DIR MIN_CONNECT_RATE MIN_FANOUT_RATE MAX_P99_MS MAX_RSS_BYTES_PER_CONNECTION" >&2
   exit 2
@@ -21,15 +23,16 @@ minimum_fanout_rate="$8"
 maximum_p99_ms="$9"
 maximum_rss_per_connection="${10}"
 
-positive_integer() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
-positive_decimal() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$1" != 0 && "$1" != 0.0 ]]; }
-for value in "$server_pid" "$clients" "$channels" "$burst" "$maximum_rss_per_connection"; do
+for value in "$server_pid" "$maximum_rss_per_connection"; do
   positive_integer "$value" || { echo "positive integer required: $value" >&2; exit 2; }
 done
 for value in "$minimum_connect_rate" "$minimum_fanout_rate" "$maximum_p99_ms"; do
   positive_decimal "$value" || { echo "positive decimal required: $value" >&2; exit 2; }
 done
-[[ "$clients" -gt "$channels" ]] || { echo "CLIENTS must exceed CHANNELS" >&2; exit 2; }
+validate_qualification_arguments "$clients" "$channels" "$burst" || {
+  echo "workload must fit e6irc-load's 100000-client and 10000000-message limits" >&2
+  exit 2
+}
 [[ -r "/proc/$server_pid/limits" ]] || { echo "cannot inspect server PID $server_pid" >&2; exit 2; }
 server_executable="$(readlink -f "/proc/$server_pid/exe")"
 [[ "$(basename "$server_executable")" == e6ircd ]] || { echo "PID $server_pid is not e6ircd" >&2; exit 2; }
