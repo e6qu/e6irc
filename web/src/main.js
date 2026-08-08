@@ -1235,7 +1235,8 @@ function renderNetworkPicker(networks, failure = null) {
   messagesEl.replaceChildren();
   const intro = document.createElement("li");
   intro.className = "network-picker-intro";
-  if (failure) intro.setAttribute("role", "alert");
+  const panel = document.createElement("div");
+  if (failure) panel.setAttribute("role", "alert");
   const title = document.createElement("h2");
   title.textContent = failure ? "Network list unavailable" : "Your chat networks";
   const copy = document.createElement("p");
@@ -1244,7 +1245,8 @@ function renderNetworkPicker(networks, failure = null) {
     : networks.length
       ? "Choose an always-on network:"
       : "No networks are configured for this account.";
-  intro.append(title, copy);
+  panel.append(title, copy);
+  intro.appendChild(panel);
   if (!failure && networks.length) messagesEl.appendChild(intro);
   for (const item of networks) {
     const li = document.createElement("li");
@@ -1283,7 +1285,7 @@ function renderNetworkPicker(networks, failure = null) {
     const actions = document.createElement("div");
     actions.className = "picker-actions";
     for (const control of Array.from(manageLi.children)) actions.appendChild(control);
-    intro.appendChild(actions);
+    panel.appendChild(actions);
   } else {
     messagesEl.appendChild(manageLi);
   }

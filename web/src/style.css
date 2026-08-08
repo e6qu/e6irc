@@ -20,6 +20,8 @@
    specific than the bare :root, so a manual choice always wins over the OS. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
+    --accent: #60a5fa;
+    --accent-strong: #93c5fd;
     --border: #262b33;
     --muted: #9aa3b1;
     --bg: #0f1115;
@@ -33,6 +35,8 @@
   }
 }
 :root[data-theme="dark"] {
+  --accent: #60a5fa;
+  --accent-strong: #93c5fd;
   --border: #262b33;
   --muted: #9aa3b1;
   --bg: #0f1115;

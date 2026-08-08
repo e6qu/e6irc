@@ -1,8 +1,14 @@
 import playwrightTest from "playwright/test";
+import AxeBuilder from "@axe-core/playwright";
 
 const { expect, test } = playwrightTest;
 
 const identity = { account: "visual-test", email: "visual@example.test", role: "operator" };
+
+async function expectAccessible(page) {
+  const results = await new AxeBuilder({ page }).include("#app").analyze();
+  expect(results.violations, results.violations.map(({ id, help }) => `${id}: ${help}`).join("\n")).toEqual([]);
+}
 
 async function mockSession(page, networks, failureStatus = 503) {
   await page.route(/\/api\/v1\/me$/, (route) =>
@@ -30,6 +36,7 @@ test("network picker renders the empty account state", async ({ page }) => {
   await page.goto("/");
 
   await expect(page.getByText("No networks are configured for this account.")).toBeVisible();
+  await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-empty-light.png", {
     animations: "disabled",
     fullPage: true,
@@ -44,6 +51,7 @@ test("network picker distinguishes an unavailable API on narrow dark screens", a
 
   await expect(page.getByRole("alert")).toContainText("Could not load your networks");
   await expect(page.getByRole("link", { name: "Retry" })).toBeVisible();
+  await expectAccessible(page);
   await expect(page).toHaveScreenshot("network-picker-unavailable-dark-narrow.png", {
     animations: "disabled",
     fullPage: true,
@@ -57,4 +65,5 @@ test("network picker directs an expired session to sign in", async ({ page }) =>
   await expect(page.getByRole("alert")).toContainText("Could not load your networks");
   await expect(page.getByRole("link", { name: "Sign in" })).toHaveAttribute("href", "/login");
   await expect(page.getByRole("link", { name: "Retry" })).toHaveCount(0);
+  await expectAccessible(page);
 });
