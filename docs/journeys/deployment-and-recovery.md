@@ -349,7 +349,8 @@ and host process/memory/CPU telemetry is available.
 4. Pass the e6ircd process ID and a maximum incremental RSS-per-connection
    budget so the harness samples and enforces daemon memory rather than relying
    on an operator to transcribe it.
-5. Correlate results with broader host CPU and socket telemetry.
+5. Use `qualify-linux.sh` for controlled Linux runs. It validates host budgets
+   and stores a versioned JSON result with host provenance.
 
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires

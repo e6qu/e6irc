@@ -867,6 +867,8 @@ name = "e6irc-load"
 version = "0.1.0"
 dependencies = [
  "e6irc-client",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

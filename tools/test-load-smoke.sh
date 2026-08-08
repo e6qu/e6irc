@@ -54,6 +54,7 @@ load_args=(
   --minimum-connect-rate 10
   --minimum-fanout-rate 100
   --maximum-p99-ms 5000
+  --report-json "$test_dir/load-report.json"
 )
 if [[ "$(uname -s)" == "Linux" ]]; then
   load_args+=(
@@ -63,6 +64,9 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 "$load_bin" "${load_args[@]}"
+test -s "$test_dir/load-report.json"
+grep -F '"format_version": 1' "$test_dir/load-report.json" >/dev/null
+grep -F '"passed": true' "$test_dir/load-report.json" >/dev/null
 
 kill -TERM "$server_pid"
 if ! wait "$server_pid"; then
