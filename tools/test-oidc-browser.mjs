@@ -194,9 +194,7 @@ try {
   await page.goto(`${applicationOrigin}/api/v1/auth/oidc/dex/start`);
   assert.equal(page.url(), `${applicationOrigin}/`);
   await page.locator("#account-name").waitFor();
-  // The client fills #account-name from an async /api/v1/me fetch on boot, so
-  // wait for it to be populated rather than racing the placeholder — the
-  // element exists in the served HTML immediately, but its identity does not.
+  // Wait for identity API hydration.
   await page.waitForFunction(
     () => document.getElementById("account-name")?.textContent !== "signed in",
   );
