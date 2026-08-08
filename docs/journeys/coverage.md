@@ -60,7 +60,7 @@ a design target rather than current behavior.
 | [Receive replay and live messages without gaps or duplicates](web-chat.md#receive-replay-and-live-messages-without-gaps-or-duplicates) | Proven | Deterministic three-engine edge cases plus real upstream/persistence/restart path | — |
 | [Join, converse, and leave](web-chat.md#join-converse-and-leave) | Proven | Three-engine acknowledgement/refusal/lifecycle cases and real bidirectional upstream journey | — |
 | [Personalize web chat and desktop notifications](web-chat.md#personalize-web-chat-and-desktop-notifications) | Proven | Client edge-case tests plus three-engine theme reload, explicit granted-permission boundary, exact notification, and opt-out over real upstream traffic | Operating-system presentation after the browser API is the platform’s responsibility |
-| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Three engines visit every administrator directory, run axe checks, and perform configuration, credential, network, policy, monitoring, audit, and sign-out workflows; focused HTTP covers remaining mutations | — |
+| [Navigate account and operational surfaces](web-chat.md#navigate-account-and-operational-surfaces) | Proven | Three engines visit every administrator directory, run axe checks, verify reduced-motion monitoring, and perform configuration, credential, network, policy, monitoring, audit, and sign-out workflows; focused HTTP covers remaining mutations | — |
 
 “—” means the defined journey boundary is crossed by current CI; it does not
 mean every possible environment or fault has been tested.

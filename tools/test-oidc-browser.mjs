@@ -739,6 +739,11 @@ try {
     await guestContext.close();
   }
 
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  assert.equal(
+    await page.evaluate(() => matchMedia("(prefers-reduced-motion: reduce)").matches),
+    true,
+  );
   const monitoringRead = page.waitForResponse(
     (response) =>
       response.url() === `${applicationOrigin}/api/v1/admin/monitoring?minutes=60` &&
@@ -749,6 +754,11 @@ try {
   await page.getByRole("heading", { name: "Monitoring", exact: true }).waitFor();
   await page.getByRole("heading", { name: "Queue pressure", exact: true }).waitFor();
   await page.getByText("Live data refreshed.", { exact: true }).waitFor();
+  assert.equal(
+    await page.locator(".pulse").evaluate((pulse) => getComputedStyle(pulse).animationName),
+    "none",
+    "reduced motion must disable the live-status pulse",
+  );
   const runtimeQueues = page.locator("section").filter({
     has: page.getByRole("heading", { name: "Runtime queues", exact: true }),
   });
