@@ -1291,6 +1291,13 @@ try {
       }),
     });
   });
+  await page.route(historyURL, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ lines: [] }),
+    }),
+  );
   let mockSocket;
   const clientFrames = [];
   let rejectedSendAttempts = 0;
@@ -1440,6 +1447,7 @@ try {
   const historyRouteReached = new Promise((resolve) => {
     resolveHistoryRoute = resolve;
   });
+  await page.unroute(historyURL);
   await page.route(historyURL, (route) => {
     resolveHistoryRoute(route);
   });
