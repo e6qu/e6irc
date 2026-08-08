@@ -81,11 +81,13 @@ test("network picker renders typed network states on tablets", async ({ page }) 
   await mockSession(page, [
     {
       name: "Libera",
+      kind: "irc",
+      nick: "viewer",
       enabled: true,
       connected: false,
       runtime: { state: "reconnecting" },
     },
-    { name: "Archive", enabled: false, connected: null, runtime: null },
+    { name: "Archive", kind: "irc", nick: "viewer", enabled: false, connected: null, runtime: null },
   ]);
   await page.goto("/");
 
@@ -103,6 +105,8 @@ test("chat reflows at a 200 percent equivalent layout width", async ({ page }) =
   await mockSession(page, [
     {
       name: "Libera",
+      kind: "irc",
+      nick: "viewer",
       enabled: true,
       connected: false,
       runtime: { state: "reconnecting" },

@@ -1257,7 +1257,10 @@ function renderNetworkPicker(networks, failure = null) {
   const intro = document.createElement("li");
   intro.className = "network-picker-intro";
   const panel = document.createElement("div");
-  if (failure) panel.setAttribute("role", "alert");
+  if (failure) {
+    panel.setAttribute("role", "alert");
+    panel.dataset.alert = "networks";
+  }
   const title = document.createElement("h2");
   title.textContent = failure ? "Network list unavailable" : "Your chat networks";
   const copy = document.createElement("p");
@@ -1486,7 +1489,6 @@ async function boot() {
     clearAlert("networks");
   } catch (error) {
     networkFailure = error;
-    showAlert("networks", errorMessage("load your networks", error), "error");
   }
   populateNetworkSelector(networks, networkFailure);
 
