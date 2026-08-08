@@ -1937,11 +1937,11 @@ impl NetworkHandle {
         let mut history_ready = self.history_ready.subscribe();
         let mut shutdown = self.shutdown.subscribe();
         loop {
-            if *history_ready.borrow() {
-                return true;
-            }
             if *shutdown.borrow() {
                 return false;
+            }
+            if *history_ready.borrow() {
+                return true;
             }
             tokio::select! {
                 changed = history_ready.changed() => {
