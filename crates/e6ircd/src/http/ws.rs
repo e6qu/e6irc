@@ -387,9 +387,6 @@ pub(super) async fn ws_ui_conn(
                     }
                 }
                 Err(RecvError::Lagged(n)) => {
-                    // Slow client: the broadcast buffer overwrote lines this
-                    // socket hadn't read. They're unrecoverable, but surface
-                    // the gap rather than let it vanish silently.
                     let notice = format!(":*bnc* NOTICE * :{n} line(s) skipped (slow connection)");
                     if socket
                         .send(WsMessage::text(line_event(&notice)))
@@ -409,11 +406,10 @@ pub(super) async fn ws_ui_conn(
                     let request = match composer_request(&t) {
                         Ok(request) => request,
                         Err(error) => {
-                            let event = composer_result_event(
-                                error.request_id.as_deref(),
-                                false,
-                                Some(error.message),
-                            );
+                            let event = composer_result_event(ComposerResult::Rejected {
+                                request_id: error.request_id.as_deref(),
+                                message: error.message,
+                            });
                             if socket.send(WsMessage::text(event)).await.is_err() {
                                 break;
                             }
@@ -425,9 +421,7 @@ pub(super) async fn ws_ui_conn(
                             if let Some(request_id) = request.request_id
                                 && socket
                                     .send(WsMessage::text(composer_result_event(
-                                        Some(&request_id),
-                                        true,
-                                        None,
+                                        ComposerResult::Sent(&request_id),
                                     )))
                                     .await
                                     .is_err()
@@ -435,15 +429,11 @@ pub(super) async fn ws_ui_conn(
                                 break;
                             }
                         }
-                        // Full: upstream congested/reconnecting. Tell the client
-                        // its line was not sent rather than block (which would
-                        // stall other clients sharing the queue) or drop silently.
                         crate::bouncer::SendOutcome::Full => {
-                            let event = composer_result_event(
-                                request.request_id.as_deref(),
-                                false,
-                                Some("upstream busy; line not sent, try again"),
-                            );
+                            let event = composer_result_event(ComposerResult::Rejected {
+                                request_id: request.request_id.as_deref(),
+                                message: "upstream busy; line not sent, try again",
+                            });
                             if socket.send(WsMessage::text(event)).await.is_err() {
                                 break;
                             }
@@ -462,8 +452,6 @@ pub(super) async fn ws_ui_conn(
 }
 
 async fn send_unavailable(socket: &mut WebSocket) {
-    // This is a terminal courtesy event; a failed send means the peer already
-    // detached, so there is no second observer to notify.
     drop(
         socket
             .send(WsMessage::text(status_event(ConnStatus::Unavailable, None)))
@@ -483,9 +471,7 @@ struct ComposerRequestError {
     message: &'static str,
 }
 
-/// Parse and validate one web-composer request. Embedded frame delimiters and
-/// over-long lines are refused as whole requests: truncating them would make
-/// the browser's local echo claim text the upstream never received.
+/// Reject invalid or over-long composer lines.
 fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError> {
     let parsed = serde_json::from_str::<serde_json::Value>(frame).ok();
     let request_id = match parsed.as_ref().and_then(|value| value.get("id")) {
@@ -522,31 +508,36 @@ fn composer_request(frame: &str) -> Result<ComposerRequest, ComposerRequestError
     Ok(ComposerRequest { line, request_id })
 }
 
-/// A request-correlated composer result. Older/raw clients that omit an id get
-/// the same visible fixed-text NOTICE shape as before.
-fn composer_result_event(request_id: Option<&str>, accepted: bool, error: Option<&str>) -> String {
-    match request_id {
-        Some(request_id) if accepted => {
+enum ComposerResult<'a> {
+    Sent(&'a str),
+    Rejected {
+        request_id: Option<&'a str>,
+        message: &'a str,
+    },
+}
+
+fn composer_result_event(result: ComposerResult<'_>) -> String {
+    match result {
+        ComposerResult::Sent(request_id) => {
             serde_json::json!({ "t": "sent", "v": request_id }).to_string()
         }
-        Some(request_id) => serde_json::json!({
+        ComposerResult::Rejected {
+            request_id: Some(request_id),
+            message,
+        } => serde_json::json!({
             "t": "send-error",
             "v": request_id,
-            "message": error.unwrap_or("message was not sent"),
+            "message": message,
         })
         .to_string(),
-        None => line_event(&format!(
-            ":*bnc* NOTICE * :{}",
-            error.unwrap_or("message was not sent")
-        )),
+        ComposerResult::Rejected {
+            request_id: None,
+            message,
+        } => line_event(&format!(":*bnc* NOTICE * :{message}")),
     }
 }
 
-/// Translate a composer frame into an IRC line. The web composer sends a JSON
-/// object (`{"target": "#c", "message": "hi", ...}`) which
-/// becomes `PRIVMSG #c :hi`, with a small set of slash-commands. A
-/// non-JSON frame (e.g. a raw line from a script or test) is relayed
-/// unchanged.
+/// Translate composer JSON; preserve raw frames.
 pub(super) fn composer_to_irc(frame: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else {
         return frame.to_string();
@@ -558,9 +549,7 @@ pub(super) fn composer_to_irc(frame: &str) -> String {
     slash_to_irc(message, target)
 }
 
-/// Map a composer message (with the current `target`) to an IRC line.
-/// Recognised slash-commands: `/raw`, `/me`, `/msg`, `/join`, `/part`,
-/// `/nick`, `/topic`. Anything else is a PRIVMSG to `target`.
+/// Map a composer message to IRC.
 pub(super) fn slash_to_irc(message: &str, target: &str) -> String {
     let (cmd, rest) = match message.strip_prefix('/') {
         Some(body) => match body.split_once(' ') {
@@ -703,12 +692,15 @@ mod tests {
     #[test]
     fn composer_results_are_typed_and_request_correlated() {
         let accepted: serde_json::Value =
-            serde_json::from_str(&composer_result_event(Some("a1"), true, None)).unwrap();
+            serde_json::from_str(&composer_result_event(ComposerResult::Sent("a1"))).unwrap();
         assert_eq!(accepted, serde_json::json!({ "t": "sent", "v": "a1" }));
 
         let rejected: serde_json::Value =
-            serde_json::from_str(&composer_result_event(Some("a2"), false, Some("not sent")))
-                .unwrap();
+            serde_json::from_str(&composer_result_event(ComposerResult::Rejected {
+                request_id: Some("a2"),
+                message: "not sent",
+            }))
+            .unwrap();
         assert_eq!(rejected["t"], "send-error");
         assert_eq!(rejected["v"], "a2");
         assert_eq!(rejected["message"], "not sent");
