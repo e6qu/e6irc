@@ -10,14 +10,18 @@
 //! It exercises the exact paths the server's scale target stresses
 //! (thousands of sessions, wide fan-out) without any test framework.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use e6irc_client::Connection;
+use serde::Serialize;
 use tokio::sync::Barrier;
 
+#[derive(Clone)]
 struct Args {
     addr: String,
     clients: usize,
@@ -38,6 +42,7 @@ struct Args {
     /// Maximum incremental peak resident bytes divided by the requested
     /// connection count. Requires `server_pid`.
     maximum_server_rss_per_connection_bytes: Option<u64>,
+    report_json: Option<PathBuf>,
 }
 
 impl Args {
@@ -68,6 +73,7 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
         maximum_p99_ms: None,
         server_pid: None,
         maximum_server_rss_per_connection_bytes: None,
+        report_json: None,
     };
     let mut it = arguments.into_iter();
     while let Some(flag) = it.next() {
@@ -144,6 +150,12 @@ fn parse_args_from(arguments: impl IntoIterator<Item = String>) -> Result<Args, 
                     "--maximum-server-rss-per-connection-bytes",
                 )?);
             }
+            "--report-json" => {
+                args.report_json = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| "--report-json needs a path".to_string())?,
+                ));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -213,11 +225,80 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    if runtime.block_on(run(args)) {
+    let report = match runtime.block_on(run(args.clone())) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("e6irc-load: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(path) = args.report_json.as_deref()
+        && let Err(error) = write_report(path, &report)
+    {
+        eprintln!("e6irc-load: failed to write {}: {error}", path.display());
+        return ExitCode::FAILURE;
+    }
+    if report.passed {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+#[derive(Serialize)]
+struct Thresholds {
+    minimum_connect_rate: Option<f64>,
+    minimum_fanout_rate: Option<f64>,
+    maximum_p99_ms: Option<f64>,
+    maximum_server_rss_per_connection_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct LatencyReport {
+    p50_us: f64,
+    p90_us: f64,
+    p99_us: f64,
+    max_us: f64,
+}
+
+#[derive(Serialize)]
+struct ServerRssReport {
+    baseline_bytes: u64,
+    peak_bytes: u64,
+    incremental_bytes: u64,
+    per_connection_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct RunReport {
+    format_version: u8,
+    addr: String,
+    clients: usize,
+    channels: usize,
+    burst: usize,
+    tls: bool,
+    successful_clients: usize,
+    failed_clients: usize,
+    expected_deliveries: u64,
+    received_deliveries: u64,
+    connect_seconds: f64,
+    connect_rate: f64,
+    fanout_seconds: f64,
+    fanout_rate: f64,
+    latency: Option<LatencyReport>,
+    server_rss: Option<ServerRssReport>,
+    thresholds: Thresholds,
+    passed: bool,
+}
+
+fn write_report(path: &Path, report: &RunReport) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|error| std::io::Error::other(format!("encode report: {error}")))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(&bytes)
 }
 
 /// Shared timing/counters across the client tasks.
@@ -324,7 +405,7 @@ impl DeliverySet {
     }
 }
 
-async fn run(args: Args) -> bool {
+async fn run(args: Args) -> Result<RunReport, String> {
     let args = Arc::new(args);
     println!(
         "e6irc-load: {} clients across {} channel(s) -> {} (burst {})",
@@ -342,8 +423,9 @@ async fn run(args: Args) -> bool {
                 ))
             }
             Err(error) => {
-                eprintln!("server RSS measurement failed before the run: {error}");
-                return false;
+                return Err(format!(
+                    "server RSS measurement failed before the run: {error}"
+                ));
             }
         },
         None => None,
@@ -391,12 +473,12 @@ async fn run(args: Args) -> bool {
         Some((baseline, task)) => match task.await {
             Ok(Ok(peak)) => Some((baseline, peak)),
             Ok(Err(error)) => {
-                eprintln!("server RSS measurement failed during the run: {error}");
-                return false;
+                return Err(format!(
+                    "server RSS measurement failed during the run: {error}"
+                ));
             }
             Err(error) => {
-                eprintln!("server RSS sampler task failed: {error}");
-                return false;
+                return Err(format!("server RSS sampler task failed: {error}"));
             }
         },
         None => None,
@@ -433,7 +515,7 @@ async fn run(args: Args) -> bool {
         .lock()
         .expect("latency pool poisoned")
         .clone();
-    let p99_us = if lat.is_empty() {
+    let latency = if lat.is_empty() {
         None
     } else {
         lat.sort_unstable();
@@ -445,13 +527,18 @@ async fn run(args: Args) -> bool {
             p99_us,
             pctl_us(&lat, 1.0),
         );
-        Some(p99_us)
+        Some(LatencyReport {
+            p50_us: pctl_us(&lat, 0.50),
+            p90_us: pctl_us(&lat, 0.90),
+            p99_us,
+            max_us: pctl_us(&lat, 1.0),
+        })
     };
     if delivered != expected {
         eprintln!("incomplete fan-out: received {delivered} of {expected} required deliveries");
     }
     let mut thresholds_met = true;
-    if let Some((baseline, peak)) = rss_report {
+    let server_rss = if let Some((baseline, peak)) = rss_report {
         let incremental = peak.saturating_sub(baseline);
         let per_connection =
             incremental.saturating_add(args.clients as u64 - 1) / args.clients as u64;
@@ -465,7 +552,15 @@ async fn run(args: Args) -> bool {
             thresholds_met = false;
             eprintln!("server RSS threshold failed: {per_connection} > {maximum} bytes/connection");
         }
-    }
+        Some(ServerRssReport {
+            baseline_bytes: baseline,
+            peak_bytes: peak,
+            incremental_bytes: incremental,
+            per_connection_bytes: per_connection,
+        })
+    } else {
+        None
+    };
     if let Some(minimum) = args.minimum_connect_rate
         && connect_rate < minimum
     {
@@ -479,13 +574,13 @@ async fn run(args: Args) -> bool {
         eprintln!("fan-out threshold failed: {fanout_rate:.1} < {minimum:.1} messages/s");
     }
     if let Some(maximum_ms) = args.maximum_p99_ms {
-        match p99_us {
-            Some(observed_us) if observed_us <= maximum_ms * 1000.0 => {}
-            Some(observed_us) => {
+        match latency.as_ref() {
+            Some(observed) if observed.p99_us <= maximum_ms * 1000.0 => {}
+            Some(observed) => {
                 thresholds_met = false;
                 eprintln!(
                     "latency threshold failed: p99 {:.3} ms > {maximum_ms:.3} ms",
-                    observed_us / 1000.0
+                    observed.p99_us / 1000.0
                 );
             }
             None => {
@@ -494,7 +589,31 @@ async fn run(args: Args) -> bool {
             }
         }
     }
-    failures == 0 && delivered == expected && thresholds_met
+    Ok(RunReport {
+        format_version: 1,
+        addr: args.addr.clone(),
+        clients: args.clients,
+        channels: args.channels,
+        burst: args.burst,
+        tls: args.tls,
+        successful_clients: ok,
+        failed_clients: failures,
+        expected_deliveries: expected,
+        received_deliveries: delivered,
+        connect_seconds: connect_secs,
+        connect_rate,
+        fanout_seconds: fanout_secs,
+        fanout_rate,
+        latency,
+        server_rss,
+        thresholds: Thresholds {
+            minimum_connect_rate: args.minimum_connect_rate,
+            minimum_fanout_rate: args.minimum_fanout_rate,
+            maximum_p99_ms: args.maximum_p99_ms,
+            maximum_server_rss_per_connection_bytes: args.maximum_server_rss_per_connection_bytes,
+        },
+        passed: failures == 0 && delivered == expected && thresholds_met,
+    })
 }
 
 /// One client: connect, register, join, sync on the barrier, then either
@@ -667,6 +786,34 @@ mod tests {
         parse_args_from(values.iter().map(|value| (*value).to_owned()))
     }
 
+    fn sample_report() -> RunReport {
+        RunReport {
+            format_version: 1,
+            addr: "127.0.0.1:6667".into(),
+            clients: 64,
+            channels: 8,
+            burst: 4,
+            tls: false,
+            successful_clients: 64,
+            failed_clients: 0,
+            expected_deliveries: 224,
+            received_deliveries: 224,
+            connect_seconds: 1.0,
+            connect_rate: 64.0,
+            fanout_seconds: 1.0,
+            fanout_rate: 224.0,
+            latency: None,
+            server_rss: None,
+            thresholds: Thresholds {
+                minimum_connect_rate: Some(10.0),
+                minimum_fanout_rate: Some(100.0),
+                maximum_p99_ms: Some(5_000.0),
+                maximum_server_rss_per_connection_bytes: Some(1_048_576),
+            },
+            passed: true,
+        }
+    }
+
     #[test]
     fn arguments_reject_vacuous_runs_and_invalid_thresholds() {
         assert!(args(&["--burst", "0"]).is_err());
@@ -692,6 +839,8 @@ mod tests {
             "123",
             "--maximum-server-rss-per-connection-bytes",
             "1048576",
+            "--report-json",
+            "result.json",
         ])
         .unwrap();
         assert_eq!(parsed.clients, 64);
@@ -703,6 +852,7 @@ mod tests {
             parsed.maximum_server_rss_per_connection_bytes,
             Some(1_048_576)
         );
+        assert_eq!(parsed.report_json, Some(PathBuf::from("result.json")));
     }
 
     #[test]
@@ -743,5 +893,23 @@ mod tests {
         assert!(parse_linux_rss_bytes("Name:\te6ircd\n").is_err());
         assert!(parse_linux_rss_bytes("VmRSS:\t12 MB\n").is_err());
         assert!(parse_linux_rss_bytes("VmRSS:\tnot-a-number kB\n").is_err());
+    }
+
+    #[test]
+    fn report_has_a_versioned_machine_contract() {
+        let json = serde_json::to_value(sample_report()).expect("serialize report");
+        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["expected_deliveries"], 224);
+        assert_eq!(json["thresholds"]["maximum_p99_ms"], 5_000.0);
+        assert_eq!(json["passed"], true);
+    }
+
+    #[test]
+    fn report_does_not_replace_prior_evidence() {
+        let path = std::env::temp_dir().join(format!("e6irc-load-report-{}", std::process::id()));
+        let report = sample_report();
+        write_report(&path, &report).expect("write report");
+        assert!(write_report(&path, &report).is_err());
+        std::fs::remove_file(path).expect("remove report");
     }
 }

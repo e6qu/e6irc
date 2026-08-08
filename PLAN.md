@@ -12,15 +12,14 @@ and integration claims.
 
 ## Current work
 
-### Stage E — Compatibility qualification
+### Stage F — Scale qualification
 
-- Publish a checked client capability matrix and keep public-network claims
-  within their evidence.
-- Qualify or narrow service, identity-provider, and public-network claims.
+- Produce machine-readable load results with explicit performance and memory
+  budgets plus host provenance.
+- Run reproducible tuned-Linux scale campaigns before making scale claims.
 
 ## Remaining qualification
 
-- Define hardware budgets and run reproducible tuned-Linux scale campaigns.
 - Run controlled external qualification for Discord, Slack, additional identity
   providers, and public IRC networks.
 

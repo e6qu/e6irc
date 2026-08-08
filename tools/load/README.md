@@ -57,6 +57,9 @@ Any failed client, timeout, socket error, or missing delivery makes the harness
 exit nonzero; printed partial measurements can therefore never be mistaken for
 a successful qualification.
 
+`--report-json PATH` writes the versioned result contract: requested load,
+measured rates and latency, server RSS, thresholds, and pass/fail state.
+
 ## Toward the 100k-connection target (DESIGN §7.3, §17)
 
 One box, one `e6ircd`, ~100k concurrent sessions is the design target.
@@ -83,11 +86,30 @@ Run `sweep.sh` to walk client counts and tabulate the results:
 
 ```
 tools/load/sweep.sh 127.0.0.1:6667 "100 500 1000 5000 20000" 20 \
-  --minimum-connect-rate 100 --minimum-fanout-rate 1000 --maximum-p99-ms 500
+  --report-dir results --minimum-connect-rate 100 --minimum-fanout-rate 1000 --maximum-p99-ms 500
 ```
 
 Arguments after the burst are passed to every `e6irc-load` invocation, so one
-sweep can enforce thresholds chosen for that controlled host.
+sweep can enforce thresholds chosen for that controlled host. `--report-dir`
+must name a new directory; it creates one JSON result per client count.
+
+## Controlled Linux qualification
+
+`qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`
+and `host.txt`. It rejects a non-e6ircd PID, insufficient file-descriptor
+limits, ephemeral-port capacity, or listen backlog before it starts. It is a
+single-load-host tool; its client count cannot exceed that host's ephemeral
+port range. Its output directory must not exist, so it cannot overwrite prior
+evidence. `--report-json` also refuses an existing file.
+
+```
+tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 20000 200 20 results/20000 \
+  100 1000 500 262144
+```
+
+The final four values are minimum connect rate, minimum fan-out rate, maximum
+P99 milliseconds, and maximum incremental server resident bytes per requested
+connection. Keep the result and host files together when publishing a claim.
 
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,

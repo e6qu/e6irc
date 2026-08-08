@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 e6irc-client = { path = "../e6irc-client" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # rt-multi-thread to actually spread thousands of connections across cores.
 tokio = { version = "1.53.0", default-features = false, features = [
     "rt-multi-thread",

@@ -725,6 +725,8 @@ nontrivial optimization lands with evidence that proves it:
   resident-memory sampling and a 1 MiB incremental RSS/connection ceiling;
   manual baselines reach 2,000 clients. The harness accepts a stricter
   host-specific RSS ceiling alongside throughput and latency thresholds.
+  A controlled run writes a versioned result plus the host and server-binary
+  provenance, so a published number stays bound to its workload and budgets.
   Production-host budgets and the 100k qualification remain a target boundary,
   not a shipped performance claim.
 
