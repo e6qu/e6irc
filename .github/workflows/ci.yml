@@ -22,7 +22,8 @@ jobs:
       - run: tools/check-systemd-unit.sh
       - run: tools/test-docker-entrypoint.sh
       - run: tools/test-backup-restore.sh
-      - run: bash -n tools/load/sweep.sh tools/load/qualify-linux.sh
+      - run: bash -n tools/load/sweep.sh tools/load/qualify-arguments.sh tools/load/qualify-linux.sh tools/test-load-qualification-arguments.sh
+      - run: tools/test-load-qualification-arguments.sh
       # embed-web (pulled in by --all-features) embeds web/dist, so build
       # the frontend first. Node is preinstalled on the runners.
       - run: npm install -g pnpm@11.15.1 && pnpm -C web install --frozen-lockfile && pnpm -C web test && pnpm -C web build
