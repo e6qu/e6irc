@@ -118,6 +118,7 @@ test("network collection validation separates an empty list from a broken contra
     () => networksFrom({ networks: [{ name: "Libera", enabled: true, connected: false, runtime: { state: "connected" } }] }),
     /invalid network list/,
   );
+  assert.throws(() => networksFrom({ networks: [], next: "not part of this response" }), /invalid network list/);
 });
 
 test("identity parsing keeps only a safe, complete projection", () => {
@@ -136,6 +137,8 @@ test("identity parsing keeps only a safe, complete projection", () => {
   assert.throws(() => identityFrom({ account: "", email: null }), /invalid identity/);
   assert.throws(() => identityFrom({ account: "alice", role: 1 }), /invalid identity/);
   assert.throws(() => identityFrom({ account: "alice", logout_url: "//other.test/logout" }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", csrf_token: 1 }), /invalid identity/);
+  assert.throws(() => identityFrom({ account: "alice", unexpected: true }), /invalid identity/);
 });
 
 test("network labels use the API's typed runtime state", () => {

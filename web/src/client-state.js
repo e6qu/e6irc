@@ -14,6 +14,16 @@ const NETWORK_STATES = new Set([
   "authentication_failed",
   "registration_failed",
 ]);
+const IDENTITY_KEYS = new Set([
+  "account",
+  "email",
+  "role",
+  "provider",
+  "release_revision",
+  "csrf_token",
+  "logout_url",
+]);
+const NETWORK_LIST_KEYS = new Set(["networks"]);
 
 function defaults() {
   return { ...DEFAULT_SETTINGS };
@@ -113,19 +123,34 @@ function optionalString(value) {
   return value === undefined || value === null ? null : typeof value === "string" ? value : undefined;
 }
 
+function hasOnlyKeys(value, allowed) {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
 export function identityFrom(payload) {
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    !hasOnlyKeys(payload, IDENTITY_KEYS)
+  ) {
     throw new ApiError(200, "The server returned an invalid identity");
   }
   const { account } = payload;
   const email = optionalString(payload.email);
   const role = optionalString(payload.role);
+  const provider = optionalString(payload.provider);
+  const releaseRevision = optionalString(payload.release_revision);
   const logoutURL = optionalString(payload.logout_url);
+  const csrfToken = payload.csrf_token;
   if (
     typeof account !== "string" ||
     !account.trim() ||
     email === undefined ||
     role === undefined ||
+    provider === undefined ||
+    releaseRevision === undefined ||
+    (csrfToken !== undefined && typeof csrfToken !== "string") ||
     logoutURL === undefined ||
     (logoutURL !== null && (!logoutURL.startsWith("/") || logoutURL.startsWith("//")))
   ) {
@@ -155,7 +180,13 @@ function networkSummary(value) {
 }
 
 export function networksFrom(payload) {
-  if (payload === null || typeof payload !== "object" || !Array.isArray(payload.networks)) {
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    !hasOnlyKeys(payload, NETWORK_LIST_KEYS) ||
+    !Array.isArray(payload.networks)
+  ) {
     throw new ApiError(200, "The server returned an invalid network list");
   }
   const networks = payload.networks.map(networkSummary);

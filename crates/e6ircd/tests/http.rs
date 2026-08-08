@@ -859,6 +859,24 @@ async fn openapi_spec_is_served() {
         identity_schema["properties"]["logout_url"]["pattern"],
         "^/[^/]"
     );
+    assert_eq!(
+        identity_schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>()),
+        Some(vec![
+            "account".into(),
+            "csrf_token".into(),
+            "email".into(),
+            "logout_url".into(),
+            "provider".into(),
+            "release_revision".into(),
+            "role".into(),
+        ])
+    );
+    assert_eq!(
+        identity_schema["properties"]["csrf_token"]["type"],
+        "string"
+    );
     let network_list_schema = &v["paths"]["/api/v1/me/networks"]["get"]["responses"]["200"]["content"]
         ["application/json"]["schema"];
     assert_eq!(network_list_schema["additionalProperties"], false);
