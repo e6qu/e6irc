@@ -1817,7 +1817,9 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn remote_channel_message_reaches_the_destination_workers_sendq() {
-        use crate::core::state::{Caps, ChanModes, Channel, MemberModes, Recipient};
+        use crate::core::state::{
+            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
+        };
 
         let config = Config {
             name: "two-worker-core",
@@ -1893,6 +1895,7 @@ mod ingress_tests {
                     ..Caps::default()
                 },
             ),
+            MemberIdentity::new("remote".into(), "remote!u@host.test".into(), false),
             MemberModes::default(),
         );
         first.state.channels.entry(key.clone()).or_insert(channel);

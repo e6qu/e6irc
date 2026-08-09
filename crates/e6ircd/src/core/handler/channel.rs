@@ -223,6 +223,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         .map(|a| state.access_modes(&key, a))
         .unwrap_or((false, false));
     let recipient = state.local_recipient(conn);
+    let identity = state.local_member_identity(conn);
     let chan = state.channels.get_mut(&key).expect("just inserted");
     if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
         state.numeric(
@@ -268,6 +269,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let first = !chan.has_members();
     chan.add_member(
         recipient,
+        identity,
         MemberModes {
             op: first || is_founder || access_op,
             voice: access_voice,
@@ -443,24 +445,24 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
         return;
     }
     let requester_caps = state.sessions[&conn].caps;
+    let requester_is_member = chan.is_member(conn);
     let mut names: Vec<String> = chan
-        .members()
+        .member_identities()
         // An invisible member is hidden from a NAMES by an outsider who shares
         // no channel with them — the same rule WHO applies. Fellow members
         // share this channel, so they still see each other; only a non-member
         // listing a public channel is filtered. Without this, `+i` leaks.
-        .filter(|(m, _)| {
-            *m == conn || !state.sessions[m].invisible || state.share_channel(conn, *m)
+        .filter(|(m, _, identity)| {
+            *m == conn
+                || !identity.invisible
+                || requester_is_member
+                || state.share_channel(conn, *m)
         })
-        .map(|(m, modes)| {
-            let member = &state.sessions[&m];
+        .map(|(_, modes, identity)| {
             let shown = if requester_caps.userhost_in_names {
-                member.prefix()
+                identity.prefix.clone()
             } else {
-                member
-                    .nick()
-                    .map(String::from)
-                    .expect("member is registered")
+                identity.nick.clone()
             };
             let sigil = match (modes.op, modes.voice, requester_caps.multi_prefix) {
                 (true, true, true) => "@+",

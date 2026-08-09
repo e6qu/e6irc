@@ -672,9 +672,27 @@ impl Recipient {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct MemberIdentity {
+    pub(crate) nick: String,
+    pub(crate) prefix: String,
+    pub(crate) invisible: bool,
+}
+
+impl MemberIdentity {
+    pub(crate) fn new(nick: String, prefix: String, invisible: bool) -> Self {
+        Self {
+            nick,
+            prefix,
+            invisible,
+        }
+    }
+}
+
 struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
+    identity: MemberIdentity,
 }
 
 #[derive(Default)]
@@ -1069,9 +1087,20 @@ impl Channel {
         recipients
     }
 
-    pub fn add_member(&mut self, recipient: Recipient, modes: MemberModes) {
-        self.members
-            .insert(recipient.conn(), ChannelMember { modes, recipient });
+    pub fn add_member(
+        &mut self,
+        recipient: Recipient,
+        identity: MemberIdentity,
+        modes: MemberModes,
+    ) {
+        self.members.insert(
+            recipient.conn(),
+            ChannelMember {
+                modes,
+                recipient,
+                identity,
+            },
+        );
         self.recipients.get_mut().take();
     }
 
@@ -1091,6 +1120,14 @@ impl Channel {
             member.recipient = recipient;
             self.recipients.get_mut().take();
         }
+    }
+
+    pub fn member_identities(
+        &self,
+    ) -> impl Iterator<Item = (ConnId, &MemberModes, &MemberIdentity)> {
+        self.members
+            .iter()
+            .map(|(conn, member)| (*conn, &member.modes, &member.identity))
     }
 
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
@@ -1367,6 +1404,15 @@ impl ServerState {
         Recipient::new(
             SessionOwner::new(conn, self.shard),
             self.sessions[&conn].caps,
+        )
+    }
+
+    pub fn local_member_identity(&self, conn: ConnId) -> MemberIdentity {
+        let session = &self.sessions[&conn];
+        MemberIdentity::new(
+            session.nick().expect("registered member").to_string(),
+            session.prefix(),
+            session.invisible,
         )
     }
 
@@ -2882,6 +2928,7 @@ mod session_store_tests {
                 owner: SessionOwner::new(ConnId(1), CoreShardId(0)),
                 caps: Caps::default(),
             },
+            MemberIdentity::new("one".into(), "one!u@h".into(), false),
             MemberModes {
                 op: true,
                 voice: false,
@@ -2897,6 +2944,7 @@ mod session_store_tests {
                 owner: SessionOwner::new(ConnId(2), CoreShardId(0)),
                 caps: Caps::default(),
             },
+            MemberIdentity::new("two".into(), "two!u@h".into(), false),
             MemberModes {
                 op: false,
                 voice: false,
@@ -2926,7 +2974,11 @@ mod session_store_tests {
         let key = state.chan_key("#chat");
         let recipient = state.local_recipient(ConnId(1));
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
-        channel.add_member(recipient, MemberModes::default());
+        channel.add_member(
+            recipient,
+            MemberIdentity::new("one".into(), "one!u@h".into(), false),
+            MemberModes::default(),
+        );
         state.channels.entry(key.clone()).or_insert(channel);
         state
             .sessions
@@ -2963,6 +3015,7 @@ mod session_store_tests {
                     ..Caps::default()
                 },
             },
+            MemberIdentity::new("remote".into(), "remote!u@h".into(), false),
             MemberModes::default(),
         );
         state.channels.entry(key.clone()).or_insert(channel);
