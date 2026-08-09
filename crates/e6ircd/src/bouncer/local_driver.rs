@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use e6irc_queue::{Config as QueueConfig, Policy, Sender, queue};
+use e6irc_queue::{Config as QueueConfig, Policy, queue};
 
 use super::{ConnectionEvent, DriverEnds, NetworkConfig, NetworkDriver, NetworkHandle};
-use crate::core::{ConnectionIdAllocator, Input, Output};
+use crate::core::{ConnectionIdAllocator, CoreIngress, Input, Output};
 
 /// The in-process network's name — the driver `kind`, the session host, and the
 /// network a slash-less BNC attach defaults to (DESIGN §10.4: bare = `local`).
@@ -17,7 +17,7 @@ pub(crate) const LOCAL_NETWORK: &str = "local";
 /// Handles into the core, so the driver can open an in-process session.
 #[derive(Clone)]
 pub struct CoreHandles {
-    pub core_tx: Sender<Input>,
+    pub core_tx: CoreIngress,
     pub next_conn: Arc<ConnectionIdAllocator>,
     pub sendq: usize,
 }
@@ -224,7 +224,7 @@ async fn session_once(session: &LocalSession, ends: &mut DriverEnds) -> super::S
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use e6irc_queue::Receiver;
+    use e6irc_queue::{Receiver, Sender};
     use tokio::sync::broadcast;
 
     fn core_queue(capacity: usize) -> (Sender<Input>, Receiver<Input>) {
@@ -245,7 +245,7 @@ mod tests {
     ) {
         let session = LocalSession {
             core: CoreHandles {
-                core_tx,
+                core_tx: CoreIngress::single(core_tx),
                 next_conn: Arc::new(ConnectionIdAllocator::new(std::num::NonZeroU64::MIN)),
                 sendq: 8,
             },

@@ -12,10 +12,10 @@ and integration claims.
 
 ## Current work
 
-### Stage F — Scale qualification
+### Stage F — Scale architecture and qualification
 
-- Produce machine-readable load results with explicit performance and memory
-  budgets plus host provenance.
+- Ship a deterministic, sharded core while preserving IRC and control-plane
+  semantics.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.
 
 ## Remaining qualification

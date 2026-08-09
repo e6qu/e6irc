@@ -103,7 +103,7 @@ pub struct AppState {
     pub application_release_revision: Option<String>,
     pub pending_auth: Mutex<HashMap<String, PendingAuth>>,
     /// Inbound queue to the IRC core, for the ws-irc bridge.
-    pub core_tx: e6irc_queue::Sender<crate::core::Input>,
+    pub core_tx: crate::core::CoreIngress,
     /// Shared connection-id allocator (with every other ingress transport).
     pub next_conn: std::sync::Arc<crate::core::ConnectionIdAllocator>,
     /// Per-connection SendQ capacity.

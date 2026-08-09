@@ -13,13 +13,13 @@ mod state;
 
 pub use state::{ConnId, CoreConfig, dm_conversation_key};
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use e6irc_queue::{PushError, Sender};
+use e6irc_queue::{PushError, QueueMonitor, Sender};
 use state::ServerState;
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -35,6 +35,86 @@ use crate::observability::{LatencyKind, Telemetry};
 #[derive(Debug)]
 pub struct ConnectionIdAllocator {
     next: AtomicU64,
+}
+
+/// Number of core shards. Zero shards cannot be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreShardCount(NonZeroUsize);
+
+impl CoreShardCount {
+    pub fn new(count: NonZeroUsize) -> Self {
+        Self(count)
+    }
+
+    pub fn single() -> Self {
+        Self(NonZeroUsize::MIN)
+    }
+
+    fn shard_for(self, conn: ConnId) -> CoreShardId {
+        CoreShardId((conn.0 as usize) % self.0.get())
+    }
+}
+
+/// Index of one configured core shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreShardId(usize);
+
+/// The only ingress path into core state.
+#[derive(Clone)]
+pub struct CoreIngress {
+    shards: Arc<[Sender<Input>]>,
+    count: CoreShardCount,
+}
+
+impl CoreIngress {
+    pub fn single(sender: Sender<Input>) -> Self {
+        Self {
+            shards: Arc::from([sender]),
+            count: CoreShardCount::single(),
+        }
+    }
+
+    /// Build an ingress with a mandatory first shard.
+    #[cfg(test)]
+    pub fn with_shards(first: Sender<Input>, mut rest: Vec<Sender<Input>>) -> Self {
+        let capacity = rest
+            .len()
+            .checked_add(1)
+            .expect("allocated shard list cannot exceed usize");
+        let count = NonZeroUsize::new(capacity)
+            .expect("mandatory first shard keeps the core shard count nonzero");
+        let mut shards = Vec::with_capacity(capacity);
+        shards.push(first);
+        shards.append(&mut rest);
+        Self {
+            shards: shards.into(),
+            count: CoreShardCount::new(count),
+        }
+    }
+
+    pub async fn push(&self, input: Input) -> Result<u64, Input> {
+        let shard = match &input {
+            Input::Open { conn, .. }
+            | Input::Line { conn, .. }
+            | Input::OverlongLine { conn }
+            | Input::Closed { conn, .. }
+            | Input::DbReply { conn, .. }
+            | Input::HistoryPage { conn, .. }
+            | Input::TargetsPage { conn, .. } => self.count.shard_for(*conn),
+            Input::Tick { .. }
+            | Input::Shutdown
+            | Input::Admin { .. }
+            | Input::ChannelDropResult { .. }
+            | Input::ServerBanResult { .. }
+            | Input::ChannelControlResult { .. }
+            | Input::OwnedChannelRegistrationResult { .. } => CoreShardId(0),
+        };
+        self.shards[shard.0].push(input).await
+    }
+
+    pub fn monitor(&self) -> QueueMonitor {
+        self.shards[0].monitor()
+    }
 }
 
 impl ConnectionIdAllocator {
@@ -168,7 +248,7 @@ pub enum Input {
 /// `false` when the core is gone, so the connection stops directly rather
 /// than queueing into a void. Shared by the TCP and WebSocket read loops.
 pub(crate) async fn push_framed(
-    core_tx: &e6irc_queue::Sender<Input>,
+    core_tx: &CoreIngress,
     conn: ConnId,
     events: &mut Vec<e6irc_proto::framing::LineEvent>,
 ) -> bool {
@@ -1373,5 +1453,52 @@ mod connection_id_allocator_tests {
             u64::MAX - 1
         );
         assert!(exhausted.allocate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::{ConnId, CoreIngress, Input};
+    use e6irc_queue::{Config, Policy, queue};
+
+    #[tokio::test]
+    async fn connection_events_keep_one_deterministic_owner() {
+        let (first, mut first_rx) = queue(Config {
+            name: "first-core-shard",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, mut second_rx) = queue(Config {
+            name: "second-core-shard",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::with_shards(first, vec![second]);
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(4),
+                line: b"PING :one".to_vec(),
+            })
+            .await
+            .expect("first shard event routed");
+        ingress
+            .push(Input::OverlongLine { conn: ConnId(5) })
+            .await
+            .expect("second shard event routed");
+
+        let first = first_rx.pop().await.expect("first routed event");
+        let second = second_rx.pop().await.expect("second routed event");
+        assert!(matches!(
+            first.payload,
+            Input::Line {
+                conn: ConnId(4),
+                ..
+            }
+        ));
+        assert!(matches!(
+            second.payload,
+            Input::OverlongLine { conn: ConnId(5) }
+        ));
     }
 }

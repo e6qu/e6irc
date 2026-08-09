@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use crate::core::{DbReply, DbRequest, Input};
 use crate::observability::Telemetry;
-use e6irc_queue::{Receiver, Sender};
+use e6irc_queue::Receiver;
 
 mod secret_rotation;
 pub use secret_rotation::{SecretRotationReport, rotate_database_secrets};
@@ -1671,7 +1671,11 @@ pub async fn issue_app_password_for_account(
 
 /// One worker loop; run as a task. Replies always reach the core (or
 /// the core is gone and the server is shutting down).
-pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Sender<Input>) {
+pub async fn run_worker(
+    pool: PgPool,
+    mut rx: Receiver<DbRequest>,
+    core_tx: crate::core::CoreIngress,
+) {
     run_worker_inner(pool, &mut rx, core_tx, None).await;
 }
 
@@ -1682,7 +1686,7 @@ pub async fn run_worker(pool: PgPool, mut rx: Receiver<DbRequest>, core_tx: Send
 /// head-of-line-block queued reads behind one serial argon2 at a time.
 fn spawn_db_offload<F>(
     pool: &PgPool,
-    core_tx: &Sender<Input>,
+    core_tx: &crate::core::CoreIngress,
     telemetry: &Option<std::sync::Arc<Telemetry>>,
     conn: crate::core::ConnId,
     work: impl FnOnce(PgPool) -> F + Send + 'static,
@@ -1709,7 +1713,7 @@ fn spawn_db_offload<F>(
 pub(crate) async fn run_worker_observed(
     pool: PgPool,
     mut rx: Receiver<DbRequest>,
-    core_tx: Sender<Input>,
+    core_tx: crate::core::CoreIngress,
     telemetry: Arc<Telemetry>,
 ) {
     run_worker_inner(pool, &mut rx, core_tx, Some(telemetry)).await;
@@ -1718,7 +1722,7 @@ pub(crate) async fn run_worker_observed(
 async fn run_worker_inner(
     pool: PgPool,
     rx: &mut Receiver<DbRequest>,
-    core_tx: Sender<Input>,
+    core_tx: crate::core::CoreIngress,
     telemetry: Option<Arc<Telemetry>>,
 ) {
     let mut log_batch: Vec<DbRequest> = Vec::new();
@@ -1928,7 +1932,7 @@ fn record_database_error(telemetry: Option<&Telemetry>) {
 /// Handle one non-history request; false = core gone, stop the worker.
 async fn handle_request(
     pool: &PgPool,
-    core_tx: &Sender<Input>,
+    core_tx: &crate::core::CoreIngress,
     request: DbRequest,
     telemetry: Option<&Telemetry>,
 ) -> bool {
