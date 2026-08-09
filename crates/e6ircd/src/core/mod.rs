@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use e6irc_queue::{PushError, QueueMonitor, Sender};
+use e6irc_queue::{Envelope, PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -114,6 +114,86 @@ impl CoreIngress {
 
     pub fn monitor(&self) -> QueueMonitor {
         self.shards[0].monitor()
+    }
+}
+
+/// One event selected from a shard queue by the deterministic scheduler.
+pub(crate) struct ScheduledInput {
+    pub shard: CoreShardId,
+    pub sequence: u64,
+    pub input: Input,
+}
+
+/// Round-robin core queue selection.
+///
+/// A step records both the selected shard and that queue's sequence number,
+/// which is sufficient to replay a fixed set of queued inputs.
+pub(crate) struct CoreScheduler {
+    receivers: Vec<Receiver<Input>>,
+    count: CoreShardCount,
+    next: CoreShardId,
+}
+
+impl CoreScheduler {
+    pub(crate) fn single(receiver: Receiver<Input>) -> Self {
+        Self {
+            receivers: vec![receiver],
+            count: CoreShardCount::single(),
+            next: CoreShardId(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_shards(first: Receiver<Input>, mut rest: Vec<Receiver<Input>>) -> Self {
+        let capacity = rest
+            .len()
+            .checked_add(1)
+            .expect("allocated shard list cannot exceed usize");
+        let count = NonZeroUsize::new(capacity)
+            .expect("mandatory first shard keeps the core shard count nonzero");
+        let mut receivers = Vec::with_capacity(capacity);
+        receivers.push(first);
+        receivers.append(&mut rest);
+        Self {
+            receivers,
+            count: CoreShardCount::new(count),
+            next: CoreShardId(0),
+        }
+    }
+
+    pub(crate) fn try_step(&mut self) -> Option<ScheduledInput> {
+        for _ in 0..self.count.0.get() {
+            let shard = self.next;
+            self.next = CoreShardId((self.next.0 + 1) % self.count.0.get());
+            if let Some(Envelope {
+                seq,
+                payload: input,
+            }) = self.receivers[shard.0].try_pop()
+            {
+                return Some(ScheduledInput {
+                    shard,
+                    sequence: seq,
+                    input,
+                });
+            }
+        }
+        None
+    }
+
+    /// Await one event from the one-worker production configuration.
+    pub(crate) async fn pop_single(&mut self) -> Option<ScheduledInput> {
+        debug_assert_eq!(self.count.0.get(), 1);
+        if let Some(input) = self.try_step() {
+            return Some(input);
+        }
+        self.receivers[0]
+            .pop()
+            .await
+            .map(|envelope| ScheduledInput {
+                shard: CoreShardId(0),
+                sequence: envelope.seq,
+                input: envelope.payload,
+            })
     }
 }
 
@@ -1174,6 +1254,7 @@ impl WireLine {
 
 pub struct Core {
     state: ServerState,
+    next_sequence: u64,
 }
 
 impl Core {
@@ -1197,7 +1278,19 @@ impl Core {
     ) -> Self {
         Self {
             state: ServerState::new(shard, config, db_tx, telemetry),
+            next_sequence: 0,
         }
+    }
+
+    /// Process the next event selected by this worker's scheduler.
+    pub(crate) fn handle_scheduled(&mut self, event: ScheduledInput) {
+        debug_assert_eq!(event.shard, CoreShardId(0));
+        debug_assert_eq!(event.sequence, self.next_sequence);
+        self.next_sequence = event
+            .sequence
+            .checked_add(1)
+            .expect("core queue sequence exhausted");
+        self.handle(event.input);
     }
 
     /// Seed the hot channel-ownership map from persisted rows before the
@@ -1452,7 +1545,7 @@ mod connection_id_allocator_tests {
 
 #[cfg(test)]
 mod ingress_tests {
-    use super::{ConnId, CoreIngress, Input};
+    use super::{ConnId, CoreIngress, CoreScheduler, CoreShardId, Input};
     use e6irc_queue::{Config, Policy, queue};
 
     #[tokio::test]
@@ -1494,5 +1587,29 @@ mod ingress_tests {
             second.payload,
             Input::OverlongLine { conn: ConnId(5) }
         ));
+    }
+
+    #[test]
+    fn scheduler_round_robins_nonempty_shards_with_queue_sequences() {
+        let (first, first_rx) = queue(Config {
+            name: "scheduled-first",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, second_rx) = queue(Config {
+            name: "scheduled-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        first.try_push(Input::Shutdown).expect("first event");
+        second.try_push(Input::Shutdown).expect("second event");
+        let mut scheduler = CoreScheduler::with_shards(first_rx, vec![second_rx]);
+
+        let first = scheduler.try_step().expect("first scheduled event");
+        let second = scheduler.try_step().expect("second scheduled event");
+        assert_eq!(first.shard, CoreShardId(0));
+        assert_eq!(second.shard, CoreShardId(1));
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 0);
     }
 }

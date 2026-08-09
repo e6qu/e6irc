@@ -19,7 +19,9 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, TlsConfig};
-use crate::core::{ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, Input, Output};
+use crate::core::{
+    ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreScheduler, Input, Output,
+};
 use crate::observability::{ErrorKind, Telemetry};
 use e6irc_proto::framing::LineBuffer;
 use e6irc_queue::{Policy, Receiver, queue};
@@ -924,14 +926,15 @@ fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("TLS PEM: {e}"))
 }
 
-async fn core_worker(mut core: Core, mut rx: Receiver<Input>) {
-    while let Some(envelope) = rx.pop().await {
+async fn core_worker(mut core: Core, rx: Receiver<Input>) {
+    let mut scheduler = CoreScheduler::single(rx);
+    while let Some(event) = scheduler.pop_single().await {
         // `Shutdown` is handled (clients are notified) and then ends the loop.
         // Returning drops `core` — and with it the sole `Sender<DbRequest>` and
         // every session's `Sender<Output>` — which is what lets the DB worker
         // drain/flush and the write tasks deliver the ERROR before we exit.
-        let stop = matches!(envelope.payload, Input::Shutdown);
-        core.handle(envelope.payload);
+        let stop = matches!(&event.input, Input::Shutdown);
+        core.handle_scheduled(event);
         if stop {
             return;
         }
