@@ -2483,6 +2483,70 @@ mod ingress_tests {
         ingress
             .push(Input::Line {
                 conn: ConnId(1),
+                line: b"CAP REQ :-echo-message".to_vec(),
+            })
+            .await
+            .expect("disable echo-message");
+        let cap_ack = joiner_rx.pop().await.expect("echo-message CAP ACK");
+        assert!(
+            cap_ack
+                .payload
+                .0
+                .ends_with(b" CAP joiner ACK :-echo-message\r\n")
+        );
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=noecho BATCH +n draft/multiline #chat".to_vec(),
+            })
+            .await
+            .expect("open no-echo multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@batch=n PRIVMSG #chat :two".to_vec(),
+            })
+            .await
+            .expect("collect no-echo multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"BATCH -n".to_vec(),
+            })
+            .await
+            .expect("close no-echo multiline");
+        let noecho_peer = peer_rx
+            .pop()
+            .await
+            .expect("peer receives no-echo multiline");
+        assert!(
+            noecho_peer
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :two\r\n")
+        );
+        let noecho_ack = joiner_rx
+            .pop()
+            .await
+            .expect("opening label is acknowledged");
+        assert!(
+            noecho_ack
+                .payload
+                .0
+                .starts_with(b"@label=noecho :irc.test ACK\r\n")
+        );
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"CAP REQ :echo-message".to_vec(),
+            })
+            .await
+            .expect("restore echo-message");
+        joiner_rx.pop().await.expect("echo-message CAP ACK");
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
                 line: b"@label=tag;+typing=active TAGMSG #chat".to_vec(),
             })
             .await
