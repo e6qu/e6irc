@@ -794,25 +794,20 @@ pub struct ChannelQuit {
     line: String,
 }
 
-/// A parsed TOPIC request, owned by its channel shard.
+/// A parsed request, owned by its channel shard.
 #[derive(Debug, Clone)]
-pub struct ChannelTopic {
+pub struct ChannelRequest<Operation> {
     owner: ChannelOwner,
     actor: ChannelActor,
     target: String,
-    operation: ChannelTopicOperation,
+    operation: Operation,
     label: Option<String>,
 }
 
+pub type ChannelTopic = ChannelRequest<ChannelTopicOperation>;
+
 /// A channel command that must execute on the channel owner.
-#[derive(Debug, Clone)]
-pub struct ChannelCommand {
-    owner: ChannelOwner,
-    actor: ChannelActor,
-    target: String,
-    operation: ChannelCommandOperation,
-    label: Option<String>,
-}
+pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
 
 /// Closed channel-command operations.
 #[derive(Debug, Clone)]
@@ -845,12 +840,12 @@ impl ChannelInvitee {
     }
 }
 
-impl ChannelCommand {
+impl<Operation> ChannelRequest<Operation> {
     pub(crate) fn new(
         owner: ChannelOwner,
         actor: ChannelActor,
         target: String,
-        operation: ChannelCommandOperation,
+        operation: Operation,
         label: Option<String>,
     ) -> Self {
         Self {
@@ -874,14 +869,14 @@ impl ChannelCommand {
         self.label.clone()
     }
 
-    pub(crate) fn operation(&self) -> ChannelCommandOperation {
-        self.operation.clone()
-    }
-
-    pub(crate) fn into_parts(
-        self,
-    ) -> (ChannelOwner, ChannelActor, String, ChannelCommandOperation) {
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, Operation) {
         (self.owner, self.actor, self.target, self.operation)
+    }
+}
+
+impl<Operation: Clone> ChannelRequest<Operation> {
+    pub(crate) fn operation(&self) -> Operation {
+        self.operation.clone()
     }
 }
 
@@ -941,37 +936,6 @@ pub enum ChannelSessionEvent {
 pub enum ChannelTopicOperation {
     Query,
     Set(String),
-}
-
-impl ChannelTopic {
-    pub(crate) fn new(
-        owner: ChannelOwner,
-        actor: ChannelActor,
-        target: String,
-        operation: ChannelTopicOperation,
-        label: Option<String>,
-    ) -> Self {
-        Self {
-            owner,
-            actor,
-            target,
-            operation,
-            label,
-        }
-    }
-
-    pub(crate) fn owner(&self) -> &ChannelOwner {
-        &self.owner
-    }
-    pub(crate) fn actor(&self) -> &ChannelActor {
-        &self.actor
-    }
-    pub(crate) fn label(&self) -> Option<String> {
-        self.label.clone()
-    }
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, ChannelTopicOperation) {
-        (self.owner, self.actor, self.target, self.operation)
-    }
 }
 
 /// A channel owner's TOPIC answer, delivered only to the requester's session owner.
@@ -1198,46 +1162,7 @@ pub enum ChannelMultilineResult {
 }
 
 /// A parsed channel TAGMSG, owned by its channel shard.
-#[derive(Debug, Clone)]
-pub struct ChannelTagmsg {
-    owner: ChannelOwner,
-    actor: ChannelActor,
-    target: String,
-    client_tags: String,
-    label: Option<String>,
-}
-
-impl ChannelTagmsg {
-    pub(crate) fn new(
-        owner: ChannelOwner,
-        actor: ChannelActor,
-        target: String,
-        client_tags: String,
-        label: Option<String>,
-    ) -> Self {
-        Self {
-            owner,
-            actor,
-            target,
-            client_tags,
-            label,
-        }
-    }
-
-    pub(crate) fn owner(&self) -> &ChannelOwner {
-        &self.owner
-    }
-    pub(crate) fn actor(&self) -> &ChannelActor {
-        &self.actor
-    }
-    pub(crate) fn label(&self) -> Option<String> {
-        self.label.clone()
-    }
-
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, String) {
-        (self.owner, self.actor, self.target, self.client_tags)
-    }
-}
+pub type ChannelTagmsg = ChannelRequest<String>;
 
 /// The channel owner's answer to a parsed channel TAGMSG.
 #[derive(Debug)]

@@ -2264,8 +2264,12 @@ mod ingress_tests {
         ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
         CoreShardId, CoreTraceStep, CoreWorker, Input, NickDirectory, ReplayError, SessionOwner,
     };
+    use crate::core::state::{
+        Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
+        MemberIdentity, MemberModes, Recipient,
+    };
     use bytes::Bytes;
-    use e6irc_queue::{Config, Policy, queue};
+    use e6irc_queue::{Config, Envelope, Policy, Receiver, Sender, queue};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
@@ -2294,6 +2298,73 @@ mod ingress_tests {
             mono_clock,
             command_burst: None,
             registration_burst: None,
+        }
+    }
+
+    struct TwoWorkerHarness {
+        first: Core,
+        second: Core,
+        first_tx: Sender<Input>,
+        first_rx: Receiver<Input>,
+        second_tx: Sender<Input>,
+        second_rx: Receiver<Input>,
+        ingress: CoreIngress,
+    }
+
+    fn two_worker_harness() -> TwoWorkerHarness {
+        let config = Config {
+            name: "two-worker-routing",
+            capacity: 64,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config);
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let nicks = ingress.nick_directory();
+        let (first_db, _first_db_rx) = queue(Config {
+            name: "two-worker-first-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let (second_db, _second_db_rx) = queue(Config {
+            name: "two-worker-second-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let first = Core::with_telemetry_on_shard_with_nicks(
+            core_config(),
+            first_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+            nicks.clone(),
+        );
+        let second = Core::with_telemetry_on_shard_with_nicks(
+            core_config(),
+            second_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            shards,
+            nicks,
+        );
+        TwoWorkerHarness {
+            first,
+            second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        }
+    }
+
+    async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
+        loop {
+            if let Some(output) = rx.try_pop() {
+                return output;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -2355,10 +2426,6 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn channel_commands_reach_their_channel_owner() {
-        use crate::core::state::{
-            Caps, ChannelActor, ChannelCommand, ChannelCommandOperation, MemberIdentity, Recipient,
-        };
-
         let config = Config {
             name: "channel-command-routing",
             capacity: 2,
@@ -2419,46 +2486,15 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn remote_knock_runs_on_the_channel_owner() {
-        use crate::core::state::{
-            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
-        };
-
-        let config = Config {
-            name: "remote-knock",
-            capacity: 8,
-            policy: Policy::Fifo,
-        };
-        let (first_tx, first_rx) = queue(config);
-        let (second_tx, second_rx) = queue(config);
-        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
-        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
-        let nicks = ingress.nick_directory();
-        let (first_db, _first_db_rx) = queue(Config {
-            name: "remote-knock-first-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let (second_db, _second_db_rx) = queue(Config {
-            name: "remote-knock-second-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let mut first = Core::with_telemetry_on_shard_with_nicks(
-            core_config(),
-            first_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(0),
-            shards,
-            nicks.clone(),
-        );
-        let mut second = Core::with_telemetry_on_shard_with_nicks(
-            core_config(),
-            second_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(1),
-            shards,
-            nicks,
-        );
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
         let output_config = Config {
             name: "remote-knock-output",
             capacity: 64,
@@ -2520,24 +2556,14 @@ mod ingress_tests {
                 line: b"KNOCK #chat".to_vec(),
             })
             .expect("knock queued");
-        let operator = loop {
-            if let Some(output) = alice_rx.try_pop() {
-                break output;
-            }
-            tokio::task::yield_now().await;
-        };
+        let operator = next_output(&mut alice_rx).await;
         assert!(
             operator
                 .payload
                 .0
                 .ends_with(b" 710 alice #chat bob!bob@host.test :has asked for an invite\r\n")
         );
-        let result = loop {
-            if let Some(output) = bob_rx.try_pop() {
-                break output;
-            }
-            tokio::task::yield_now().await;
-        };
+        let result = next_output(&mut bob_rx).await;
         assert!(
             result
                 .payload
@@ -2550,19 +2576,9 @@ mod ingress_tests {
                 line: b"INVITE bob #chat".to_vec(),
             })
             .expect("invite queued");
-        let inviter = loop {
-            if let Some(output) = alice_rx.try_pop() {
-                break output;
-            }
-            tokio::task::yield_now().await;
-        };
+        let inviter = next_output(&mut alice_rx).await;
         assert!(inviter.payload.0.ends_with(b" 341 alice bob #chat\r\n"));
-        let invitee = loop {
-            if let Some(output) = bob_rx.try_pop() {
-                break output;
-            }
-            tokio::task::yield_now().await;
-        };
+        let invitee = next_output(&mut bob_rx).await;
         assert!(
             invitee
                 .payload
@@ -2577,46 +2593,15 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn remote_channel_message_reaches_the_destination_workers_sendq() {
-        use crate::core::state::{
-            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
-        };
-
-        let config = Config {
-            name: "two-worker-core",
-            capacity: 4,
-            policy: Policy::Fifo,
-        };
-        let (first_tx, first_rx) = queue(config);
-        let (second_tx, second_rx) = queue(config);
-        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
-        let nicks = ingress.nick_directory();
-        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
-        let (first_db, _first_db_rx) = queue(Config {
-            name: "first-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let (second_db, _second_db_rx) = queue(Config {
-            name: "second-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let mut first = Core::with_telemetry_on_shard_with_nicks(
-            core_config(),
-            first_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(0),
-            shards,
-            nicks.clone(),
-        );
-        let mut second = Core::with_telemetry_on_shard_with_nicks(
-            core_config(),
-            second_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(1),
-            shards,
-            nicks,
-        );
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
         let (out_tx, mut out_rx) = queue(Config {
             name: "remote-member-sendq",
             capacity: 8,
@@ -2694,46 +2679,15 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn remote_join_returns_to_the_session_owner() {
-        use crate::core::state::{
-            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
-        };
-
-        let config = Config {
-            name: "two-worker-join",
-            capacity: 8,
-            policy: Policy::Fifo,
-        };
-        let (first_tx, first_rx) = queue(config);
-        let (second_tx, second_rx) = queue(config);
-        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
-        let nicks = ingress.nick_directory();
-        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
-        let (first_db, _first_db_rx) = queue(Config {
-            name: "first-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let (second_db, _second_db_rx) = queue(Config {
-            name: "second-worker-db",
-            capacity: 1,
-            policy: Policy::Fifo,
-        });
-        let mut first = Core::with_telemetry_on_shard_with_nicks(
-            core_config(),
-            first_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(0),
-            shards,
-            nicks.clone(),
-        );
-        let mut second = Core::with_telemetry_on_shard_with_nicks(
-            core_config(),
-            second_db,
-            Arc::new(crate::observability::Telemetry::new()),
-            CoreShardId(1),
-            shards,
-            nicks,
-        );
+        let TwoWorkerHarness {
+            mut first,
+            mut second,
+            first_tx,
+            first_rx,
+            second_tx,
+            second_rx,
+            ingress,
+        } = two_worker_harness();
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
 
         let (peer_tx, mut peer_rx) = queue(Config {
