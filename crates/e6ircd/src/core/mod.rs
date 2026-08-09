@@ -1726,6 +1726,7 @@ mod ingress_tests {
         ConnId, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId,
         CoreTraceStep, CoreWorker, Input, ReplayError,
     };
+    use bytes::Bytes;
     use e6irc_queue::{Config, Policy, queue};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
@@ -1783,6 +1784,13 @@ mod ingress_tests {
             .push(Input::OverlongLine { conn: ConnId(5) })
             .await
             .expect("second shard event routed");
+        ingress
+            .push(Input::Delivery {
+                conn: ConnId(5),
+                line: Bytes::from_static(b"NOTICE * :delivered\r\n"),
+            })
+            .await
+            .expect("second shard delivery routed");
 
         let first = first_rx.pop().await.expect("first routed event");
         let second = second_rx.pop().await.expect("second routed event");
@@ -1796,6 +1804,14 @@ mod ingress_tests {
         assert!(matches!(
             second.payload,
             Input::OverlongLine { conn: ConnId(5) }
+        ));
+        let second = second_rx.pop().await.expect("second routed delivery");
+        assert!(matches!(
+            second.payload,
+            Input::Delivery {
+                conn: ConnId(5),
+                ..
+            }
         ));
     }
 
