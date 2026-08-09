@@ -161,6 +161,7 @@ impl CoreIngress {
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
             Input::ChannelCommand { command } => command.owner().shard(),
             Input::ChannelCommandResult { session, .. } => session.shard(),
+            Input::ChannelSessionEvent { session, .. } => session.shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
             Input::ChannelKickResult { session, .. } => session.shard(),
             Input::SessionChannelRemoved { session, .. } => session.shard(),
@@ -429,6 +430,10 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelCommandResult,
         label: Option<String>,
+    },
+    ChannelSessionEvent {
+        session: SessionOwner,
+        event: state::ChannelSessionEvent,
     },
     ChannelKick {
         kick: ChannelKick,
@@ -1976,6 +1981,14 @@ impl Core {
                     "channel command result reached wrong session shard"
                 );
                 handler::channel_command_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelSessionEvent { session, event } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "channel event reached wrong session shard"
+                );
+                handler::channel_session_event(&mut self.state, session.conn(), event);
             }
             Input::SessionChannelRemoved { session, key } => {
                 assert_eq!(

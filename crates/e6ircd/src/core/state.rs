@@ -815,9 +815,33 @@ pub struct ChannelCommand {
 }
 
 /// Closed channel-command operations.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ChannelCommandOperation {
     Knock,
+    Invite(ChannelInvitee),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelInvitee {
+    owner: SessionOwner,
+    requested_nick: String,
+}
+
+impl ChannelInvitee {
+    pub(crate) fn new(owner: SessionOwner, requested_nick: String) -> Self {
+        Self {
+            owner,
+            requested_nick,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> SessionOwner {
+        self.owner
+    }
+
+    pub(crate) fn requested_nick(&self) -> &str {
+        &self.requested_nick
+    }
 }
 
 impl ChannelCommand {
@@ -850,7 +874,7 @@ impl ChannelCommand {
     }
 
     pub(crate) fn operation(&self) -> ChannelCommandOperation {
-        self.operation
+        self.operation.clone()
     }
 
     pub(crate) fn into_parts(
@@ -864,6 +888,7 @@ impl ChannelCommand {
 #[derive(Debug)]
 pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
+    Invite(ChannelInviteResult),
 }
 
 #[derive(Debug)]
@@ -874,6 +899,24 @@ pub enum ChannelKnockResult {
     AlreadyOnChannel { display: String },
     ChannelOpen { display: String },
     CannotSend { display: String },
+}
+
+#[derive(Debug)]
+pub enum ChannelInviteResult {
+    Invited { invitee: String, channel: String },
+    NoSuchChannel { target: String },
+    NotOnChannel { target: String },
+    NotOperator { target: String },
+    UserOnChannel { invitee: String, channel: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelSessionEvent {
+    Invitation {
+        inviter_prefix: String,
+        inviter_account: Option<String>,
+        channel: String,
+    },
 }
 
 /// A TOPIC request has exactly one operation.
@@ -2118,6 +2161,18 @@ impl ServerState {
                 label,
             },
         ));
+    }
+
+    pub fn route_channel_session_event(
+        &mut self,
+        session: SessionOwner,
+        event: ChannelSessionEvent,
+    ) {
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelSessionEvent {
+                session,
+                event,
+            }));
     }
 
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {

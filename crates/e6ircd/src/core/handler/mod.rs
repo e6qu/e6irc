@@ -139,6 +139,11 @@ pub(crate) fn channel_command(
         crate::core::state::ChannelCommandOperation::Knock => {
             crate::core::state::ChannelCommandResult::Knock(chanops::knock_on_owner(state, command))
         }
+        crate::core::state::ChannelCommandOperation::Invite(_) => {
+            crate::core::state::ChannelCommandResult::Invite(chanops::invite_on_owner(
+                state, command,
+            ))
+        }
     };
     state.route_channel_command_result(session, result, label);
 }
@@ -153,7 +158,20 @@ pub(crate) fn channel_command_result(
         crate::core::state::ChannelCommandResult::Knock(result) => {
             chanops::emit_knock_result(state, conn, result, label)
         }
+        crate::core::state::ChannelCommandResult::Invite(result) => {
+            state.emit_deferred_labeled(conn, label, |state| {
+                chanops::emit_invite_result_now(state, conn, result)
+            })
+        }
     }
+}
+
+pub(crate) fn channel_session_event(
+    state: &mut ServerState,
+    conn: ConnId,
+    event: crate::core::state::ChannelSessionEvent,
+) {
+    chanops::emit_invitation(state, conn, event);
 }
 
 pub(crate) fn channel_kick(state: &mut ServerState, kick: crate::core::state::ChannelKick) {

@@ -208,110 +208,173 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "INVITE");
         return;
     };
-    let Some((key, display)) = resolve_channel(state, conn, target) else {
-        return;
-    };
-    if !state.channels[&key].is_member(conn) {
-        state.err_notonchannel(conn, target);
-        return;
-    }
-    let is_op = state.channels[&key].member(conn).is_some_and(|m| m.op);
-    if state.channels[&key].modes.invite_only && !is_op {
-        state.numeric(
-            conn,
-            ERR_CHANOPRIVSNEEDED,
-            &[target],
-            Some("You're not a channel operator"),
-        );
-        return;
-    }
-    let who_key = state.nick_key(who);
-    let Some(invitee) = state.registered_peer(&who_key) else {
+    let Some(invitee) = state.registered_nick_owner(&state.nick_key(who)) else {
         state.err_nosuchnick(conn, clip_echo(who));
         return;
     };
-    if state.channels[&key].is_member(invitee) {
-        state.numeric(
-            conn,
-            ERR_USERONCHANNEL,
-            &[who, &display],
-            Some("is already on channel"),
-        );
-        return;
+    let owner = state.channel_owner(target);
+    let label = if state.owns_channel(&owner) {
+        state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.label.clone())
+    } else {
+        state.defer_channel_reply(conn)
+    };
+    let command = crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.into(),
+        crate::core::state::ChannelCommandOperation::Invite(
+            crate::core::state::ChannelInvitee::new(invitee, who.into()),
+        ),
+        label,
+    );
+    if state.owns_channel(command.owner()) {
+        let result = invite_on_owner(state, command);
+        emit_invite_result_now(state, conn, result);
+    } else {
+        state.route_channel_command(command);
     }
-    let invitee_nick = state.sessions[&invitee]
-        .nick()
-        .map(String::from)
-        .expect("registered");
-    // Bound the channel's pending-invite set — INVITE would otherwise grow it
-    // without limit (invites to since-disconnected sessions linger). Drop
-    // entries for dead connections first; if still at the cap, evict an
-    // arbitrary old invite so the set stays bounded while the new one still
-    // lands (invites are low-value and the invitee can be re-invited).
-    if state.channels[&key].invited.len() >= INVITE_LIMIT {
-        let stale: Vec<ConnId> = state.channels[&key]
-            .invited
-            .iter()
-            .filter(|c| !state.sessions.contains_key(c))
-            .copied()
-            .collect();
-        let invited = &mut state.channels.get_mut(&key).expect("checked").invited;
-        for c in &stale {
-            invited.remove(c);
-        }
-        while invited.len() >= INVITE_LIMIT {
-            let Some(victim) = invited.iter().next().copied() else {
-                break;
-            };
-            invited.remove(&victim);
-        }
+}
+
+pub(super) fn invite_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelInviteResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::Invite(invitee) = operation else {
+        unreachable!("INVITE command operation");
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "INVITE owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelInviteResult::NoSuchChannel { target };
+    };
+    let display = chan.name.clone();
+    if !chan.is_member(actor.recipient.conn()) {
+        return crate::core::state::ChannelInviteResult::NotOnChannel { target };
     }
-    state
-        .channels
-        .get_mut(&key)
-        .expect("checked")
-        .invited
-        .insert(invitee);
-    state.numeric(conn, RPL_INVITING, &[&invitee_nick, &display], None);
-    let prefix = state.sessions[&conn].prefix();
-    let sender_account = state.sessions[&conn].account.clone();
-    let body = format!(":{prefix} INVITE {invitee_nick} :{display}");
-    // The invitee always sees the invite; invite-notify adds the channel's
-    // other cap-holding members. Both honor the recipient's server-time and
-    // account-tag caps: the IRCv3 account-tag spec covers INVITE from an
-    // identified sender, and irctest's AccountTag suite asserts it.
-    let mut recipients = vec![invitee];
-    let watchers: Vec<ConnId> = state.channels[&key]
+    if chan.modes.invite_only && !chan.member(actor.recipient.conn()).is_some_and(|m| m.op) {
+        return crate::core::state::ChannelInviteResult::NotOperator { target };
+    }
+    if chan.is_member(invitee.owner().conn()) {
+        return crate::core::state::ChannelInviteResult::UserOnChannel {
+            invitee: invitee.requested_nick().into(),
+            channel: display,
+        };
+    }
+    let recipients: Vec<_> = chan
         .recipients()
         .iter()
-        .map(|recipient| recipient.conn())
-        .filter(|c| *c != conn && *c != invitee)
-        .filter(|c| state.sessions.get(c).is_some_and(|s| s.caps.invite_notify))
+        .copied()
+        .filter(|recipient| {
+            recipient.conn() != actor.recipient.conn()
+                && recipient.conn() != invitee.owner().conn()
+                && recipient.caps().invite_notify
+        })
         .collect();
-    recipients.extend(watchers);
+    let invited = &mut state.channels.get_mut(&key).expect("checked").invited;
+    while invited.len() >= INVITE_LIMIT && !invited.contains(&invitee.owner().conn()) {
+        let victim = *invited.iter().next().expect("non-empty at invite cap");
+        invited.remove(&victim);
+    }
+    invited.insert(invitee.owner().conn());
     for recipient in recipients {
-        let Some(session) = state.sessions.get(&recipient) else {
-            continue;
-        };
-        let caps = session.caps;
-        let mut tags: Vec<String> = Vec::new();
-        if caps.server_time {
-            tags.push(format!("time={}", state.time_tag()));
+        let body = format!(
+            ":{} INVITE {} :{display}",
+            actor.identity.prefix,
+            invitee.requested_nick()
+        );
+        let line = invite_tags(state, recipient, &actor.account, &body);
+        state.send_recipient_uncaptured(recipient, bytes::Bytes::from(format!("{line}\r\n")));
+    }
+    let event = crate::core::state::ChannelSessionEvent::Invitation {
+        inviter_prefix: actor.identity.prefix,
+        inviter_account: actor.account,
+        channel: display.clone(),
+    };
+    if state.owns_session(invitee.owner()) {
+        emit_invitation(state, invitee.owner().conn(), event);
+    } else {
+        state.route_channel_session_event(invitee.owner(), event);
+    }
+    crate::core::state::ChannelInviteResult::Invited {
+        invitee: invitee.requested_nick().into(),
+        channel: display,
+    }
+}
+
+pub(super) fn invite_tags(
+    state: &ServerState,
+    recipient: crate::core::state::Recipient,
+    account: &Option<String>,
+    body: &str,
+) -> String {
+    let mut tags = Vec::new();
+    if recipient.caps().server_time {
+        tags.push(format!("time={}", state.time_tag()));
+    }
+    if recipient.caps().account_tag
+        && let Some(account) = account
+    {
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if tags.is_empty() {
+        body.into()
+    } else {
+        format!("@{} {body}", tags.join(";"))
+    }
+}
+
+pub(super) fn emit_invitation(
+    state: &mut ServerState,
+    conn: ConnId,
+    event: crate::core::state::ChannelSessionEvent,
+) {
+    let crate::core::state::ChannelSessionEvent::Invitation {
+        inviter_prefix,
+        inviter_account,
+        channel,
+    } = event;
+    let nick = state.sessions[&conn].nick().unwrap_or("*");
+    let body = format!(":{inviter_prefix} INVITE {nick} :{channel}");
+    let recipient = state.local_recipient(conn);
+    let line = invite_tags(state, recipient, &inviter_account, &body);
+    state.send(conn, &line);
+}
+
+pub(super) fn emit_invite_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelInviteResult,
+) {
+    match result {
+        crate::core::state::ChannelInviteResult::Invited { invitee, channel } => {
+            state.numeric(conn, RPL_INVITING, &[&invitee, &channel], None)
         }
-        if caps.account_tag
-            && let Some(account) = &sender_account
-        {
-            tags.push(format!(
-                "account={}",
-                e6irc_proto::message::escape_tag_value(account)
-            ));
+        crate::core::state::ChannelInviteResult::NoSuchChannel { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target))
         }
-        let line = if tags.is_empty() {
-            body.clone()
-        } else {
-            format!("@{} {body}", tags.join(";"))
-        };
-        state.send(recipient, &line);
+        crate::core::state::ChannelInviteResult::NotOnChannel { target } => {
+            state.err_notonchannel(conn, &target)
+        }
+        crate::core::state::ChannelInviteResult::NotOperator { target } => state.numeric(
+            conn,
+            ERR_CHANOPRIVSNEEDED,
+            &[&target],
+            Some("You're not a channel operator"),
+        ),
+        crate::core::state::ChannelInviteResult::UserOnChannel { invitee, channel } => state
+            .numeric(
+                conn,
+                ERR_USERONCHANNEL,
+                &[&invitee, &channel],
+                Some("is already on channel"),
+            ),
     }
 }
 
