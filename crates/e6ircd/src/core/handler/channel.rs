@@ -797,13 +797,19 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             .capture
             .as_ref()
             .and_then(|capture| capture.label.clone());
-        state.route_topic(crate::core::state::ChannelTopic::new(
+        let request = crate::core::state::ChannelTopic::new(
             state.channel_owner(target),
             state.channel_actor(conn),
             target.to_string(),
             None,
-            label,
-        ));
+            label.clone(),
+        );
+        if state.owns_channel(request.owner()) {
+            let result = topic_on_owner(state, request);
+            emit_topic_result(state, conn, result, label);
+        } else {
+            state.route_topic(request);
+        }
         return;
     }
     let Some((key, chan)) = require_channel(state, conn, target) else {

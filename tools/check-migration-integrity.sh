@@ -36,4 +36,4 @@ while IFS= read -r row; do
             fi
             ;;
     esac
-done < <(git diff --name-status -M "$base" -- migrations)
+done < <(git diff --name-status -M "$base" -- migrations) || true
