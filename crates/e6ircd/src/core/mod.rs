@@ -2373,7 +2373,7 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let mut core = Core::with_telemetry_on_shard_with_nicks(
+        let core = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
             db_tx,
             Arc::new(crate::observability::Telemetry::new()),
