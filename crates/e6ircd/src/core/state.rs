@@ -3725,6 +3725,18 @@ mod session_store_tests {
     }
 
     #[test]
+    fn nick_reservation_is_not_registered_until_marked() {
+        let directory = NickDirectory::default();
+        let key = NickKey("alice".into());
+        let owner = SessionOwner::new(ConnId(7), CoreShardId(1));
+
+        assert!(directory.claim(key.clone(), owner, false));
+        assert_eq!(directory.registered_owner(&key), None);
+        directory.mark_registered(&key, ConnId(7));
+        assert_eq!(directory.registered_owner(&key), Some(owner));
+    }
+
+    #[test]
     fn channel_owner_is_stable_for_the_folded_key() {
         let shards =
             CoreShardCount::new(std::num::NonZeroUsize::new(3).expect("nonzero shard count"));
