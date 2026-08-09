@@ -2542,6 +2542,31 @@ mod ingress_tests {
                 .0
                 .ends_with(b" 711 bob :Your KNOCK has been delivered\r\n")
         );
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"INVITE bob #chat".to_vec(),
+            })
+            .expect("invite queued");
+        let inviter = loop {
+            if let Some(output) = alice_rx.try_pop() {
+                break output;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(inviter.payload.0.ends_with(b" 341 alice bob #chat\r\n"));
+        let invitee = loop {
+            if let Some(output) = bob_rx.try_pop() {
+                break output;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            invitee
+                .payload
+                .0
+                .ends_with(b":alice!alice@host.test INVITE bob :#chat\r\n")
+        );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");
