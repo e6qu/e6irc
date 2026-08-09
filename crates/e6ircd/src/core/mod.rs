@@ -1150,32 +1150,17 @@ pub enum DbReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output(pub Bytes);
 
-/// A wire line whose content carries no injection bytes (embedded CR/LF/NUL).
-/// [`deliver`] takes only this, so a client's stream can never be handed a line
-/// that smuggles a second, forged line — the injection class is *unrepresentable
-/// at the delivery funnel*, in every build (not merely a debug assertion).
+/// A wire line with no embedded CR, LF, or NUL.
 ///
-/// Its one constructor, [`WireLine::sanitized`], neutralizes any CR/LF/NUL in
-/// the content — replacing each with a space, as `sanitize::upstream_line` does
-/// for bridge lines — while leaving the single trailing CRLF terminator, in
-/// every build. A well-formed line built by `ServerState::send` already has
-/// clean content (`Message::parse` rejects those bytes on input, and
-/// per-position sanitizers guard the synthesized fields), so this is a no-op
-/// fast path; the neutralization is the backstop for a line that carries an
-/// injection byte from an untrusted *data* source the core relays — a history
-/// body, a bridged line, future code. Unlike the over-long-line check (a *code*
-/// bug the debug assertion panics on to surface in tests), an injection byte is
-/// data the core must handle gracefully rather than aborting the shared worker,
-/// so it is neutralized, never asserted against.
+/// [`deliver`] accepts only this type. [`WireLine::sanitized`] preserves the
+/// trailing CRLF and replaces unsafe content bytes with spaces.
 pub(crate) struct WireLine(Bytes);
 
 impl WireLine {
     pub(crate) fn sanitized(bytes: Bytes) -> Self {
-        // Only the content before the terminating CRLF is scanned; the
-        // terminator itself is the one legitimate CRLF in the line.
         let end = bytes.len() - if bytes.ends_with(b"\r\n") { 2 } else { 0 };
         if !bytes[..end].iter().any(|&b| matches!(b, b'\r' | b'\n' | 0)) {
-            return WireLine(bytes); // fast path: content already injection-free
+            return WireLine(bytes);
         }
         let mut out = bytes.to_vec();
         for b in &mut out[..end] {
