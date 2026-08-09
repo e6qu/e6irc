@@ -6,8 +6,8 @@ use e6irc_proto::numerics::*;
 use super::ConnId;
 use super::state::{
     BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelMessage,
-    ChannelMessageResult, ChannelPartResult, ChannelTagmsg, ChannelTagmsgResult, MemberModes,
-    Recipient, ServerBan, ServerState, Topic,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult,
+    ChannelTagmsg, ChannelTagmsgResult, MemberModes, Recipient, ServerBan, ServerState, Topic,
 };
 
 pub(crate) mod admin;
@@ -117,6 +117,20 @@ pub(crate) fn channel_message_result(
     label: Option<String>,
 ) {
     message::emit_message_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_multiline(state: &mut ServerState, message: ChannelMultiline) {
+    let session = message.actor().session_owner();
+    let result = message::multiline_on_owner(state, message);
+    state.route_multiline_result(session, result);
+}
+
+pub(crate) fn channel_multiline_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelMultilineResult,
+) {
+    message::emit_multiline_result(state, conn, result);
 }
 
 pub(crate) fn channel_tagmsg(state: &mut ServerState, tagmsg: ChannelTagmsg) {

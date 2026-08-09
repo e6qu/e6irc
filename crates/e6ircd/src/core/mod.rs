@@ -27,8 +27,9 @@ use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
 use state::{
-    ChannelActor, ChannelJoinResult, ChannelMessage, ChannelMessageResult, ChannelOwner,
-    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult,
+    ChannelActor, ChannelJoinResult, ChannelMessage, ChannelMessageResult, ChannelMultiline,
+    ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
+    ChannelTagmsgResult,
 };
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -153,6 +154,8 @@ impl CoreIngress {
             Input::ChannelQuit { quit } => quit.owner().shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
+            Input::ChannelMultiline { message } => message.owner().shard(),
+            Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
             Input::Tick { .. }
@@ -394,6 +397,13 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelMessageResult,
         label: Option<String>,
+    },
+    ChannelMultiline {
+        message: ChannelMultiline,
+    },
+    ChannelMultilineResult {
+        session: SessionOwner,
+        result: ChannelMultilineResult,
     },
     ChannelTagmsg {
         tagmsg: ChannelTagmsg,
@@ -1468,6 +1478,13 @@ pub(crate) enum CoreEffect {
         result: ChannelMessageResult,
         label: Option<String>,
     },
+    ChannelMultiline {
+        message: ChannelMultiline,
+    },
+    ChannelMultilineResult {
+        session: SessionOwner,
+        result: ChannelMultilineResult,
+    },
     ChannelTagmsg {
         tagmsg: ChannelTagmsg,
     },
@@ -1563,6 +1580,10 @@ impl CoreWorker {
                         result,
                         label,
                     },
+                    CoreEffect::ChannelMultiline { message } => Input::ChannelMultiline { message },
+                    CoreEffect::ChannelMultilineResult { session, result } => {
+                        Input::ChannelMultilineResult { session, result }
+                    }
                     CoreEffect::ChannelTagmsg { tagmsg } => Input::ChannelTagmsg { tagmsg },
                     CoreEffect::ChannelTagmsgResult {
                         session,
@@ -1775,6 +1796,22 @@ impl Core {
                     "message result reached wrong session shard"
                 );
                 handler::channel_message_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelMultiline { message } => {
+                assert_eq!(
+                    message.owner().shard(),
+                    self.shard,
+                    "multiline reached wrong channel shard"
+                );
+                handler::channel_multiline(&mut self.state, message);
+            }
+            Input::ChannelMultilineResult { session, result } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "multiline result reached wrong session shard"
+                );
+                handler::channel_multiline_result(&mut self.state, session.conn(), result);
             }
             Input::ChannelTagmsg { tagmsg } => {
                 assert_eq!(
@@ -2296,6 +2333,20 @@ mod ingress_tests {
             .expect("joiner session")
             .caps
             .message_tags = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .batch = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .multiline = true;
         while joiner_rx.try_pop().is_some() {}
 
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
@@ -2369,6 +2420,65 @@ mod ingress_tests {
                 .0
                 .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
         );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=multi BATCH +m draft/multiline #chat".to_vec(),
+            })
+            .await
+            .expect("open cross-shard multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@batch=m PRIVMSG #chat :one".to_vec(),
+            })
+            .await
+            .expect("collect cross-shard multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"BATCH -m".to_vec(),
+            })
+            .await
+            .expect("close cross-shard multiline");
+        let multiline_peer = peer_rx
+            .pop()
+            .await
+            .expect("peer receives flattened multiline");
+        assert!(
+            multiline_peer
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :one\r\n")
+        );
+        let multiline_open = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives multiline open");
+        assert!(multiline_open.payload.0.starts_with(b"@label=multi;msgid="));
+        assert!(
+            multiline_open
+                .payload
+                .0
+                .windows(b" BATCH +".len())
+                .any(|part| part == b" BATCH +")
+        );
+        let multiline_line = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives multiline line");
+        assert!(
+            multiline_line
+                .payload
+                .0
+                .ends_with(b" PRIVMSG #chat :one\r\n")
+        );
+        let multiline_close = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives multiline close");
+        assert!(multiline_close.payload.0.starts_with(b":irc.test BATCH -"));
 
         ingress
             .push(Input::Line {

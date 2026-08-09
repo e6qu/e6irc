@@ -992,7 +992,20 @@ pub(super) fn cmd_batch(state: &mut ServerState, conn: ConnId, msg: &Message, p:
             // capture across delivery so the echo goes out uncaptured with only its
             // inline label; restore it (empty) so the close still gets its own ACK.
             let close_capture = state.capture.take();
-            deliver_multiline(state, conn, batch);
+            let (_, channel_target) = StatusSigil::split(&batch.target);
+            let owner = state.channel_owner(channel_target);
+            if !batch.lines.is_empty()
+                && channel_target.starts_with('#')
+                && !state.owns_channel(&owner)
+            {
+                state.route_multiline(crate::core::state::ChannelMultiline::new(
+                    owner,
+                    state.channel_actor(conn),
+                    batch,
+                ));
+            } else {
+                deliver_multiline(state, conn, batch);
+            }
             state.capture = close_capture;
         }
         _ => multiline_fail(
@@ -1250,6 +1263,255 @@ pub(super) fn deliver_multiline(
     );
 }
 
+pub(super) fn multiline_on_owner(
+    state: &mut ServerState,
+    message: crate::core::state::ChannelMultiline,
+) -> crate::core::state::ChannelMultilineResult {
+    let (owner, actor, batch) = message.into_parts();
+    let kind = batch
+        .kind
+        .expect("completed non-empty multiline has a kind");
+    let (status, channel_target) = StatusSigil::split(&batch.target);
+    let key = state.chan_key(channel_target);
+    assert_eq!(owner.key(), &key, "multiline owner does not match target");
+    let Some(channel) = state.channels.get(&key) else {
+        return crate::core::state::ChannelMultilineResult::NoSuchChannel {
+            target: batch.target,
+            loud: kind.is_loud(),
+            label: batch.label,
+        };
+    };
+    if !channel.may_speak(
+        channel.member(actor.recipient.conn()),
+        state.casemap,
+        &actor.identity.prefix,
+    ) {
+        return crate::core::state::ChannelMultilineResult::CannotSend {
+            target: batch.target,
+            no_ctcp: false,
+            loud: kind.is_loud(),
+            label: batch.label,
+        };
+    }
+    let joined = multiline_joined(&batch.lines);
+    if channel.modes.no_ctcp && joined.split('\n').any(is_blocked_ctcp) {
+        return crate::core::state::ChannelMultilineResult::CannotSend {
+            target: batch.target,
+            no_ctcp: true,
+            loud: kind.is_loud(),
+            label: batch.label,
+        };
+    }
+    let recipients = channel.recipients_where(|member, modes| {
+        member != actor.recipient.conn() && status.is_none_or(|sig| sig.admits(modes))
+    });
+    let (ts, msgid) = state.stamp();
+    let batch_ref = state.next_msgid();
+    for recipient in recipients {
+        for line in render_multiline_lines(
+            state,
+            recipient.caps(),
+            &actor,
+            &batch,
+            kind,
+            ts,
+            &msgid,
+            &batch_ref,
+            None,
+        ) {
+            state.send_recipient_uncaptured(recipient, line);
+        }
+    }
+    let echo = if actor.recipient.caps().echo_message {
+        render_multiline_lines(
+            state,
+            actor.recipient.caps(),
+            &actor,
+            &batch,
+            kind,
+            ts,
+            &msgid,
+            &batch_ref,
+            batch.label.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+    if status.is_none() {
+        let fallback = batch
+            .lines
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        record_history(
+            state,
+            &(&key).into(),
+            Vec::new(),
+            crate::core::state::HistoryEntry {
+                msgid,
+                ts,
+                sender_prefix: actor.identity.prefix.clone(),
+                sender_account: actor.account.clone(),
+                kind,
+                body: fallback,
+                sender_is_bot: actor.bot,
+                multiline: Some(encode_multiline(&batch.lines)),
+            },
+        );
+    }
+    crate::core::state::ChannelMultilineResult::Delivered {
+        echo,
+        label: batch.label,
+    }
+}
+
+fn multiline_joined(lines: &[(String, bool)]) -> String {
+    let mut joined = String::new();
+    for (index, (text, concat)) in lines.iter().enumerate() {
+        if index > 0 && !concat {
+            joined.push('\n');
+        }
+        joined.push_str(text);
+    }
+    joined
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_multiline_lines(
+    state: &ServerState,
+    caps: crate::core::state::Caps,
+    actor: &crate::core::state::ChannelActor,
+    batch: &crate::core::state::MultilineBatch,
+    kind: crate::core::MessageKind,
+    ts: e6irc_proto::time::Millis,
+    msgid: &str,
+    batch_ref: &str,
+    label: Option<&str>,
+) -> Vec<bytes::Bytes> {
+    let target = &batch.target;
+    let prefix = &actor.identity.prefix;
+    let mut common = Vec::new();
+    if caps.server_time {
+        common.push(format!("time={}", e6irc_proto::time::server_time(ts)));
+    }
+    if caps.account_tag
+        && let Some(account) = &actor.account
+    {
+        common.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if actor.bot && caps.message_tags {
+        common.push("bot".into());
+    }
+    let mut lines = Vec::new();
+    if caps.multiline && caps.batch {
+        let mut open = Vec::new();
+        if let Some(label) = label {
+            open.push(format!("label={label}"));
+        }
+        if caps.message_tags {
+            open.push(format!("msgid={msgid}"));
+            if !batch.client_tags.is_empty() {
+                open.push(batch.client_tags.clone());
+            }
+        }
+        open.extend(common.iter().cloned());
+        lines.push(render_multiline_line(&format!(
+            "{}:{prefix} BATCH +{batch_ref} {MULTILINE_CAP} {target}",
+            tag_prefix(&open)
+        )));
+        for (text, concat) in &batch.lines {
+            let mut tags = vec![format!("batch={batch_ref}")];
+            if *concat && caps.message_tags {
+                tags.push(MULTILINE_CONCAT_TAG.into());
+            }
+            tags.extend(common.iter().cloned());
+            lines.push(render_multiline_line(&format!(
+                "{}:{prefix} {} {target} :{text}",
+                tag_prefix(&tags),
+                kind.wire()
+            )));
+        }
+        lines.push(render_multiline_line(&format!(
+            ":{} BATCH -{batch_ref}",
+            state.config.server_name
+        )));
+    } else {
+        let mut first = true;
+        for (text, _) in batch.lines.iter().filter(|(text, _)| !text.is_empty()) {
+            let mut tags = Vec::new();
+            if caps.message_tags {
+                if first {
+                    tags.push(format!("msgid={msgid}"));
+                }
+                if !batch.client_tags.is_empty() {
+                    tags.push(batch.client_tags.clone());
+                }
+            }
+            tags.extend(common.iter().cloned());
+            let text = fit_relayed_text(prefix, kind.wire(), target, text);
+            lines.push(render_multiline_line(&format!(
+                "{}:{prefix} {} {target} :{text}",
+                tag_prefix(&tags),
+                kind.wire()
+            )));
+            first = false;
+        }
+    }
+    lines
+}
+
+pub(super) fn emit_multiline_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelMultilineResult,
+) {
+    match result {
+        crate::core::state::ChannelMultilineResult::Delivered { echo, label } => {
+            let has_echo = !echo.is_empty();
+            for line in echo {
+                state.send_bytes_uncaptured(conn, line);
+            }
+            if !has_echo {
+                ack_multiline_label(state, conn, label.as_deref());
+            }
+        }
+        crate::core::state::ChannelMultilineResult::NoSuchChannel {
+            target,
+            loud,
+            label,
+        } => {
+            if loud {
+                state.err_nosuchchannel(conn, clip_echo(&target));
+            }
+            ack_multiline_label(state, conn, label.as_deref());
+        }
+        crate::core::state::ChannelMultilineResult::CannotSend {
+            target,
+            no_ctcp,
+            loud,
+            label,
+        } => {
+            if loud {
+                state.numeric(
+                    conn,
+                    ERR_CANNOTSENDTOCHAN,
+                    &[&target],
+                    Some(if no_ctcp {
+                        "Cannot send to channel (+C, no CTCP)"
+                    } else {
+                        "Cannot send to channel"
+                    }),
+                );
+            }
+            ack_multiline_label(state, conn, label.as_deref());
+        }
+    }
+}
+
 /// Encode a multiline message's `(text, concat)` lines into one string for
 /// history storage: each line is `0`/`1` (its concat flag) followed by its
 /// text, lines joined by `\n`. A stored line's text never contains `\n` or NUL
@@ -1308,12 +1570,20 @@ pub(super) fn send_multiline_line(
     bypass_capture: bool,
     line: &str,
 ) {
-    let bytes = bytes::Bytes::from(format!("{line}\r\n"));
+    let bytes = render_multiline_line(line);
     if bypass_capture {
         state.send_recipient_uncaptured(recipient, bytes);
     } else {
         state.send_recipient(recipient, bytes);
     }
+}
+
+/// Render one already-formed multiline wire line.
+///
+/// Kept separate from delivery so channel owners can produce a sender echo as
+/// data for its session owner, without touching that owner's output capture.
+pub(super) fn render_multiline_line(line: &str) -> bytes::Bytes {
+    bytes::Bytes::from(format!("{line}\r\n"))
 }
 
 /// Buffer one line of an open multiline batch. Returns true when the message

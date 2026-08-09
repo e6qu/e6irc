@@ -833,6 +833,54 @@ pub enum ChannelMessageResult {
     },
 }
 
+/// A completed channel multiline message.
+#[derive(Debug)]
+pub struct ChannelMultiline {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    batch: MultilineBatch,
+}
+
+impl ChannelMultiline {
+    pub(crate) fn new(owner: ChannelOwner, actor: ChannelActor, batch: MultilineBatch) -> Self {
+        Self {
+            owner,
+            actor,
+            batch,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, MultilineBatch) {
+        (self.owner, self.actor, self.batch)
+    }
+}
+
+/// A channel-owner multiline outcome delivered to the sender's session owner.
+#[derive(Debug)]
+pub enum ChannelMultilineResult {
+    Delivered {
+        echo: Vec<Bytes>,
+        label: Option<String>,
+    },
+    NoSuchChannel {
+        target: String,
+        loud: bool,
+        label: Option<String>,
+    },
+    CannotSend {
+        target: String,
+        no_ctcp: bool,
+        loud: bool,
+        label: Option<String>,
+    },
+}
+
 /// A parsed channel TAGMSG, owned by its channel shard.
 #[derive(Debug, Clone)]
 pub struct ChannelTagmsg {
@@ -1101,6 +1149,7 @@ impl From<&ChanKey> for HistoryKey {
 /// lines are buffered rather than delivered as they arrive, since a multiline
 /// message is one message — it gets one msgid and one timestamp, and a client
 /// that abandons the batch must deliver nothing at all.
+#[derive(Debug)]
 pub(crate) struct MultilineBatch {
     /// The client's batch reference, as given after `+`.
     pub reference: String,
@@ -1747,6 +1796,19 @@ impl ServerState {
             result,
             label,
         });
+    }
+
+    pub fn route_multiline(&mut self, message: ChannelMultiline) {
+        self.effects.push(CoreEffect::ChannelMultiline { message });
+    }
+
+    pub fn route_multiline_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelMultilineResult,
+    ) {
+        self.effects
+            .push(CoreEffect::ChannelMultilineResult { session, result });
     }
 
     pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
