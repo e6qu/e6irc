@@ -2418,6 +2418,137 @@ mod ingress_tests {
     }
 
     #[tokio::test]
+    async fn remote_knock_runs_on_the_channel_owner() {
+        use crate::core::state::{
+            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
+        };
+
+        let config = Config {
+            name: "remote-knock",
+            capacity: 8,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config);
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let nicks = ingress.nick_directory();
+        let (first_db, _first_db_rx) = queue(Config {
+            name: "remote-knock-first-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let (second_db, _second_db_rx) = queue(Config {
+            name: "remote-knock-second-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut first = Core::with_telemetry_on_shard_with_nicks(
+            core_config(),
+            first_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+            nicks.clone(),
+        );
+        let mut second = Core::with_telemetry_on_shard_with_nicks(
+            core_config(),
+            second_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            shards,
+            nicks,
+        );
+        let output_config = Config {
+            name: "remote-knock-output",
+            capacity: 64,
+            policy: Policy::Fifo,
+        };
+        let (alice_tx, mut alice_rx) = queue(output_config);
+        let (bob_tx, mut bob_rx) = queue(output_config);
+        first.state.open(
+            ConnId(2),
+            alice_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        second.state.open(
+            ConnId(1),
+            bob_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        for (core, conn, nick) in [
+            (&mut first, ConnId(2), "alice"),
+            (&mut second, ConnId(1), "bob"),
+        ] {
+            core.handle(Input::Line {
+                conn,
+                line: format!("NICK {nick}").into_bytes(),
+            });
+            core.handle(Input::Line {
+                conn,
+                line: format!("USER {nick} 0 * :{nick}").into_bytes(),
+            });
+        }
+        while alice_rx.try_pop().is_some() {}
+        while bob_rx.try_pop().is_some() {}
+        let key = first.state.chan_key("#chat");
+        assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
+        let mut modes = ChanModes::default();
+        modes.invite_only = true;
+        let mut channel = Channel::new("#chat".into(), None, modes, 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(2), CoreShardId(0)),
+                Caps::default(),
+            ),
+            MemberIdentity::new("alice".into(), "alice!alice@host.test".into(), false),
+            MemberModes {
+                op: true,
+                voice: false,
+            },
+        );
+        first.state.channels.entry(key).or_insert(channel);
+        let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
+        let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"KNOCK #chat".to_vec(),
+            })
+            .expect("knock queued");
+        let operator = loop {
+            if let Some(output) = alice_rx.try_pop() {
+                break output;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            operator
+                .payload
+                .0
+                .ends_with(b" 710 alice #chat bob!bob@host.test :has asked for an invite\r\n")
+        );
+        let result = loop {
+            if let Some(output) = bob_rx.try_pop() {
+                break output;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(
+            result
+                .payload
+                .0
+                .ends_with(b" 711 bob :Your KNOCK has been delivered\r\n")
+        );
+        first_tx.try_push(Input::Shutdown).expect("stop first");
+        second_tx.try_push(Input::Shutdown).expect("stop second");
+        first_worker.await.expect("first worker");
+        second_worker.await.expect("second worker");
+    }
+
+    #[tokio::test]
     async fn remote_channel_message_reaches_the_destination_workers_sendq() {
         use crate::core::state::{
             Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
