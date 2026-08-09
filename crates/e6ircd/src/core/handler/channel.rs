@@ -1722,18 +1722,22 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     continue;
                 };
                 let nick_key = state.nick_key(who);
-                let Some(member_conn) = state.nick_connection(&nick_key) else {
-                    state.err_nosuchnick(conn, clip_echo(who));
+                let Some((member_conn, _, identity)) =
+                    state.channels[&key].member_named(state.casemap, who)
+                else {
+                    if state.registered_nick_owner(&nick_key).is_none() {
+                        state.err_nosuchnick(conn, clip_echo(who));
+                    } else {
+                        state.numeric(
+                            conn,
+                            ERR_USERNOTINCHANNEL,
+                            &[who, &display],
+                            Some("They aren't on that channel"),
+                        );
+                    }
                     continue;
                 };
-                // Echo the target's canonical nick, not the raw input casing, so
-                // `+o bob` on member `Bob` broadcasts `+o Bob` — captured before
-                // the mutable channel borrow below.
-                let member_nick = state
-                    .sessions
-                    .get(&member_conn)
-                    .and_then(|s| s.nick().map(String::from))
-                    .unwrap_or_else(|| who.to_string());
+                let member_nick = identity.nick.clone();
                 let chan = state.channels.get_mut(&key).expect("checked");
                 let Some(member) = chan.member_mut(member_conn) else {
                     state.numeric(
