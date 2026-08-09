@@ -586,6 +586,17 @@ fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPart
 }
 
 pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, echo: &str) {
+    let caps = state.local_recipient(conn).caps();
+    send_names_with_caps(state, conn, caps, key, echo);
+}
+
+fn send_names_with_caps(
+    state: &mut ServerState,
+    conn: ConnId,
+    requester_caps: crate::core::state::Caps,
+    key: &ChanKey,
+    echo: &str,
+) {
     let Some(chan) = state.channels.get(key) else {
         return;
     };
@@ -606,7 +617,6 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
         );
         return;
     }
-    let requester_caps = state.sessions[&conn].caps;
     let requester_is_member = chan.is_member(conn);
     let mut names: Vec<String> = chan
         .member_identities()
@@ -663,21 +673,65 @@ pub(super) fn cmd_names(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     match p.first().filter(|_| has_target) {
         Some(&targets) => {
             for target in targets.split(',').filter(|t| !t.is_empty()) {
-                let key = state.chan_key(target);
-                if state.channels.contains_key(&key) {
+                let owner = state.channel_owner(target);
+                if state.owns_channel(&owner) {
+                    let key = state.chan_key(target);
                     send_names(state, conn, &key, target);
                 } else {
-                    state.numeric(
-                        conn,
-                        RPL_ENDOFNAMES,
-                        &[clip_echo(target)],
-                        Some("End of /NAMES list"),
-                    );
+                    let label = state.channel_reply_label(conn, &owner);
+                    state.route_channel_command(crate::core::state::ChannelCommand::new(
+                        owner,
+                        state.channel_actor(conn),
+                        target.to_string(),
+                        crate::core::state::ChannelCommandOperation::Names,
+                        label,
+                    ));
                 }
             }
         }
         None => state.numeric(conn, RPL_ENDOFNAMES, &["*"], Some("End of /NAMES list")),
     }
+}
+
+pub(super) fn names_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelCommandReplies {
+    let (owner, actor, target, operation) = command.into_parts();
+    debug_assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::Names
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "NAMES owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick),
+        label: None,
+        deferred: false,
+    });
+    send_names_with_caps(
+        state,
+        actor.recipient.conn(),
+        actor.recipient.caps(),
+        &key,
+        &target,
+    );
+    if !state.channels.contains_key(&key) {
+        state.numeric(
+            actor.recipient.conn(),
+            RPL_ENDOFNAMES,
+            &[clip_echo(&target)],
+            Some("End of /NAMES list"),
+        );
+    }
+    let lines = state.capture.take().expect("NAMES capture installed").lines;
+    crate::core::state::ChannelCommandReplies { lines }
 }
 
 /// One message delivery: the payload plus its sender/tag context. Bundled
@@ -1394,7 +1448,7 @@ fn emit_mode_query_result_now(
 pub(super) fn mode_change_on_owner(
     state: &mut ServerState,
     command: crate::core::state::ChannelCommand,
-) -> crate::core::state::ChannelModeChangeResult {
+) -> crate::core::state::ChannelCommandReplies {
     let (owner, actor, target, operation) = command.into_parts();
     let crate::core::state::ChannelCommandOperation::ModeChange(change) = operation else {
         unreachable!("MODE mutation requires its operation")
@@ -1423,13 +1477,13 @@ pub(super) fn mode_change_on_owner(
         &actor.identity.prefix,
     );
     let lines = state.capture.take().expect("MODE capture installed").lines;
-    crate::core::state::ChannelModeChangeResult { lines }
+    crate::core::state::ChannelCommandReplies { lines }
 }
 
-pub(super) fn emit_mode_change_result(
+pub(super) fn emit_channel_command_replies(
     state: &mut ServerState,
     conn: ConnId,
-    result: crate::core::state::ChannelModeChangeResult,
+    result: crate::core::state::ChannelCommandReplies,
     label: Option<String>,
 ) {
     state.emit_deferred_labeled(conn, label, |state| {

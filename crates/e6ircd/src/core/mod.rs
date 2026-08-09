@@ -2721,6 +2721,25 @@ mod ingress_tests {
                 .0
                 .ends_with(b":robert!bob@host.test MODE #chat +m\r\n")
         );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"NAMES #chat".to_vec(),
+            })
+            .expect("remote names queued");
+        let names = next_output(&mut bob_rx).await;
+        assert!(
+            names
+                .payload
+                .0
+                .ends_with(b" 353 robert = #chat :@alice @robert\r\n")
+        );
+        let end = next_output(&mut bob_rx).await;
+        assert!(
+            end.payload
+                .0
+                .ends_with(b" 366 robert #chat :End of /NAMES list\r\n")
+        );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");

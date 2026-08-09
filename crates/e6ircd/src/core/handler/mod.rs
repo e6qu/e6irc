@@ -144,6 +144,9 @@ pub(crate) fn channel_command(
                 state, command,
             ))
         }
+        crate::core::state::ChannelCommandOperation::Names => {
+            crate::core::state::ChannelCommandResult::Names(channel::names_on_owner(state, command))
+        }
         crate::core::state::ChannelCommandOperation::ModeQuery => {
             crate::core::state::ChannelCommandResult::ModeQuery(channel::mode_query_on_owner(
                 state, command,
@@ -178,6 +181,9 @@ pub(crate) fn channel_command_result(
                 chanops::emit_invite_result_now(state, conn, result)
             })
         }
+        crate::core::state::ChannelCommandResult::Names(result) => {
+            channel::emit_channel_command_replies(state, conn, result, label)
+        }
         crate::core::state::ChannelCommandResult::ModeQuery(result) => {
             channel::emit_mode_query_result(state, conn, result, label)
         }
@@ -185,7 +191,7 @@ pub(crate) fn channel_command_result(
             channel::emit_mode_list_query_result(state, conn, result, label)
         }
         crate::core::state::ChannelCommandResult::ModeChange(result) => {
-            channel::emit_mode_change_result(state, conn, result, label)
+            channel::emit_channel_command_replies(state, conn, result, label)
         }
     }
 }

@@ -864,6 +864,7 @@ pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
 pub enum ChannelCommandOperation {
     Knock,
     Invite(ChannelInvitee),
+    Names,
     ModeQuery,
     ModeListQuery(String),
     ModeChange(ChannelModeChange),
@@ -944,14 +945,15 @@ impl<Operation: Clone> ChannelRequest<Operation> {
 pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
+    Names(ChannelCommandReplies),
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
-    ModeChange(ChannelModeChangeResult),
+    ModeChange(ChannelCommandReplies),
 }
 
-/// Direct MODE replies produced by the channel owner for the session owner.
+/// Direct replies produced by the channel owner for the session owner.
 #[derive(Debug)]
-pub struct ChannelModeChangeResult {
+pub struct ChannelCommandReplies {
     pub(crate) lines: Vec<Bytes>,
 }
 
