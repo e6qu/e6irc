@@ -294,24 +294,21 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
     let joiner_away = state.sessions[&conn].away.clone();
     let members = state.channels[&key].recipients();
-    for member in members.iter().map(|recipient| recipient.conn()) {
-        let Some(session) = state.sessions.get(&member) else {
-            continue;
-        };
-        let caps = session.caps;
+    for recipient in members.iter().copied() {
+        let caps = recipient.caps();
         let line = if caps.extended_join {
             &extended_join
         } else {
             &plain_join
         };
-        state.send_timed(member, line);
+        state.send_timed_recipient(recipient, line);
         // away-notify: an away joiner's status follows the JOIN.
-        if member != conn
+        if recipient.conn() != conn
             && caps.away_notify
             && let Some(away) = &joiner_away
         {
             let away_line = format!(":{prefix} AWAY :{away}");
-            state.send_timed(member, &away_line);
+            state.send_timed_recipient(recipient, &away_line);
         }
     }
 

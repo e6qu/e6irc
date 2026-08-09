@@ -2428,6 +2428,16 @@ impl ServerState {
         }
     }
 
+    pub fn send_timed_recipient(&mut self, recipient: Recipient, line: &str) {
+        let tagged = recipient.caps().server_time;
+        if tagged {
+            let line = format!("@time={} {line}", self.time_tag());
+            self.send_recipient_uncaptured(recipient, Bytes::from(format!("{line}\r\n")));
+        } else {
+            self.send_recipient_uncaptured(recipient, Bytes::from(format!("{line}\r\n")));
+        }
+    }
+
     /// Serialize once per capability variant, deliver to every member of
     /// a channel except `except`.
     pub fn broadcast_channel(&mut self, chan_key: &ChanKey, line: &str, except: Option<ConnId>) {

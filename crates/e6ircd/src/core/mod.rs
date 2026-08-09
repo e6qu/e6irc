@@ -1885,20 +1885,23 @@ mod ingress_tests {
         let key = first.state.chan_key("#chat");
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
         channel.add_member(
-            first.state.local_recipient(ConnId(2)),
-            MemberModes::default(),
-        );
-        channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(1), CoreShardId(1)),
                 Caps {
                     server_time: true,
+                    extended_join: true,
                     ..Caps::default()
                 },
             ),
             MemberModes::default(),
         );
         first.state.channels.entry(key.clone()).or_insert(channel);
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"JOIN #chat".to_vec(),
+            })
+            .expect("queue source join");
         first_tx
             .try_push(Input::Line {
                 conn: ConnId(2),
@@ -1911,9 +1914,12 @@ mod ingress_tests {
         CoreWorker::new(first, first_rx, ingress.clone())
             .run()
             .await;
-        let output = out_rx.pop().await.expect("remote output delivered");
-        assert!(output.payload.0.starts_with(b"@time="));
-        assert!(output.payload.0.ends_with(b"PRIVMSG #chat :hello\r\n"));
+        let join = out_rx.pop().await.expect("remote join delivered");
+        assert!(join.payload.0.starts_with(b"@time="));
+        assert!(join.payload.0.ends_with(b"JOIN #chat * :Sender\r\n"));
+        let message = out_rx.pop().await.expect("remote message delivered");
+        assert!(message.payload.0.starts_with(b"@time="));
+        assert!(message.payload.0.ends_with(b"PRIVMSG #chat :hello\r\n"));
         second_tx
             .try_push(Input::Shutdown)
             .expect("stop destination");
