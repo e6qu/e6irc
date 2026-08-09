@@ -21,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::config::{Config, TlsConfig};
 use crate::core::{
     ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreScheduler, Input, Output,
+    TimerWheel,
 };
 use crate::observability::{ErrorKind, Telemetry};
 use e6irc_proto::framing::LineBuffer;
@@ -34,7 +35,9 @@ const READ_BUF: usize = 4096;
 const ACCEPT_BATCH: usize = 64;
 /// How often the liveness reaper tick fires (seconds); the reaper's own
 /// deadlines are coarse minutes, so a fine tick isn't needed.
-const REAP_TICK_SECS: u64 = 15;
+const REAP_TICK_MILLIS: u64 = 15_000;
+const TIMER_WHEEL_RESOLUTION_MILLIS: u64 = 1_000;
+const TIMER_WHEEL_SLOTS: usize = 64;
 
 fn random_connection_id_start() -> io::Result<NonZeroU64> {
     use aws_lc_rs::rand::SecureRandom;
@@ -829,15 +832,25 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     {
         let core_tx = core_tx.clone();
         let reaper = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(REAP_TICK_SECS));
+            let now = mono_clock();
+            let mut wheel = TimerWheel::new(
+                now,
+                NonZeroU64::new(TIMER_WHEEL_RESOLUTION_MILLIS)
+                    .expect("timer resolution is nonzero"),
+                std::num::NonZeroUsize::new(TIMER_WHEEL_SLOTS).expect("timer wheel has slots"),
+            );
+            wheel.schedule(now.saturating_add_millis(REAP_TICK_MILLIS), ());
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                TIMER_WHEEL_RESOLUTION_MILLIS,
+            ));
             loop {
                 ticker.tick().await;
-                if core_tx
-                    .push(Input::Tick { now: mono_clock() })
-                    .await
-                    .is_err()
-                {
-                    break; // core gone
+                let now = mono_clock();
+                for () in wheel.advance(now) {
+                    wheel.schedule(now.saturating_add_millis(REAP_TICK_MILLIS), ());
+                    if core_tx.push(Input::Tick { now }).await.is_err() {
+                        return;
+                    }
                 }
             }
         });

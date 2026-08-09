@@ -10,6 +10,9 @@
 
 mod handler;
 mod state;
+mod timer;
+
+pub(crate) use timer::TimerWheel;
 
 pub use state::{ConnId, CoreConfig, dm_conversation_key};
 
