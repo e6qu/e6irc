@@ -512,59 +512,119 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_needmoreparams(conn, "KNOCK");
         return;
     };
-    let Some((key, display)) = resolve_channel(state, conn, target) else {
-        return;
+    let owner = state.channel_owner(target);
+    let label = if state.owns_channel(&owner) {
+        state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.label.clone())
+    } else {
+        state.defer_channel_reply(conn)
     };
+    let command = crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.to_string(),
+        crate::core::state::ChannelCommandOperation::Knock,
+        label,
+    );
+    if state.owns_channel(command.owner()) {
+        let result = knock_on_owner(state, command);
+        emit_knock_result_now(state, conn, result);
+    } else {
+        state.route_channel_command(command);
+    }
+}
+
+pub(super) fn knock_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelKnockResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    debug_assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::Knock
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "KNOCK owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelKnockResult::NoSuchChannel { target };
+    };
+    let display = chan.name.clone();
     // A secret channel is hidden: look non-existent to a non-member.
-    if let Some(proof) = state.channels[&key].hidden_from(conn) {
-        super::deny_hidden(state, conn, target, proof);
-        return;
+    if chan.hidden_from(actor.recipient.conn()).is_some() {
+        return crate::core::state::ChannelKnockResult::Hidden { target };
     }
-    if state.channels[&key].is_member(conn) {
-        state.numeric(
-            conn,
-            ERR_KNOCKONCHAN,
-            &[&display],
-            Some("You are on that channel"),
-        );
-        return;
+    if chan.is_member(actor.recipient.conn()) {
+        return crate::core::state::ChannelKnockResult::AlreadyOnChannel { display };
     }
-    if !state.channels[&key].modes.invite_only {
-        state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"));
-        return;
+    if !chan.modes.invite_only {
+        return crate::core::state::ChannelKnockResult::ChannelOpen { display };
     }
     // A banned user cannot knock (Solanum refuses with ERR_CANNOTSENDTOCHAN):
     // otherwise +b is no barrier to spamming the channel's ops with knock
     // requests they can't act on.
     let casemap = state.casemap;
-    let user_prefix = state.sessions[&conn].prefix();
-    if state.channels[&key].is_banned(casemap, &user_prefix) {
-        state.numeric(
+    if chan.is_banned(casemap, &actor.identity.prefix) {
+        return crate::core::state::ChannelKnockResult::CannotSend { display };
+    }
+    // Deliver the knock to the channel's operators, then confirm to the knocker.
+    let ops = chan.operator_recipients();
+    for (recipient, nick) in ops {
+        let line = format!(
+            ":{} {} {} {} {} :has asked for an invite",
+            state.config.server_name,
+            e6irc_proto::numerics::code_str(RPL_KNOCK),
+            nick,
+            display,
+            actor.identity.prefix,
+        );
+        state.send_timed_recipient(recipient, &line);
+    }
+    crate::core::state::ChannelKnockResult::KnockDelivered
+}
+
+pub(super) fn emit_knock_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKnockResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_knock_result_now(state, conn, result)
+    });
+}
+
+fn emit_knock_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKnockResult,
+) {
+    match result {
+        crate::core::state::ChannelKnockResult::KnockDelivered => state.numeric(
+            conn,
+            RPL_KNOCKDLVR,
+            &[],
+            Some("Your KNOCK has been delivered"),
+        ),
+        crate::core::state::ChannelKnockResult::NoSuchChannel { target }
+        | crate::core::state::ChannelKnockResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelKnockResult::AlreadyOnChannel { display } => state.numeric(
+            conn,
+            ERR_KNOCKONCHAN,
+            &[&display],
+            Some("You are on that channel"),
+        ),
+        crate::core::state::ChannelKnockResult::ChannelOpen { display } => {
+            state.numeric(conn, ERR_CHANOPEN, &[&display], Some("Channel is open"))
+        }
+        crate::core::state::ChannelKnockResult::CannotSend { display } => state.numeric(
             conn,
             ERR_CANNOTSENDTOCHAN,
             &[&display],
             Some("Cannot knock on channel (+b)"),
-        );
-        return;
+        ),
     }
-    // Deliver the knock to the channel's operators, then confirm to the knocker.
-    let ops: Vec<ConnId> = state.channels[&key]
-        .members()
-        .filter(|(_, m)| m.op)
-        .map(|(c, _)| c)
-        .collect();
-    for op in ops {
-        state.numeric(
-            op,
-            RPL_KNOCK,
-            &[&display, &user_prefix],
-            Some("has asked for an invite"),
-        );
-    }
-    state.numeric(
-        conn,
-        RPL_KNOCKDLVR,
-        &[&display],
-        Some("Your KNOCK has been delivered"),
-    );
 }

@@ -804,6 +804,78 @@ pub struct ChannelTopic {
     label: Option<String>,
 }
 
+/// A channel command that must execute on the channel owner.
+#[derive(Debug, Clone)]
+pub struct ChannelCommand {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    operation: ChannelCommandOperation,
+    label: Option<String>,
+}
+
+/// Closed channel-command operations.
+#[derive(Debug, Clone, Copy)]
+pub enum ChannelCommandOperation {
+    Knock,
+}
+
+impl ChannelCommand {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        operation: ChannelCommandOperation,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            operation,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    pub(crate) fn operation(&self) -> ChannelCommandOperation {
+        self.operation
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (ChannelOwner, ChannelActor, String, ChannelCommandOperation) {
+        (self.owner, self.actor, self.target, self.operation)
+    }
+}
+
+/// A channel command's reply to its requester.
+#[derive(Debug)]
+pub enum ChannelCommandResult {
+    Knock(ChannelKnockResult),
+}
+
+#[derive(Debug)]
+pub enum ChannelKnockResult {
+    KnockDelivered,
+    NoSuchChannel { target: String },
+    Hidden { target: String },
+    AlreadyOnChannel { display: String },
+    ChannelOpen { display: String },
+    CannotSend { display: String },
+}
+
 /// A TOPIC request has exactly one operation.
 #[derive(Debug, Clone)]
 pub enum ChannelTopicOperation {
@@ -1575,6 +1647,14 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes, &member.identity))
     }
 
+    pub fn operator_recipients(&self) -> Vec<(Recipient, String)> {
+        self.members
+            .values()
+            .filter(|member| member.modes.op)
+            .map(|member| (member.recipient, member.identity.nick.clone()))
+            .collect()
+    }
+
     /// Resolve a member from channel-owned identity data.
     pub fn member_named(
         &self,
@@ -2016,6 +2096,28 @@ impl ServerState {
                 session,
                 result,
             });
+    }
+
+    pub fn route_channel_command(&mut self, command: ChannelCommand) {
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelCommand {
+                command,
+            }));
+    }
+
+    pub fn route_channel_command_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelCommandResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::Input(
+            crate::core::Input::ChannelCommandResult {
+                session,
+                result,
+                label,
+            },
+        ));
     }
 
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {

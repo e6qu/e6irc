@@ -26,10 +26,10 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::{
-    ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelMessage,
-    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
-    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
-    ChannelTopicResult,
+    ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
+    ChannelKickResult, ChannelMessage, ChannelMessageResult, ChannelMultiline,
+    ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
+    ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
 };
 use state::{NickDirectory, ServerState};
 
@@ -159,6 +159,8 @@ impl CoreIngress {
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::ChannelCommand { command } => command.owner().shard(),
+            Input::ChannelCommandResult { session, .. } => session.shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
             Input::ChannelKickResult { session, .. } => session.shard(),
             Input::SessionChannelRemoved { session, .. } => session.shard(),
@@ -417,6 +419,16 @@ pub enum Input {
         conn: ConnId,
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
+    },
+    /// A channel command whose mutation and authorization belong to its owner.
+    ChannelCommand {
+        command: ChannelCommand,
+    },
+    /// A channel command answer, processed only by the requester's session owner.
+    ChannelCommandResult {
+        session: SessionOwner,
+        result: ChannelCommandResult,
+        label: Option<String>,
     },
     ChannelKick {
         kick: ChannelKick,
@@ -1502,6 +1514,8 @@ pub struct Core {
 }
 
 pub(crate) enum CoreEffect {
+    /// A typed event for another core owner.
+    Input(Input),
     Delivery {
         owner: SessionOwner,
         line: Bytes,
@@ -1608,6 +1622,7 @@ impl CoreWorker {
             });
             for effect in self.core.take_effects() {
                 let input = match effect {
+                    CoreEffect::Input(input) => input,
                     CoreEffect::Delivery { owner, line } => Input::Delivery {
                         conn: owner.conn(),
                         line,
@@ -1941,6 +1956,26 @@ impl Core {
                     "TOPIC verdict reached wrong channel shard"
                 );
                 handler::channel_topic_persisted(&mut self.state, conn, session, result);
+            }
+            Input::ChannelCommand { command } => {
+                assert_eq!(
+                    command.owner().shard(),
+                    self.shard,
+                    "channel command reached wrong channel shard"
+                );
+                handler::channel_command(&mut self.state, command);
+            }
+            Input::ChannelCommandResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "channel command result reached wrong session shard"
+                );
+                handler::channel_command_result(&mut self.state, session.conn(), result, label);
             }
             Input::SessionChannelRemoved { session, key } => {
                 assert_eq!(
@@ -2302,6 +2337,73 @@ mod ingress_tests {
                 conn: ConnId(5),
                 ..
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn channel_commands_reach_their_channel_owner() {
+        use crate::core::state::{ChannelCommand, ChannelCommandOperation};
+
+        let config = Config {
+            name: "channel-command-routing",
+            capacity: 2,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, _first_rx) = queue(config);
+        let (second_tx, mut second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx, vec![second_tx]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let (db_tx, _db_rx) = queue(Config {
+            name: "channel-command-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut core = Core::with_telemetry_on_shard_with_nicks(
+            core_config(),
+            db_tx,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+            ingress.nick_directory(),
+        );
+        let (out_tx, _out_rx) = queue(Config {
+            name: "channel-command-output",
+            capacity: 8,
+            policy: Policy::Fifo,
+        });
+        core.state.open(
+            ConnId(2),
+            out_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        core.handle(Input::Line {
+            conn: ConnId(2),
+            line: b"NICK requester".to_vec(),
+        });
+        core.handle(Input::Line {
+            conn: ConnId(2),
+            line: b"USER requester 0 * :Requester".to_vec(),
+        });
+        let target = ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .find(|name| core.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a target owned by shard one");
+        let command = ChannelCommand::new(
+            core.state.channel_owner(target),
+            core.state.channel_actor(ConnId(2)),
+            target.into(),
+            ChannelCommandOperation::Knock,
+            None,
+        );
+
+        ingress
+            .push(Input::ChannelCommand { command })
+            .await
+            .expect("channel command routed");
+        assert!(matches!(
+            second_rx.pop().await.expect("channel owner event").payload,
+            Input::ChannelCommand { .. }
         ));
     }
 
