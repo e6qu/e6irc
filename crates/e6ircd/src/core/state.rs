@@ -672,7 +672,7 @@ impl Recipient {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct MemberIdentity {
     pub(crate) nick: String,
     pub(crate) prefix: String,
@@ -690,8 +690,8 @@ impl MemberIdentity {
 }
 
 /// Immutable session data a channel operation may use.
-#[derive(Clone)]
-pub(crate) struct ChannelActor {
+#[derive(Debug, Clone)]
+pub struct ChannelActor {
     pub(crate) recipient: Recipient,
     pub(crate) identity: MemberIdentity,
     pub(crate) account: Option<String>,
@@ -1207,7 +1207,7 @@ impl Channel {
 /// The local worker's channel state and its ownership boundary.
 /// A channel key paired with the only core shard allowed to mutate it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ChannelOwner {
+pub struct ChannelOwner {
     key: ChanKey,
     shard: CoreShardId,
 }

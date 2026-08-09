@@ -60,6 +60,15 @@ pub(crate) fn overlong(state: &mut ServerState, conn: ConnId) {
     state.numeric(conn, ERR_INPUTTOOLONG, &[], Some("Input line was too long"));
 }
 
+pub(crate) fn channel_join(
+    state: &mut ServerState,
+    actor: ChannelActor,
+    name: &str,
+    join_key: Option<&str>,
+) {
+    join_one(state, actor, name, join_key);
+}
+
 pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
     if !state.sessions.contains_key(&conn) {
         return; // line raced a close; session already gone

@@ -26,6 +26,7 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
+use state::{ChannelActor, ChannelOwner};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -142,6 +143,7 @@ impl CoreIngress {
             | Input::DbReply { conn, .. }
             | Input::HistoryPage { conn, .. }
             | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
+            Input::ChannelJoin { owner, .. } => owner.shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -344,6 +346,12 @@ pub enum Input {
     Delivery {
         conn: ConnId,
         line: Bytes,
+    },
+    /// A parsed JOIN that may run only on its channel owner.
+    ChannelJoin {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        join_key: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
@@ -1536,6 +1544,23 @@ impl Core {
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
             Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
+            Input::ChannelJoin {
+                owner,
+                actor,
+                join_key,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "JOIN reached wrong channel shard"
+                );
+                handler::channel_join(
+                    &mut self.state,
+                    actor,
+                    owner.key().as_str(),
+                    join_key.as_deref(),
+                );
+            }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
