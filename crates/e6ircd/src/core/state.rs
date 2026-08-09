@@ -11,7 +11,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{Output, WireLine, deliver};
+use super::{CoreShardId, Output, WireLine, deliver};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +36,48 @@ pub struct NickKey(String);
 impl NickKey {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The connection and core shard that own a reserved nick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NickOwner {
+    conn: ConnId,
+    shard: CoreShardId,
+}
+
+impl NickOwner {
+    pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn shard(self) -> CoreShardId {
+        self.shard
+    }
+}
+
+/// The sole owner of nick reservations and their worker assignment.
+#[derive(Default)]
+pub(crate) struct NickDirectory {
+    by_key: HashMap<NickKey, NickOwner>,
+}
+
+impl NickDirectory {
+    pub(crate) fn owner(&self, key: &NickKey) -> Option<NickOwner> {
+        self.by_key.get(key).copied()
+    }
+
+    pub(crate) fn reserve(&mut self, key: NickKey, owner: NickOwner) {
+        self.by_key.insert(key, owner);
+    }
+
+    pub(crate) fn release_if_owned(&mut self, key: &NickKey, conn: ConnId) -> bool {
+        if self.owner(key).is_some_and(|owner| owner.conn() == conn) {
+            self.by_key.remove(key);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1009,11 +1051,12 @@ impl Channel {
 }
 
 pub(crate) struct ServerState {
+    shard: CoreShardId,
     pub telemetry: Arc<Telemetry>,
     pub config: CoreConfig,
     pub casemap: CaseMapping,
     pub sessions: SessionStore,
-    pub nicks: HashMap<NickKey, ConnId>,
+    nicks: NickDirectory,
     pub channels: HashMap<ChanKey, Channel>,
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
@@ -1155,17 +1198,19 @@ pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
     pub fn new(
+        shard: CoreShardId,
         config: CoreConfig,
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
+            shard,
             telemetry,
             config,
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
-            nicks: HashMap::new(),
+            nicks: NickDirectory::default(),
             channels: HashMap::new(),
             doomed: Vec::new(),
             suspended_accounts: HashSet::new(),
@@ -1602,13 +1647,40 @@ impl ServerState {
         NickKey(self.casemap.casefold(nick))
     }
 
+    /// Reserve `key` for this worker's connection.
+    pub fn reserve_nick(&mut self, key: NickKey, conn: ConnId) {
+        self.nicks.reserve(
+            key,
+            NickOwner {
+                conn,
+                shard: self.shard,
+            },
+        );
+    }
+
+    /// The reservation for `key`, including a remote worker assignment.
+    pub fn nick_reservation(&self, key: &NickKey) -> Option<NickOwner> {
+        self.nicks.owner(key)
+    }
+
+    /// The local connection owning `key`.
+    pub fn nick_connection(&self, key: &NickKey) -> Option<ConnId> {
+        self.nick_reservation(key)
+            .filter(|owner| owner.shard() == self.shard)
+            .map(NickOwner::conn)
+    }
+
+    /// Release `key` only when `conn` still owns it.
+    pub fn release_nick(&mut self, key: &NickKey, conn: ConnId) -> bool {
+        self.nicks.release_if_owned(key, conn)
+    }
+
     /// A casefolded nick rendered for display: the online user's actual nick
     /// casing when they are connected, otherwise the casefolded form itself
     /// (the only spelling still on record once they have gone).
     pub fn display_nick(&self, folded: &str) -> String {
-        self.nicks
-            .get(&NickKey(folded.to_string()))
-            .and_then(|&conn| self.sessions.get(&conn))
+        self.nick_connection(&NickKey(folded.to_string()))
+            .and_then(|conn| self.sessions.get(&conn))
             .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| folded.to_string())
     }
@@ -1694,10 +1766,8 @@ impl ServerState {
     /// expectations honest — an unregistered holder can never be prefix-built
     /// (that would panic the shared core worker and take down the server).
     pub fn registered_peer(&self, key: &NickKey) -> Option<ConnId> {
-        self.nicks
-            .get(key)
-            .copied()
-            .filter(|c| self.sessions.get(c).is_some_and(|s| s.is_registered()))
+        self.nick_connection(key)
+            .filter(|conn| self.sessions.get(conn).is_some_and(|s| s.is_registered()))
     }
 
     pub fn open(
@@ -2312,7 +2382,7 @@ impl ServerState {
         }
         if let Some(nick) = session.nick() {
             let nick_key = NickKey(self.casemap.casefold(nick));
-            self.nicks.remove(&nick_key);
+            self.release_nick(&nick_key, conn);
             if was_registered {
                 super::handler::monitor_notify(self, nick, false);
             }
@@ -2514,6 +2584,7 @@ mod session_store_tests {
             policy: Policy::Fifo,
         });
         ServerState::new(
+            CoreShardId(0),
             CoreConfig {
                 server_name: "irc.test".into(),
                 network_name: "test".into(),
@@ -2548,6 +2619,28 @@ mod session_store_tests {
             "host.test".into(),
             crate::core::ConnectionTransport::Tcp,
         );
+    }
+
+    #[test]
+    fn nick_reservation_retains_its_worker() {
+        let mut directory = NickDirectory::default();
+        let key = NickKey("alice".into());
+        let owner = NickOwner {
+            conn: ConnId(7),
+            shard: CoreShardId(3),
+        };
+
+        directory.reserve(key.clone(), owner);
+
+        assert_eq!(directory.owner(&key), Some(owner));
+        assert_eq!(
+            directory.owner(&key).map(NickOwner::shard),
+            Some(CoreShardId(3))
+        );
+        assert!(!directory.release_if_owned(&key, ConnId(8)));
+        assert_eq!(directory.owner(&key), Some(owner));
+        assert!(directory.release_if_owned(&key, ConnId(7)));
+        assert_eq!(directory.owner(&key), None);
     }
 
     #[test]

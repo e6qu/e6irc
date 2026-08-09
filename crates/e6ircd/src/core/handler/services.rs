@@ -191,7 +191,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 return;
             }
             let key = state.nick_key(nick);
-            let Some(&victim) = state.nicks.get(&key) else {
+            let Some(victim) = state.nick_connection(&key) else {
                 state.service_notice(conn, "NickServ", &format!("\x02{nick}\x02 is not online."));
                 return;
             };
@@ -604,7 +604,7 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
             .expect("registered"),
     };
     let nk = state.nick_key(&target_nick);
-    let Some(&target_conn) = state.nicks.get(&nk) else {
+    let Some(target_conn) = state.nick_connection(&nk) else {
         state.service_notice(
             conn,
             "ChanServ",

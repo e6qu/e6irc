@@ -1424,7 +1424,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     continue;
                 };
                 let nick_key = state.nick_key(who);
-                let Some(&member_conn) = state.nicks.get(&nick_key) else {
+                let Some(member_conn) = state.nick_connection(&nick_key) else {
                     state.err_nosuchnick(conn, clip_echo(who));
                     continue;
                 };

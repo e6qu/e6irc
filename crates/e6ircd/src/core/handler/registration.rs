@@ -36,8 +36,8 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     }
-    if let Some(&owner) = state.nicks.get(&key)
-        && owner != conn
+    if let Some(owner) = state.nick_reservation(&key)
+        && owner.conn() != conn
     {
         state.numeric(
             conn,
@@ -74,9 +74,9 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .expect("checked")
         .set_nick(nick.to_string());
     if let Some(old_key) = old_key {
-        state.nicks.remove(&old_key);
+        state.release_nick(&old_key, conn);
     }
-    state.nicks.insert(key, conn);
+    state.reserve_nick(key, conn);
 
     if registered {
         let line = format!(":{} NICK {nick}", prefix.expect("registered"));

@@ -130,7 +130,7 @@ fn kick_one_user(
     reason: Option<&str>,
 ) {
     let who_key = state.nick_key(who);
-    let victim = state.nicks.get(&who_key).copied();
+    let victim = state.nick_connection(&who_key);
     let victim_on = victim.is_some_and(|v| state.channels[key].members.contains_key(&v));
     let Some(victim) = victim.filter(|_| victim_on) else {
         state.numeric(

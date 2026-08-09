@@ -57,7 +57,7 @@ impl CoreShardCount {
 
 /// Index of one configured core shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CoreShardId(usize);
+pub(crate) struct CoreShardId(usize);
 
 /// The only ingress path into core state.
 #[derive(Clone)]
@@ -1186,8 +1186,17 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
+        Self::with_telemetry_on_shard(config, db_tx, telemetry, CoreShardId(0))
+    }
+
+    fn with_telemetry_on_shard(
+        config: CoreConfig,
+        db_tx: Sender<DbRequest>,
+        telemetry: Arc<Telemetry>,
+        shard: CoreShardId,
+    ) -> Self {
         Self {
-            state: ServerState::new(config, db_tx, telemetry),
+            state: ServerState::new(shard, config, db_tx, telemetry),
         }
     }
 
