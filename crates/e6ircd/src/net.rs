@@ -20,7 +20,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, TlsConfig};
 use crate::core::{
-    ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreScheduler, Input, Output,
+    ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreWorker, Input, Output,
     TimerWheel,
 };
 use crate::observability::{ErrorKind, Telemetry};
@@ -939,19 +939,8 @@ fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("TLS PEM: {e}"))
 }
 
-async fn core_worker(mut core: Core, rx: Receiver<Input>) {
-    let mut scheduler = CoreScheduler::single(rx);
-    while let Some(event) = scheduler.pop_single().await {
-        // `Shutdown` is handled (clients are notified) and then ends the loop.
-        // Returning drops `core` — and with it the sole `Sender<DbRequest>` and
-        // every session's `Sender<Output>` — which is what lets the DB worker
-        // drain/flush and the write tasks deliver the ERROR before we exit.
-        let stop = matches!(&event.input, Input::Shutdown);
-        core.handle_scheduled(event);
-        if stop {
-            return;
-        }
-    }
+async fn core_worker(core: Core, rx: Receiver<Input>) {
+    CoreWorker::new(core, rx).run().await;
 }
 
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the

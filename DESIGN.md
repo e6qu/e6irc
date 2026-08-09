@@ -600,12 +600,13 @@ single-threaded core worker (N=1) owning all sessions, nicks, and channels.
 Connection tasks and the database writer communicate through bounded queues;
 the driver/attach layer also uses bounded tokio channels. `e6irc-queue`
 provides the delivered-or-returned, sequence, manual-pop, adaptive-mode, and
-loom-checked contracts below. Core sharding, cross-shard routing, the
-whole-core seeded scheduler/trace replay, and timer-wheel worker described
-later in this section are the target architecture for qualifying the 100k
-goal, not shipped behavior. Current qualification evidence and journey impact
-are tracked in `tools/load/README.md` and
-`docs/journeys/coverage.md`.
+loom-checked contracts below. Typed shard ownership, deterministic queue
+scheduling and replay tests, a timer-wheel reaper, dense generation-safe
+sessions, CoW recipient snapshots, batched accepts, and reusable write batches
+are shipped foundations. Runtime N>1 workers and cross-shard command and
+delivery routing remain required before any multi-worker claim. Current
+qualification evidence and journey impact are tracked in `tools/load/README.md`
+and `docs/journeys/coverage.md`.
 
 **Target architecture rule.** The server is a set of **single-threaded event
 loops ("workers") that own their state exclusively**; the *only*
@@ -682,12 +683,12 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
 The following is the performance target and review checklist, not a claim that
 every mechanism is present. Shipped foundations include borrowed IRC parsing,
 `Cow` tag/ISUPPORT unescaping, bounded queues, capability-variant
-serialize-once fan-out in shared `Bytes`, and partial-write-correct vectored
-SendQ draining capped below platform scatter/gather limits, plus release LTO.
-The server does not currently have Arc-swapped configuration, copy-on-write
-recipient snapshots, slab/generation session IDs, buffer pools, batched
-accepts, timer wheels, Criterion microbenchmarks, or per-PR load tracking. Any
-nontrivial optimization lands with evidence that proves it:
+serialize-once fan-out in shared `Bytes`, partial-write-correct vectored SendQ
+draining capped below platform scatter/gather limits, release LTO, CoW
+recipient snapshots, dense generation-safe session IDs, batched accepts, a
+timer-wheel reaper, reusable outbound write batches, and reproducible load
+tracking. Arc-swapped configuration and Criterion microbenchmarks are not yet
+present. Any nontrivial optimization lands with evidence that proves it:
 
 - **Zero-copy end-to-end**: parsing borrows from the receive buffer
   (§7.1); a routed message is serialized once per capability variant and
@@ -1834,8 +1835,9 @@ Layers, bottom to top:
 2. **Fuzzing**: CI smoke runs every declared cargo-fuzz target, including
    parser/tag input, serialization, single- and multi-client stateful core
    command streams, and arbitrary server output into the TUI model.
-   `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive, but the
-   seeded whole-core scheduler/replay described in §7.3 is not implemented.
+   `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive; fixed
+   multi-queue schedules record and replay their shard/sequence steps. A seeded
+   whole-core multi-worker simulation remains part of the N>1 architecture.
    A separate all-feature coverage job combines the portable workspace suite
    with the real PostgreSQL database and HTTP lifecycle suites, then rejects
    line coverage below 80%; the floor is a regression ratchet. Provider/browser
