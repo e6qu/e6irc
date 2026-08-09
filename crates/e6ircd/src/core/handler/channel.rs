@@ -223,6 +223,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         .map(|a| state.access_modes(&key, a))
         .unwrap_or((false, false));
     let recipient = state.local_recipient(conn);
+    let identity = state.local_member_identity(conn);
     let chan = state.channels.get_mut(&key).expect("just inserted");
     if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
         state.numeric(
@@ -268,6 +269,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let first = !chan.has_members();
     chan.add_member(
         recipient,
+        identity,
         MemberModes {
             op: first || is_founder || access_op,
             voice: access_voice,
@@ -294,24 +296,25 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
     let joiner_away = state.sessions[&conn].away.clone();
     let members = state.channels[&key].recipients();
-    for member in members.iter().map(|recipient| recipient.conn()) {
-        let Some(session) = state.sessions.get(&member) else {
-            continue;
-        };
-        let caps = session.caps;
+    for recipient in members.iter().copied() {
+        let caps = recipient.caps();
         let line = if caps.extended_join {
             &extended_join
         } else {
             &plain_join
         };
-        state.send_timed(member, line);
+        if recipient.conn() == conn {
+            state.send_timed(conn, line);
+        } else {
+            state.send_timed_recipient(recipient, line);
+        }
         // away-notify: an away joiner's status follows the JOIN.
-        if member != conn
+        if recipient.conn() != conn
             && caps.away_notify
             && let Some(away) = &joiner_away
         {
             let away_line = format!(":{prefix} AWAY :{away}");
-            state.send_timed(member, &away_line);
+            state.send_timed_recipient(recipient, &away_line);
         }
     }
 
@@ -446,24 +449,24 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
         return;
     }
     let requester_caps = state.sessions[&conn].caps;
+    let requester_is_member = chan.is_member(conn);
     let mut names: Vec<String> = chan
-        .members()
+        .member_identities()
         // An invisible member is hidden from a NAMES by an outsider who shares
         // no channel with them — the same rule WHO applies. Fellow members
         // share this channel, so they still see each other; only a non-member
         // listing a public channel is filtered. Without this, `+i` leaks.
-        .filter(|(m, _)| {
-            *m == conn || !state.sessions[m].invisible || state.share_channel(conn, *m)
+        .filter(|(m, _, identity)| {
+            *m == conn
+                || !identity.invisible
+                || requester_is_member
+                || state.share_channel(conn, *m)
         })
-        .map(|(m, modes)| {
-            let member = &state.sessions[&m];
+        .map(|(_, modes, identity)| {
             let shown = if requester_caps.userhost_in_names {
-                member.prefix()
+                identity.prefix.clone()
             } else {
-                member
-                    .nick()
-                    .map(String::from)
-                    .expect("member is registered")
+                identity.nick.clone()
             };
             let sigil = match (modes.op, modes.voice, requester_caps.multi_prefix) {
                 (true, true, true) => "@+",
@@ -548,7 +551,7 @@ pub(super) struct Delivery<'a> {
 pub(super) fn deliver_and_echo(
     state: &mut ServerState,
     conn: ConnId,
-    recipients: &[ConnId],
+    recipients: &[Recipient],
     delivery: &Delivery,
 ) {
     deliver_message(state, recipients, delivery);
@@ -562,19 +565,17 @@ pub(super) fn deliver_and_echo(
             bypass_capture: false,
             ..*delivery
         };
-        deliver_message(state, &[conn], &echo);
+        let sender = state.local_recipient(conn);
+        deliver_message(state, &[sender], &echo);
     }
 }
 
 /// Deliver a message line to recipients, applying per-recipient
 /// `server-time` and `account-tag` variants.
-pub(super) fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d: &Delivery) {
+pub(super) fn deliver_message(state: &mut ServerState, recipients: &[Recipient], d: &Delivery) {
     let time = e6irc_proto::time::server_time(d.ts);
     for &recipient in recipients {
-        let Some(session) = state.sessions.get(&recipient) else {
-            continue;
-        };
-        let caps = session.caps;
+        let caps = recipient.caps();
         let mut tags: Vec<String> = Vec::new();
         if caps.message_tags {
             tags.push(format!("msgid={}", d.msgid));
@@ -608,9 +609,9 @@ pub(super) fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d:
         };
         let bytes = bytes::Bytes::from(format!("{line}\r\n"));
         if d.bypass_capture {
-            state.send_bytes_uncaptured(recipient, bytes);
+            state.send_recipient_uncaptured(recipient, bytes);
         } else {
-            state.send_bytes(recipient, bytes);
+            state.send_recipient(recipient, bytes);
         }
     }
 }

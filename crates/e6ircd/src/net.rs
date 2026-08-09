@@ -825,7 +825,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                 .map_err(io::Error::other)?,
         );
     }
-    let core_worker = tokio::spawn(core_worker(core, core_rx));
+    let core_worker = tokio::spawn(core_worker(core, core_rx, core_tx.clone()));
 
     // Liveness reaper tick: drives the core's registration deadline and idle
     // PING/PONG timeout so a silent connection can't hold a session forever.
@@ -939,8 +939,8 @@ fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("TLS PEM: {e}"))
 }
 
-async fn core_worker(core: Core, rx: Receiver<Input>) {
-    CoreWorker::new(core, rx).run().await;
+async fn core_worker(core: Core, rx: Receiver<Input>, ingress: CoreIngress) {
+    CoreWorker::new(core, rx, ingress).run().await;
 }
 
 /// Per-IP concurrent-connection cap. When `max_per_ip` is `None` the
@@ -1587,7 +1587,11 @@ mod tests {
             policy: Policy::Fifo,
         });
         let core = Core::new(test_core_config(), db_tx);
-        let worker = tokio::spawn(core_worker(core, core_rx));
+        let worker = tokio::spawn(core_worker(
+            core,
+            core_rx,
+            CoreIngress::single(core_tx.clone()),
+        ));
 
         // Register one client so there is a session to notify. Its send queue's
         // receiver is held here to observe the ERROR.

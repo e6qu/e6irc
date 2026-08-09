@@ -12,7 +12,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{CoreShardCount, CoreShardId, Output, WireLine, deliver};
+use super::{CoreEffect, CoreShardCount, CoreShardId, Output, SessionOwner, WireLine, deliver};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,35 +40,18 @@ impl NickKey {
     }
 }
 
-/// The connection and core shard that own a reserved nick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NickOwner {
-    conn: ConnId,
-    shard: CoreShardId,
-}
-
-impl NickOwner {
-    pub(crate) fn conn(self) -> ConnId {
-        self.conn
-    }
-
-    pub(crate) fn shard(self) -> CoreShardId {
-        self.shard
-    }
-}
-
 /// The sole owner of nick reservations and their worker assignment.
 #[derive(Default)]
 pub(crate) struct NickDirectory {
-    by_key: HashMap<NickKey, NickOwner>,
+    by_key: HashMap<NickKey, SessionOwner>,
 }
 
 impl NickDirectory {
-    pub(crate) fn owner(&self, key: &NickKey) -> Option<NickOwner> {
+    pub(crate) fn owner(&self, key: &NickKey) -> Option<SessionOwner> {
         self.by_key.get(key).copied()
     }
 
-    pub(crate) fn reserve(&mut self, key: NickKey, owner: NickOwner) {
+    pub(crate) fn reserve(&mut self, key: NickKey, owner: SessionOwner) {
         self.by_key.insert(key, owner);
     }
 
@@ -667,23 +650,49 @@ pub(crate) struct MemberModes {
 /// A channel recipient and the worker that owns its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Recipient {
-    conn: ConnId,
-    shard: CoreShardId,
+    owner: SessionOwner,
+    caps: Caps,
 }
 
 impl Recipient {
+    pub(crate) fn new(owner: SessionOwner, caps: Caps) -> Self {
+        Self { owner, caps }
+    }
+
     pub(crate) fn conn(self) -> ConnId {
-        self.conn
+        self.owner.conn()
     }
 
     pub(crate) fn shard(self) -> CoreShardId {
-        self.shard
+        self.owner.shard()
+    }
+
+    pub(crate) fn caps(self) -> Caps {
+        self.caps
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct MemberIdentity {
+    pub(crate) nick: String,
+    pub(crate) prefix: String,
+    pub(crate) invisible: bool,
+}
+
+impl MemberIdentity {
+    pub(crate) fn new(nick: String, prefix: String, invisible: bool) -> Self {
+        Self {
+            nick,
+            prefix,
+            invisible,
+        }
     }
 }
 
 struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
+    identity: MemberIdentity,
 }
 
 #[derive(Default)]
@@ -1052,6 +1061,17 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes))
     }
 
+    pub fn recipients_where(
+        &self,
+        mut include: impl FnMut(ConnId, &MemberModes) -> bool,
+    ) -> Vec<Recipient> {
+        self.members
+            .iter()
+            .filter(|(conn, member)| include(**conn, &member.modes))
+            .map(|(_, member)| member.recipient)
+            .collect()
+    }
+
     /// Immutable recipients, rebuilt only after a join or part.
     pub fn recipients(&self) -> Arc<[Recipient]> {
         let mut cached = self.recipients.borrow_mut();
@@ -1067,9 +1087,20 @@ impl Channel {
         recipients
     }
 
-    pub fn add_member(&mut self, recipient: Recipient, modes: MemberModes) {
-        self.members
-            .insert(recipient.conn(), ChannelMember { modes, recipient });
+    pub fn add_member(
+        &mut self,
+        recipient: Recipient,
+        identity: MemberIdentity,
+        modes: MemberModes,
+    ) {
+        self.members.insert(
+            recipient.conn(),
+            ChannelMember {
+                modes,
+                recipient,
+                identity,
+            },
+        );
         self.recipients.get_mut().take();
     }
 
@@ -1079,6 +1110,24 @@ impl Channel {
             self.recipients.get_mut().take();
         }
         removed
+    }
+
+    pub fn update_recipient(&mut self, recipient: Recipient) {
+        let Some(member) = self.members.get_mut(&recipient.conn()) else {
+            return;
+        };
+        if member.recipient != recipient {
+            member.recipient = recipient;
+            self.recipients.get_mut().take();
+        }
+    }
+
+    pub fn member_identities(
+        &self,
+    ) -> impl Iterator<Item = (ConnId, &MemberModes, &MemberIdentity)> {
+        self.members
+            .iter()
+            .map(|(conn, member)| (*conn, &member.modes, &member.identity))
     }
 
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
@@ -1214,6 +1263,7 @@ pub(crate) struct ServerState {
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
+    effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
     /// verification already in flight cannot re-authenticate after the
@@ -1351,10 +1401,33 @@ pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
     pub fn local_recipient(&self, conn: ConnId) -> Recipient {
-        Recipient {
-            conn,
-            shard: self.shard,
+        Recipient::new(
+            SessionOwner::new(conn, self.shard),
+            self.sessions[&conn].caps,
+        )
+    }
+
+    pub fn local_member_identity(&self, conn: ConnId) -> MemberIdentity {
+        let session = &self.sessions[&conn];
+        MemberIdentity::new(
+            session.nick().expect("registered member").to_string(),
+            session.prefix(),
+            session.invisible,
+        )
+    }
+
+    pub fn refresh_recipient(&mut self, conn: ConnId) {
+        let recipient = self.local_recipient(conn);
+        let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
+        for key in channels {
+            if let Some(channel) = self.channels.get_mut(&key) {
+                channel.update_recipient(recipient);
+            }
         }
+    }
+
+    pub(crate) fn take_effects(&mut self) -> Vec<CoreEffect> {
+        std::mem::take(&mut self.effects)
     }
 
     pub fn new(
@@ -1374,6 +1447,7 @@ impl ServerState {
             nicks: NickDirectory::default(),
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
+            effects: Vec::new(),
             suspended_accounts: HashSet::new(),
             db_tx,
             max_users: 0,
@@ -1810,17 +1884,11 @@ impl ServerState {
 
     /// Reserve `key` for this worker's connection.
     pub fn reserve_nick(&mut self, key: NickKey, conn: ConnId) {
-        self.nicks.reserve(
-            key,
-            NickOwner {
-                conn,
-                shard: self.shard,
-            },
-        );
+        self.nicks.reserve(key, SessionOwner::new(conn, self.shard));
     }
 
     /// The reservation for `key`, including a remote worker assignment.
-    pub fn nick_reservation(&self, key: &NickKey) -> Option<NickOwner> {
+    pub fn nick_reservation(&self, key: &NickKey) -> Option<SessionOwner> {
         self.nicks.owner(key)
     }
 
@@ -1828,7 +1896,7 @@ impl ServerState {
     pub fn nick_connection(&self, key: &NickKey) -> Option<ConnId> {
         self.nick_reservation(key)
             .filter(|owner| owner.shard() == self.shard)
-            .map(NickOwner::conn)
+            .map(SessionOwner::conn)
     }
 
     /// Release `key` only when `conn` still owns it.
@@ -2014,6 +2082,27 @@ impl ServerState {
             return;
         }
         self.send_bytes_uncaptured(conn, bytes);
+    }
+
+    pub fn send_recipient(&mut self, recipient: Recipient, bytes: Bytes) {
+        assert_eq!(
+            recipient.shard(),
+            self.shard,
+            "captured output crossed shard"
+        );
+        self.send_bytes(recipient.conn(), bytes);
+    }
+
+    /// Deliver received output to its owning worker.
+    pub fn send_recipient_uncaptured(&mut self, recipient: Recipient, bytes: Bytes) {
+        if recipient.shard() == self.shard {
+            self.send_bytes_uncaptured(recipient.conn(), bytes);
+        } else {
+            self.effects.push(CoreEffect::Delivery {
+                owner: recipient.owner,
+                line: bytes,
+            });
+        }
     }
 
     /// Debug-build invariant: every outbound line fits what the recipient's
@@ -2385,6 +2474,16 @@ impl ServerState {
         }
     }
 
+    pub fn send_timed_recipient(&mut self, recipient: Recipient, line: &str) {
+        let tagged = recipient.caps().server_time;
+        if tagged {
+            let line = format!("@time={} {line}", self.time_tag());
+            self.send_recipient_uncaptured(recipient, Bytes::from(format!("{line}\r\n")));
+        } else {
+            self.send_recipient_uncaptured(recipient, Bytes::from(format!("{line}\r\n")));
+        }
+    }
+
     /// Serialize once per capability variant, deliver to every member of
     /// a channel except `except`.
     pub fn broadcast_channel(&mut self, chan_key: &ChanKey, line: &str, except: Option<ConnId>) {
@@ -2401,10 +2500,7 @@ impl ServerState {
             .copied()
             .filter(|recipient| Some(recipient.conn()) != except)
         {
-            debug_assert_eq!(recipient.shard(), self.shard);
-            let m = recipient.conn();
-            let wants_time = self.sessions.get(&m).is_some_and(|s| s.caps.server_time);
-            let bytes = if wants_time {
+            let bytes = if recipient.caps().server_time {
                 timed
                     .get_or_insert_with(|| {
                         Bytes::from(format!("@time={} {line}\r\n", self.time_tag()))
@@ -2413,6 +2509,14 @@ impl ServerState {
             } else {
                 plain.clone()
             };
+            if recipient.shard() != self.shard {
+                self.effects.push(CoreEffect::Delivery {
+                    owner: recipient.owner,
+                    line: bytes,
+                });
+                continue;
+            }
+            let m = recipient.conn();
             self.send_bytes(m, bytes);
         }
     }
@@ -2789,16 +2893,13 @@ mod session_store_tests {
     fn nick_reservation_retains_its_worker() {
         let mut directory = NickDirectory::default();
         let key = NickKey("alice".into());
-        let owner = NickOwner {
-            conn: ConnId(7),
-            shard: CoreShardId(3),
-        };
+        let owner = SessionOwner::new(ConnId(7), CoreShardId(3));
 
         directory.reserve(key.clone(), owner);
 
         assert_eq!(directory.owner(&key), Some(owner));
         assert_eq!(
-            directory.owner(&key).map(NickOwner::shard),
+            directory.owner(&key).map(SessionOwner::shard),
             Some(CoreShardId(3))
         );
         assert!(!directory.release_if_owned(&key, ConnId(8)));
@@ -2824,9 +2925,10 @@ mod session_store_tests {
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
         channel.add_member(
             Recipient {
-                conn: ConnId(1),
-                shard: CoreShardId(0),
+                owner: SessionOwner::new(ConnId(1), CoreShardId(0)),
+                caps: Caps::default(),
             },
+            MemberIdentity::new("one".into(), "one!u@h".into(), false),
             MemberModes {
                 op: true,
                 voice: false,
@@ -2839,9 +2941,10 @@ mod session_store_tests {
 
         channel.add_member(
             Recipient {
-                conn: ConnId(2),
-                shard: CoreShardId(0),
+                owner: SessionOwner::new(ConnId(2), CoreShardId(0)),
+                caps: Caps::default(),
             },
+            MemberIdentity::new("two".into(), "two!u@h".into(), false),
             MemberModes {
                 op: false,
                 voice: false,
@@ -2862,6 +2965,69 @@ mod session_store_tests {
                 .any(|recipient| recipient.conn() == ConnId(2)
                     && recipient.shard() == CoreShardId(0))
         );
+    }
+
+    #[test]
+    fn refreshing_a_member_updates_its_delivery_capabilities() {
+        let mut state = state();
+        open(&mut state, ConnId(1));
+        let key = state.chan_key("#chat");
+        let recipient = state.local_recipient(ConnId(1));
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            recipient,
+            MemberIdentity::new("one".into(), "one!u@h".into(), false),
+            MemberModes::default(),
+        );
+        state.channels.entry(key.clone()).or_insert(channel);
+        state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("open session")
+            .channels
+            .insert(key);
+
+        state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("open session")
+            .caps
+            .server_time = true;
+        state.refresh_recipient(ConnId(1));
+
+        assert!(
+            state.channels[&state.chan_key("#chat")].recipients()[0]
+                .caps()
+                .server_time
+        );
+    }
+
+    #[test]
+    fn remote_recipient_becomes_a_typed_delivery_effect() {
+        let mut state = state();
+        let key = state.chan_key("#chat");
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient {
+                owner: SessionOwner::new(ConnId(9), CoreShardId(1)),
+                caps: Caps {
+                    server_time: true,
+                    ..Caps::default()
+                },
+            },
+            MemberIdentity::new("remote".into(), "remote!u@h".into(), false),
+            MemberModes::default(),
+        );
+        state.channels.entry(key.clone()).or_insert(channel);
+
+        state.broadcast_channel(&key, ":nick PRIVMSG #chat :hello", None);
+
+        let effects = state.take_effects();
+        assert_eq!(effects.len(), 1);
+        let crate::core::CoreEffect::Delivery { owner, line } = &effects[0];
+        assert_eq!(*owner, SessionOwner::new(ConnId(9), CoreShardId(1)));
+        assert!(line.starts_with(b"@time="));
+        assert!(line.ends_with(b":nick PRIVMSG #chat :hello\r\n"));
     }
 
     #[test]

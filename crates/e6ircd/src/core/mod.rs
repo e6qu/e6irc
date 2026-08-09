@@ -59,6 +59,10 @@ impl CoreShardCount {
         CoreShardId((conn.0 as usize) % self.0.get())
     }
 
+    pub(crate) fn session_owner(self, conn: ConnId) -> SessionOwner {
+        SessionOwner::new(conn, self.shard_for(conn))
+    }
+
     pub(crate) fn shard_for_channel(self, key: &state::ChanKey) -> CoreShardId {
         let hash = key
             .as_str()
@@ -73,6 +77,27 @@ impl CoreShardCount {
 /// Index of one configured core shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CoreShardId(usize);
+
+/// The connection and worker that own one live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionOwner {
+    conn: ConnId,
+    shard: CoreShardId,
+}
+
+impl SessionOwner {
+    pub(crate) fn new(conn: ConnId, shard: CoreShardId) -> Self {
+        Self { conn, shard }
+    }
+
+    pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn shard(self) -> CoreShardId {
+        self.shard
+    }
+}
 
 /// The only ingress path into core state.
 #[derive(Clone)]
@@ -113,9 +138,10 @@ impl CoreIngress {
             | Input::Line { conn, .. }
             | Input::OverlongLine { conn }
             | Input::Closed { conn, .. }
+            | Input::Delivery { conn, .. }
             | Input::DbReply { conn, .. }
             | Input::HistoryPage { conn, .. }
-            | Input::TargetsPage { conn, .. } => self.count.shard_for(*conn),
+            | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -307,19 +333,36 @@ pub enum Input {
         transport: ConnectionTransport,
     },
     /// One complete line from the connection (terminator stripped).
-    Line { conn: ConnId, line: Vec<u8> },
+    Line {
+        conn: ConnId,
+        line: Vec<u8>,
+    },
     /// The connection sent an over-long line (framing already dropped it).
-    OverlongLine { conn: ConnId },
+    OverlongLine {
+        conn: ConnId,
+    },
+    Delivery {
+        conn: ConnId,
+        line: Bytes,
+    },
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
-    Closed { conn: ConnId, reason: String },
+    Closed {
+        conn: ConnId,
+        reason: String,
+    },
     /// A periodic timer tick carrying the current **monotonic** millisecond,
     /// driving the liveness reaper (registration deadline + idle PING/PONG
     /// timeout). Monotonic, not wall-clock, so an NTP step can't make the reaper
     /// mass-close live connections or freeze.
-    Tick { now: e6irc_proto::time::MonoMillis },
+    Tick {
+        now: e6irc_proto::time::MonoMillis,
+    },
     /// An answer from the DB worker to an earlier [`DbRequest`].
-    DbReply { conn: ConnId, reply: DbReply },
+    DbReply {
+        conn: ConnId,
+        reply: DbReply,
+    },
     /// A resolved CHATHISTORY page from PostgreSQL. `Err` means the store
     /// failed — the handler answers a CHATHISTORY FAIL rather than an empty
     /// batch, so a transient DB fault is never indistinguishable from a buffer
@@ -1329,15 +1372,24 @@ pub struct Core {
     next_sequence: u64,
 }
 
+pub(crate) enum CoreEffect {
+    Delivery { owner: SessionOwner, line: Bytes },
+}
+
 /// One core and the only queue allowed to drive its state transitions.
 pub(crate) struct CoreWorker {
     core: Core,
     receiver: Receiver<Input>,
+    ingress: CoreIngress,
 }
 
 impl CoreWorker {
-    pub(crate) fn new(core: Core, receiver: Receiver<Input>) -> Self {
-        Self { core, receiver }
+    pub(crate) fn new(core: Core, receiver: Receiver<Input>, ingress: CoreIngress) -> Self {
+        Self {
+            core,
+            receiver,
+            ingress,
+        }
     }
 
     pub(crate) async fn run(mut self) {
@@ -1348,6 +1400,20 @@ impl CoreWorker {
                 sequence: envelope.seq,
                 input: envelope.payload,
             });
+            for effect in self.core.take_effects() {
+                let CoreEffect::Delivery { owner, line } = effect;
+                if self
+                    .ingress
+                    .push(Input::Delivery {
+                        conn: owner.conn(),
+                        line,
+                    })
+                    .await
+                    .is_err()
+                {
+                    panic!("cross-shard delivery target closed");
+                }
+            }
             if stop {
                 return;
             }
@@ -1397,6 +1463,10 @@ impl Core {
             .checked_add(1)
             .expect("core queue sequence exhausted");
         self.handle(event.input);
+    }
+
+    fn take_effects(&mut self) -> Vec<CoreEffect> {
+        self.state.take_effects()
     }
 
     /// Seed the hot channel-ownership map from persisted rows before the
@@ -1465,6 +1535,7 @@ impl Core {
             } => self.state.open(conn, tx, host, transport),
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
+            Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
@@ -1652,9 +1723,10 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ConnId, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId,
-        CoreTraceStep, CoreWorker, Input, ReplayError,
+        ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
+        CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
     };
+    use bytes::Bytes;
     use e6irc_queue::{Config, Policy, queue};
     use std::num::NonZeroUsize;
     use std::sync::Arc;
@@ -1712,6 +1784,13 @@ mod ingress_tests {
             .push(Input::OverlongLine { conn: ConnId(5) })
             .await
             .expect("second shard event routed");
+        ingress
+            .push(Input::Delivery {
+                conn: ConnId(5),
+                line: Bytes::from_static(b"NOTICE * :delivered\r\n"),
+            })
+            .await
+            .expect("second shard delivery routed");
 
         let first = first_rx.pop().await.expect("first routed event");
         let second = second_rx.pop().await.expect("second routed event");
@@ -1726,6 +1805,128 @@ mod ingress_tests {
             second.payload,
             Input::OverlongLine { conn: ConnId(5) }
         ));
+        let second = second_rx.pop().await.expect("second routed delivery");
+        assert!(matches!(
+            second.payload,
+            Input::Delivery {
+                conn: ConnId(5),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_channel_message_reaches_the_destination_workers_sendq() {
+        use crate::core::state::{
+            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
+        };
+
+        let config = Config {
+            name: "two-worker-core",
+            capacity: 4,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config);
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let (first_db, _first_db_rx) = queue(Config {
+            name: "first-worker-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let (second_db, _second_db_rx) = queue(Config {
+            name: "second-worker-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut first = Core::with_telemetry_on_shard(
+            core_config(),
+            first_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+        );
+        let mut second = Core::with_telemetry_on_shard(
+            core_config(),
+            second_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            shards,
+        );
+        let (out_tx, mut out_rx) = queue(Config {
+            name: "remote-member-sendq",
+            capacity: 8,
+            policy: Policy::Fifo,
+        });
+        second.state.open(
+            ConnId(1),
+            out_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        let (sender_tx, _sender_rx) = queue(Config {
+            name: "local-member-sendq",
+            capacity: 64,
+            policy: Policy::Fifo,
+        });
+        first.state.open(
+            ConnId(2),
+            sender_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        first.handle(Input::Line {
+            conn: ConnId(2),
+            line: b"NICK sender".to_vec(),
+        });
+        first.handle(Input::Line {
+            conn: ConnId(2),
+            line: b"USER sender 0 * :Sender".to_vec(),
+        });
+        let key = first.state.chan_key("#chat");
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(1), CoreShardId(1)),
+                Caps {
+                    server_time: true,
+                    extended_join: true,
+                    ..Caps::default()
+                },
+            ),
+            MemberIdentity::new("remote".into(), "remote!u@host.test".into(), false),
+            MemberModes::default(),
+        );
+        first.state.channels.entry(key.clone()).or_insert(channel);
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"JOIN #chat".to_vec(),
+            })
+            .expect("queue source join");
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"PRIVMSG #chat :hello".to_vec(),
+            })
+            .expect("queue source message");
+        first_tx.try_push(Input::Shutdown).expect("stop source");
+
+        let destination = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        CoreWorker::new(first, first_rx, ingress.clone())
+            .run()
+            .await;
+        let join = out_rx.pop().await.expect("remote join delivered");
+        assert!(join.payload.0.starts_with(b"@time="));
+        assert!(join.payload.0.ends_with(b"JOIN #chat * :Sender\r\n"));
+        let message = out_rx.pop().await.expect("remote message delivered");
+        assert!(message.payload.0.starts_with(b"@time="));
+        assert!(message.payload.0.ends_with(b"PRIVMSG #chat :hello\r\n"));
+        second_tx
+            .try_push(Input::Shutdown)
+            .expect("stop destination");
+        destination.await.expect("destination worker");
     }
 
     #[test]
@@ -1773,7 +1974,9 @@ mod ingress_tests {
         });
         tx.try_push(Input::Shutdown).expect("shutdown event queued");
 
-        CoreWorker::new(core, rx).run().await;
+        CoreWorker::new(core, rx, CoreIngress::single(tx))
+            .run()
+            .await;
     }
 
     #[test]

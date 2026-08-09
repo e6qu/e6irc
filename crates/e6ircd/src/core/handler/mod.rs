@@ -5,7 +5,7 @@ use e6irc_proto::numerics::*;
 
 use super::ConnId;
 use super::state::{
-    BanKind, CAP_NAMES, ChanKey, Channel, MemberModes, ServerBan, ServerState, Topic,
+    BanKind, CAP_NAMES, ChanKey, Channel, MemberModes, Recipient, ServerBan, ServerState, Topic,
 };
 
 pub(crate) mod admin;
