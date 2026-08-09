@@ -2493,3 +2493,75 @@ mod wire_line_tests {
         assert!(wire_line_violation(huge_tags.as_bytes(), false).is_some());
     }
 }
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+    use e6irc_queue::{Config as QueueConfig, Policy, queue};
+
+    fn wall_clock() -> e6irc_proto::time::Millis {
+        e6irc_proto::time::Millis::from_millis(0)
+    }
+
+    fn mono_clock() -> e6irc_proto::time::MonoMillis {
+        e6irc_proto::time::MonoMillis::from_millis(0)
+    }
+
+    fn state() -> ServerState {
+        let (db_tx, _db_rx) = queue(QueueConfig {
+            name: "session-store-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        ServerState::new(
+            CoreConfig {
+                server_name: "irc.test".into(),
+                network_name: "test".into(),
+                description: "test".into(),
+                registration_before_connect: false,
+                registration_require_email: false,
+                sendq: 1,
+                motd: Vec::new(),
+                nicklen: 30,
+                sasl_enabled: false,
+                max_hot_channels: 1,
+                opers: Vec::new(),
+                clock: wall_clock,
+                mono_clock,
+                command_burst: None,
+                registration_burst: None,
+            },
+            db_tx,
+            Arc::new(Telemetry::new()),
+        )
+    }
+
+    fn open(state: &mut ServerState, conn: ConnId) {
+        let (tx, _rx) = queue(QueueConfig {
+            name: "session-store-output",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        state.open(
+            conn,
+            tx,
+            "host.test".into(),
+            crate::core::ConnectionTransport::Tcp,
+        );
+    }
+
+    #[test]
+    fn reused_slot_has_a_new_generation() {
+        let mut state = state();
+        open(&mut state, ConnId(1));
+        let old = state.sessions.by_conn[&ConnId(1)];
+        state.sessions.remove(&ConnId(1));
+        open(&mut state, ConnId(2));
+        let current = state.sessions.by_conn[&ConnId(2)];
+
+        assert_eq!(old.slot, current.slot);
+        assert_ne!(old.generation, current.generation);
+        assert!(state.sessions.get(&ConnId(1)).is_none());
+        assert!(state.sessions.get(&ConnId(2)).is_some());
+    }
+}
