@@ -21,8 +21,8 @@ and integration claims.
   owner, so remote NICK and visibility changes cannot leave stale members.
   Process-wide membership records make cross-shard membership and shared-channel
   visibility explicit rather than reading a foreign session table.
-  All MODE reads and mutations, NAMES, channel WHO, and channel CHATHISTORY
-  route to the owner; remaining channel queries, services, persistence callbacks,
+  All MODE reads and mutations, NAMES, channel WHO, channel CHATHISTORY, and
+  explicit-target LIST route to the owner; remaining channel queries, services, persistence callbacks,
   and HTTP controls still need the
   same boundary.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and

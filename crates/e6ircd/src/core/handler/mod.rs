@@ -155,6 +155,9 @@ pub(crate) fn channel_command(
                 state, command,
             ))
         }
+        crate::core::state::ChannelCommandOperation::List => {
+            crate::core::state::ChannelCommandResult::List(chanops::list_on_owner(state, command))
+        }
         crate::core::state::ChannelCommandOperation::ModeQuery => {
             crate::core::state::ChannelCommandResult::ModeQuery(channel::mode_query_on_owner(
                 state, command,
@@ -201,6 +204,9 @@ pub(crate) fn channel_command_result(
             }
             crate::core::state::ChannelHistoryResult::Deferred => {}
         },
+        crate::core::state::ChannelCommandResult::List(result) => {
+            channel::emit_channel_command_replies(state, conn, result, label)
+        }
         crate::core::state::ChannelCommandResult::ModeQuery(result) => {
             channel::emit_mode_query_result(state, conn, result, label)
         }

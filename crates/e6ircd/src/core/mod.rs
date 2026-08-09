@@ -2822,6 +2822,28 @@ mod ingress_tests {
                 .windows(17)
                 .any(|part| part == b"chathistory #chat")
         }));
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"LIST #chat".to_vec(),
+            })
+            .expect("remote list queued");
+        let list_start = next_output(&mut bob_rx).await;
+        let list_row = next_output(&mut bob_rx).await;
+        let list_end = next_output(&mut bob_rx).await;
+        assert!(
+            list_start
+                .payload
+                .0
+                .ends_with(b" 321 robert Channel :Users  Name\r\n")
+        );
+        assert!(list_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n"));
+        assert!(
+            list_end
+                .payload
+                .0
+                .ends_with(b" 323 robert :End of /LIST\r\n")
+        );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");
