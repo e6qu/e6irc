@@ -1348,6 +1348,7 @@ impl WireLine {
 
 pub struct Core {
     state: ServerState,
+    shard: CoreShardId,
     next_sequence: u64,
 }
 
@@ -1379,13 +1380,14 @@ impl Core {
     ) -> Self {
         Self {
             state: ServerState::new(shard, shards, config, db_tx, telemetry),
+            shard,
             next_sequence: 0,
         }
     }
 
     /// Process the next event selected by this worker's scheduler.
     pub(crate) fn handle_scheduled(&mut self, event: ScheduledInput) {
-        debug_assert_eq!(event.shard, CoreShardId(0));
+        debug_assert_eq!(event.shard, self.shard);
         debug_assert_eq!(event.sequence, self.next_sequence);
         self.next_sequence = event
             .sequence
@@ -1647,9 +1649,40 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ConnId, CoreIngress, CoreScheduler, CoreShardId, CoreTraceStep, Input, ReplayError,
+        ConnId, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId,
+        CoreTraceStep, Input, ReplayError, ScheduledInput,
     };
     use e6irc_queue::{Config, Policy, queue};
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    fn wall_clock() -> e6irc_proto::time::Millis {
+        e6irc_proto::time::Millis::from_millis(0)
+    }
+
+    fn mono_clock() -> e6irc_proto::time::MonoMillis {
+        e6irc_proto::time::MonoMillis::from_millis(0)
+    }
+
+    fn core_config() -> CoreConfig {
+        CoreConfig {
+            server_name: "irc.test".into(),
+            network_name: "test".into(),
+            description: "test".into(),
+            registration_before_connect: false,
+            registration_require_email: false,
+            sendq: 1,
+            motd: Vec::new(),
+            nicklen: 30,
+            sasl_enabled: false,
+            max_hot_channels: 1,
+            opers: Vec::new(),
+            clock: wall_clock,
+            mono_clock,
+            command_burst: None,
+            registration_burst: None,
+        }
+    }
 
     #[tokio::test]
     async fn connection_events_keep_one_deterministic_owner() {
@@ -1714,6 +1747,28 @@ mod ingress_tests {
         assert_eq!(second.shard, CoreShardId(1));
         assert_eq!(first.sequence, 0);
         assert_eq!(second.sequence, 0);
+    }
+
+    #[test]
+    fn core_accepts_the_event_for_its_own_shard() {
+        let (db_tx, _db_rx) = queue(Config {
+            name: "nonzero-core-shard-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut core = Core::with_telemetry_on_shard(
+            core_config(),
+            db_tx,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
+        );
+
+        core.handle_scheduled(ScheduledInput {
+            shard: CoreShardId(1),
+            sequence: 0,
+            input: Input::Shutdown,
+        });
     }
 
     #[test]
