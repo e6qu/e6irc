@@ -713,6 +713,7 @@ pub(super) fn names_on_owner(
         conn: actor.recipient.conn(),
         lines: Vec::new(),
         reply_target: Some(actor.identity.nick),
+        reply_caps: Some(actor.recipient.caps()),
         label: None,
         deferred: false,
     });
@@ -1464,6 +1465,7 @@ pub(super) fn mode_change_on_owner(
         conn: actor.recipient.conn(),
         lines: Vec::new(),
         reply_target: Some(actor.identity.nick.clone()),
+        reply_caps: Some(actor.recipient.caps()),
         label: None,
         deferred: false,
     });

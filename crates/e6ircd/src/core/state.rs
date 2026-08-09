@@ -899,9 +899,15 @@ pub enum ChannelCommandOperation {
     Knock,
     Invite(ChannelInvitee),
     Names,
+    Who(ChannelWhoQuery),
     ModeQuery,
     ModeListQuery(String),
     ModeChange(ChannelModeChange),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelWhoQuery {
+    pub(crate) argument: String,
 }
 
 /// A parsed channel MODE mutation, with its mode token separate from arguments.
@@ -980,6 +986,7 @@ pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
     Names(ChannelCommandReplies),
+    Who(ChannelCommandReplies),
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
     ModeChange(ChannelCommandReplies),
@@ -2135,6 +2142,7 @@ pub(crate) struct Capture {
     pub lines: Vec<Bytes>,
     /// The nick used in replies when the connection lives on another shard.
     pub reply_target: Option<String>,
+    pub reply_caps: Option<Caps>,
     /// The escaped `label` value, so a command whose response is produced
     /// asynchronously (CHATHISTORY falling back to PostgreSQL) can carry the
     /// label into that deferred reply instead of losing it.
@@ -3338,6 +3346,7 @@ impl ServerState {
             conn,
             lines: Vec::new(),
             reply_target: None,
+            reply_caps: None,
             label: Some(label.clone()),
             deferred: false,
         });
@@ -3375,6 +3384,7 @@ impl ServerState {
                     conn,
                     lines: Vec::new(),
                     reply_target: None,
+                    reply_caps: None,
                     label: Some(label.clone()),
                     deferred: false,
                 });
@@ -3426,6 +3436,14 @@ impl ServerState {
                     .and_then(|session| session.nick().map(String::from))
             })
             .unwrap_or_else(|| "*".into())
+    }
+
+    pub fn reply_caps(&self, conn: ConnId) -> Caps {
+        self.capture
+            .as_ref()
+            .filter(|capture| capture.conn == conn)
+            .and_then(|capture| capture.reply_caps)
+            .unwrap_or_else(|| self.sessions[&conn].caps)
     }
 
     pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {

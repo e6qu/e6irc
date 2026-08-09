@@ -147,6 +147,9 @@ pub(crate) fn channel_command(
         crate::core::state::ChannelCommandOperation::Names => {
             crate::core::state::ChannelCommandResult::Names(channel::names_on_owner(state, command))
         }
+        crate::core::state::ChannelCommandOperation::Who(_) => {
+            crate::core::state::ChannelCommandResult::Who(query::who_on_owner(state, command))
+        }
         crate::core::state::ChannelCommandOperation::ModeQuery => {
             crate::core::state::ChannelCommandResult::ModeQuery(channel::mode_query_on_owner(
                 state, command,
@@ -182,6 +185,9 @@ pub(crate) fn channel_command_result(
             })
         }
         crate::core::state::ChannelCommandResult::Names(result) => {
+            channel::emit_channel_command_replies(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::Who(result) => {
             channel::emit_channel_command_replies(state, conn, result, label)
         }
         crate::core::state::ChannelCommandResult::ModeQuery(result) => {
@@ -315,6 +321,7 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
             conn,
             lines: Vec::new(),
             reply_target: None,
+            reply_caps: None,
             label: Some(label.to_string()),
             deferred: false,
         });

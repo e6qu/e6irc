@@ -118,6 +118,24 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.numeric(conn, RPL_ENDOFWHO, &["*"], Some("End of /WHO list"));
         return;
     };
+    if mask.starts_with('#') {
+        let owner = state.channel_owner(mask);
+        if !state.owns_channel(&owner) {
+            let label = state.channel_reply_label(conn, &owner);
+            state.route_channel_command(crate::core::state::ChannelCommand::new(
+                owner,
+                state.channel_actor(conn),
+                mask.to_string(),
+                crate::core::state::ChannelCommandOperation::Who(
+                    crate::core::state::ChannelWhoQuery {
+                        argument: p.get(1).copied().unwrap_or("").to_string(),
+                    },
+                ),
+                label,
+            ));
+            return;
+        }
+    }
     // The RFC 2812 `o` flag restricts matches to operators; Solanum also
     // accepts it combined with a WHOX spec (`WHO * o%nf`). Anything else in
     // the flags position is ignored, as before.
@@ -127,7 +145,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         _ => (false, arg),
     };
     let whox = parse_whox(whox_part);
-    let requester_multi_prefix = state.sessions[&conn].caps.multi_prefix;
+    let requester_multi_prefix = state.reply_caps(conn).multi_prefix;
     let server = state.config.server_name.clone();
     // Monotonic: idle is elapsed time since `last_active` (also monotonic).
     let now = (state.config.mono_clock)();
@@ -281,6 +299,37 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         &[clip_echo(mask)],
         Some("End of /WHO list"),
     );
+}
+
+pub(super) fn who_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelCommandReplies {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::Who(query) = operation else {
+        unreachable!("WHO requires its operation")
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "WHO owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick),
+        reply_caps: Some(actor.recipient.caps()),
+        label: None,
+        deferred: false,
+    });
+    cmd_who(
+        state,
+        actor.recipient.conn(),
+        &[target.as_str(), query.argument.as_str()],
+    );
+    let lines = state.capture.take().expect("WHO capture installed").lines;
+    crate::core::state::ChannelCommandReplies { lines }
 }
 
 pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {

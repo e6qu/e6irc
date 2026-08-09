@@ -2753,6 +2753,28 @@ mod ingress_tests {
                 .0
                 .ends_with(b" 366 robert #chat :End of /NAMES list\r\n")
         );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"WHO #chat".to_vec(),
+            })
+            .expect("remote who queued");
+        let first_who = next_output(&mut bob_rx).await;
+        let second_who = next_output(&mut bob_rx).await;
+        let who_end = next_output(&mut bob_rx).await;
+        let who_rows = [first_who.payload.0, second_who.payload.0];
+        assert!(who_rows.iter().any(|line| {
+            line.ends_with(b" 352 robert #chat alice host.test irc.test alice H@ :0 alice\r\n")
+        }));
+        assert!(who_rows.iter().any(|line| {
+            line.ends_with(b" 352 robert #chat bob host.test irc.test robert H@ :0 bob\r\n")
+        }));
+        assert!(
+            who_end
+                .payload
+                .0
+                .ends_with(b" 315 robert #chat :End of /WHO list\r\n")
+        );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");
