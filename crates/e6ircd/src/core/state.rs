@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use e6irc_proto::casemap::CaseMapping;
@@ -40,28 +40,39 @@ impl NickKey {
     }
 }
 
-/// The sole owner of nick reservations and their worker assignment.
-#[derive(Default)]
+/// Process-wide nick reservations and their session owners.
+#[derive(Clone, Default)]
 pub(crate) struct NickDirectory {
-    by_key: HashMap<NickKey, SessionOwner>,
+    by_key: Arc<Mutex<HashMap<NickKey, SessionOwner>>>,
 }
 
 impl NickDirectory {
     pub(crate) fn owner(&self, key: &NickKey) -> Option<SessionOwner> {
-        self.by_key.get(key).copied()
+        self.by_key
+            .lock()
+            .expect("nick directory poisoned")
+            .get(key)
+            .copied()
     }
 
-    pub(crate) fn reserve(&mut self, key: NickKey, owner: SessionOwner) {
-        self.by_key.insert(key, owner);
-    }
-
-    pub(crate) fn release_if_owned(&mut self, key: &NickKey, conn: ConnId) -> bool {
-        if self.owner(key).is_some_and(|owner| owner.conn() == conn) {
-            self.by_key.remove(key);
-            true
-        } else {
-            false
+    pub(crate) fn claim(&self, key: NickKey, owner: SessionOwner) -> bool {
+        let mut by_key = self.by_key.lock().expect("nick directory poisoned");
+        match by_key.get(&key) {
+            Some(existing) if existing.conn() != owner.conn() => false,
+            _ => {
+                by_key.insert(key, owner);
+                true
+            }
         }
+    }
+
+    pub(crate) fn release_if_owned(&self, key: &NickKey, conn: ConnId) -> bool {
+        let mut by_key = self.by_key.lock().expect("nick directory poisoned");
+        if by_key.get(key).is_some_and(|owner| owner.conn() == conn) {
+            by_key.remove(key);
+            return true;
+        }
+        false
     }
 }
 
@@ -2075,6 +2086,7 @@ impl ServerState {
         config: CoreConfig,
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
+        nicks: NickDirectory,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
@@ -2083,7 +2095,7 @@ impl ServerState {
             config,
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
-            nicks: NickDirectory::default(),
+            nicks,
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             effects: Vec::new(),
@@ -2521,9 +2533,9 @@ impl ServerState {
         NickKey(self.casemap.casefold(nick))
     }
 
-    /// Reserve `key` for this worker's connection.
-    pub fn reserve_nick(&mut self, key: NickKey, conn: ConnId) {
-        self.nicks.reserve(key, SessionOwner::new(conn, self.shard));
+    /// Claim `key` for this connection if no other connection owns it.
+    pub fn claim_nick(&self, key: NickKey, conn: ConnId) -> bool {
+        self.nicks.claim(key, SessionOwner::new(conn, self.shard))
     }
 
     /// The reservation for `key`, including a remote worker assignment.
@@ -3539,6 +3551,7 @@ mod session_store_tests {
             },
             db_tx,
             Arc::new(Telemetry::new()),
+            NickDirectory::default(),
         )
     }
 
@@ -3558,11 +3571,11 @@ mod session_store_tests {
 
     #[test]
     fn nick_reservation_retains_its_worker() {
-        let mut directory = NickDirectory::default();
+        let directory = NickDirectory::default();
         let key = NickKey("alice".into());
         let owner = SessionOwner::new(ConnId(7), CoreShardId(3));
 
-        directory.reserve(key.clone(), owner);
+        assert!(directory.claim(key.clone(), owner));
 
         assert_eq!(directory.owner(&key), Some(owner));
         assert_eq!(
@@ -3573,6 +3586,18 @@ mod session_store_tests {
         assert_eq!(directory.owner(&key), Some(owner));
         assert!(directory.release_if_owned(&key, ConnId(7)));
         assert_eq!(directory.owner(&key), None);
+    }
+
+    #[test]
+    fn nick_claim_cannot_replace_another_session() {
+        let directory = NickDirectory::default();
+        let key = NickKey("alice".into());
+        let first = SessionOwner::new(ConnId(7), CoreShardId(0));
+        let second = SessionOwner::new(ConnId(8), CoreShardId(1));
+
+        assert!(directory.claim(key.clone(), first));
+        assert!(!directory.claim(key.clone(), second));
+        assert_eq!(directory.owner(&key), Some(first));
     }
 
     #[test]

@@ -25,13 +25,13 @@ use bytes::Bytes;
 #[cfg(test)]
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
-use state::ServerState;
 use state::{
     ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelMessage,
     ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
     ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
     ChannelTopicResult,
 };
+use state::{NickDirectory, ServerState};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -110,6 +110,7 @@ impl SessionOwner {
 pub struct CoreIngress {
     shards: Arc<[Sender<Input>]>,
     count: CoreShardCount,
+    nicks: NickDirectory,
 }
 
 impl CoreIngress {
@@ -117,6 +118,7 @@ impl CoreIngress {
         Self {
             shards: Arc::from([sender]),
             count: CoreShardCount::single(),
+            nicks: NickDirectory::default(),
         }
     }
 
@@ -135,6 +137,7 @@ impl CoreIngress {
         Self {
             shards: shards.into(),
             count: CoreShardCount::new(count),
+            nicks: NickDirectory::default(),
         }
     }
 
@@ -178,6 +181,10 @@ impl CoreIngress {
 
     pub fn monitor(&self) -> QueueMonitor {
         self.shards[0].monitor()
+    }
+
+    pub(crate) fn nick_directory(&self) -> NickDirectory {
+        self.nicks.clone()
     }
 }
 
@@ -1730,24 +1737,35 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
-        Self::with_telemetry_on_shard(
+        Self::with_telemetry_with_nicks(config, db_tx, telemetry, NickDirectory::default())
+    }
+
+    pub(crate) fn with_telemetry_with_nicks(
+        config: CoreConfig,
+        db_tx: Sender<DbRequest>,
+        telemetry: Arc<Telemetry>,
+        nicks: NickDirectory,
+    ) -> Self {
+        Self::with_telemetry_on_shard_with_nicks(
             config,
             db_tx,
             telemetry,
             CoreShardId(0),
             CoreShardCount::single(),
+            nicks,
         )
     }
 
-    fn with_telemetry_on_shard(
+    fn with_telemetry_on_shard_with_nicks(
         config: CoreConfig,
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
         shard: CoreShardId,
         shards: CoreShardCount,
+        nicks: NickDirectory,
     ) -> Self {
         Self {
-            state: ServerState::new(shard, shards, config, db_tx, telemetry),
+            state: ServerState::new(shard, shards, config, db_tx, telemetry, nicks),
             shard,
             next_sequence: 0,
         }
@@ -2196,7 +2214,7 @@ mod connection_id_allocator_tests {
 mod ingress_tests {
     use super::{
         ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
-        CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
+        CoreShardId, CoreTraceStep, CoreWorker, Input, NickDirectory, ReplayError, SessionOwner,
     };
     use bytes::Bytes;
     use e6irc_queue::{Config, Policy, queue};
@@ -2301,6 +2319,7 @@ mod ingress_tests {
         let (first_tx, first_rx) = queue(config);
         let (second_tx, second_rx) = queue(config);
         let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let nicks = ingress.nick_directory();
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
         let (first_db, _first_db_rx) = queue(Config {
             name: "first-worker-db",
@@ -2312,19 +2331,21 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let mut first = Core::with_telemetry_on_shard(
+        let mut first = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
             first_db,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(0),
             shards,
+            nicks.clone(),
         );
-        let mut second = Core::with_telemetry_on_shard(
+        let mut second = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
             second_db,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             shards,
+            nicks,
         );
         let (out_tx, mut out_rx) = queue(Config {
             name: "remote-member-sendq",
@@ -2415,6 +2436,7 @@ mod ingress_tests {
         let (first_tx, first_rx) = queue(config);
         let (second_tx, second_rx) = queue(config);
         let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let nicks = ingress.nick_directory();
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
         let (first_db, _first_db_rx) = queue(Config {
             name: "first-worker-db",
@@ -2426,19 +2448,21 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let mut first = Core::with_telemetry_on_shard(
+        let mut first = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
             first_db,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(0),
             shards,
+            nicks.clone(),
         );
-        let mut second = Core::with_telemetry_on_shard(
+        let mut second = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
             second_db,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             shards,
+            nicks,
         );
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
 
@@ -2860,12 +2884,13 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let core = Core::with_telemetry_on_shard(
+        let core = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
             db_tx,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
+            NickDirectory::default(),
         );
         let (tx, rx) = queue(Config {
             name: "nonzero-core-shard-input",
