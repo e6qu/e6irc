@@ -129,6 +129,22 @@ pub(crate) fn channel_topic_persisted(
     channel::topic_persisted_on_owner(state, conn, session, result);
 }
 
+pub(crate) fn channel_kick(state: &mut ServerState, kick: crate::core::state::ChannelKick) {
+    let session = kick.actor().session_owner();
+    let label = kick.label();
+    let result = chanops::kick_on_owner(state, kick);
+    state.route_kick_result(session, result, label);
+}
+
+pub(crate) fn channel_kick_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKickResult,
+    label: Option<String>,
+) {
+    chanops::emit_kick_result(state, conn, result, label);
+}
+
 pub(crate) fn channel_message(state: &mut ServerState, message: ChannelMessage) {
     let session = message.actor().session_owner();
     let label = message.label();

@@ -42,11 +42,7 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         );
         return;
     };
-    let prefix = state.sessions[&conn].prefix();
-    let kicker_nick = state.sessions[&conn]
-        .nick()
-        .map(String::from)
-        .expect("registered");
+    let actor = state.channel_actor(conn);
     // Dedup identical (channel, user) pairs; bound the total number of kicks by
     // TARGMAX (the advertised per-KICK target cap), like PRIVMSG's target list.
     let mut seen = std::collections::HashSet::new();
@@ -65,7 +61,29 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             break;
         }
         kicked += 1;
-        kick_pair(state, conn, channel, who, &prefix, &kicker_nick, reason);
+        let owner = state.channel_owner(channel);
+        let label = if state.owns_channel(&owner) {
+            state
+                .capture
+                .as_ref()
+                .and_then(|capture| capture.label.clone())
+        } else {
+            state.defer_channel_reply(conn)
+        };
+        let kick = crate::core::state::ChannelKick::new(
+            owner,
+            actor.clone(),
+            channel.to_string(),
+            who.to_string(),
+            reason.map(str::to_string),
+            label.clone(),
+        );
+        if state.owns_channel(kick.owner()) {
+            let result = kick_on_owner(state, kick);
+            emit_kick_result_now(state, conn, result);
+        } else {
+            state.route_kick(kick);
+        }
     }
 }
 
@@ -73,95 +91,99 @@ pub(super) fn cmd_kick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 /// `who`. Each error (unknown channel, not on channel, not an operator) is
 /// answered with its own numeric, so one bad pair in a multi-target KICK does not
 /// stop the others.
-#[allow(clippy::too_many_arguments)]
-fn kick_pair(
+pub(super) fn kick_on_owner(
     state: &mut ServerState,
-    conn: ConnId,
-    channel: &str,
-    who: &str,
-    prefix: &str,
-    kicker_nick: &str,
-    reason: Option<&str>,
-) {
-    let key = state.chan_key(channel);
+    kick: crate::core::state::ChannelKick,
+) -> crate::core::state::ChannelKickResult {
+    let (owner, actor, channel, who, reason) = kick.into_parts();
+    let conn = actor.recipient.conn();
+    let key = state.chan_key(&channel);
+    assert_eq!(owner.key(), &key, "KICK owner does not match target");
     let Some(chan) = state.channels.get(&key) else {
-        state.err_nosuchchannel(conn, clip_echo(channel));
-        return;
+        return crate::core::state::ChannelKickResult::NoSuchChannel { target: channel };
     };
     let display = chan.name.clone();
     if !chan.is_member(conn) {
-        state.err_notonchannel(conn, channel);
-        return;
+        return crate::core::state::ChannelKickResult::NotOnChannel { target: channel };
     }
     if !chan.member(conn).is_some_and(|member| member.op) {
-        state.numeric(
-            conn,
-            ERR_CHANOPRIVSNEEDED,
-            &[channel],
-            Some("You're not a channel operator"),
-        );
-        return;
+        return crate::core::state::ChannelKickResult::NotOperator { target: channel };
     }
-    kick_one_user(
-        state,
-        conn,
-        &key,
-        &display,
-        prefix,
-        kicker_nick,
-        who,
-        reason,
-    );
-}
-
-/// Remove one already-split `who` from channel `key` (the caller has verified the
-/// kicker is an opped member). An unknown user or one not on the channel answers
-/// ERR_USERNOTINCHANNEL and removes no one, so one bad name in a comma list does
-/// not stop the others.
-#[allow(clippy::too_many_arguments)]
-fn kick_one_user(
-    state: &mut ServerState,
-    conn: ConnId,
-    key: &crate::core::state::ChanKey,
-    display: &str,
-    prefix: &str,
-    kicker_nick: &str,
-    who: &str,
-    reason: Option<&str>,
-) {
-    let Some((victim, recipient, identity)) = state.channels[key].member_named(state.casemap, who)
+    let Some((victim, recipient, identity)) =
+        state.channels[&key].member_named(state.casemap, &who)
     else {
-        state.numeric(
-            conn,
-            ERR_USERNOTINCHANNEL,
-            &[who, display],
-            Some("They aren't on that channel"),
-        );
-        return;
+        return crate::core::state::ChannelKickResult::UserNotInChannel {
+            victim: who,
+            channel: display,
+        };
     };
     let victim_nick = identity.nick.clone();
-    let line = match reason {
+    let line = match reason.as_deref() {
         Some(reason) => {
             // KICKLEN bounds the reason itself; the relayed line also carries
             // the kicker's prefix, so fit against the actual head too.
-            let head = format!(":{prefix} KICK {display} {victim_nick} :");
+            let head = format!(":{} KICK {display} {victim_nick} :", actor.identity.prefix);
             let reason = crate::core::handler::fit_trailing(&head, truncate_chars(reason, KICKLEN));
             format!("{head}{reason}")
         }
-        None => format!(":{prefix} KICK {display} {victim_nick} :{kicker_nick}"),
+        None => format!(
+            ":{} KICK {display} {victim_nick} :{}",
+            actor.identity.prefix, actor.identity.nick
+        ),
     };
-    state.broadcast_channel(key, &line, None);
-    let chan = state.channels.get_mut(key).expect("checked");
+    state.broadcast_channel(&key, &line, None);
+    let chan = state.channels.get_mut(&key).expect("checked");
     chan.remove_member(victim);
     let empty = !chan.has_members();
     if empty {
-        state.remove_channel(key);
+        state.remove_channel(&key);
     }
     let owner = recipient.owner();
     if state.owns_session(owner) {
-        state.remove_session_channel(victim, key);
+        state.remove_session_channel(victim, &key);
     } else {
-        state.route_session_channel_removed(owner, key.clone());
+        state.route_session_channel_removed(owner, key);
+    }
+    crate::core::state::ChannelKickResult::Kicked
+}
+
+pub(super) fn emit_kick_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKickResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_kick_result_now(state, conn, result)
+    });
+}
+
+fn emit_kick_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKickResult,
+) {
+    match result {
+        crate::core::state::ChannelKickResult::Kicked => {}
+        crate::core::state::ChannelKickResult::NoSuchChannel { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target))
+        }
+        crate::core::state::ChannelKickResult::NotOnChannel { target } => {
+            state.err_notonchannel(conn, &target)
+        }
+        crate::core::state::ChannelKickResult::NotOperator { target } => state.numeric(
+            conn,
+            ERR_CHANOPRIVSNEEDED,
+            &[&target],
+            Some("You're not a channel operator"),
+        ),
+        crate::core::state::ChannelKickResult::UserNotInChannel { victim, channel } => state
+            .numeric(
+                conn,
+                ERR_USERNOTINCHANNEL,
+                &[&victim, &channel],
+                Some("They aren't on that channel"),
+            ),
     }
 }
 

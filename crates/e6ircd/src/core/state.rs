@@ -837,6 +837,63 @@ pub enum ChannelTopicResult {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelKick {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    victim: String,
+    reason: Option<String>,
+    label: Option<String>,
+}
+
+impl ChannelKick {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        victim: String,
+        reason: Option<String>,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            victim,
+            reason,
+            label,
+        }
+    }
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, String, Option<String>) {
+        (
+            self.owner,
+            self.actor,
+            self.target,
+            self.victim,
+            self.reason,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum ChannelKickResult {
+    Kicked,
+    NoSuchChannel { target: String },
+    NotOnChannel { target: String },
+    NotOperator { target: String },
+    UserNotInChannel { victim: String, channel: String },
+}
+
 /// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -1924,6 +1981,25 @@ impl ServerState {
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
         self.effects
             .push(crate::core::CoreEffect::SessionChannelRemoved { session, key });
+    }
+
+    pub fn route_kick(&mut self, kick: ChannelKick) {
+        self.effects
+            .push(crate::core::CoreEffect::ChannelKick { kick });
+    }
+
+    pub fn route_kick_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelKickResult,
+        label: Option<String>,
+    ) {
+        self.effects
+            .push(crate::core::CoreEffect::ChannelKickResult {
+                session,
+                result,
+                label,
+            });
     }
 
     pub fn remove_session_channel(&mut self, conn: ConnId, key: &ChanKey) {

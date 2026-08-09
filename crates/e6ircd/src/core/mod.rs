@@ -27,9 +27,10 @@ use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
 use state::{
-    ChannelActor, ChannelJoinResult, ChannelMessage, ChannelMessageResult, ChannelMultiline,
-    ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
-    ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
+    ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelMessage,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
+    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
+    ChannelTopicResult,
 };
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -155,6 +156,8 @@ impl CoreIngress {
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::ChannelKick { kick } => kick.owner().shard(),
+            Input::ChannelKickResult { session, .. } => session.shard(),
             Input::SessionChannelRemoved { session, .. } => session.shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
@@ -407,6 +410,14 @@ pub enum Input {
         conn: ConnId,
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
+    },
+    ChannelKick {
+        kick: ChannelKick,
+    },
+    ChannelKickResult {
+        session: SessionOwner,
+        result: ChannelKickResult,
+        label: Option<String>,
     },
     SessionChannelRemoved {
         session: SessionOwner,
@@ -1527,6 +1538,14 @@ pub(crate) enum CoreEffect {
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
     },
+    ChannelKick {
+        kick: ChannelKick,
+    },
+    ChannelKickResult {
+        session: SessionOwner,
+        result: ChannelKickResult,
+        label: Option<String>,
+    },
     SessionChannelRemoved {
         session: SessionOwner,
         key: state::ChanKey,
@@ -1655,6 +1674,16 @@ impl CoreWorker {
                     CoreEffect::SessionChannelRemoved { session, key } => {
                         Input::SessionChannelRemoved { session, key }
                     }
+                    CoreEffect::ChannelKick { kick } => Input::ChannelKick { kick },
+                    CoreEffect::ChannelKickResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelKickResult {
+                        session,
+                        result,
+                        label,
+                    },
                     CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
                     CoreEffect::ChannelMessageResult {
                         session,
@@ -1902,6 +1931,26 @@ impl Core {
                     "session update reached wrong shard"
                 );
                 self.state.remove_session_channel(session.conn(), &key);
+            }
+            Input::ChannelKick { kick } => {
+                assert_eq!(
+                    kick.owner().shard(),
+                    self.shard,
+                    "KICK reached wrong channel shard"
+                );
+                handler::channel_kick(&mut self.state, kick);
+            }
+            Input::ChannelKickResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "KICK result reached wrong session shard"
+                );
+                handler::channel_kick_result(&mut self.state, session.conn(), result, label);
             }
             Input::ChannelMessage { message } => {
                 assert_eq!(
