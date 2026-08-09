@@ -32,7 +32,7 @@ use state::{
     ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
     ChannelTopicResult,
 };
-use state::{MembershipDirectory, NickDirectory, ServerState};
+use state::{FounderDirectory, MembershipDirectory, NickDirectory, ServerState};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -117,6 +117,7 @@ pub struct CoreIngress {
     count: CoreShardCount,
     nicks: NickDirectory,
     memberships: MembershipDirectory,
+    founders: FounderDirectory,
 }
 
 impl CoreIngress {
@@ -126,6 +127,7 @@ impl CoreIngress {
             count: CoreShardCount::single(),
             nicks: NickDirectory::default(),
             memberships: MembershipDirectory::default(),
+            founders: FounderDirectory::default(),
         }
     }
 
@@ -146,6 +148,7 @@ impl CoreIngress {
             count: CoreShardCount::new(count),
             nicks: NickDirectory::default(),
             memberships: MembershipDirectory::default(),
+            founders: FounderDirectory::default(),
         }
     }
 
@@ -203,6 +206,10 @@ impl CoreIngress {
 
     pub(crate) fn membership_directory(&self) -> MembershipDirectory {
         self.memberships.clone()
+    }
+
+    pub(crate) fn founder_directory(&self) -> FounderDirectory {
+        self.founders.clone()
     }
 }
 
@@ -1807,6 +1814,7 @@ impl Core {
             telemetry,
             NickDirectory::default(),
             MembershipDirectory::default(),
+            FounderDirectory::default(),
         )
     }
 
@@ -1816,6 +1824,7 @@ impl Core {
         telemetry: Arc<Telemetry>,
         nicks: NickDirectory,
         memberships: MembershipDirectory,
+        founders: FounderDirectory,
     ) -> Self {
         Self::with_telemetry_on_shard_with_nicks(
             config,
@@ -1825,6 +1834,7 @@ impl Core {
             CoreShardCount::single(),
             nicks,
             memberships,
+            founders,
         )
     }
 
@@ -1836,9 +1846,19 @@ impl Core {
         shards: CoreShardCount,
         nicks: NickDirectory,
         memberships: MembershipDirectory,
+        founders: FounderDirectory,
     ) -> Self {
         Self {
-            state: ServerState::new(shard, shards, config, db_tx, telemetry, nicks, memberships),
+            state: ServerState::new(
+                shard,
+                shards,
+                config,
+                db_tx,
+                telemetry,
+                nicks,
+                memberships,
+                founders,
+            ),
             shard,
             next_sequence: 0,
         }
@@ -2334,8 +2354,8 @@ mod connection_id_allocator_tests {
 mod ingress_tests {
     use super::{
         ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
-        CoreShardId, CoreTraceStep, CoreWorker, Input, MembershipDirectory, NickDirectory,
-        ReplayError, SessionOwner,
+        CoreShardId, CoreTraceStep, CoreWorker, FounderDirectory, Input, MembershipDirectory,
+        NickDirectory, ReplayError, SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2396,6 +2416,7 @@ mod ingress_tests {
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
         let nicks = ingress.nick_directory();
         let memberships = ingress.membership_directory();
+        let founders = ingress.founder_directory();
         let (first_db, _first_db_rx) = queue(Config {
             name: "two-worker-first-db",
             capacity: 1,
@@ -2414,6 +2435,7 @@ mod ingress_tests {
             shards,
             nicks.clone(),
             memberships.clone(),
+            founders.clone(),
         );
         let second = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
@@ -2423,6 +2445,7 @@ mod ingress_tests {
             shards,
             nicks,
             memberships,
+            founders,
         );
         TwoWorkerHarness {
             first,
@@ -2433,6 +2456,17 @@ mod ingress_tests {
             second_rx,
             ingress,
         }
+    }
+
+    #[test]
+    fn registered_channel_ownership_is_shared_by_core_shards() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        first.preload_founders(vec![("#chat".into(), "alice".into())]);
+        let key = second.state.chan_key("#chat");
+        assert!(second.state.is_founder(&key, "alice"));
+        assert!(second.state.is_registered(&key));
     }
 
     async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
@@ -2524,6 +2558,7 @@ mod ingress_tests {
             shards,
             ingress.nick_directory(),
             ingress.membership_directory(),
+            ingress.founder_directory(),
         );
         let target = ["#alpha", "#beta", "#gamma"]
             .into_iter()
@@ -3466,6 +3501,7 @@ mod ingress_tests {
             CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
             NickDirectory::default(),
             MembershipDirectory::default(),
+            FounderDirectory::default(),
         );
         let (tx, rx) = queue(Config {
             name: "nonzero-core-shard-input",

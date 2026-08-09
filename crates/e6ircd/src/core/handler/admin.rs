@@ -144,7 +144,7 @@ fn begin_owned_channel_registration(
         ));
         return;
     }
-    if state.registered_founders.contains_key(&key) {
+    if state.is_registered(&key) {
         let _ = reply.send(channel_error(
             crate::core::ChannelControlError::Conflict,
             format!("{} is already registered", channel.name),
@@ -742,7 +742,7 @@ fn begin_drop_channel(
         ));
         return;
     };
-    if !state.registered_founders.contains_key(&key) {
+    if !state.is_registered(&key) {
         let _ = reply.send(channel_error(
             crate::core::ChannelControlError::NotFound,
             format!("{} is not a registered channel", key.as_str()),
@@ -886,7 +886,7 @@ pub(crate) fn channel_control_result(
                 PersistedChannelMutation::TransferFounder { account } => {
                     state
                         .registered_founders
-                        .insert(key.clone(), state.account_key(&account));
+                        .set(key.clone(), state.account_key(&account));
                     format!("Transferred {} to {account}", key.as_str())
                 }
                 PersistedChannelMutation::Drop => {

@@ -223,6 +223,49 @@ impl AccountKey {
     }
 }
 
+/// Process-wide authoritative registered-channel ownership.
+#[derive(Clone, Default)]
+pub(crate) struct FounderDirectory {
+    by_channel: Arc<Mutex<HashMap<ChanKey, AccountKey>>>,
+}
+
+impl FounderDirectory {
+    pub(crate) fn replace(&self, rows: impl IntoIterator<Item = (ChanKey, AccountKey)>) {
+        *self.by_channel.lock().expect("founder directory poisoned") = rows.into_iter().collect();
+    }
+
+    pub(crate) fn founder(&self, key: &ChanKey) -> Option<AccountKey> {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set(&self, key: ChanKey, founder: AccountKey) {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .insert(key, founder);
+    }
+
+    pub(crate) fn remove(&self, key: &ChanKey) {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .remove(key);
+    }
+
+    pub(crate) fn count(&self, account: &AccountKey) -> usize {
+        self.by_channel
+            .lock()
+            .expect("founder directory poisoned")
+            .values()
+            .filter(|founder| *founder == account)
+            .count()
+    }
+}
+
 pub struct CoreConfig {
     pub server_name: String,
     pub network_name: String,
@@ -2140,7 +2183,7 @@ pub(crate) struct ServerState {
     /// Registered channels → founder account (both casefolded). The hot
     /// copy of the `channels` table's ownership, boot-loaded and updated
     /// on registration; a founder rejoining their channel is re-opped.
-    pub registered_founders: HashMap<ChanKey, AccountKey>,
+    pub registered_founders: FounderDirectory,
     /// Channel registrations waiting for a database verdict, keyed by channel
     /// and carrying the founder reservation. A pending name cannot be queued
     /// twice, and pending reservations count toward the per-account cap.
@@ -2701,6 +2744,7 @@ impl ServerState {
         telemetry: Arc<Telemetry>,
         nicks: NickDirectory,
         memberships: MembershipDirectory,
+        registered_founders: FounderDirectory,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
@@ -2722,7 +2766,7 @@ impl ServerState {
             monitors: HashMap::new(),
             read_markers: HashMap::new(),
             pending_read_markers: HashMap::new(),
-            registered_founders: HashMap::new(),
+            registered_founders,
             pending_channel_registrations: HashMap::new(),
             registered_topics: HashMap::new(),
             pending_channel_topics: HashMap::new(),
@@ -2958,29 +3002,27 @@ impl ServerState {
     /// Load persisted channel ownership as `(name_folded, founder_folded)`
     /// rows (both already casefolded, so they key directly).
     pub fn preload_founders(&mut self, rows: Vec<(String, String)>) {
-        self.registered_founders = rows
-            .into_iter()
-            .map(|(name_folded, founder)| (ChanKey(name_folded), AccountKey(founder)))
-            .collect();
+        self.registered_founders.replace(
+            rows.into_iter()
+                .map(|(name_folded, founder)| (ChanKey(name_folded), AccountKey(founder))),
+        );
     }
 
     /// Record a channel's founder (called when registration succeeds).
     pub fn set_founder(&mut self, channel: &str, founder_account: &str) {
         let key = self.chan_key(channel);
         let founder = self.account_key(founder_account);
-        self.registered_founders.insert(key, founder);
+        self.registered_founders.set(key, founder);
     }
 
     /// Whether `account` is the registered founder of channel `key`.
     pub fn is_founder(&self, key: &ChanKey, account: &str) -> bool {
-        self.registered_founders
-            .get(key)
-            .is_some_and(|f| *f == self.account_key(account))
+        self.registered_founders.founder(key) == Some(self.account_key(account))
     }
 
     /// Whether channel `key` is registered (ownership recorded).
     pub fn is_registered(&self, key: &ChanKey) -> bool {
-        self.registered_founders.contains_key(key)
+        self.registered_founders.founder(key).is_some()
     }
 
     /// How many channels `account` currently founds or has reserved by an
@@ -2988,16 +3030,12 @@ impl ServerState {
     /// burst from stepping around the permanent-map cap before verdicts land.
     pub fn channels_founded_by(&self, account: &str) -> usize {
         let account_key = self.account_key(account);
-        let committed = self
-            .registered_founders
-            .values()
-            .filter(|f| **f == account_key)
-            .count();
+        let committed = self.registered_founders.count(&account_key);
         let pending = self
             .pending_channel_registrations
             .iter()
             .filter(|(channel, founder)| {
-                **founder == account_key && !self.registered_founders.contains_key(*channel)
+                **founder == account_key && self.registered_founders.founder(channel).is_none()
             })
             .count();
         committed + pending
@@ -4208,6 +4246,7 @@ mod session_store_tests {
             Arc::new(Telemetry::new()),
             NickDirectory::default(),
             MembershipDirectory::default(),
+            FounderDirectory::default(),
         )
     }
 
