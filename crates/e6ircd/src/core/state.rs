@@ -1043,6 +1043,17 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes))
     }
 
+    pub fn recipients_where(
+        &self,
+        mut include: impl FnMut(ConnId, &MemberModes) -> bool,
+    ) -> Vec<Recipient> {
+        self.members
+            .iter()
+            .filter(|(conn, member)| include(**conn, &member.modes))
+            .map(|(_, member)| member.recipient)
+            .collect()
+    }
+
     /// Immutable recipients, rebuilt only after a join or part.
     pub fn recipients(&self) -> Arc<[Recipient]> {
         let mut cached = self.recipients.borrow_mut();
@@ -2025,6 +2036,27 @@ impl ServerState {
             return;
         }
         self.send_bytes_uncaptured(conn, bytes);
+    }
+
+    pub fn send_recipient(&mut self, recipient: Recipient, bytes: Bytes) {
+        assert_eq!(
+            recipient.shard(),
+            self.shard,
+            "captured output crossed shard"
+        );
+        self.send_bytes(recipient.conn(), bytes);
+    }
+
+    /// Deliver received output to its owning worker.
+    pub fn send_recipient_uncaptured(&mut self, recipient: Recipient, bytes: Bytes) {
+        if recipient.shard() == self.shard {
+            self.send_bytes_uncaptured(recipient.conn(), bytes);
+        } else {
+            self.effects.push(CoreEffect::Delivery {
+                owner: recipient.owner,
+                line: bytes,
+            });
+        }
     }
 
     /// Debug-build invariant: every outbound line fits what the recipient's

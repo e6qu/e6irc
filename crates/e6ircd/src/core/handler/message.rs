@@ -223,7 +223,7 @@ pub(super) enum ResolvedKind {
 pub(super) struct ResolvedTarget {
     pub(super) kind: ResolvedKind,
     /// Everyone who receives it, the sender excluded.
-    pub(super) recipients: Vec<ConnId>,
+    pub(super) recipients: Vec<Recipient>,
 }
 
 /// Resolve a message target and decide whether the sender may speak to it.
@@ -254,7 +254,7 @@ pub(super) fn resolve_message_target(
         };
         return Some(ResolvedTarget {
             kind: ResolvedKind::User { peer },
-            recipients: vec![peer],
+            recipients: vec![state.local_recipient(peer)],
         });
     }
     let key = state.chan_key(chan_target);
@@ -294,13 +294,9 @@ pub(super) fn resolve_message_target(
         }
         return None;
     }
-    let recipients: Vec<ConnId> = chan
-        .members()
-        .filter(|(member, modes)| {
-            *member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
-        })
-        .map(|(member, _)| member)
-        .collect();
+    let recipients = chan.recipients_where(|member, modes| {
+        member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
+    });
     Some(ResolvedTarget {
         kind: ResolvedKind::Channel { key, status_prefix },
         recipients,
@@ -348,9 +344,10 @@ pub(super) fn deliver_one_message(
             let sender_account = state.sessions[&conn].account.clone();
             let sender_is_bot = state.sessions[&conn].bot;
             let (ts, msgid) = state.stamp();
+            let sender = state.local_recipient(conn);
             deliver_message(
                 state,
-                &[conn],
+                &[sender],
                 &Delivery {
                     sender_account: sender_account.as_deref(),
                     sender_is_bot,
@@ -407,8 +404,7 @@ pub(super) fn deliver_one_message(
         bypass_capture: true,
     };
     if let ResolvedKind::Channel { key, status_prefix } = resolved.kind {
-        let recipients = resolved.recipients;
-        deliver_and_echo(state, conn, &recipients, &delivery);
+        deliver_and_echo(state, conn, &resolved.recipients, &delivery);
         // A STATUSMSG (@#/+#) reached only ops/voiced members. It must not
         // enter the shared history ring or the messages table, or CHATHISTORY
         // would replay it to members who were excluded from the live delivery.
@@ -420,7 +416,7 @@ pub(super) fn deliver_one_message(
         let ResolvedKind::User { peer } = resolved.kind else {
             unreachable!("resolve_message_target returns Channel or User");
         };
-        deliver_and_echo(state, conn, &[peer], &delivery);
+        deliver_and_echo(state, conn, &resolved.recipients, &delivery);
         // The conversation is recorded once, under a key both participants
         // derive identically, so each side's CHATHISTORY sees the whole thread
         // rather than only the half it sent.
@@ -821,7 +817,7 @@ pub(super) fn deliver_multiline(
     let batch_ref = state.next_msgid();
 
     let echo_message = state.sessions[&conn].caps.echo_message;
-    let mut audience: Vec<(ConnId, bool)> = resolved
+    let mut audience: Vec<(Recipient, bool)> = resolved
         .recipients
         .iter()
         .map(|&c| (c, /* bypass_capture */ true))
@@ -829,13 +825,10 @@ pub(super) fn deliver_multiline(
     if echo_message {
         // A self-directed multiline correctly arrives twice with echo-message
         // (recipient copy + captured echo); only the echo carries the label.
-        audience.push((conn, false));
+        audience.push((state.local_recipient(conn), false));
     }
     for (recipient, bypass) in audience {
-        let Some(session) = state.sessions.get(&recipient) else {
-            continue;
-        };
-        let caps = session.caps;
+        let caps = recipient.caps();
         // Tags every form carries, in the order the other delivery path uses.
         let mut common: Vec<String> = Vec::new();
         if caps.server_time {
@@ -1056,15 +1049,15 @@ pub(super) fn tag_prefix(tags: &[String]) -> String {
 /// same way the single-message path does.
 pub(super) fn send_multiline_line(
     state: &mut ServerState,
-    conn: ConnId,
+    recipient: Recipient,
     bypass_capture: bool,
     line: &str,
 ) {
     let bytes = bytes::Bytes::from(format!("{line}\r\n"));
     if bypass_capture {
-        state.send_bytes_uncaptured(conn, bytes);
+        state.send_recipient_uncaptured(recipient, bytes);
     } else {
-        state.send_bytes(conn, bytes);
+        state.send_recipient(recipient, bytes);
     }
 }
 

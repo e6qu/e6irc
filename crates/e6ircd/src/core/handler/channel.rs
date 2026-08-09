@@ -548,7 +548,7 @@ pub(super) struct Delivery<'a> {
 pub(super) fn deliver_and_echo(
     state: &mut ServerState,
     conn: ConnId,
-    recipients: &[ConnId],
+    recipients: &[Recipient],
     delivery: &Delivery,
 ) {
     deliver_message(state, recipients, delivery);
@@ -562,19 +562,17 @@ pub(super) fn deliver_and_echo(
             bypass_capture: false,
             ..*delivery
         };
-        deliver_message(state, &[conn], &echo);
+        let sender = state.local_recipient(conn);
+        deliver_message(state, &[sender], &echo);
     }
 }
 
 /// Deliver a message line to recipients, applying per-recipient
 /// `server-time` and `account-tag` variants.
-pub(super) fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d: &Delivery) {
+pub(super) fn deliver_message(state: &mut ServerState, recipients: &[Recipient], d: &Delivery) {
     let time = e6irc_proto::time::server_time(d.ts);
     for &recipient in recipients {
-        let Some(session) = state.sessions.get(&recipient) else {
-            continue;
-        };
-        let caps = session.caps;
+        let caps = recipient.caps();
         let mut tags: Vec<String> = Vec::new();
         if caps.message_tags {
             tags.push(format!("msgid={}", d.msgid));
@@ -608,9 +606,9 @@ pub(super) fn deliver_message(state: &mut ServerState, recipients: &[ConnId], d:
         };
         let bytes = bytes::Bytes::from(format!("{line}\r\n"));
         if d.bypass_capture {
-            state.send_bytes_uncaptured(recipient, bytes);
+            state.send_recipient_uncaptured(recipient, bytes);
         } else {
-            state.send_bytes(recipient, bytes);
+            state.send_recipient(recipient, bytes);
         }
     }
 }
