@@ -735,6 +735,12 @@ pub enum ChannelJoinFailure {
     Full { name: String },
 }
 
+#[derive(Debug, Clone)]
+pub enum ChannelPartResult {
+    Parted { key: ChanKey, line: String },
+    NotOnChannel { name: String },
+}
+
 struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
@@ -1521,6 +1527,36 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects.push(CoreEffect::ChannelJoinResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_part(
+        &mut self,
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        reason: Option<String>,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelPart {
+            owner,
+            actor,
+            name,
+            reason,
+            label,
+        });
+    }
+
+    pub fn route_part_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelPartResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelPartResult {
             session,
             result,
             label,

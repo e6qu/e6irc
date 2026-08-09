@@ -495,43 +495,88 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let reason = p.get(1).map(|r| r.to_string());
+    let actor = state.channel_actor(conn);
     for target in targets.split(',').filter(|t| !t.is_empty()) {
-        let key = state.chan_key(target);
-        let on_channel = state.channels.get(&key).is_some_and(|c| c.is_member(conn));
-        if !on_channel {
-            state.err_notonchannel(conn, target);
+        let owner = state.channel_owner(target);
+        if !state.owns_channel(&owner) {
+            let label = state.defer_channel_reply(conn);
+            state.route_part(
+                owner,
+                actor.clone(),
+                target.to_string(),
+                reason.clone(),
+                label,
+            );
             continue;
         }
-        let display = state.channels[&key].name.clone();
-        let prefix = state.sessions[&conn].prefix();
-        // A quieted or banned member can't broadcast a PART reason (which would
-        // evade the quiet), unless op/voice — same speak-gate as messages.
-        let exempt = state.channels[&key]
-            .member(conn)
-            .is_some_and(|m| m.op || m.voice);
-        let suppress_reason = !exempt
-            && (state.channels[&key].is_banned(state.casemap, &prefix)
-                || state.channels[&key].is_quieted(state.casemap, &prefix));
-        let line = match &reason {
-            Some(r) if !suppress_reason => {
-                let head = format!(":{prefix} PART {display} :");
-                let r = crate::core::handler::fit_trailing(&head, r);
-                format!("{head}{r}")
-            }
-            _ => format!(":{prefix} PART {display}"),
+        let result = part_on_owner(state, actor.clone(), target, reason.as_deref());
+        emit_part_response(state, conn, result);
+    }
+}
+
+pub(super) fn part_on_owner(
+    state: &mut ServerState,
+    actor: ChannelActor,
+    name: &str,
+    reason: Option<&str>,
+) -> ChannelPartResult {
+    let conn = actor.recipient.conn();
+    let key = state.chan_key(name);
+    let Some(channel) = state.channels.get(&key) else {
+        return ChannelPartResult::NotOnChannel {
+            name: name.to_string(),
         };
-        state.broadcast_channel(&key, &line, None);
-        let chan = state.channels.get_mut(&key).expect("checked");
-        chan.remove_member(conn);
-        if !chan.has_members() {
-            state.remove_channel(&key);
+    };
+    if !channel.is_member(conn) {
+        return ChannelPartResult::NotOnChannel {
+            name: name.to_string(),
+        };
+    }
+    let display = channel.name.clone();
+    let prefix = actor.identity.prefix;
+    // A quieted or banned member can't broadcast a PART reason (which would
+    // evade the quiet), unless op/voice — same speak-gate as messages.
+    let exempt = state.channels[&key]
+        .member(conn)
+        .is_some_and(|m| m.op || m.voice);
+    let suppress_reason = !exempt
+        && (state.channels[&key].is_banned(state.casemap, &prefix)
+            || state.channels[&key].is_quieted(state.casemap, &prefix));
+    let line = match reason {
+        Some(r) if !suppress_reason => {
+            let head = format!(":{prefix} PART {display} :");
+            let r = crate::core::handler::fit_trailing(&head, r);
+            format!("{head}{r}")
         }
-        state
-            .sessions
-            .get_mut(&conn)
-            .expect("checked")
-            .channels
-            .remove(&key);
+        _ => format!(":{prefix} PART {display}"),
+    };
+    state.broadcast_channel(&key, &line, Some(conn));
+    let chan = state.channels.get_mut(&key).expect("checked");
+    chan.remove_member(conn);
+    if !chan.has_members() {
+        state.remove_channel(&key);
+    }
+    ChannelPartResult::Parted { key, line }
+}
+
+pub(super) fn emit_part_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelPartResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| emit_part_response(state, conn, result));
+}
+
+fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPartResult) {
+    match result {
+        ChannelPartResult::NotOnChannel { name } => state.err_notonchannel(conn, &name),
+        ChannelPartResult::Parted { key, line } => {
+            state.send_timed(conn, &line);
+            if let Some(session) = state.sessions.get_mut(&conn) {
+                session.channels.remove(&key);
+            }
+        }
     }
 }
 

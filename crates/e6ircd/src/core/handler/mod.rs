@@ -5,8 +5,8 @@ use e6irc_proto::numerics::*;
 
 use super::ConnId;
 use super::state::{
-    BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, MemberModes, Recipient,
-    ServerBan, ServerState, Topic,
+    BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelPartResult,
+    MemberModes, Recipient, ServerBan, ServerState, Topic,
 };
 
 pub(crate) mod admin;
@@ -79,6 +79,27 @@ pub(crate) fn channel_join_result(
     label: Option<String>,
 ) {
     channel::emit_join_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_part(
+    state: &mut ServerState,
+    actor: ChannelActor,
+    name: &str,
+    reason: Option<&str>,
+    label: Option<String>,
+) {
+    let session = actor.session_owner();
+    let result = channel::part_on_owner(state, actor, name, reason);
+    state.route_part_result(session, result, label);
+}
+
+pub(crate) fn channel_part_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelPartResult,
+    label: Option<String>,
+) {
+    channel::emit_part_result(state, conn, result, label);
 }
 
 pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {

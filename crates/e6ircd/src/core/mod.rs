@@ -26,7 +26,7 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
-use state::{ChannelActor, ChannelJoinResult, ChannelOwner};
+use state::{ChannelActor, ChannelJoinResult, ChannelOwner, ChannelPartResult};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -145,6 +145,8 @@ impl CoreIngress {
             | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
             Input::ChannelJoin { owner, .. } => owner.shard(),
             Input::ChannelJoinResult { session, .. } => session.shard(),
+            Input::ChannelPart { owner, .. } => owner.shard(),
+            Input::ChannelPartResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -360,6 +362,18 @@ pub enum Input {
     ChannelJoinResult {
         session: SessionOwner,
         result: ChannelJoinResult,
+        label: Option<String>,
+    },
+    ChannelPart {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        reason: Option<String>,
+        label: Option<String>,
+    },
+    ChannelPartResult {
+        session: SessionOwner,
+        result: ChannelPartResult,
         label: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
@@ -1406,6 +1420,18 @@ pub(crate) enum CoreEffect {
         result: ChannelJoinResult,
         label: Option<String>,
     },
+    ChannelPart {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        reason: Option<String>,
+        label: Option<String>,
+    },
+    ChannelPartResult {
+        session: SessionOwner,
+        result: ChannelPartResult,
+        label: Option<String>,
+    },
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1456,6 +1482,28 @@ impl CoreWorker {
                         result,
                         label,
                     } => Input::ChannelJoinResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelPart {
+                        owner,
+                        actor,
+                        name,
+                        reason,
+                        label,
+                    } => Input::ChannelPart {
+                        owner,
+                        actor,
+                        name,
+                        reason,
+                        label,
+                    },
+                    CoreEffect::ChannelPartResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelPartResult {
                         session,
                         result,
                         label,
@@ -1612,6 +1660,32 @@ impl Core {
                     "JOIN result reached wrong session shard"
                 );
                 handler::channel_join_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelPart {
+                owner,
+                actor,
+                name,
+                reason,
+                label,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "PART reached wrong channel shard"
+                );
+                handler::channel_part(&mut self.state, actor, &name, reason.as_deref(), label);
+            }
+            Input::ChannelPartResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "PART result reached wrong session shard"
+                );
+                handler::channel_part_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
