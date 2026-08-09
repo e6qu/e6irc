@@ -154,6 +154,11 @@ pub(crate) fn channel_command(
                 channel::mode_list_query_on_owner(state, command),
             )
         }
+        crate::core::state::ChannelCommandOperation::ModeChange(_) => {
+            crate::core::state::ChannelCommandResult::ModeChange(channel::mode_change_on_owner(
+                state, command,
+            ))
+        }
     };
     state.route_channel_command_result(session, result, label);
 }
@@ -178,6 +183,9 @@ pub(crate) fn channel_command_result(
         }
         crate::core::state::ChannelCommandResult::ModeListQuery(result) => {
             channel::emit_mode_list_query_result(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::ModeChange(result) => {
+            channel::emit_mode_change_result(state, conn, result, label)
         }
     }
 }
@@ -300,6 +308,7 @@ pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {
         state.capture = Some(super::state::Capture {
             conn,
             lines: Vec::new(),
+            reply_target: None,
             label: Some(label.to_string()),
             deferred: false,
         });

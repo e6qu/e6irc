@@ -2662,6 +2662,47 @@ mod ingress_tests {
                 .0
                 .ends_with(b" 368 robert #chat :End of Channel Ban List\r\n")
         );
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"MODE #chat +o robert".to_vec(),
+            })
+            .expect("grant operator queued");
+        let _ = next_output(&mut alice_rx).await;
+        let _ = next_output(&mut bob_rx).await;
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"MODE #chat +k".to_vec(),
+            })
+            .expect("remote mode error queued");
+        let mode_error = next_output(&mut bob_rx).await;
+        assert!(
+            mode_error
+                .payload
+                .0
+                .ends_with(b" 461 robert MODE :Not enough parameters\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"MODE #chat +m".to_vec(),
+            })
+            .expect("remote mode change queued");
+        let changed = next_output(&mut bob_rx).await;
+        assert!(
+            changed
+                .payload
+                .0
+                .ends_with(b":robert!bob@host.test MODE #chat +m\r\n")
+        );
+        let observed = next_output(&mut alice_rx).await;
+        assert!(
+            observed
+                .payload
+                .0
+                .ends_with(b":robert!bob@host.test MODE #chat +m\r\n")
+        );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");

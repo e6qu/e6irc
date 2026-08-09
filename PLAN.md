@@ -19,9 +19,9 @@ and integration claims.
   the channel owner. Nick reservations are process-wide and atomically claimed.
   Member identity and recipient capabilities now synchronize to every channel
   owner, so remote NICK and visibility changes cannot leave stale members.
-  MODE reads and list queries route to the owner; MODE mutations, remaining
-  channel queries, services, history, persistence callbacks, and HTTP controls
-  still need the same boundary.
+  All MODE reads and mutations route to the owner; remaining channel queries,
+  services, history, persistence callbacks, and HTTP controls still need the
+  same boundary.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.

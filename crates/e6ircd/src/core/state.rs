@@ -816,6 +816,14 @@ pub enum ChannelCommandOperation {
     Invite(ChannelInvitee),
     ModeQuery,
     ModeListQuery(String),
+    ModeChange(ChannelModeChange),
+}
+
+/// A parsed channel MODE mutation, with its mode token separate from arguments.
+#[derive(Debug, Clone)]
+pub struct ChannelModeChange {
+    pub(crate) modes: String,
+    pub(crate) arguments: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -888,6 +896,13 @@ pub enum ChannelCommandResult {
     Invite(ChannelInviteResult),
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
+    ModeChange(ChannelModeChangeResult),
+}
+
+/// Direct MODE replies produced by the channel owner for the session owner.
+#[derive(Debug)]
+pub struct ChannelModeChangeResult {
+    pub(crate) lines: Vec<Bytes>,
 }
 
 #[derive(Debug)]
@@ -1996,6 +2011,8 @@ const REGISTRATION_REFILL_WINDOW_MS: u64 = 60 * 60 * 1000;
 pub(crate) struct Capture {
     pub conn: ConnId,
     pub lines: Vec<Bytes>,
+    /// The nick used in replies when the connection lives on another shard.
+    pub reply_target: Option<String>,
     /// The escaped `label` value, so a command whose response is produced
     /// asynchronously (CHATHISTORY falling back to PostgreSQL) can carry the
     /// label into that deferred reply instead of losing it.
@@ -3155,6 +3172,7 @@ impl ServerState {
         self.capture = Some(Capture {
             conn,
             lines: Vec::new(),
+            reply_target: None,
             label: Some(label.clone()),
             deferred: false,
         });
@@ -3191,6 +3209,7 @@ impl ServerState {
                 self.capture = Some(Capture {
                     conn,
                     lines: Vec::new(),
+                    reply_target: None,
                     label: Some(label.clone()),
                     deferred: false,
                 });
@@ -3231,12 +3250,21 @@ impl ServerState {
     /// than each numeric separately.
     const NUMERIC_MIDDLE_MAX: usize = 100;
 
+    fn reply_target(&self, conn: ConnId) -> String {
+        self.capture
+            .as_ref()
+            .filter(|capture| capture.conn == conn)
+            .and_then(|capture| capture.reply_target.clone())
+            .or_else(|| {
+                self.sessions
+                    .get(&conn)
+                    .and_then(|session| session.nick().map(String::from))
+            })
+            .unwrap_or_else(|| "*".into())
+    }
+
     pub fn numeric(&mut self, conn: ConnId, code: u16, middle: &[&str], trailing: Option<&str>) {
-        let target = self
-            .sessions
-            .get(&conn)
-            .and_then(|s| s.nick().map(String::from))
-            .unwrap_or_else(|| "*".into());
+        let target = self.reply_target(conn);
         let mut line = format!(
             ":{} {} {}",
             self.config.server_name,
@@ -3352,11 +3380,7 @@ impl ServerState {
         // Measure the fixed part of every line exactly as `numeric` frames it —
         // ":{server} {code} {target}" + each middle + " :" + CRLF — so the
         // budget can never drift from the line actually sent.
-        let target = self
-            .sessions
-            .get(&conn)
-            .and_then(|s| s.nick().map(String::from))
-            .unwrap_or_else(|| "*".into());
+        let target = self.reply_target(conn);
         let mut overhead = 1
             + self.config.server_name.len()
             + 1

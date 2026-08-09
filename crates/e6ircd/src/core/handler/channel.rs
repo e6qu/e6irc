@@ -1222,11 +1222,35 @@ pub(super) fn cmd_mode(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 crate::core::state::ChannelCommandOperation::ModeListQuery(modes),
             );
         } else {
-            channel_mode(state, conn, target, &p[1..]);
+            route_mode_change(state, conn, target, &p[1..]);
         }
     } else {
         user_mode(state, conn, target, &p[1..]);
     }
+}
+
+fn route_mode_change(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
+    let owner = state.channel_owner(target);
+    if state.owns_channel(&owner) {
+        channel_mode(state, conn, target, rest);
+        return;
+    }
+    let label = state.channel_reply_label(conn, &owner);
+    state.route_channel_command(crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        target.to_string(),
+        crate::core::state::ChannelCommandOperation::ModeChange(
+            crate::core::state::ChannelModeChange {
+                modes: rest[0].to_string(),
+                arguments: rest[1..]
+                    .iter()
+                    .map(|argument| (*argument).to_string())
+                    .collect(),
+            },
+        ),
+        label,
+    ));
 }
 
 fn mode_list_query_modes(rest: &[&str]) -> Option<String> {
@@ -1363,6 +1387,54 @@ fn emit_mode_query_result_now(
             state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
         }
     }
+}
+
+pub(super) fn mode_change_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelModeChangeResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::ModeChange(change) = operation else {
+        unreachable!("MODE mutation requires its operation")
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "MODE owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick.clone()),
+        label: None,
+        deferred: false,
+    });
+    let mut arguments = Vec::with_capacity(change.arguments.len() + 1);
+    arguments.push(change.modes);
+    arguments.extend(change.arguments);
+    channel_mode_with_prefix(
+        state,
+        actor.recipient.conn(),
+        &target,
+        &arguments,
+        &actor.identity.prefix,
+    );
+    let lines = state.capture.take().expect("MODE capture installed").lines;
+    crate::core::state::ChannelModeChangeResult { lines }
+}
+
+pub(super) fn emit_mode_change_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeChangeResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        for line in result.lines {
+            state.send_bytes(conn, line);
+        }
+    });
 }
 
 pub(super) fn emit_mode_list_query_result(
@@ -1647,6 +1719,21 @@ fn emit_channel_list_rows(
 }
 
 pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, rest: &[&str]) {
+    let prefix = state.sessions[&conn].prefix();
+    let arguments: Vec<String> = rest
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect();
+    channel_mode_with_prefix(state, conn, target, &arguments, &prefix);
+}
+
+fn channel_mode_with_prefix(
+    state: &mut ServerState,
+    conn: ConnId,
+    target: &str,
+    rest: &[String],
+    prefix: &str,
+) {
     let casemap = state.casemap;
     let Some((key, chan)) = require_channel(state, conn, target) else {
         return;
@@ -1704,7 +1791,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     }
 
     let mut adding = true;
-    let mut args = rest[1..].iter();
+    let mut args = rest[1..].iter().map(String::as_str);
     // Each applied change as (adding, mode char, optional arg). Collected rather
     // than formatted inline so the broadcast can be split across as many MODE
     // lines as the 512-byte wire limit needs — a single line of many bans is
@@ -1763,7 +1850,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             'k' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
                 if adding {
-                    let Some(&k) = args.next() else {
+                    let Some(k) = args.next() else {
                         state.err_needmoreparams(conn, "MODE");
                         // Skip this mode but keep processing the string —
                         // `break`ing would also drop any *param-less* mode after
@@ -1815,7 +1902,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
             'l' => {
                 let chan = state.channels.get_mut(&key).expect("checked");
                 if adding {
-                    let Some(&l) = args.next() else {
+                    let Some(l) = args.next() else {
                         state.err_needmoreparams(conn, "MODE");
                         // Skip, don't `break` — a later param-less mode must
                         // still apply (see the `+k` arm).
@@ -1847,7 +1934,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 }
             }
             'b' | 'q' | 'e' | 'I' => {
-                let Some(&raw_mask) = args.next() else {
+                let Some(raw_mask) = args.next() else {
                     // No mask: a list *query* for this mode (e.g. `MODE #c be`
                     // views bans and exceptions), not a silent no-op. Op context
                     // here (the apply loop is op-gated), so `e`/`I` are viewable.
@@ -1934,7 +2021,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                 }
             }
             'o' | 'v' => {
-                let Some(&who) = args.next() else {
+                let Some(who) = args.next() else {
                     state.err_needmoreparams(conn, "MODE");
                     // Skip, don't `break` — a later param-less mode must still
                     // apply (see the `+k` arm).
@@ -1994,8 +2081,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
     }
 
     if !changes.is_empty() {
-        let prefix = state.sessions[&conn].prefix();
-        broadcast_mode_changes(state, &key, &prefix, &display, &changes);
+        broadcast_mode_changes(state, &key, prefix, &display, &changes);
     }
 }
 
