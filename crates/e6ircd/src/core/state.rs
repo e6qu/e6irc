@@ -956,6 +956,41 @@ pub enum ChannelSessionEvent {
     },
 }
 
+/// A current session snapshot applied by the owner of one of its channels.
+#[derive(Debug, Clone)]
+pub struct ChannelMemberUpdate {
+    owner: ChannelOwner,
+    recipient: Recipient,
+    identity: MemberIdentity,
+    change: ChannelMemberChange,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelMemberChange {
+    Identity,
+    Nick { previous_prefix: String },
+}
+
+impl ChannelMemberUpdate {
+    fn new(
+        owner: ChannelOwner,
+        recipient: Recipient,
+        identity: MemberIdentity,
+        change: ChannelMemberChange,
+    ) -> Self {
+        Self {
+            owner,
+            recipient,
+            identity,
+            change,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+}
+
 /// A TOPIC request has exactly one operation.
 #[derive(Debug, Clone)]
 pub enum ChannelTopicOperation {
@@ -1639,14 +1674,19 @@ impl Channel {
         removed
     }
 
-    pub fn update_recipient(&mut self, recipient: Recipient) {
+    pub fn update_member(&mut self, recipient: Recipient, identity: MemberIdentity) -> bool {
         let Some(member) = self.members.get_mut(&recipient.conn()) else {
-            return;
+            return false;
         };
+        if member.recipient.owner() != recipient.owner() {
+            return false;
+        }
         if member.recipient != recipient {
             member.recipient = recipient;
             self.recipients.get_mut().take();
         }
+        member.identity = identity;
+        true
     }
 
     pub fn member_identities(
@@ -2230,11 +2270,54 @@ impl ServerState {
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {
+        self.sync_channel_member(conn, ChannelMemberChange::Identity);
+    }
+
+    pub fn sync_channel_member(&mut self, conn: ConnId, change: ChannelMemberChange) {
+        if !self.sessions[&conn].is_registered() {
+            return;
+        }
         let recipient = self.local_recipient(conn);
+        let identity = self.local_member_identity(conn);
         let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
         for key in channels {
-            if let Some(channel) = self.channels.get_mut(&key) {
-                channel.update_recipient(recipient);
+            let update = ChannelMemberUpdate::new(
+                self.channels.owner(&key),
+                recipient,
+                identity.clone(),
+                change.clone(),
+            );
+            if self.owns_channel(update.owner()) {
+                self.apply_channel_member_update(update);
+            } else {
+                self.effects
+                    .push(CoreEffect::Input(crate::core::Input::ChannelMemberUpdate {
+                        update,
+                    }));
+            }
+        }
+    }
+
+    pub fn apply_channel_member_update(&mut self, update: ChannelMemberUpdate) {
+        assert_eq!(
+            update.owner.shard(),
+            self.shard,
+            "member update reached wrong shard"
+        );
+        let key = update.owner.key().clone();
+        let updated = self.channels.get_mut(&key).is_some_and(|channel| {
+            channel.update_member(update.recipient, update.identity.clone())
+        });
+        if !updated {
+            return;
+        }
+        let ChannelMemberChange::Nick { previous_prefix } = update.change else {
+            return;
+        };
+        let line = format!(":{previous_prefix} NICK {}", update.identity.nick);
+        for recipient in self.channels[&key].recipients().iter().copied() {
+            if recipient.conn() != update.recipient.conn() {
+                self.send_timed_recipient(recipient, &line);
             }
         }
     }

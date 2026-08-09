@@ -1506,6 +1506,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
     let mut applied = String::new();
     let mut last_sign = ' ';
     let mut unknown = false;
+    let mut member_identity_changed = false;
     for c in rest.join("").chars() {
         match c {
             '+' => adding = true,
@@ -1513,6 +1514,7 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
             'i' => {
                 state.sessions.get_mut(&conn).expect("registered").invisible = adding;
                 push_mode(&mut applied, &mut last_sign, adding, 'i');
+                member_identity_changed = true;
             }
             'w' => {
                 state.sessions.get_mut(&conn).expect("registered").wallops = adding;
@@ -1540,6 +1542,9 @@ pub(super) fn user_mode(state: &mut ServerState, conn: ConnId, target: &str, res
             .expect("registered");
         let server = state.config.server_name.clone();
         state.send(conn, &format!(":{server} MODE {nick} :{applied}"));
+    }
+    if member_identity_changed {
+        state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 }
 

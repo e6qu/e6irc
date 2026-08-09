@@ -75,15 +75,16 @@ pub(super) fn cmd_nick(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
 
     if registered {
-        let line = format!(":{} NICK {nick}", prefix.expect("registered"));
+        let previous_prefix = prefix.expect("registered");
+        let line = format!(":{previous_prefix} NICK {nick}");
         // Route through send_timed (self and each peer) so server-time clients
         // get an @time= tag, like every other membership event — a raw
         // send_bytes loop would silently omit it for NICK alone.
         state.send_timed(conn, &line);
-        let peers = state.channel_peers(conn);
-        for peer in peers {
-            state.send_timed(peer, &line);
-        }
+        state.sync_channel_member(
+            conn,
+            crate::core::state::ChannelMemberChange::Nick { previous_prefix },
+        );
         if !case_change_only {
             if let Some(old_nick) = old_nick_display {
                 monitor_notify(state, &old_nick, false);

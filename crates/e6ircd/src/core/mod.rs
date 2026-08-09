@@ -27,7 +27,7 @@ use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::{
     ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
-    ChannelKickResult, ChannelMessage, ChannelMessageResult, ChannelMultiline,
+    ChannelKickResult, ChannelMemberUpdate, ChannelMessage, ChannelMessageResult, ChannelMultiline,
     ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
     ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
 };
@@ -162,6 +162,7 @@ impl CoreIngress {
             Input::ChannelCommand { command } => command.owner().shard(),
             Input::ChannelCommandResult { session, .. } => session.shard(),
             Input::ChannelSessionEvent { session, .. } => session.shard(),
+            Input::ChannelMemberUpdate { update } => update.owner().shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
             Input::ChannelKickResult { session, .. } => session.shard(),
             Input::SessionChannelRemoved { session, .. } => session.shard(),
@@ -434,6 +435,9 @@ pub enum Input {
     ChannelSessionEvent {
         session: SessionOwner,
         event: state::ChannelSessionEvent,
+    },
+    ChannelMemberUpdate {
+        update: ChannelMemberUpdate,
     },
     ChannelKick {
         kick: ChannelKick,
@@ -1990,6 +1994,14 @@ impl Core {
                 );
                 handler::channel_session_event(&mut self.state, session.conn(), event);
             }
+            Input::ChannelMemberUpdate { update } => {
+                assert_eq!(
+                    update.owner().shard(),
+                    self.shard,
+                    "member update reached wrong channel shard"
+                );
+                self.state.apply_channel_member_update(update);
+            }
             Input::SessionChannelRemoved { session, key } => {
                 assert_eq!(
                     session.shard(),
@@ -2585,6 +2597,49 @@ mod ingress_tests {
                 .0
                 .ends_with(b":alice!alice@host.test INVITE bob :#chat\r\n")
         );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"JOIN #chat".to_vec(),
+            })
+            .expect("join queued");
+        loop {
+            let output = next_output(&mut bob_rx).await;
+            if output
+                .payload
+                .0
+                .ends_with(b" 366 bob #chat :End of /NAMES list\r\n")
+            {
+                break;
+            }
+        }
+        let joined = next_output(&mut alice_rx).await;
+        assert!(
+            joined
+                .payload
+                .0
+                .ends_with(b":bob!bob@host.test JOIN #chat\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"NICK robert".to_vec(),
+            })
+            .expect("nick queued");
+        let renamed_self = next_output(&mut bob_rx).await;
+        assert!(
+            renamed_self
+                .payload
+                .0
+                .ends_with(b":bob!bob@host.test NICK robert\r\n")
+        );
+        let renamed = next_output(&mut alice_rx).await;
+        assert!(
+            renamed
+                .payload
+                .0
+                .ends_with(b":bob!bob@host.test NICK robert\r\n")
+        );
         first_tx
             .try_push(Input::Line {
                 conn: ConnId(2),
@@ -2592,6 +2647,7 @@ mod ingress_tests {
             })
             .expect("mode change queued");
         let _ = next_output(&mut alice_rx).await;
+        let _ = next_output(&mut bob_rx).await;
         second_tx
             .try_push(Input::Line {
                 conn: ConnId(1),
@@ -2599,12 +2655,12 @@ mod ingress_tests {
             })
             .expect("mode list queued");
         let ban = next_output(&mut bob_rx).await;
-        assert!(ban.payload.0.ends_with(b" 367 bob #chat bad!*@*\r\n"));
+        assert!(ban.payload.0.ends_with(b" 367 robert #chat bad!*@*\r\n"));
         let end = next_output(&mut bob_rx).await;
         assert!(
             end.payload
                 .0
-                .ends_with(b" 368 bob #chat :End of Channel Ban List\r\n")
+                .ends_with(b" 368 robert #chat :End of Channel Ban List\r\n")
         );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");

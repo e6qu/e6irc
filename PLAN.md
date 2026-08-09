@@ -17,6 +17,8 @@ and integration claims.
 - Complete typed cross-shard channel ownership. JOIN, PART, QUIT, KICK, TOPIC,
   single-line messages, TAGMSG, batches/multiline, KNOCK, and INVITE route to
   the channel owner. Nick reservations are process-wide and atomically claimed.
+  Member identity and recipient capabilities now synchronize to every channel
+  owner, so remote NICK and visibility changes cannot leave stale members.
   MODE reads and list queries route to the owner; MODE mutations, remaining
   channel queries, services, history, persistence callbacks, and HTTP controls
   still need the same boundary.
