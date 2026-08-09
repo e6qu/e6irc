@@ -222,6 +222,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         .as_deref()
         .map(|a| state.access_modes(&key, a))
         .unwrap_or((false, false));
+    let recipient = state.local_recipient(conn);
     let chan = state.channels.get_mut(&key).expect("just inserted");
     if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
         state.numeric(
@@ -266,7 +267,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     }
     let first = !chan.has_members();
     chan.add_member(
-        conn,
+        recipient,
         MemberModes {
             op: first || is_founder || access_op,
             voice: access_voice,
@@ -293,7 +294,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
     let joiner_away = state.sessions[&conn].away.clone();
     let members = state.channels[&key].recipients();
-    for member in members.iter().copied() {
+    for member in members.iter().map(|recipient| recipient.conn()) {
         let Some(session) = state.sessions.get(&member) else {
             continue;
         };

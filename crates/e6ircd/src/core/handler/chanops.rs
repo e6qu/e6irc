@@ -267,7 +267,7 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let watchers: Vec<ConnId> = state.channels[&key]
         .recipients()
         .iter()
-        .copied()
+        .map(|recipient| recipient.conn())
         .filter(|c| *c != conn && *c != invitee)
         .filter(|c| state.sessions.get(c).is_some_and(|s| s.caps.invite_notify))
         .collect();

@@ -664,6 +664,28 @@ pub(crate) struct MemberModes {
     pub voice: bool,
 }
 
+/// A channel recipient and the worker that owns its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Recipient {
+    conn: ConnId,
+    shard: CoreShardId,
+}
+
+impl Recipient {
+    pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn shard(self) -> CoreShardId {
+        self.shard
+    }
+}
+
+struct ChannelMember {
+    modes: MemberModes,
+    recipient: Recipient,
+}
+
 #[derive(Default)]
 pub(crate) struct ChanModes {
     pub invite_only: bool,
@@ -959,8 +981,8 @@ pub(crate) struct Channel {
     /// Display name (creator's casing).
     pub name: String,
     pub topic: Option<Topic>,
-    members: HashMap<ConnId, MemberModes>,
-    recipients: RefCell<Option<Arc<[ConnId]>>>,
+    members: HashMap<ConnId, ChannelMember>,
+    recipients: RefCell<Option<Arc<[Recipient]>>>,
     pub modes: ChanModes,
     pub bans: Vec<MaskKey>,
     pub quiets: Vec<MaskKey>,
@@ -1009,11 +1031,11 @@ impl Channel {
     }
 
     pub fn member(&self, conn: ConnId) -> Option<&MemberModes> {
-        self.members.get(&conn)
+        self.members.get(&conn).map(|member| &member.modes)
     }
 
     pub fn member_mut(&mut self, conn: ConnId) -> Option<&mut MemberModes> {
-        self.members.get_mut(&conn)
+        self.members.get_mut(&conn).map(|member| &mut member.modes)
     }
 
     pub fn member_count(&self) -> usize {
@@ -1025,27 +1047,34 @@ impl Channel {
     }
 
     pub fn members(&self) -> impl Iterator<Item = (ConnId, &MemberModes)> {
-        self.members.iter().map(|(conn, modes)| (*conn, modes))
+        self.members
+            .iter()
+            .map(|(conn, member)| (*conn, &member.modes))
     }
 
     /// Immutable recipients, rebuilt only after a join or part.
-    pub fn recipients(&self) -> Arc<[ConnId]> {
+    pub fn recipients(&self) -> Arc<[Recipient]> {
         let mut cached = self.recipients.borrow_mut();
         if let Some(recipients) = cached.as_ref() {
             return Arc::clone(recipients);
         }
-        let recipients = self.members.keys().copied().collect();
+        let recipients = self
+            .members
+            .values()
+            .map(|member| member.recipient)
+            .collect();
         *cached = Some(Arc::clone(&recipients));
         recipients
     }
 
-    pub fn add_member(&mut self, conn: ConnId, modes: MemberModes) {
-        self.members.insert(conn, modes);
+    pub fn add_member(&mut self, recipient: Recipient, modes: MemberModes) {
+        self.members
+            .insert(recipient.conn(), ChannelMember { modes, recipient });
         self.recipients.get_mut().take();
     }
 
     pub fn remove_member(&mut self, conn: ConnId) -> Option<MemberModes> {
-        let removed = self.members.remove(&conn);
+        let removed = self.members.remove(&conn).map(|member| member.modes);
         if removed.is_some() {
             self.recipients.get_mut().take();
         }
@@ -1263,6 +1292,13 @@ pub(crate) struct WhowasEntry {
 pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
+    pub fn local_recipient(&self, conn: ConnId) -> Recipient {
+        Recipient {
+            conn,
+            shard: self.shard,
+        }
+    }
+
     pub fn new(
         shard: CoreShardId,
         config: CoreConfig,
@@ -2300,7 +2336,13 @@ impl ServerState {
         let plain = Bytes::from(format!("{line}\r\n"));
         // Built lazily: channels with no server-time member pay nothing.
         let mut timed: Option<Bytes> = None;
-        for m in members.iter().copied().filter(|conn| Some(*conn) != except) {
+        for recipient in members
+            .iter()
+            .copied()
+            .filter(|recipient| Some(recipient.conn()) != except)
+        {
+            debug_assert_eq!(recipient.shard(), self.shard);
+            let m = recipient.conn();
             let wants_time = self.sessions.get(&m).is_some_and(|s| s.caps.server_time);
             let bytes = if wants_time {
                 timed
@@ -2349,7 +2391,7 @@ impl ServerState {
         let mut seen = HashSet::new();
         for key in &session.channels {
             if let Some(chan) = self.channels.get(key) {
-                seen.extend(chan.recipients().iter().copied());
+                seen.extend(chan.recipients().iter().map(|recipient| recipient.conn()));
             }
         }
         seen.remove(&conn);
@@ -2708,7 +2750,10 @@ mod session_store_tests {
     fn recipient_snapshot_is_shared_until_membership_changes() {
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
         channel.add_member(
-            ConnId(1),
+            Recipient {
+                conn: ConnId(1),
+                shard: CoreShardId(0),
+            },
             MemberModes {
                 op: true,
                 voice: false,
@@ -2720,7 +2765,10 @@ mod session_store_tests {
         assert!(Arc::ptr_eq(&first, &again));
 
         channel.add_member(
-            ConnId(2),
+            Recipient {
+                conn: ConnId(2),
+                shard: CoreShardId(0),
+            },
             MemberModes {
                 op: false,
                 voice: false,
@@ -2729,8 +2777,18 @@ mod session_store_tests {
         let changed = channel.recipients();
         assert!(!Arc::ptr_eq(&first, &changed));
         assert_eq!(changed.len(), 2);
-        assert!(changed.contains(&ConnId(1)));
-        assert!(changed.contains(&ConnId(2)));
+        assert!(
+            changed
+                .iter()
+                .any(|recipient| recipient.conn() == ConnId(1)
+                    && recipient.shard() == CoreShardId(0))
+        );
+        assert!(
+            changed
+                .iter()
+                .any(|recipient| recipient.conn() == ConnId(2)
+                    && recipient.shard() == CoreShardId(0))
+        );
     }
 
     #[test]
