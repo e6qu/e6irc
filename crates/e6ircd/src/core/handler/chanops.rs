@@ -238,7 +238,7 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         let stale: Vec<ConnId> = state.channels[&key]
             .invited
             .iter()
-            .filter(|c| !state.sessions.contains_key(*c))
+            .filter(|c| !state.sessions.contains_key(c))
             .copied()
             .collect();
         let invited = &mut state.channels.get_mut(&key).expect("checked").invited;

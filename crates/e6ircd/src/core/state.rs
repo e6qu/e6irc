@@ -1,6 +1,7 @@
 //! All chat state, owned exclusively by the core worker.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Index;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -379,6 +380,146 @@ pub(crate) struct Session {
     /// ambiguous-overtake case above is a real hazard, and that one is closed.
     pub deferred_replies: usize,
     pub held: Vec<Bytes>,
+}
+
+#[derive(Clone, Copy)]
+struct SessionHandle {
+    slot: usize,
+    generation: u32,
+}
+
+struct SessionSlot {
+    generation: u32,
+    session: Option<Session>,
+}
+
+/// Dense sessions with generation-checked connection lookup.
+pub(crate) struct SessionStore {
+    by_conn: HashMap<ConnId, SessionHandle>,
+    slots: Vec<SessionSlot>,
+    free: Vec<usize>,
+    len: usize,
+}
+
+pub(crate) struct SessionIter<'a> {
+    by_conn: std::collections::hash_map::Iter<'a, ConnId, SessionHandle>,
+    slots: &'a [SessionSlot],
+}
+
+impl<'a> Iterator for SessionIter<'a> {
+    type Item = (&'a ConnId, &'a Session);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.by_conn.find_map(|(conn, handle)| {
+            let slot = self.slots.get(handle.slot)?;
+            (slot.generation == handle.generation)
+                .then_some(slot.session.as_ref())
+                .flatten()
+                .map(|session| (conn, session))
+        })
+    }
+}
+
+impl SessionStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_conn: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn get(&self, conn: &ConnId) -> Option<&Session> {
+        let handle = self.by_conn.get(conn)?;
+        let slot = self.slots.get(handle.slot)?;
+        (slot.generation == handle.generation)
+            .then_some(slot.session.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn get_mut(&mut self, conn: &ConnId) -> Option<&mut Session> {
+        let handle = *self.by_conn.get(conn)?;
+        let slot = self.slots.get_mut(handle.slot)?;
+        (slot.generation == handle.generation)
+            .then_some(slot.session.as_mut())
+            .flatten()
+    }
+
+    pub(crate) fn contains_key(&self, conn: &ConnId) -> bool {
+        self.get(conn).is_some()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Session> {
+        self.slots.iter().filter_map(|slot| slot.session.as_ref())
+    }
+
+    pub(crate) fn iter(&self) -> SessionIter<'_> {
+        SessionIter {
+            by_conn: self.by_conn.iter(),
+            slots: &self.slots,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, conn: ConnId, session: Session) -> Option<Session> {
+        let previous = self.remove(&conn);
+        let (slot_index, generation) = match self.free.pop() {
+            Some(index) => (index, self.slots[index].generation),
+            None => {
+                self.slots.push(SessionSlot {
+                    generation: 0,
+                    session: None,
+                });
+                (self.slots.len() - 1, 0)
+            }
+        };
+        self.slots[slot_index].session = Some(session);
+        self.by_conn.insert(
+            conn,
+            SessionHandle {
+                slot: slot_index,
+                generation,
+            },
+        );
+        self.len += 1;
+        previous
+    }
+
+    pub(crate) fn remove(&mut self, conn: &ConnId) -> Option<Session> {
+        let handle = self.by_conn.remove(conn)?;
+        let slot = self.slots.get_mut(handle.slot)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let session = slot.session.take()?;
+        self.len -= 1;
+        if let Some(next) = slot.generation.checked_add(1) {
+            slot.generation = next;
+            self.free.push(handle.slot);
+        }
+        Some(session)
+    }
+}
+
+impl<'a> IntoIterator for &'a SessionStore {
+    type Item = (&'a ConnId, &'a Session);
+    type IntoIter = SessionIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl Index<&ConnId> for SessionStore {
+    type Output = Session;
+
+    fn index(&self, conn: &ConnId) -> &Self::Output {
+        self.get(conn).expect("indexed session is present")
+    }
 }
 
 impl Session {
@@ -871,7 +1012,7 @@ pub(crate) struct ServerState {
     pub telemetry: Arc<Telemetry>,
     pub config: CoreConfig,
     pub casemap: CaseMapping,
-    pub sessions: HashMap<ConnId, Session>,
+    pub sessions: SessionStore,
     pub nicks: HashMap<NickKey, ConnId>,
     pub channels: HashMap<ChanKey, Channel>,
     /// Connections whose SendQ overflowed during this event; swept (and
@@ -1023,7 +1164,7 @@ impl ServerState {
             telemetry,
             config,
             casemap: CaseMapping::Rfc1459,
-            sessions: HashMap::new(),
+            sessions: SessionStore::new(),
             nicks: HashMap::new(),
             channels: HashMap::new(),
             doomed: Vec::new(),
