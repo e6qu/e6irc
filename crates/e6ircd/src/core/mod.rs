@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use e6irc_queue::{Envelope, PushError, QueueMonitor, Receiver, Sender};
+#[cfg(test)]
+use e6irc_queue::Envelope;
+use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -130,7 +132,7 @@ impl CoreIngress {
     }
 }
 
-/// One event selected from a shard queue by the deterministic scheduler.
+/// One event delivered from a shard queue to its owning worker.
 pub(crate) struct ScheduledInput {
     pub shard: CoreShardId,
     pub sequence: u64,
@@ -179,10 +181,11 @@ pub(crate) enum ReplayError {
     SequenceMismatch { expected: u64, actual: u64 },
 }
 
-/// Round-robin core queue selection.
+/// Round-robin core queue selection for deterministic tests.
 ///
 /// A step records both the selected shard and that queue's sequence number,
 /// which is sufficient to replay a fixed set of queued inputs.
+#[cfg(test)]
 pub(crate) struct CoreScheduler {
     receivers: Vec<Receiver<Input>>,
     count: CoreShardCount,
@@ -191,18 +194,8 @@ pub(crate) struct CoreScheduler {
     trace: CoreTrace,
 }
 
+#[cfg(test)]
 impl CoreScheduler {
-    pub(crate) fn single(receiver: Receiver<Input>) -> Self {
-        Self {
-            receivers: vec![receiver],
-            count: CoreShardCount::single(),
-            next: CoreShardId(0),
-            #[cfg(test)]
-            trace: CoreTrace::default(),
-        }
-    }
-
-    #[cfg(test)]
     fn with_shards(first: Receiver<Input>, mut rest: Vec<Receiver<Input>>) -> Self {
         let capacity = rest
             .len()
@@ -272,22 +265,6 @@ impl CoreScheduler {
             sequence: seq,
             input,
         })
-    }
-
-    /// Await one event from the one-worker production configuration.
-    pub(crate) async fn pop_single(&mut self) -> Option<ScheduledInput> {
-        debug_assert_eq!(self.count.0.get(), 1);
-        if let Some(input) = self.try_step() {
-            return Some(input);
-        }
-        self.receivers[0]
-            .pop()
-            .await
-            .map(|envelope| ScheduledInput {
-                shard: CoreShardId(0),
-                sequence: envelope.seq,
-                input: envelope.payload,
-            })
     }
 }
 
@@ -1352,6 +1329,32 @@ pub struct Core {
     next_sequence: u64,
 }
 
+/// One core and the only queue allowed to drive its state transitions.
+pub(crate) struct CoreWorker {
+    core: Core,
+    receiver: Receiver<Input>,
+}
+
+impl CoreWorker {
+    pub(crate) fn new(core: Core, receiver: Receiver<Input>) -> Self {
+        Self { core, receiver }
+    }
+
+    pub(crate) async fn run(mut self) {
+        while let Some(envelope) = self.receiver.pop().await {
+            let stop = matches!(&envelope.payload, Input::Shutdown);
+            self.core.handle_scheduled(ScheduledInput {
+                shard: self.core.shard,
+                sequence: envelope.seq,
+                input: envelope.payload,
+            });
+            if stop {
+                return;
+            }
+        }
+    }
+}
+
 impl Core {
     pub fn new(config: CoreConfig, db_tx: Sender<DbRequest>) -> Self {
         Self::with_telemetry(config, db_tx, Arc::new(Telemetry::new()))
@@ -1385,7 +1388,7 @@ impl Core {
         }
     }
 
-    /// Process the next event selected by this worker's scheduler.
+    /// Process the next event delivered to this worker.
     pub(crate) fn handle_scheduled(&mut self, event: ScheduledInput) {
         debug_assert_eq!(event.shard, self.shard);
         debug_assert_eq!(event.sequence, self.next_sequence);
@@ -1650,7 +1653,7 @@ mod connection_id_allocator_tests {
 mod ingress_tests {
     use super::{
         ConnId, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId,
-        CoreTraceStep, Input, ReplayError, ScheduledInput,
+        CoreTraceStep, CoreWorker, Input, ReplayError,
     };
     use e6irc_queue::{Config, Policy, queue};
     use std::num::NonZeroUsize;
@@ -1749,26 +1752,28 @@ mod ingress_tests {
         assert_eq!(second.sequence, 0);
     }
 
-    #[test]
-    fn core_accepts_the_event_for_its_own_shard() {
+    #[tokio::test]
+    async fn worker_delivers_events_to_its_own_shard() {
         let (db_tx, _db_rx) = queue(Config {
             name: "nonzero-core-shard-db",
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let mut core = Core::with_telemetry_on_shard(
+        let core = Core::with_telemetry_on_shard(
             core_config(),
             db_tx,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
         );
-
-        core.handle_scheduled(ScheduledInput {
-            shard: CoreShardId(1),
-            sequence: 0,
-            input: Input::Shutdown,
+        let (tx, rx) = queue(Config {
+            name: "nonzero-core-shard-input",
+            capacity: 1,
+            policy: Policy::Fifo,
         });
+        tx.try_push(Input::Shutdown).expect("shutdown event queued");
+
+        CoreWorker::new(core, rx).run().await;
     }
 
     #[test]
