@@ -138,6 +138,7 @@ impl CoreIngress {
             | Input::Line { conn, .. }
             | Input::OverlongLine { conn }
             | Input::Closed { conn, .. }
+            | Input::Delivery { conn, .. }
             | Input::DbReply { conn, .. }
             | Input::HistoryPage { conn, .. }
             | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
@@ -332,19 +333,36 @@ pub enum Input {
         transport: ConnectionTransport,
     },
     /// One complete line from the connection (terminator stripped).
-    Line { conn: ConnId, line: Vec<u8> },
+    Line {
+        conn: ConnId,
+        line: Vec<u8>,
+    },
     /// The connection sent an over-long line (framing already dropped it).
-    OverlongLine { conn: ConnId },
+    OverlongLine {
+        conn: ConnId,
+    },
+    Delivery {
+        conn: ConnId,
+        line: Bytes,
+    },
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
-    Closed { conn: ConnId, reason: String },
+    Closed {
+        conn: ConnId,
+        reason: String,
+    },
     /// A periodic timer tick carrying the current **monotonic** millisecond,
     /// driving the liveness reaper (registration deadline + idle PING/PONG
     /// timeout). Monotonic, not wall-clock, so an NTP step can't make the reaper
     /// mass-close live connections or freeze.
-    Tick { now: e6irc_proto::time::MonoMillis },
+    Tick {
+        now: e6irc_proto::time::MonoMillis,
+    },
     /// An answer from the DB worker to an earlier [`DbRequest`].
-    DbReply { conn: ConnId, reply: DbReply },
+    DbReply {
+        conn: ConnId,
+        reply: DbReply,
+    },
     /// A resolved CHATHISTORY page from PostgreSQL. `Err` means the store
     /// failed — the handler answers a CHATHISTORY FAIL rather than an empty
     /// batch, so a transient DB fault is never indistinguishable from a buffer
@@ -1354,15 +1372,24 @@ pub struct Core {
     next_sequence: u64,
 }
 
+pub(crate) enum CoreEffect {
+    Delivery { owner: SessionOwner, line: Bytes },
+}
+
 /// One core and the only queue allowed to drive its state transitions.
 pub(crate) struct CoreWorker {
     core: Core,
     receiver: Receiver<Input>,
+    ingress: CoreIngress,
 }
 
 impl CoreWorker {
-    pub(crate) fn new(core: Core, receiver: Receiver<Input>) -> Self {
-        Self { core, receiver }
+    pub(crate) fn new(core: Core, receiver: Receiver<Input>, ingress: CoreIngress) -> Self {
+        Self {
+            core,
+            receiver,
+            ingress,
+        }
     }
 
     pub(crate) async fn run(mut self) {
@@ -1373,6 +1400,20 @@ impl CoreWorker {
                 sequence: envelope.seq,
                 input: envelope.payload,
             });
+            for effect in self.core.take_effects() {
+                let CoreEffect::Delivery { owner, line } = effect;
+                if self
+                    .ingress
+                    .push(Input::Delivery {
+                        conn: owner.conn(),
+                        line,
+                    })
+                    .await
+                    .is_err()
+                {
+                    panic!("cross-shard delivery target closed");
+                }
+            }
             if stop {
                 return;
             }
@@ -1422,6 +1463,10 @@ impl Core {
             .checked_add(1)
             .expect("core queue sequence exhausted");
         self.handle(event.input);
+    }
+
+    fn take_effects(&mut self) -> Vec<CoreEffect> {
+        self.state.take_effects()
     }
 
     /// Seed the hot channel-ownership map from persisted rows before the
@@ -1490,6 +1535,7 @@ impl Core {
             } => self.state.open(conn, tx, host, transport),
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
+            Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
@@ -1798,7 +1844,9 @@ mod ingress_tests {
         });
         tx.try_push(Input::Shutdown).expect("shutdown event queued");
 
-        CoreWorker::new(core, rx).run().await;
+        CoreWorker::new(core, rx, CoreIngress::single(tx))
+            .run()
+            .await;
     }
 
     #[test]

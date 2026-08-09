@@ -12,7 +12,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{CoreShardCount, CoreShardId, Output, SessionOwner, WireLine, deliver};
+use super::{CoreEffect, CoreShardCount, CoreShardId, Output, SessionOwner, WireLine, deliver};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -651,6 +651,7 @@ pub(crate) struct MemberModes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Recipient {
     owner: SessionOwner,
+    caps: Caps,
 }
 
 impl Recipient {
@@ -660,6 +661,10 @@ impl Recipient {
 
     pub(crate) fn shard(self) -> CoreShardId {
         self.owner.shard()
+    }
+
+    pub(crate) fn caps(self) -> Caps {
+        self.caps
     }
 }
 
@@ -1063,6 +1068,16 @@ impl Channel {
         removed
     }
 
+    pub fn update_recipient(&mut self, recipient: Recipient) {
+        let Some(member) = self.members.get_mut(&recipient.conn()) else {
+            return;
+        };
+        if member.recipient != recipient {
+            member.recipient = recipient;
+            self.recipients.get_mut().take();
+        }
+    }
+
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
     /// non-members on every query surface — its existence, modes, topic, and
     /// member lists all. The single source of that predicate: deny surfaces
@@ -1196,6 +1211,7 @@ pub(crate) struct ServerState {
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
+    effects: Vec<CoreEffect>,
     /// Durably suspended accounts. This gate lives on the same ordered core
     /// thread as credential verdicts and administrative disconnects, so a
     /// verification already in flight cannot re-authenticate after the
@@ -1335,7 +1351,22 @@ impl ServerState {
     pub fn local_recipient(&self, conn: ConnId) -> Recipient {
         Recipient {
             owner: SessionOwner::new(conn, self.shard),
+            caps: self.sessions[&conn].caps,
         }
+    }
+
+    pub fn refresh_recipient(&mut self, conn: ConnId) {
+        let recipient = self.local_recipient(conn);
+        let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
+        for key in channels {
+            if let Some(channel) = self.channels.get_mut(&key) {
+                channel.update_recipient(recipient);
+            }
+        }
+    }
+
+    pub(crate) fn take_effects(&mut self) -> Vec<CoreEffect> {
+        std::mem::take(&mut self.effects)
     }
 
     pub fn new(
@@ -1355,6 +1386,7 @@ impl ServerState {
             nicks: NickDirectory::default(),
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
+            effects: Vec::new(),
             suspended_accounts: HashSet::new(),
             db_tx,
             max_users: 0,
@@ -2376,10 +2408,7 @@ impl ServerState {
             .copied()
             .filter(|recipient| Some(recipient.conn()) != except)
         {
-            debug_assert_eq!(recipient.shard(), self.shard);
-            let m = recipient.conn();
-            let wants_time = self.sessions.get(&m).is_some_and(|s| s.caps.server_time);
-            let bytes = if wants_time {
+            let bytes = if recipient.caps().server_time {
                 timed
                     .get_or_insert_with(|| {
                         Bytes::from(format!("@time={} {line}\r\n", self.time_tag()))
@@ -2388,6 +2417,14 @@ impl ServerState {
             } else {
                 plain.clone()
             };
+            if recipient.shard() != self.shard {
+                self.effects.push(CoreEffect::Delivery {
+                    owner: recipient.owner,
+                    line: bytes,
+                });
+                continue;
+            }
+            let m = recipient.conn();
             self.send_bytes(m, bytes);
         }
     }
@@ -2797,6 +2834,7 @@ mod session_store_tests {
         channel.add_member(
             Recipient {
                 owner: SessionOwner::new(ConnId(1), CoreShardId(0)),
+                caps: Caps::default(),
             },
             MemberModes {
                 op: true,
@@ -2811,6 +2849,7 @@ mod session_store_tests {
         channel.add_member(
             Recipient {
                 owner: SessionOwner::new(ConnId(2), CoreShardId(0)),
+                caps: Caps::default(),
             },
             MemberModes {
                 op: false,
@@ -2832,6 +2871,64 @@ mod session_store_tests {
                 .any(|recipient| recipient.conn() == ConnId(2)
                     && recipient.shard() == CoreShardId(0))
         );
+    }
+
+    #[test]
+    fn refreshing_a_member_updates_its_delivery_capabilities() {
+        let mut state = state();
+        open(&mut state, ConnId(1));
+        let key = state.chan_key("#chat");
+        let recipient = state.local_recipient(ConnId(1));
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(recipient, MemberModes::default());
+        state.channels.entry(key.clone()).or_insert(channel);
+        state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("open session")
+            .channels
+            .insert(key);
+
+        state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("open session")
+            .caps
+            .server_time = true;
+        state.refresh_recipient(ConnId(1));
+
+        assert!(
+            state.channels[&state.chan_key("#chat")].recipients()[0]
+                .caps()
+                .server_time
+        );
+    }
+
+    #[test]
+    fn remote_recipient_becomes_a_typed_delivery_effect() {
+        let mut state = state();
+        let key = state.chan_key("#chat");
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient {
+                owner: SessionOwner::new(ConnId(9), CoreShardId(1)),
+                caps: Caps {
+                    server_time: true,
+                    ..Caps::default()
+                },
+            },
+            MemberModes::default(),
+        );
+        state.channels.entry(key.clone()).or_insert(channel);
+
+        state.broadcast_channel(&key, ":nick PRIVMSG #chat :hello", None);
+
+        let effects = state.take_effects();
+        assert_eq!(effects.len(), 1);
+        let crate::core::CoreEffect::Delivery { owner, line } = &effects[0];
+        assert_eq!(*owner, SessionOwner::new(ConnId(9), CoreShardId(1)));
+        assert!(line.starts_with(b"@time="));
+        assert!(line.ends_with(b":nick PRIVMSG #chat :hello\r\n"));
     }
 
     #[test]

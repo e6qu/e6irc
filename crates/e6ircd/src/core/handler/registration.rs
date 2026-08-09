@@ -501,6 +501,7 @@ pub(super) fn cmd_cap(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             let verb = if all_known && fits { "ACK" } else { "NAK" };
             if verb == "ACK" {
                 state.sessions.get_mut(&conn).expect("checked").caps = caps;
+                state.refresh_recipient(conn);
             }
             let head = format!(":{server} CAP {target} {verb} :");
             let echo = super::fit_trailing(&head, request);
