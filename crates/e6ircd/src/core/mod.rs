@@ -26,7 +26,10 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
-use state::{ChannelActor, ChannelJoinResult, ChannelOwner, ChannelPartResult, ChannelQuit};
+use state::{
+    ChannelActor, ChannelJoinResult, ChannelMessage, ChannelMessageResult, ChannelOwner,
+    ChannelPartResult, ChannelQuit,
+};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -148,6 +151,8 @@ impl CoreIngress {
             Input::ChannelPart { owner, .. } => owner.shard(),
             Input::ChannelPartResult { session, .. } => session.shard(),
             Input::ChannelQuit { quit } => quit.owner().shard(),
+            Input::ChannelMessage { message } => message.owner().shard(),
+            Input::ChannelMessageResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -379,6 +384,14 @@ pub enum Input {
     },
     ChannelQuit {
         quit: ChannelQuit,
+    },
+    ChannelMessage {
+        message: ChannelMessage,
+    },
+    ChannelMessageResult {
+        session: SessionOwner,
+        result: ChannelMessageResult,
+        label: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
@@ -1437,6 +1450,14 @@ pub(crate) enum CoreEffect {
         label: Option<String>,
     },
     ChannelQuit(ChannelQuit),
+    ChannelMessage {
+        message: ChannelMessage,
+    },
+    ChannelMessageResult {
+        session: SessionOwner,
+        result: ChannelMessageResult,
+        label: Option<String>,
+    },
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1514,6 +1535,16 @@ impl CoreWorker {
                         label,
                     },
                     CoreEffect::ChannelQuit(quit) => Input::ChannelQuit { quit },
+                    CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
+                    CoreEffect::ChannelMessageResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelMessageResult {
+                        session,
+                        result,
+                        label,
+                    },
                 };
                 if self.ingress.push(input).await.is_err() {
                     panic!("cross-shard target closed");
@@ -1696,6 +1727,26 @@ impl Core {
             Input::ChannelQuit { quit } => {
                 self.state
                     .quit_channel_member(quit.owner(), quit.conn(), quit.line());
+            }
+            Input::ChannelMessage { message } => {
+                assert_eq!(
+                    message.owner().shard(),
+                    self.shard,
+                    "message reached wrong channel shard"
+                );
+                handler::channel_message(&mut self.state, message);
+            }
+            Input::ChannelMessageResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "message result reached wrong session shard"
+                );
+                handler::channel_message_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
@@ -2180,6 +2231,13 @@ mod ingress_tests {
             .expect("joiner session")
             .caps
             .labeled_response = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .echo_message = true;
         while joiner_rx.try_pop().is_some() {}
 
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
@@ -2231,6 +2289,28 @@ mod ingress_tests {
         );
         let close = joiner_rx.pop().await.expect("joiner closes labeled batch");
         assert!(close.payload.0.starts_with(b":irc.test BATCH -"));
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=message PRIVMSG #chat :hello".to_vec(),
+            })
+            .await
+            .expect("queue cross-shard message");
+        let message = peer_rx.pop().await.expect("peer receives channel message");
+        assert!(
+            message
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
+        );
+        let echo = joiner_rx.pop().await.expect("joiner receives labeled echo");
+        assert!(echo.payload.0.starts_with(b"@label=message :joiner!"));
+        assert!(
+            echo.payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
+        );
 
         ingress
             .push(Input::Line {

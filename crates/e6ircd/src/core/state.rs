@@ -697,6 +697,7 @@ pub struct ChannelActor {
     pub(crate) account: Option<String>,
     pub(crate) realname: String,
     pub(crate) away: Option<String>,
+    pub(crate) bot: bool,
 }
 
 impl ChannelActor {
@@ -747,6 +748,89 @@ pub struct ChannelQuit {
     owner: ChannelOwner,
     conn: ConnId,
     line: String,
+}
+
+/// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelMessage {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    text: String,
+    kind: crate::core::MessageKind,
+    client_tags: String,
+    label: Option<String>,
+}
+
+impl ChannelMessage {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        text: String,
+        kind: crate::core::MessageKind,
+        client_tags: String,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            text,
+            kind,
+            client_tags,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ChannelOwner,
+        ChannelActor,
+        String,
+        String,
+        crate::core::MessageKind,
+        String,
+    ) {
+        (
+            self.owner,
+            self.actor,
+            self.target,
+            self.text,
+            self.kind,
+            self.client_tags,
+        )
+    }
+}
+
+/// The channel owner's complete answer to a parsed channel message.
+#[derive(Debug)]
+pub enum ChannelMessageResult {
+    Delivered {
+        echo: Option<Bytes>,
+    },
+    NoSuchChannel {
+        target: String,
+        loud: bool,
+    },
+    CannotSend {
+        target: String,
+        no_ctcp: bool,
+        loud: bool,
+    },
 }
 
 impl ChannelQuit {
@@ -1522,6 +1606,7 @@ impl ServerState {
             account: session.account.clone(),
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
+            bot: session.bot,
         }
     }
 
@@ -1595,6 +1680,23 @@ impl ServerState {
 
     pub fn route_quit(&mut self, quit: ChannelQuit) {
         self.effects.push(CoreEffect::ChannelQuit(quit));
+    }
+
+    pub fn route_message(&mut self, message: ChannelMessage) {
+        self.effects.push(CoreEffect::ChannelMessage { message });
+    }
+
+    pub fn route_message_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelMessageResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelMessageResult {
+            session,
+            result,
+            label,
+        });
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {

@@ -726,47 +726,44 @@ pub(super) fn deliver_and_echo(
 /// Deliver a message line to recipients, applying per-recipient
 /// `server-time` and `account-tag` variants.
 pub(super) fn deliver_message(state: &mut ServerState, recipients: &[Recipient], d: &Delivery) {
-    let time = e6irc_proto::time::server_time(d.ts);
     for &recipient in recipients {
-        let caps = recipient.caps();
-        let mut tags: Vec<String> = Vec::new();
-        if caps.message_tags {
-            tags.push(format!("msgid={}", d.msgid));
-        }
-        if caps.server_time {
-            tags.push(format!("time={time}"));
-        }
-        if caps.account_tag
-            && let Some(account) = d.sender_account
-        {
-            // The account name is a nick or an OIDC-sanitized name, both of which
-            // can contain `\\` (a legal nick char) — a raw backslash in a tag value
-            // is an escape introducer, so a client would decode `a\\b` as `ab` and
-            // see a different account than the one that spoke. Escape it like any
-            // tag value.
-            tags.push(format!(
-                "account={}",
-                e6irc_proto::message::escape_tag_value(account)
-            ));
-        }
-        if caps.message_tags && d.sender_is_bot {
-            tags.push("bot".to_string());
-        }
-        if caps.message_tags && !d.client_tags.is_empty() {
-            tags.push(d.client_tags.to_string());
-        }
-        let line = if tags.is_empty() {
-            d.body.to_string()
-        } else {
-            format!("@{} {}", tags.join(";"), d.body)
-        };
-        let bytes = bytes::Bytes::from(format!("{line}\r\n"));
+        let bytes = render_delivery(recipient.caps(), d);
         if d.bypass_capture {
             state.send_recipient_uncaptured(recipient, bytes);
         } else {
             state.send_recipient(recipient, bytes);
         }
     }
+}
+
+pub(super) fn render_delivery(caps: crate::core::state::Caps, d: &Delivery) -> bytes::Bytes {
+    let mut tags: Vec<String> = Vec::new();
+    if caps.message_tags {
+        tags.push(format!("msgid={}", d.msgid));
+    }
+    if caps.server_time {
+        tags.push(format!("time={}", e6irc_proto::time::server_time(d.ts)));
+    }
+    if caps.account_tag
+        && let Some(account) = d.sender_account
+    {
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if caps.message_tags && d.sender_is_bot {
+        tags.push("bot".to_string());
+    }
+    if caps.message_tags && !d.client_tags.is_empty() {
+        tags.push(d.client_tags.to_string());
+    }
+    let line = if tags.is_empty() {
+        d.body.to_string()
+    } else {
+        format!("@{} {}", tags.join(";"), d.body)
+    };
+    bytes::Bytes::from(format!("{line}\r\n"))
 }
 
 // ---- topic --------------------------------------------------------------

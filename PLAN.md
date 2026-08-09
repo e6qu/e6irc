@@ -14,9 +14,10 @@ and integration claims.
 
 ### Stage F — Scale architecture and qualification
 
-- Complete typed cross-shard channel ownership. JOIN, PART, and QUIT route to
-  the channel owner; messages, channel control, queries, services, history,
-  persistence callbacks, and HTTP controls still need the same boundary.
+- Complete typed cross-shard channel ownership. JOIN, PART, QUIT, and
+  single-line channel messages route to the channel owner; batches/multiline,
+  channel control, queries, services, history, persistence callbacks, and HTTP
+  controls still need the same boundary.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.

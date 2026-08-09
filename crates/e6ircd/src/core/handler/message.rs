@@ -365,6 +365,24 @@ pub(super) fn deliver_one_message(
         return;
     }
 
+    let (_, channel_target) = StatusSigil::split(target);
+    if channel_target.starts_with('#') {
+        let owner = state.channel_owner(channel_target);
+        if !state.owns_channel(&owner) {
+            let label = state.defer_channel_reply(conn);
+            state.route_message(crate::core::state::ChannelMessage::new(
+                owner,
+                state.channel_actor(conn),
+                target.to_string(),
+                text.to_string(),
+                kind,
+                client_tags.to_string(),
+                label,
+            ));
+            return;
+        }
+    }
+
     let prefix = state.sessions[&conn].prefix();
     // Permission/CTCP checks see the message as sent (CTCP markers and the
     // hostmask are at the front, which truncation never touches).
@@ -436,6 +454,119 @@ pub(super) fn deliver_one_message(
             state.numeric(conn, RPL_AWAY, &[&peer_nick], Some(&away));
         }
     }
+}
+
+/// Execute one parsed channel message on its channel-owning shard.
+pub(super) fn message_on_owner(
+    state: &mut ServerState,
+    message: crate::core::state::ChannelMessage,
+) -> crate::core::state::ChannelMessageResult {
+    let (owner, actor, target, message_text, kind, client_tags) = message.into_parts();
+    let (status_prefix, chan_target) = StatusSigil::split(&target);
+    let key = state.chan_key(chan_target);
+    assert_eq!(
+        owner.key(),
+        &key,
+        "message owner does not match its channel target"
+    );
+    let Some(channel) = state.channels.get(&key) else {
+        return crate::core::state::ChannelMessageResult::NoSuchChannel {
+            target,
+            loud: kind.is_loud(),
+        };
+    };
+    if !channel.may_speak(
+        channel.member(actor.recipient.conn()),
+        state.casemap,
+        &actor.identity.prefix,
+    ) {
+        return crate::core::state::ChannelMessageResult::CannotSend {
+            target,
+            no_ctcp: false,
+            loud: kind.is_loud(),
+        };
+    }
+    if channel.modes.no_ctcp && message_text.split('\n').any(is_blocked_ctcp) {
+        return crate::core::state::ChannelMessageResult::CannotSend {
+            target,
+            no_ctcp: true,
+            loud: kind.is_loud(),
+        };
+    }
+    let recipients = channel.recipients_where(|member, modes| {
+        member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
+    });
+    let prefix = &actor.identity.prefix;
+    let text = fit_relayed_text(prefix, kind.wire(), &target, &message_text);
+    let line = format!(":{prefix} {} {target} :{text}", kind.wire());
+    let (ts, msgid) = state.stamp();
+    let entry = crate::core::state::HistoryEntry {
+        msgid,
+        ts,
+        sender_prefix: prefix.clone(),
+        sender_account: actor.account.clone(),
+        kind,
+        body: text.to_string(),
+        sender_is_bot: actor.bot,
+        multiline: None,
+    };
+    let delivery = Delivery {
+        sender_account: entry.sender_account.as_deref(),
+        sender_is_bot: entry.sender_is_bot,
+        msgid: &entry.msgid,
+        client_tags: &client_tags,
+        body: &line,
+        ts: entry.ts,
+        bypass_capture: true,
+    };
+    deliver_message(state, &recipients, &delivery);
+    let echo = actor
+        .recipient
+        .caps()
+        .echo_message
+        .then(|| render_delivery(actor.recipient.caps(), &delivery));
+    if status_prefix.is_none() {
+        record_history(state, &(&key).into(), Vec::new(), entry);
+    }
+    crate::core::state::ChannelMessageResult::Delivered { echo }
+}
+
+pub(super) fn emit_message_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelMessageResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| match result {
+        crate::core::state::ChannelMessageResult::Delivered { echo } => {
+            if let Some(echo) = echo {
+                state.send_bytes(conn, echo);
+            }
+        }
+        crate::core::state::ChannelMessageResult::NoSuchChannel { target, loud } => {
+            if loud {
+                state.err_nosuchchannel(conn, clip_echo(&target));
+            }
+        }
+        crate::core::state::ChannelMessageResult::CannotSend {
+            target,
+            no_ctcp,
+            loud,
+        } => {
+            if loud {
+                state.numeric(
+                    conn,
+                    ERR_CANNOTSENDTOCHAN,
+                    &[&target],
+                    Some(if no_ctcp {
+                        "Cannot send to channel (+C, no CTCP)"
+                    } else {
+                        "Cannot send to channel"
+                    }),
+                );
+            }
+        }
+    });
 }
 
 /// TAGMSG: tags-only message (message-tags spec). Only clients that
