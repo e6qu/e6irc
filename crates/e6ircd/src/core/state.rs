@@ -1447,6 +1447,21 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes, &member.identity))
     }
 
+    /// Resolve a member from channel-owned identity data.
+    pub fn member_named(
+        &self,
+        casemap: CaseMapping,
+        nick: &str,
+    ) -> Option<(ConnId, Recipient, &MemberIdentity)> {
+        self.members.iter().find_map(|(conn, member)| {
+            (casemap.casefold(&member.identity.nick) == casemap.casefold(nick)).then_some((
+                *conn,
+                member.recipient,
+                &member.identity,
+            ))
+        })
+    }
+
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
     /// non-members on every query surface — its existence, modes, topic, and
     /// member lists all. The single source of that predicate: deny surfaces
@@ -3479,6 +3494,26 @@ mod session_store_tests {
                 .any(|recipient| recipient.conn() == ConnId(2)
                     && recipient.shard() == CoreShardId(0))
         );
+    }
+
+    #[test]
+    fn member_lookup_uses_channel_identity_and_casemapping() {
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(2), CoreShardId(1)),
+                Caps::default(),
+            ),
+            MemberIdentity::new("[Alice]".into(), "[Alice]!u@h".into(), false),
+            MemberModes::default(),
+        );
+
+        let (conn, recipient, identity) = channel
+            .member_named(CaseMapping::Rfc1459, "{alice}")
+            .expect("casefolded member");
+        assert_eq!(conn, ConnId(2));
+        assert_eq!(recipient.shard(), CoreShardId(1));
+        assert_eq!(identity.nick, "[Alice]");
     }
 
     #[test]

@@ -129,10 +129,7 @@ fn kick_one_user(
     who: &str,
     reason: Option<&str>,
 ) {
-    let who_key = state.nick_key(who);
-    let victim = state.nick_connection(&who_key);
-    let victim_on = victim.is_some_and(|v| state.channels[key].is_member(v));
-    let Some(victim) = victim.filter(|_| victim_on) else {
+    let Some((victim, _, identity)) = state.channels[key].member_named(state.casemap, who) else {
         state.numeric(
             conn,
             ERR_USERNOTINCHANNEL,
@@ -141,10 +138,7 @@ fn kick_one_user(
         );
         return;
     };
-    let victim_nick = state.sessions[&victim]
-        .nick()
-        .map(String::from)
-        .expect("registered");
+    let victim_nick = identity.nick.clone();
     let line = match reason {
         Some(reason) => {
             // KICKLEN bounds the reason itself; the relayed line also carries
