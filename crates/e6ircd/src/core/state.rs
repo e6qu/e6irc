@@ -667,6 +667,10 @@ impl Recipient {
         self.owner.shard()
     }
 
+    pub(crate) fn owner(self) -> SessionOwner {
+        self.owner
+    }
+
     pub(crate) fn caps(self) -> Caps {
         self.caps
     }
@@ -697,6 +701,7 @@ pub struct ChannelActor {
     pub(crate) account: Option<String>,
     pub(crate) realname: String,
     pub(crate) away: Option<String>,
+    pub(crate) bot: bool,
 }
 
 impl ChannelActor {
@@ -739,6 +744,353 @@ pub enum ChannelJoinFailure {
 pub enum ChannelPartResult {
     Parted { key: ChanKey, line: String },
     NotOnChannel { name: String },
+}
+
+/// A complete QUIT request for one channel owner.
+#[derive(Debug)]
+pub struct ChannelQuit {
+    owner: ChannelOwner,
+    conn: ConnId,
+    line: String,
+}
+
+/// A parsed TOPIC request, owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelTopic {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    operation: ChannelTopicOperation,
+    label: Option<String>,
+}
+
+/// A TOPIC request has exactly one operation.
+#[derive(Debug, Clone)]
+pub enum ChannelTopicOperation {
+    Query,
+    Set(String),
+}
+
+impl ChannelTopic {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        operation: ChannelTopicOperation,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            operation,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, ChannelTopicOperation) {
+        (self.owner, self.actor, self.target, self.operation)
+    }
+}
+
+/// A channel owner's TOPIC answer, delivered only to the requester's session owner.
+#[derive(Debug)]
+pub enum ChannelTopicResult {
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    Topic {
+        display: String,
+        topic: Option<Topic>,
+    },
+    Set {
+        line: String,
+    },
+    NotOnChannel {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    CannotSend {
+        target: String,
+    },
+    Unavailable {
+        display: String,
+        message: String,
+    },
+    PersistenceFailed {
+        display: String,
+        failure: crate::core::ChannelTopicFailure,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelKick {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    victim: String,
+    reason: Option<String>,
+    label: Option<String>,
+}
+
+impl ChannelKick {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        victim: String,
+        reason: Option<String>,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            victim,
+            reason,
+            label,
+        }
+    }
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, String, Option<String>) {
+        (
+            self.owner,
+            self.actor,
+            self.target,
+            self.victim,
+            self.reason,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum ChannelKickResult {
+    Kicked,
+    NoSuchChannel { target: String },
+    NotOnChannel { target: String },
+    NotOperator { target: String },
+    UserNotInChannel { victim: String, channel: String },
+}
+
+/// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelMessage {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    text: String,
+    kind: crate::core::MessageKind,
+    client_tags: String,
+    label: Option<String>,
+}
+
+impl ChannelMessage {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        text: String,
+        kind: crate::core::MessageKind,
+        client_tags: String,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            text,
+            kind,
+            client_tags,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ChannelOwner,
+        ChannelActor,
+        String,
+        String,
+        crate::core::MessageKind,
+        String,
+    ) {
+        (
+            self.owner,
+            self.actor,
+            self.target,
+            self.text,
+            self.kind,
+            self.client_tags,
+        )
+    }
+}
+
+/// The channel owner's complete answer to a parsed channel message.
+#[derive(Debug)]
+pub enum ChannelMessageResult {
+    Delivered {
+        echo: Option<Bytes>,
+    },
+    NoSuchChannel {
+        target: String,
+        loud: bool,
+    },
+    CannotSend {
+        target: String,
+        no_ctcp: bool,
+        loud: bool,
+    },
+}
+
+/// A completed channel multiline message.
+#[derive(Debug)]
+pub struct ChannelMultiline {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    batch: MultilineBatch,
+}
+
+impl ChannelMultiline {
+    pub(crate) fn new(owner: ChannelOwner, actor: ChannelActor, batch: MultilineBatch) -> Self {
+        Self {
+            owner,
+            actor,
+            batch,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, MultilineBatch) {
+        (self.owner, self.actor, self.batch)
+    }
+}
+
+/// A channel-owner multiline outcome delivered to the sender's session owner.
+#[derive(Debug)]
+pub enum ChannelMultilineResult {
+    Delivered {
+        echo: Vec<Bytes>,
+        label: Option<String>,
+    },
+    NoSuchChannel {
+        target: String,
+        loud: bool,
+        label: Option<String>,
+    },
+    CannotSend {
+        target: String,
+        no_ctcp: bool,
+        loud: bool,
+        label: Option<String>,
+    },
+}
+
+/// A parsed channel TAGMSG, owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelTagmsg {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    client_tags: String,
+    label: Option<String>,
+}
+
+impl ChannelTagmsg {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        client_tags: String,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            client_tags,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, String) {
+        (self.owner, self.actor, self.target, self.client_tags)
+    }
+}
+
+/// The channel owner's answer to a parsed channel TAGMSG.
+#[derive(Debug)]
+pub enum ChannelTagmsgResult {
+    Delivered { echo: Option<Bytes> },
+    NoSuchChannel { target: String },
+    CannotSend { target: String },
+}
+
+impl ChannelQuit {
+    pub(crate) fn new(owner: ChannelOwner, conn: ConnId, line: String) -> Self {
+        Self { owner, conn, line }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+
+    pub(crate) fn conn(&self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn line(&self) -> &str {
+        &self.line
+    }
 }
 
 struct ChannelMember {
@@ -941,6 +1293,7 @@ impl From<&ChanKey> for HistoryKey {
 /// lines are buffered rather than delivered as they arrive, since a multiline
 /// message is one message — it gets one msgid and one timestamp, and a client
 /// that abandons the batch must deliver nothing at all.
+#[derive(Debug)]
 pub(crate) struct MultilineBatch {
     /// The client's batch reference, as given after `+`.
     pub reference: String,
@@ -971,7 +1324,7 @@ pub(crate) struct HistoryRing {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Topic {
+pub struct Topic {
     pub text: String,
     pub set_by: String,
     /// Unix **seconds** — RPL_TOPICWHOTIME reports whole seconds and the
@@ -1182,6 +1535,22 @@ impl Channel {
             .map(|(conn, member)| (*conn, &member.modes, &member.identity))
     }
 
+    /// Resolve a member from channel-owned identity data.
+    pub fn member_named(
+        &self,
+        casemap: CaseMapping,
+        nick: &str,
+    ) -> Option<(ConnId, Recipient, &MemberIdentity)> {
+        let nick = casemap.casefold(nick);
+        self.members.iter().find_map(|(conn, member)| {
+            (casemap.casefold(&member.identity.nick) == nick).then_some((
+                *conn,
+                member.recipient,
+                &member.identity,
+            ))
+        })
+    }
+
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
     /// non-members on every query surface — its existence, modes, topic, and
     /// member lists all. The single source of that predicate: deny surfaces
@@ -1257,6 +1626,10 @@ pub struct ChannelOwner {
 impl ChannelOwner {
     pub(crate) fn shard(&self) -> CoreShardId {
         self.shard
+    }
+
+    pub(crate) fn key(&self) -> &ChanKey {
+        &self.key
     }
 }
 
@@ -1492,6 +1865,7 @@ impl ServerState {
             account: session.account.clone(),
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
+            bot: session.bot,
         }
     }
 
@@ -1500,6 +1874,10 @@ impl ServerState {
     }
 
     pub fn owns_channel(&self, owner: &ChannelOwner) -> bool {
+        owner.shard() == self.shard
+    }
+
+    pub fn owns_session(&self, owner: SessionOwner) -> bool {
         owner.shard() == self.shard
     }
 
@@ -1557,6 +1935,120 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects.push(CoreEffect::ChannelPartResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_quit(&mut self, quit: ChannelQuit) {
+        self.effects.push(CoreEffect::ChannelQuit(quit));
+    }
+
+    pub fn route_topic(&mut self, topic: ChannelTopic) {
+        self.effects.push(CoreEffect::ChannelTopic { topic });
+    }
+
+    pub fn route_topic_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelTopicResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelTopicResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_topic_persisted(
+        &mut self,
+        owner: ChannelOwner,
+        conn: ConnId,
+        session: Option<SessionOwner>,
+        result: crate::core::ChannelTopicPersistence,
+    ) {
+        self.effects
+            .push(crate::core::CoreEffect::ChannelTopicPersisted {
+                owner,
+                conn,
+                session,
+                result,
+            });
+    }
+
+    pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
+        self.effects
+            .push(crate::core::CoreEffect::SessionChannelRemoved { session, key });
+    }
+
+    pub fn route_kick(&mut self, kick: ChannelKick) {
+        self.effects
+            .push(crate::core::CoreEffect::ChannelKick { kick });
+    }
+
+    pub fn route_kick_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelKickResult,
+        label: Option<String>,
+    ) {
+        self.effects
+            .push(crate::core::CoreEffect::ChannelKickResult {
+                session,
+                result,
+                label,
+            });
+    }
+
+    pub fn remove_session_channel(&mut self, conn: ConnId, key: &ChanKey) {
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.channels.remove(key);
+        }
+    }
+
+    pub fn route_message(&mut self, message: ChannelMessage) {
+        self.effects.push(CoreEffect::ChannelMessage { message });
+    }
+
+    pub fn route_message_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelMessageResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelMessageResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_multiline(&mut self, message: ChannelMultiline) {
+        self.effects.push(CoreEffect::ChannelMultiline { message });
+    }
+
+    pub fn route_multiline_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelMultilineResult,
+    ) {
+        self.effects
+            .push(CoreEffect::ChannelMultilineResult { session, result });
+    }
+
+    pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
+        self.effects.push(CoreEffect::ChannelTagmsg { tagmsg });
+    }
+
+    pub fn route_tagmsg_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelTagmsgResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelTagmsgResult {
             session,
             result,
             label,
@@ -2781,19 +3273,12 @@ impl ServerState {
         let joined: Vec<ChanKey> = session.channels.iter().cloned().collect();
 
         if let Some(line) = quit_line {
-            // send_timed per peer so server-time clients get an @time= tag,
-            // consistent with every other membership event (a raw send_bytes
-            // loop would omit it for QUIT alone).
-            let peers = self.channel_peers(conn);
-            for p in peers {
-                self.send_timed(p, &line);
-            }
-        }
-        for key in joined {
-            if let Some(chan) = self.channels.get_mut(&key) {
-                chan.remove_member(conn);
-                if !chan.has_members() {
-                    self.remove_channel(&key);
+            for key in joined {
+                let owner = self.channels.owner(&key);
+                if self.owns_channel(&owner) {
+                    self.quit_channel_member(&owner, conn, &line);
+                } else {
+                    self.route_quit(ChannelQuit::new(owner, conn, line.clone()));
                 }
             }
         }
@@ -2837,6 +3322,29 @@ impl ServerState {
                     });
                 self.hot_history.retain(|k| self.history.contains_key(k));
             }
+        }
+    }
+
+    /// Apply a registered session's departure on the channel-owning shard.
+    /// A preceding PART can have removed the member while its response was in
+    /// flight to the closing session; that makes this departure already applied.
+    pub fn quit_channel_member(&mut self, owner: &ChannelOwner, conn: ConnId, line: &str) {
+        assert_eq!(
+            owner.shard(),
+            self.shard,
+            "QUIT reached wrong channel shard"
+        );
+        let key = owner.key();
+        let removed = self
+            .channels
+            .get_mut(key)
+            .and_then(|channel| channel.remove_member(conn));
+        let Some(_) = removed else {
+            return;
+        };
+        self.broadcast_channel(key, line, Some(conn));
+        if !self.channels[key].has_members() {
+            self.remove_channel(key);
         }
     }
 }
@@ -3125,6 +3633,26 @@ mod session_store_tests {
                 .any(|recipient| recipient.conn() == ConnId(2)
                     && recipient.shard() == CoreShardId(0))
         );
+    }
+
+    #[test]
+    fn member_lookup_uses_channel_identity_and_casemapping() {
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(2), CoreShardId(1)),
+                Caps::default(),
+            ),
+            MemberIdentity::new("[Alice]".into(), "[Alice]!u@h".into(), false),
+            MemberModes::default(),
+        );
+
+        let (conn, recipient, identity) = channel
+            .member_named(CaseMapping::Rfc1459, "{alice}")
+            .expect("casefolded member");
+        assert_eq!(conn, ConnId(2));
+        assert_eq!(recipient.shard(), CoreShardId(1));
+        assert_eq!(identity.nick, "[Alice]");
     }
 
     #[test]

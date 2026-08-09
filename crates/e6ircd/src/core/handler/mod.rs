@@ -5,8 +5,9 @@ use e6irc_proto::numerics::*;
 
 use super::ConnId;
 use super::state::{
-    BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelPartResult,
-    MemberModes, Recipient, ServerBan, ServerState, Topic,
+    BanKind, CAP_NAMES, ChanKey, Channel, ChannelActor, ChannelJoinResult, ChannelMessage,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelPartResult,
+    ChannelTagmsg, ChannelTagmsgResult, MemberModes, Recipient, ServerBan, ServerState, Topic,
 };
 
 pub(crate) mod admin;
@@ -100,6 +101,94 @@ pub(crate) fn channel_part_result(
     label: Option<String>,
 ) {
     channel::emit_part_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_topic(state: &mut ServerState, topic: crate::core::state::ChannelTopic) {
+    let session = topic.actor().session_owner();
+    let label = topic.label();
+    if let Some(result) = channel::topic_on_owner(state, topic) {
+        state.route_topic_result(session, result, label);
+    }
+}
+
+pub(crate) fn channel_topic_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTopicResult,
+    label: Option<String>,
+) {
+    channel::emit_topic_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_topic_persisted(
+    state: &mut ServerState,
+    conn: ConnId,
+    session: Option<crate::core::SessionOwner>,
+    result: crate::core::ChannelTopicPersistence,
+) {
+    channel::topic_persisted_on_owner(state, conn, session, result);
+}
+
+pub(crate) fn channel_kick(state: &mut ServerState, kick: crate::core::state::ChannelKick) {
+    let session = kick.actor().session_owner();
+    let label = kick.label();
+    let result = chanops::kick_on_owner(state, kick);
+    state.route_kick_result(session, result, label);
+}
+
+pub(crate) fn channel_kick_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelKickResult,
+    label: Option<String>,
+) {
+    chanops::emit_kick_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_message(state: &mut ServerState, message: ChannelMessage) {
+    let session = message.actor().session_owner();
+    let label = message.label();
+    let result = message::message_on_owner(state, message);
+    state.route_message_result(session, result, label);
+}
+
+pub(crate) fn channel_message_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelMessageResult,
+    label: Option<String>,
+) {
+    message::emit_message_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_multiline(state: &mut ServerState, message: ChannelMultiline) {
+    let session = message.actor().session_owner();
+    let result = message::multiline_on_owner(state, message);
+    state.route_multiline_result(session, result);
+}
+
+pub(crate) fn channel_multiline_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelMultilineResult,
+) {
+    message::emit_multiline_result(state, conn, result);
+}
+
+pub(crate) fn channel_tagmsg(state: &mut ServerState, tagmsg: ChannelTagmsg) {
+    let session = tagmsg.actor().session_owner();
+    let label = tagmsg.label();
+    let result = message::tagmsg_on_owner(state, tagmsg);
+    state.route_tagmsg_result(session, result, label);
+}
+
+pub(crate) fn channel_tagmsg_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelTagmsgResult,
+    label: Option<String>,
+) {
+    message::emit_tagmsg_result(state, conn, result, label);
 }
 
 pub(crate) fn dispatch(state: &mut ServerState, conn: ConnId, line: &[u8]) {

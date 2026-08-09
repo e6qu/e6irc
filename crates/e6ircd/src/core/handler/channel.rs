@@ -1,7 +1,10 @@
 //! Channel membership, topic, and modes.
 
 use super::*;
-use crate::core::state::{ChannelJoinFailure, ChannelJoinSuccess};
+use crate::core::{
+    ChannelOwner,
+    state::{ChannelJoinFailure, ChannelJoinSuccess},
+};
 
 // ---- channels -----------------------------------------------------------
 
@@ -726,47 +729,44 @@ pub(super) fn deliver_and_echo(
 /// Deliver a message line to recipients, applying per-recipient
 /// `server-time` and `account-tag` variants.
 pub(super) fn deliver_message(state: &mut ServerState, recipients: &[Recipient], d: &Delivery) {
-    let time = e6irc_proto::time::server_time(d.ts);
     for &recipient in recipients {
-        let caps = recipient.caps();
-        let mut tags: Vec<String> = Vec::new();
-        if caps.message_tags {
-            tags.push(format!("msgid={}", d.msgid));
-        }
-        if caps.server_time {
-            tags.push(format!("time={time}"));
-        }
-        if caps.account_tag
-            && let Some(account) = d.sender_account
-        {
-            // The account name is a nick or an OIDC-sanitized name, both of which
-            // can contain `\\` (a legal nick char) — a raw backslash in a tag value
-            // is an escape introducer, so a client would decode `a\\b` as `ab` and
-            // see a different account than the one that spoke. Escape it like any
-            // tag value.
-            tags.push(format!(
-                "account={}",
-                e6irc_proto::message::escape_tag_value(account)
-            ));
-        }
-        if caps.message_tags && d.sender_is_bot {
-            tags.push("bot".to_string());
-        }
-        if caps.message_tags && !d.client_tags.is_empty() {
-            tags.push(d.client_tags.to_string());
-        }
-        let line = if tags.is_empty() {
-            d.body.to_string()
-        } else {
-            format!("@{} {}", tags.join(";"), d.body)
-        };
-        let bytes = bytes::Bytes::from(format!("{line}\r\n"));
+        let bytes = render_delivery(recipient.caps(), d);
         if d.bypass_capture {
             state.send_recipient_uncaptured(recipient, bytes);
         } else {
             state.send_recipient(recipient, bytes);
         }
     }
+}
+
+pub(super) fn render_delivery(caps: crate::core::state::Caps, d: &Delivery) -> bytes::Bytes {
+    let mut tags: Vec<String> = Vec::new();
+    if caps.message_tags {
+        tags.push(format!("msgid={}", d.msgid));
+    }
+    if caps.server_time {
+        tags.push(format!("time={}", e6irc_proto::time::server_time(d.ts)));
+    }
+    if caps.account_tag
+        && let Some(account) = d.sender_account
+    {
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if caps.message_tags && d.sender_is_bot {
+        tags.push("bot".to_string());
+    }
+    if caps.message_tags && !d.client_tags.is_empty() {
+        tags.push(d.client_tags.to_string());
+    }
+    let line = if tags.is_empty() {
+        d.body.to_string()
+    } else {
+        format!("@{} {}", tags.join(";"), d.body)
+    };
+    bytes::Bytes::from(format!("{line}\r\n"))
 }
 
 // ---- topic --------------------------------------------------------------
@@ -795,52 +795,56 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
         state.err_needmoreparams(conn, "TOPIC");
         return;
     };
-    let Some((key, chan)) = require_channel(state, conn, target) else {
-        return;
+    let operation = if p.len() == 1 && !msg.has_trailing {
+        crate::core::state::ChannelTopicOperation::Query
+    } else {
+        crate::core::state::ChannelTopicOperation::Set(p.get(1).copied().unwrap_or("").to_string())
+    };
+    let local = state.owns_channel(&state.channel_owner(target));
+    let label = if local {
+        state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.label.clone())
+    } else {
+        state.defer_channel_reply(conn)
+    };
+    let request = crate::core::state::ChannelTopic::new(
+        state.channel_owner(target),
+        state.channel_actor(conn),
+        target.to_string(),
+        operation,
+        label.clone(),
+    );
+    if local {
+        if let Some(result) = topic_on_owner(state, request) {
+            emit_topic_result_now(state, conn, result);
+        }
+    } else {
+        state.route_topic(request);
+    }
+}
+
+fn topic_set_on_owner(
+    state: &mut ServerState,
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    raw_text: String,
+    label: Option<String>,
+) -> Option<crate::core::state::ChannelTopicResult> {
+    let conn = actor.recipient.conn();
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "TOPIC owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return Some(crate::core::state::ChannelTopicResult::NoSuchChannel { target });
     };
     let display = chan.name.clone();
-
-    // Query: exactly one param. Setting requires the second param —
-    // distinguished from "TOPIC #c :" (clearing) by has_trailing/params.
-    if p.len() == 1 && !msg.has_trailing {
-        // A +s channel's topic — and its very existence — is hidden from
-        // non-members, like every other query surface (NAMES/WHO/WHOIS/LIST).
-        // It must look *non-existent* (403), not "you're not on it" (442) —
-        // the latter confirms the channel exists, an existence oracle. The
-        // shared `deny_hidden` funnels every deny surface to the one numeric.
-        if let Some(proof) = chan.hidden_from(conn) {
-            super::deny_hidden(state, conn, target, proof);
-            return;
-        }
-        match &chan.topic {
-            Some(t) => {
-                let (text, set_by, set_at) = (t.text.clone(), t.set_by.clone(), t.set_at_secs);
-                state.numeric(conn, RPL_TOPIC, &[&display], Some(&text));
-                state.numeric(
-                    conn,
-                    RPL_TOPICWHOTIME,
-                    &[&display, &set_by, &set_at.to_string()],
-                    None,
-                );
-            }
-            None => state.numeric(conn, RPL_NOTOPIC, &[&display], Some("No topic is set")),
-        }
-        return;
-    }
-
-    let member = chan.member(conn);
-    let Some(member) = member else {
-        state.err_notonchannel(conn, target);
-        return;
+    let Some(member) = chan.member(conn) else {
+        return Some(crate::core::state::ChannelTopicResult::NotOnChannel { target });
     };
     if chan.modes.topic_ops_only && !member.op {
-        state.numeric(
-            conn,
-            ERR_CHANOPRIVSNEEDED,
-            &[target],
-            Some("You're not a channel operator"),
-        );
-        return;
+        return Some(crate::core::state::ChannelTopicResult::NotOperator { target });
     }
     // A quieted or banned member can't set the topic (which would evade the
     // quiet by defacing the channel), unless op/voice. This is deliberately
@@ -849,23 +853,17 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     // in here — a regular member of a +m, -t channel may still set the topic.
     let exempt = member.op || member.voice;
     if !exempt {
-        let prefix = state.sessions[&conn].prefix();
+        let prefix = &actor.identity.prefix;
         let blocked = {
             let chan = &state.channels[&key];
-            chan.is_banned(state.casemap, &prefix) || chan.is_quieted(state.casemap, &prefix)
+            chan.is_banned(state.casemap, prefix) || chan.is_quieted(state.casemap, prefix)
         };
         if blocked {
-            state.numeric(
-                conn,
-                ERR_CANNOTSENDTOCHAN,
-                &[target],
-                Some("Cannot send to channel"),
-            );
-            return;
+            return Some(crate::core::state::ChannelTopicResult::CannotSend { target });
         }
     }
-    let new_text = truncate_chars(p.get(1).copied().unwrap_or(""), TOPICLEN);
-    let prefix = state.sessions[&conn].prefix();
+    let new_text = truncate_chars(&raw_text, TOPICLEN);
+    let prefix = actor.identity.prefix;
     // TOPICLEN bounds the topic itself; the *relayed* line also carries the
     // setter's prefix, which can push it past the wire limit. Fit against the
     // broadcast head and store the same fitted text, so the broadcast, 332
@@ -893,21 +891,15 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     if !state.is_registered(&key) && !state.channel_registration_pending(&key) {
         state.channels.get_mut(&key).expect("checked").topic = new_topic;
         let line = format!(":{prefix} TOPIC {display} :{new_text}");
-        state.broadcast_channel(&key, &line, None);
-        return;
+        state.broadcast_channel(&key, &line, Some(conn));
+        return Some(crate::core::state::ChannelTopicResult::Set { line });
     }
 
-    let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
     let Some(revision) = state.channel_topic_revision.checked_add(1) else {
-        let server = state.config.server_name.clone();
-        state.send(
-            conn,
-            &format!(
-                ":{server} FAIL TOPIC TEMPORARILY_UNAVAILABLE {display} \
-                 :Topic revision space exhausted"
-            ),
-        );
-        return;
+        return Some(crate::core::state::ChannelTopicResult::Unavailable {
+            display,
+            message: "Topic revision space exhausted".into(),
+        });
     };
     state.channel_topic_revision = revision;
     let topic = new_topic
@@ -923,20 +915,184 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
         label,
     };
     if state.db_tx.try_push(request).is_err() {
-        let server = state.config.server_name.clone();
-        state.send(
-            conn,
-            &format!(
-                ":{server} FAIL TOPIC TEMPORARILY_UNAVAILABLE {display} \
-                 :Topic could not be persisted"
-            ),
-        );
-        return;
+        return Some(crate::core::state::ChannelTopicResult::Unavailable {
+            display,
+            message: "Topic could not be persisted".into(),
+        });
     }
     state
         .pending_channel_topics
         .insert(key, (revision, new_topic));
-    state.defer_captured_reply(conn);
+    if state.sessions.contains_key(&conn) {
+        state.defer_captured_reply(conn);
+    }
+    None
+}
+
+pub(super) fn topic_on_owner(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelTopic,
+) -> Option<crate::core::state::ChannelTopicResult> {
+    let label = request.label();
+    let (owner, actor, target, operation) = request.into_parts();
+    if let crate::core::state::ChannelTopicOperation::Set(text) = operation {
+        return topic_set_on_owner(state, owner, actor, target, text, label);
+    }
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "TOPIC owner does not match target");
+    let Some(channel) = state.channels.get(&key) else {
+        return Some(crate::core::state::ChannelTopicResult::NoSuchChannel { target });
+    };
+    if channel.hidden_from(actor.recipient.conn()).is_some() {
+        return Some(crate::core::state::ChannelTopicResult::Hidden { target });
+    }
+    Some(crate::core::state::ChannelTopicResult::Topic {
+        display: channel.name.clone(),
+        topic: channel.topic.clone(),
+    })
+}
+
+pub(super) fn emit_topic_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTopicResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_topic_result_now(state, conn, result)
+    });
+}
+
+fn emit_topic_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTopicResult,
+) {
+    match result {
+        crate::core::state::ChannelTopicResult::NoSuchChannel { target }
+        | crate::core::state::ChannelTopicResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelTopicResult::Topic { display, topic } => match topic {
+            Some(topic) => {
+                state.numeric(conn, RPL_TOPIC, &[&display], Some(&topic.text));
+                state.numeric(
+                    conn,
+                    RPL_TOPICWHOTIME,
+                    &[&display, &topic.set_by, &topic.set_at_secs.to_string()],
+                    None,
+                );
+            }
+            None => state.numeric(conn, RPL_NOTOPIC, &[&display], Some("No topic is set")),
+        },
+        crate::core::state::ChannelTopicResult::Set { line } => state.send_timed(conn, &line),
+        crate::core::state::ChannelTopicResult::NotOnChannel { target } => {
+            state.err_notonchannel(conn, &target);
+        }
+        crate::core::state::ChannelTopicResult::NotOperator { target } => state.numeric(
+            conn,
+            ERR_CHANOPRIVSNEEDED,
+            &[&target],
+            Some("You're not a channel operator"),
+        ),
+        crate::core::state::ChannelTopicResult::CannotSend { target } => state.numeric(
+            conn,
+            ERR_CANNOTSENDTOCHAN,
+            &[&target],
+            Some("Cannot send to channel"),
+        ),
+        crate::core::state::ChannelTopicResult::Unavailable { display, message } => {
+            let server = state.config.server_name.clone();
+            state.send(
+                conn,
+                &format!(":{server} FAIL TOPIC TEMPORARILY_UNAVAILABLE {display} :{message}"),
+            );
+        }
+        crate::core::state::ChannelTopicResult::PersistenceFailed { display, failure } => {
+            let (code, message) = match failure {
+                crate::core::ChannelTopicFailure::MissingRegistration => (
+                    "REGISTRATION_CHANGED",
+                    "Channel is no longer registered; topic was not changed",
+                ),
+                crate::core::ChannelTopicFailure::PersistenceUnavailable => {
+                    ("TEMPORARILY_UNAVAILABLE", "Topic could not be persisted")
+                }
+            };
+            let server = state.config.server_name.clone();
+            state.send(
+                conn,
+                &format!(":{server} FAIL TOPIC {code} {display} :{message}"),
+            );
+        }
+    }
+}
+
+pub(super) fn topic_persisted_on_owner(
+    state: &mut ServerState,
+    conn: ConnId,
+    session: Option<crate::core::SessionOwner>,
+    result: crate::core::ChannelTopicPersistence,
+) {
+    match result {
+        crate::core::ChannelTopicPersistence::Set {
+            channel,
+            display,
+            prefix,
+            topic,
+            revision,
+            retained,
+            label,
+        } => {
+            let line = format!(
+                ":{prefix} TOPIC {display} :{}",
+                topic.as_ref().map_or("", |t| &t.0)
+            );
+            channel_topic_set(
+                state,
+                conn,
+                AppliedChannelTopic {
+                    channel,
+                    display,
+                    prefix,
+                    topic,
+                    revision,
+                    retained,
+                    label: label.clone(),
+                },
+            );
+            if let Some(session) = session.filter(|session| !state.owns_session(*session)) {
+                state.route_topic_result(
+                    session,
+                    crate::core::state::ChannelTopicResult::Set { line },
+                    label,
+                );
+            }
+        }
+        crate::core::ChannelTopicPersistence::Failed {
+            channel,
+            display,
+            revision,
+            label,
+            failure,
+        } => {
+            channel_topic_failed(
+                state,
+                conn,
+                channel,
+                display.clone(),
+                revision,
+                label.clone(),
+                failure,
+            );
+            if let Some(session) = session.filter(|session| !state.owns_session(*session)) {
+                state.route_topic_result(
+                    session,
+                    crate::core::state::ChannelTopicResult::PersistenceFailed { display, failure },
+                    label,
+                );
+            }
+        }
+    }
 }
 
 pub(super) struct AppliedChannelTopic {

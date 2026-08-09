@@ -14,8 +14,12 @@ and integration claims.
 
 ### Stage F — Scale architecture and qualification
 
-- Ship a deterministic, sharded core while preserving IRC and control-plane
-  semantics.
+- Complete typed cross-shard channel ownership. JOIN, PART, QUIT, single-line
+  messages, TAGMSG, and batches/multiline route to the channel owner; channel
+  control, queries, services, history, persistence callbacks, and HTTP
+  controls still need the same boundary.
+- Prove multi-worker ordering, failure, backpressure, persistence, API, and
+  load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.
 
 ## Remaining qualification

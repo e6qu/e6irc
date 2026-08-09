@@ -5,8 +5,8 @@
 //! transition — which is what makes deterministic simulation and
 //! step-debugging possible.
 //!
-//! Today one worker owns everything; the design splits the same worker
-//! into N hash-sharded instances when scale demands it.
+//! Workers can run as N hash-sharded instances. Each instance owns its local
+//! session state and its assigned channel state.
 
 mod handler;
 mod state;
@@ -26,7 +26,12 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
-use state::{ChannelActor, ChannelJoinResult, ChannelOwner, ChannelPartResult};
+use state::{
+    ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelMessage,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
+    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
+    ChannelTopicResult,
+};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -147,6 +152,19 @@ impl CoreIngress {
             Input::ChannelJoinResult { session, .. } => session.shard(),
             Input::ChannelPart { owner, .. } => owner.shard(),
             Input::ChannelPartResult { session, .. } => session.shard(),
+            Input::ChannelQuit { quit } => quit.owner().shard(),
+            Input::ChannelTopic { topic } => topic.owner().shard(),
+            Input::ChannelTopicResult { session, .. } => session.shard(),
+            Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::ChannelKick { kick } => kick.owner().shard(),
+            Input::ChannelKickResult { session, .. } => session.shard(),
+            Input::SessionChannelRemoved { session, .. } => session.shard(),
+            Input::ChannelMessage { message } => message.owner().shard(),
+            Input::ChannelMessageResult { session, .. } => session.shard(),
+            Input::ChannelMultiline { message } => message.owner().shard(),
+            Input::ChannelMultilineResult { session, .. } => session.shard(),
+            Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
+            Input::ChannelTagmsgResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -374,6 +392,58 @@ pub enum Input {
     ChannelPartResult {
         session: SessionOwner,
         result: ChannelPartResult,
+        label: Option<String>,
+    },
+    ChannelQuit {
+        quit: ChannelQuit,
+    },
+    ChannelTopic {
+        topic: ChannelTopic,
+    },
+    ChannelTopicResult {
+        session: SessionOwner,
+        result: ChannelTopicResult,
+        label: Option<String>,
+    },
+    ChannelTopicPersisted {
+        owner: ChannelOwner,
+        conn: ConnId,
+        session: Option<SessionOwner>,
+        result: ChannelTopicPersistence,
+    },
+    ChannelKick {
+        kick: ChannelKick,
+    },
+    ChannelKickResult {
+        session: SessionOwner,
+        result: ChannelKickResult,
+        label: Option<String>,
+    },
+    SessionChannelRemoved {
+        session: SessionOwner,
+        key: state::ChanKey,
+    },
+    ChannelMessage {
+        message: ChannelMessage,
+    },
+    ChannelMessageResult {
+        session: SessionOwner,
+        result: ChannelMessageResult,
+        label: Option<String>,
+    },
+    ChannelMultiline {
+        message: ChannelMultiline,
+    },
+    ChannelMultilineResult {
+        session: SessionOwner,
+        result: ChannelMultilineResult,
+    },
+    ChannelTagmsg {
+        tagmsg: ChannelTagmsg,
+    },
+    ChannelTagmsgResult {
+        session: SessionOwner,
+        result: ChannelTagmsgResult,
         label: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
@@ -829,6 +899,27 @@ pub enum ServerBanResult {
 pub enum ChannelTopicFailure {
     MissingRegistration,
     PersistenceUnavailable,
+}
+
+/// A durable TOPIC verdict that must be applied by the channel owner.
+#[derive(Debug)]
+pub enum ChannelTopicPersistence {
+    Set {
+        channel: String,
+        display: String,
+        prefix: String,
+        topic: Option<(String, String, u64)>,
+        revision: u64,
+        retained: bool,
+        label: Option<String>,
+    },
+    Failed {
+        channel: String,
+        display: String,
+        revision: u64,
+        label: Option<String>,
+        failure: ChannelTopicFailure,
+    },
 }
 
 /// Work the core asks the DB worker to do. The worker answers by
@@ -1432,6 +1523,56 @@ pub(crate) enum CoreEffect {
         result: ChannelPartResult,
         label: Option<String>,
     },
+    ChannelQuit(ChannelQuit),
+    ChannelTopic {
+        topic: ChannelTopic,
+    },
+    ChannelTopicResult {
+        session: SessionOwner,
+        result: ChannelTopicResult,
+        label: Option<String>,
+    },
+    ChannelTopicPersisted {
+        owner: ChannelOwner,
+        conn: ConnId,
+        session: Option<SessionOwner>,
+        result: ChannelTopicPersistence,
+    },
+    ChannelKick {
+        kick: ChannelKick,
+    },
+    ChannelKickResult {
+        session: SessionOwner,
+        result: ChannelKickResult,
+        label: Option<String>,
+    },
+    SessionChannelRemoved {
+        session: SessionOwner,
+        key: state::ChanKey,
+    },
+    ChannelMessage {
+        message: ChannelMessage,
+    },
+    ChannelMessageResult {
+        session: SessionOwner,
+        result: ChannelMessageResult,
+        label: Option<String>,
+    },
+    ChannelMultiline {
+        message: ChannelMultiline,
+    },
+    ChannelMultilineResult {
+        session: SessionOwner,
+        result: ChannelMultilineResult,
+    },
+    ChannelTagmsg {
+        tagmsg: ChannelTagmsg,
+    },
+    ChannelTagmsgResult {
+        session: SessionOwner,
+        result: ChannelTagmsgResult,
+        label: Option<String>,
+    },
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1504,6 +1645,65 @@ impl CoreWorker {
                         result,
                         label,
                     } => Input::ChannelPartResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelQuit(quit) => Input::ChannelQuit { quit },
+                    CoreEffect::ChannelTopic { topic } => Input::ChannelTopic { topic },
+                    CoreEffect::ChannelTopicResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelTopicResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelTopicPersisted {
+                        owner,
+                        conn,
+                        session,
+                        result,
+                    } => Input::ChannelTopicPersisted {
+                        owner,
+                        conn,
+                        session,
+                        result,
+                    },
+                    CoreEffect::SessionChannelRemoved { session, key } => {
+                        Input::SessionChannelRemoved { session, key }
+                    }
+                    CoreEffect::ChannelKick { kick } => Input::ChannelKick { kick },
+                    CoreEffect::ChannelKickResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelKickResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
+                    CoreEffect::ChannelMessageResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelMessageResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelMultiline { message } => Input::ChannelMultiline { message },
+                    CoreEffect::ChannelMultilineResult { session, result } => {
+                        Input::ChannelMultilineResult { session, result }
+                    }
+                    CoreEffect::ChannelTagmsg { tagmsg } => Input::ChannelTagmsg { tagmsg },
+                    CoreEffect::ChannelTagmsgResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelTagmsgResult {
                         session,
                         result,
                         label,
@@ -1686,6 +1886,127 @@ impl Core {
                     "PART result reached wrong session shard"
                 );
                 handler::channel_part_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelQuit { quit } => {
+                self.state
+                    .quit_channel_member(quit.owner(), quit.conn(), quit.line());
+            }
+            Input::ChannelTopic { topic } => {
+                assert_eq!(
+                    topic.owner().shard(),
+                    self.shard,
+                    "TOPIC reached wrong channel shard"
+                );
+                handler::channel_topic(&mut self.state, topic);
+            }
+            Input::ChannelTopicResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "TOPIC result reached wrong session shard"
+                );
+                handler::channel_topic_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelTopicPersisted {
+                owner,
+                conn,
+                session,
+                result,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "TOPIC verdict reached wrong channel shard"
+                );
+                handler::channel_topic_persisted(&mut self.state, conn, session, result);
+            }
+            Input::SessionChannelRemoved { session, key } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "session update reached wrong shard"
+                );
+                self.state.remove_session_channel(session.conn(), &key);
+            }
+            Input::ChannelKick { kick } => {
+                assert_eq!(
+                    kick.owner().shard(),
+                    self.shard,
+                    "KICK reached wrong channel shard"
+                );
+                handler::channel_kick(&mut self.state, kick);
+            }
+            Input::ChannelKickResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "KICK result reached wrong session shard"
+                );
+                handler::channel_kick_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelMessage { message } => {
+                assert_eq!(
+                    message.owner().shard(),
+                    self.shard,
+                    "message reached wrong channel shard"
+                );
+                handler::channel_message(&mut self.state, message);
+            }
+            Input::ChannelMessageResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "message result reached wrong session shard"
+                );
+                handler::channel_message_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelMultiline { message } => {
+                assert_eq!(
+                    message.owner().shard(),
+                    self.shard,
+                    "multiline reached wrong channel shard"
+                );
+                handler::channel_multiline(&mut self.state, message);
+            }
+            Input::ChannelMultilineResult { session, result } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "multiline result reached wrong session shard"
+                );
+                handler::channel_multiline_result(&mut self.state, session.conn(), result);
+            }
+            Input::ChannelTagmsg { tagmsg } => {
+                assert_eq!(
+                    tagmsg.owner().shard(),
+                    self.shard,
+                    "TAGMSG reached wrong channel shard"
+                );
+                handler::channel_tagmsg(&mut self.state, tagmsg);
+            }
+            Input::ChannelTagmsgResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "TAGMSG result reached wrong session shard"
+                );
+                handler::channel_tagmsg_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
@@ -2137,7 +2458,10 @@ mod ingress_tests {
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(0)),
-                Caps::default(),
+                Caps {
+                    message_tags: true,
+                    ..Caps::default()
+                },
             ),
             MemberIdentity::new("peer".into(), "peer!u@host.test".into(), false),
             MemberModes::default(),
@@ -2170,6 +2494,34 @@ mod ingress_tests {
             .expect("joiner session")
             .caps
             .labeled_response = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .echo_message = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .message_tags = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .batch = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .multiline = true;
         while joiner_rx.try_pop().is_some() {}
 
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
@@ -2225,6 +2577,193 @@ mod ingress_tests {
         ingress
             .push(Input::Line {
                 conn: ConnId(1),
+                line: b"TOPIC #chat".to_vec(),
+            })
+            .await
+            .expect("queue cross-shard TOPIC query");
+        let topic = joiner_rx.pop().await.expect("joiner receives TOPIC result");
+        assert!(
+            topic
+                .payload
+                .0
+                .ends_with(b" 331 joiner #chat :No topic is set\r\n")
+        );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=message PRIVMSG #chat :hello".to_vec(),
+            })
+            .await
+            .expect("queue cross-shard message");
+        let message = peer_rx.pop().await.expect("peer receives channel message");
+        assert!(
+            message
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
+        );
+        let echo = joiner_rx.pop().await.expect("joiner receives labeled echo");
+        assert!(echo.payload.0.starts_with(b"@label=message;msgid="));
+        assert!(
+            echo.payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
+        );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=multi BATCH +m draft/multiline #chat".to_vec(),
+            })
+            .await
+            .expect("open cross-shard multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@batch=m PRIVMSG #chat :one".to_vec(),
+            })
+            .await
+            .expect("collect cross-shard multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"BATCH -m".to_vec(),
+            })
+            .await
+            .expect("close cross-shard multiline");
+        let multiline_peer = peer_rx
+            .pop()
+            .await
+            .expect("peer receives flattened multiline");
+        assert!(
+            multiline_peer
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :one\r\n")
+        );
+        let multiline_open = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives multiline open");
+        assert!(multiline_open.payload.0.starts_with(b"@label=multi;msgid="));
+        assert!(
+            multiline_open
+                .payload
+                .0
+                .windows(b" BATCH +".len())
+                .any(|part| part == b" BATCH +")
+        );
+        let multiline_line = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives multiline line");
+        assert!(
+            multiline_line
+                .payload
+                .0
+                .ends_with(b" PRIVMSG #chat :one\r\n")
+        );
+        let multiline_close = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives multiline close");
+        assert!(multiline_close.payload.0.starts_with(b":irc.test BATCH -"));
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"CAP REQ :-echo-message".to_vec(),
+            })
+            .await
+            .expect("disable echo-message");
+        let cap_ack = joiner_rx.pop().await.expect("echo-message CAP ACK");
+        assert!(
+            cap_ack
+                .payload
+                .0
+                .ends_with(b" CAP joiner ACK :-echo-message\r\n")
+        );
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=noecho BATCH +n draft/multiline #chat".to_vec(),
+            })
+            .await
+            .expect("open no-echo multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@batch=n PRIVMSG #chat :two".to_vec(),
+            })
+            .await
+            .expect("collect no-echo multiline");
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"BATCH -n".to_vec(),
+            })
+            .await
+            .expect("close no-echo multiline");
+        let noecho_peer = peer_rx
+            .pop()
+            .await
+            .expect("peer receives no-echo multiline");
+        assert!(
+            noecho_peer
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :two\r\n")
+        );
+        let noecho_ack = joiner_rx
+            .pop()
+            .await
+            .expect("opening label is acknowledged");
+        assert!(
+            noecho_ack
+                .payload
+                .0
+                .starts_with(b"@label=noecho :irc.test ACK\r\n")
+        );
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"CAP REQ :echo-message".to_vec(),
+            })
+            .await
+            .expect("restore echo-message");
+        joiner_rx.pop().await.expect("echo-message CAP ACK");
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=tag;+typing=active TAGMSG #chat".to_vec(),
+            })
+            .await
+            .expect("queue cross-shard TAGMSG");
+        let tagmsg = peer_rx.pop().await.expect("peer receives channel TAGMSG");
+        assert!(tagmsg.payload.0.starts_with(b"@msgid="));
+        assert!(
+            tagmsg
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test TAGMSG #chat\r\n")
+        );
+        let tag_echo = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives labeled TAGMSG echo");
+        assert!(tag_echo.payload.0.starts_with(b"@label=tag;msgid="));
+        assert!(
+            tag_echo
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test TAGMSG #chat\r\n")
+        );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
                 line: b"@label=part PART #chat :bye".to_vec(),
             })
             .await
@@ -2241,6 +2780,47 @@ mod ingress_tests {
             part.payload
                 .0
                 .starts_with(b"@label=part :joiner!joiner@host.test PART #chat :bye")
+        );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"JOIN #chat".to_vec(),
+            })
+            .await
+            .expect("queue second join");
+        let peer_rejoin = peer_rx.pop().await.expect("peer receives second JOIN");
+        assert!(
+            peer_rejoin
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test JOIN #chat\r\n")
+        );
+        let own_rejoin = joiner_rx.pop().await.expect("joiner receives second JOIN");
+        assert!(
+            own_rejoin
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test JOIN #chat\r\n")
+        );
+        joiner_rx.pop().await.expect("joiner receives second NAMES");
+        joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives second end of NAMES");
+
+        ingress
+            .push(Input::Closed {
+                conn: ConnId(1),
+                reason: "bye".into(),
+            })
+            .await
+            .expect("queue close");
+        let quit = peer_rx.pop().await.expect("peer receives remote QUIT");
+        assert!(
+            quit.payload
+                .0
+                .ends_with(b":joiner!joiner@host.test QUIT :bye\r\n")
         );
 
         first_tx.try_push(Input::Shutdown).expect("stop first");
