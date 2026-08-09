@@ -162,24 +162,26 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         if target.is_empty() {
             continue;
         }
+        let key = state.chan_key(target);
+        // The session owner alone owns this index, so it enforces the bound
+        // before either a local or remote channel-owner request.
+        if !state.sessions[&conn].channels.contains(&key)
+            && state.sessions[&conn].channels.len() >= MAX_CHANNELS_PER_SESSION
+        {
+            state.numeric(
+                conn,
+                ERR_TOOMANYCHANNELS,
+                &[target],
+                Some("You have joined too many channels"),
+            );
+            continue;
+        }
         let owner = state.channel_owner(target);
         let join_key = keys.get(i).copied();
         if state.owns_channel(&owner) {
             let result = join_on_owner(state, actor.clone(), target, join_key);
             emit_join_response(state, conn, result);
         } else {
-            let key = state.chan_key(target);
-            if !state.sessions[&conn].channels.contains(&key)
-                && state.sessions[&conn].channels.len() >= MAX_CHANNELS_PER_SESSION
-            {
-                state.numeric(
-                    conn,
-                    ERR_TOOMANYCHANNELS,
-                    &[target],
-                    Some("You have joined too many channels"),
-                );
-                continue;
-            }
             let label = state.defer_channel_reply(conn);
             state.route_join(
                 owner,
