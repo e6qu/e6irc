@@ -741,6 +741,32 @@ pub enum ChannelPartResult {
     NotOnChannel { name: String },
 }
 
+/// A complete QUIT request for one channel owner.
+#[derive(Debug)]
+pub struct ChannelQuit {
+    owner: ChannelOwner,
+    conn: ConnId,
+    line: String,
+}
+
+impl ChannelQuit {
+    pub(crate) fn new(owner: ChannelOwner, conn: ConnId, line: String) -> Self {
+        Self { owner, conn, line }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+
+    pub(crate) fn conn(&self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn line(&self) -> &str {
+        &self.line
+    }
+}
+
 struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
@@ -1258,6 +1284,10 @@ impl ChannelOwner {
     pub(crate) fn shard(&self) -> CoreShardId {
         self.shard
     }
+
+    pub(crate) fn key(&self) -> &ChanKey {
+        &self.key
+    }
 }
 
 pub(crate) struct ChannelDirectory {
@@ -1561,6 +1591,10 @@ impl ServerState {
             result,
             label,
         });
+    }
+
+    pub fn route_quit(&mut self, quit: ChannelQuit) {
+        self.effects.push(CoreEffect::ChannelQuit(quit));
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {
@@ -2781,19 +2815,12 @@ impl ServerState {
         let joined: Vec<ChanKey> = session.channels.iter().cloned().collect();
 
         if let Some(line) = quit_line {
-            // send_timed per peer so server-time clients get an @time= tag,
-            // consistent with every other membership event (a raw send_bytes
-            // loop would omit it for QUIT alone).
-            let peers = self.channel_peers(conn);
-            for p in peers {
-                self.send_timed(p, &line);
-            }
-        }
-        for key in joined {
-            if let Some(chan) = self.channels.get_mut(&key) {
-                chan.remove_member(conn);
-                if !chan.has_members() {
-                    self.remove_channel(&key);
+            for key in joined {
+                let owner = self.channels.owner(&key);
+                if self.owns_channel(&owner) {
+                    self.quit_channel_member(&owner, conn, &line);
+                } else {
+                    self.route_quit(ChannelQuit::new(owner, conn, line.clone()));
                 }
             }
         }
@@ -2837,6 +2864,29 @@ impl ServerState {
                     });
                 self.hot_history.retain(|k| self.history.contains_key(k));
             }
+        }
+    }
+
+    /// Apply a registered session's departure on the channel-owning shard.
+    /// A preceding PART can have removed the member while its response was in
+    /// flight to the closing session; that makes this departure already applied.
+    pub fn quit_channel_member(&mut self, owner: &ChannelOwner, conn: ConnId, line: &str) {
+        assert_eq!(
+            owner.shard(),
+            self.shard,
+            "QUIT reached wrong channel shard"
+        );
+        let key = owner.key();
+        let removed = self
+            .channels
+            .get_mut(key)
+            .and_then(|channel| channel.remove_member(conn));
+        let Some(_) = removed else {
+            return;
+        };
+        self.broadcast_channel(key, line, Some(conn));
+        if !self.channels[key].has_members() {
+            self.remove_channel(key);
         }
     }
 }

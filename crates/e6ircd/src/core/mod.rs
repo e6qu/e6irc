@@ -26,7 +26,7 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
-use state::{ChannelActor, ChannelJoinResult, ChannelOwner, ChannelPartResult};
+use state::{ChannelActor, ChannelJoinResult, ChannelOwner, ChannelPartResult, ChannelQuit};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -147,6 +147,7 @@ impl CoreIngress {
             Input::ChannelJoinResult { session, .. } => session.shard(),
             Input::ChannelPart { owner, .. } => owner.shard(),
             Input::ChannelPartResult { session, .. } => session.shard(),
+            Input::ChannelQuit { quit } => quit.owner().shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -375,6 +376,9 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelPartResult,
         label: Option<String>,
+    },
+    ChannelQuit {
+        quit: ChannelQuit,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
@@ -1432,6 +1436,7 @@ pub(crate) enum CoreEffect {
         result: ChannelPartResult,
         label: Option<String>,
     },
+    ChannelQuit(ChannelQuit),
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1508,6 +1513,7 @@ impl CoreWorker {
                         result,
                         label,
                     },
+                    CoreEffect::ChannelQuit(quit) => Input::ChannelQuit { quit },
                 };
                 if self.ingress.push(input).await.is_err() {
                     panic!("cross-shard target closed");
@@ -1686,6 +1692,10 @@ impl Core {
                     "PART result reached wrong session shard"
                 );
                 handler::channel_part_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelQuit { quit } => {
+                self.state
+                    .quit_channel_member(quit.owner(), quit.conn(), quit.line());
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
@@ -2241,6 +2251,47 @@ mod ingress_tests {
             part.payload
                 .0
                 .starts_with(b"@label=part :joiner!joiner@host.test PART #chat :bye")
+        );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"JOIN #chat".to_vec(),
+            })
+            .await
+            .expect("queue second join");
+        let peer_rejoin = peer_rx.pop().await.expect("peer receives second JOIN");
+        assert!(
+            peer_rejoin
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test JOIN #chat\r\n")
+        );
+        let own_rejoin = joiner_rx.pop().await.expect("joiner receives second JOIN");
+        assert!(
+            own_rejoin
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test JOIN #chat\r\n")
+        );
+        joiner_rx.pop().await.expect("joiner receives second NAMES");
+        joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives second end of NAMES");
+
+        ingress
+            .push(Input::Closed {
+                conn: ConnId(1),
+                reason: "bye".into(),
+            })
+            .await
+            .expect("queue close");
+        let quit = peer_rx.pop().await.expect("peer receives remote QUIT");
+        assert!(
+            quit.payload
+                .0
+                .ends_with(b":joiner!joiner@host.test QUIT :bye\r\n")
         );
 
         first_tx.try_push(Input::Shutdown).expect("stop first");
