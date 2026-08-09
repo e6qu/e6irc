@@ -105,6 +105,56 @@ impl NickDirectory {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct MembershipDirectory {
+    by_conn: Arc<Mutex<HashMap<ConnId, HashSet<ChanKey>>>>,
+}
+
+impl MembershipDirectory {
+    pub(crate) fn join(&self, conn: ConnId, key: ChanKey) {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .entry(conn)
+            .or_default()
+            .insert(key);
+    }
+
+    pub(crate) fn part(&self, conn: ConnId, key: &ChanKey) {
+        let mut by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let Some(channels) = by_conn.get_mut(&conn) else {
+            return;
+        };
+        channels.remove(key);
+        if channels.is_empty() {
+            by_conn.remove(&conn);
+        }
+    }
+
+    pub(crate) fn release(&self, conn: ConnId) {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .remove(&conn);
+    }
+
+    pub(crate) fn shares(&self, a: ConnId, b: ConnId) -> bool {
+        let by_conn = self.by_conn.lock().expect("membership directory poisoned");
+        let (Some(a), Some(b)) = (by_conn.get(&a), by_conn.get(&b)) else {
+            return false;
+        };
+        a.intersection(b).next().is_some()
+    }
+
+    pub(crate) fn contains(&self, conn: ConnId, key: &ChanKey) -> bool {
+        self.by_conn
+            .lock()
+            .expect("membership directory poisoned")
+            .get(&conn)
+            .is_some_and(|channels| channels.contains(key))
+    }
+}
+
 /// A channel list-mode mask (`+b`/`+q`/`+e`/`+I`), carrying both the casefolded
 /// form used for equality and the original casing used for display and matching.
 ///
@@ -1895,6 +1945,7 @@ pub(crate) struct ServerState {
     pub casemap: CaseMapping,
     pub sessions: SessionStore,
     nicks: NickDirectory,
+    memberships: MembershipDirectory,
     pub channels: ChannelDirectory,
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
@@ -2247,6 +2298,23 @@ impl ServerState {
         if let Some(session) = self.sessions.get_mut(&conn) {
             session.channels.remove(key);
         }
+        self.memberships.part(conn, key);
+    }
+
+    pub fn membership_join(&self, conn: ConnId, key: ChanKey) {
+        self.memberships.join(conn, key);
+    }
+
+    pub fn membership_part(&self, conn: ConnId, key: &ChanKey) {
+        self.memberships.part(conn, key);
+    }
+
+    pub fn is_channel_member(&self, conn: ConnId, key: &ChanKey) -> bool {
+        self.memberships.contains(conn, key)
+            || self
+                .channels
+                .get(key)
+                .is_some_and(|channel| channel.is_member(conn))
     }
 
     pub fn route_message(&mut self, message: ChannelMessage) {
@@ -2370,6 +2438,7 @@ impl ServerState {
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
         nicks: NickDirectory,
+        memberships: MembershipDirectory,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
@@ -2379,6 +2448,7 @@ impl ServerState {
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
             nicks,
+            memberships,
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             effects: Vec::new(),
@@ -2563,6 +2633,9 @@ impl ServerState {
 
     /// Whether two connections share at least one channel.
     pub fn share_channel(&self, a: ConnId, b: ConnId) -> bool {
+        if self.memberships.shares(a, b) {
+            return true;
+        }
         let (Some(sa), Some(sb)) = (self.sessions.get(&a), self.sessions.get(&b)) else {
             return false;
         };
@@ -3600,6 +3673,7 @@ impl ServerState {
             }
         }
         let session = self.sessions.remove(&conn).expect("checked above");
+        self.memberships.release(conn);
         for key in session.monitoring.keys() {
             if let Some(watchers) = self.monitors.get_mut(key) {
                 watchers.remove(&conn);
@@ -3857,7 +3931,24 @@ mod session_store_tests {
             db_tx,
             Arc::new(Telemetry::new()),
             NickDirectory::default(),
+            MembershipDirectory::default(),
         )
+    }
+
+    #[test]
+    fn membership_directory_tracks_shared_channels_and_departures() {
+        let directory = MembershipDirectory::default();
+        let channel = ChanKey("#chat".into());
+        let alice = ConnId(1);
+        let bob = ConnId(2);
+        directory.join(alice, channel.clone());
+        directory.join(bob, channel.clone());
+        assert!(directory.shares(alice, bob));
+        directory.part(bob, &channel);
+        assert!(!directory.shares(alice, bob));
+        directory.join(bob, channel);
+        directory.release(alice);
+        assert!(!directory.shares(alice, bob));
     }
 
     fn open(state: &mut ServerState, conn: ConnId) {

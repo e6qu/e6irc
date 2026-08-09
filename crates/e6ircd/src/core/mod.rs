@@ -31,7 +31,7 @@ use state::{
     ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
     ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
 };
-use state::{NickDirectory, ServerState};
+use state::{MembershipDirectory, NickDirectory, ServerState};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -111,6 +111,8 @@ pub struct CoreIngress {
     shards: Arc<[Sender<Input>]>,
     count: CoreShardCount,
     nicks: NickDirectory,
+    #[cfg(test)]
+    memberships: MembershipDirectory,
 }
 
 impl CoreIngress {
@@ -119,6 +121,8 @@ impl CoreIngress {
             shards: Arc::from([sender]),
             count: CoreShardCount::single(),
             nicks: NickDirectory::default(),
+            #[cfg(test)]
+            memberships: MembershipDirectory::default(),
         }
     }
 
@@ -138,6 +142,8 @@ impl CoreIngress {
             shards: shards.into(),
             count: CoreShardCount::new(count),
             nicks: NickDirectory::default(),
+            #[cfg(test)]
+            memberships: MembershipDirectory::default(),
         }
     }
 
@@ -189,6 +195,11 @@ impl CoreIngress {
 
     pub(crate) fn nick_directory(&self) -> NickDirectory {
         self.nicks.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn membership_directory(&self) -> MembershipDirectory {
+        self.memberships.clone()
     }
 }
 
@@ -1777,6 +1788,7 @@ impl Core {
             CoreShardId(0),
             CoreShardCount::single(),
             nicks,
+            MembershipDirectory::default(),
         )
     }
 
@@ -1787,9 +1799,10 @@ impl Core {
         shard: CoreShardId,
         shards: CoreShardCount,
         nicks: NickDirectory,
+        memberships: MembershipDirectory,
     ) -> Self {
         Self {
-            state: ServerState::new(shard, shards, config, db_tx, telemetry, nicks),
+            state: ServerState::new(shard, shards, config, db_tx, telemetry, nicks, memberships),
             shard,
             next_sequence: 0,
         }
@@ -2274,7 +2287,8 @@ mod connection_id_allocator_tests {
 mod ingress_tests {
     use super::{
         ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
-        CoreShardId, CoreTraceStep, CoreWorker, Input, NickDirectory, ReplayError, SessionOwner,
+        CoreShardId, CoreTraceStep, CoreWorker, Input, MembershipDirectory, NickDirectory,
+        ReplayError, SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2334,6 +2348,7 @@ mod ingress_tests {
         let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
         let nicks = ingress.nick_directory();
+        let memberships = ingress.membership_directory();
         let (first_db, _first_db_rx) = queue(Config {
             name: "two-worker-first-db",
             capacity: 1,
@@ -2351,6 +2366,7 @@ mod ingress_tests {
             CoreShardId(0),
             shards,
             nicks.clone(),
+            memberships.clone(),
         );
         let second = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
@@ -2359,6 +2375,7 @@ mod ingress_tests {
             CoreShardId(1),
             shards,
             nicks,
+            memberships,
         );
         TwoWorkerHarness {
             first,
@@ -2459,6 +2476,7 @@ mod ingress_tests {
             CoreShardId(0),
             shards,
             ingress.nick_directory(),
+            ingress.membership_directory(),
         );
         let target = ["#alpha", "#beta", "#gamma"]
             .into_iter()
@@ -3233,6 +3251,7 @@ mod ingress_tests {
             CoreShardId(1),
             CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
             NickDirectory::default(),
+            MembershipDirectory::default(),
         );
         let (tx, rx) = queue(Config {
             name: "nonzero-core-shard-input",

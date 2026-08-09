@@ -159,7 +159,7 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // so a client can only ever ask for a conversation it is part of.
     let (hist_key, history_targets) = if target.starts_with('#') {
         let key = state.chan_key(target);
-        let is_member = state.channels.get(&key).is_some_and(|c| c.is_member(conn));
+        let is_member = state.is_channel_member(conn, &key);
         if !is_member {
             chathistory_fail(
                 state,

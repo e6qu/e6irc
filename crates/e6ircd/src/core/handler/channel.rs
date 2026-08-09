@@ -435,6 +435,7 @@ fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoin
                 return;
             };
             session.channels.insert(join.key.clone());
+            state.membership_join(conn, join.key.clone());
             if !join.own_join.is_empty() {
                 state.send_timed(conn, &join.own_join);
             }
@@ -579,6 +580,7 @@ fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPart
             if let Some(session) = state.sessions.get_mut(&conn) {
                 session.channels.remove(&key);
             }
+            state.membership_part(conn, &key);
         }
     }
 }
