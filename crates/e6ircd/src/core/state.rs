@@ -641,7 +641,7 @@ impl Session {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MemberModes {
     pub op: bool,
     pub voice: bool,
@@ -697,6 +697,42 @@ pub struct ChannelActor {
     pub(crate) account: Option<String>,
     pub(crate) realname: String,
     pub(crate) away: Option<String>,
+}
+
+impl ChannelActor {
+    pub(crate) fn session_owner(&self) -> SessionOwner {
+        self.recipient.owner
+    }
+}
+
+/// A channel owner's complete answer to a JOIN request.
+///
+/// This crosses back to the session owner instead of giving the channel owner
+/// access to another shard's session table.
+#[derive(Debug, Clone)]
+pub enum ChannelJoinResult {
+    Joined(ChannelJoinSuccess),
+    Rejected(ChannelJoinFailure),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelJoinSuccess {
+    pub(crate) key: ChanKey,
+    pub(crate) display: String,
+    pub(crate) topic: Option<Topic>,
+    pub(crate) secret: bool,
+    pub(crate) members: Vec<(MemberModes, MemberIdentity)>,
+    pub(crate) own_join: String,
+    pub(crate) own_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelJoinFailure {
+    NoSuchChannel { name: String },
+    InviteOnly { name: String },
+    Banned { name: String },
+    BadKey { name: String },
+    Full { name: String },
 }
 
 struct ChannelMember {
@@ -928,7 +964,7 @@ pub(crate) struct HistoryRing {
     pub complete: bool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Topic {
     pub text: String,
     pub set_by: String,
@@ -1467,12 +1503,27 @@ impl ServerState {
         actor: ChannelActor,
         name: String,
         join_key: Option<String>,
+        label: Option<String>,
     ) {
         self.effects.push(CoreEffect::ChannelJoin {
             owner,
             actor,
             name,
             join_key,
+            label,
+        });
+    }
+
+    pub fn route_join_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelJoinResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelJoinResult {
+            session,
+            result,
+            label,
         });
     }
 
@@ -2236,6 +2287,18 @@ impl ServerState {
         {
             capture.deferred = true;
         }
+    }
+
+    /// Start a cross-shard command. Its result owns the deferred slot and,
+    /// when present, the captured label.
+    pub fn defer_channel_reply(&mut self, conn: ConnId) -> Option<String> {
+        let label = self.capture.as_ref().and_then(|capture| {
+            (capture.conn == conn)
+                .then(|| capture.label.clone())
+                .flatten()
+        });
+        self.defer_captured_reply(conn);
+        label
     }
 
     /// Emit a reply the connection has been waiting on: it bypasses that
