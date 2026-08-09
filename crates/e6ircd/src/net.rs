@@ -1248,6 +1248,7 @@ async fn write_loop<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let mut batch = Vec::new();
     loop {
         let Some(envelope) = rx.pop().await else {
             // Core dropped the session (sender gone): flush and close.
@@ -1257,7 +1258,8 @@ where
         // Drain everything currently queued and present the shared Bytes as
         // vectored slices. Fan-out already serialized each capability variant
         // once; concatenating here copied every recipient's wire bytes again.
-        let mut batch = vec![envelope.payload.0];
+        batch.clear();
+        batch.push(envelope.payload.0);
         while let Some(e) = rx.try_pop() {
             batch.push(e.payload.0);
         }
