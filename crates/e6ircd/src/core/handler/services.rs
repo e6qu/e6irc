@@ -191,7 +191,7 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 return;
             }
             let key = state.nick_key(nick);
-            let Some(&victim) = state.nicks.get(&key) else {
+            let Some(victim) = state.nick_connection(&key) else {
                 state.service_notice(conn, "NickServ", &format!("\x02{nick}\x02 is not online."));
                 return;
             };
@@ -267,7 +267,7 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             let is_op = state
                 .channels
                 .get(&key)
-                .and_then(|c| c.members.get(&conn))
+                .and_then(|c| c.member(conn))
                 .is_some_and(|m| m.op);
             if !is_op {
                 state.service_notice(
@@ -604,7 +604,7 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
             .expect("registered"),
     };
     let nk = state.nick_key(&target_nick);
-    let Some(&target_conn) = state.nicks.get(&nk) else {
+    let Some(target_conn) = state.nick_connection(&nk) else {
         state.service_notice(
             conn,
             "ChanServ",
@@ -615,7 +615,7 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
     match state
         .channels
         .get(&key)
-        .and_then(|c| c.members.get(&target_conn))
+        .and_then(|c| c.member(target_conn))
         .map(|m| m.op)
     {
         None => {
@@ -637,7 +637,7 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
         Some(false) => {}
     }
     if let Some(chan) = state.channels.get_mut(&key)
-        && let Some(member) = chan.members.get_mut(&target_conn)
+        && let Some(member) = chan.member_mut(target_conn)
     {
         member.op = true;
     }

@@ -10,16 +10,19 @@
 
 mod handler;
 mod state;
+mod timer;
+
+pub(crate) use timer::TimerWheel;
 
 pub use state::{ConnId, CoreConfig, dm_conversation_key};
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use e6irc_queue::{PushError, Sender};
+use e6irc_queue::{Envelope, PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -35,6 +38,257 @@ use crate::observability::{LatencyKind, Telemetry};
 #[derive(Debug)]
 pub struct ConnectionIdAllocator {
     next: AtomicU64,
+}
+
+/// Number of core shards. Zero shards cannot be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreShardCount(NonZeroUsize);
+
+impl CoreShardCount {
+    pub fn new(count: NonZeroUsize) -> Self {
+        Self(count)
+    }
+
+    pub fn single() -> Self {
+        Self(NonZeroUsize::MIN)
+    }
+
+    fn shard_for(self, conn: ConnId) -> CoreShardId {
+        CoreShardId((conn.0 as usize) % self.0.get())
+    }
+
+    pub(crate) fn shard_for_channel(self, key: &state::ChanKey) -> CoreShardId {
+        let hash = key
+            .as_str()
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        CoreShardId((hash as usize) % self.0.get())
+    }
+}
+
+/// Index of one configured core shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoreShardId(usize);
+
+/// The only ingress path into core state.
+#[derive(Clone)]
+pub struct CoreIngress {
+    shards: Arc<[Sender<Input>]>,
+    count: CoreShardCount,
+}
+
+impl CoreIngress {
+    pub fn single(sender: Sender<Input>) -> Self {
+        Self {
+            shards: Arc::from([sender]),
+            count: CoreShardCount::single(),
+        }
+    }
+
+    /// Build an ingress with a mandatory first shard.
+    #[cfg(test)]
+    pub fn with_shards(first: Sender<Input>, mut rest: Vec<Sender<Input>>) -> Self {
+        let capacity = rest
+            .len()
+            .checked_add(1)
+            .expect("allocated shard list cannot exceed usize");
+        let count = NonZeroUsize::new(capacity)
+            .expect("mandatory first shard keeps the core shard count nonzero");
+        let mut shards = Vec::with_capacity(capacity);
+        shards.push(first);
+        shards.append(&mut rest);
+        Self {
+            shards: shards.into(),
+            count: CoreShardCount::new(count),
+        }
+    }
+
+    pub async fn push(&self, input: Input) -> Result<u64, Input> {
+        let shard = match &input {
+            Input::Open { conn, .. }
+            | Input::Line { conn, .. }
+            | Input::OverlongLine { conn }
+            | Input::Closed { conn, .. }
+            | Input::DbReply { conn, .. }
+            | Input::HistoryPage { conn, .. }
+            | Input::TargetsPage { conn, .. } => self.count.shard_for(*conn),
+            Input::Tick { .. }
+            | Input::Shutdown
+            | Input::Admin { .. }
+            | Input::ChannelDropResult { .. }
+            | Input::ServerBanResult { .. }
+            | Input::ChannelControlResult { .. }
+            | Input::OwnedChannelRegistrationResult { .. } => CoreShardId(0),
+        };
+        self.shards[shard.0].push(input).await
+    }
+
+    pub fn monitor(&self) -> QueueMonitor {
+        self.shards[0].monitor()
+    }
+}
+
+/// One event selected from a shard queue by the deterministic scheduler.
+pub(crate) struct ScheduledInput {
+    pub shard: CoreShardId,
+    pub sequence: u64,
+    pub input: Input,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoreTraceStep {
+    shard: CoreShardId,
+    sequence: u64,
+}
+
+#[cfg(test)]
+impl ScheduledInput {
+    pub(crate) fn trace_step(&self) -> CoreTraceStep {
+        CoreTraceStep {
+            shard: self.shard,
+            sequence: self.sequence,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CoreTrace {
+    steps: Vec<CoreTraceStep>,
+}
+
+#[cfg(test)]
+impl CoreTrace {
+    pub(crate) fn steps(&self) -> &[CoreTraceStep] {
+        &self.steps
+    }
+
+    fn record(&mut self, input: &ScheduledInput) {
+        self.steps.push(input.trace_step());
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayError {
+    ShardMissing,
+    EventMissing,
+    SequenceMismatch { expected: u64, actual: u64 },
+}
+
+/// Round-robin core queue selection.
+///
+/// A step records both the selected shard and that queue's sequence number,
+/// which is sufficient to replay a fixed set of queued inputs.
+pub(crate) struct CoreScheduler {
+    receivers: Vec<Receiver<Input>>,
+    count: CoreShardCount,
+    next: CoreShardId,
+    #[cfg(test)]
+    trace: CoreTrace,
+}
+
+impl CoreScheduler {
+    pub(crate) fn single(receiver: Receiver<Input>) -> Self {
+        Self {
+            receivers: vec![receiver],
+            count: CoreShardCount::single(),
+            next: CoreShardId(0),
+            #[cfg(test)]
+            trace: CoreTrace::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_shards(first: Receiver<Input>, mut rest: Vec<Receiver<Input>>) -> Self {
+        let capacity = rest
+            .len()
+            .checked_add(1)
+            .expect("allocated shard list cannot exceed usize");
+        let count = NonZeroUsize::new(capacity)
+            .expect("mandatory first shard keeps the core shard count nonzero");
+        let mut receivers = Vec::with_capacity(capacity);
+        receivers.push(first);
+        receivers.append(&mut rest);
+        Self {
+            receivers,
+            count: CoreShardCount::new(count),
+            next: CoreShardId(0),
+            trace: CoreTrace::default(),
+        }
+    }
+
+    pub(crate) fn try_step(&mut self) -> Option<ScheduledInput> {
+        for _ in 0..self.count.0.get() {
+            let shard = self.next;
+            self.next = CoreShardId((self.next.0 + 1) % self.count.0.get());
+            if let Some(Envelope {
+                seq,
+                payload: input,
+            }) = self.receivers[shard.0].try_pop()
+            {
+                let scheduled = ScheduledInput {
+                    shard,
+                    sequence: seq,
+                    input,
+                };
+                #[cfg(test)]
+                self.trace.record(&scheduled);
+                return Some(scheduled);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace(&self) -> &CoreTrace {
+        &self.trace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_step(
+        &mut self,
+        step: CoreTraceStep,
+    ) -> Result<ScheduledInput, ReplayError> {
+        let receiver = self
+            .receivers
+            .get_mut(step.shard.0)
+            .ok_or(ReplayError::ShardMissing)?;
+        let Envelope {
+            seq,
+            payload: input,
+        } = receiver.try_pop().ok_or(ReplayError::EventMissing)?;
+        if seq != step.sequence {
+            return Err(ReplayError::SequenceMismatch {
+                expected: step.sequence,
+                actual: seq,
+            });
+        }
+        Ok(ScheduledInput {
+            shard: step.shard,
+            sequence: seq,
+            input,
+        })
+    }
+
+    /// Await one event from the one-worker production configuration.
+    pub(crate) async fn pop_single(&mut self) -> Option<ScheduledInput> {
+        debug_assert_eq!(self.count.0.get(), 1);
+        if let Some(input) = self.try_step() {
+            return Some(input);
+        }
+        self.receivers[0]
+            .pop()
+            .await
+            .map(|envelope| ScheduledInput {
+                shard: CoreShardId(0),
+                sequence: envelope.seq,
+                input: envelope.payload,
+            })
+    }
 }
 
 impl ConnectionIdAllocator {
@@ -168,7 +422,7 @@ pub enum Input {
 /// `false` when the core is gone, so the connection stops directly rather
 /// than queueing into a void. Shared by the TCP and WebSocket read loops.
 pub(crate) async fn push_framed(
-    core_tx: &e6irc_queue::Sender<Input>,
+    core_tx: &CoreIngress,
     conn: ConnId,
     events: &mut Vec<e6irc_proto::framing::LineEvent>,
 ) -> bool {
@@ -1070,32 +1324,17 @@ pub enum DbReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output(pub Bytes);
 
-/// A wire line whose content carries no injection bytes (embedded CR/LF/NUL).
-/// [`deliver`] takes only this, so a client's stream can never be handed a line
-/// that smuggles a second, forged line — the injection class is *unrepresentable
-/// at the delivery funnel*, in every build (not merely a debug assertion).
+/// A wire line with no embedded CR, LF, or NUL.
 ///
-/// Its one constructor, [`WireLine::sanitized`], neutralizes any CR/LF/NUL in
-/// the content — replacing each with a space, as `sanitize::upstream_line` does
-/// for bridge lines — while leaving the single trailing CRLF terminator, in
-/// every build. A well-formed line built by `ServerState::send` already has
-/// clean content (`Message::parse` rejects those bytes on input, and
-/// per-position sanitizers guard the synthesized fields), so this is a no-op
-/// fast path; the neutralization is the backstop for a line that carries an
-/// injection byte from an untrusted *data* source the core relays — a history
-/// body, a bridged line, future code. Unlike the over-long-line check (a *code*
-/// bug the debug assertion panics on to surface in tests), an injection byte is
-/// data the core must handle gracefully rather than aborting the shared worker,
-/// so it is neutralized, never asserted against.
+/// [`deliver`] accepts only this type. [`WireLine::sanitized`] preserves the
+/// trailing CRLF and replaces unsafe content bytes with spaces.
 pub(crate) struct WireLine(Bytes);
 
 impl WireLine {
     pub(crate) fn sanitized(bytes: Bytes) -> Self {
-        // Only the content before the terminating CRLF is scanned; the
-        // terminator itself is the one legitimate CRLF in the line.
         let end = bytes.len() - if bytes.ends_with(b"\r\n") { 2 } else { 0 };
         if !bytes[..end].iter().any(|&b| matches!(b, b'\r' | b'\n' | 0)) {
-            return WireLine(bytes); // fast path: content already injection-free
+            return WireLine(bytes);
         }
         let mut out = bytes.to_vec();
         for b in &mut out[..end] {
@@ -1109,6 +1348,7 @@ impl WireLine {
 
 pub struct Core {
     state: ServerState,
+    next_sequence: u64,
 }
 
 impl Core {
@@ -1121,9 +1361,37 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
+        Self::with_telemetry_on_shard(
+            config,
+            db_tx,
+            telemetry,
+            CoreShardId(0),
+            CoreShardCount::single(),
+        )
+    }
+
+    fn with_telemetry_on_shard(
+        config: CoreConfig,
+        db_tx: Sender<DbRequest>,
+        telemetry: Arc<Telemetry>,
+        shard: CoreShardId,
+        shards: CoreShardCount,
+    ) -> Self {
         Self {
-            state: ServerState::new(config, db_tx, telemetry),
+            state: ServerState::new(shard, shards, config, db_tx, telemetry),
+            next_sequence: 0,
         }
+    }
+
+    /// Process the next event selected by this worker's scheduler.
+    pub(crate) fn handle_scheduled(&mut self, event: ScheduledInput) {
+        debug_assert_eq!(event.shard, CoreShardId(0));
+        debug_assert_eq!(event.sequence, self.next_sequence);
+        self.next_sequence = event
+            .sequence
+            .checked_add(1)
+            .expect("core queue sequence exhausted");
+        self.handle(event.input);
     }
 
     /// Seed the hot channel-ownership map from persisted rows before the
@@ -1373,5 +1641,126 @@ mod connection_id_allocator_tests {
             u64::MAX - 1
         );
         assert!(exhausted.allocate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod ingress_tests {
+    use super::{
+        ConnId, CoreIngress, CoreScheduler, CoreShardId, CoreTraceStep, Input, ReplayError,
+    };
+    use e6irc_queue::{Config, Policy, queue};
+
+    #[tokio::test]
+    async fn connection_events_keep_one_deterministic_owner() {
+        let (first, mut first_rx) = queue(Config {
+            name: "first-core-shard",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, mut second_rx) = queue(Config {
+            name: "second-core-shard",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let ingress = CoreIngress::with_shards(first, vec![second]);
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(4),
+                line: b"PING :one".to_vec(),
+            })
+            .await
+            .expect("first shard event routed");
+        ingress
+            .push(Input::OverlongLine { conn: ConnId(5) })
+            .await
+            .expect("second shard event routed");
+
+        let first = first_rx.pop().await.expect("first routed event");
+        let second = second_rx.pop().await.expect("second routed event");
+        assert!(matches!(
+            first.payload,
+            Input::Line {
+                conn: ConnId(4),
+                ..
+            }
+        ));
+        assert!(matches!(
+            second.payload,
+            Input::OverlongLine { conn: ConnId(5) }
+        ));
+    }
+
+    #[test]
+    fn scheduler_round_robins_nonempty_shards_with_queue_sequences() {
+        let (first, first_rx) = queue(Config {
+            name: "scheduled-first",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, second_rx) = queue(Config {
+            name: "scheduled-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        first.try_push(Input::Shutdown).expect("first event");
+        second.try_push(Input::Shutdown).expect("second event");
+        let mut scheduler = CoreScheduler::with_shards(first_rx, vec![second_rx]);
+
+        let first = scheduler.try_step().expect("first scheduled event");
+        let second = scheduler.try_step().expect("second scheduled event");
+        assert_eq!(first.shard, CoreShardId(0));
+        assert_eq!(second.shard, CoreShardId(1));
+        assert_eq!(first.sequence, 0);
+        assert_eq!(second.sequence, 0);
+    }
+
+    #[test]
+    fn scheduler_trace_replays_the_same_shard_sequences() {
+        let (first, first_rx) = queue(Config {
+            name: "trace-first",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, second_rx) = queue(Config {
+            name: "trace-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        first.try_push(Input::Shutdown).expect("first event");
+        second.try_push(Input::Shutdown).expect("second event");
+        let mut recorded = CoreScheduler::with_shards(first_rx, vec![second_rx]);
+        recorded.try_step().expect("first recorded event");
+        recorded.try_step().expect("second recorded event");
+        let trace = recorded.trace().steps().to_vec();
+
+        let (first, first_rx) = queue(Config {
+            name: "replay-first",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, second_rx) = queue(Config {
+            name: "replay-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        first.try_push(Input::Shutdown).expect("first replay event");
+        second
+            .try_push(Input::Shutdown)
+            .expect("second replay event");
+        let mut replay = CoreScheduler::with_shards(first_rx, vec![second_rx]);
+
+        for step in trace {
+            let event = replay.replay_step(step).expect("replay event");
+            assert_eq!(event.trace_step(), step);
+        }
+        assert!(matches!(
+            replay.replay_step(CoreTraceStep {
+                shard: CoreShardId(0),
+                sequence: 1,
+            }),
+            Err(ReplayError::EventMissing)
+        ));
     }
 }

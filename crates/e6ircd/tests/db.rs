@@ -6,7 +6,7 @@
 
 use e6irc_queue::{Config as QueueConfig, Policy, queue};
 use e6ircd::config::{Config, DatabaseConfig, ListenerConfig};
-use e6ircd::core::{DbReply, DbRequest, HistoryTargets, Input};
+use e6ircd::core::{CoreIngress, DbReply, DbRequest, HistoryTargets, Input};
 use e6ircd::{db, net};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -85,7 +85,7 @@ async fn verify_password_roundtrip() {
         capacity: 8,
         policy: Policy::Fifo,
     });
-    tokio::spawn(db::run_worker(pool, req_rx, core_tx));
+    tokio::spawn(db::run_worker(pool, req_rx, CoreIngress::single(core_tx)));
 
     let conn = e6ircd::core::ConnId(7);
     // right password, case-insensitive account lookup
@@ -593,7 +593,11 @@ async fn buffered_history_flushes_when_the_sender_is_dropped() {
         capacity: 8,
         policy: Policy::Fifo,
     });
-    let worker = tokio::spawn(db::run_worker(pool.clone(), req_rx, core_tx));
+    let worker = tokio::spawn(db::run_worker(
+        pool.clone(),
+        req_rx,
+        CoreIngress::single(core_tx),
+    ));
 
     for i in 0..5 {
         req_tx
@@ -668,7 +672,11 @@ async fn history_worker_resolves_offline_direct_message_candidates() {
         capacity: 8,
         policy: Policy::Fifo,
     });
-    tokio::spawn(db::run_worker(pool, request_rx, core_tx));
+    tokio::spawn(db::run_worker(
+        pool,
+        request_rx,
+        CoreIngress::single(core_tx),
+    ));
 
     for (targets, expected) in [
         (
@@ -3024,7 +3032,11 @@ async fn channel_registration_stores_initial_topic_in_its_insert() {
         capacity: 8,
         policy: Policy::Fifo,
     });
-    tokio::spawn(db::run_worker(pool.clone(), request_rx, core_tx));
+    tokio::spawn(db::run_worker(
+        pool.clone(),
+        request_rx,
+        CoreIngress::single(core_tx),
+    ));
     let conn = e6ircd::core::ConnId(17);
     let topic = ("initial".to_string(), "boss!b@h".to_string(), 1000);
     request_tx
@@ -3597,7 +3609,11 @@ async fn server_ban_worker_mutates_and_audits_atomically() {
         capacity: 8,
         policy: Policy::Fifo,
     });
-    tokio::spawn(db::run_worker(pool.clone(), request_rx, core_tx));
+    tokio::spawn(db::run_worker(
+        pool.clone(),
+        request_rx,
+        CoreIngress::single(core_tx),
+    ));
     let conn = e6ircd::core::ConnId(9);
     let add = e6ircd::core::ServerBanMutation::Add {
         mask: "baddie@*".into(),

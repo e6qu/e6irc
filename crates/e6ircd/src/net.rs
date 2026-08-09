@@ -19,19 +19,25 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::{Config, TlsConfig};
-use crate::core::{ConnId, ConnectionIdAllocator, Core, CoreConfig, Input, Output};
+use crate::core::{
+    ConnId, ConnectionIdAllocator, Core, CoreConfig, CoreIngress, CoreScheduler, Input, Output,
+    TimerWheel,
+};
 use crate::observability::{ErrorKind, Telemetry};
 use e6irc_proto::framing::LineBuffer;
-use e6irc_queue::{Policy, Receiver, Sender, queue};
+use e6irc_queue::{Policy, Receiver, queue};
 
 /// Traditional 512-byte line minus CRLF, plus the 4096-byte client tag
 /// allowance (message-tags spec); the body-only limit is enforced in
 /// the core after the tag section is split off.
 const LINE_LIMIT: usize = e6irc_proto::message::MAX_CLIENT_FRAME_LEN;
 const READ_BUF: usize = 4096;
+const ACCEPT_BATCH: usize = 64;
 /// How often the liveness reaper tick fires (seconds); the reaper's own
 /// deadlines are coarse minutes, so a fine tick isn't needed.
-const REAP_TICK_SECS: u64 = 15;
+const REAP_TICK_MILLIS: u64 = 15_000;
+const TIMER_WHEEL_RESOLUTION_MILLIS: u64 = 1_000;
+const TIMER_WHEEL_SLOTS: usize = 64;
 
 fn random_connection_id_start() -> io::Result<NonZeroU64> {
     use aws_lc_rs::rand::SecureRandom;
@@ -103,7 +109,7 @@ pub struct ShutdownHandle {
     listeners: Vec<tokio::task::AbortHandle>,
     /// The core worker's input sender. Pushing [`Input::Shutdown`] makes the
     /// core notify clients and then stop, which drops the DB request sender.
-    core_tx: Sender<Input>,
+    core_tx: CoreIngress,
     /// The core is the authority for all live state. Main watches this handle
     /// while serving and treats any pre-shutdown completion as fatal.
     core_worker: Option<tokio::task::JoinHandle<()>>,
@@ -468,11 +474,12 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         None => (None, None),
     };
 
-    let (core_tx, core_rx) = queue::<Input>(e6irc_queue::Config {
+    let (core_sender, core_rx) = queue::<Input>(e6irc_queue::Config {
         name: "core",
         capacity: config.core_queue,
         policy: Policy::Fifo,
     });
+    let core_tx = CoreIngress::single(core_sender);
     let (db_tx, db_rx) = queue::<crate::core::DbRequest>(e6irc_queue::Config {
         name: "db",
         capacity: 1024,
@@ -825,15 +832,25 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
     {
         let core_tx = core_tx.clone();
         let reaper = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(REAP_TICK_SECS));
+            let now = mono_clock();
+            let mut wheel = TimerWheel::new(
+                now,
+                NonZeroU64::new(TIMER_WHEEL_RESOLUTION_MILLIS)
+                    .expect("timer resolution is nonzero"),
+                std::num::NonZeroUsize::new(TIMER_WHEEL_SLOTS).expect("timer wheel has slots"),
+            );
+            wheel.schedule(now, ());
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
+                TIMER_WHEEL_RESOLUTION_MILLIS,
+            ));
             loop {
                 ticker.tick().await;
-                if core_tx
-                    .push(Input::Tick { now: mono_clock() })
-                    .await
-                    .is_err()
-                {
-                    break; // core gone
+                let now = mono_clock();
+                for () in wheel.advance(now) {
+                    wheel.schedule(now.saturating_add_millis(REAP_TICK_MILLIS), ());
+                    if core_tx.push(Input::Tick { now }).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -922,14 +939,15 @@ fn pem_err(e: rustls_pki_types::pem::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, format!("TLS PEM: {e}"))
 }
 
-async fn core_worker(mut core: Core, mut rx: Receiver<Input>) {
-    while let Some(envelope) = rx.pop().await {
+async fn core_worker(mut core: Core, rx: Receiver<Input>) {
+    let mut scheduler = CoreScheduler::single(rx);
+    while let Some(event) = scheduler.pop_single().await {
         // `Shutdown` is handled (clients are notified) and then ends the loop.
         // Returning drops `core` — and with it the sole `Sender<DbRequest>` and
         // every session's `Sender<Output>` — which is what lets the DB worker
         // drain/flush and the write tasks deliver the ERROR before we exit.
-        let stop = matches!(envelope.payload, Input::Shutdown);
-        core.handle(envelope.payload);
+        let stop = matches!(&event.input, Input::Shutdown);
+        core.handle_scheduled(event);
         if stop {
             return;
         }
@@ -998,12 +1016,20 @@ impl Drop for ConnGuard {
 async fn accept_loop(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
-    core_tx: Sender<Input>,
+    core_tx: CoreIngress,
     next_conn: Arc<ConnectionIdAllocator>,
     sendq: usize,
     limiter: ConnLimiter,
     telemetry: Arc<Telemetry>,
 ) {
+    let context = AcceptContext {
+        tls: &tls,
+        core_tx: &core_tx,
+        next_conn: &next_conn,
+        sendq,
+        limiter: &limiter,
+        telemetry: &telemetry,
+    };
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -1016,81 +1042,105 @@ async fn accept_loop(
                 continue;
             }
         };
-        // Enforce the per-IP cap before spending a ConnId or a task. The
-        // guard is held for the connection's lifetime and frees the slot
-        // on drop.
-        let Some(guard) = limiter.try_acquire(peer.ip()) else {
-            eprintln!("refused {peer}: per-IP connection limit reached");
-            telemetry.record_connection_rejected();
-            drop(stream); // closes the socket; the client sees EOF
-            continue;
-        };
-        let conn = match next_conn.allocate() {
-            Ok(conn) => conn,
-            Err(error) => {
-                eprintln!("refused {peer}: {error}");
-                telemetry.record_error(ErrorKind::ConnectionSetup);
-                drop(stream);
-                continue;
+        spawn_accepted(stream, peer, &context);
+
+        for _ in 1..ACCEPT_BATCH {
+            let accepted = std::future::poll_fn(|context| match listener.poll_accept(context) {
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+            })
+            .await;
+            match accepted {
+                Some(Ok((stream, peer))) => spawn_accepted(stream, peer, &context),
+                None => break,
+                Some(Err(e)) => {
+                    eprintln!("accept error: {e}");
+                    telemetry.record_error(ErrorKind::Accept);
+                    break;
+                }
             }
-        };
-        let core_tx = core_tx.clone();
-        let tls = tls.clone();
-        let telemetry = telemetry.clone();
-        tokio::spawn(async move {
-            let _guard = guard; // released when this task ends
-            if let Err(e) = stream.set_nodelay(true) {
-                eprintln!("socket setup failed for {peer}: {e}");
-                telemetry.record_error(ErrorKind::ConnectionSetup);
-                return;
-            }
-            match tls {
-                Some(acceptor) => {
-                    // Bound the handshake so a stalled TLS peer can't hold this
-                    // task/fd/slot forever below the reaper's line of sight.
-                    let handshake = tokio::time::timeout(
-                        std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
-                        acceptor.accept(stream),
-                    )
-                    .await;
-                    match handshake {
-                        Ok(Ok(tls_stream)) => {
-                            serve_conn(
-                                tls_stream,
-                                conn,
-                                peer,
-                                crate::core::ConnectionTransport::Tls,
-                                core_tx,
-                                sendq,
-                                telemetry,
-                            )
-                            .await
-                        }
-                        Ok(Err(e)) => {
-                            telemetry.record_error(ErrorKind::TlsHandshake);
-                            eprintln!("TLS handshake failed from {peer}: {e}");
-                        }
-                        Err(_) => {
-                            telemetry.record_error(ErrorKind::TlsHandshake);
-                            eprintln!("TLS handshake from {peer} timed out");
-                        }
+        }
+    }
+}
+
+struct AcceptContext<'a> {
+    tls: &'a Option<TlsAcceptor>,
+    core_tx: &'a CoreIngress,
+    next_conn: &'a Arc<ConnectionIdAllocator>,
+    sendq: usize,
+    limiter: &'a ConnLimiter,
+    telemetry: &'a Arc<Telemetry>,
+}
+
+fn spawn_accepted(stream: tokio::net::TcpStream, peer: SocketAddr, context: &AcceptContext<'_>) {
+    let Some(guard) = context.limiter.try_acquire(peer.ip()) else {
+        eprintln!("refused {peer}: per-IP connection limit reached");
+        context.telemetry.record_connection_rejected();
+        return;
+    };
+    let conn = match context.next_conn.allocate() {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("refused {peer}: {error}");
+            context.telemetry.record_error(ErrorKind::ConnectionSetup);
+            return;
+        }
+    };
+    let core_tx = context.core_tx.clone();
+    let tls = context.tls.clone();
+    let telemetry = context.telemetry.clone();
+    let sendq = context.sendq;
+    tokio::spawn(async move {
+        let _guard = guard;
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("socket setup failed for {peer}: {e}");
+            telemetry.record_error(ErrorKind::ConnectionSetup);
+            return;
+        }
+        match tls {
+            Some(acceptor) => {
+                let handshake = tokio::time::timeout(
+                    std::time::Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                    acceptor.accept(stream),
+                )
+                .await;
+                match handshake {
+                    Ok(Ok(tls_stream)) => {
+                        serve_conn(
+                            tls_stream,
+                            conn,
+                            peer,
+                            crate::core::ConnectionTransport::Tls,
+                            core_tx,
+                            sendq,
+                            telemetry,
+                        )
+                        .await
+                    }
+                    Ok(Err(e)) => {
+                        telemetry.record_error(ErrorKind::TlsHandshake);
+                        eprintln!("TLS handshake failed from {peer}: {e}");
+                    }
+                    Err(_) => {
+                        telemetry.record_error(ErrorKind::TlsHandshake);
+                        eprintln!("TLS handshake from {peer} timed out");
                     }
                 }
-                None => {
-                    serve_conn(
-                        stream,
-                        conn,
-                        peer,
-                        crate::core::ConnectionTransport::Tcp,
-                        core_tx,
-                        sendq,
-                        telemetry,
-                    )
-                    .await
-                }
             }
-        });
-    }
+            None => {
+                serve_conn(
+                    stream,
+                    conn,
+                    peer,
+                    crate::core::ConnectionTransport::Tcp,
+                    core_tx,
+                    sendq,
+                    telemetry,
+                )
+                .await
+            }
+        }
+    });
 }
 
 async fn serve_conn<S>(
@@ -1098,7 +1148,7 @@ async fn serve_conn<S>(
     conn: ConnId,
     peer: SocketAddr,
     transport: crate::core::ConnectionTransport,
-    core_tx: Sender<Input>,
+    core_tx: CoreIngress,
     sendq: usize,
     telemetry: Arc<Telemetry>,
 ) where
@@ -1160,12 +1210,8 @@ async fn serve_conn<S>(
     }
 }
 
-async fn read_loop<R>(
-    mut read_half: R,
-    conn: ConnId,
-    core_tx: &Sender<Input>,
-    telemetry: &Telemetry,
-) where
+async fn read_loop<R>(mut read_half: R, conn: ConnId, core_tx: &CoreIngress, telemetry: &Telemetry)
+where
     R: AsyncRead + Unpin,
 {
     let mut framing = LineBuffer::new(LINE_LIMIT);
@@ -1202,6 +1248,7 @@ async fn write_loop<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let mut batch = Vec::new();
     loop {
         let Some(envelope) = rx.pop().await else {
             // Core dropped the session (sender gone): flush and close.
@@ -1211,7 +1258,8 @@ where
         // Drain everything currently queued and present the shared Bytes as
         // vectored slices. Fan-out already serialized each capability variant
         // once; concatenating here copied every recipient's wire bytes again.
-        let mut batch = vec![envelope.payload.0];
+        batch.clear();
+        batch.push(envelope.payload.0);
         while let Some(e) = rx.try_pop() {
             batch.push(e.payload.0);
         }
@@ -1282,6 +1330,7 @@ where
 mod tests {
     use super::*;
     use crate::core::Input;
+    use e6irc_queue::Sender;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -1444,7 +1493,7 @@ mod tests {
             ConnId(1),
             peer,
             crate::core::ConnectionTransport::Tcp,
-            core_tx,
+            CoreIngress::single(core_tx),
             8,
             Arc::new(Telemetry::new()),
         ));

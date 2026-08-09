@@ -1,6 +1,8 @@
 //! All chat state, owned exclusively by the core worker.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Index;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -10,7 +12,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{Output, WireLine, deliver};
+use super::{CoreShardCount, CoreShardId, Output, WireLine, deliver};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +37,48 @@ pub struct NickKey(String);
 impl NickKey {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// The connection and core shard that own a reserved nick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NickOwner {
+    conn: ConnId,
+    shard: CoreShardId,
+}
+
+impl NickOwner {
+    pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn shard(self) -> CoreShardId {
+        self.shard
+    }
+}
+
+/// The sole owner of nick reservations and their worker assignment.
+#[derive(Default)]
+pub(crate) struct NickDirectory {
+    by_key: HashMap<NickKey, NickOwner>,
+}
+
+impl NickDirectory {
+    pub(crate) fn owner(&self, key: &NickKey) -> Option<NickOwner> {
+        self.by_key.get(key).copied()
+    }
+
+    pub(crate) fn reserve(&mut self, key: NickKey, owner: NickOwner) {
+        self.by_key.insert(key, owner);
+    }
+
+    pub(crate) fn release_if_owned(&mut self, key: &NickKey, conn: ConnId) -> bool {
+        if self.owner(key).is_some_and(|owner| owner.conn() == conn) {
+            self.by_key.remove(key);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -381,6 +425,146 @@ pub(crate) struct Session {
     pub held: Vec<Bytes>,
 }
 
+#[derive(Clone, Copy)]
+struct SessionHandle {
+    slot: usize,
+    generation: u32,
+}
+
+struct SessionSlot {
+    generation: u32,
+    session: Option<Session>,
+}
+
+/// Dense sessions with generation-checked connection lookup.
+pub(crate) struct SessionStore {
+    by_conn: HashMap<ConnId, SessionHandle>,
+    slots: Vec<SessionSlot>,
+    free: Vec<usize>,
+    len: usize,
+}
+
+pub(crate) struct SessionIter<'a> {
+    by_conn: std::collections::hash_map::Iter<'a, ConnId, SessionHandle>,
+    slots: &'a [SessionSlot],
+}
+
+impl<'a> Iterator for SessionIter<'a> {
+    type Item = (&'a ConnId, &'a Session);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.by_conn.find_map(|(conn, handle)| {
+            let slot = self.slots.get(handle.slot)?;
+            (slot.generation == handle.generation)
+                .then_some(slot.session.as_ref())
+                .flatten()
+                .map(|session| (conn, session))
+        })
+    }
+}
+
+impl SessionStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_conn: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn get(&self, conn: &ConnId) -> Option<&Session> {
+        let handle = self.by_conn.get(conn)?;
+        let slot = self.slots.get(handle.slot)?;
+        (slot.generation == handle.generation)
+            .then_some(slot.session.as_ref())
+            .flatten()
+    }
+
+    pub(crate) fn get_mut(&mut self, conn: &ConnId) -> Option<&mut Session> {
+        let handle = *self.by_conn.get(conn)?;
+        let slot = self.slots.get_mut(handle.slot)?;
+        (slot.generation == handle.generation)
+            .then_some(slot.session.as_mut())
+            .flatten()
+    }
+
+    pub(crate) fn contains_key(&self, conn: &ConnId) -> bool {
+        self.get(conn).is_some()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Session> {
+        self.slots.iter().filter_map(|slot| slot.session.as_ref())
+    }
+
+    pub(crate) fn iter(&self) -> SessionIter<'_> {
+        SessionIter {
+            by_conn: self.by_conn.iter(),
+            slots: &self.slots,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, conn: ConnId, session: Session) -> Option<Session> {
+        let previous = self.remove(&conn);
+        let (slot_index, generation) = match self.free.pop() {
+            Some(index) => (index, self.slots[index].generation),
+            None => {
+                self.slots.push(SessionSlot {
+                    generation: 0,
+                    session: None,
+                });
+                (self.slots.len() - 1, 0)
+            }
+        };
+        self.slots[slot_index].session = Some(session);
+        self.by_conn.insert(
+            conn,
+            SessionHandle {
+                slot: slot_index,
+                generation,
+            },
+        );
+        self.len += 1;
+        previous
+    }
+
+    pub(crate) fn remove(&mut self, conn: &ConnId) -> Option<Session> {
+        let handle = self.by_conn.remove(conn)?;
+        let slot = self.slots.get_mut(handle.slot)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let session = slot.session.take()?;
+        self.len -= 1;
+        if let Some(next) = slot.generation.checked_add(1) {
+            slot.generation = next;
+            self.free.push(handle.slot);
+        }
+        Some(session)
+    }
+}
+
+impl<'a> IntoIterator for &'a SessionStore {
+    type Item = (&'a ConnId, &'a Session);
+    type IntoIter = SessionIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl Index<&ConnId> for SessionStore {
+    type Output = Session;
+
+    fn index(&self, conn: &ConnId) -> &Self::Output {
+        self.get(conn).expect("indexed session is present")
+    }
+}
+
 impl Session {
     /// Whether registration has completed.
     pub fn is_registered(&self) -> bool {
@@ -478,6 +662,28 @@ impl Session {
 pub(crate) struct MemberModes {
     pub op: bool,
     pub voice: bool,
+}
+
+/// A channel recipient and the worker that owns its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Recipient {
+    conn: ConnId,
+    shard: CoreShardId,
+}
+
+impl Recipient {
+    pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn shard(self) -> CoreShardId {
+        self.shard
+    }
+}
+
+struct ChannelMember {
+    modes: MemberModes,
+    recipient: Recipient,
 }
 
 #[derive(Default)]
@@ -775,7 +981,8 @@ pub(crate) struct Channel {
     /// Display name (creator's casing).
     pub name: String,
     pub topic: Option<Topic>,
-    pub members: HashMap<ConnId, MemberModes>,
+    members: HashMap<ConnId, ChannelMember>,
+    recipients: RefCell<Option<Arc<[Recipient]>>>,
     pub modes: ChanModes,
     pub bans: Vec<MaskKey>,
     pub quiets: Vec<MaskKey>,
@@ -803,6 +1010,77 @@ pub(crate) struct Channel {
 pub(crate) struct Hidden(());
 
 impl Channel {
+    pub fn new(name: String, topic: Option<Topic>, modes: ChanModes, created_at_secs: u64) -> Self {
+        Self {
+            name,
+            topic,
+            members: HashMap::new(),
+            recipients: RefCell::new(None),
+            modes,
+            bans: Vec::new(),
+            quiets: Vec::new(),
+            ban_exceptions: Vec::new(),
+            invite_exceptions: Vec::new(),
+            invited: HashSet::new(),
+            created_at_secs,
+        }
+    }
+
+    pub fn is_member(&self, conn: ConnId) -> bool {
+        self.members.contains_key(&conn)
+    }
+
+    pub fn member(&self, conn: ConnId) -> Option<&MemberModes> {
+        self.members.get(&conn).map(|member| &member.modes)
+    }
+
+    pub fn member_mut(&mut self, conn: ConnId) -> Option<&mut MemberModes> {
+        self.members.get_mut(&conn).map(|member| &mut member.modes)
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn has_members(&self) -> bool {
+        !self.members.is_empty()
+    }
+
+    pub fn members(&self) -> impl Iterator<Item = (ConnId, &MemberModes)> {
+        self.members
+            .iter()
+            .map(|(conn, member)| (*conn, &member.modes))
+    }
+
+    /// Immutable recipients, rebuilt only after a join or part.
+    pub fn recipients(&self) -> Arc<[Recipient]> {
+        let mut cached = self.recipients.borrow_mut();
+        if let Some(recipients) = cached.as_ref() {
+            return Arc::clone(recipients);
+        }
+        let recipients = self
+            .members
+            .values()
+            .map(|member| member.recipient)
+            .collect();
+        *cached = Some(Arc::clone(&recipients));
+        recipients
+    }
+
+    pub fn add_member(&mut self, recipient: Recipient, modes: MemberModes) {
+        self.members
+            .insert(recipient.conn(), ChannelMember { modes, recipient });
+        self.recipients.get_mut().take();
+    }
+
+    pub fn remove_member(&mut self, conn: ConnId) -> Option<MemberModes> {
+        let removed = self.members.remove(&conn).map(|member| member.modes);
+        if removed.is_some() {
+            self.recipients.get_mut().take();
+        }
+        removed
+    }
+
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
     /// non-members on every query surface — its existence, modes, topic, and
     /// member lists all. The single source of that predicate: deny surfaces
@@ -810,7 +1088,7 @@ impl Channel {
     /// content-listing surfaces (`NAMES`/`WHO`/`WHOIS`/`LIST`) test `.is_some()`
     /// and simply omit the channel's rows.
     pub(crate) fn hidden_from(&self, conn: ConnId) -> Option<Hidden> {
-        (self.modes.secret && !self.members.contains_key(&conn)).then_some(Hidden(()))
+        (self.modes.secret && !self.is_member(conn)).then_some(Hidden(()))
     }
 
     fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &str) -> bool {
@@ -867,13 +1145,72 @@ impl Channel {
     }
 }
 
+/// The local worker's channel state and its ownership boundary.
+pub(crate) struct ChannelDirectory {
+    shards: CoreShardCount,
+    channels: HashMap<ChanKey, Channel>,
+}
+
+impl ChannelDirectory {
+    pub(crate) fn new(shards: CoreShardCount) -> Self {
+        Self {
+            shards,
+            channels: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn owner(&self, key: &ChanKey) -> CoreShardId {
+        self.shards.shard_for_channel(key)
+    }
+
+    pub(crate) fn get(&self, key: &ChanKey) -> Option<&Channel> {
+        self.channels.get(key)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &ChanKey) -> Option<&mut Channel> {
+        self.channels.get_mut(key)
+    }
+
+    pub(crate) fn contains_key(&self, key: &ChanKey) -> bool {
+        self.channels.contains_key(key)
+    }
+
+    pub(crate) fn entry(
+        &mut self,
+        key: ChanKey,
+    ) -> std::collections::hash_map::Entry<'_, ChanKey, Channel> {
+        self.channels.entry(key)
+    }
+
+    pub(crate) fn remove(&mut self, key: &ChanKey) -> Option<Channel> {
+        self.channels.remove(key)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.channels.len()
+    }
+
+    pub(crate) fn iter(&self) -> std::collections::hash_map::Iter<'_, ChanKey, Channel> {
+        self.channels.iter()
+    }
+}
+
+impl Index<&ChanKey> for ChannelDirectory {
+    type Output = Channel;
+
+    fn index(&self, key: &ChanKey) -> &Self::Output {
+        &self.channels[key]
+    }
+}
+
 pub(crate) struct ServerState {
+    shard: CoreShardId,
     pub telemetry: Arc<Telemetry>,
     pub config: CoreConfig,
     pub casemap: CaseMapping,
-    pub sessions: HashMap<ConnId, Session>,
-    pub nicks: HashMap<NickKey, ConnId>,
-    pub channels: HashMap<ChanKey, Channel>,
+    pub sessions: SessionStore,
+    nicks: NickDirectory,
+    pub channels: ChannelDirectory,
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
@@ -1013,19 +1350,29 @@ pub(crate) struct WhowasEntry {
 pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
+    pub fn local_recipient(&self, conn: ConnId) -> Recipient {
+        Recipient {
+            conn,
+            shard: self.shard,
+        }
+    }
+
     pub fn new(
+        shard: CoreShardId,
+        shards: CoreShardCount,
         config: CoreConfig,
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
+            shard,
             telemetry,
             config,
             casemap: CaseMapping::Rfc1459,
-            sessions: HashMap::new(),
-            nicks: HashMap::new(),
-            channels: HashMap::new(),
+            sessions: SessionStore::new(),
+            nicks: NickDirectory::default(),
+            channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             suspended_accounts: HashSet::new(),
             db_tx,
@@ -1461,13 +1808,40 @@ impl ServerState {
         NickKey(self.casemap.casefold(nick))
     }
 
+    /// Reserve `key` for this worker's connection.
+    pub fn reserve_nick(&mut self, key: NickKey, conn: ConnId) {
+        self.nicks.reserve(
+            key,
+            NickOwner {
+                conn,
+                shard: self.shard,
+            },
+        );
+    }
+
+    /// The reservation for `key`, including a remote worker assignment.
+    pub fn nick_reservation(&self, key: &NickKey) -> Option<NickOwner> {
+        self.nicks.owner(key)
+    }
+
+    /// The local connection owning `key`.
+    pub fn nick_connection(&self, key: &NickKey) -> Option<ConnId> {
+        self.nick_reservation(key)
+            .filter(|owner| owner.shard() == self.shard)
+            .map(NickOwner::conn)
+    }
+
+    /// Release `key` only when `conn` still owns it.
+    pub fn release_nick(&mut self, key: &NickKey, conn: ConnId) -> bool {
+        self.nicks.release_if_owned(key, conn)
+    }
+
     /// A casefolded nick rendered for display: the online user's actual nick
     /// casing when they are connected, otherwise the casefolded form itself
     /// (the only spelling still on record once they have gone).
     pub fn display_nick(&self, folded: &str) -> String {
-        self.nicks
-            .get(&NickKey(folded.to_string()))
-            .and_then(|&conn| self.sessions.get(&conn))
+        self.nick_connection(&NickKey(folded.to_string()))
+            .and_then(|conn| self.sessions.get(&conn))
             .and_then(|s| s.nick().map(String::from))
             .unwrap_or_else(|| folded.to_string())
     }
@@ -1553,10 +1927,8 @@ impl ServerState {
     /// expectations honest — an unregistered holder can never be prefix-built
     /// (that would panic the shared core worker and take down the server).
     pub fn registered_peer(&self, key: &NickKey) -> Option<ConnId> {
-        self.nicks
-            .get(key)
-            .copied()
-            .filter(|c| self.sessions.get(c).is_some_and(|s| s.is_registered()))
+        self.nick_connection(key)
+            .filter(|conn| self.sessions.get(conn).is_some_and(|s| s.is_registered()))
     }
 
     pub fn open(
@@ -2019,16 +2391,18 @@ impl ServerState {
         let Some(chan) = self.channels.get(chan_key) else {
             return;
         };
-        let members: Vec<ConnId> = chan
-            .members
-            .keys()
-            .copied()
-            .filter(|c| Some(*c) != except)
-            .collect();
+        debug_assert_eq!(self.channels.owner(chan_key), self.shard);
+        let members = chan.recipients();
         let plain = Bytes::from(format!("{line}\r\n"));
         // Built lazily: channels with no server-time member pay nothing.
         let mut timed: Option<Bytes> = None;
-        for m in members {
+        for recipient in members
+            .iter()
+            .copied()
+            .filter(|recipient| Some(recipient.conn()) != except)
+        {
+            debug_assert_eq!(recipient.shard(), self.shard);
+            let m = recipient.conn();
             let wants_time = self.sessions.get(&m).is_some_and(|s| s.caps.server_time);
             let bytes = if wants_time {
                 timed
@@ -2077,7 +2451,7 @@ impl ServerState {
         let mut seen = HashSet::new();
         for key in &session.channels {
             if let Some(chan) = self.channels.get(key) {
-                seen.extend(chan.members.keys().copied());
+                seen.extend(chan.recipients().iter().map(|recipient| recipient.conn()));
             }
         }
         seen.remove(&conn);
@@ -2154,8 +2528,8 @@ impl ServerState {
         }
         for key in joined {
             if let Some(chan) = self.channels.get_mut(&key) {
-                chan.members.remove(&conn);
-                if chan.members.is_empty() {
+                chan.remove_member(conn);
+                if !chan.has_members() {
                     self.remove_channel(&key);
                 }
             }
@@ -2171,7 +2545,7 @@ impl ServerState {
         }
         if let Some(nick) = session.nick() {
             let nick_key = NickKey(self.casemap.casefold(nick));
-            self.nicks.remove(&nick_key);
+            self.release_nick(&nick_key, conn);
             if was_registered {
                 super::handler::monitor_notify(self, nick, false);
             }
@@ -2350,5 +2724,158 @@ mod wire_line_tests {
         assert!(wire_line_violation(tagged.as_bytes(), false).is_none());
         let huge_tags = format!("@a={} :s PING\r\n", "t".repeat(9000));
         assert!(wire_line_violation(huge_tags.as_bytes(), false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+    use e6irc_queue::{Config as QueueConfig, Policy, queue};
+
+    fn wall_clock() -> e6irc_proto::time::Millis {
+        e6irc_proto::time::Millis::from_millis(0)
+    }
+
+    fn mono_clock() -> e6irc_proto::time::MonoMillis {
+        e6irc_proto::time::MonoMillis::from_millis(0)
+    }
+
+    fn state() -> ServerState {
+        let (db_tx, _db_rx) = queue(QueueConfig {
+            name: "session-store-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        ServerState::new(
+            CoreShardId(0),
+            CoreShardCount::single(),
+            CoreConfig {
+                server_name: "irc.test".into(),
+                network_name: "test".into(),
+                description: "test".into(),
+                registration_before_connect: false,
+                registration_require_email: false,
+                sendq: 1,
+                motd: Vec::new(),
+                nicklen: 30,
+                sasl_enabled: false,
+                max_hot_channels: 1,
+                opers: Vec::new(),
+                clock: wall_clock,
+                mono_clock,
+                command_burst: None,
+                registration_burst: None,
+            },
+            db_tx,
+            Arc::new(Telemetry::new()),
+        )
+    }
+
+    fn open(state: &mut ServerState, conn: ConnId) {
+        let (tx, _rx) = queue(QueueConfig {
+            name: "session-store-output",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        state.open(
+            conn,
+            tx,
+            "host.test".into(),
+            crate::core::ConnectionTransport::Tcp,
+        );
+    }
+
+    #[test]
+    fn nick_reservation_retains_its_worker() {
+        let mut directory = NickDirectory::default();
+        let key = NickKey("alice".into());
+        let owner = NickOwner {
+            conn: ConnId(7),
+            shard: CoreShardId(3),
+        };
+
+        directory.reserve(key.clone(), owner);
+
+        assert_eq!(directory.owner(&key), Some(owner));
+        assert_eq!(
+            directory.owner(&key).map(NickOwner::shard),
+            Some(CoreShardId(3))
+        );
+        assert!(!directory.release_if_owned(&key, ConnId(8)));
+        assert_eq!(directory.owner(&key), Some(owner));
+        assert!(directory.release_if_owned(&key, ConnId(7)));
+        assert_eq!(directory.owner(&key), None);
+    }
+
+    #[test]
+    fn channel_owner_is_stable_for_the_folded_key() {
+        let shards =
+            CoreShardCount::new(std::num::NonZeroUsize::new(3).expect("nonzero shard count"));
+        let directory = ChannelDirectory::new(shards);
+        let first = directory.owner(&ChanKey("#chat".into()));
+        let again = directory.owner(&ChanKey("#chat".into()));
+
+        assert_eq!(first, again);
+        assert!(first.0 < 3);
+    }
+
+    #[test]
+    fn recipient_snapshot_is_shared_until_membership_changes() {
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient {
+                conn: ConnId(1),
+                shard: CoreShardId(0),
+            },
+            MemberModes {
+                op: true,
+                voice: false,
+            },
+        );
+
+        let first = channel.recipients();
+        let again = channel.recipients();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        channel.add_member(
+            Recipient {
+                conn: ConnId(2),
+                shard: CoreShardId(0),
+            },
+            MemberModes {
+                op: false,
+                voice: false,
+            },
+        );
+        let changed = channel.recipients();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.len(), 2);
+        assert!(
+            changed
+                .iter()
+                .any(|recipient| recipient.conn() == ConnId(1)
+                    && recipient.shard() == CoreShardId(0))
+        );
+        assert!(
+            changed
+                .iter()
+                .any(|recipient| recipient.conn() == ConnId(2)
+                    && recipient.shard() == CoreShardId(0))
+        );
+    }
+
+    #[test]
+    fn reused_slot_has_a_new_generation() {
+        let mut state = state();
+        open(&mut state, ConnId(1));
+        let old = state.sessions.by_conn[&ConnId(1)];
+        state.sessions.remove(&ConnId(1));
+        open(&mut state, ConnId(2));
+        let current = state.sessions.by_conn[&ConnId(2)];
+
+        assert_eq!(old.slot, current.slot);
+        assert_ne!(old.generation, current.generation);
+        assert!(state.sessions.get(&ConnId(1)).is_none());
+        assert!(state.sessions.get(&ConnId(2)).is_some());
     }
 }

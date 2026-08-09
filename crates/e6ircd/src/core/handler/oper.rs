@@ -77,7 +77,7 @@ pub(super) fn cmd_kill(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let key = state.nick_key(target);
-    if !state.nicks.contains_key(&key) {
+    if state.nick_connection(&key).is_none() {
         state.err_nosuchnick(conn, target);
         return;
     }
@@ -101,7 +101,7 @@ pub(crate) fn kill_by_nick(
     killer: &str,
 ) -> bool {
     let key = state.nick_key(target);
-    let Some(&victim) = state.nicks.get(&key) else {
+    let Some(victim) = state.nick_connection(&key) else {
         return false;
     };
     kill_connection(state, victim, comment, killer)

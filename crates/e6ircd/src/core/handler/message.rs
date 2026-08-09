@@ -264,7 +264,7 @@ pub(super) fn resolve_message_target(
         }
         return None;
     };
-    let may_speak = chan.may_speak(chan.members.get(&conn), state.casemap, &prefix);
+    let may_speak = chan.may_speak(chan.member(conn), state.casemap, &prefix);
     if !may_speak {
         if loud {
             state.numeric(
@@ -295,10 +295,11 @@ pub(super) fn resolve_message_target(
         return None;
     }
     let recipients: Vec<ConnId> = chan
-        .members
-        .iter()
-        .filter(|(c, m)| **c != conn && status_prefix.is_none_or(|sig| sig.admits(m)))
-        .map(|(c, _)| *c)
+        .members()
+        .filter(|(member, modes)| {
+            *member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
+        })
+        .map(|(member, _)| member)
         .collect();
     Some(ResolvedTarget {
         kind: ResolvedKind::Channel { key, status_prefix },
@@ -548,7 +549,7 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
         };
         // The same gate PRIVMSG/NOTICE use, so a banned or quieted member can't
         // relay TAGMSG (typing/reaction tags) it couldn't relay as text.
-        if !chan.may_speak(chan.members.get(&conn), state.casemap, &prefix) {
+        if !chan.may_speak(chan.member(conn), state.casemap, &prefix) {
             state.numeric(
                 conn,
                 ERR_CANNOTSENDTOCHAN,
@@ -557,10 +558,11 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
             );
             return;
         }
-        chan.members
-            .iter()
-            .filter(|(c, m)| **c != conn && status_prefix.is_none_or(|sig| sig.admits(m)))
-            .map(|(c, _)| *c)
+        chan.members()
+            .filter(|(member, modes)| {
+                *member != conn && status_prefix.is_none_or(|sig| sig.admits(modes))
+            })
+            .map(|(member, _)| member)
             .collect()
     } else {
         let key = state.nick_key(target);

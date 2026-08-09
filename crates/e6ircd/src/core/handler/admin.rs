@@ -126,11 +126,11 @@ fn begin_owned_channel_registration(
         return;
     };
     let actor_key = state.account_key(&actor);
-    let operates_channel = channel.members.iter().any(|(conn, member)| {
+    let operates_channel = channel.members().any(|(conn, member)| {
         member.op
             && state
                 .sessions
-                .get(conn)
+                .get(&conn)
                 .and_then(|session| session.account.as_deref())
                 .is_some_and(|account| state.account_key(account) == actor_key)
     });
