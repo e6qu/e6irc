@@ -59,6 +59,10 @@ impl CoreShardCount {
         CoreShardId((conn.0 as usize) % self.0.get())
     }
 
+    pub(crate) fn session_owner(self, conn: ConnId) -> SessionOwner {
+        SessionOwner::new(conn, self.shard_for(conn))
+    }
+
     pub(crate) fn shard_for_channel(self, key: &state::ChanKey) -> CoreShardId {
         let hash = key
             .as_str()
@@ -73,6 +77,27 @@ impl CoreShardCount {
 /// Index of one configured core shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CoreShardId(usize);
+
+/// The connection and worker that own one live session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionOwner {
+    conn: ConnId,
+    shard: CoreShardId,
+}
+
+impl SessionOwner {
+    pub(crate) fn new(conn: ConnId, shard: CoreShardId) -> Self {
+        Self { conn, shard }
+    }
+
+    pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub(crate) fn shard(self) -> CoreShardId {
+        self.shard
+    }
+}
 
 /// The only ingress path into core state.
 #[derive(Clone)]
@@ -115,7 +140,7 @@ impl CoreIngress {
             | Input::Closed { conn, .. }
             | Input::DbReply { conn, .. }
             | Input::HistoryPage { conn, .. }
-            | Input::TargetsPage { conn, .. } => self.count.shard_for(*conn),
+            | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }

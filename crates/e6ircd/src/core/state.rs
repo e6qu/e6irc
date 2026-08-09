@@ -12,7 +12,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{CoreShardCount, CoreShardId, Output, WireLine, deliver};
+use super::{CoreShardCount, CoreShardId, Output, SessionOwner, WireLine, deliver};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,35 +40,18 @@ impl NickKey {
     }
 }
 
-/// The connection and core shard that own a reserved nick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NickOwner {
-    conn: ConnId,
-    shard: CoreShardId,
-}
-
-impl NickOwner {
-    pub(crate) fn conn(self) -> ConnId {
-        self.conn
-    }
-
-    pub(crate) fn shard(self) -> CoreShardId {
-        self.shard
-    }
-}
-
 /// The sole owner of nick reservations and their worker assignment.
 #[derive(Default)]
 pub(crate) struct NickDirectory {
-    by_key: HashMap<NickKey, NickOwner>,
+    by_key: HashMap<NickKey, SessionOwner>,
 }
 
 impl NickDirectory {
-    pub(crate) fn owner(&self, key: &NickKey) -> Option<NickOwner> {
+    pub(crate) fn owner(&self, key: &NickKey) -> Option<SessionOwner> {
         self.by_key.get(key).copied()
     }
 
-    pub(crate) fn reserve(&mut self, key: NickKey, owner: NickOwner) {
+    pub(crate) fn reserve(&mut self, key: NickKey, owner: SessionOwner) {
         self.by_key.insert(key, owner);
     }
 
@@ -667,17 +650,16 @@ pub(crate) struct MemberModes {
 /// A channel recipient and the worker that owns its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Recipient {
-    conn: ConnId,
-    shard: CoreShardId,
+    owner: SessionOwner,
 }
 
 impl Recipient {
     pub(crate) fn conn(self) -> ConnId {
-        self.conn
+        self.owner.conn()
     }
 
     pub(crate) fn shard(self) -> CoreShardId {
-        self.shard
+        self.owner.shard()
     }
 }
 
@@ -1352,8 +1334,7 @@ pub(crate) const WHOWAS_CAP: usize = 1000;
 impl ServerState {
     pub fn local_recipient(&self, conn: ConnId) -> Recipient {
         Recipient {
-            conn,
-            shard: self.shard,
+            owner: SessionOwner::new(conn, self.shard),
         }
     }
 
@@ -1810,17 +1791,11 @@ impl ServerState {
 
     /// Reserve `key` for this worker's connection.
     pub fn reserve_nick(&mut self, key: NickKey, conn: ConnId) {
-        self.nicks.reserve(
-            key,
-            NickOwner {
-                conn,
-                shard: self.shard,
-            },
-        );
+        self.nicks.reserve(key, SessionOwner::new(conn, self.shard));
     }
 
     /// The reservation for `key`, including a remote worker assignment.
-    pub fn nick_reservation(&self, key: &NickKey) -> Option<NickOwner> {
+    pub fn nick_reservation(&self, key: &NickKey) -> Option<SessionOwner> {
         self.nicks.owner(key)
     }
 
@@ -1828,7 +1803,7 @@ impl ServerState {
     pub fn nick_connection(&self, key: &NickKey) -> Option<ConnId> {
         self.nick_reservation(key)
             .filter(|owner| owner.shard() == self.shard)
-            .map(NickOwner::conn)
+            .map(SessionOwner::conn)
     }
 
     /// Release `key` only when `conn` still owns it.
@@ -2789,16 +2764,13 @@ mod session_store_tests {
     fn nick_reservation_retains_its_worker() {
         let mut directory = NickDirectory::default();
         let key = NickKey("alice".into());
-        let owner = NickOwner {
-            conn: ConnId(7),
-            shard: CoreShardId(3),
-        };
+        let owner = SessionOwner::new(ConnId(7), CoreShardId(3));
 
         directory.reserve(key.clone(), owner);
 
         assert_eq!(directory.owner(&key), Some(owner));
         assert_eq!(
-            directory.owner(&key).map(NickOwner::shard),
+            directory.owner(&key).map(SessionOwner::shard),
             Some(CoreShardId(3))
         );
         assert!(!directory.release_if_owned(&key, ConnId(8)));
@@ -2824,8 +2796,7 @@ mod session_store_tests {
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
         channel.add_member(
             Recipient {
-                conn: ConnId(1),
-                shard: CoreShardId(0),
+                owner: SessionOwner::new(ConnId(1), CoreShardId(0)),
             },
             MemberModes {
                 op: true,
@@ -2839,8 +2810,7 @@ mod session_store_tests {
 
         channel.add_member(
             Recipient {
-                conn: ConnId(2),
-                shard: CoreShardId(0),
+                owner: SessionOwner::new(ConnId(2), CoreShardId(0)),
             },
             MemberModes {
                 op: false,
