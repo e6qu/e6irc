@@ -1689,6 +1689,16 @@ impl Channel {
         true
     }
 
+    pub fn update_recipient(&mut self, recipient: Recipient) {
+        let Some(member) = self.members.get_mut(&recipient.conn()) else {
+            return;
+        };
+        if member.recipient != recipient {
+            member.recipient = recipient;
+            self.recipients.get_mut().take();
+        }
+    }
+
     pub fn member_identities(
         &self,
     ) -> impl Iterator<Item = (ConnId, &MemberModes, &MemberIdentity)> {
@@ -2270,6 +2280,16 @@ impl ServerState {
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {
+        if !self.sessions[&conn].is_registered() {
+            let recipient = self.local_recipient(conn);
+            let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
+            for key in channels {
+                if let Some(channel) = self.channels.get_mut(&key) {
+                    channel.update_recipient(recipient);
+                }
+            }
+            return;
+        }
         self.sync_channel_member(conn, ChannelMemberChange::Identity);
     }
 
