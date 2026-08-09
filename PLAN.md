@@ -22,9 +22,9 @@ and integration claims.
   Process-wide membership records make cross-shard membership and shared-channel
   visibility explicit rather than reading a foreign session table.
   All MODE reads and mutations, NAMES, channel WHO, channel CHATHISTORY, and
-  explicit-target LIST route to the owner; remaining channel queries, services, persistence callbacks,
-  and HTTP controls still need the
-  same boundary.
+  LIST route through typed channel-owner requests; unrestricted LIST fans out
+  to every shard and merges one ordered response. Remaining channel queries,
+  services, persistence callbacks, and HTTP controls need the same boundary.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.

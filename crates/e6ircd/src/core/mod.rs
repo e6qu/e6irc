@@ -27,9 +27,10 @@ use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::{
     ChannelActor, ChannelCommand, ChannelCommandResult, ChannelJoinResult, ChannelKick,
-    ChannelKickResult, ChannelMemberUpdate, ChannelMessage, ChannelMessageResult, ChannelMultiline,
-    ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
-    ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
+    ChannelKickResult, ChannelListRequest, ChannelListResult, ChannelMemberUpdate, ChannelMessage,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
+    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
+    ChannelTopicResult,
 };
 use state::{MembershipDirectory, NickDirectory, ServerState};
 
@@ -59,6 +60,10 @@ impl CoreShardCount {
 
     pub fn single() -> Self {
         Self(NonZeroUsize::MIN)
+    }
+
+    pub(crate) fn len(self) -> usize {
+        self.0.get()
     }
 
     fn shard_for(self, conn: ConnId) -> CoreShardId {
@@ -164,6 +169,8 @@ impl CoreIngress {
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
             Input::ChannelCommand { command } => command.owner().shard(),
             Input::ChannelCommandResult { session, .. } => session.shard(),
+            Input::ChannelListResult { result } => result.session.shard(),
+            Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
             Input::ChannelSessionEvent { session, .. } => session.shard(),
             Input::ChannelMemberUpdate { update } => update.owner().shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
@@ -438,6 +445,14 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelCommandResult,
         label: Option<String>,
+    },
+    /// One shard's answer to a whole-network LIST request.
+    ChannelListResult {
+        result: ChannelListResult,
+    },
+    /// A whole-network LIST request, delivered once to every channel shard.
+    ChannelList {
+        request: ChannelListRequest,
     },
     ChannelSessionEvent {
         session: SessionOwner,
@@ -1532,6 +1547,9 @@ pub struct Core {
 pub(crate) enum CoreEffect {
     /// A typed event for another core owner.
     Input(Input),
+    BroadcastChannelList {
+        request: ChannelListRequest,
+    },
     Delivery {
         owner: SessionOwner,
         line: Bytes,
@@ -1637,6 +1655,20 @@ impl CoreWorker {
                 input: envelope.payload,
             });
             for effect in self.core.take_effects() {
+                if let CoreEffect::BroadcastChannelList { request } = effect {
+                    for shard in self.ingress.shards.iter() {
+                        if shard
+                            .push(Input::ChannelList {
+                                request: request.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            panic!("cross-shard target closed");
+                        }
+                    }
+                    continue;
+                }
                 let input = match effect {
                     CoreEffect::Input(input) => input,
                     CoreEffect::Delivery { owner, line } => Input::Delivery {
@@ -1746,6 +1778,7 @@ impl CoreWorker {
                         result,
                         label,
                     },
+                    CoreEffect::BroadcastChannelList { .. } => unreachable!("handled above"),
                 };
                 if self.ingress.push(input).await.is_err() {
                     panic!("cross-shard target closed");
@@ -2001,6 +2034,17 @@ impl Core {
                     "channel command result reached wrong session shard"
                 );
                 handler::channel_command_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelList { request } => {
+                handler::channel_list(&mut self.state, request);
+            }
+            Input::ChannelListResult { result } => {
+                assert_eq!(
+                    result.session.shard(),
+                    self.shard,
+                    "LIST result reached wrong session shard"
+                );
+                handler::channel_list_result(&mut self.state, result);
             }
             Input::ChannelSessionEvent { session, event } => {
                 assert_eq!(
@@ -2600,6 +2644,16 @@ mod ingress_tests {
             },
         );
         first.state.channels.entry(key).or_insert(channel);
+        let other = ["#delta", "#echo", "#foxtrot"]
+            .into_iter()
+            .find(|name| second.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel owned by shard one");
+        let other_key = second.state.chan_key(other);
+        second
+            .state
+            .channels
+            .entry(other_key)
+            .or_insert(Channel::new(other.into(), None, ChanModes::default(), 0));
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
         let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
         second_tx
@@ -2838,6 +2892,43 @@ mod ingress_tests {
                 .ends_with(b" 321 robert Channel :Users  Name\r\n")
         );
         assert!(list_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n"));
+        assert!(
+            list_end
+                .payload
+                .0
+                .ends_with(b" 323 robert :End of /LIST\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"LIST".to_vec(),
+            })
+            .expect("whole-network list queued");
+        let list_start = next_output(&mut bob_rx).await;
+        let first_row = next_output(&mut bob_rx).await;
+        let second_row = next_output(&mut bob_rx).await;
+        let list_end = next_output(&mut bob_rx).await;
+        assert!(
+            list_start
+                .payload
+                .0
+                .ends_with(b" 321 robert Channel :Users  Name\r\n")
+        );
+        assert!(first_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n"));
+        assert!(
+            first_row
+                .payload
+                .0
+                .ends_with(format!(" 322 robert {other} 0 :\r\n").as_bytes())
+                || second_row
+                    .payload
+                    .0
+                    .ends_with(format!(" 322 robert {other} 0 :\r\n").as_bytes())
+        );
+        assert!(
+            first_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n")
+                || second_row.payload.0.ends_with(b" 322 robert #chat 2 :\r\n")
+        );
         assert!(
             list_end
                 .payload

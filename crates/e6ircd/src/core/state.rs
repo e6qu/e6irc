@@ -901,7 +901,6 @@ pub enum ChannelCommandOperation {
     Names,
     Who(ChannelWhoQuery),
     History(ChannelHistoryRequest),
-    List,
     ModeQuery,
     ModeListQuery(String),
     ModeChange(ChannelModeChange),
@@ -915,6 +914,74 @@ pub struct ChannelWhoQuery {
 #[derive(Debug, Clone)]
 pub struct ChannelHistoryRequest {
     pub(crate) parameters: Vec<String>,
+}
+
+/// One whole-network LIST request. Each channel shard answers once.
+#[derive(Debug, Clone)]
+pub struct ChannelListRequest {
+    id: ChannelListRequestId,
+    session: SessionOwner,
+    actor: ChannelActor,
+    targets: Option<Vec<ChanKey>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelListRequestId(u64);
+
+impl ChannelListRequest {
+    fn new(
+        id: ChannelListRequestId,
+        session: SessionOwner,
+        actor: ChannelActor,
+        targets: Option<Vec<ChanKey>>,
+    ) -> Self {
+        Self {
+            id,
+            session,
+            actor,
+            targets,
+        }
+    }
+
+    pub(crate) fn id(&self) -> ChannelListRequestId {
+        self.id
+    }
+
+    pub(crate) fn session(&self) -> SessionOwner {
+        self.session
+    }
+
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+
+    pub(crate) fn targets(&self) -> Option<&[ChanKey]> {
+        self.targets.as_deref()
+    }
+}
+
+/// One visible channel row returned by a channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelListRow {
+    pub(crate) name: String,
+    pub(crate) members: usize,
+    pub(crate) topic: String,
+}
+
+/// A channel shard's complete contribution to a whole-network LIST request.
+#[derive(Debug)]
+pub struct ChannelListResult {
+    pub(crate) id: ChannelListRequestId,
+    pub(crate) session: SessionOwner,
+    pub(crate) rows: Vec<ChannelListRow>,
+}
+
+struct PendingChannelList {
+    session: SessionOwner,
+    remaining: usize,
+    label: Option<String>,
+    prefix: Vec<Bytes>,
+    rows: Vec<ChannelListRow>,
 }
 
 /// A parsed channel MODE mutation, with its mode token separate from arguments.
@@ -995,7 +1062,6 @@ pub enum ChannelCommandResult {
     Names(ChannelCommandReplies),
     Who(ChannelCommandReplies),
     History(ChannelHistoryResult),
-    List(ChannelCommandReplies),
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
     ModeChange(ChannelCommandReplies),
@@ -1984,6 +2050,10 @@ impl ChannelDirectory {
         }
     }
 
+    pub(crate) fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     pub(crate) fn owner(&self, key: &ChanKey) -> ChannelOwner {
         ChannelOwner {
             key: key.clone(),
@@ -2138,6 +2208,8 @@ pub(crate) struct ServerState {
     pub pending_channel_controls: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
     /// Monotonic request ID source for `pending_channel_controls`.
     pub channel_control_id: u64,
+    pending_channel_lists: HashMap<ChannelListRequestId, PendingChannelList>,
+    channel_list_id: u64,
 }
 
 /// Hard ceiling on the account-creation bucket map, mirroring the HTTP
@@ -2365,6 +2437,81 @@ impl ServerState {
                 label,
             },
         ));
+    }
+
+    pub fn start_channel_list(
+        &mut self,
+        conn: ConnId,
+        label: Option<String>,
+        targets: Option<Vec<String>>,
+    ) -> ChannelListRequest {
+        let id = ChannelListRequestId(self.channel_list_id);
+        self.channel_list_id = self
+            .channel_list_id
+            .checked_add(1)
+            .expect("channel LIST request identifiers exhausted");
+        let session = SessionOwner::new(conn, self.shard);
+        let targets = targets.map(|targets| {
+            targets
+                .into_iter()
+                .map(|target| self.chan_key(&target))
+                .collect()
+        });
+        let request = ChannelListRequest::new(id, session, self.channel_actor(conn), targets);
+        let previous = self.pending_channel_lists.insert(
+            id,
+            PendingChannelList {
+                session,
+                remaining: self.channels.shard_count(),
+                prefix: if label.is_some() {
+                    std::mem::take(
+                        &mut self
+                            .capture
+                            .as_mut()
+                            .expect("labeled LIST capture exists")
+                            .lines,
+                    )
+                } else {
+                    Vec::new()
+                },
+                label,
+                rows: Vec::new(),
+            },
+        );
+        assert!(previous.is_none(), "channel LIST request identifier reused");
+        request
+    }
+
+    pub fn route_channel_list(&mut self, request: ChannelListRequest) {
+        self.effects
+            .push(CoreEffect::BroadcastChannelList { request });
+    }
+
+    pub fn route_channel_list_result(&mut self, result: ChannelListResult) {
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelListResult {
+                result,
+            }));
+    }
+
+    pub fn take_channel_list(
+        &mut self,
+        result: ChannelListResult,
+    ) -> Option<(Option<String>, Vec<Bytes>, Vec<ChannelListRow>)> {
+        let pending = self.pending_channel_lists.get_mut(&result.id)?;
+        assert!(
+            pending.remaining > 0,
+            "LIST received too many shard results"
+        );
+        pending.remaining -= 1;
+        pending.rows.extend(result.rows);
+        (pending.remaining == 0).then(|| {
+            let pending = self
+                .pending_channel_lists
+                .remove(&result.id)
+                .expect("completed channel LIST request exists");
+            (pending.label, pending.prefix, pending.rows)
+        })
     }
 
     pub fn route_channel_session_event(
@@ -2597,6 +2744,8 @@ impl ServerState {
             admin_server_ban_id: 0,
             pending_channel_controls: HashMap::new(),
             channel_control_id: 0,
+            pending_channel_lists: HashMap::new(),
+            channel_list_id: 0,
         }
     }
 
@@ -3748,6 +3897,8 @@ impl ServerState {
         let Some(session) = self.sessions.get(&conn) else {
             return;
         };
+        self.pending_channel_lists
+            .retain(|_, pending| pending.session.conn() != conn);
         let was_registered = session.is_registered();
         // Output withheld behind an in-flight deferred DB reply (a CHATHISTORY
         // ring miss, say) would be dropped with the session — including the

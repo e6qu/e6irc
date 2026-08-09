@@ -397,92 +397,82 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
 }
 
 pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    // A non-empty first argument is a comma-separated channel list; when
-    // present LIST reports only those channels (Modern IRC `LIST <channels>`)
-    // instead of enumerating every channel.
     state.numeric(conn, RPL_LISTSTART, &["Channel"], Some("Users  Name"));
-    if let Some(targets) = p.first().filter(|target| !target.is_empty()) {
-        for target in targets.split(',').filter(|target| !target.is_empty()) {
-            let owner = state.channel_owner(target);
-            if state.owns_channel(&owner) {
-                send_list_row(state, conn, target);
-            } else {
-                let label = state.channel_reply_label(conn, &owner);
-                state.route_channel_command(crate::core::state::ChannelCommand::new(
-                    owner,
-                    state.channel_actor(conn),
-                    target.to_string(),
-                    crate::core::state::ChannelCommandOperation::List,
-                    label,
-                ));
-            }
-        }
-        state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
-        return;
-    }
-    let rows: Vec<(String, usize, String)> = state
+    let targets = p
+        .first()
+        .filter(|target| !target.is_empty())
+        .map(|targets| {
+            targets
+                .split(',')
+                .filter(|target| !target.is_empty())
+                .map(str::to_string)
+                .collect()
+        });
+    let label = state.defer_channel_reply(conn);
+    let request = state.start_channel_list(conn, label, targets);
+    state.route_channel_list(request);
+}
+
+pub(crate) fn channel_list(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelListRequest,
+) {
+    let conn = request.actor().recipient.conn();
+    let rows = state
         .channels
         .iter()
-        .map(|(_, c)| c)
-        .filter(|c| c.hidden_from(conn).is_none())
-        .map(|c| {
-            (
-                c.name.clone(),
-                c.member_count(),
-                c.topic.as_ref().map(|t| t.text.clone()).unwrap_or_default(),
-            )
+        .filter(|(key, _)| {
+            request
+                .targets()
+                .is_none_or(|targets| targets.contains(key))
+        })
+        .map(|(_, channel)| channel)
+        .filter(|channel| channel.hidden_from(conn).is_none())
+        .map(|channel| crate::core::state::ChannelListRow {
+            name: channel.name.clone(),
+            members: channel.member_count(),
+            topic: channel
+                .topic
+                .as_ref()
+                .map(|topic| topic.text.clone())
+                .unwrap_or_default(),
         })
         .collect();
-    for (name, count, topic) in rows {
-        state.numeric(conn, RPL_LIST, &[&name, &count.to_string()], Some(&topic));
-    }
-    state.numeric(conn, RPL_LISTEND, &[], Some("End of /LIST"));
+    state.route_channel_list_result(crate::core::state::ChannelListResult {
+        id: request.id(),
+        session: request.session(),
+        rows,
+    });
 }
 
-fn send_list_row(state: &mut ServerState, conn: ConnId, target: &str) {
-    let key = state.chan_key(target);
-    let Some(channel) = state.channels.get(&key) else {
+pub(crate) fn channel_list_result(
+    state: &mut ServerState,
+    result: crate::core::state::ChannelListResult,
+) {
+    let session = result.session;
+    let Some((label, prefix, mut rows)) = state.take_channel_list(result) else {
         return;
     };
-    if channel.hidden_from(conn).is_some() {
-        return;
-    }
-    let name = channel.name.clone();
-    let count = channel.member_count().to_string();
-    let topic = channel
-        .topic
-        .as_ref()
-        .map(|topic| topic.text.clone())
-        .unwrap_or_default();
-    state.numeric(conn, RPL_LIST, &[&name, &count], Some(&topic));
-}
-
-pub(super) fn list_on_owner(
-    state: &mut ServerState,
-    command: crate::core::state::ChannelCommand,
-) -> crate::core::state::ChannelCommandReplies {
-    let (owner, actor, target, operation) = command.into_parts();
-    debug_assert!(matches!(
-        operation,
-        crate::core::state::ChannelCommandOperation::List
-    ));
-    let key = state.chan_key(&target);
-    assert_eq!(owner.key(), &key, "LIST owner does not match target");
-    debug_assert!(
-        state.capture.is_none(),
-        "channel owner must not have a capture"
-    );
-    state.capture = Some(crate::core::state::Capture {
-        conn: actor.recipient.conn(),
-        lines: Vec::new(),
-        reply_target: Some(actor.identity.nick),
-        reply_caps: Some(actor.recipient.caps()),
-        label: None,
-        deferred: false,
+    rows.sort_by(|left, right| left.name.cmp(&right.name));
+    state.emit_deferred_labeled(session.conn(), label, |state| {
+        if !prefix.is_empty() {
+            state
+                .capture
+                .as_mut()
+                .expect("labeled LIST capture exists")
+                .lines
+                .extend(prefix);
+        }
+        for row in rows {
+            state.numeric(
+                session.conn(),
+                RPL_LIST,
+                &[&row.name, &row.members.to_string()],
+                Some(&row.topic),
+            );
+        }
+        state.numeric(session.conn(), RPL_LISTEND, &[], Some("End of /LIST"));
     });
-    send_list_row(state, actor.recipient.conn(), &target);
-    let lines = state.capture.take().expect("LIST capture installed").lines;
-    crate::core::state::ChannelCommandReplies { lines }
 }
 
 /// Build the `nick[*]=<+|->user@host` entries shared by USERHOST and USERIP
