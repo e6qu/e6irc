@@ -1076,6 +1076,7 @@ pub(super) fn maybe_complete_registration(state: &mut ServerState, conn: ConnId)
         session.signon = signon;
         session.last_active = active;
     }
+    state.mark_nick_registered(conn);
     let registered_now = state
         .sessions
         .values()

@@ -43,7 +43,13 @@ impl NickKey {
 /// Process-wide nick reservations and their session owners.
 #[derive(Clone, Default)]
 pub(crate) struct NickDirectory {
-    by_key: Arc<Mutex<HashMap<NickKey, SessionOwner>>>,
+    by_key: Arc<Mutex<HashMap<NickKey, NickReservation>>>,
+}
+
+#[derive(Clone, Copy)]
+struct NickReservation {
+    owner: SessionOwner,
+    registered: bool,
 }
 
 impl NickDirectory {
@@ -52,15 +58,23 @@ impl NickDirectory {
             .lock()
             .expect("nick directory poisoned")
             .get(key)
-            .copied()
+            .map(|reservation| reservation.owner)
     }
 
-    pub(crate) fn claim(&self, key: NickKey, owner: SessionOwner) -> bool {
+    pub(crate) fn registered_owner(&self, key: &NickKey) -> Option<SessionOwner> {
+        self.by_key
+            .lock()
+            .expect("nick directory poisoned")
+            .get(key)
+            .and_then(|reservation| reservation.registered.then_some(reservation.owner))
+    }
+
+    pub(crate) fn claim(&self, key: NickKey, owner: SessionOwner, registered: bool) -> bool {
         let mut by_key = self.by_key.lock().expect("nick directory poisoned");
         match by_key.get(&key) {
-            Some(existing) if existing.conn() != owner.conn() => false,
+            Some(existing) if existing.owner.conn() != owner.conn() => false,
             _ => {
-                by_key.insert(key, owner);
+                by_key.insert(key, NickReservation { owner, registered });
                 true
             }
         }
@@ -68,11 +82,26 @@ impl NickDirectory {
 
     pub(crate) fn release_if_owned(&self, key: &NickKey, conn: ConnId) -> bool {
         let mut by_key = self.by_key.lock().expect("nick directory poisoned");
-        if by_key.get(key).is_some_and(|owner| owner.conn() == conn) {
+        if by_key
+            .get(key)
+            .is_some_and(|owner| owner.owner.conn() == conn)
+        {
             by_key.remove(key);
             return true;
         }
         false
+    }
+
+    pub(crate) fn mark_registered(&self, key: &NickKey, conn: ConnId) {
+        if let Some(reservation) = self
+            .by_key
+            .lock()
+            .expect("nick directory poisoned")
+            .get_mut(key)
+            && reservation.owner.conn() == conn
+        {
+            reservation.registered = true;
+        }
     }
 }
 
@@ -2615,12 +2644,26 @@ impl ServerState {
 
     /// Claim `key` for this connection if no other connection owns it.
     pub fn claim_nick(&self, key: NickKey, conn: ConnId) -> bool {
-        self.nicks.claim(key, SessionOwner::new(conn, self.shard))
+        self.nicks.claim(
+            key,
+            SessionOwner::new(conn, self.shard),
+            self.sessions[&conn].is_registered(),
+        )
     }
 
     /// The reservation for `key`, including a remote worker assignment.
     pub fn nick_reservation(&self, key: &NickKey) -> Option<SessionOwner> {
         self.nicks.owner(key)
+    }
+
+    pub fn registered_nick_owner(&self, key: &NickKey) -> Option<SessionOwner> {
+        self.nicks.registered_owner(key)
+    }
+
+    pub fn mark_nick_registered(&self, conn: ConnId) {
+        if let Some(nick) = self.sessions[&conn].nick() {
+            self.nicks.mark_registered(&self.nick_key(nick), conn);
+        }
     }
 
     /// The local connection owning `key`.
@@ -2726,8 +2769,9 @@ impl ServerState {
     /// expectations honest — an unregistered holder can never be prefix-built
     /// (that would panic the shared core worker and take down the server).
     pub fn registered_peer(&self, key: &NickKey) -> Option<ConnId> {
-        self.nick_connection(key)
-            .filter(|conn| self.sessions.get(conn).is_some_and(|s| s.is_registered()))
+        self.registered_nick_owner(key)
+            .filter(|owner| owner.shard() == self.shard)
+            .map(SessionOwner::conn)
     }
 
     pub fn open(
@@ -3655,7 +3699,7 @@ mod session_store_tests {
         let key = NickKey("alice".into());
         let owner = SessionOwner::new(ConnId(7), CoreShardId(3));
 
-        assert!(directory.claim(key.clone(), owner));
+        assert!(directory.claim(key.clone(), owner, true));
 
         assert_eq!(directory.owner(&key), Some(owner));
         assert_eq!(
@@ -3675,8 +3719,8 @@ mod session_store_tests {
         let first = SessionOwner::new(ConnId(7), CoreShardId(0));
         let second = SessionOwner::new(ConnId(8), CoreShardId(1));
 
-        assert!(directory.claim(key.clone(), first));
-        assert!(!directory.claim(key.clone(), second));
+        assert!(directory.claim(key.clone(), first, true));
+        assert!(!directory.claim(key.clone(), second, true));
         assert_eq!(directory.owner(&key), Some(first));
     }
 
