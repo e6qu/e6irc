@@ -124,6 +124,48 @@ pub(crate) struct ScheduledInput {
     pub input: Input,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoreTraceStep {
+    shard: CoreShardId,
+    sequence: u64,
+}
+
+#[cfg(test)]
+impl ScheduledInput {
+    pub(crate) fn trace_step(&self) -> CoreTraceStep {
+        CoreTraceStep {
+            shard: self.shard,
+            sequence: self.sequence,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CoreTrace {
+    steps: Vec<CoreTraceStep>,
+}
+
+#[cfg(test)]
+impl CoreTrace {
+    pub(crate) fn steps(&self) -> &[CoreTraceStep] {
+        &self.steps
+    }
+
+    fn record(&mut self, input: &ScheduledInput) {
+        self.steps.push(input.trace_step());
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayError {
+    ShardMissing,
+    EventMissing,
+    SequenceMismatch { expected: u64, actual: u64 },
+}
+
 /// Round-robin core queue selection.
 ///
 /// A step records both the selected shard and that queue's sequence number,
@@ -132,6 +174,8 @@ pub(crate) struct CoreScheduler {
     receivers: Vec<Receiver<Input>>,
     count: CoreShardCount,
     next: CoreShardId,
+    #[cfg(test)]
+    trace: CoreTrace,
 }
 
 impl CoreScheduler {
@@ -140,6 +184,8 @@ impl CoreScheduler {
             receivers: vec![receiver],
             count: CoreShardCount::single(),
             next: CoreShardId(0),
+            #[cfg(test)]
+            trace: CoreTrace::default(),
         }
     }
 
@@ -158,6 +204,7 @@ impl CoreScheduler {
             receivers,
             count: CoreShardCount::new(count),
             next: CoreShardId(0),
+            trace: CoreTrace::default(),
         }
     }
 
@@ -170,14 +217,48 @@ impl CoreScheduler {
                 payload: input,
             }) = self.receivers[shard.0].try_pop()
             {
-                return Some(ScheduledInput {
+                let scheduled = ScheduledInput {
                     shard,
                     sequence: seq,
                     input,
-                });
+                };
+                #[cfg(test)]
+                self.trace.record(&scheduled);
+                return Some(scheduled);
             }
         }
         None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trace(&self) -> &CoreTrace {
+        &self.trace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_step(
+        &mut self,
+        step: CoreTraceStep,
+    ) -> Result<ScheduledInput, ReplayError> {
+        let receiver = self
+            .receivers
+            .get_mut(step.shard.0)
+            .ok_or(ReplayError::ShardMissing)?;
+        let Envelope {
+            seq,
+            payload: input,
+        } = receiver.try_pop().ok_or(ReplayError::EventMissing)?;
+        if seq != step.sequence {
+            return Err(ReplayError::SequenceMismatch {
+                expected: step.sequence,
+                actual: seq,
+            });
+        }
+        Ok(ScheduledInput {
+            shard: step.shard,
+            sequence: seq,
+            input,
+        })
     }
 
     /// Await one event from the one-worker production configuration.
@@ -1545,7 +1626,9 @@ mod connection_id_allocator_tests {
 
 #[cfg(test)]
 mod ingress_tests {
-    use super::{ConnId, CoreIngress, CoreScheduler, CoreShardId, Input};
+    use super::{
+        ConnId, CoreIngress, CoreScheduler, CoreShardId, CoreTraceStep, Input, ReplayError,
+    };
     use e6irc_queue::{Config, Policy, queue};
 
     #[tokio::test]
@@ -1611,5 +1694,53 @@ mod ingress_tests {
         assert_eq!(second.shard, CoreShardId(1));
         assert_eq!(first.sequence, 0);
         assert_eq!(second.sequence, 0);
+    }
+
+    #[test]
+    fn scheduler_trace_replays_the_same_shard_sequences() {
+        let (first, first_rx) = queue(Config {
+            name: "trace-first",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, second_rx) = queue(Config {
+            name: "trace-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        first.try_push(Input::Shutdown).expect("first event");
+        second.try_push(Input::Shutdown).expect("second event");
+        let mut recorded = CoreScheduler::with_shards(first_rx, vec![second_rx]);
+        recorded.try_step().expect("first recorded event");
+        recorded.try_step().expect("second recorded event");
+        let trace = recorded.trace().steps().to_vec();
+
+        let (first, first_rx) = queue(Config {
+            name: "replay-first",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let (second, second_rx) = queue(Config {
+            name: "replay-second",
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        first.try_push(Input::Shutdown).expect("first replay event");
+        second
+            .try_push(Input::Shutdown)
+            .expect("second replay event");
+        let mut replay = CoreScheduler::with_shards(first_rx, vec![second_rx]);
+
+        for step in trace {
+            let event = replay.replay_step(step).expect("replay event");
+            assert_eq!(event.trace_step(), step);
+        }
+        assert!(matches!(
+            replay.replay_step(CoreTraceStep {
+                shard: CoreShardId(0),
+                sequence: 1,
+            }),
+            Err(ReplayError::EventMissing)
+        ));
     }
 }
