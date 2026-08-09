@@ -1207,9 +1207,92 @@ pub(super) fn cmd_mode(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     if target.starts_with('#') {
-        channel_mode(state, conn, target, &p[1..]);
+        if p.len() == 1 {
+            let owner = state.channel_owner(target);
+            let label = if state.owns_channel(&owner) {
+                state
+                    .capture
+                    .as_ref()
+                    .and_then(|capture| capture.label.clone())
+            } else {
+                state.defer_channel_reply(conn)
+            };
+            let command = crate::core::state::ChannelCommand::new(
+                owner,
+                state.channel_actor(conn),
+                target.into(),
+                crate::core::state::ChannelCommandOperation::ModeQuery,
+                label,
+            );
+            if state.owns_channel(command.owner()) {
+                let result = mode_query_on_owner(state, command);
+                emit_mode_query_result_now(state, conn, result);
+            } else {
+                state.route_channel_command(command);
+            }
+        } else {
+            channel_mode(state, conn, target, &p[1..]);
+        }
     } else {
         user_mode(state, conn, target, &p[1..]);
+    }
+}
+
+pub(super) fn mode_query_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelModeQueryResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    debug_assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::ModeQuery
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "MODE owner does not match target");
+    let Some(chan) = state.channels.get(&key) else {
+        return crate::core::state::ChannelModeQueryResult::NoSuchChannel { target };
+    };
+    if chan.hidden_from(actor.recipient.conn()).is_some() {
+        return crate::core::state::ChannelModeQueryResult::Hidden { target };
+    }
+    crate::core::state::ChannelModeQueryResult::Modes {
+        display: chan.name.clone(),
+        modes: chan
+            .modes
+            .to_string_with_args(chan.is_member(actor.recipient.conn())),
+        created: chan.created_at_secs.to_string(),
+    }
+}
+
+pub(super) fn emit_mode_query_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeQueryResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_mode_query_result_now(state, conn, result)
+    });
+}
+
+fn emit_mode_query_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelModeQueryResult,
+) {
+    match result {
+        crate::core::state::ChannelModeQueryResult::NoSuchChannel { target }
+        | crate::core::state::ChannelModeQueryResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, super::clip_echo(&target))
+        }
+        crate::core::state::ChannelModeQueryResult::Modes {
+            display,
+            modes,
+            created,
+        } => {
+            state.numeric(conn, RPL_CHANNELMODEIS, &[&display, &modes], None);
+            state.numeric(conn, RPL_CREATIONTIME, &[&display, &created], None);
+        }
     }
 }
 

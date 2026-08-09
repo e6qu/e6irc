@@ -819,6 +819,7 @@ pub struct ChannelCommand {
 pub enum ChannelCommandOperation {
     Knock,
     Invite(ChannelInvitee),
+    ModeQuery,
 }
 
 #[derive(Debug, Clone)]
@@ -889,6 +890,7 @@ impl ChannelCommand {
 pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
+    ModeQuery(ChannelModeQueryResult),
 }
 
 #[derive(Debug)]
@@ -908,6 +910,21 @@ pub enum ChannelInviteResult {
     NotOnChannel { target: String },
     NotOperator { target: String },
     UserOnChannel { invitee: String, channel: String },
+}
+
+#[derive(Debug)]
+pub enum ChannelModeQueryResult {
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    Modes {
+        display: String,
+        modes: String,
+        created: String,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -144,6 +144,11 @@ pub(crate) fn channel_command(
                 state, command,
             ))
         }
+        crate::core::state::ChannelCommandOperation::ModeQuery => {
+            crate::core::state::ChannelCommandResult::ModeQuery(channel::mode_query_on_owner(
+                state, command,
+            ))
+        }
     };
     state.route_channel_command_result(session, result, label);
 }
@@ -162,6 +167,9 @@ pub(crate) fn channel_command_result(
             state.emit_deferred_labeled(conn, label, |state| {
                 chanops::emit_invite_result_now(state, conn, result)
             })
+        }
+        crate::core::state::ChannelCommandResult::ModeQuery(result) => {
+            channel::emit_mode_query_result(state, conn, result, label)
         }
     }
 }
