@@ -818,7 +818,7 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     );
     if local {
         if let Some(result) = topic_on_owner(state, request) {
-            emit_topic_result(state, conn, result, label);
+            emit_topic_result_now(state, conn, result);
         }
     } else {
         state.route_topic(request);
@@ -958,7 +958,17 @@ pub(super) fn emit_topic_result(
     result: crate::core::state::ChannelTopicResult,
     label: Option<String>,
 ) {
-    state.emit_deferred_labeled(conn, label, |state| match result {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_topic_result_now(state, conn, result)
+    });
+}
+
+fn emit_topic_result_now(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTopicResult,
+) {
+    match result {
         crate::core::state::ChannelTopicResult::NoSuchChannel { target }
         | crate::core::state::ChannelTopicResult::Hidden { target } => {
             state.err_nosuchchannel(conn, clip_echo(&target));
@@ -1014,7 +1024,7 @@ pub(super) fn emit_topic_result(
                 &format!(":{server} FAIL TOPIC {code} {display} :{message}"),
             );
         }
-    });
+    }
 }
 
 pub(super) fn topic_persisted_on_owner(
