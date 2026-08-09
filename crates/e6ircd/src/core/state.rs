@@ -1453,8 +1453,9 @@ impl Channel {
         casemap: CaseMapping,
         nick: &str,
     ) -> Option<(ConnId, Recipient, &MemberIdentity)> {
+        let nick = casemap.casefold(nick);
         self.members.iter().find_map(|(conn, member)| {
-            (casemap.casefold(&member.identity.nick) == casemap.casefold(nick)).then_some((
+            (casemap.casefold(&member.identity.nick) == nick).then_some((
                 *conn,
                 member.recipient,
                 &member.identity,
