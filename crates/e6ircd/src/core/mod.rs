@@ -2756,6 +2756,18 @@ mod ingress_tests {
         second_tx
             .try_push(Input::Line {
                 conn: ConnId(1),
+                line: b"AWAY :testing".to_vec(),
+            })
+            .expect("remote away queued");
+        let away = next_output(&mut bob_rx).await;
+        assert!(
+            away.payload
+                .0
+                .ends_with(b" 306 robert :You have been marked as being away\r\n")
+        );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
                 line: b"WHO #chat".to_vec(),
             })
             .expect("remote who queued");
@@ -2767,7 +2779,7 @@ mod ingress_tests {
             line.ends_with(b" 352 robert #chat alice host.test irc.test alice H@ :0 alice\r\n")
         }));
         assert!(who_rows.iter().any(|line| {
-            line.ends_with(b" 352 robert #chat bob host.test irc.test robert H@ :0 bob\r\n")
+            line.ends_with(b" 352 robert #chat bob host.test irc.test robert G@ :0 bob\r\n")
         }));
         assert!(
             who_end
