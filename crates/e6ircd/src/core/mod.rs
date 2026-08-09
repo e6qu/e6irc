@@ -2222,6 +2222,27 @@ mod ingress_tests {
         let close = joiner_rx.pop().await.expect("joiner closes labeled batch");
         assert!(close.payload.0.starts_with(b":irc.test BATCH -"));
 
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=part PART #chat :bye".to_vec(),
+            })
+            .await
+            .expect("queue part");
+        let peer_part = peer_rx.pop().await.expect("peer receives PART");
+        assert!(
+            peer_part
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PART #chat :bye\r\n")
+        );
+        let part = joiner_rx.pop().await.expect("joiner receives labeled PART");
+        assert!(
+            part.payload
+                .0
+                .starts_with(b"@label=part :joiner!joiner@host.test PART #chat :bye")
+        );
+
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");
