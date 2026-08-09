@@ -815,6 +815,7 @@ pub enum ChannelCommandOperation {
     Knock,
     Invite(ChannelInvitee),
     ModeQuery,
+    ModeListQuery(String),
 }
 
 #[derive(Debug, Clone)]
@@ -886,6 +887,7 @@ pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
     ModeQuery(ChannelModeQueryResult),
+    ModeListQuery(ChannelModeListQueryResult),
 }
 
 #[derive(Debug)]
@@ -920,6 +922,29 @@ pub enum ChannelModeQueryResult {
         modes: String,
         created: String,
     },
+}
+
+#[derive(Debug)]
+pub enum ChannelModeListQueryResult {
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    Lists {
+        display: String,
+        lists: Vec<ChannelModeList>,
+    },
+}
+
+#[derive(Debug)]
+pub struct ChannelModeList {
+    pub(crate) mode: char,
+    pub(crate) masks: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1980,6 +2005,16 @@ impl ServerState {
 
     pub fn owns_channel(&self, owner: &ChannelOwner) -> bool {
         owner.shard() == self.shard
+    }
+
+    pub fn channel_reply_label(&mut self, conn: ConnId, owner: &ChannelOwner) -> Option<String> {
+        if self.owns_channel(owner) {
+            self.capture
+                .as_ref()
+                .and_then(|capture| capture.label.clone())
+        } else {
+            self.defer_channel_reply(conn)
+        }
     }
 
     pub fn owns_session(&self, owner: SessionOwner) -> bool {

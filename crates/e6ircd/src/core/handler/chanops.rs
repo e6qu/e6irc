@@ -197,14 +197,7 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     };
     let owner = state.channel_owner(target);
-    let label = if state.owns_channel(&owner) {
-        state
-            .capture
-            .as_ref()
-            .and_then(|capture| capture.label.clone())
-    } else {
-        state.defer_channel_reply(conn)
-    };
+    let label = state.channel_reply_label(conn, &owner);
     let command = crate::core::state::ChannelCommand::new(
         owner,
         state.channel_actor(conn),

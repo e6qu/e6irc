@@ -2585,6 +2585,27 @@ mod ingress_tests {
                 .0
                 .ends_with(b":alice!alice@host.test INVITE bob :#chat\r\n")
         );
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"MODE #chat +b bad!*@*".to_vec(),
+            })
+            .expect("mode change queued");
+        let _ = next_output(&mut alice_rx).await;
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"MODE #chat +b".to_vec(),
+            })
+            .expect("mode list queued");
+        let ban = next_output(&mut bob_rx).await;
+        assert!(ban.payload.0.ends_with(b" 367 bob #chat bad!*@*\r\n"));
+        let end = next_output(&mut bob_rx).await;
+        assert!(
+            end.payload
+                .0
+                .ends_with(b" 368 bob #chat :End of Channel Ban List\r\n")
+        );
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");

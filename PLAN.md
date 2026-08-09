@@ -17,8 +17,9 @@ and integration claims.
 - Complete typed cross-shard channel ownership. JOIN, PART, QUIT, KICK, TOPIC,
   single-line messages, TAGMSG, batches/multiline, KNOCK, and INVITE route to
   the channel owner. Nick reservations are process-wide and atomically claimed.
-  MODE mutations, channel queries, services, history, persistence callbacks,
-  and HTTP controls still need the same boundary.
+  MODE reads and list queries route to the owner; MODE mutations, remaining
+  channel queries, services, history, persistence callbacks, and HTTP controls
+  still need the same boundary.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.

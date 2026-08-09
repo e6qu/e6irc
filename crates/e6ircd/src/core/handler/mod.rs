@@ -149,6 +149,11 @@ pub(crate) fn channel_command(
                 state, command,
             ))
         }
+        crate::core::state::ChannelCommandOperation::ModeListQuery(_) => {
+            crate::core::state::ChannelCommandResult::ModeListQuery(
+                channel::mode_list_query_on_owner(state, command),
+            )
+        }
     };
     state.route_channel_command_result(session, result, label);
 }
@@ -170,6 +175,9 @@ pub(crate) fn channel_command_result(
         }
         crate::core::state::ChannelCommandResult::ModeQuery(result) => {
             channel::emit_mode_query_result(state, conn, result, label)
+        }
+        crate::core::state::ChannelCommandResult::ModeListQuery(result) => {
+            channel::emit_mode_list_query_result(state, conn, result, label)
         }
     }
 }
