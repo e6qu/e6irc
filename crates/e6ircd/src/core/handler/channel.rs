@@ -792,6 +792,20 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
         state.err_needmoreparams(conn, "TOPIC");
         return;
     };
+    if p.len() == 1 && !msg.has_trailing {
+        let label = state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.label.clone());
+        state.route_topic(crate::core::state::ChannelTopic::new(
+            state.channel_owner(target),
+            state.channel_actor(conn),
+            target.to_string(),
+            None,
+            label,
+        ));
+        return;
+    }
     let Some((key, chan)) = require_channel(state, conn, target) else {
         return;
     };
@@ -934,6 +948,55 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
         .pending_channel_topics
         .insert(key, (revision, new_topic));
     state.defer_captured_reply(conn);
+}
+
+pub(super) fn topic_on_owner(
+    state: &mut ServerState,
+    request: crate::core::state::ChannelTopic,
+) -> crate::core::state::ChannelTopicResult {
+    let (owner, actor, target, topic) = request.into_parts();
+    assert!(
+        topic.is_none(),
+        "TOPIC setter must not bypass its owner boundary"
+    );
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "TOPIC owner does not match target");
+    let Some(channel) = state.channels.get(&key) else {
+        return crate::core::state::ChannelTopicResult::NoSuchChannel { target };
+    };
+    if channel.hidden_from(actor.recipient.conn()).is_some() {
+        return crate::core::state::ChannelTopicResult::Hidden { target };
+    }
+    crate::core::state::ChannelTopicResult::Topic {
+        display: channel.name.clone(),
+        topic: channel.topic.clone(),
+    }
+}
+
+pub(super) fn emit_topic_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTopicResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| match result {
+        crate::core::state::ChannelTopicResult::NoSuchChannel { target }
+        | crate::core::state::ChannelTopicResult::Hidden { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelTopicResult::Topic { display, topic } => match topic {
+            Some(topic) => {
+                state.numeric(conn, RPL_TOPIC, &[&display], Some(&topic.text));
+                state.numeric(
+                    conn,
+                    RPL_TOPICWHOTIME,
+                    &[&display, &topic.set_by, &topic.set_at_secs.to_string()],
+                    None,
+                );
+            }
+            None => state.numeric(conn, RPL_NOTOPIC, &[&display], Some("No topic is set")),
+        },
+    });
 }
 
 pub(super) struct AppliedChannelTopic {

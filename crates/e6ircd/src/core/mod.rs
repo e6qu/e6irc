@@ -29,7 +29,7 @@ use state::ServerState;
 use state::{
     ChannelActor, ChannelJoinResult, ChannelMessage, ChannelMessageResult, ChannelMultiline,
     ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
-    ChannelTagmsgResult,
+    ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
 };
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -152,6 +152,8 @@ impl CoreIngress {
             Input::ChannelPart { owner, .. } => owner.shard(),
             Input::ChannelPartResult { session, .. } => session.shard(),
             Input::ChannelQuit { quit } => quit.owner().shard(),
+            Input::ChannelTopic { topic } => topic.owner().shard(),
+            Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
             Input::ChannelMultiline { message } => message.owner().shard(),
@@ -389,6 +391,14 @@ pub enum Input {
     },
     ChannelQuit {
         quit: ChannelQuit,
+    },
+    ChannelTopic {
+        topic: ChannelTopic,
+    },
+    ChannelTopicResult {
+        session: SessionOwner,
+        result: ChannelTopicResult,
+        label: Option<String>,
     },
     ChannelMessage {
         message: ChannelMessage,
@@ -1470,6 +1480,14 @@ pub(crate) enum CoreEffect {
         label: Option<String>,
     },
     ChannelQuit(ChannelQuit),
+    ChannelTopic {
+        topic: ChannelTopic,
+    },
+    ChannelTopicResult {
+        session: SessionOwner,
+        result: ChannelTopicResult,
+        label: Option<String>,
+    },
     ChannelMessage {
         message: ChannelMessage,
     },
@@ -1570,6 +1588,16 @@ impl CoreWorker {
                         label,
                     },
                     CoreEffect::ChannelQuit(quit) => Input::ChannelQuit { quit },
+                    CoreEffect::ChannelTopic { topic } => Input::ChannelTopic { topic },
+                    CoreEffect::ChannelTopicResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelTopicResult {
+                        session,
+                        result,
+                        label,
+                    },
                     CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
                     CoreEffect::ChannelMessageResult {
                         session,
@@ -1776,6 +1804,26 @@ impl Core {
             Input::ChannelQuit { quit } => {
                 self.state
                     .quit_channel_member(quit.owner(), quit.conn(), quit.line());
+            }
+            Input::ChannelTopic { topic } => {
+                assert_eq!(
+                    topic.owner().shard(),
+                    self.shard,
+                    "TOPIC reached wrong channel shard"
+                );
+                handler::channel_topic(&mut self.state, topic);
+            }
+            Input::ChannelTopicResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "TOPIC result reached wrong session shard"
+                );
+                handler::channel_topic_result(&mut self.state, session.conn(), result, label);
             }
             Input::ChannelMessage { message } => {
                 assert_eq!(
@@ -2398,6 +2446,21 @@ mod ingress_tests {
         );
         let close = joiner_rx.pop().await.expect("joiner closes labeled batch");
         assert!(close.payload.0.starts_with(b":irc.test BATCH -"));
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"TOPIC #chat".to_vec(),
+            })
+            .await
+            .expect("queue cross-shard TOPIC query");
+        let topic = joiner_rx.pop().await.expect("joiner receives TOPIC result");
+        assert!(
+            topic
+                .payload
+                .0
+                .ends_with(b" 331 joiner #chat :No topic is set\r\n")
+        );
 
         ingress
             .push(Input::Line {

@@ -103,6 +103,22 @@ pub(crate) fn channel_part_result(
     channel::emit_part_result(state, conn, result, label);
 }
 
+pub(crate) fn channel_topic(state: &mut ServerState, topic: crate::core::state::ChannelTopic) {
+    let session = topic.actor().session_owner();
+    let label = topic.label();
+    let result = channel::topic_on_owner(state, topic);
+    state.route_topic_result(session, result, label);
+}
+
+pub(crate) fn channel_topic_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTopicResult,
+    label: Option<String>,
+) {
+    channel::emit_topic_result(state, conn, result, label);
+}
+
 pub(crate) fn channel_message(state: &mut ServerState, message: ChannelMessage) {
     let session = message.actor().session_owner();
     let label = message.label();

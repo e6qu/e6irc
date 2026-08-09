@@ -750,6 +750,62 @@ pub struct ChannelQuit {
     line: String,
 }
 
+/// A parsed TOPIC request, owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelTopic {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    topic: Option<String>,
+    label: Option<String>,
+}
+
+impl ChannelTopic {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        topic: Option<String>,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            topic,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, Option<String>) {
+        (self.owner, self.actor, self.target, self.topic)
+    }
+}
+
+/// A channel owner's TOPIC answer, delivered only to the requester's session owner.
+#[derive(Debug)]
+pub enum ChannelTopicResult {
+    NoSuchChannel {
+        target: String,
+    },
+    Hidden {
+        target: String,
+    },
+    Topic {
+        display: String,
+        topic: Option<Topic>,
+    },
+}
+
 /// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -1180,7 +1236,7 @@ pub(crate) struct HistoryRing {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Topic {
+pub struct Topic {
     pub text: String,
     pub set_by: String,
     /// Unix **seconds** — RPL_TOPICWHOTIME reports whole seconds and the
@@ -1779,6 +1835,23 @@ impl ServerState {
 
     pub fn route_quit(&mut self, quit: ChannelQuit) {
         self.effects.push(CoreEffect::ChannelQuit(quit));
+    }
+
+    pub fn route_topic(&mut self, topic: ChannelTopic) {
+        self.effects.push(CoreEffect::ChannelTopic { topic });
+    }
+
+    pub fn route_topic_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelTopicResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelTopicResult {
+            session,
+            result,
+            label,
+        });
     }
 
     pub fn route_message(&mut self, message: ChannelMessage) {
