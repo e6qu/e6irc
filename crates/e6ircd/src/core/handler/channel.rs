@@ -156,15 +156,22 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Keys align to the *raw* comma positions of the target list, so an empty
     // target slot still consumes its key slot: `JOIN #a,,#c k1,k2` gives `#a`
     // k1 and `#c` no key (k2 belonged to the empty slot), never `#c`←k2.
+    let actor = state.channel_actor(conn);
     for (i, target) in targets.split(',').enumerate() {
         if target.is_empty() {
             continue;
         }
-        join_one(state, conn, target, keys.get(i).copied());
+        join_one(state, actor.clone(), target, keys.get(i).copied());
     }
 }
 
-pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<&str>) {
+pub(super) fn join_one(
+    state: &mut ServerState,
+    actor: ChannelActor,
+    name: &str,
+    join_key: Option<&str>,
+) {
+    let conn = actor.recipient.conn();
     if !crate::sanitize::valid_channel_name(name) {
         state.err_nosuchchannel(conn, clip_echo(name));
         return;
@@ -184,7 +191,6 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         return;
     }
     let now = (state.config.clock)();
-    let actor = state.channel_actor(conn);
     let user_prefix = &actor.identity.prefix;
     let casemap = state.casemap;
     // A registered channel being (re)created restores its retained topic.
