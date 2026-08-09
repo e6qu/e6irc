@@ -1145,6 +1145,64 @@ impl Channel {
     }
 }
 
+/// The local worker's channel state and its ownership boundary.
+pub(crate) struct ChannelDirectory {
+    shard: CoreShardId,
+    channels: HashMap<ChanKey, Channel>,
+}
+
+impl ChannelDirectory {
+    pub(crate) fn new(shard: CoreShardId) -> Self {
+        Self {
+            shard,
+            channels: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn owner(&self, _key: &ChanKey) -> CoreShardId {
+        self.shard
+    }
+
+    pub(crate) fn get(&self, key: &ChanKey) -> Option<&Channel> {
+        self.channels.get(key)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &ChanKey) -> Option<&mut Channel> {
+        self.channels.get_mut(key)
+    }
+
+    pub(crate) fn contains_key(&self, key: &ChanKey) -> bool {
+        self.channels.contains_key(key)
+    }
+
+    pub(crate) fn entry(
+        &mut self,
+        key: ChanKey,
+    ) -> std::collections::hash_map::Entry<'_, ChanKey, Channel> {
+        self.channels.entry(key)
+    }
+
+    pub(crate) fn remove(&mut self, key: &ChanKey) -> Option<Channel> {
+        self.channels.remove(key)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.channels.len()
+    }
+
+    pub(crate) fn iter(&self) -> std::collections::hash_map::Iter<'_, ChanKey, Channel> {
+        self.channels.iter()
+    }
+}
+
+impl Index<&ChanKey> for ChannelDirectory {
+    type Output = Channel;
+
+    fn index(&self, key: &ChanKey) -> &Self::Output {
+        &self.channels[key]
+    }
+}
+
 pub(crate) struct ServerState {
     shard: CoreShardId,
     pub telemetry: Arc<Telemetry>,
@@ -1152,7 +1210,7 @@ pub(crate) struct ServerState {
     pub casemap: CaseMapping,
     pub sessions: SessionStore,
     nicks: NickDirectory,
-    pub channels: HashMap<ChanKey, Channel>,
+    pub channels: ChannelDirectory,
     /// Connections whose SendQ overflowed during this event; swept (and
     /// killed) by `Core::handle` after the event completes.
     pub doomed: Vec<ConnId>,
@@ -1313,7 +1371,7 @@ impl ServerState {
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
             nicks: NickDirectory::default(),
-            channels: HashMap::new(),
+            channels: ChannelDirectory::new(shard),
             doomed: Vec::new(),
             suspended_accounts: HashSet::new(),
             db_tx,
@@ -2332,6 +2390,7 @@ impl ServerState {
         let Some(chan) = self.channels.get(chan_key) else {
             return;
         };
+        debug_assert_eq!(self.channels.owner(chan_key), self.shard);
         let members = chan.recipients();
         let plain = Bytes::from(format!("{line}\r\n"));
         // Built lazily: channels with no server-time member pay nothing.
