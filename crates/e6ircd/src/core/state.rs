@@ -833,6 +833,56 @@ pub enum ChannelMessageResult {
     },
 }
 
+/// A parsed channel TAGMSG, owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelTagmsg {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    target: String,
+    client_tags: String,
+    label: Option<String>,
+}
+
+impl ChannelTagmsg {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        target: String,
+        client_tags: String,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            target,
+            client_tags,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, String) {
+        (self.owner, self.actor, self.target, self.client_tags)
+    }
+}
+
+/// The channel owner's answer to a parsed channel TAGMSG.
+#[derive(Debug)]
+pub enum ChannelTagmsgResult {
+    Delivered { echo: Option<Bytes> },
+    NoSuchChannel { target: String },
+    CannotSend { target: String },
+}
+
 impl ChannelQuit {
     pub(crate) fn new(owner: ChannelOwner, conn: ConnId, line: String) -> Self {
         Self { owner, conn, line }
@@ -1693,6 +1743,23 @@ impl ServerState {
         label: Option<String>,
     ) {
         self.effects.push(CoreEffect::ChannelMessageResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
+        self.effects.push(CoreEffect::ChannelTagmsg { tagmsg });
+    }
+
+    pub fn route_tagmsg_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelTagmsgResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelTagmsgResult {
             session,
             result,
             label,

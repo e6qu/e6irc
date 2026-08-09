@@ -634,6 +634,21 @@ pub(super) fn cmd_tagmsg(state: &mut ServerState, conn: ConnId, msg: &Message, p
 /// answers its own error numeric and delivers nothing, so one bad target in a
 /// comma list does not stop the others.
 fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, client_tags: &str) {
+    let (_, channel_target) = StatusSigil::split(target);
+    if channel_target.starts_with('#') {
+        let owner = state.channel_owner(channel_target);
+        if !state.owns_channel(&owner) {
+            let label = state.defer_channel_reply(conn);
+            state.route_tagmsg(crate::core::state::ChannelTagmsg::new(
+                owner,
+                state.channel_actor(conn),
+                target.to_string(),
+                client_tags.to_string(),
+                label,
+            ));
+            return;
+        }
+    }
     let prefix = state.sessions[&conn].prefix();
     let msgid = state.next_msgid();
     // The sender's account/bot state. TAGMSG carries `account` (for account-tag
@@ -717,6 +732,115 @@ fn deliver_one_tagmsg(state: &mut ServerState, conn: ConnId, target: &str, clien
         let line = make_line(caps.server_time.then(|| time.clone()), caps.account_tag);
         state.send(conn, &line); // echo is the labeled response
     }
+}
+
+/// Execute one parsed channel TAGMSG on its channel-owning shard.
+pub(super) fn tagmsg_on_owner(
+    state: &mut ServerState,
+    tagmsg: crate::core::state::ChannelTagmsg,
+) -> crate::core::state::ChannelTagmsgResult {
+    let (owner, actor, target, client_tags) = tagmsg.into_parts();
+    let (status_prefix, channel_target) = StatusSigil::split(&target);
+    let key = state.chan_key(channel_target);
+    assert_eq!(
+        owner.key(),
+        &key,
+        "TAGMSG owner does not match its channel target"
+    );
+    let Some(channel) = state.channels.get(&key) else {
+        return crate::core::state::ChannelTagmsgResult::NoSuchChannel { target };
+    };
+    if !channel.may_speak(
+        channel.member(actor.recipient.conn()),
+        state.casemap,
+        &actor.identity.prefix,
+    ) {
+        return crate::core::state::ChannelTagmsgResult::CannotSend { target };
+    }
+    let recipients = channel.recipients_where(|member, modes| {
+        member != actor.recipient.conn() && status_prefix.is_none_or(|sig| sig.admits(modes))
+    });
+    let msgid = state.next_msgid();
+    let time = state.time_tag();
+    for recipient in recipients {
+        let caps = recipient.caps();
+        if caps.message_tags {
+            state.send_recipient_uncaptured(
+                recipient,
+                render_tagmsg(&actor, &target, &client_tags, &msgid, &time, caps),
+            );
+        }
+    }
+    let echo = actor.recipient.caps().echo_message.then(|| {
+        render_tagmsg(
+            &actor,
+            &target,
+            &client_tags,
+            &msgid,
+            &time,
+            actor.recipient.caps(),
+        )
+    });
+    crate::core::state::ChannelTagmsgResult::Delivered { echo }
+}
+
+fn render_tagmsg(
+    actor: &crate::core::state::ChannelActor,
+    target: &str,
+    client_tags: &str,
+    msgid: &str,
+    time: &str,
+    caps: crate::core::state::Caps,
+) -> bytes::Bytes {
+    let mut tags = vec![format!("msgid={msgid}")];
+    if caps.server_time {
+        tags.push(format!("time={time}"));
+    }
+    if caps.account_tag
+        && let Some(account) = &actor.account
+    {
+        tags.push(format!(
+            "account={}",
+            e6irc_proto::message::escape_tag_value(account)
+        ));
+    }
+    if actor.bot {
+        tags.push("bot".to_string());
+    }
+    if !client_tags.is_empty() {
+        tags.push(client_tags.to_string());
+    }
+    bytes::Bytes::from(format!(
+        "@{} :{} TAGMSG {target}\r\n",
+        tags.join(";"),
+        actor.identity.prefix
+    ))
+}
+
+pub(super) fn emit_tagmsg_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChannelTagmsgResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| match result {
+        crate::core::state::ChannelTagmsgResult::Delivered { echo } => {
+            if let Some(echo) = echo {
+                state.send_bytes(conn, echo);
+            }
+        }
+        crate::core::state::ChannelTagmsgResult::NoSuchChannel { target } => {
+            state.err_nosuchchannel(conn, clip_echo(&target));
+        }
+        crate::core::state::ChannelTagmsgResult::CannotSend { target } => {
+            state.numeric(
+                conn,
+                ERR_CANNOTSENDTOCHAN,
+                &[&target],
+                Some("Cannot send to channel"),
+            );
+        }
+    });
 }
 
 /// The `draft/multiline` capability, and the limits advertised as its value.

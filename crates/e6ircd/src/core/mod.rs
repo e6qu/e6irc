@@ -28,7 +28,7 @@ use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
 use state::{
     ChannelActor, ChannelJoinResult, ChannelMessage, ChannelMessageResult, ChannelOwner,
-    ChannelPartResult, ChannelQuit,
+    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult,
 };
 
 use crate::observability::{LatencyKind, Telemetry};
@@ -153,6 +153,8 @@ impl CoreIngress {
             Input::ChannelQuit { quit } => quit.owner().shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
+            Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
+            Input::ChannelTagmsgResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -391,6 +393,14 @@ pub enum Input {
     ChannelMessageResult {
         session: SessionOwner,
         result: ChannelMessageResult,
+        label: Option<String>,
+    },
+    ChannelTagmsg {
+        tagmsg: ChannelTagmsg,
+    },
+    ChannelTagmsgResult {
+        session: SessionOwner,
+        result: ChannelTagmsgResult,
         label: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
@@ -1458,6 +1468,14 @@ pub(crate) enum CoreEffect {
         result: ChannelMessageResult,
         label: Option<String>,
     },
+    ChannelTagmsg {
+        tagmsg: ChannelTagmsg,
+    },
+    ChannelTagmsgResult {
+        session: SessionOwner,
+        result: ChannelTagmsgResult,
+        label: Option<String>,
+    },
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1541,6 +1559,16 @@ impl CoreWorker {
                         result,
                         label,
                     } => Input::ChannelMessageResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelTagmsg { tagmsg } => Input::ChannelTagmsg { tagmsg },
+                    CoreEffect::ChannelTagmsgResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelTagmsgResult {
                         session,
                         result,
                         label,
@@ -1747,6 +1775,26 @@ impl Core {
                     "message result reached wrong session shard"
                 );
                 handler::channel_message_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelTagmsg { tagmsg } => {
+                assert_eq!(
+                    tagmsg.owner().shard(),
+                    self.shard,
+                    "TAGMSG reached wrong channel shard"
+                );
+                handler::channel_tagmsg(&mut self.state, tagmsg);
+            }
+            Input::ChannelTagmsgResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "TAGMSG result reached wrong session shard"
+                );
+                handler::channel_tagmsg_result(&mut self.state, session.conn(), result, label);
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
@@ -2198,7 +2246,10 @@ mod ingress_tests {
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(2), CoreShardId(0)),
-                Caps::default(),
+                Caps {
+                    message_tags: true,
+                    ..Caps::default()
+                },
             ),
             MemberIdentity::new("peer".into(), "peer!u@host.test".into(), false),
             MemberModes::default(),
@@ -2238,6 +2289,13 @@ mod ingress_tests {
             .expect("joiner session")
             .caps
             .echo_message = true;
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .message_tags = true;
         while joiner_rx.try_pop().is_some() {}
 
         let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
@@ -2305,11 +2363,38 @@ mod ingress_tests {
                 .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
         );
         let echo = joiner_rx.pop().await.expect("joiner receives labeled echo");
-        assert!(echo.payload.0.starts_with(b"@label=message :joiner!"));
+        assert!(echo.payload.0.starts_with(b"@label=message;msgid="));
         assert!(
             echo.payload
                 .0
                 .ends_with(b":joiner!joiner@host.test PRIVMSG #chat :hello\r\n")
+        );
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=tag;+typing=active TAGMSG #chat".to_vec(),
+            })
+            .await
+            .expect("queue cross-shard TAGMSG");
+        let tagmsg = peer_rx.pop().await.expect("peer receives channel TAGMSG");
+        assert!(tagmsg.payload.0.starts_with(b"@msgid="));
+        assert!(
+            tagmsg
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test TAGMSG #chat\r\n")
+        );
+        let tag_echo = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives labeled TAGMSG echo");
+        assert!(tag_echo.payload.0.starts_with(b"@label=tag;msgid="));
+        assert!(
+            tag_echo
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test TAGMSG #chat\r\n")
         );
 
         ingress
