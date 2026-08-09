@@ -56,6 +56,16 @@ impl CoreShardCount {
     fn shard_for(self, conn: ConnId) -> CoreShardId {
         CoreShardId((conn.0 as usize) % self.0.get())
     }
+
+    pub(crate) fn shard_for_channel(self, key: &state::ChanKey) -> CoreShardId {
+        let hash = key
+            .as_str()
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+        CoreShardId((hash as usize) % self.0.get())
+    }
 }
 
 /// Index of one configured core shard.
@@ -1351,7 +1361,13 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
-        Self::with_telemetry_on_shard(config, db_tx, telemetry, CoreShardId(0))
+        Self::with_telemetry_on_shard(
+            config,
+            db_tx,
+            telemetry,
+            CoreShardId(0),
+            CoreShardCount::single(),
+        )
     }
 
     fn with_telemetry_on_shard(
@@ -1359,9 +1375,10 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
         shard: CoreShardId,
+        shards: CoreShardCount,
     ) -> Self {
         Self {
-            state: ServerState::new(shard, config, db_tx, telemetry),
+            state: ServerState::new(shard, shards, config, db_tx, telemetry),
             next_sequence: 0,
         }
     }

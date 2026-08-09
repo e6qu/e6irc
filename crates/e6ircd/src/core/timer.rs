@@ -34,6 +34,7 @@ impl<T> TimerWheel<T> {
     pub(crate) fn advance(&mut self, now: MonoMillis) -> Vec<T> {
         let target = now.as_millis() / self.resolution.get();
         let mut due = Vec::new();
+        self.drain_current(&mut due);
         if target.saturating_sub(self.tick) >= self.buckets.len() as u64 {
             self.tick = target;
             for bucket in &mut self.buckets {
@@ -58,6 +59,16 @@ impl<T> TimerWheel<T> {
         }
         due
     }
+
+    fn drain_current(&mut self, due: &mut Vec<T>) {
+        let slot = self.tick as usize % self.buckets.len();
+        let bucket = std::mem::take(&mut self.buckets[slot]);
+        let (ready, pending): (Vec<_>, Vec<_>) = bucket
+            .into_iter()
+            .partition(|timer| timer.tick <= self.tick);
+        due.extend(ready.into_iter().map(|timer| timer.payload));
+        self.buckets[slot] = pending;
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +92,17 @@ mod tests {
         assert_eq!(wheel.advance(at(10)), vec!["first"]);
         assert!(wheel.advance(at(20)).is_empty());
         assert_eq!(wheel.advance(at(30)), vec!["later"]);
+    }
+
+    #[test]
+    fn emits_a_timer_due_now() {
+        let mut wheel = TimerWheel::new(
+            at(10),
+            NonZeroU64::new(10).expect("nonzero resolution"),
+            NonZeroUsize::new(2).expect("nonzero slots"),
+        );
+        wheel.schedule(at(10), "now");
+        assert_eq!(wheel.advance(at(10)), vec!["now"]);
     }
 
     #[test]

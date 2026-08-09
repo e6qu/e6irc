@@ -12,7 +12,7 @@ use e6irc_proto::numerics::{
 };
 use e6irc_queue::Sender;
 
-use super::{CoreShardId, Output, WireLine, deliver};
+use super::{CoreShardCount, CoreShardId, Output, WireLine, deliver};
 use crate::observability::Telemetry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1147,20 +1147,20 @@ impl Channel {
 
 /// The local worker's channel state and its ownership boundary.
 pub(crate) struct ChannelDirectory {
-    shard: CoreShardId,
+    shards: CoreShardCount,
     channels: HashMap<ChanKey, Channel>,
 }
 
 impl ChannelDirectory {
-    pub(crate) fn new(shard: CoreShardId) -> Self {
+    pub(crate) fn new(shards: CoreShardCount) -> Self {
         Self {
-            shard,
+            shards,
             channels: HashMap::new(),
         }
     }
 
-    pub(crate) fn owner(&self, _key: &ChanKey) -> CoreShardId {
-        self.shard
+    pub(crate) fn owner(&self, key: &ChanKey) -> CoreShardId {
+        self.shards.shard_for_channel(key)
     }
 
     pub(crate) fn get(&self, key: &ChanKey) -> Option<&Channel> {
@@ -1359,6 +1359,7 @@ impl ServerState {
 
     pub fn new(
         shard: CoreShardId,
+        shards: CoreShardCount,
         config: CoreConfig,
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
@@ -1371,7 +1372,7 @@ impl ServerState {
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
             nicks: NickDirectory::default(),
-            channels: ChannelDirectory::new(shard),
+            channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             suspended_accounts: HashSet::new(),
             db_tx,
@@ -2747,6 +2748,7 @@ mod session_store_tests {
         });
         ServerState::new(
             CoreShardId(0),
+            CoreShardCount::single(),
             CoreConfig {
                 server_name: "irc.test".into(),
                 network_name: "test".into(),

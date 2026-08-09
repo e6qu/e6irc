@@ -839,7 +839,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
                     .expect("timer resolution is nonzero"),
                 std::num::NonZeroUsize::new(TIMER_WHEEL_SLOTS).expect("timer wheel has slots"),
             );
-            wheel.schedule(now.saturating_add_millis(REAP_TICK_MILLIS), ());
+            wheel.schedule(now, ());
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
                 TIMER_WHEEL_RESOLUTION_MILLIS,
             ));
