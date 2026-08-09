@@ -30,8 +30,8 @@ while IFS= read -r row; do
             exit 1
             ;;
         A)
-            if [[ -n "$last_historical" && "$after" < "$last_historical" ]]; then
-                echo "error: new migration must append after $last_historical: $after" >&2
+            if [[ -n "$last_historical" && "$before" < "$last_historical" ]]; then
+                echo "error: new migration must append after $last_historical: $before" >&2
                 exit 1
             fi
             ;;

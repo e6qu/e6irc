@@ -24,6 +24,7 @@ jobs:
       - run: tools/test-backup-restore.sh
       - run: bash -n tools/load/sweep.sh tools/load/qualify-arguments.sh tools/load/qualify-linux.sh tools/test-load-qualification-arguments.sh
       - run: tools/test-load-qualification-arguments.sh
+      - run: tools/test-check-migration-integrity.sh
       - name: Migration integrity
         run: |
           git fetch --no-tags --depth=1 origin main
