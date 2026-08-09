@@ -1213,10 +1213,6 @@ pub struct ChannelOwner {
 }
 
 impl ChannelOwner {
-    pub(crate) fn key(&self) -> &ChanKey {
-        &self.key
-    }
-
     pub(crate) fn shard(&self) -> CoreShardId {
         self.shard
     }
@@ -1455,6 +1451,29 @@ impl ServerState {
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
         }
+    }
+
+    pub fn channel_owner(&self, name: &str) -> ChannelOwner {
+        self.channels.owner(&self.chan_key(name))
+    }
+
+    pub fn owns_channel(&self, owner: &ChannelOwner) -> bool {
+        owner.shard() == self.shard
+    }
+
+    pub fn route_join(
+        &mut self,
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        join_key: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelJoin {
+            owner,
+            actor,
+            name,
+            join_key,
+        });
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {
@@ -2958,7 +2977,7 @@ mod session_store_tests {
         let again = directory.owner(&ChanKey("#chat".into()));
 
         assert_eq!(first, again);
-        assert_eq!(first.key().as_str(), "#chat");
+        assert_eq!(first.key.as_str(), "#chat");
         assert!(first.shard().0 < 3);
     }
 
@@ -3066,7 +3085,9 @@ mod session_store_tests {
 
         let effects = state.take_effects();
         assert_eq!(effects.len(), 1);
-        let crate::core::CoreEffect::Delivery { owner, line } = &effects[0];
+        let crate::core::CoreEffect::Delivery { owner, line } = &effects[0] else {
+            panic!("expected delivery effect");
+        };
         assert_eq!(*owner, SessionOwner::new(ConnId(9), CoreShardId(1)));
         assert!(line.starts_with(b"@time="));
         assert!(line.ends_with(b":nick PRIVMSG #chat :hello\r\n"));

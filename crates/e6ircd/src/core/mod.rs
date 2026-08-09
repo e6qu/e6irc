@@ -351,6 +351,7 @@ pub enum Input {
     ChannelJoin {
         owner: ChannelOwner,
         actor: ChannelActor,
+        name: String,
         join_key: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
@@ -1381,7 +1382,16 @@ pub struct Core {
 }
 
 pub(crate) enum CoreEffect {
-    Delivery { owner: SessionOwner, line: Bytes },
+    Delivery {
+        owner: SessionOwner,
+        line: Bytes,
+    },
+    ChannelJoin {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        join_key: Option<String>,
+    },
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1409,17 +1419,25 @@ impl CoreWorker {
                 input: envelope.payload,
             });
             for effect in self.core.take_effects() {
-                let CoreEffect::Delivery { owner, line } = effect;
-                if self
-                    .ingress
-                    .push(Input::Delivery {
+                let input = match effect {
+                    CoreEffect::Delivery { owner, line } => Input::Delivery {
                         conn: owner.conn(),
                         line,
-                    })
-                    .await
-                    .is_err()
-                {
-                    panic!("cross-shard delivery target closed");
+                    },
+                    CoreEffect::ChannelJoin {
+                        owner,
+                        actor,
+                        name,
+                        join_key,
+                    } => Input::ChannelJoin {
+                        owner,
+                        actor,
+                        name,
+                        join_key,
+                    },
+                };
+                if self.ingress.push(input).await.is_err() {
+                    panic!("cross-shard target closed");
                 }
             }
             if stop {
@@ -1547,6 +1565,7 @@ impl Core {
             Input::ChannelJoin {
                 owner,
                 actor,
+                name,
                 join_key,
             } => {
                 assert_eq!(
@@ -1554,12 +1573,7 @@ impl Core {
                     self.shard,
                     "JOIN reached wrong channel shard"
                 );
-                handler::channel_join(
-                    &mut self.state,
-                    actor,
-                    owner.key().as_str(),
-                    join_key.as_deref(),
-                );
+                handler::channel_join(&mut self.state, actor, &name, join_key.as_deref());
             }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),

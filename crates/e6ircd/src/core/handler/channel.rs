@@ -161,7 +161,18 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         if target.is_empty() {
             continue;
         }
-        join_one(state, actor.clone(), target, keys.get(i).copied());
+        let owner = state.channel_owner(target);
+        let join_key = keys.get(i).copied();
+        if state.owns_channel(&owner) {
+            join_one(state, actor.clone(), target, join_key);
+        } else {
+            state.route_join(
+                owner,
+                actor.clone(),
+                target.to_string(),
+                join_key.map(str::to_string),
+            );
+        }
     }
 }
 
