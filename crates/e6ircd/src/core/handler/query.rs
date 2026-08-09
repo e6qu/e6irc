@@ -134,8 +134,7 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             let rows: Vec<WhoRowData> = if hidden {
                 Vec::new()
             } else {
-                chan.members
-                    .iter()
+                chan.members()
                     // An invisible member is hidden from a WHO by someone who
                     // shares no channel with them (and isn't them) — the same
                     // rule the wildcard/host branch below applies. A fellow
@@ -143,13 +142,11 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                     // each other; only an outsider WHOing a public channel is
                     // filtered. Without this, `+i` leaks through channel WHO.
                     .filter(|(m, _)| {
-                        **m == conn
-                            || !state.sessions[m].invisible
-                            || state.share_channel(conn, **m)
+                        *m == conn || !state.sessions[m].invisible || state.share_channel(conn, *m)
                     })
                     .filter(|(m, _)| !opers_only || state.sessions[m].oper)
                     .map(|(m, modes)| {
-                        let s = &state.sessions[m];
+                        let s = &state.sessions[&m];
                         let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
                             (true, true, true) => "@+",
                             (true, _, _) => "@",
@@ -302,7 +299,7 @@ pub(super) fn cmd_whois(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                 .iter()
                 .filter_map(|k| {
                     let chan = state.channels.get(k)?;
-                    let modes = chan.members.get(&peer)?;
+                    let modes = chan.member(peer)?;
                     // A +s (secret) channel is disclosed only to a requester
                     // who also shares it, so WHOIS can't enumerate hidden
                     // channels a target is in.

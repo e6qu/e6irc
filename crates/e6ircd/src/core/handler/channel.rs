@@ -193,27 +193,19 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     } else {
         None
     };
-    let chan = state
-        .channels
-        .entry(key.clone())
-        .or_insert_with(|| Channel {
-            name: name.to_string(),
-            topic: restored_topic,
-            members: std::collections::HashMap::new(),
-            modes: crate::core::state::ChanModes {
+    let chan = state.channels.entry(key.clone()).or_insert_with(|| {
+        Channel::new(
+            name.to_string(),
+            restored_topic,
+            crate::core::state::ChanModes {
                 no_external: true,
                 topic_ops_only: true,
                 ..Default::default()
             },
-            bans: Vec::new(),
-            quiets: Vec::new(),
-            ban_exceptions: Vec::new(),
-            invite_exceptions: Vec::new(),
-            invited: std::collections::HashSet::new(),
-            // The clock is milliseconds; RPL_CREATIONTIME reports seconds.
-            created_at_secs: now.as_secs(),
-        });
-    if chan.members.contains_key(&conn) {
+            now.as_secs(),
+        )
+    });
+    if chan.is_member(conn) {
         return; // already joined: JOIN is idempotent per Solanum
     }
     // Admission checks, Solanum order. The invite lives on the channel, so it
@@ -262,7 +254,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         return;
     }
     if let Some(limit) = chan.modes.limit
-        && chan.members.len() >= limit as usize
+        && chan.member_count() >= limit as usize
     {
         state.numeric(
             conn,
@@ -272,8 +264,8 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         );
         return;
     }
-    let first = chan.members.is_empty();
-    chan.members.insert(
+    let first = !chan.has_members();
+    chan.add_member(
         conn,
         MemberModes {
             op: first || is_founder || access_op,
@@ -300,8 +292,8 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let plain_join = format!(":{prefix} JOIN {display}");
     let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
     let joiner_away = state.sessions[&conn].away.clone();
-    let members: Vec<ConnId> = state.channels[&key].members.keys().copied().collect();
-    for member in members {
+    let members = state.channels[&key].recipients();
+    for member in members.iter().copied() {
         let Some(session) = state.sessions.get(&member) else {
             continue;
         };
@@ -393,10 +385,7 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let reason = p.get(1).map(|r| r.to_string());
     for target in targets.split(',').filter(|t| !t.is_empty()) {
         let key = state.chan_key(target);
-        let on_channel = state
-            .channels
-            .get(&key)
-            .is_some_and(|c| c.members.contains_key(&conn));
+        let on_channel = state.channels.get(&key).is_some_and(|c| c.is_member(conn));
         if !on_channel {
             state.err_notonchannel(conn, target);
             continue;
@@ -406,8 +395,7 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         // A quieted or banned member can't broadcast a PART reason (which would
         // evade the quiet), unless op/voice — same speak-gate as messages.
         let exempt = state.channels[&key]
-            .members
-            .get(&conn)
+            .member(conn)
             .is_some_and(|m| m.op || m.voice);
         let suppress_reason = !exempt
             && (state.channels[&key].is_banned(state.casemap, &prefix)
@@ -422,8 +410,8 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         };
         state.broadcast_channel(&key, &line, None);
         let chan = state.channels.get_mut(&key).expect("checked");
-        chan.members.remove(&conn);
-        if chan.members.is_empty() {
+        chan.remove_member(conn);
+        if !chan.has_members() {
             state.remove_channel(&key);
         }
         state
@@ -458,17 +446,16 @@ pub(super) fn send_names(state: &mut ServerState, conn: ConnId, key: &ChanKey, e
     }
     let requester_caps = state.sessions[&conn].caps;
     let mut names: Vec<String> = chan
-        .members
-        .iter()
+        .members()
         // An invisible member is hidden from a NAMES by an outsider who shares
         // no channel with them — the same rule WHO applies. Fellow members
         // share this channel, so they still see each other; only a non-member
         // listing a public channel is filtered. Without this, `+i` leaks.
         .filter(|(m, _)| {
-            **m == conn || !state.sessions[m].invisible || state.share_channel(conn, **m)
+            *m == conn || !state.sessions[m].invisible || state.share_channel(conn, *m)
         })
         .map(|(m, modes)| {
-            let member = &state.sessions[m];
+            let member = &state.sessions[&m];
             let shown = if requester_caps.userhost_in_names {
                 member.prefix()
             } else {
@@ -686,7 +673,7 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
         return;
     }
 
-    let member = chan.members.get(&conn);
+    let member = chan.member(conn);
     let Some(member) = member else {
         state.err_notonchannel(conn, target);
         return;
@@ -1135,8 +1122,8 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
         return;
     };
     let display = chan.name.clone();
-    let is_member = chan.members.contains_key(&conn);
-    let is_op = chan.members.get(&conn).is_some_and(|m| m.op);
+    let is_member = chan.is_member(conn);
+    let is_op = chan.member(conn).is_some_and(|m| m.op);
 
     // A +s channel is hidden from non-members on every surface — including
     // MODE, whose mode string, creation time, and +b/+q mask lists would all
@@ -1437,7 +1424,7 @@ pub(super) fn channel_mode(state: &mut ServerState, conn: ConnId, target: &str, 
                     .and_then(|s| s.nick().map(String::from))
                     .unwrap_or_else(|| who.to_string());
                 let chan = state.channels.get_mut(&key).expect("checked");
-                let Some(member) = chan.members.get_mut(&member_conn) else {
+                let Some(member) = chan.member_mut(member_conn) else {
                     state.numeric(
                         conn,
                         ERR_USERNOTINCHANNEL,

@@ -89,11 +89,11 @@ fn kick_pair(
         return;
     };
     let display = chan.name.clone();
-    if !chan.members.contains_key(&conn) {
+    if !chan.is_member(conn) {
         state.err_notonchannel(conn, channel);
         return;
     }
-    if !chan.members[&conn].op {
+    if !chan.member(conn).is_some_and(|member| member.op) {
         state.numeric(
             conn,
             ERR_CHANOPRIVSNEEDED,
@@ -131,7 +131,7 @@ fn kick_one_user(
 ) {
     let who_key = state.nick_key(who);
     let victim = state.nick_connection(&who_key);
-    let victim_on = victim.is_some_and(|v| state.channels[key].members.contains_key(&v));
+    let victim_on = victim.is_some_and(|v| state.channels[key].is_member(v));
     let Some(victim) = victim.filter(|_| victim_on) else {
         state.numeric(
             conn,
@@ -157,8 +157,8 @@ fn kick_one_user(
     };
     state.broadcast_channel(key, &line, None);
     let chan = state.channels.get_mut(key).expect("checked");
-    chan.members.remove(&victim);
-    let empty = chan.members.is_empty();
+    chan.remove_member(victim);
+    let empty = !chan.has_members();
     if empty {
         state.remove_channel(key);
     }
@@ -194,14 +194,11 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let Some((key, display)) = resolve_channel(state, conn, target) else {
         return;
     };
-    if !state.channels[&key].members.contains_key(&conn) {
+    if !state.channels[&key].is_member(conn) {
         state.err_notonchannel(conn, target);
         return;
     }
-    let is_op = state.channels[&key]
-        .members
-        .get(&conn)
-        .is_some_and(|m| m.op);
+    let is_op = state.channels[&key].member(conn).is_some_and(|m| m.op);
     if state.channels[&key].modes.invite_only && !is_op {
         state.numeric(
             conn,
@@ -216,7 +213,7 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         state.err_nosuchnick(conn, clip_echo(who));
         return;
     };
-    if state.channels[&key].members.contains_key(&invitee) {
+    if state.channels[&key].is_member(invitee) {
         state.numeric(
             conn,
             ERR_USERONCHANNEL,
@@ -268,8 +265,8 @@ pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // identified sender, and irctest's AccountTag suite asserts it.
     let mut recipients = vec![invitee];
     let watchers: Vec<ConnId> = state.channels[&key]
-        .members
-        .keys()
+        .recipients()
+        .iter()
         .copied()
         .filter(|c| *c != conn && *c != invitee)
         .filter(|c| state.sessions.get(c).is_some_and(|s| s.caps.invite_notify))
@@ -366,7 +363,7 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         .map(|c| {
             (
                 c.name.clone(),
-                c.members.len(),
+                c.member_count(),
                 c.topic.as_ref().map(|t| t.text.clone()).unwrap_or_default(),
             )
         })
@@ -506,7 +503,7 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         super::deny_hidden(state, conn, target, proof);
         return;
     }
-    if state.channels[&key].members.contains_key(&conn) {
+    if state.channels[&key].is_member(conn) {
         state.numeric(
             conn,
             ERR_KNOCKONCHAN,
@@ -535,10 +532,9 @@ pub(super) fn cmd_knock(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     }
     // Deliver the knock to the channel's operators, then confirm to the knocker.
     let ops: Vec<ConnId> = state.channels[&key]
-        .members
-        .iter()
+        .members()
         .filter(|(_, m)| m.op)
-        .map(|(c, _)| *c)
+        .map(|(c, _)| c)
         .collect();
     for op in ops {
         state.numeric(

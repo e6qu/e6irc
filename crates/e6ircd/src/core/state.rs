@@ -1,5 +1,6 @@
 //! All chat state, owned exclusively by the core worker.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 use std::sync::Arc;
@@ -958,7 +959,8 @@ pub(crate) struct Channel {
     /// Display name (creator's casing).
     pub name: String,
     pub topic: Option<Topic>,
-    pub members: HashMap<ConnId, MemberModes>,
+    members: HashMap<ConnId, MemberModes>,
+    recipients: RefCell<Option<Arc<[ConnId]>>>,
     pub modes: ChanModes,
     pub bans: Vec<MaskKey>,
     pub quiets: Vec<MaskKey>,
@@ -986,6 +988,70 @@ pub(crate) struct Channel {
 pub(crate) struct Hidden(());
 
 impl Channel {
+    pub fn new(name: String, topic: Option<Topic>, modes: ChanModes, created_at_secs: u64) -> Self {
+        Self {
+            name,
+            topic,
+            members: HashMap::new(),
+            recipients: RefCell::new(None),
+            modes,
+            bans: Vec::new(),
+            quiets: Vec::new(),
+            ban_exceptions: Vec::new(),
+            invite_exceptions: Vec::new(),
+            invited: HashSet::new(),
+            created_at_secs,
+        }
+    }
+
+    pub fn is_member(&self, conn: ConnId) -> bool {
+        self.members.contains_key(&conn)
+    }
+
+    pub fn member(&self, conn: ConnId) -> Option<&MemberModes> {
+        self.members.get(&conn)
+    }
+
+    pub fn member_mut(&mut self, conn: ConnId) -> Option<&mut MemberModes> {
+        self.members.get_mut(&conn)
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.members.len()
+    }
+
+    pub fn has_members(&self) -> bool {
+        !self.members.is_empty()
+    }
+
+    pub fn members(&self) -> impl Iterator<Item = (ConnId, &MemberModes)> {
+        self.members.iter().map(|(conn, modes)| (*conn, modes))
+    }
+
+    /// Immutable recipients, rebuilt only after a join or part.
+    pub fn recipients(&self) -> Arc<[ConnId]> {
+        let mut cached = self.recipients.borrow_mut();
+        if let Some(recipients) = cached.as_ref() {
+            return Arc::clone(recipients);
+        }
+        let recipients = self.members.keys().copied().collect();
+        *cached = Some(Arc::clone(&recipients));
+        recipients
+    }
+
+    pub fn add_member(&mut self, conn: ConnId, modes: MemberModes) {
+        self.members.insert(conn, modes);
+        self.recipients.get_mut().take();
+    }
+
+    pub fn remove_member(&mut self, conn: ConnId) -> Option<MemberModes> {
+        let removed = self.members.remove(&conn);
+        if removed.is_some() {
+            self.recipients.get_mut().take();
+        }
+        removed
+    }
+
     /// Is this secret channel invisible to `conn`? A `+s` channel is hidden from
     /// non-members on every query surface — its existence, modes, topic, and
     /// member lists all. The single source of that predicate: deny surfaces
@@ -993,7 +1059,7 @@ impl Channel {
     /// content-listing surfaces (`NAMES`/`WHO`/`WHOIS`/`LIST`) test `.is_some()`
     /// and simply omit the channel's rows.
     pub(crate) fn hidden_from(&self, conn: ConnId) -> Option<Hidden> {
-        (self.modes.secret && !self.members.contains_key(&conn)).then_some(Hidden(()))
+        (self.modes.secret && !self.is_member(conn)).then_some(Hidden(()))
     }
 
     fn any_match(casemap: CaseMapping, masks: &[MaskKey], subject: &str) -> bool {
@@ -2230,16 +2296,11 @@ impl ServerState {
         let Some(chan) = self.channels.get(chan_key) else {
             return;
         };
-        let members: Vec<ConnId> = chan
-            .members
-            .keys()
-            .copied()
-            .filter(|c| Some(*c) != except)
-            .collect();
+        let members = chan.recipients();
         let plain = Bytes::from(format!("{line}\r\n"));
         // Built lazily: channels with no server-time member pay nothing.
         let mut timed: Option<Bytes> = None;
-        for m in members {
+        for m in members.iter().copied().filter(|conn| Some(*conn) != except) {
             let wants_time = self.sessions.get(&m).is_some_and(|s| s.caps.server_time);
             let bytes = if wants_time {
                 timed
@@ -2288,7 +2349,7 @@ impl ServerState {
         let mut seen = HashSet::new();
         for key in &session.channels {
             if let Some(chan) = self.channels.get(key) {
-                seen.extend(chan.members.keys().copied());
+                seen.extend(chan.recipients().iter().copied());
             }
         }
         seen.remove(&conn);
@@ -2365,8 +2426,8 @@ impl ServerState {
         }
         for key in joined {
             if let Some(chan) = self.channels.get_mut(&key) {
-                chan.members.remove(&conn);
-                if chan.members.is_empty() {
+                chan.remove_member(conn);
+                if !chan.has_members() {
                     self.remove_channel(&key);
                 }
             }
@@ -2641,6 +2702,35 @@ mod session_store_tests {
         assert_eq!(directory.owner(&key), Some(owner));
         assert!(directory.release_if_owned(&key, ConnId(7)));
         assert_eq!(directory.owner(&key), None);
+    }
+
+    #[test]
+    fn recipient_snapshot_is_shared_until_membership_changes() {
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            ConnId(1),
+            MemberModes {
+                op: true,
+                voice: false,
+            },
+        );
+
+        let first = channel.recipients();
+        let again = channel.recipients();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        channel.add_member(
+            ConnId(2),
+            MemberModes {
+                op: false,
+                voice: false,
+            },
+        );
+        let changed = channel.recipients();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.len(), 2);
+        assert!(changed.contains(&ConnId(1)));
+        assert!(changed.contains(&ConnId(2)));
     }
 
     #[test]
