@@ -655,6 +655,10 @@ pub(crate) struct Recipient {
 }
 
 impl Recipient {
+    pub(crate) fn new(owner: SessionOwner, caps: Caps) -> Self {
+        Self { owner, caps }
+    }
+
     pub(crate) fn conn(self) -> ConnId {
         self.owner.conn()
     }
@@ -1349,10 +1353,10 @@ pub(crate) const WHOWAS_CAP: usize = 1000;
 
 impl ServerState {
     pub fn local_recipient(&self, conn: ConnId) -> Recipient {
-        Recipient {
-            owner: SessionOwner::new(conn, self.shard),
-            caps: self.sessions[&conn].caps,
-        }
+        Recipient::new(
+            SessionOwner::new(conn, self.shard),
+            self.sessions[&conn].caps,
+        )
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {

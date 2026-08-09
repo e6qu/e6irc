@@ -1723,8 +1723,8 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ConnId, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId,
-        CoreTraceStep, CoreWorker, Input, ReplayError,
+        ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
+        CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
     };
     use bytes::Bytes;
     use e6irc_queue::{Config, Policy, queue};
@@ -1813,6 +1813,84 @@ mod ingress_tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn remote_fanout_reaches_the_destination_workers_sendq() {
+        use crate::core::state::{Caps, ChanModes, Channel, MemberModes, Recipient};
+
+        let config = Config {
+            name: "two-worker-core",
+            capacity: 4,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config.clone());
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let (first_db, _first_db_rx) = queue(Config {
+            name: "first-worker-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let (second_db, _second_db_rx) = queue(Config {
+            name: "second-worker-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut first = Core::with_telemetry_on_shard(
+            core_config(),
+            first_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+        );
+        let mut second = Core::with_telemetry_on_shard(
+            core_config(),
+            second_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            shards,
+        );
+        let (out_tx, mut out_rx) = queue(Config {
+            name: "remote-member-sendq",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        second.state.open(
+            ConnId(1),
+            out_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        let key = first.state.chan_key("#chat");
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(1), CoreShardId(1)),
+                Caps {
+                    server_time: true,
+                    ..Caps::default()
+                },
+            ),
+            MemberModes::default(),
+        );
+        first.state.channels.entry(key.clone()).or_insert(channel);
+        first
+            .state
+            .broadcast_channel(&key, ":nick PRIVMSG #chat :hello", None);
+        first_tx.try_push(Input::Shutdown).expect("stop source");
+
+        let destination = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        CoreWorker::new(first, first_rx, ingress.clone())
+            .run()
+            .await;
+        let output = out_rx.pop().await.expect("remote output delivered");
+        assert!(output.payload.0.starts_with(b"@time="));
+        second_tx
+            .try_push(Input::Shutdown)
+            .expect("stop destination");
+        destination.await.expect("destination worker");
     }
 
     #[test]
