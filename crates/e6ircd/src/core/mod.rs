@@ -2572,6 +2572,15 @@ mod ingress_tests {
         }
         while alice_rx.try_pop().is_some() {}
         while bob_rx.try_pop().is_some() {}
+        {
+            let bob = second
+                .state
+                .sessions
+                .get_mut(&ConnId(1))
+                .expect("bob session");
+            bob.caps.batch = true;
+            bob.caps.chathistory = true;
+        }
         let key = first.state.chan_key("#chat");
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
         let modes = ChanModes {
@@ -2787,6 +2796,32 @@ mod ingress_tests {
                 .0
                 .ends_with(b" 315 robert #chat :End of /WHO list\r\n")
         );
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"PRIVMSG #chat :historic".to_vec(),
+            })
+            .expect("remote history message queued");
+        let historic = next_output(&mut alice_rx).await;
+        assert!(historic.payload.0.ends_with(b"PRIVMSG #chat :historic\r\n"));
+        second_tx
+            .try_push(Input::Line {
+                conn: ConnId(1),
+                line: b"CHATHISTORY LATEST #chat * 1".to_vec(),
+            })
+            .expect("remote chathistory queued");
+        let history = [
+            next_output(&mut bob_rx).await,
+            next_output(&mut bob_rx).await,
+            next_output(&mut bob_rx).await,
+        ];
+        assert!(history.iter().any(|output| {
+            output
+                .payload
+                .0
+                .windows(17)
+                .any(|part| part == b"chathistory #chat")
+        }));
         first_tx.try_push(Input::Shutdown).expect("stop first");
         second_tx.try_push(Input::Shutdown).expect("stop second");
         first_worker.await.expect("first worker");

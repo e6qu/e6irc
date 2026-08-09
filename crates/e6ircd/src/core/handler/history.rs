@@ -125,7 +125,7 @@ pub(super) fn chathistory_fail(
 /// been evicted, a request that reaches older than the ring is resolved
 /// against the `messages` table by composite `(ts, id)` position.
 pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str]) {
-    let caps = state.sessions[&conn].caps;
+    let caps = state.reply_caps(conn);
     if !caps.batch || !caps.chathistory {
         chathistory_fail(
             state,
@@ -153,6 +153,24 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
         );
         return;
     };
+    if target.starts_with('#') {
+        let owner = state.channel_owner(target);
+        if !state.owns_channel(&owner) {
+            let label = state.channel_reply_label(conn, &owner);
+            state.route_channel_command(crate::core::state::ChannelCommand::new(
+                owner,
+                state.channel_actor(conn),
+                target.to_string(),
+                crate::core::state::ChannelCommandOperation::History(
+                    crate::core::state::ChannelHistoryRequest {
+                        parameters: p.iter().map(|parameter| (*parameter).to_string()).collect(),
+                    },
+                ),
+                label,
+            ));
+            return;
+        }
+    }
     // A channel target requires membership. Any other target names the other
     // participant in a direct-message conversation, which the requester is a
     // participant of by construction — the key is derived from their own nick,
@@ -428,6 +446,43 @@ pub(super) fn cmd_chathistory(state: &mut ServerState, conn: ConnId, p: &[&str])
     // label, so history_page must not (pass None). The ring read cannot fail,
     // so the page is always `Ok`.
     history_page(state, conn, &display, &batch_ref, Ok(rows), None);
+}
+
+pub(super) fn history_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChannelHistoryResult {
+    let label = command.label();
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::History(request) = operation else {
+        unreachable!("CHATHISTORY requires its operation")
+    };
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "CHATHISTORY owner does not match target");
+    debug_assert!(
+        state.capture.is_none(),
+        "channel owner must not have a capture"
+    );
+    state.capture = Some(crate::core::state::Capture {
+        conn: actor.recipient.conn(),
+        lines: Vec::new(),
+        reply_target: Some(actor.identity.nick),
+        reply_caps: Some(actor.recipient.caps()),
+        label,
+        deferred: false,
+    });
+    let parameters: Vec<&str> = request.parameters.iter().map(String::as_str).collect();
+    cmd_chathistory(state, actor.recipient.conn(), &parameters);
+    let capture = state.capture.take().expect("CHATHISTORY capture installed");
+    if capture.lines.is_empty() {
+        crate::core::state::ChannelHistoryResult::Deferred
+    } else {
+        crate::core::state::ChannelHistoryResult::Replies(
+            crate::core::state::ChannelCommandReplies {
+                lines: capture.lines,
+            },
+        )
+    }
 }
 
 /// The correspondent in a conversation key, from `me`'s point of view, or

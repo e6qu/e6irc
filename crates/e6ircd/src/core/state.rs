@@ -900,6 +900,7 @@ pub enum ChannelCommandOperation {
     Invite(ChannelInvitee),
     Names,
     Who(ChannelWhoQuery),
+    History(ChannelHistoryRequest),
     ModeQuery,
     ModeListQuery(String),
     ModeChange(ChannelModeChange),
@@ -908,6 +909,11 @@ pub enum ChannelCommandOperation {
 #[derive(Debug, Clone)]
 pub struct ChannelWhoQuery {
     pub(crate) argument: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelHistoryRequest {
+    pub(crate) parameters: Vec<String>,
 }
 
 /// A parsed channel MODE mutation, with its mode token separate from arguments.
@@ -987,6 +993,7 @@ pub enum ChannelCommandResult {
     Invite(ChannelInviteResult),
     Names(ChannelCommandReplies),
     Who(ChannelCommandReplies),
+    History(ChannelHistoryResult),
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
     ModeChange(ChannelCommandReplies),
@@ -996,6 +1003,12 @@ pub enum ChannelCommandResult {
 #[derive(Debug)]
 pub struct ChannelCommandReplies {
     pub(crate) lines: Vec<Bytes>,
+}
+
+#[derive(Debug)]
+pub enum ChannelHistoryResult {
+    Replies(ChannelCommandReplies),
+    Deferred,
 }
 
 #[derive(Debug)]

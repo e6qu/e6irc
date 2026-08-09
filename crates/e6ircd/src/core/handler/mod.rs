@@ -150,6 +150,11 @@ pub(crate) fn channel_command(
         crate::core::state::ChannelCommandOperation::Who(_) => {
             crate::core::state::ChannelCommandResult::Who(query::who_on_owner(state, command))
         }
+        crate::core::state::ChannelCommandOperation::History(_) => {
+            crate::core::state::ChannelCommandResult::History(history::history_on_owner(
+                state, command,
+            ))
+        }
         crate::core::state::ChannelCommandOperation::ModeQuery => {
             crate::core::state::ChannelCommandResult::ModeQuery(channel::mode_query_on_owner(
                 state, command,
@@ -190,6 +195,12 @@ pub(crate) fn channel_command_result(
         crate::core::state::ChannelCommandResult::Who(result) => {
             channel::emit_channel_command_replies(state, conn, result, label)
         }
+        crate::core::state::ChannelCommandResult::History(result) => match result {
+            crate::core::state::ChannelHistoryResult::Replies(replies) => {
+                channel::emit_channel_command_replies(state, conn, replies, label)
+            }
+            crate::core::state::ChannelHistoryResult::Deferred => {}
+        },
         crate::core::state::ChannelCommandResult::ModeQuery(result) => {
             channel::emit_mode_query_result(state, conn, result, label)
         }
