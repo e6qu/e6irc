@@ -120,36 +120,6 @@ pub(crate) fn channel_topic_result(
     channel::emit_topic_result(state, conn, result, label);
 }
 
-pub(crate) fn channel_knock(state: &mut ServerState, knock: crate::core::state::ChannelKnock) {
-    let session = knock.actor().session_owner();
-    let label = knock.label();
-    let result = chanops::knock_on_owner(state, knock);
-    state.route_knock_result(session, result, label);
-}
-
-pub(crate) fn channel_knock_result(
-    state: &mut ServerState,
-    conn: ConnId,
-    result: crate::core::state::ChannelKnockResult,
-    label: Option<String>,
-) {
-    chanops::emit_knock_result(state, conn, result, label);
-}
-
-pub(crate) fn channel_knock_notice(
-    state: &mut ServerState,
-    conn: ConnId,
-    channel: &str,
-    actor_prefix: &str,
-) {
-    state.numeric(
-        conn,
-        RPL_KNOCK,
-        &[channel, actor_prefix],
-        Some("has asked for an invite"),
-    );
-}
-
 pub(crate) fn channel_topic_persisted(
     state: &mut ServerState,
     conn: ConnId,

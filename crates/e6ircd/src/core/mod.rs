@@ -26,10 +26,10 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::{
-    ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelKnock,
-    ChannelKnockResult, ChannelMessage, ChannelMessageResult, ChannelMultiline,
-    ChannelMultilineResult, ChannelOwner, ChannelPartResult, ChannelQuit, ChannelTagmsg,
-    ChannelTagmsgResult, ChannelTopic, ChannelTopicResult,
+    ChannelActor, ChannelJoinResult, ChannelKick, ChannelKickResult, ChannelMessage,
+    ChannelMessageResult, ChannelMultiline, ChannelMultilineResult, ChannelOwner,
+    ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
+    ChannelTopicResult,
 };
 use state::{NickDirectory, ServerState};
 
@@ -161,9 +161,6 @@ impl CoreIngress {
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
             Input::ChannelKick { kick } => kick.owner().shard(),
             Input::ChannelKickResult { session, .. } => session.shard(),
-            Input::ChannelKnock { knock } => knock.owner().shard(),
-            Input::ChannelKnockResult { session, .. }
-            | Input::ChannelKnockNotice { session, .. } => session.shard(),
             Input::SessionChannelRemoved { session, .. } => session.shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
@@ -428,19 +425,6 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelKickResult,
         label: Option<String>,
-    },
-    ChannelKnock {
-        knock: ChannelKnock,
-    },
-    ChannelKnockResult {
-        session: SessionOwner,
-        result: ChannelKnockResult,
-        label: Option<String>,
-    },
-    ChannelKnockNotice {
-        session: SessionOwner,
-        channel: String,
-        actor_prefix: String,
     },
     SessionChannelRemoved {
         session: SessionOwner,
@@ -1569,19 +1553,6 @@ pub(crate) enum CoreEffect {
         result: ChannelKickResult,
         label: Option<String>,
     },
-    ChannelKnock {
-        knock: ChannelKnock,
-    },
-    ChannelKnockResult {
-        session: SessionOwner,
-        result: ChannelKnockResult,
-        label: Option<String>,
-    },
-    ChannelKnockNotice {
-        session: SessionOwner,
-        channel: String,
-        actor_prefix: String,
-    },
     SessionChannelRemoved {
         session: SessionOwner,
         key: state::ChanKey,
@@ -1719,25 +1690,6 @@ impl CoreWorker {
                         session,
                         result,
                         label,
-                    },
-                    CoreEffect::ChannelKnock { knock } => Input::ChannelKnock { knock },
-                    CoreEffect::ChannelKnockResult {
-                        session,
-                        result,
-                        label,
-                    } => Input::ChannelKnockResult {
-                        session,
-                        result,
-                        label,
-                    },
-                    CoreEffect::ChannelKnockNotice {
-                        session,
-                        channel,
-                        actor_prefix,
-                    } => Input::ChannelKnockNotice {
-                        session,
-                        channel,
-                        actor_prefix,
                     },
                     CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
                     CoreEffect::ChannelMessageResult {
@@ -2017,43 +1969,6 @@ impl Core {
                     "KICK result reached wrong session shard"
                 );
                 handler::channel_kick_result(&mut self.state, session.conn(), result, label);
-            }
-            Input::ChannelKnock { knock } => {
-                assert_eq!(
-                    knock.owner().shard(),
-                    self.shard,
-                    "KNOCK reached wrong channel shard"
-                );
-                handler::channel_knock(&mut self.state, knock);
-            }
-            Input::ChannelKnockResult {
-                session,
-                result,
-                label,
-            } => {
-                assert_eq!(
-                    session.shard(),
-                    self.shard,
-                    "KNOCK result reached wrong session shard"
-                );
-                handler::channel_knock_result(&mut self.state, session.conn(), result, label);
-            }
-            Input::ChannelKnockNotice {
-                session,
-                channel,
-                actor_prefix,
-            } => {
-                assert_eq!(
-                    session.shard(),
-                    self.shard,
-                    "KNOCK notice reached wrong session shard"
-                );
-                handler::channel_knock_notice(
-                    &mut self.state,
-                    session.conn(),
-                    &channel,
-                    &actor_prefix,
-                );
             }
             Input::ChannelMessage { message } => {
                 assert_eq!(
