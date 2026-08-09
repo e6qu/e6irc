@@ -905,6 +905,56 @@ pub enum ChannelKickResult {
     UserNotInChannel { victim: String, channel: String },
 }
 
+/// A KNOCK request owned by its channel shard.
+#[derive(Debug, Clone)]
+pub struct ChannelKnock {
+    owner: ChannelOwner,
+    actor: ChannelActor,
+    name: String,
+    label: Option<String>,
+}
+
+impl ChannelKnock {
+    pub(crate) fn new(
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        label: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            actor,
+            name,
+            label,
+        }
+    }
+
+    pub(crate) fn owner(&self) -> &ChannelOwner {
+        &self.owner
+    }
+
+    pub(crate) fn actor(&self) -> &ChannelActor {
+        &self.actor
+    }
+
+    pub(crate) fn label(&self) -> Option<String> {
+        self.label.clone()
+    }
+
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, Option<String>) {
+        (self.owner, self.actor, self.name, self.label)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelKnockResult {
+    NoSuchChannel { target: String },
+    NotOnChannel { channel: String },
+    ChannelOpen { channel: String },
+    Banned { channel: String },
+    Delivered { channel: String },
+}
+
 /// A parsed channel PRIVMSG or NOTICE, owned by its channel shard.
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -2011,6 +2061,36 @@ impl ServerState {
                 result,
                 label,
             });
+    }
+
+    pub fn route_knock(&mut self, knock: ChannelKnock) {
+        self.effects.push(CoreEffect::ChannelKnock { knock });
+    }
+
+    pub fn route_knock_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelKnockResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelKnockResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_knock_notice(
+        &mut self,
+        session: SessionOwner,
+        channel: String,
+        actor_prefix: String,
+    ) {
+        self.effects.push(CoreEffect::ChannelKnockNotice {
+            session,
+            channel,
+            actor_prefix,
+        });
     }
 
     pub fn remove_session_channel(&mut self, conn: ConnId, key: &ChanKey) {
