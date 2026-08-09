@@ -303,7 +303,11 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         } else {
             &plain_join
         };
-        state.send_timed_recipient(recipient, line);
+        if recipient.conn() == conn {
+            state.send_timed(conn, line);
+        } else {
+            state.send_timed_recipient(recipient, line);
+        }
         // away-notify: an away joiner's status follows the JOIN.
         if recipient.conn() != conn
             && caps.away_notify

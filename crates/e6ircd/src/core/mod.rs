@@ -1826,7 +1826,7 @@ mod ingress_tests {
             capacity: 4,
             policy: Policy::Fifo,
         };
-        let (first_tx, first_rx) = queue(config.clone());
+        let (first_tx, first_rx) = queue(config);
         let (second_tx, second_rx) = queue(config);
         let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
