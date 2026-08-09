@@ -2808,6 +2808,18 @@ mod session_store_tests {
     }
 
     #[test]
+    fn channel_owner_is_stable_for_the_folded_key() {
+        let shards =
+            CoreShardCount::new(std::num::NonZeroUsize::new(3).expect("nonzero shard count"));
+        let directory = ChannelDirectory::new(shards);
+        let first = directory.owner(&ChanKey("#chat".into()));
+        let again = directory.owner(&ChanKey("#chat".into()));
+
+        assert_eq!(first, again);
+        assert!(first.0 < 3);
+    }
+
+    #[test]
     fn recipient_snapshot_is_shared_until_membership_changes() {
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
         channel.add_member(
