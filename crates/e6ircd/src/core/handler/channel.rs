@@ -811,34 +811,6 @@ pub(super) fn cmd_topic(state: &mut ServerState, conn: ConnId, msg: &Message, p:
     };
     let display = chan.name.clone();
 
-    // Query: exactly one param. Setting requires the second param —
-    // distinguished from "TOPIC #c :" (clearing) by has_trailing/params.
-    if p.len() == 1 && !msg.has_trailing {
-        // A +s channel's topic — and its very existence — is hidden from
-        // non-members, like every other query surface (NAMES/WHO/WHOIS/LIST).
-        // It must look *non-existent* (403), not "you're not on it" (442) —
-        // the latter confirms the channel exists, an existence oracle. The
-        // shared `deny_hidden` funnels every deny surface to the one numeric.
-        if let Some(proof) = chan.hidden_from(conn) {
-            super::deny_hidden(state, conn, target, proof);
-            return;
-        }
-        match &chan.topic {
-            Some(t) => {
-                let (text, set_by, set_at) = (t.text.clone(), t.set_by.clone(), t.set_at_secs);
-                state.numeric(conn, RPL_TOPIC, &[&display], Some(&text));
-                state.numeric(
-                    conn,
-                    RPL_TOPICWHOTIME,
-                    &[&display, &set_by, &set_at.to_string()],
-                    None,
-                );
-            }
-            None => state.numeric(conn, RPL_NOTOPIC, &[&display], Some("No topic is set")),
-        }
-        return;
-    }
-
     let member = chan.member(conn);
     let Some(member) = member else {
         state.err_notonchannel(conn, target);
