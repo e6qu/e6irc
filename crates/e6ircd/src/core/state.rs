@@ -1195,6 +1195,23 @@ impl Channel {
 }
 
 /// The local worker's channel state and its ownership boundary.
+/// A channel key paired with the only core shard allowed to mutate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChannelOwner {
+    key: ChanKey,
+    shard: CoreShardId,
+}
+
+impl ChannelOwner {
+    pub(crate) fn key(&self) -> &ChanKey {
+        &self.key
+    }
+
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.shard
+    }
+}
+
 pub(crate) struct ChannelDirectory {
     shards: CoreShardCount,
     channels: HashMap<ChanKey, Channel>,
@@ -1208,8 +1225,11 @@ impl ChannelDirectory {
         }
     }
 
-    pub(crate) fn owner(&self, key: &ChanKey) -> CoreShardId {
-        self.shards.shard_for_channel(key)
+    pub(crate) fn owner(&self, key: &ChanKey) -> ChannelOwner {
+        ChannelOwner {
+            key: key.clone(),
+            shard: self.shards.shard_for_channel(key),
+        }
     }
 
     pub(crate) fn get(&self, key: &ChanKey) -> Option<&Channel> {
@@ -2490,7 +2510,7 @@ impl ServerState {
         let Some(chan) = self.channels.get(chan_key) else {
             return;
         };
-        debug_assert_eq!(self.channels.owner(chan_key), self.shard);
+        debug_assert_eq!(self.channels.owner(chan_key).shard(), self.shard);
         let members = chan.recipients();
         let plain = Bytes::from(format!("{line}\r\n"));
         // Built lazily: channels with no server-time member pay nothing.
@@ -2917,7 +2937,8 @@ mod session_store_tests {
         let again = directory.owner(&ChanKey("#chat".into()));
 
         assert_eq!(first, again);
-        assert!(first.0 < 3);
+        assert_eq!(first.key().as_str(), "#chat");
+        assert!(first.shard().0 < 3);
     }
 
     #[test]
