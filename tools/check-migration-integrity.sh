@@ -2,7 +2,10 @@
 set -euo pipefail
 
 base=${1:?usage: check-migration-integrity.sh <base-revision>}
-base=$(git merge-base HEAD "$base")
+# Pull requests use a shallow checkout.  A depth-one base fetch has no merge
+# base unless it is HEAD's direct parent, but `git diff <base>` still compares
+# the complete base tree correctly.
+base=$(git merge-base HEAD "$base" 2>/dev/null || printf '%s\n' "$base")
 
 last_historical=$(git ls-tree -r --name-only "$base" -- migrations | grep -E '^migrations/[0-9]+_.+\.sql$' | sort | tail -1 || true)
 
