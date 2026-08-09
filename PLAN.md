@@ -15,10 +15,10 @@ and integration claims.
 ### Stage F — Scale architecture and qualification
 
 - Complete typed cross-shard channel ownership. JOIN, PART, QUIT, KICK, TOPIC,
-  single-line messages, TAGMSG, batches/multiline, and KNOCK route to the
-  channel owner. Nick reservations are process-wide and atomically claimed.
-  INVITE, MODE, channel queries, services, history, persistence callbacks,
-  and HTTP controls still need the same boundary.
+  single-line messages, TAGMSG, batches/multiline, KNOCK, and INVITE route to
+  the channel owner. Nick reservations are process-wide and atomically claimed.
+  MODE, channel queries, services, history, persistence callbacks, and HTTP
+  controls still need the same boundary.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.

@@ -187,22 +187,6 @@ fn emit_kick_result_now(
     }
 }
 
-/// Resolve a channel by name, answering NOSUCHCHANNEL and returning the
-/// key + display name. The display is cloned so the caller is free to mutate
-/// state without holding the channels borrow.
-fn resolve_channel(
-    state: &mut ServerState,
-    conn: ConnId,
-    target: &str,
-) -> Option<(ChanKey, String)> {
-    let key = state.chan_key(target);
-    let Some(chan) = state.channels.get(&key) else {
-        state.err_nosuchchannel(conn, clip_echo(target));
-        return None;
-    };
-    Some((key, chan.name.clone()))
-}
-
 pub(super) fn cmd_invite(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     let (Some(&who), Some(&target)) = (p.first(), p.get(1)) else {
         state.err_needmoreparams(conn, "INVITE");
