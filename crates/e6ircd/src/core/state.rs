@@ -689,6 +689,16 @@ impl MemberIdentity {
     }
 }
 
+/// Immutable session data a channel operation may use.
+#[derive(Clone)]
+pub(crate) struct ChannelActor {
+    pub(crate) recipient: Recipient,
+    pub(crate) identity: MemberIdentity,
+    pub(crate) account: Option<String>,
+    pub(crate) realname: String,
+    pub(crate) away: Option<String>,
+}
+
 struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
@@ -1434,6 +1444,17 @@ impl ServerState {
             session.prefix(),
             session.invisible,
         )
+    }
+
+    pub fn channel_actor(&self, conn: ConnId) -> ChannelActor {
+        let session = &self.sessions[&conn];
+        ChannelActor {
+            recipient: self.local_recipient(conn),
+            identity: self.local_member_identity(conn),
+            account: session.account.clone(),
+            realname: session.realname().expect("registered session").to_string(),
+            away: session.away.clone(),
+        }
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {

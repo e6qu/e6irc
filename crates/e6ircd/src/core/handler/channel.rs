@@ -184,7 +184,8 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         return;
     }
     let now = (state.config.clock)();
-    let user_prefix = state.sessions[&conn].prefix();
+    let actor = state.channel_actor(conn);
+    let user_prefix = &actor.identity.prefix;
     let casemap = state.casemap;
     // A registered channel being (re)created restores its retained topic.
     let newly_created = !state.channels.contains_key(&key);
@@ -213,17 +214,16 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     let was_invited = chan.invited.contains(&conn);
     // A registered channel's founder is opped on join, even when not the
     // first to arrive.
-    let account = state.sessions[&conn].account.clone();
-    let is_founder = account
+    let is_founder = actor
+        .account
         .as_deref()
         .is_some_and(|a| state.is_founder(&key, a));
     // ChanServ access flags grant auto-op / auto-voice on join.
-    let (access_op, access_voice) = account
+    let (access_op, access_voice) = actor
+        .account
         .as_deref()
         .map(|a| state.access_modes(&key, a))
         .unwrap_or((false, false));
-    let recipient = state.local_recipient(conn);
-    let identity = state.local_member_identity(conn);
     let chan = state.channels.get_mut(&key).expect("just inserted");
     if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
         state.numeric(
@@ -268,8 +268,8 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     }
     let first = !chan.has_members();
     chan.add_member(
-        recipient,
-        identity,
+        actor.recipient,
+        actor.identity.clone(),
         MemberModes {
             op: first || is_founder || access_op,
             voice: access_voice,
@@ -283,18 +283,12 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         .get_mut(&conn)
         .expect("session checked in dispatch");
     session.channels.insert(key.clone());
-    let prefix = session.prefix();
-
-    let (account, realname) = {
-        let session = &state.sessions[&conn];
-        (
-            session.account.clone().unwrap_or_else(|| "*".into()),
-            session.realname().map(String::from).expect("registered"),
-        )
-    };
+    let prefix = actor.identity.prefix;
+    let account = actor.account.unwrap_or_else(|| "*".into());
+    let realname = actor.realname;
     let plain_join = format!(":{prefix} JOIN {display}");
     let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
-    let joiner_away = state.sessions[&conn].away.clone();
+    let joiner_away = actor.away;
     let members = state.channels[&key].recipients();
     for recipient in members.iter().copied() {
         let caps = recipient.caps();
