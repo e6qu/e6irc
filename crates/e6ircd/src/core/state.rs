@@ -667,6 +667,10 @@ impl Recipient {
         self.owner.shard()
     }
 
+    pub(crate) fn owner(self) -> SessionOwner {
+        self.owner
+    }
+
     pub(crate) fn caps(self) -> Caps {
         self.caps
     }
@@ -1915,6 +1919,17 @@ impl ServerState {
                 session,
                 result,
             });
+    }
+
+    pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
+        self.effects
+            .push(crate::core::CoreEffect::SessionChannelRemoved { session, key });
+    }
+
+    pub fn remove_session_channel(&mut self, conn: ConnId, key: &ChanKey) {
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.channels.remove(key);
+        }
     }
 
     pub fn route_message(&mut self, message: ChannelMessage) {

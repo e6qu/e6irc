@@ -155,6 +155,7 @@ impl CoreIngress {
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
+            Input::SessionChannelRemoved { session, .. } => session.shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
             Input::ChannelMultiline { message } => message.owner().shard(),
@@ -406,6 +407,10 @@ pub enum Input {
         conn: ConnId,
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
+    },
+    SessionChannelRemoved {
+        session: SessionOwner,
+        key: state::ChanKey,
     },
     ChannelMessage {
         message: ChannelMessage,
@@ -1522,6 +1527,10 @@ pub(crate) enum CoreEffect {
         session: Option<SessionOwner>,
         result: ChannelTopicPersistence,
     },
+    SessionChannelRemoved {
+        session: SessionOwner,
+        key: state::ChanKey,
+    },
     ChannelMessage {
         message: ChannelMessage,
     },
@@ -1643,6 +1652,9 @@ impl CoreWorker {
                         session,
                         result,
                     },
+                    CoreEffect::SessionChannelRemoved { session, key } => {
+                        Input::SessionChannelRemoved { session, key }
+                    }
                     CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
                     CoreEffect::ChannelMessageResult {
                         session,
@@ -1882,6 +1894,14 @@ impl Core {
                     "TOPIC verdict reached wrong channel shard"
                 );
                 handler::channel_topic_persisted(&mut self.state, conn, session, result);
+            }
+            Input::SessionChannelRemoved { session, key } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "session update reached wrong shard"
+                );
+                self.state.remove_session_channel(session.conn(), &key);
             }
             Input::ChannelMessage { message } => {
                 assert_eq!(

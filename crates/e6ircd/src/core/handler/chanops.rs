@@ -129,7 +129,8 @@ fn kick_one_user(
     who: &str,
     reason: Option<&str>,
 ) {
-    let Some((victim, _, identity)) = state.channels[key].member_named(state.casemap, who) else {
+    let Some((victim, recipient, identity)) = state.channels[key].member_named(state.casemap, who)
+    else {
         state.numeric(
             conn,
             ERR_USERNOTINCHANNEL,
@@ -156,12 +157,12 @@ fn kick_one_user(
     if empty {
         state.remove_channel(key);
     }
-    state
-        .sessions
-        .get_mut(&victim)
-        .expect("member")
-        .channels
-        .remove(key);
+    let owner = recipient.owner();
+    if state.owns_session(owner) {
+        state.remove_session_channel(victim, key);
+    } else {
+        state.route_session_channel_removed(owner, key.clone());
+    }
 }
 
 /// Resolve a channel by name, answering NOSUCHCHANNEL and returning the
