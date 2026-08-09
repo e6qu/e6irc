@@ -2495,8 +2495,10 @@ mod ingress_tests {
         while bob_rx.try_pop().is_some() {}
         let key = first.state.chan_key("#chat");
         assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
-        let mut modes = ChanModes::default();
-        modes.invite_only = true;
+        let modes = ChanModes {
+            invite_only: true,
+            ..ChanModes::default()
+        };
         let mut channel = Channel::new("#chat".into(), None, modes, 0);
         channel.add_member(
             Recipient::new(
