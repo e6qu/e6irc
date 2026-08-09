@@ -5,8 +5,8 @@
 //! transition — which is what makes deterministic simulation and
 //! step-debugging possible.
 //!
-//! Today one worker owns everything; the design splits the same worker
-//! into N hash-sharded instances when scale demands it.
+//! Workers can run as N hash-sharded instances. Each instance owns its local
+//! session state and its assigned channel state.
 
 mod handler;
 mod state;
