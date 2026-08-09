@@ -768,6 +768,7 @@ pub async fn start(mut config: Config) -> io::Result<Running> {
         db_tx,
         telemetry.clone(),
         core_tx.nick_directory(),
+        core_tx.membership_directory(),
     );
     // Seed registered-channel ownership and retained topics so a founder
     // is re-opped and the topic restored on join after a restart, not only

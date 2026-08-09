@@ -111,7 +111,6 @@ pub struct CoreIngress {
     shards: Arc<[Sender<Input>]>,
     count: CoreShardCount,
     nicks: NickDirectory,
-    #[cfg(test)]
     memberships: MembershipDirectory,
 }
 
@@ -121,7 +120,6 @@ impl CoreIngress {
             shards: Arc::from([sender]),
             count: CoreShardCount::single(),
             nicks: NickDirectory::default(),
-            #[cfg(test)]
             memberships: MembershipDirectory::default(),
         }
     }
@@ -142,7 +140,6 @@ impl CoreIngress {
             shards: shards.into(),
             count: CoreShardCount::new(count),
             nicks: NickDirectory::default(),
-            #[cfg(test)]
             memberships: MembershipDirectory::default(),
         }
     }
@@ -197,7 +194,6 @@ impl CoreIngress {
         self.nicks.clone()
     }
 
-    #[cfg(test)]
     pub(crate) fn membership_directory(&self) -> MembershipDirectory {
         self.memberships.clone()
     }
@@ -1772,7 +1768,13 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
-        Self::with_telemetry_with_nicks(config, db_tx, telemetry, NickDirectory::default())
+        Self::with_telemetry_with_nicks(
+            config,
+            db_tx,
+            telemetry,
+            NickDirectory::default(),
+            MembershipDirectory::default(),
+        )
     }
 
     pub(crate) fn with_telemetry_with_nicks(
@@ -1780,6 +1782,7 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
         nicks: NickDirectory,
+        memberships: MembershipDirectory,
     ) -> Self {
         Self::with_telemetry_on_shard_with_nicks(
             config,
@@ -1788,7 +1791,7 @@ impl Core {
             CoreShardId(0),
             CoreShardCount::single(),
             nicks,
-            MembershipDirectory::default(),
+            memberships,
         )
     }
 
