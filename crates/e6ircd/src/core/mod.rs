@@ -1816,7 +1816,7 @@ mod ingress_tests {
     }
 
     #[tokio::test]
-    async fn remote_fanout_reaches_the_destination_workers_sendq() {
+    async fn remote_channel_message_reaches_the_destination_workers_sendq() {
         use crate::core::state::{Caps, ChanModes, Channel, MemberModes, Recipient};
 
         let config = Config {
@@ -1854,7 +1854,7 @@ mod ingress_tests {
         );
         let (out_tx, mut out_rx) = queue(Config {
             name: "remote-member-sendq",
-            capacity: 1,
+            capacity: 8,
             policy: Policy::Fifo,
         });
         second.state.open(
@@ -1863,8 +1863,31 @@ mod ingress_tests {
             "host.test".into(),
             ConnectionTransport::Tcp,
         );
+        let (sender_tx, _sender_rx) = queue(Config {
+            name: "local-member-sendq",
+            capacity: 64,
+            policy: Policy::Fifo,
+        });
+        first.state.open(
+            ConnId(2),
+            sender_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        first.handle(Input::Line {
+            conn: ConnId(2),
+            line: b"NICK sender".to_vec(),
+        });
+        first.handle(Input::Line {
+            conn: ConnId(2),
+            line: b"USER sender 0 * :Sender".to_vec(),
+        });
         let key = first.state.chan_key("#chat");
         let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            first.state.local_recipient(ConnId(2)),
+            MemberModes::default(),
+        );
         channel.add_member(
             Recipient::new(
                 SessionOwner::new(ConnId(1), CoreShardId(1)),
@@ -1876,9 +1899,12 @@ mod ingress_tests {
             MemberModes::default(),
         );
         first.state.channels.entry(key.clone()).or_insert(channel);
-        first
-            .state
-            .broadcast_channel(&key, ":nick PRIVMSG #chat :hello", None);
+        first_tx
+            .try_push(Input::Line {
+                conn: ConnId(2),
+                line: b"PRIVMSG #chat :hello".to_vec(),
+            })
+            .expect("queue source message");
         first_tx.try_push(Input::Shutdown).expect("stop source");
 
         let destination = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
@@ -1887,6 +1913,7 @@ mod ingress_tests {
             .await;
         let output = out_rx.pop().await.expect("remote output delivered");
         assert!(output.payload.0.starts_with(b"@time="));
+        assert!(output.payload.0.ends_with(b"PRIVMSG #chat :hello\r\n"));
         second_tx
             .try_push(Input::Shutdown)
             .expect("stop destination");
