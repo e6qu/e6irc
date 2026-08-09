@@ -2355,7 +2355,9 @@ mod ingress_tests {
 
     #[tokio::test]
     async fn channel_commands_reach_their_channel_owner() {
-        use crate::core::state::{ChannelCommand, ChannelCommandOperation};
+        use crate::core::state::{
+            Caps, ChannelActor, ChannelCommand, ChannelCommandOperation, MemberIdentity, Recipient,
+        };
 
         let config = Config {
             name: "channel-command-routing",
@@ -2379,32 +2381,27 @@ mod ingress_tests {
             shards,
             ingress.nick_directory(),
         );
-        let (out_tx, _out_rx) = queue(Config {
-            name: "channel-command-output",
-            capacity: 8,
-            policy: Policy::Fifo,
-        });
-        core.state.open(
-            ConnId(2),
-            out_tx,
-            "host.test".into(),
-            ConnectionTransport::Tcp,
-        );
-        core.handle(Input::Line {
-            conn: ConnId(2),
-            line: b"NICK requester".to_vec(),
-        });
-        core.handle(Input::Line {
-            conn: ConnId(2),
-            line: b"USER requester 0 * :Requester".to_vec(),
-        });
         let target = ["#alpha", "#beta", "#gamma"]
             .into_iter()
             .find(|name| core.state.channel_owner(name).shard() == CoreShardId(1))
             .expect("a target owned by shard one");
         let command = ChannelCommand::new(
             core.state.channel_owner(target),
-            core.state.channel_actor(ConnId(2)),
+            ChannelActor {
+                recipient: Recipient::new(
+                    SessionOwner::new(ConnId(2), CoreShardId(0)),
+                    Caps::default(),
+                ),
+                identity: MemberIdentity::new(
+                    "requester".into(),
+                    "requester!u@host.test".into(),
+                    false,
+                ),
+                account: None,
+                realname: "Requester".into(),
+                away: None,
+                bot: false,
+            },
             target.into(),
             ChannelCommandOperation::Knock,
             None,
