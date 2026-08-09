@@ -154,6 +154,7 @@ impl CoreIngress {
             Input::ChannelQuit { quit } => quit.owner().shard(),
             Input::ChannelTopic { topic } => topic.owner().shard(),
             Input::ChannelTopicResult { session, .. } => session.shard(),
+            Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
             Input::ChannelMessage { message } => message.owner().shard(),
             Input::ChannelMessageResult { session, .. } => session.shard(),
             Input::ChannelMultiline { message } => message.owner().shard(),
@@ -399,6 +400,12 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelTopicResult,
         label: Option<String>,
+    },
+    ChannelTopicPersisted {
+        owner: ChannelOwner,
+        conn: ConnId,
+        session: Option<SessionOwner>,
+        result: ChannelTopicPersistence,
     },
     ChannelMessage {
         message: ChannelMessage,
@@ -876,6 +883,27 @@ pub enum ServerBanResult {
 pub enum ChannelTopicFailure {
     MissingRegistration,
     PersistenceUnavailable,
+}
+
+/// A durable TOPIC verdict that must be applied by the channel owner.
+#[derive(Debug)]
+pub enum ChannelTopicPersistence {
+    Set {
+        channel: String,
+        display: String,
+        prefix: String,
+        topic: Option<(String, String, u64)>,
+        revision: u64,
+        retained: bool,
+        label: Option<String>,
+    },
+    Failed {
+        channel: String,
+        display: String,
+        revision: u64,
+        label: Option<String>,
+        failure: ChannelTopicFailure,
+    },
 }
 
 /// Work the core asks the DB worker to do. The worker answers by
@@ -1488,6 +1516,12 @@ pub(crate) enum CoreEffect {
         result: ChannelTopicResult,
         label: Option<String>,
     },
+    ChannelTopicPersisted {
+        owner: ChannelOwner,
+        conn: ConnId,
+        session: Option<SessionOwner>,
+        result: ChannelTopicPersistence,
+    },
     ChannelMessage {
         message: ChannelMessage,
     },
@@ -1597,6 +1631,17 @@ impl CoreWorker {
                         session,
                         result,
                         label,
+                    },
+                    CoreEffect::ChannelTopicPersisted {
+                        owner,
+                        conn,
+                        session,
+                        result,
+                    } => Input::ChannelTopicPersisted {
+                        owner,
+                        conn,
+                        session,
+                        result,
                     },
                     CoreEffect::ChannelMessage { message } => Input::ChannelMessage { message },
                     CoreEffect::ChannelMessageResult {
@@ -1824,6 +1869,19 @@ impl Core {
                     "TOPIC result reached wrong session shard"
                 );
                 handler::channel_topic_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelTopicPersisted {
+                owner,
+                conn,
+                session,
+                result,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "TOPIC verdict reached wrong channel shard"
+                );
+                handler::channel_topic_persisted(&mut self.state, conn, session, result);
             }
             Input::ChannelMessage { message } => {
                 assert_eq!(

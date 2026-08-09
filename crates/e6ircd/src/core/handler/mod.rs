@@ -106,8 +106,9 @@ pub(crate) fn channel_part_result(
 pub(crate) fn channel_topic(state: &mut ServerState, topic: crate::core::state::ChannelTopic) {
     let session = topic.actor().session_owner();
     let label = topic.label();
-    let result = channel::topic_on_owner(state, topic);
-    state.route_topic_result(session, result, label);
+    if let Some(result) = channel::topic_on_owner(state, topic) {
+        state.route_topic_result(session, result, label);
+    }
 }
 
 pub(crate) fn channel_topic_result(
@@ -117,6 +118,15 @@ pub(crate) fn channel_topic_result(
     label: Option<String>,
 ) {
     channel::emit_topic_result(state, conn, result, label);
+}
+
+pub(crate) fn channel_topic_persisted(
+    state: &mut ServerState,
+    conn: ConnId,
+    session: Option<crate::core::SessionOwner>,
+    result: crate::core::ChannelTopicPersistence,
+) {
+    channel::topic_persisted_on_owner(state, conn, session, result);
 }
 
 pub(crate) fn channel_message(state: &mut ServerState, message: ChannelMessage) {

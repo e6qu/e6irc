@@ -756,8 +756,15 @@ pub struct ChannelTopic {
     owner: ChannelOwner,
     actor: ChannelActor,
     target: String,
-    topic: Option<String>,
+    operation: ChannelTopicOperation,
     label: Option<String>,
+}
+
+/// A TOPIC request has exactly one operation.
+#[derive(Debug, Clone)]
+pub enum ChannelTopicOperation {
+    Query,
+    Set(String),
 }
 
 impl ChannelTopic {
@@ -765,14 +772,14 @@ impl ChannelTopic {
         owner: ChannelOwner,
         actor: ChannelActor,
         target: String,
-        topic: Option<String>,
+        operation: ChannelTopicOperation,
         label: Option<String>,
     ) -> Self {
         Self {
             owner,
             actor,
             target,
-            topic,
+            operation,
             label,
         }
     }
@@ -786,8 +793,8 @@ impl ChannelTopic {
     pub(crate) fn label(&self) -> Option<String> {
         self.label.clone()
     }
-    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, Option<String>) {
-        (self.owner, self.actor, self.target, self.topic)
+    pub(crate) fn into_parts(self) -> (ChannelOwner, ChannelActor, String, ChannelTopicOperation) {
+        (self.owner, self.actor, self.target, self.operation)
     }
 }
 
@@ -803,6 +810,26 @@ pub enum ChannelTopicResult {
     Topic {
         display: String,
         topic: Option<Topic>,
+    },
+    Set {
+        line: String,
+    },
+    NotOnChannel {
+        target: String,
+    },
+    NotOperator {
+        target: String,
+    },
+    CannotSend {
+        target: String,
+    },
+    Unavailable {
+        display: String,
+        message: String,
+    },
+    PersistenceFailed {
+        display: String,
+        failure: crate::core::ChannelTopicFailure,
     },
 }
 
@@ -1789,6 +1816,10 @@ impl ServerState {
         owner.shard() == self.shard
     }
 
+    pub fn owns_session(&self, owner: SessionOwner) -> bool {
+        owner.shard() == self.shard
+    }
+
     pub fn route_join(
         &mut self,
         owner: ChannelOwner,
@@ -1868,6 +1899,22 @@ impl ServerState {
             result,
             label,
         });
+    }
+
+    pub fn route_topic_persisted(
+        &mut self,
+        owner: ChannelOwner,
+        conn: ConnId,
+        session: Option<SessionOwner>,
+        result: crate::core::ChannelTopicPersistence,
+    ) {
+        self.effects
+            .push(crate::core::CoreEffect::ChannelTopicPersisted {
+                owner,
+                conn,
+                session,
+                result,
+            });
     }
 
     pub fn route_message(&mut self, message: ChannelMessage) {

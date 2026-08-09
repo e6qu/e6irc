@@ -595,19 +595,41 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             retained,
             label,
         } => {
-            super::channel::channel_topic_set(
-                state,
-                conn,
-                super::channel::AppliedChannelTopic {
-                    channel,
-                    display,
-                    prefix,
-                    topic,
-                    revision,
-                    retained,
-                    label,
-                },
-            );
+            let owner = state.channel_owner(&channel);
+            if state.owns_channel(&owner) {
+                super::channel::channel_topic_set(
+                    state,
+                    conn,
+                    super::channel::AppliedChannelTopic {
+                        channel,
+                        display,
+                        prefix,
+                        topic,
+                        revision,
+                        retained,
+                        label,
+                    },
+                );
+            } else {
+                let session = state
+                    .sessions
+                    .contains_key(&conn)
+                    .then(|| state.channel_actor(conn).session_owner());
+                state.route_topic_persisted(
+                    owner,
+                    conn,
+                    session,
+                    crate::core::ChannelTopicPersistence::Set {
+                        channel,
+                        display,
+                        prefix,
+                        topic,
+                        revision,
+                        retained,
+                        label,
+                    },
+                );
+            }
         }
         crate::core::DbReply::ChannelTopicFailed {
             channel,
@@ -616,9 +638,29 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             label,
             failure,
         } => {
-            super::channel::channel_topic_failed(
-                state, conn, channel, display, revision, label, failure,
-            );
+            let owner = state.channel_owner(&channel);
+            if state.owns_channel(&owner) {
+                super::channel::channel_topic_failed(
+                    state, conn, channel, display, revision, label, failure,
+                );
+            } else {
+                let session = state
+                    .sessions
+                    .contains_key(&conn)
+                    .then(|| state.channel_actor(conn).session_owner());
+                state.route_topic_persisted(
+                    owner,
+                    conn,
+                    session,
+                    crate::core::ChannelTopicPersistence::Failed {
+                        channel,
+                        display,
+                        revision,
+                        label,
+                        failure,
+                    },
+                );
+            }
         }
         crate::core::DbReply::ChannelKeeptopicSet {
             channel,
