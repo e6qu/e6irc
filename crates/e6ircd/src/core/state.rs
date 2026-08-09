@@ -641,7 +641,7 @@ impl Session {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MemberModes {
     pub op: bool,
     pub voice: bool,
@@ -672,7 +672,7 @@ impl Recipient {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct MemberIdentity {
     pub(crate) nick: String,
     pub(crate) prefix: String,
@@ -687,6 +687,58 @@ impl MemberIdentity {
             invisible,
         }
     }
+}
+
+/// Immutable session data a channel operation may use.
+#[derive(Debug, Clone)]
+pub struct ChannelActor {
+    pub(crate) recipient: Recipient,
+    pub(crate) identity: MemberIdentity,
+    pub(crate) account: Option<String>,
+    pub(crate) realname: String,
+    pub(crate) away: Option<String>,
+}
+
+impl ChannelActor {
+    pub(crate) fn session_owner(&self) -> SessionOwner {
+        self.recipient.owner
+    }
+}
+
+/// A channel owner's complete answer to a JOIN request.
+///
+/// This crosses back to the session owner instead of giving the channel owner
+/// access to another shard's session table.
+#[derive(Debug, Clone)]
+pub enum ChannelJoinResult {
+    Joined(ChannelJoinSuccess),
+    Rejected(ChannelJoinFailure),
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelJoinSuccess {
+    pub(crate) key: ChanKey,
+    pub(crate) display: String,
+    pub(crate) topic: Option<Topic>,
+    pub(crate) secret: bool,
+    pub(crate) members: Vec<(MemberModes, MemberIdentity)>,
+    pub(crate) own_join: String,
+    pub(crate) own_mode: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelJoinFailure {
+    NoSuchChannel { name: String },
+    InviteOnly { name: String },
+    Banned { name: String },
+    BadKey { name: String },
+    Full { name: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelPartResult {
+    Parted { key: ChanKey, line: String },
+    NotOnChannel { name: String },
 }
 
 struct ChannelMember {
@@ -918,7 +970,7 @@ pub(crate) struct HistoryRing {
     pub complete: bool,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct Topic {
     pub text: String,
     pub set_by: String,
@@ -1195,6 +1247,19 @@ impl Channel {
 }
 
 /// The local worker's channel state and its ownership boundary.
+/// A channel key paired with the only core shard allowed to mutate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelOwner {
+    key: ChanKey,
+    shard: CoreShardId,
+}
+
+impl ChannelOwner {
+    pub(crate) fn shard(&self) -> CoreShardId {
+        self.shard
+    }
+}
+
 pub(crate) struct ChannelDirectory {
     shards: CoreShardCount,
     channels: HashMap<ChanKey, Channel>,
@@ -1208,8 +1273,11 @@ impl ChannelDirectory {
         }
     }
 
-    pub(crate) fn owner(&self, key: &ChanKey) -> CoreShardId {
-        self.shards.shard_for_channel(key)
+    pub(crate) fn owner(&self, key: &ChanKey) -> ChannelOwner {
+        ChannelOwner {
+            key: key.clone(),
+            shard: self.shards.shard_for_channel(key),
+        }
     }
 
     pub(crate) fn get(&self, key: &ChanKey) -> Option<&Channel> {
@@ -1414,6 +1482,85 @@ impl ServerState {
             session.prefix(),
             session.invisible,
         )
+    }
+
+    pub fn channel_actor(&self, conn: ConnId) -> ChannelActor {
+        let session = &self.sessions[&conn];
+        ChannelActor {
+            recipient: self.local_recipient(conn),
+            identity: self.local_member_identity(conn),
+            account: session.account.clone(),
+            realname: session.realname().expect("registered session").to_string(),
+            away: session.away.clone(),
+        }
+    }
+
+    pub fn channel_owner(&self, name: &str) -> ChannelOwner {
+        self.channels.owner(&self.chan_key(name))
+    }
+
+    pub fn owns_channel(&self, owner: &ChannelOwner) -> bool {
+        owner.shard() == self.shard
+    }
+
+    pub fn route_join(
+        &mut self,
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        join_key: Option<String>,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelJoin {
+            owner,
+            actor,
+            name,
+            join_key,
+            label,
+        });
+    }
+
+    pub fn route_join_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelJoinResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelJoinResult {
+            session,
+            result,
+            label,
+        });
+    }
+
+    pub fn route_part(
+        &mut self,
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        reason: Option<String>,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelPart {
+            owner,
+            actor,
+            name,
+            reason,
+            label,
+        });
+    }
+
+    pub fn route_part_result(
+        &mut self,
+        session: SessionOwner,
+        result: ChannelPartResult,
+        label: Option<String>,
+    ) {
+        self.effects.push(CoreEffect::ChannelPartResult {
+            session,
+            result,
+            label,
+        });
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {
@@ -2178,6 +2325,18 @@ impl ServerState {
         }
     }
 
+    /// Start a cross-shard command. Its result owns the deferred slot and,
+    /// when present, the captured label.
+    pub fn defer_channel_reply(&mut self, conn: ConnId) -> Option<String> {
+        let label = self.capture.as_ref().and_then(|capture| {
+            (capture.conn == conn)
+                .then(|| capture.label.clone())
+                .flatten()
+        });
+        self.defer_captured_reply(conn);
+        label
+    }
+
     /// Emit a reply the connection has been waiting on: it bypasses that
     /// connection's hold — it *is* what the hold is waiting for — and releases
     /// one slot afterwards, letting the output queued behind it through.
@@ -2490,7 +2649,7 @@ impl ServerState {
         let Some(chan) = self.channels.get(chan_key) else {
             return;
         };
-        debug_assert_eq!(self.channels.owner(chan_key), self.shard);
+        debug_assert_eq!(self.channels.owner(chan_key).shard(), self.shard);
         let members = chan.recipients();
         let plain = Bytes::from(format!("{line}\r\n"));
         // Built lazily: channels with no server-time member pay nothing.
@@ -2917,7 +3076,8 @@ mod session_store_tests {
         let again = directory.owner(&ChanKey("#chat".into()));
 
         assert_eq!(first, again);
-        assert!(first.0 < 3);
+        assert_eq!(first.key.as_str(), "#chat");
+        assert!(first.shard().0 < 3);
     }
 
     #[test]
@@ -3024,7 +3184,9 @@ mod session_store_tests {
 
         let effects = state.take_effects();
         assert_eq!(effects.len(), 1);
-        let crate::core::CoreEffect::Delivery { owner, line } = &effects[0];
+        let crate::core::CoreEffect::Delivery { owner, line } = &effects[0] else {
+            panic!("expected delivery effect");
+        };
         assert_eq!(*owner, SessionOwner::new(ConnId(9), CoreShardId(1)));
         assert!(line.starts_with(b"@time="));
         assert!(line.ends_with(b":nick PRIVMSG #chat :hello\r\n"));

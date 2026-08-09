@@ -26,6 +26,7 @@ use bytes::Bytes;
 use e6irc_queue::Envelope;
 use e6irc_queue::{PushError, QueueMonitor, Receiver, Sender};
 use state::ServerState;
+use state::{ChannelActor, ChannelJoinResult, ChannelOwner, ChannelPartResult};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -80,7 +81,7 @@ pub(crate) struct CoreShardId(usize);
 
 /// The connection and worker that own one live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SessionOwner {
+pub struct SessionOwner {
     conn: ConnId,
     shard: CoreShardId,
 }
@@ -142,6 +143,10 @@ impl CoreIngress {
             | Input::DbReply { conn, .. }
             | Input::HistoryPage { conn, .. }
             | Input::TargetsPage { conn, .. } => self.count.session_owner(*conn).shard(),
+            Input::ChannelJoin { owner, .. } => owner.shard(),
+            Input::ChannelJoinResult { session, .. } => session.shard(),
+            Input::ChannelPart { owner, .. } => owner.shard(),
+            Input::ChannelPartResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
             | Input::Admin { .. }
@@ -344,6 +349,32 @@ pub enum Input {
     Delivery {
         conn: ConnId,
         line: Bytes,
+    },
+    /// A parsed JOIN that may run only on its channel owner.
+    ChannelJoin {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        join_key: Option<String>,
+        label: Option<String>,
+    },
+    /// The channel owner's typed answer, processed only by the session owner.
+    ChannelJoinResult {
+        session: SessionOwner,
+        result: ChannelJoinResult,
+        label: Option<String>,
+    },
+    ChannelPart {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        reason: Option<String>,
+        label: Option<String>,
+    },
+    ChannelPartResult {
+        session: SessionOwner,
+        result: ChannelPartResult,
+        label: Option<String>,
     },
     /// The socket closed or errored; `reason` is used in the QUIT
     /// broadcast if the session was registered.
@@ -1373,7 +1404,34 @@ pub struct Core {
 }
 
 pub(crate) enum CoreEffect {
-    Delivery { owner: SessionOwner, line: Bytes },
+    Delivery {
+        owner: SessionOwner,
+        line: Bytes,
+    },
+    ChannelJoin {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        join_key: Option<String>,
+        label: Option<String>,
+    },
+    ChannelJoinResult {
+        session: SessionOwner,
+        result: ChannelJoinResult,
+        label: Option<String>,
+    },
+    ChannelPart {
+        owner: ChannelOwner,
+        actor: ChannelActor,
+        name: String,
+        reason: Option<String>,
+        label: Option<String>,
+    },
+    ChannelPartResult {
+        session: SessionOwner,
+        result: ChannelPartResult,
+        label: Option<String>,
+    },
 }
 
 /// One core and the only queue allowed to drive its state transitions.
@@ -1401,17 +1459,58 @@ impl CoreWorker {
                 input: envelope.payload,
             });
             for effect in self.core.take_effects() {
-                let CoreEffect::Delivery { owner, line } = effect;
-                if self
-                    .ingress
-                    .push(Input::Delivery {
+                let input = match effect {
+                    CoreEffect::Delivery { owner, line } => Input::Delivery {
                         conn: owner.conn(),
                         line,
-                    })
-                    .await
-                    .is_err()
-                {
-                    panic!("cross-shard delivery target closed");
+                    },
+                    CoreEffect::ChannelJoin {
+                        owner,
+                        actor,
+                        name,
+                        join_key,
+                        label,
+                    } => Input::ChannelJoin {
+                        owner,
+                        actor,
+                        name,
+                        join_key,
+                        label,
+                    },
+                    CoreEffect::ChannelJoinResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelJoinResult {
+                        session,
+                        result,
+                        label,
+                    },
+                    CoreEffect::ChannelPart {
+                        owner,
+                        actor,
+                        name,
+                        reason,
+                        label,
+                    } => Input::ChannelPart {
+                        owner,
+                        actor,
+                        name,
+                        reason,
+                        label,
+                    },
+                    CoreEffect::ChannelPartResult {
+                        session,
+                        result,
+                        label,
+                    } => Input::ChannelPartResult {
+                        session,
+                        result,
+                        label,
+                    },
+                };
+                if self.ingress.push(input).await.is_err() {
+                    panic!("cross-shard target closed");
                 }
             }
             if stop {
@@ -1536,6 +1635,58 @@ impl Core {
             Input::Line { conn, line } => handler::dispatch(&mut self.state, conn, &line),
             Input::OverlongLine { conn } => handler::overlong(&mut self.state, conn),
             Input::Delivery { conn, line } => self.state.send_bytes_uncaptured(conn, line),
+            Input::ChannelJoin {
+                owner,
+                actor,
+                name,
+                join_key,
+                label,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "JOIN reached wrong channel shard"
+                );
+                handler::channel_join(&mut self.state, actor, &name, join_key.as_deref(), label);
+            }
+            Input::ChannelJoinResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "JOIN result reached wrong session shard"
+                );
+                handler::channel_join_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelPart {
+                owner,
+                actor,
+                name,
+                reason,
+                label,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "PART reached wrong channel shard"
+                );
+                handler::channel_part(&mut self.state, actor, &name, reason.as_deref(), label);
+            }
+            Input::ChannelPartResult {
+                session,
+                result,
+                label,
+            } => {
+                assert_eq!(
+                    session.shard(),
+                    self.shard,
+                    "PART result reached wrong session shard"
+                );
+                handler::channel_part_result(&mut self.state, session.conn(), result, label);
+            }
             Input::Closed { conn, reason } => self.state.close(conn, &reason),
             Input::Tick { now } => handler::reap_idle(&mut self.state, now),
             Input::DbReply { conn, reply } => handler::db_reply(&mut self.state, conn, reply),
@@ -1927,6 +2078,175 @@ mod ingress_tests {
             .try_push(Input::Shutdown)
             .expect("stop destination");
         destination.await.expect("destination worker");
+    }
+
+    #[tokio::test]
+    async fn remote_join_returns_to_the_session_owner() {
+        use crate::core::state::{
+            Caps, ChanModes, Channel, MemberIdentity, MemberModes, Recipient,
+        };
+
+        let config = Config {
+            name: "two-worker-join",
+            capacity: 8,
+            policy: Policy::Fifo,
+        };
+        let (first_tx, first_rx) = queue(config);
+        let (second_tx, second_rx) = queue(config);
+        let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
+        let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
+        let (first_db, _first_db_rx) = queue(Config {
+            name: "first-worker-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let (second_db, _second_db_rx) = queue(Config {
+            name: "second-worker-db",
+            capacity: 1,
+            policy: Policy::Fifo,
+        });
+        let mut first = Core::with_telemetry_on_shard(
+            core_config(),
+            first_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(0),
+            shards,
+        );
+        let mut second = Core::with_telemetry_on_shard(
+            core_config(),
+            second_db,
+            Arc::new(crate::observability::Telemetry::new()),
+            CoreShardId(1),
+            shards,
+        );
+        assert_eq!(first.state.channel_owner("#chat").shard(), CoreShardId(0));
+
+        let (peer_tx, mut peer_rx) = queue(Config {
+            name: "join-peer-sendq",
+            capacity: 8,
+            policy: Policy::Fifo,
+        });
+        first.state.open(
+            ConnId(2),
+            peer_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        let key = first.state.chan_key("#chat");
+        let mut channel = Channel::new("#chat".into(), None, ChanModes::default(), 0);
+        channel.add_member(
+            Recipient::new(
+                SessionOwner::new(ConnId(2), CoreShardId(0)),
+                Caps::default(),
+            ),
+            MemberIdentity::new("peer".into(), "peer!u@host.test".into(), false),
+            MemberModes::default(),
+        );
+        first.state.channels.entry(key).or_insert(channel);
+
+        let (joiner_tx, mut joiner_rx) = queue(Config {
+            name: "joiner-sendq",
+            capacity: 16,
+            policy: Policy::Fifo,
+        });
+        second.state.open(
+            ConnId(1),
+            joiner_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        second.handle(Input::Line {
+            conn: ConnId(1),
+            line: b"NICK joiner".to_vec(),
+        });
+        second.handle(Input::Line {
+            conn: ConnId(1),
+            line: b"USER joiner 0 * :Joiner".to_vec(),
+        });
+        second
+            .state
+            .sessions
+            .get_mut(&ConnId(1))
+            .expect("joiner session")
+            .caps
+            .labeled_response = true;
+        while joiner_rx.try_pop().is_some() {}
+
+        let first_worker = tokio::spawn(CoreWorker::new(first, first_rx, ingress.clone()).run());
+        let second_worker = tokio::spawn(CoreWorker::new(second, second_rx, ingress.clone()).run());
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=join JOIN #chat".to_vec(),
+            })
+            .await
+            .expect("queue join");
+
+        let peer = peer_rx.pop().await.expect("peer receives JOIN");
+        assert!(
+            peer.payload
+                .0
+                .ends_with(b":joiner!joiner@host.test JOIN #chat\r\n")
+        );
+        let batch = joiner_rx
+            .pop()
+            .await
+            .expect("joiner receives labeled batch");
+        assert!(
+            batch
+                .payload
+                .0
+                .starts_with(b"@label=join :irc.test BATCH +")
+        );
+        let join = joiner_rx.pop().await.expect("joiner receives own JOIN");
+        assert!(
+            join.payload
+                .0
+                .ends_with(b":joiner!joiner@host.test JOIN #chat\r\n")
+        );
+        let names = joiner_rx.pop().await.expect("joiner receives NAMES");
+        assert!(
+            names
+                .payload
+                .0
+                .ends_with(b" 353 joiner = #chat :joiner peer\r\n")
+        );
+        let end_names = joiner_rx.pop().await.expect("joiner receives end of NAMES");
+        assert!(
+            end_names
+                .payload
+                .0
+                .windows(b" 366 joiner #chat ".len())
+                .any(|window| window == b" 366 joiner #chat ")
+        );
+        let close = joiner_rx.pop().await.expect("joiner closes labeled batch");
+        assert!(close.payload.0.starts_with(b":irc.test BATCH -"));
+
+        ingress
+            .push(Input::Line {
+                conn: ConnId(1),
+                line: b"@label=part PART #chat :bye".to_vec(),
+            })
+            .await
+            .expect("queue part");
+        let peer_part = peer_rx.pop().await.expect("peer receives PART");
+        assert!(
+            peer_part
+                .payload
+                .0
+                .ends_with(b":joiner!joiner@host.test PART #chat :bye\r\n")
+        );
+        let part = joiner_rx.pop().await.expect("joiner receives labeled PART");
+        assert!(
+            part.payload
+                .0
+                .starts_with(b"@label=part :joiner!joiner@host.test PART #chat :bye")
+        );
+
+        first_tx.try_push(Input::Shutdown).expect("stop first");
+        second_tx.try_push(Input::Shutdown).expect("stop second");
+        first_worker.await.expect("first worker");
+        second_worker.await.expect("second worker");
     }
 
     #[test]

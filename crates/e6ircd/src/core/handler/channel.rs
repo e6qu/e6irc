@@ -1,6 +1,7 @@
 //! Channel membership, topic, and modes.
 
 use super::*;
+use crate::core::state::{ChannelJoinFailure, ChannelJoinSuccess};
 
 // ---- channels -----------------------------------------------------------
 
@@ -156,35 +157,58 @@ pub(super) fn cmd_join(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     // Keys align to the *raw* comma positions of the target list, so an empty
     // target slot still consumes its key slot: `JOIN #a,,#c k1,k2` gives `#a`
     // k1 and `#c` no key (k2 belonged to the empty slot), never `#c`←k2.
+    let actor = state.channel_actor(conn);
     for (i, target) in targets.split(',').enumerate() {
         if target.is_empty() {
             continue;
         }
-        join_one(state, conn, target, keys.get(i).copied());
+        let key = state.chan_key(target);
+        // The session owner alone owns this index, so it enforces the bound
+        // before either a local or remote channel-owner request.
+        if !state.sessions[&conn].channels.contains(&key)
+            && state.sessions[&conn].channels.len() >= MAX_CHANNELS_PER_SESSION
+        {
+            state.numeric(
+                conn,
+                ERR_TOOMANYCHANNELS,
+                &[target],
+                Some("You have joined too many channels"),
+            );
+            continue;
+        }
+        let owner = state.channel_owner(target);
+        let join_key = keys.get(i).copied();
+        if state.owns_channel(&owner) {
+            let result = join_on_owner(state, actor.clone(), target, join_key);
+            emit_join_response(state, conn, result);
+        } else {
+            let label = state.defer_channel_reply(conn);
+            state.route_join(
+                owner,
+                actor.clone(),
+                target.to_string(),
+                join_key.map(str::to_string),
+                label,
+            );
+        }
     }
 }
 
-pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_key: Option<&str>) {
+pub(super) fn join_on_owner(
+    state: &mut ServerState,
+    actor: ChannelActor,
+    name: &str,
+    join_key: Option<&str>,
+) -> ChannelJoinResult {
+    let conn = actor.recipient.conn();
     if !crate::sanitize::valid_channel_name(name) {
-        state.err_nosuchchannel(conn, clip_echo(name));
-        return;
+        return ChannelJoinResult::Rejected(ChannelJoinFailure::NoSuchChannel {
+            name: clip_echo(name).to_string(),
+        });
     }
     let key = state.chan_key(name);
-    // Bound channels per session so one connection can't allocate unbounded
-    // Channel state. A rejoin of a channel already held is exempt.
-    if !state.sessions[&conn].channels.contains(&key)
-        && state.sessions[&conn].channels.len() >= MAX_CHANNELS_PER_SESSION
-    {
-        state.numeric(
-            conn,
-            ERR_TOOMANYCHANNELS,
-            &[name],
-            Some("You have joined too many channels"),
-        );
-        return;
-    }
     let now = (state.config.clock)();
-    let user_prefix = state.sessions[&conn].prefix();
+    let user_prefix = &actor.identity.prefix;
     let casemap = state.casemap;
     // A registered channel being (re)created restores its retained topic.
     let newly_created = !state.channels.contains_key(&key);
@@ -206,70 +230,64 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         )
     });
     if chan.is_member(conn) {
-        return; // already joined: JOIN is idempotent per Solanum
+        return ChannelJoinResult::Joined(ChannelJoinSuccess {
+            key,
+            display: chan.name.clone(),
+            topic: chan.topic.clone(),
+            secret: chan.modes.secret,
+            members: chan
+                .member_identities()
+                .map(|(_, modes, identity)| (modes.clone(), identity.clone()))
+                .collect(),
+            own_join: String::new(),
+            own_mode: None,
+        });
     }
     // Admission checks, Solanum order. The invite lives on the channel, so it
     // can only ever admit into the incarnation whose op granted it.
     let was_invited = chan.invited.contains(&conn);
     // A registered channel's founder is opped on join, even when not the
     // first to arrive.
-    let account = state.sessions[&conn].account.clone();
-    let is_founder = account
+    let is_founder = actor
+        .account
         .as_deref()
         .is_some_and(|a| state.is_founder(&key, a));
     // ChanServ access flags grant auto-op / auto-voice on join.
-    let (access_op, access_voice) = account
+    let (access_op, access_voice) = actor
+        .account
         .as_deref()
         .map(|a| state.access_modes(&key, a))
         .unwrap_or((false, false));
-    let recipient = state.local_recipient(conn);
-    let identity = state.local_member_identity(conn);
     let chan = state.channels.get_mut(&key).expect("just inserted");
-    if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, &user_prefix) {
-        state.numeric(
-            conn,
-            ERR_INVITEONLYCHAN,
-            &[name],
-            Some("Cannot join channel (+i) - you must be invited"),
-        );
-        return;
+    if chan.modes.invite_only && !was_invited && !chan.is_invite_excepted(casemap, user_prefix) {
+        return ChannelJoinResult::Rejected(ChannelJoinFailure::InviteOnly {
+            name: name.to_string(),
+        });
     }
-    if chan.is_banned(casemap, &user_prefix) {
-        state.numeric(
-            conn,
-            ERR_BANNEDFROMCHAN,
-            &[name],
-            Some("Cannot join channel (+b) - you are banned"),
-        );
-        return;
+    if chan.is_banned(casemap, user_prefix) {
+        return ChannelJoinResult::Rejected(ChannelJoinFailure::Banned {
+            name: name.to_string(),
+        });
     }
     if let Some(chan_key) = &chan.modes.key
         && !join_key.is_some_and(|k| constant_time_eq(k.as_bytes(), chan_key.as_bytes()))
     {
         // Constant-time so the key isn't recoverable by timing the compare.
-        state.numeric(
-            conn,
-            ERR_BADCHANNELKEY,
-            &[name],
-            Some("Cannot join channel (+k) - bad key"),
-        );
-        return;
+        return ChannelJoinResult::Rejected(ChannelJoinFailure::BadKey {
+            name: name.to_string(),
+        });
     }
     if let Some(limit) = chan.modes.limit
         && chan.member_count() >= limit as usize
     {
-        state.numeric(
-            conn,
-            ERR_CHANNELISFULL,
-            &[name],
-            Some("Cannot join channel (+l) - channel is full"),
-        );
-        return;
+        return ChannelJoinResult::Rejected(ChannelJoinFailure::Full {
+            name: name.to_string(),
+        });
     }
     let first = !chan.has_members();
     chan.add_member(
-        recipient,
-        identity,
+        actor.recipient,
+        actor.identity.clone(),
         MemberModes {
             op: first || is_founder || access_op,
             voice: access_voice,
@@ -278,23 +296,12 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     chan.invited.remove(&conn); // an invite is consumed by the join it admitted
     let display = chan.name.clone();
 
-    let session = state
-        .sessions
-        .get_mut(&conn)
-        .expect("session checked in dispatch");
-    session.channels.insert(key.clone());
-    let prefix = session.prefix();
-
-    let (account, realname) = {
-        let session = &state.sessions[&conn];
-        (
-            session.account.clone().unwrap_or_else(|| "*".into()),
-            session.realname().map(String::from).expect("registered"),
-        )
-    };
+    let prefix = actor.identity.prefix;
+    let account = actor.account.unwrap_or_else(|| "*".into());
+    let realname = actor.realname;
     let plain_join = format!(":{prefix} JOIN {display}");
     let extended_join = format!(":{prefix} JOIN {display} {account} :{realname}");
-    let joiner_away = state.sessions[&conn].away.clone();
+    let joiner_away = actor.away;
     let members = state.channels[&key].recipients();
     for recipient in members.iter().copied() {
         let caps = recipient.caps();
@@ -303,9 +310,7 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         } else {
             &plain_join
         };
-        if recipient.conn() == conn {
-            state.send_timed(conn, line);
-        } else {
+        if recipient.conn() != conn {
             state.send_timed_recipient(recipient, line);
         }
         // away-notify: an away joiner's status follows the JOIN.
@@ -325,11 +330,8 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
     // the newcomer as an ordinary user while the server treats them as an
     // operator: a silent membership-state desync. The channel creator (`first`)
     // needs no broadcast — nobody else is present to desync.
-    if !first && (is_founder || access_op || access_voice) {
-        let nick = state.sessions[&conn]
-            .nick()
-            .map(String::from)
-            .expect("registered joiner has a nick");
+    let own_mode = if !first && (is_founder || access_op || access_voice) {
+        let nick = actor.identity.nick.clone();
         let mut letters = String::from("+");
         let mut args = String::new();
         // A founder without an explicit access flag still gets +o.
@@ -345,37 +347,143 @@ pub(super) fn join_one(state: &mut ServerState, conn: ConnId, name: &str, join_k
         state.broadcast_channel(
             &key,
             &format!(":{server} MODE {display} {letters}{args}"),
-            None,
+            Some(conn),
         );
-    }
-
-    // topic, if set
-    if let Some(chan) = state.channels.get(&key)
-        && let Some(topic) = &chan.topic
-    {
-        let (text, set_by, set_at) = (topic.text.clone(), topic.set_by.clone(), topic.set_at_secs);
-        state.numeric(conn, RPL_TOPIC, &[&display], Some(&text));
-        state.numeric(
-            conn,
-            RPL_TOPICWHOTIME,
-            &[&display, &set_by, &set_at.to_string()],
-            None,
-        );
-    }
-    // draft/read-marker: a joining client that negotiated the cap is told the
-    // channel's current marker before RPL_ENDOFNAMES.
-    if state.sessions[&conn].caps.read_marker {
-        send_current_markread(state, conn, &key, &display);
-    }
-    // The joiner is a member, so the hidden-outsider branch never fires; the
-    // canonical display is the right echo for the member NAMES terminator.
-    send_names(state, conn, &key, &display);
+        Some(format!(":{server} MODE {display} {letters}{args}"))
+    } else {
+        None
+    };
 
     // A registered channel with a mode lock enforces it the moment it is
     // (re)created, so its locked modes survive the channel going empty.
     if newly_created {
         apply_mlock(state, &key);
     }
+
+    let chan = &state.channels[&key];
+    ChannelJoinResult::Joined(ChannelJoinSuccess {
+        key,
+        display,
+        topic: chan.topic.clone(),
+        secret: chan.modes.secret,
+        members: chan
+            .member_identities()
+            .map(|(_, modes, identity)| (modes.clone(), identity.clone()))
+            .collect(),
+        own_join: if actor.recipient.caps().extended_join {
+            extended_join
+        } else {
+            plain_join
+        },
+        own_mode,
+    })
+}
+
+pub(super) fn emit_join_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelJoinResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| {
+        emit_join_response(state, conn, result);
+    });
+}
+
+fn emit_join_response(state: &mut ServerState, conn: ConnId, result: ChannelJoinResult) {
+    match result {
+        ChannelJoinResult::Rejected(ChannelJoinFailure::NoSuchChannel { name }) => {
+            state.err_nosuchchannel(conn, &name);
+        }
+        ChannelJoinResult::Rejected(ChannelJoinFailure::InviteOnly { name }) => {
+            state.numeric(
+                conn,
+                ERR_INVITEONLYCHAN,
+                &[&name],
+                Some("Cannot join channel (+i) - you must be invited"),
+            );
+        }
+        ChannelJoinResult::Rejected(ChannelJoinFailure::Banned { name }) => {
+            state.numeric(
+                conn,
+                ERR_BANNEDFROMCHAN,
+                &[&name],
+                Some("Cannot join channel (+b) - you are banned"),
+            );
+        }
+        ChannelJoinResult::Rejected(ChannelJoinFailure::BadKey { name }) => {
+            state.numeric(
+                conn,
+                ERR_BADCHANNELKEY,
+                &[&name],
+                Some("Cannot join channel (+k) - bad key"),
+            );
+        }
+        ChannelJoinResult::Rejected(ChannelJoinFailure::Full { name }) => {
+            state.numeric(
+                conn,
+                ERR_CHANNELISFULL,
+                &[&name],
+                Some("Cannot join channel (+l) - channel is full"),
+            );
+        }
+        ChannelJoinResult::Joined(join) => {
+            let Some(session) = state.sessions.get_mut(&conn) else {
+                return;
+            };
+            session.channels.insert(join.key.clone());
+            if !join.own_join.is_empty() {
+                state.send_timed(conn, &join.own_join);
+            }
+            if let Some(mode) = &join.own_mode {
+                state.send_timed(conn, mode);
+            }
+            if let Some(topic) = &join.topic {
+                state.numeric(conn, RPL_TOPIC, &[&join.display], Some(&topic.text));
+                state.numeric(
+                    conn,
+                    RPL_TOPICWHOTIME,
+                    &[&join.display, &topic.set_by, &topic.set_at_secs.to_string()],
+                    None,
+                );
+            }
+            if state.sessions[&conn].caps.read_marker {
+                send_current_markread(state, conn, &join.key, &join.display);
+            }
+            send_join_names(state, conn, join);
+        }
+    }
+}
+
+fn send_join_names(state: &mut ServerState, conn: ConnId, join: ChannelJoinSuccess) {
+    let caps = state.sessions[&conn].caps;
+    let mut names: Vec<String> = join
+        .members
+        .iter()
+        .map(|(modes, identity)| {
+            let shown = if caps.userhost_in_names {
+                identity.prefix.clone()
+            } else {
+                identity.nick.clone()
+            };
+            let sigil = match (modes.op, modes.voice, caps.multi_prefix) {
+                (true, true, true) => "@+",
+                (true, _, _) => "@",
+                (false, true, _) => "+",
+                _ => "",
+            };
+            format!("{sigil}{shown}")
+        })
+        .collect();
+    names.sort();
+    let symbol = if join.secret { "@" } else { "=" };
+    state.numeric_list(conn, RPL_NAMREPLY, &[symbol, &join.display], &names, ' ');
+    state.numeric(
+        conn,
+        RPL_ENDOFNAMES,
+        &[&join.display],
+        Some("End of /NAMES list"),
+    );
 }
 
 pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
@@ -387,43 +495,88 @@ pub(super) fn cmd_part(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         return;
     }
     let reason = p.get(1).map(|r| r.to_string());
+    let actor = state.channel_actor(conn);
     for target in targets.split(',').filter(|t| !t.is_empty()) {
-        let key = state.chan_key(target);
-        let on_channel = state.channels.get(&key).is_some_and(|c| c.is_member(conn));
-        if !on_channel {
-            state.err_notonchannel(conn, target);
+        let owner = state.channel_owner(target);
+        if !state.owns_channel(&owner) {
+            let label = state.defer_channel_reply(conn);
+            state.route_part(
+                owner,
+                actor.clone(),
+                target.to_string(),
+                reason.clone(),
+                label,
+            );
             continue;
         }
-        let display = state.channels[&key].name.clone();
-        let prefix = state.sessions[&conn].prefix();
-        // A quieted or banned member can't broadcast a PART reason (which would
-        // evade the quiet), unless op/voice — same speak-gate as messages.
-        let exempt = state.channels[&key]
-            .member(conn)
-            .is_some_and(|m| m.op || m.voice);
-        let suppress_reason = !exempt
-            && (state.channels[&key].is_banned(state.casemap, &prefix)
-                || state.channels[&key].is_quieted(state.casemap, &prefix));
-        let line = match &reason {
-            Some(r) if !suppress_reason => {
-                let head = format!(":{prefix} PART {display} :");
-                let r = crate::core::handler::fit_trailing(&head, r);
-                format!("{head}{r}")
-            }
-            _ => format!(":{prefix} PART {display}"),
+        let result = part_on_owner(state, actor.clone(), target, reason.as_deref());
+        emit_part_response(state, conn, result);
+    }
+}
+
+pub(super) fn part_on_owner(
+    state: &mut ServerState,
+    actor: ChannelActor,
+    name: &str,
+    reason: Option<&str>,
+) -> ChannelPartResult {
+    let conn = actor.recipient.conn();
+    let key = state.chan_key(name);
+    let Some(channel) = state.channels.get(&key) else {
+        return ChannelPartResult::NotOnChannel {
+            name: name.to_string(),
         };
-        state.broadcast_channel(&key, &line, None);
-        let chan = state.channels.get_mut(&key).expect("checked");
-        chan.remove_member(conn);
-        if !chan.has_members() {
-            state.remove_channel(&key);
+    };
+    if !channel.is_member(conn) {
+        return ChannelPartResult::NotOnChannel {
+            name: name.to_string(),
+        };
+    }
+    let display = channel.name.clone();
+    let prefix = actor.identity.prefix;
+    // A quieted or banned member can't broadcast a PART reason (which would
+    // evade the quiet), unless op/voice — same speak-gate as messages.
+    let exempt = state.channels[&key]
+        .member(conn)
+        .is_some_and(|m| m.op || m.voice);
+    let suppress_reason = !exempt
+        && (state.channels[&key].is_banned(state.casemap, &prefix)
+            || state.channels[&key].is_quieted(state.casemap, &prefix));
+    let line = match reason {
+        Some(r) if !suppress_reason => {
+            let head = format!(":{prefix} PART {display} :");
+            let r = crate::core::handler::fit_trailing(&head, r);
+            format!("{head}{r}")
         }
-        state
-            .sessions
-            .get_mut(&conn)
-            .expect("checked")
-            .channels
-            .remove(&key);
+        _ => format!(":{prefix} PART {display}"),
+    };
+    state.broadcast_channel(&key, &line, Some(conn));
+    let chan = state.channels.get_mut(&key).expect("checked");
+    chan.remove_member(conn);
+    if !chan.has_members() {
+        state.remove_channel(&key);
+    }
+    ChannelPartResult::Parted { key, line }
+}
+
+pub(super) fn emit_part_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: ChannelPartResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| emit_part_response(state, conn, result));
+}
+
+fn emit_part_response(state: &mut ServerState, conn: ConnId, result: ChannelPartResult) {
+    match result {
+        ChannelPartResult::NotOnChannel { name } => state.err_notonchannel(conn, &name),
+        ChannelPartResult::Parted { key, line } => {
+            state.send_timed(conn, &line);
+            if let Some(session) = state.sessions.get_mut(&conn) {
+                session.channels.remove(&key);
+            }
+        }
     }
 }
 
