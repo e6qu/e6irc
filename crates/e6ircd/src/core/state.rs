@@ -773,6 +773,39 @@ pub(crate) struct MemberIdentity {
     pub(crate) invisible: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ChannelMemberProfile {
+    pub(crate) user: String,
+    pub(crate) host: String,
+    pub(crate) realname: String,
+    pub(crate) account: Option<String>,
+    pub(crate) away: bool,
+    pub(crate) oper: bool,
+    pub(crate) bot: bool,
+    pub(crate) last_active: e6irc_proto::time::MonoMillis,
+}
+
+impl ChannelMemberProfile {
+    #[cfg(test)]
+    fn derived(identity: &MemberIdentity) -> Self {
+        let (_, user_host) = identity
+            .prefix
+            .split_once('!')
+            .unwrap_or((&identity.nick, ""));
+        let (user, host) = user_host.split_once('@').unwrap_or(("", ""));
+        Self {
+            user: user.to_string(),
+            host: host.to_string(),
+            realname: identity.nick.clone(),
+            account: None,
+            away: false,
+            oper: false,
+            bot: false,
+            last_active: e6irc_proto::time::MonoMillis::default(),
+        }
+    }
+}
+
 impl MemberIdentity {
     pub(crate) fn new(nick: String, prefix: String, invisible: bool) -> Self {
         Self {
@@ -792,6 +825,7 @@ pub struct ChannelActor {
     pub(crate) realname: String,
     pub(crate) away: Option<String>,
     pub(crate) bot: bool,
+    pub(crate) profile: ChannelMemberProfile,
 }
 
 impl ChannelActor {
@@ -1029,6 +1063,7 @@ pub struct ChannelMemberUpdate {
     owner: ChannelOwner,
     recipient: Recipient,
     identity: MemberIdentity,
+    profile: ChannelMemberProfile,
     change: ChannelMemberChange,
 }
 
@@ -1043,12 +1078,14 @@ impl ChannelMemberUpdate {
         owner: ChannelOwner,
         recipient: Recipient,
         identity: MemberIdentity,
+        profile: ChannelMemberProfile,
         change: ChannelMemberChange,
     ) -> Self {
         Self {
             owner,
             recipient,
             identity,
+            profile,
             change,
         }
     }
@@ -1321,6 +1358,7 @@ struct ChannelMember {
     modes: MemberModes,
     recipient: Recipient,
     identity: MemberIdentity,
+    profile: ChannelMemberProfile,
 }
 
 #[derive(Default)]
@@ -1716,9 +1754,25 @@ impl Channel {
         recipients
     }
 
+    #[cfg(test)]
     pub fn add_member(
         &mut self,
         recipient: Recipient,
+        identity: MemberIdentity,
+        modes: MemberModes,
+    ) {
+        self.add_member_with_profile(
+            recipient,
+            ChannelMemberProfile::derived(&identity),
+            identity,
+            modes,
+        );
+    }
+
+    pub fn add_member_with_profile(
+        &mut self,
+        recipient: Recipient,
+        profile: ChannelMemberProfile,
         identity: MemberIdentity,
         modes: MemberModes,
     ) {
@@ -1728,6 +1782,7 @@ impl Channel {
                 modes,
                 recipient,
                 identity,
+                profile,
             },
         );
         self.recipients.get_mut().take();
@@ -1741,7 +1796,12 @@ impl Channel {
         removed
     }
 
-    pub fn update_member(&mut self, recipient: Recipient, identity: MemberIdentity) -> bool {
+    pub fn update_member(
+        &mut self,
+        recipient: Recipient,
+        identity: MemberIdentity,
+        profile: ChannelMemberProfile,
+    ) -> bool {
         let Some(member) = self.members.get_mut(&recipient.conn()) else {
             return false;
         };
@@ -1753,6 +1813,7 @@ impl Channel {
             self.recipients.get_mut().take();
         }
         member.identity = identity;
+        member.profile = profile;
         true
     }
 
@@ -1772,6 +1833,14 @@ impl Channel {
         self.members
             .iter()
             .map(|(conn, member)| (*conn, &member.modes, &member.identity))
+    }
+
+    pub fn member_profiles(
+        &self,
+    ) -> impl Iterator<Item = (ConnId, &MemberModes, &MemberIdentity, &ChannelMemberProfile)> {
+        self.members
+            .iter()
+            .map(|(conn, member)| (*conn, &member.modes, &member.identity, &member.profile))
     }
 
     pub fn operator_recipients(&self) -> Vec<(Recipient, String)> {
@@ -2107,6 +2176,20 @@ impl ServerState {
         )
     }
 
+    pub fn local_member_profile(&self, conn: ConnId) -> ChannelMemberProfile {
+        let session = &self.sessions[&conn];
+        ChannelMemberProfile {
+            user: session.user().expect("registered member").to_string(),
+            host: session.host.clone(),
+            realname: session.realname().expect("registered member").to_string(),
+            account: session.account.clone(),
+            away: session.away.is_some(),
+            oper: session.oper,
+            bot: session.bot,
+            last_active: session.last_active,
+        }
+    }
+
     pub fn channel_actor(&self, conn: ConnId) -> ChannelActor {
         let session = &self.sessions[&conn];
         ChannelActor {
@@ -2116,6 +2199,7 @@ impl ServerState {
             realname: session.realname().expect("registered session").to_string(),
             away: session.away.clone(),
             bot: session.bot,
+            profile: self.local_member_profile(conn),
         }
     }
 
@@ -2386,12 +2470,14 @@ impl ServerState {
         }
         let recipient = self.local_recipient(conn);
         let identity = self.local_member_identity(conn);
+        let profile = self.local_member_profile(conn);
         let channels: Vec<_> = self.sessions[&conn].channels.iter().cloned().collect();
         for key in channels {
             let update = ChannelMemberUpdate::new(
                 self.channels.owner(&key),
                 recipient,
                 identity.clone(),
+                profile.clone(),
                 change.clone(),
             );
             if self.owns_channel(update.owner()) {
@@ -2413,7 +2499,11 @@ impl ServerState {
         );
         let key = update.owner.key().clone();
         let updated = self.channels.get_mut(&key).is_some_and(|channel| {
-            channel.update_member(update.recipient, update.identity.clone())
+            channel.update_member(
+                update.recipient,
+                update.identity.clone(),
+                update.profile.clone(),
+            )
         });
         if !updated {
             return;

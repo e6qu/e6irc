@@ -574,14 +574,22 @@ fn dispatch_parsed(state: &mut ServerState, conn: ConnId, msg: &Message) {
     // is alive, so it answers an outstanding liveness PING: the reaper must not
     // close an actively-sending client merely because its traffic happened to
     // be its own PINGs and never a literal PONG (a real class of minimal bots).
-    if let Some(session) = state.sessions.get_mut(&conn) {
+    let refresh_member_profile = if let Some(session) = state.sessions.get_mut(&conn) {
         session.awaiting_pong = false;
         // WHOIS idle / WHOX `l`, on the other hand, measures time since real
         // activity, so a keepalive must not reset it — only a non-keepalive
         // command bumps `last_active`.
         if command != "PING" && command != "PONG" {
             session.last_active = (state.config.mono_clock)();
+            session.is_registered()
+        } else {
+            false
         }
+    } else {
+        false
+    };
+    if refresh_member_profile {
+        state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     }
 
     // Commands legal before registration.

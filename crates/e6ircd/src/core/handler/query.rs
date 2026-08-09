@@ -96,6 +96,13 @@ pub(super) fn who_flags(session: &crate::core::state::Session, sigil: &str) -> S
     format!("{here}{star}{bot}{sigil}")
 }
 
+fn who_flags_profile(profile: &crate::core::state::ChannelMemberProfile, sigil: &str) -> String {
+    let here = if profile.away { "G" } else { "H" };
+    let star = if profile.oper { "*" } else { "" };
+    let bot = if profile.bot { "B" } else { "" };
+    format!("{here}{star}{bot}{sigil}")
+}
+
 struct WhoRowData {
     user: String,
     host: String,
@@ -134,19 +141,18 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
             let rows: Vec<WhoRowData> = if hidden {
                 Vec::new()
             } else {
-                chan.members()
+                chan.member_profiles()
                     // An invisible member is hidden from a WHO by someone who
                     // shares no channel with them (and isn't them) — the same
                     // rule the wildcard/host branch below applies. A fellow
                     // member always shares this channel, so members still see
                     // each other; only an outsider WHOing a public channel is
                     // filtered. Without this, `+i` leaks through channel WHO.
-                    .filter(|(m, _)| {
-                        *m == conn || !state.sessions[m].invisible || state.share_channel(conn, *m)
+                    .filter(|(m, _, identity, _)| {
+                        *m == conn || !identity.invisible || state.share_channel(conn, *m)
                     })
-                    .filter(|(m, _)| !opers_only || state.sessions[m].oper)
-                    .map(|(m, modes)| {
-                        let s = &state.sessions[&m];
+                    .filter(|(_, _, _, profile)| !opers_only || profile.oper)
+                    .map(|(_, modes, identity, profile)| {
                         let sigil = match (modes.op, modes.voice, requester_multi_prefix) {
                             (true, true, true) => "@+",
                             (true, _, _) => "@",
@@ -154,13 +160,13 @@ pub(super) fn cmd_who(state: &mut ServerState, conn: ConnId, p: &[&str]) {
                             _ => "",
                         };
                         WhoRowData {
-                            user: s.user().map(String::from).expect("registered"),
-                            host: s.host.clone(),
-                            nick: s.nick().map(String::from).expect("registered"),
-                            flags: who_flags(s, sigil),
-                            realname: s.realname().map(String::from).expect("registered"),
-                            account: s.account.clone(),
-                            idle_secs: now.saturating_sub(s.last_active).as_secs(),
+                            user: profile.user.clone(),
+                            host: profile.host.clone(),
+                            nick: identity.nick.clone(),
+                            flags: who_flags_profile(profile, sigil),
+                            realname: profile.realname.clone(),
+                            account: profile.account.clone(),
+                            idle_secs: now.saturating_sub(profile.last_active).as_secs(),
                         }
                     })
                     .collect()

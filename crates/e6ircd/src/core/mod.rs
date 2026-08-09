@@ -2295,7 +2295,7 @@ mod ingress_tests {
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
-        MemberIdentity, MemberModes, Recipient,
+        ChannelMemberProfile, MemberIdentity, MemberModes, Recipient,
     };
     use bytes::Bytes;
     use e6irc_queue::{Config, Envelope, Policy, Receiver, Sender, queue};
@@ -2501,6 +2501,16 @@ mod ingress_tests {
                 realname: "Requester".into(),
                 away: None,
                 bot: false,
+                profile: ChannelMemberProfile {
+                    user: "u".into(),
+                    host: "host.test".into(),
+                    realname: "Requester".into(),
+                    account: None,
+                    away: false,
+                    oper: false,
+                    bot: false,
+                    last_active: mono_clock(),
+                },
             },
             target.into(),
             ChannelCommandOperation::Knock,
