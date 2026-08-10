@@ -25,9 +25,9 @@ and integration claims.
   LIST route through typed channel-owner requests; unrestricted LIST fans out
   to every shard and merges one ordered response. Durable registration metadata
   (founders, retained topics, KEEPTOPIC, MLOCK, and access grants) is shared
-  through controlled process-wide directories. HTTP controls and ChanServ OP
-  route to the channel owner. Remaining services persistence callbacks need
-  owner-routed application of live channel state.
+  through controlled process-wide directories. HTTP controls and every
+  ChanServ persistence callback apply live state on the channel owner and
+  reply through the captured session owner.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.
