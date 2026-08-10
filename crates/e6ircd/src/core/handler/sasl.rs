@@ -482,15 +482,12 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         crate::core::DbReply::ChannelRegisterUnavailable { channel, label } => {
             let key = state.chan_key(&channel);
             state.pending_channel_registrations.remove(&key);
-            if state.sessions.contains_key(&conn) {
-                state.emit_deferred_labeled(conn, label, |state| {
-                    state.service_notice(
-                        conn,
-                        "ChanServ",
-                        "Services are temporarily unavailable. Try again later.",
-                    );
-                });
-            }
+            chanserv_reply(
+                state,
+                conn,
+                label,
+                "Services are temporarily unavailable. Try again later.".into(),
+            );
         }
         crate::core::DbReply::AccountCreated { account, origin } => {
             state.sessions.get_mut(&conn).expect("checked").account = Some(account.clone());
@@ -567,24 +564,22 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     },
                 );
             }
-            if state.sessions.contains_key(&conn) {
-                state.emit_deferred_labeled(conn, label, |state| {
-                    state.service_notice(
-                        conn,
-                        "ChanServ",
-                        &format!("\x02{channel}\x02 is now registered to your account."),
-                    );
-                });
-            }
+            chanserv_reply(
+                state,
+                conn,
+                label,
+                format!("\x02{channel}\x02 is now registered to your account."),
+            );
         }
         crate::core::DbReply::ChannelExists { channel, label } => {
             let key = state.chan_key(&channel);
             state.pending_channel_registrations.remove(&key);
-            if state.sessions.contains_key(&conn) {
-                state.emit_deferred_labeled(conn, label, |state| {
-                    state.service_notice(conn, "ChanServ", "That channel is already registered.");
-                });
-            }
+            chanserv_reply(
+                state,
+                conn,
+                label,
+                "That channel is already registered.".into(),
+            );
         }
         crate::core::DbReply::ChannelTopicSet {
             channel,
@@ -611,14 +606,10 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     },
                 );
             } else {
-                let session = state
-                    .sessions
-                    .contains_key(&conn)
-                    .then(|| state.channel_actor(conn).session_owner());
-                state.route_topic_persisted(
-                    owner,
+                route_remote_topic_persistence(
+                    state,
                     conn,
-                    session,
+                    owner,
                     crate::core::ChannelTopicPersistence::Set {
                         channel,
                         display,
@@ -644,14 +635,10 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     state, conn, channel, display, revision, label, failure,
                 );
             } else {
-                let session = state
-                    .sessions
-                    .contains_key(&conn)
-                    .then(|| state.channel_actor(conn).session_owner());
-                state.route_topic_persisted(
-                    owner,
+                route_remote_topic_persistence(
+                    state,
                     conn,
-                    session,
+                    owner,
                     crate::core::ChannelTopicPersistence::Failed {
                         channel,
                         display,
@@ -833,6 +820,27 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
     // ready. Only a verify reply can unblock it, so other replies skip this.
     if was_verify_reply {
         super::services::maybe_complete_registration(state, conn);
+    }
+}
+
+fn route_remote_topic_persistence(
+    state: &mut ServerState,
+    conn: ConnId,
+    owner: crate::core::state::ChannelOwner,
+    result: crate::core::ChannelTopicPersistence,
+) {
+    let session = state
+        .sessions
+        .contains_key(&conn)
+        .then(|| state.channel_actor(conn).session_owner());
+    state.route_topic_persisted(owner, conn, session, result);
+}
+
+fn chanserv_reply(state: &mut ServerState, conn: ConnId, label: Option<String>, text: String) {
+    if state.sessions.contains_key(&conn) {
+        state.emit_deferred_labeled(conn, label, move |state| {
+            state.service_notice(conn, "ChanServ", &text);
+        });
     }
 }
 
