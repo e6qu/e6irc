@@ -57,10 +57,13 @@ Any failed client, timeout, socket error, or missing delivery makes the harness
 exit nonzero; printed partial measurements can therefore never be mistaken for
 a successful qualification.
 
-`--report-json PATH` writes the versioned result contract: requested load,
-measured rates and latency, server RSS, thresholds, and pass/fail state.
+`--report-json PATH` writes the versioned result contract. A completed report
+has a closed `passed` or `rejected` outcome; an execution failure has a closed
+`failed` status with its requested workload, thresholds, provenance digest, and
+error. The file is created once and synced before success is reported.
 `--host-provenance-sha256 DIGEST` records a controlled runner's host-file
-digest in that contract.
+digest in that contract. It requires a report, server resident-memory sampling,
+and every throughput, latency, and memory acceptance threshold.
 The harness rejects workloads above 100,000 clients or 10 million tracked
 messages before it allocates tasks or measurement buffers.
 
@@ -100,12 +103,14 @@ must name a new directory; it creates one JSON result per client count.
 ## Controlled Linux qualification
 
 `qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`
-and `host.txt`. It rejects a non-e6ircd PID, insufficient file-descriptor
-limits, a target listener owned by another process, ephemeral-port capacity,
-or listen backlog before it starts. It is a single-load-host tool; its client
-count cannot exceed that host's ephemeral port range or the harness workload
-limit. Its output directory must not exist, so it cannot overwrite prior
-evidence. `--report-json` also refuses an existing file.
+and `host.txt`. It requires a clean source tree and records the source revision,
+the load and server executable hashes, host limits, and exact workload/budgets.
+It rejects a non-e6ircd PID, insufficient file-descriptor limits, a target
+listener owned by another process, ephemeral-port capacity, or listen backlog
+before it starts. It is a single-load-host tool; its client count cannot exceed
+that host's ephemeral port range or the harness workload limit. Its output
+directory must not exist, so it cannot overwrite prior evidence. A failed
+harness run still writes `result.json`; preflight failures create no evidence.
 
 ```
 tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 20000 200 20 results/20000 \
