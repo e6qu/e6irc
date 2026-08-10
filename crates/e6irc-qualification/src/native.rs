@@ -465,15 +465,8 @@ async fn oidc(target: &str) -> ProbeReport {
     ) else {
         return rejected();
     };
-    let Some(mut issuer) = safe_url(target) else {
+    let Some(discovery) = oidc_discovery_url(target) else {
         return rejected();
-    };
-    if !issuer.path().ends_with('/') {
-        issuer.set_path(&format!("{}/", issuer.path()));
-    }
-    let discovery = match issuer.join(".well-known/openid-configuration") {
-        Ok(url) => url,
-        Err(_) => return rejected(),
     };
     let Ok(http) = client() else { return failed() };
     let configuration = match http.get(discovery).send().await {
@@ -568,6 +561,14 @@ async fn oidc(target: &str) -> ProbeReport {
         cleanup,
         persistence,
     )
+}
+
+fn oidc_discovery_url(target: &str) -> Option<Url> {
+    let mut issuer = safe_url(target)?;
+    if !issuer.path().ends_with('/') {
+        issuer.set_path(&format!("{}/", issuer.path()));
+    }
+    issuer.join(".well-known/openid-configuration").ok()
 }
 
 async fn oidc_token(
@@ -731,6 +732,16 @@ mod tests {
         assert!(safe_url("https://user:secret@issuer.example/api").is_none());
         assert!(safe_url("https://issuer.example/api?token=secret").is_none());
         assert!(safe_url("https://issuer.example/api#secret").is_none());
+    }
+
+    #[test]
+    fn oidc_discovery_keeps_the_issuer_path() {
+        assert_eq!(
+            oidc_discovery_url("https://issuer.example/realms/e6")
+                .expect("discovery URL")
+                .as_str(),
+            "https://issuer.example/realms/e6/.well-known/openid-configuration"
+        );
     }
 
     #[tokio::test]
