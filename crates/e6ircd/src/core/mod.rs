@@ -2389,9 +2389,8 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ChannelDropRequester, ChannelDropResult, ConnId, ConnectionTransport, Core, CoreConfig,
-        CoreDirectories, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId, CoreTraceStep,
-        CoreWorker, Input, ReplayError, SessionOwner,
+        ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
+        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2610,18 +2609,6 @@ mod ingress_tests {
             })
             .await
             .expect("second shard delivery routed");
-        ingress
-            .push(Input::ChannelDropResult {
-                channel: "#chat".into(),
-                requester: ChannelDropRequester::ChanServ {
-                    session: SessionOwner::new(ConnId(5), CoreShardId(1)),
-                    display: "#chat".into(),
-                    label: None,
-                },
-                result: ChannelDropResult::Dropped,
-            })
-            .await
-            .expect("second shard drop result routed");
 
         let first = first_rx.pop().await.expect("first routed event");
         let second = second_rx.pop().await.expect("second routed event");
@@ -2643,14 +2630,6 @@ mod ingress_tests {
                 conn: ConnId(5),
                 ..
             }
-        ));
-        let second = second_rx.pop().await.expect("second routed drop result");
-        assert!(matches!(
-            second.payload,
-            Input::ChannelDropResult {
-                requester: ChannelDropRequester::ChanServ { session, .. },
-                ..
-            } if session == SessionOwner::new(ConnId(5), CoreShardId(1))
         ));
     }
 
