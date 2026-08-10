@@ -599,6 +599,12 @@ fn send_names_with_caps(
     echo: &str,
 ) {
     let Some(chan) = state.channels.get(key) else {
+        state.numeric(
+            conn,
+            RPL_ENDOFNAMES,
+            &[clip_echo(echo)],
+            Some("End of /NAMES list"),
+        );
         return;
     };
     let display = chan.name.clone();
@@ -724,14 +730,6 @@ pub(super) fn names_on_owner(
         &key,
         &target,
     );
-    if !state.channels.contains_key(&key) {
-        state.numeric(
-            actor.recipient.conn(),
-            RPL_ENDOFNAMES,
-            &[clip_echo(&target)],
-            Some("End of /NAMES list"),
-        );
-    }
     let lines = state.capture.take().expect("NAMES capture installed").lines;
     crate::core::state::ChannelCommandReplies { lines }
 }

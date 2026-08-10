@@ -393,6 +393,7 @@ pub(super) fn cmd_away(state: &mut ServerState, conn: ConnId, p: &[&str]) {
     if !changed {
         return;
     }
+    state.sync_channel_member(conn, crate::core::state::ChannelMemberChange::Identity);
     notify_event(state, conn, &notify, |c| c.away_notify, false);
 }
 
