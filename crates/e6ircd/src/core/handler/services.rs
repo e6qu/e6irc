@@ -524,8 +524,8 @@ pub(super) fn apply_flag_changes(current: &str, changes: &str) -> Result<String,
 /// the copy that drifts is the one that stops refusing.
 fn chanserv_founder_gate(
     state: &mut ServerState,
-    conn: ConnId,
     channel: &str,
+    conn: ConnId,
     identify_hint: &str,
 ) -> Option<(ChanKey, String)> {
     let (key, account) = chanserv_registered_gate(state, conn, channel, identify_hint)?;
@@ -589,8 +589,8 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
     };
     let Some((key, _account)) = chanserv_founder_gate(
         state,
-        conn,
         channel,
+        conn,
         "You must identify to services before using FLAGS.",
     ) else {
         return;
@@ -809,8 +809,8 @@ pub(super) fn chanserv_set(state: &mut ServerState, conn: ConnId, args: &[&str])
     };
     let Some((key, _account)) = chanserv_founder_gate(
         state,
-        conn,
         channel,
+        conn,
         "You must identify to services before using SET.",
     ) else {
         return;
