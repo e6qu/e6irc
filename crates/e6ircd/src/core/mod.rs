@@ -2583,6 +2583,30 @@ mod ingress_tests {
         assert_eq!(second.state.access_modes(&key, "alice"), (true, true));
     }
 
+    #[test]
+    fn owner_channel_admin_request_reaches_its_channel_shard() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        let channel = ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .find(|name| first.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel owned by shard one");
+        let (reply, _response) = tokio::sync::oneshot::channel();
+        first.handle(Input::Admin {
+            req: super::AdminRequest::RegisterOwnedChannel {
+                channel: channel.into(),
+                actor: "alice".into(),
+            },
+            reply,
+        });
+        assert!(matches!(
+            first.take_effects().as_slice(),
+            [super::CoreEffect::Input(Input::Admin { .. })]
+        ));
+        assert_eq!(second.shard, CoreShardId(1));
+    }
+
     async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
         loop {
             if let Some(output) = rx.try_pop() {
