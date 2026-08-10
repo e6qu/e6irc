@@ -3946,7 +3946,7 @@ async fn drop_channel_audited(
 /// Insert one registered channel with its initial retained topic and audit
 /// record as one transition. Both ChanServ and the owner HTTP control plane use
 /// this function; only their authorization and response transports differ.
-async fn persist_channel_registration(
+pub async fn persist_channel_registration(
     pool: &PgPool,
     channel: &str,
     founder: &str,
