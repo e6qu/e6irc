@@ -174,6 +174,11 @@ fn begin_owned_channel_registration(
     if queue_channel_control(
         state,
         reply,
+        crate::core::state::PendingChannelControlKind::Registration {
+            channel: key.clone(),
+            founder_account: actor.clone(),
+            topic: topic.clone(),
+        },
         "persistence unavailable; channel was not registered",
         move |request_id| crate::core::DbRequest::RegisterOwnedChannel {
             owner,
@@ -218,6 +223,10 @@ fn begin_owned_channel_mutation(
     queue_channel_control(
         state,
         reply,
+        crate::core::state::PendingChannelControlKind::Mutation {
+            channel: key.clone(),
+            mutation: persisted.clone(),
+        },
         "persistence unavailable; channel was not changed",
         move |request_id| crate::core::DbRequest::MutateOwnedChannel {
             owner,
@@ -249,6 +258,7 @@ fn channel_request_key(
 fn queue_channel_control(
     state: &mut ServerState,
     reply: tokio::sync::oneshot::Sender<AdminReply>,
+    kind: crate::core::state::PendingChannelControlKind,
     queue_failure: &'static str,
     make_request: impl FnOnce(u64) -> crate::core::DbRequest,
 ) -> bool {
@@ -267,7 +277,10 @@ fn queue_channel_control(
         return false;
     }
     state.channel_control_id = request_id;
-    state.pending_channel_controls.insert(request_id, reply);
+    state.pending_channel_controls.insert(
+        request_id,
+        crate::core::state::PendingChannelControl { reply, kind },
+    );
     true
 }
 
@@ -779,13 +792,26 @@ fn begin_drop_channel(
 pub(crate) fn channel_control_result(
     state: &mut ServerState,
     request_id: u64,
-    channel: String,
-    mutation: crate::core::PersistedChannelMutation,
     result: crate::core::ChannelControlResult,
 ) {
     use crate::core::{ChannelControlError, ChannelControlResult, PersistedChannelMutation};
 
-    let key = state.chan_key(&channel);
+    let Some(pending) = state.pending_channel_controls.remove(&request_id) else {
+        eprintln!("core: channel-control verdict for unknown request {request_id}");
+        return;
+    };
+    let crate::core::state::PendingChannelControlKind::Mutation {
+        channel: key,
+        mutation,
+    } = pending.kind
+    else {
+        let _ = pending.reply.send(channel_error(
+            ChannelControlError::Unavailable,
+            "persistence returned a verdict for the wrong channel operation",
+        ));
+        return;
+    };
+    let reply = pending.reply;
     let response = match result {
         ChannelControlResult::Applied => {
             let summary = match mutation {
@@ -852,8 +878,7 @@ pub(crate) fn channel_control_result(
                                     "core: database echoed invalid canonical MLOCK character {bad:?}"
                                 );
                                 return finish_channel_control(
-                                    state,
-                                    request_id,
+                                    reply,
                                     channel_error(
                                         ChannelControlError::Unavailable,
                                         "persistence returned an invalid mode lock",
@@ -920,20 +945,34 @@ pub(crate) fn channel_control_result(
             "persistence unavailable; channel was not changed",
         ),
     };
-    finish_channel_control(state, request_id, response);
+    finish_channel_control(reply, response);
 }
 
 pub(crate) fn owned_channel_registration_result(
     state: &mut ServerState,
     request_id: u64,
-    channel: String,
-    founder_account: String,
-    topic: Option<(String, String, u64)>,
     result: crate::core::ChannelRegistrationResult,
 ) {
     use crate::core::{ChannelControlError, ChannelRegistrationResult};
 
-    let key = state.chan_key(&channel);
+    let Some(pending) = state.pending_channel_controls.remove(&request_id) else {
+        eprintln!("core: channel-registration verdict for unknown request {request_id}");
+        return;
+    };
+    let crate::core::state::PendingChannelControlKind::Registration {
+        channel: key,
+        founder_account,
+        topic,
+    } = pending.kind
+    else {
+        let _ = pending.reply.send(channel_error(
+            ChannelControlError::Unavailable,
+            "persistence returned a verdict for the wrong channel operation",
+        ));
+        return;
+    };
+    let reply = pending.reply;
+    let channel = key.as_str().to_string();
     state.pending_channel_registrations.remove(&key);
     let response = match result {
         ChannelRegistrationResult::Registered => {
@@ -954,16 +993,9 @@ pub(crate) fn owned_channel_registration_result(
             "persistence unavailable; channel was not registered",
         ),
     };
-    finish_channel_control(state, request_id, response);
+    finish_channel_control(reply, response);
 }
 
-fn finish_channel_control(state: &mut ServerState, request_id: u64, response: AdminReply) {
-    match state.pending_channel_controls.remove(&request_id) {
-        Some(reply) => {
-            let _ = reply.send(response);
-        }
-        None => {
-            eprintln!("core: channel-control verdict for unknown request {request_id}");
-        }
-    }
+fn finish_channel_control(reply: tokio::sync::oneshot::Sender<AdminReply>, response: AdminReply) {
+    let _ = reply.send(response);
 }

@@ -28,8 +28,9 @@ and integration claims.
   through controlled process-wide directories. HTTP controls and every
   ChanServ persistence callback apply live state on the channel owner and
   reply through the captured session owner.
-- Prove multi-worker ordering, failure, backpressure, persistence, API, and
-  load behavior before enabling production N>1 workers.
+- Deterministic two-worker tests cover ordering, backpressure, persistence
+  success/failure, requester disconnects, and owner API controls. Qualify
+  production N>1 workers with load campaigns before enabling them.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.
 
 ## Remaining qualification

@@ -8086,8 +8086,6 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
     s.core.handle(Input::ChannelControlResult {
         owner,
         request_id,
-        channel: "#room".into(),
-        mutation,
         result: e6ircd::core::ChannelControlResult::Applied,
     });
     assert!(matches!(
@@ -8131,6 +8129,70 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         s.db_requests().is_empty(),
         "a non-founder request reached persistence"
     );
+}
+
+#[test]
+fn owner_channel_control_verdicts_are_request_bound_and_consumed_once() {
+    let mut s = TestServer::new();
+    s.core
+        .preload_founders(vec![("#room".to_string(), "boss".to_string())]);
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::MutateOwnedChannel {
+            channel: "#room".into(),
+            actor: "boss".into(),
+            mutation: e6ircd::core::ChannelMutation::SetAccess {
+                account: "alice".into(),
+                flags: Some("o".into()),
+            },
+        },
+        reply: reply_tx,
+    });
+    let (request_id, owner) = match s.db_requests().as_slice() {
+        [
+            e6ircd::core::DbRequest::MutateOwnedChannel {
+                request_id, owner, ..
+            },
+        ] => (*request_id, owner.clone()),
+        other => panic!("channel control did not queue: {other:#?}"),
+    };
+
+    s.core.handle(Input::ChannelControlResult {
+        owner: owner.clone(),
+        request_id,
+        result: e6ircd::core::ChannelControlResult::Applied,
+    });
+    assert!(matches!(
+        reply_rx.try_recv(),
+        Ok(e6ircd::core::AdminReply::Ok(_))
+    ));
+
+    // A duplicate cannot apply after the pending request was consumed; it has
+    // no channel or mutation payload that could describe a different action.
+    s.core.handle(Input::ChannelControlResult {
+        owner,
+        request_id,
+        result: e6ircd::core::ChannelControlResult::Applied,
+    });
+    let (next_tx, mut next_rx) = tokio::sync::oneshot::channel();
+    s.core.handle(Input::Admin {
+        req: e6ircd::core::AdminRequest::MutateOwnedChannel {
+            channel: "#room".into(),
+            actor: "boss".into(),
+            mutation: e6ircd::core::ChannelMutation::SetMlock {
+                mlock: Some("+i".into()),
+            },
+        },
+        reply: next_tx,
+    });
+    assert!(matches!(
+        next_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        s.db_requests().as_slice(),
+        [e6ircd::core::DbRequest::MutateOwnedChannel { .. }]
+    ));
 }
 
 #[test]
@@ -8179,9 +8241,6 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
     s.core.handle(Input::OwnedChannelRegistrationResult {
         owner,
         request_id,
-        channel: "#web".into(),
-        founder_account: "BoSs".into(),
-        topic,
         result: e6ircd::core::ChannelRegistrationResult::Registered,
     });
     assert!(matches!(

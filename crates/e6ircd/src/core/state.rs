@@ -2289,6 +2289,23 @@ pub struct ChannelOwner {
     shard: CoreShardId,
 }
 
+pub(crate) enum PendingChannelControlKind {
+    Mutation {
+        channel: ChanKey,
+        mutation: super::PersistedChannelMutation,
+    },
+    Registration {
+        channel: ChanKey,
+        founder_account: String,
+        topic: Option<(String, String, u64)>,
+    },
+}
+
+pub(crate) struct PendingChannelControl {
+    pub(crate) reply: tokio::sync::oneshot::Sender<super::AdminReply>,
+    pub(crate) kind: PendingChannelControlKind,
+}
+
 impl ChannelOwner {
     pub(crate) fn shard(&self) -> CoreShardId {
         self.shard
@@ -2457,8 +2474,8 @@ pub(crate) struct ServerState {
     pub pending_admin_server_bans: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
     /// Monotonic request ID source for `pending_admin_server_bans`.
     pub admin_server_ban_id: u64,
-    /// Founder-owned HTTP channel mutations awaiting a database verdict.
-    pub pending_channel_controls: HashMap<u64, tokio::sync::oneshot::Sender<super::AdminReply>>,
+    /// Founder-owned HTTP channel controls awaiting a matching database verdict.
+    pub pending_channel_controls: HashMap<u64, PendingChannelControl>,
     /// Monotonic request ID source for `pending_channel_controls`.
     pub channel_control_id: u64,
     pending_channel_lists: HashMap<ChannelListRequestId, PendingChannelList>,
