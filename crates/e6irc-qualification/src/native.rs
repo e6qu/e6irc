@@ -598,7 +598,7 @@ async fn oidc_token(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
 
     use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
     use axum::extract::{Path, State};
@@ -607,7 +607,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
 
-    static ENVIRONMENT: OnceLock<Mutex<()>> = OnceLock::new();
+    static ENVIRONMENT: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
     #[derive(Clone)]
     struct DiscordOracle {
@@ -733,9 +733,9 @@ mod tests {
     #[tokio::test]
     async fn discord_oracle_proves_all_required_phases_and_cleanup() {
         let _environment = ENVIRONMENT
-            .get_or_init(|| Mutex::new(()))
+            .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
-            .expect("environment lock");
+            .await;
         let oracle = start_discord_oracle().await;
         unsafe {
             std::env::set_var("E6IRC_DISCORD_BOT_TOKEN", "token");
