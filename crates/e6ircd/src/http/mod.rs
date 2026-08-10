@@ -2255,7 +2255,7 @@ mod pages {
 
     #[derive(Serialize)]
     struct QueueView {
-        label: &'static str,
+        label: String,
         depth: u64,
         capacity: u64,
         pressure: u64,
@@ -2456,6 +2456,17 @@ mod pages {
         queue
             .filter(|queue| queue.capacity > 0)
             .map(|queue| queue.depth.saturating_mul(100) / queue.capacity)
+            .unwrap_or(0)
+    }
+
+    fn core_queue_pressure(
+        queues: &std::collections::BTreeMap<String, crate::observability::QueueSnapshot>,
+    ) -> u64 {
+        queues
+            .iter()
+            .filter(|(name, _)| *name == "core" || name.starts_with("core-"))
+            .map(|(_, queue)| queue_pressure(Some(queue)))
+            .max()
             .unwrap_or(0)
     }
 
@@ -2682,7 +2693,7 @@ mod pages {
         let queue_bars = history
             .iter()
             .map(|snapshot| {
-                let core = queue_pressure(snapshot.queues.get("core"));
+                let core = core_queue_pressure(&snapshot.queues);
                 let database = queue_pressure(snapshot.queues.get("db"));
                 QueueBar {
                     core_height: core,
@@ -2694,11 +2705,13 @@ mod pages {
                 }
             })
             .collect();
-        let queues = [("core", "IRC core"), ("db", "Database worker")]
-            .into_iter()
-            .filter_map(|(name, label)| {
-                current.queues.get(name).map(|queue| QueueView {
-                    label,
+        let mut queues: Vec<_> = current
+            .queues
+            .iter()
+            .filter_map(|(name, queue)| {
+                let shard = name.strip_prefix("core-")?;
+                Some(QueueView {
+                    label: format!("IRC core shard {shard}"),
                     depth: queue.depth,
                     capacity: queue.capacity,
                     pressure: queue_pressure(Some(queue)),
@@ -2707,6 +2720,16 @@ mod pages {
                 })
             })
             .collect();
+        if let Some(queue) = current.queues.get("db") {
+            queues.push(QueueView {
+                label: "Database worker".into(),
+                depth: queue.depth,
+                capacity: queue.capacity,
+                pressure: queue_pressure(Some(queue)),
+                mode: queue.mode.label().to_uppercase(),
+                mode_switches: queue.mode_switches,
+            });
+        }
         let errors = current
             .errors
             .iter()

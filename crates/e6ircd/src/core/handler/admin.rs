@@ -487,6 +487,11 @@ fn begin_connection_list(
     query: crate::core::LiveConnectionQuery,
     reply: tokio::sync::oneshot::Sender<AdminReply>,
 ) {
+    if state.has_single_core_shard() {
+        let entries = connection_list_entries(state, &query);
+        let _ = reply.send(AdminReply::Connections(connection_page(query, entries)));
+        return;
+    }
     let Some(request_id) = state.admin_connection_list_id.checked_add(1) else {
         let _ = reply.send(AdminReply::Err(
             "connection-list request ID space exhausted".into(),
@@ -590,23 +595,28 @@ pub(crate) fn connection_list_result(
     if pending.remaining != 0 {
         return;
     }
-    let mut pending = state
+    let pending = state
         .pending_connection_lists
         .remove(&request_id)
         .expect("checked present");
-    let page_size = pending.query.page_size.value();
-    pending
-        .entries
-        .sort_unstable_by_key(|entry| std::cmp::Reverse(entry.id));
-    let next_before_id =
-        (pending.entries.len() > page_size).then(|| pending.entries[page_size - 1].id);
-    pending.entries.truncate(page_size);
-    let _ = pending
-        .reply
-        .send(AdminReply::Connections(crate::core::LiveConnectionPage {
-            entries: pending.entries,
-            next_before_id,
-        }));
+    let _ = pending.reply.send(AdminReply::Connections(connection_page(
+        pending.query,
+        pending.entries,
+    )));
+}
+
+fn connection_page(
+    query: crate::core::LiveConnectionQuery,
+    mut entries: Vec<crate::core::LiveConnectionInfo>,
+) -> crate::core::LiveConnectionPage {
+    let page_size = query.page_size.value();
+    entries.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.id));
+    let next_before_id = (entries.len() > page_size).then(|| entries[page_size - 1].id);
+    entries.truncate(page_size);
+    crate::core::LiveConnectionPage {
+        entries,
+        next_before_id,
+    }
 }
 
 fn disconnect_connection(

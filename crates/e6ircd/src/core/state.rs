@@ -2781,7 +2781,7 @@ impl ServerState {
             .push(CoreEffect::BroadcastChannelList { request });
     }
 
-    pub(crate) fn has_single_channel_shard(&self) -> bool {
+    pub(crate) fn has_single_core_shard(&self) -> bool {
         self.channels.shard_count() == 1
     }
 
