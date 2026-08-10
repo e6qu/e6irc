@@ -1852,6 +1852,7 @@ impl Core {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn with_telemetry_with_nicks(
         config: CoreConfig,
         db_tx: Sender<DbRequest>,
@@ -1876,6 +1877,7 @@ impl Core {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn with_telemetry_on_shard_with_nicks(
         config: CoreConfig,
         db_tx: Sender<DbRequest>,

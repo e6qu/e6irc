@@ -2916,6 +2916,7 @@ impl ServerState {
         std::mem::take(&mut self.effects)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         shard: CoreShardId,
         shards: CoreShardCount,

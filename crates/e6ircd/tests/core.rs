@@ -7920,10 +7920,11 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
     let request = s.db_requests();
-    let (request_id, mutation) = match request.as_slice() {
+    let (request_id, owner, mutation) = match request.as_slice() {
         [
             e6ircd::core::DbRequest::MutateOwnedChannel {
                 request_id,
+                owner,
                 channel,
                 actor,
                 mutation,
@@ -7931,7 +7932,7 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         ] => {
             assert_eq!(channel, "#room");
             assert_eq!(actor, "BoSs");
-            (*request_id, mutation.clone())
+            (*request_id, owner.clone(), mutation.clone())
         }
         other => panic!("channel control did not queue its typed write: {other:#?}"),
     };
@@ -7944,6 +7945,7 @@ fn owner_channel_control_waits_for_storage_and_updates_the_hot_access_map() {
         "access flags were not canonicalized at the core boundary"
     );
     s.core.handle(Input::ChannelControlResult {
+        owner,
         request_id,
         channel: "#room".into(),
         mutation,
@@ -8015,10 +8017,11 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     ));
     let requests = s.db_requests();
-    let (request_id, topic) = match requests.as_slice() {
+    let (request_id, owner, topic) = match requests.as_slice() {
         [
             e6ircd::core::DbRequest::RegisterOwnedChannel {
                 request_id,
+                owner,
                 channel,
                 founder_account,
                 topic,
@@ -8026,7 +8029,7 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
         ] => {
             assert_eq!(channel, "#web");
             assert_eq!(founder_account, "BoSs");
-            (*request_id, topic.clone())
+            (*request_id, owner.clone(), topic.clone())
         }
         other => panic!("owner registration did not queue its typed write: {other:#?}"),
     };
@@ -8035,6 +8038,7 @@ fn owner_channel_registration_requires_live_operator_and_waits_for_storage() {
         Some("from the console")
     );
     s.core.handle(Input::OwnedChannelRegistrationResult {
+        owner,
         request_id,
         channel: "#web".into(),
         founder_account: "BoSs".into(),
