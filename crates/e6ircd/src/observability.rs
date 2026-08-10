@@ -871,6 +871,17 @@ fn render_histogram(out: &mut String, kind: LatencyKind, latency: &LatencySnapsh
 mod tests {
     use super::*;
 
+    fn test_queue(
+        name: &'static str,
+        capacity: usize,
+    ) -> (e6irc_queue::Sender<u8>, e6irc_queue::Receiver<u8>) {
+        e6irc_queue::queue(e6irc_queue::Config {
+            name,
+            capacity,
+            policy: e6irc_queue::Policy::Fifo,
+        })
+    }
+
     #[test]
     fn snapshot_has_fixed_errors_and_latency_percentiles() {
         let telemetry = Telemetry::new();
@@ -915,16 +926,8 @@ mod tests {
 
     #[test]
     fn queue_pressure_reaches_snapshots_and_prometheus() {
-        let (core_tx, _core_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
-            name: "core",
-            capacity: 4,
-            policy: e6irc_queue::Policy::Fifo,
-        });
-        let (database_tx, _database_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
-            name: "db",
-            capacity: 8,
-            policy: e6irc_queue::Policy::Fifo,
-        });
+        let (core_tx, _core_rx) = test_queue("core", 4);
+        let (database_tx, _database_rx) = test_queue("db", 8);
         let telemetry = Telemetry::observing_queues([core_tx.monitor()], database_tx.monitor());
         core_tx.try_push(1).unwrap();
         core_tx.try_push(2).unwrap();
@@ -944,21 +947,9 @@ mod tests {
 
     #[test]
     fn queue_snapshots_preserve_each_core_shard() {
-        let (first_tx, _first_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
-            name: "core-0",
-            capacity: 4,
-            policy: e6irc_queue::Policy::Fifo,
-        });
-        let (second_tx, _second_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
-            name: "core-1",
-            capacity: 8,
-            policy: e6irc_queue::Policy::Fifo,
-        });
-        let (database_tx, _database_rx) = e6irc_queue::queue::<u8>(e6irc_queue::Config {
-            name: "db",
-            capacity: 16,
-            policy: e6irc_queue::Policy::Fifo,
-        });
+        let (first_tx, _first_rx) = test_queue("core-0", 4);
+        let (second_tx, _second_rx) = test_queue("core-1", 8);
+        let (database_tx, _database_rx) = test_queue("db", 16);
         let telemetry = Telemetry::observing_queues(
             [first_tx.monitor(), second_tx.monitor()],
             database_tx.monitor(),
