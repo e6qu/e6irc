@@ -32,7 +32,10 @@ use state::{
     ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
     ChannelTopicResult,
 };
-use state::{FounderDirectory, MembershipDirectory, NickDirectory, ServerState};
+use state::{
+    ChannelOptionsDirectory, FounderDirectory, MembershipDirectory, NickDirectory,
+    RetainedTopicDirectory, ServerState,
+};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -118,6 +121,8 @@ pub struct CoreIngress {
     nicks: NickDirectory,
     memberships: MembershipDirectory,
     founders: FounderDirectory,
+    topics: RetainedTopicDirectory,
+    channel_options: ChannelOptionsDirectory,
 }
 
 impl CoreIngress {
@@ -128,6 +133,8 @@ impl CoreIngress {
             nicks: NickDirectory::default(),
             memberships: MembershipDirectory::default(),
             founders: FounderDirectory::default(),
+            topics: RetainedTopicDirectory::default(),
+            channel_options: ChannelOptionsDirectory::default(),
         }
     }
 
@@ -149,6 +156,8 @@ impl CoreIngress {
             nicks: NickDirectory::default(),
             memberships: MembershipDirectory::default(),
             founders: FounderDirectory::default(),
+            topics: RetainedTopicDirectory::default(),
+            channel_options: ChannelOptionsDirectory::default(),
         }
     }
 
@@ -210,6 +219,14 @@ impl CoreIngress {
 
     pub(crate) fn founder_directory(&self) -> FounderDirectory {
         self.founders.clone()
+    }
+
+    pub(crate) fn retained_topic_directory(&self) -> RetainedTopicDirectory {
+        self.topics.clone()
+    }
+
+    pub(crate) fn channel_options_directory(&self) -> ChannelOptionsDirectory {
+        self.channel_options.clone()
     }
 }
 
@@ -1815,6 +1832,8 @@ impl Core {
             NickDirectory::default(),
             MembershipDirectory::default(),
             FounderDirectory::default(),
+            RetainedTopicDirectory::default(),
+            ChannelOptionsDirectory::default(),
         )
     }
 
@@ -1825,6 +1844,8 @@ impl Core {
         nicks: NickDirectory,
         memberships: MembershipDirectory,
         founders: FounderDirectory,
+        topics: RetainedTopicDirectory,
+        channel_options: ChannelOptionsDirectory,
     ) -> Self {
         Self::with_telemetry_on_shard_with_nicks(
             config,
@@ -1835,6 +1856,8 @@ impl Core {
             nicks,
             memberships,
             founders,
+            topics,
+            channel_options,
         )
     }
 
@@ -1847,6 +1870,8 @@ impl Core {
         nicks: NickDirectory,
         memberships: MembershipDirectory,
         founders: FounderDirectory,
+        topics: RetainedTopicDirectory,
+        channel_options: ChannelOptionsDirectory,
     ) -> Self {
         Self {
             state: ServerState::new(
@@ -1858,6 +1883,8 @@ impl Core {
                 nicks,
                 memberships,
                 founders,
+                topics,
+                channel_options,
             ),
             shard,
             next_sequence: 0,
@@ -2353,9 +2380,10 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress, CoreScheduler, CoreShardCount,
-        CoreShardId, CoreTraceStep, CoreWorker, FounderDirectory, Input, MembershipDirectory,
-        NickDirectory, ReplayError, SessionOwner,
+        ChannelOptionsDirectory, ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress,
+        CoreScheduler, CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, FounderDirectory,
+        Input, MembershipDirectory, NickDirectory, ReplayError, RetainedTopicDirectory,
+        SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2417,6 +2445,8 @@ mod ingress_tests {
         let nicks = ingress.nick_directory();
         let memberships = ingress.membership_directory();
         let founders = ingress.founder_directory();
+        let topics = ingress.retained_topic_directory();
+        let channel_options = ingress.channel_options_directory();
         let (first_db, _first_db_rx) = queue(Config {
             name: "two-worker-first-db",
             capacity: 1,
@@ -2436,6 +2466,8 @@ mod ingress_tests {
             nicks.clone(),
             memberships.clone(),
             founders.clone(),
+            topics.clone(),
+            channel_options.clone(),
         );
         let second = Core::with_telemetry_on_shard_with_nicks(
             core_config(),
@@ -2446,6 +2478,8 @@ mod ingress_tests {
             nicks,
             memberships,
             founders,
+            topics,
+            channel_options,
         );
         TwoWorkerHarness {
             first,
@@ -2467,6 +2501,52 @@ mod ingress_tests {
         let key = second.state.chan_key("#chat");
         assert!(second.state.is_founder(&key, "alice"));
         assert!(second.state.is_registered(&key));
+    }
+
+    #[test]
+    fn retained_topics_are_shared_by_core_shards() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        first.preload_topics(vec![(
+            "#chat".into(),
+            "Retained topic".into(),
+            "alice".into(),
+            42,
+        )]);
+        let key = second.state.chan_key("#chat");
+        assert_eq!(
+            second.state.registered_topics.get(&key).map(|topic| (
+                topic.text,
+                topic.set_by,
+                topic.set_at_secs
+            )),
+            Some(("Retained topic".into(), "alice".into(), 42))
+        );
+    }
+
+    #[test]
+    fn durable_channel_options_are_shared_by_core_shards() {
+        let TwoWorkerHarness {
+            mut first, second, ..
+        } = two_worker_harness();
+        first.preload_keeptopic_off(vec!["#chat".into()]);
+        first
+            .preload_mlock(vec![("#chat".into(), "+im".into())])
+            .expect("valid mode lock");
+        first.preload_access(vec![("#chat".into(), "alice".into(), "ov".into())]);
+
+        let key = second.state.chan_key("#chat");
+        assert!(!second.state.channel_options.keeptopic_enabled(&key));
+        assert_eq!(
+            second
+                .state
+                .channel_options
+                .mlock(&key)
+                .map(|modes| modes.render()),
+            Some("+im".into())
+        );
+        assert_eq!(second.state.access_modes(&key, "alice"), (true, true));
     }
 
     async fn next_output(rx: &mut Receiver<super::Output>) -> Envelope<super::Output> {
@@ -2559,6 +2639,8 @@ mod ingress_tests {
             ingress.nick_directory(),
             ingress.membership_directory(),
             ingress.founder_directory(),
+            ingress.retained_topic_directory(),
+            ingress.channel_options_directory(),
         );
         let target = ["#alpha", "#beta", "#gamma"]
             .into_iter()
@@ -3502,6 +3584,8 @@ mod ingress_tests {
             NickDirectory::default(),
             MembershipDirectory::default(),
             FounderDirectory::default(),
+            RetainedTopicDirectory::default(),
+            ChannelOptionsDirectory::default(),
         );
         let (tx, rx) = queue(Config {
             name: "nonzero-core-shard-input",

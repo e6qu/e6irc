@@ -23,8 +23,10 @@ and integration claims.
   visibility explicit rather than reading a foreign session table.
   All MODE reads and mutations, NAMES, channel WHO, channel CHATHISTORY, and
   LIST route through typed channel-owner requests; unrestricted LIST fans out
-  to every shard and merges one ordered response. Remaining channel queries,
-  services, persistence callbacks, and HTTP controls need the same boundary.
+  to every shard and merges one ordered response. Durable registration metadata
+  (founders, retained topics, KEEPTOPIC, MLOCK, and access grants) is shared
+  through controlled process-wide directories. Services, persistence callbacks,
+  and HTTP controls still need typed channel-owner routing.
 - Prove multi-worker ordering, failure, backpressure, persistence, API, and
   load behavior before enabling production N>1 workers.
 - Run reproducible tuned-Linux scale campaigns before making scale claims.

@@ -558,7 +558,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
             state.pending_channel_registrations.remove(&key);
             state.set_founder(&channel, &founder_account);
             if let Some((text, set_by, set_at_secs)) = topic {
-                state.registered_topics.insert(
+                state.registered_topics.set(
                     key,
                     Topic {
                         text,
@@ -769,10 +769,8 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                         return;
                     }
                     state
-                        .channel_access
-                        .entry(key)
-                        .or_default()
-                        .insert(account_key, f.clone());
+                        .channel_options
+                        .set_access(key, account_key, Some(f.clone()));
                     state.service_notice(
                         conn,
                         "ChanServ",
@@ -780,9 +778,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     );
                 }
                 None => {
-                    if let Some(entry) = state.channel_access.get_mut(&key) {
-                        entry.remove(&account_key);
-                    }
+                    state.channel_options.set_access(key, account_key, None);
                     state.service_notice(
                         conn,
                         "ChanServ",

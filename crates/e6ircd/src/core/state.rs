@@ -266,6 +266,191 @@ impl FounderDirectory {
     }
 }
 
+/// Process-wide retained topics for registered channels.
+#[derive(Clone, Default)]
+pub(crate) struct RetainedTopicDirectory {
+    by_channel: Arc<Mutex<HashMap<ChanKey, Topic>>>,
+}
+
+impl RetainedTopicDirectory {
+    pub(crate) fn replace(&self, rows: impl IntoIterator<Item = (ChanKey, Topic)>) {
+        *self
+            .by_channel
+            .lock()
+            .expect("retained topic directory poisoned") = rows.into_iter().collect();
+    }
+
+    pub(crate) fn get(&self, key: &ChanKey) -> Option<Topic> {
+        self.by_channel
+            .lock()
+            .expect("retained topic directory poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set(&self, key: ChanKey, topic: Topic) {
+        self.by_channel
+            .lock()
+            .expect("retained topic directory poisoned")
+            .insert(key, topic);
+    }
+
+    pub(crate) fn remove(&self, key: &ChanKey) {
+        self.by_channel
+            .lock()
+            .expect("retained topic directory poisoned")
+            .remove(key);
+    }
+}
+
+/// Process-wide durable options for registered channels.
+#[derive(Clone, Default)]
+pub(crate) struct ChannelOptionsDirectory {
+    inner: Arc<Mutex<ChannelOptions>>,
+}
+
+#[derive(Default)]
+struct ChannelOptions {
+    keeptopic_off: HashSet<ChanKey>,
+    mlock: HashMap<ChanKey, MlockModes>,
+    access: HashMap<ChanKey, HashMap<AccountKey, String>>,
+}
+
+impl ChannelOptionsDirectory {
+    pub(crate) fn replace_keeptopic_off(&self, names: impl IntoIterator<Item = ChanKey>) {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .keeptopic_off = names.into_iter().collect();
+    }
+
+    pub(crate) fn set_keeptopic(&self, key: ChanKey, enabled: bool) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        if enabled {
+            options.keeptopic_off.remove(&key);
+        } else {
+            options.keeptopic_off.insert(key);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keeptopic_enabled(&self, key: &ChanKey) -> bool {
+        !self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .keeptopic_off
+            .contains(key)
+    }
+
+    pub(crate) fn replace_mlock(&self, mlock: HashMap<ChanKey, MlockModes>) {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .mlock = mlock;
+    }
+
+    pub(crate) fn mlock(&self, key: &ChanKey) -> Option<MlockModes> {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .mlock
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set_mlock(&self, key: ChanKey, mlock: Option<MlockModes>) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        match mlock {
+            Some(mlock) => {
+                options.mlock.insert(key, mlock);
+            }
+            None => {
+                options.mlock.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn replace_access(
+        &self,
+        rows: impl IntoIterator<Item = (ChanKey, AccountKey, String)>,
+    ) {
+        let mut access = HashMap::<ChanKey, HashMap<AccountKey, String>>::new();
+        for (channel, account, flags) in rows {
+            access.entry(channel).or_default().insert(account, flags);
+        }
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access = access;
+    }
+
+    pub(crate) fn access_entries(&self, key: &ChanKey) -> Vec<(AccountKey, String)> {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access
+            .get(key)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(a, f)| (a.clone(), f.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn access_flags(&self, key: &ChanKey, account: &AccountKey) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("channel options directory poisoned")
+            .access
+            .get(key)
+            .and_then(|entries| entries.get(account))
+            .cloned()
+    }
+
+    pub(crate) fn set_access(&self, key: ChanKey, account: AccountKey, flags: Option<String>) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        match flags {
+            Some(flags) => {
+                options
+                    .access
+                    .entry(key)
+                    .or_default()
+                    .insert(account, flags);
+            }
+            None => {
+                if let Some(entries) = options.access.get_mut(&key) {
+                    entries.remove(&account);
+                    if entries.is_empty() {
+                        options.access.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove(&self, key: &ChanKey) {
+        let mut options = self
+            .inner
+            .lock()
+            .expect("channel options directory poisoned");
+        options.keeptopic_off.remove(key);
+        options.mlock.remove(key);
+        options.access.remove(key);
+    }
+}
+
 pub struct CoreConfig {
     pub server_name: String,
     pub network_name: String,
@@ -2191,7 +2376,7 @@ pub(crate) struct ServerState {
     /// Registered channels → retained topic. Boot-loaded and kept in sync
     /// on TOPIC; restored when a registered channel is recreated so its
     /// topic survives the channel going empty.
-    pub registered_topics: HashMap<ChanKey, Topic>,
+    pub registered_topics: RetainedTopicDirectory,
     /// Latest requested TOPIC per registered channel while its database
     /// verdict is pending. The revision prevents an older reply from clearing
     /// a newer request. SET KEEPTOPIC reads this overlay instead of a stale
@@ -2199,17 +2384,8 @@ pub(crate) struct ServerState {
     pub pending_channel_topics: HashMap<ChanKey, (u64, Option<Topic>)>,
     /// Monotonic revision source for `pending_channel_topics`.
     pub channel_topic_revision: u64,
-    /// Registered channels whose ChanServ KEEPTOPIC option is OFF. Topic
-    /// retention is on by default (absence ⇒ on), so only the exceptions
-    /// live here; boot-loaded and updated on `SET KEEPTOPIC`.
-    pub keeptopic_off: HashSet<ChanKey>,
-    /// Registered channels with a ChanServ mode lock. Boot-loaded and
-    /// updated on `SET MLOCK`; enforced on MODE and on channel creation.
-    pub channel_mlock: HashMap<ChanKey, MlockModes>,
-    /// Per-channel access: channel → (folded account → flag chars, e.g.
-    /// "ov"). Boot-loaded and kept in sync on ChanServ FLAGS; drives
-    /// auto-op / auto-voice on join.
-    pub channel_access: HashMap<ChanKey, HashMap<AccountKey, String>>,
+    /// Process-wide durable KEEPTOPIC, MLOCK, and access state.
+    pub channel_options: ChannelOptionsDirectory,
     /// Server bans (oper K/D/X-lines) refused at registration. Boot-loaded
     /// and kept in sync on KLINE/DLINE/XLINE and their removals.
     pub server_bans: Vec<ServerBan>,
@@ -2745,6 +2921,8 @@ impl ServerState {
         nicks: NickDirectory,
         memberships: MembershipDirectory,
         registered_founders: FounderDirectory,
+        registered_topics: RetainedTopicDirectory,
+        channel_options: ChannelOptionsDirectory,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
@@ -2768,12 +2946,10 @@ impl ServerState {
             pending_read_markers: HashMap::new(),
             registered_founders,
             pending_channel_registrations: HashMap::new(),
-            registered_topics: HashMap::new(),
+            registered_topics,
             pending_channel_topics: HashMap::new(),
             channel_topic_revision: 0,
-            keeptopic_off: HashSet::new(),
-            channel_mlock: HashMap::new(),
-            channel_access: HashMap::new(),
+            channel_options,
             server_bans: Vec::new(),
             pending_server_bans: HashSet::new(),
             whowas: std::collections::VecDeque::new(),
@@ -3049,9 +3225,8 @@ impl ServerState {
     /// Load persisted channel topics as `(name_folded, text, setter,
     /// set_at_secs)` rows into the hot retained-topic map.
     pub fn preload_topics(&mut self, rows: Vec<(String, String, String, u64)>) {
-        self.registered_topics = rows
-            .into_iter()
-            .map(|(name_folded, text, set_by, set_at_secs)| {
+        self.registered_topics.replace(rows.into_iter().map(
+            |(name_folded, text, set_by, set_at_secs)| {
                 (
                     ChanKey(name_folded),
                     Topic {
@@ -3060,13 +3235,14 @@ impl ServerState {
                         set_at_secs,
                     },
                 )
-            })
-            .collect();
+            },
+        ));
     }
 
     /// Load the registered channels whose KEEPTOPIC is OFF (by folded name).
     pub fn preload_keeptopic_off(&mut self, names: Vec<String>) {
-        self.keeptopic_off = names.into_iter().map(ChanKey).collect();
+        self.channel_options
+            .replace_keeptopic_off(names.into_iter().map(ChanKey));
     }
 
     /// Load persisted mode locks as `(name_folded, spec)`. Corrupt storage
@@ -3087,14 +3263,14 @@ impl ServerState {
             }
             locks.insert(ChanKey(name), modes);
         }
-        self.channel_mlock = locks;
+        self.channel_options.replace_mlock(locks);
         Ok(())
     }
 
     /// Whether setting boolean mode `c` to `adding` would violate `key`'s
     /// mode lock (locked-off mode set on, or locked-on mode set off).
     pub fn mlock_conflict(&self, key: &ChanKey, c: char, adding: bool) -> bool {
-        match self.channel_mlock.get(key) {
+        match self.channel_options.mlock(key) {
             Some(m) => (adding && m.off.contains(c)) || (!adding && m.on.contains(c)),
             None => false,
         }
@@ -3103,13 +3279,10 @@ impl ServerState {
     /// Load persisted channel access as `(name_folded, account_folded,
     /// flags)` rows into the hot access map.
     pub fn preload_access(&mut self, rows: Vec<(String, String, String)>) {
-        self.channel_access.clear();
-        for (name_folded, account_folded, flags) in rows {
-            self.channel_access
-                .entry(ChanKey(name_folded))
-                .or_default()
-                .insert(AccountKey(account_folded), flags);
-        }
+        self.channel_options.replace_access(
+            rows.into_iter()
+                .map(|(channel, account, flags)| (ChanKey(channel), AccountKey(account), flags)),
+        );
     }
 
     /// Seed the read-marker mirror from persisted `(account, target, millis)`
@@ -3128,7 +3301,7 @@ impl ServerState {
     /// The `(auto_op, auto_voice)` flags `account` holds on channel `key`.
     pub fn access_modes(&self, key: &ChanKey, account: &str) -> (bool, bool) {
         let account = self.account_key(account);
-        match self.channel_access.get(key).and_then(|m| m.get(&account)) {
+        match self.channel_options.access_flags(key, &account) {
             Some(flags) => (flags.contains('o'), flags.contains('v')),
             None => (false, false),
         }
@@ -4247,6 +4420,8 @@ mod session_store_tests {
             NickDirectory::default(),
             MembershipDirectory::default(),
             FounderDirectory::default(),
+            RetainedTopicDirectory::default(),
+            ChannelOptionsDirectory::default(),
         )
     }
 

@@ -18,9 +18,7 @@ pub(crate) fn clear_registered_channel(state: &mut ServerState, key: &ChanKey) {
     state.registered_founders.remove(key);
     state.registered_topics.remove(key);
     state.pending_channel_topics.remove(key);
-    state.channel_access.remove(key);
-    state.channel_mlock.remove(key);
-    state.keeptopic_off.remove(key);
+    state.channel_options.remove(key);
 }
 
 pub(super) fn is_service_nick(key: &str) -> bool {
@@ -506,14 +504,11 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
             &format!("Access list for \x02{channel}\x02:"),
         );
         let mut entries: Vec<(String, String)> = state
-            .channel_access
-            .get(&key)
-            .map(|m| {
-                m.iter()
-                    .map(|(a, f)| (a.as_str().to_string(), f.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .channel_options
+            .access_entries(&key)
+            .into_iter()
+            .map(|(account, flags)| (account.as_str().to_string(), flags))
+            .collect();
         entries.sort();
         for (acct, flags) in &entries {
             state.service_notice(conn, "ChanServ", &format!("{acct} +{flags}"));
@@ -534,10 +529,8 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
     };
     let target_key = state.account_key(target);
     let current = state
-        .channel_access
-        .get(&key)
-        .and_then(|m| m.get(&target_key))
-        .cloned()
+        .channel_options
+        .access_flags(&key, &target_key)
         .unwrap_or_default();
     let new_flags = match apply_flag_changes(&current, changes) {
         Ok(flags) => flags,
@@ -897,10 +890,10 @@ pub(super) fn channel_keeptopic_set(
     let key = state.chan_key(&channel);
     if applied && state.is_registered(&key) {
         if keeptopic {
-            state.keeptopic_off.remove(&key);
+            state.channel_options.set_keeptopic(key.clone(), true);
             replace_registered_topic(state, &key, topic);
         } else {
-            state.keeptopic_off.insert(key.clone());
+            state.channel_options.set_keeptopic(key.clone(), false);
             state.registered_topics.remove(&key);
         }
     }
@@ -979,11 +972,11 @@ pub(super) fn channel_mlock_set(
             if applied && state.is_registered(&key) {
                 match parsed {
                     Some(modes) => {
-                        state.channel_mlock.insert(key.clone(), modes);
+                        state.channel_options.set_mlock(key.clone(), Some(modes));
                         apply_mlock(state, &key);
                     }
                     None => {
-                        state.channel_mlock.remove(&key);
+                        state.channel_options.set_mlock(key.clone(), None);
                     }
                 }
             }

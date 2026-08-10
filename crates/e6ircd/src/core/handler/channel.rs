@@ -216,7 +216,7 @@ pub(super) fn join_on_owner(
     // A registered channel being (re)created restores its retained topic.
     let newly_created = !state.channels.contains_key(&key);
     let restored_topic = if newly_created {
-        state.registered_topics.get(&key).cloned()
+        state.registered_topics.get(&key)
     } else {
         None
     };
@@ -1187,7 +1187,7 @@ pub(super) fn channel_topic_set(
     if retained && state.is_registered(&key) {
         match &new_topic {
             Some(topic) => {
-                state.registered_topics.insert(key.clone(), topic.clone());
+                state.registered_topics.set(key.clone(), topic.clone());
             }
             None => {
                 state.registered_topics.remove(&key);
@@ -1561,7 +1561,7 @@ pub(super) fn set_chan_bool_mode(modes: &mut crate::core::state::ChanModes, c: c
 /// that differ from the lock and broadcast the resulting MODE from ChanServ.
 /// A no-op when the channel has no lock or is already compliant.
 pub(super) fn apply_mlock(state: &mut ServerState, key: &ChanKey) {
-    let Some(m) = state.channel_mlock.get(key).cloned() else {
+    let Some(m) = state.channel_options.mlock(key) else {
         return;
     };
     let Some(chan) = state.channels.get(key) else {
@@ -1875,9 +1875,9 @@ fn channel_mode_with_prefix(
                         .map(|ch| ch.name.clone())
                         .unwrap_or_default();
                     let locked = state
-                        .channel_mlock
-                        .get(&key)
-                        .map(crate::core::state::MlockModes::render)
+                        .channel_options
+                        .mlock(&key)
+                        .map(|modes| modes.render())
                         .unwrap_or_default();
                     let modestr = format!("{}{c}", if adding { '+' } else { '-' });
                     state.numeric(

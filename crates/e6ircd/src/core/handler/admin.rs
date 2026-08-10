@@ -324,7 +324,7 @@ fn normalize_channel_mutation(
                         .channels
                         .get(key)
                         .and_then(|channel| channel.topic.clone())
-                        .or_else(|| state.registered_topics.get(key).cloned())
+                        .or_else(|| state.registered_topics.get(key))
                 });
             Ok(PersistedChannelMutation::SetKeeptopic {
                 enabled,
@@ -792,7 +792,7 @@ pub(crate) fn channel_control_result(
                     });
                     match &live_topic {
                         Some(topic) => {
-                            state.registered_topics.insert(key.clone(), topic.clone());
+                            state.registered_topics.set(key.clone(), topic.clone());
                         }
                         None => {
                             state.registered_topics.remove(&key);
@@ -809,10 +809,10 @@ pub(crate) fn channel_control_result(
                 }
                 PersistedChannelMutation::SetKeeptopic { enabled, topic } => {
                     if enabled {
-                        state.keeptopic_off.remove(&key);
+                        state.channel_options.set_keeptopic(key.clone(), true);
                         match topic {
                             Some((text, set_by, set_at_secs)) => {
-                                state.registered_topics.insert(
+                                state.registered_topics.set(
                                     key.clone(),
                                     Topic {
                                         text,
@@ -826,7 +826,7 @@ pub(crate) fn channel_control_result(
                             }
                         }
                     } else {
-                        state.keeptopic_off.insert(key.clone());
+                        state.channel_options.set_keeptopic(key.clone(), false);
                         state.registered_topics.remove(&key);
                     }
                     format!(
@@ -839,7 +839,7 @@ pub(crate) fn channel_control_result(
                     match mlock.as_deref() {
                         Some(spec) => match crate::core::state::MlockModes::parse(spec) {
                             Ok(modes) => {
-                                state.channel_mlock.insert(key.clone(), modes);
+                                state.channel_options.set_mlock(key.clone(), Some(modes));
                                 super::channel::apply_mlock(state, &key);
                             }
                             Err(bad) => {
@@ -857,7 +857,7 @@ pub(crate) fn channel_control_result(
                             }
                         },
                         None => {
-                            state.channel_mlock.remove(&key);
+                            state.channel_options.set_mlock(key.clone(), None);
                         }
                     }
                     format!("Updated the mode lock for {}", key.as_str())
@@ -867,18 +867,13 @@ pub(crate) fn channel_control_result(
                     match flags {
                         Some(flags) => {
                             state
-                                .channel_access
-                                .entry(key.clone())
-                                .or_default()
-                                .insert(account_key, flags);
+                                .channel_options
+                                .set_access(key.clone(), account_key, Some(flags));
                         }
                         None => {
-                            if let Some(entries) = state.channel_access.get_mut(&key) {
-                                entries.remove(&account_key);
-                                if entries.is_empty() {
-                                    state.channel_access.remove(&key);
-                                }
-                            }
+                            state
+                                .channel_options
+                                .set_access(key.clone(), account_key, None);
                         }
                     }
                     format!("Updated {account}'s access on {}", key.as_str())

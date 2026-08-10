@@ -42,7 +42,7 @@ fn replace_registered_topic(
 ) {
     match topic {
         Some((text, set_by, set_at_secs)) => {
-            state.registered_topics.insert(
+            state.registered_topics.set(
                 key.clone(),
                 Topic {
                     text,
