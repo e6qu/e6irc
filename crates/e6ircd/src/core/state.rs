@@ -2581,13 +2581,14 @@ impl ServerState {
         join_key: Option<String>,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelJoin {
-            owner,
-            actor,
-            name,
-            join_key,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelJoin {
+                owner,
+                actor,
+                name,
+                join_key,
+                label,
+            }));
     }
 
     pub fn route_join_result(
@@ -2596,11 +2597,12 @@ impl ServerState {
         result: ChannelJoinResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelJoinResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelJoinResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn route_part(
@@ -2611,13 +2613,14 @@ impl ServerState {
         reason: Option<String>,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelPart {
-            owner,
-            actor,
-            name,
-            reason,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelPart {
+                owner,
+                actor,
+                name,
+                reason,
+                label,
+            }));
     }
 
     pub fn route_part_result(
@@ -2626,19 +2629,24 @@ impl ServerState {
         result: ChannelPartResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelPartResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelPartResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn route_quit(&mut self, quit: ChannelQuit) {
-        self.effects.push(CoreEffect::ChannelQuit(quit));
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelQuit { quit }));
     }
 
     pub fn route_topic(&mut self, topic: ChannelTopic) {
-        self.effects.push(CoreEffect::ChannelTopic { topic });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTopic {
+                topic,
+            }));
     }
 
     pub fn route_topic_result(
@@ -2647,11 +2655,12 @@ impl ServerState {
         result: ChannelTopicResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelTopicResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTopicResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn route_topic_persisted(
@@ -2661,13 +2670,14 @@ impl ServerState {
         session: Option<SessionOwner>,
         result: crate::core::ChannelTopicPersistence,
     ) {
-        self.effects
-            .push(crate::core::CoreEffect::ChannelTopicPersisted {
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::ChannelTopicPersisted {
                 owner,
                 conn,
                 session,
                 result,
-            });
+            },
+        ));
     }
 
     pub fn route_channel_command(&mut self, command: ChannelCommand) {
@@ -2788,13 +2798,15 @@ impl ServerState {
     }
 
     pub fn route_session_channel_removed(&mut self, session: SessionOwner, key: ChanKey) {
-        self.effects
-            .push(crate::core::CoreEffect::SessionChannelRemoved { session, key });
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::SessionChannelRemoved { session, key },
+        ));
     }
 
     pub fn route_kick(&mut self, kick: ChannelKick) {
-        self.effects
-            .push(crate::core::CoreEffect::ChannelKick { kick });
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::ChannelKick { kick },
+        ));
     }
 
     pub fn route_kick_result(
@@ -2803,12 +2815,13 @@ impl ServerState {
         result: ChannelKickResult,
         label: Option<String>,
     ) {
-        self.effects
-            .push(crate::core::CoreEffect::ChannelKickResult {
+        self.effects.push(crate::core::CoreEffect::Input(
+            crate::core::Input::ChannelKickResult {
                 session,
                 result,
                 label,
-            });
+            },
+        ));
     }
 
     pub fn remove_session_channel(&mut self, conn: ConnId, key: &ChanKey) {
@@ -2835,7 +2848,10 @@ impl ServerState {
     }
 
     pub fn route_message(&mut self, message: ChannelMessage) {
-        self.effects.push(CoreEffect::ChannelMessage { message });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelMessage {
+                message,
+            }));
     }
 
     pub fn route_message_result(
@@ -2844,15 +2860,20 @@ impl ServerState {
         result: ChannelMessageResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelMessageResult {
-            session,
-            result,
-            label,
-        });
+        self.effects.push(CoreEffect::Input(
+            crate::core::Input::ChannelMessageResult {
+                session,
+                result,
+                label,
+            },
+        ));
     }
 
     pub fn route_multiline(&mut self, message: ChannelMultiline) {
-        self.effects.push(CoreEffect::ChannelMultiline { message });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelMultiline {
+                message,
+            }));
     }
 
     pub fn route_multiline_result(
@@ -2860,12 +2881,16 @@ impl ServerState {
         session: SessionOwner,
         result: ChannelMultilineResult,
     ) {
-        self.effects
-            .push(CoreEffect::ChannelMultilineResult { session, result });
+        self.effects.push(CoreEffect::Input(
+            crate::core::Input::ChannelMultilineResult { session, result },
+        ));
     }
 
     pub fn route_tagmsg(&mut self, tagmsg: ChannelTagmsg) {
-        self.effects.push(CoreEffect::ChannelTagmsg { tagmsg });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsg {
+                tagmsg,
+            }));
     }
 
     pub fn route_tagmsg_result(
@@ -2874,11 +2899,12 @@ impl ServerState {
         result: ChannelTagmsgResult,
         label: Option<String>,
     ) {
-        self.effects.push(CoreEffect::ChannelTagmsgResult {
-            session,
-            result,
-            label,
-        });
+        self.effects
+            .push(CoreEffect::Input(crate::core::Input::ChannelTagmsgResult {
+                session,
+                result,
+                label,
+            }));
     }
 
     pub fn refresh_recipient(&mut self, conn: ConnId) {

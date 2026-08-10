@@ -482,7 +482,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         crate::core::DbReply::ChannelRegisterUnavailable { channel, label } => {
             let key = state.chan_key(&channel);
             state.pending_channel_registrations.remove(&key);
-            chanserv_reply(
+            super::services::chanserv_deferred_notice(
                 state,
                 conn,
                 label,
@@ -564,7 +564,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
                     },
                 );
             }
-            chanserv_reply(
+            super::services::chanserv_deferred_notice(
                 state,
                 conn,
                 label,
@@ -574,7 +574,7 @@ pub(crate) fn db_reply(state: &mut ServerState, conn: ConnId, reply: crate::core
         crate::core::DbReply::ChannelExists { channel, label } => {
             let key = state.chan_key(&channel);
             state.pending_channel_registrations.remove(&key);
-            chanserv_reply(
+            super::services::chanserv_deferred_notice(
                 state,
                 conn,
                 label,
@@ -834,14 +834,6 @@ fn route_remote_topic_persistence(
         .contains_key(&conn)
         .then(|| state.channel_actor(conn).session_owner());
     state.route_topic_persisted(owner, conn, session, result);
-}
-
-fn chanserv_reply(state: &mut ServerState, conn: ConnId, label: Option<String>, text: String) {
-    if state.sessions.contains_key(&conn) {
-        state.emit_deferred_labeled(conn, label, move |state| {
-            state.service_notice(conn, "ChanServ", &text);
-        });
-    }
 }
 
 /// account-notify: tell channel peers with the cap about a login state

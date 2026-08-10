@@ -1074,7 +1074,7 @@ pub(super) fn channel_keeptopic_set(
 
 /// Emit a deferred, labeled ChanServ NOTICE to the connection if it is still
 /// present — the shared shape of the per-field `*_unavailable` replies.
-fn chanserv_deferred_notice(
+pub(super) fn chanserv_deferred_notice(
     state: &mut ServerState,
     conn: ConnId,
     label: Option<String>,
