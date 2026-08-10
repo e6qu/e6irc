@@ -2278,7 +2278,8 @@ mod connection_id_allocator_tests {
 mod ingress_tests {
     use super::{
         ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
-        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
+        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, Output, ReplayError,
+        SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2373,6 +2374,44 @@ mod ingress_tests {
             second_tx,
             second_rx,
             ingress,
+        }
+    }
+
+    fn channel_on_second(core: &Core) -> &'static str {
+        ["#alpha", "#beta", "#gamma"]
+            .into_iter()
+            .find(|name| core.state.channel_owner(name).shard() == CoreShardId(1))
+            .expect("a channel owned by shard one")
+    }
+
+    fn open_session_on_first(
+        first: &mut Core,
+        name: &'static str,
+    ) -> (SessionOwner, Receiver<Output>) {
+        let (output_tx, output_rx) = queue(Config {
+            name,
+            capacity: 2,
+            policy: Policy::Fifo,
+        });
+        let session = SessionOwner::new(ConnId(2), CoreShardId(0));
+        first.state.open(
+            session.conn(),
+            output_tx,
+            "host.test".into(),
+            ConnectionTransport::Tcp,
+        );
+        (session, output_rx)
+    }
+
+    fn take_service_result(core: &mut Core, session: SessionOwner) -> Input {
+        let mut effects = core.take_effects();
+        match effects.pop() {
+            Some(super::CoreEffect::Input(
+                result @ Input::ChannelServiceResult {
+                    session: received, ..
+                },
+            )) if received == session && effects.is_empty() => result,
+            _ => panic!("owner did not produce one requester result"),
         }
     }
 
@@ -2588,23 +2627,10 @@ mod ingress_tests {
             mut second,
             ..
         } = two_worker_harness();
-        let channel = ["#alpha", "#beta", "#gamma"]
-            .into_iter()
-            .find(|name| second.state.channel_owner(name).shard() == CoreShardId(1))
-            .expect("a channel owned by shard one");
+        let channel = channel_on_second(&second);
         first.preload_founders(vec![(channel.into(), "boss".into())]);
-        let (output_tx, mut output_rx) = queue(Config {
-            name: "persistence-disconnect-output",
-            capacity: 2,
-            policy: Policy::Fifo,
-        });
-        let session = SessionOwner::new(ConnId(2), CoreShardId(0));
-        first.state.open(
-            session.conn(),
-            output_tx,
-            "host.test".into(),
-            ConnectionTransport::Tcp,
-        );
+        let (session, mut output_rx) =
+            open_session_on_first(&mut first, "persistence-disconnect-output");
 
         second.handle(Input::ChannelServicePersisted {
             owner: second.state.channel_owner(channel),
@@ -2624,15 +2650,7 @@ mod ingress_tests {
                 .access_modes(&second.state.chan_key(channel), "alice"),
             (true, false)
         );
-        let mut effects = second.take_effects();
-        let result = match effects.pop() {
-            Some(super::CoreEffect::Input(
-                result @ Input::ChannelServiceResult {
-                    session: received, ..
-                },
-            )) if received == session && effects.is_empty() => result,
-            _ => panic!("owner did not produce one requester result"),
-        };
+        let result = take_service_result(&mut second, session);
 
         first.handle(Input::Closed {
             conn: session.conn(),
@@ -2652,22 +2670,9 @@ mod ingress_tests {
             mut second,
             ..
         } = two_worker_harness();
-        let channel = ["#alpha", "#beta", "#gamma"]
-            .into_iter()
-            .find(|name| second.state.channel_owner(name).shard() == CoreShardId(1))
-            .expect("a channel owned by shard one");
-        let (output_tx, mut output_rx) = queue(Config {
-            name: "persistence-failure-output",
-            capacity: 2,
-            policy: Policy::Fifo,
-        });
-        let session = SessionOwner::new(ConnId(2), CoreShardId(0));
-        first.state.open(
-            session.conn(),
-            output_tx,
-            "host.test".into(),
-            ConnectionTransport::Tcp,
-        );
+        let channel = channel_on_second(&second);
+        let (session, mut output_rx) =
+            open_session_on_first(&mut first, "persistence-failure-output");
         second.handle(Input::ChannelServicePersisted {
             owner: second.state.channel_owner(channel),
             session,
@@ -2677,11 +2682,7 @@ mod ingress_tests {
                 label: None,
             },
         });
-        let mut effects = second.take_effects();
-        let result = match effects.pop() {
-            Some(super::CoreEffect::Input(result)) if effects.is_empty() => result,
-            _ => panic!("owner did not produce one requester result"),
-        };
+        let result = take_service_result(&mut second, session);
         first.handle(result);
         let output = output_rx
             .try_pop()
