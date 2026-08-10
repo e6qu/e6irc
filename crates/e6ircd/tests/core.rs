@@ -7753,21 +7753,21 @@ fn chanserv_drop_unregisters_channel() {
         s.drain(boss).is_empty(),
         "DROP must not confirm before PostgreSQL deletes the row"
     );
-    let dropped = s.db_requests().into_iter().any(|r| {
-        matches!(r,
-            e6ircd::core::DbRequest::DropChannel {
-                channel,
-                requester: e6ircd::core::ChannelDropRequester::ChanServ { conn, .. },
-            } if channel == "#room" && conn == boss)
-    });
-    assert!(dropped, "DropChannel not queued");
+    let requester = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::DropChannel { channel, requester } if channel == "#room" => {
+                Some(requester)
+            }
+            _ => None,
+        });
+    let Some(requester) = requester else {
+        panic!("DropChannel not queued");
+    };
     s.core.handle(Input::ChannelDropResult {
         channel: "#room".into(),
-        requester: e6ircd::core::ChannelDropRequester::ChanServ {
-            conn: boss,
-            display: "#room".into(),
-            label: None,
-        },
+        requester,
         result: e6ircd::core::ChannelDropResult::Dropped,
     });
     let out = s.drain(boss);
@@ -7811,14 +7811,19 @@ fn chanserv_drop_clears_the_mode_lock() {
     // Drop it, empty it, then recreate it.
     s.line(boss, "PRIVMSG ChanServ :DROP #reg2");
     assert!(s.drain(boss).is_empty());
-    s.db_requests();
+    let requester = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::DropChannel { requester, .. } => Some(requester),
+            _ => None,
+        });
+    let Some(requester) = requester else {
+        panic!("DropChannel not queued");
+    };
     s.core.handle(Input::ChannelDropResult {
         channel: "#reg2".into(),
-        requester: e6ircd::core::ChannelDropRequester::ChanServ {
-            conn: boss,
-            display: "#reg2".into(),
-            label: None,
-        },
+        requester,
         result: e6ircd::core::ChannelDropResult::Dropped,
     });
     s.drain(boss);
@@ -7844,23 +7849,29 @@ fn chanserv_drop_store_failure_is_loud_labeled_and_non_mutating() {
 
     s.line(boss, "@label=drop7 PRIVMSG ChanServ :DROP #room");
     assert!(s.drain(boss).is_empty());
-    assert!(matches!(
-        s.db_requests().as_slice(),
-        [e6ircd::core::DbRequest::DropChannel {
-            requester: e6ircd::core::ChannelDropRequester::ChanServ {
-                label: Some(label),
-                ..
-            },
-            ..
-        }] if label == "drop7"
-    ));
+    let requester = s
+        .db_requests()
+        .into_iter()
+        .find_map(|request| match request {
+            e6ircd::core::DbRequest::DropChannel { requester, .. }
+                if matches!(
+                    &requester,
+                    e6ircd::core::ChannelDropRequester::ChanServ {
+                        label: Some(label),
+                        ..
+                    } if label == "drop7"
+                ) =>
+            {
+                Some(requester)
+            }
+            _ => None,
+        });
+    let Some(requester) = requester else {
+        panic!("labeled DropChannel not queued");
+    };
     s.core.handle(Input::ChannelDropResult {
         channel: "#room".into(),
-        requester: e6ircd::core::ChannelDropRequester::ChanServ {
-            conn: boss,
-            display: "#room".into(),
-            label: Some("drop7".into()),
-        },
+        requester,
         result: e6ircd::core::ChannelDropResult::Unavailable,
     });
     let out = s.drain(boss);

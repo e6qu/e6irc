@@ -182,9 +182,12 @@ impl CoreIngress {
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
-            | Input::ChannelDropResult { .. }
             | Input::ServerBanResult { .. }
             | Input::Admin { .. } => CoreShardId(0),
+            Input::ChannelDropResult { requester, .. } => match requester {
+                ChannelDropRequester::ChanServ { session, .. } => session.shard(),
+                ChannelDropRequester::Admin { .. } => CoreShardId(0),
+            },
             Input::ChannelControlResult { owner, .. }
             | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
         };
@@ -867,7 +870,7 @@ pub enum BanControlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelDropRequester {
     ChanServ {
-        conn: ConnId,
+        session: SessionOwner,
         display: String,
         label: Option<String>,
     },
@@ -2386,8 +2389,9 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
-        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
+        ChannelDropRequester, ChannelDropResult, ConnId, ConnectionTransport, Core, CoreConfig,
+        CoreDirectories, CoreIngress, CoreScheduler, CoreShardCount, CoreShardId, CoreTraceStep,
+        CoreWorker, Input, ReplayError, SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2482,6 +2486,35 @@ mod ingress_tests {
             second_rx,
             ingress,
         }
+    }
+
+    #[tokio::test]
+    async fn chanserv_drop_result_returns_to_the_session_owner() {
+        let TwoWorkerHarness {
+            mut second_rx,
+            ingress,
+            ..
+        } = two_worker_harness();
+        let session = SessionOwner::new(ConnId(1), CoreShardId(1));
+        ingress
+            .push(Input::ChannelDropResult {
+                channel: "#chat".into(),
+                requester: ChannelDropRequester::ChanServ {
+                    session,
+                    display: "#chat".into(),
+                    label: None,
+                },
+                result: ChannelDropResult::Dropped,
+            })
+            .await
+            .expect("route drop result");
+        assert!(matches!(
+            second_rx.pop().await.expect("session-owner event").payload,
+            Input::ChannelDropResult {
+                requester: ChannelDropRequester::ChanServ { session: owner, .. },
+                ..
+            } if owner == session
+        ));
     }
 
     #[test]

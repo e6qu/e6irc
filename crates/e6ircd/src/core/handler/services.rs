@@ -452,7 +452,7 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             let request = crate::core::DbRequest::DropChannel {
                 channel: key.as_str().to_string(),
                 requester: crate::core::ChannelDropRequester::ChanServ {
-                    conn,
+                    session: state.channel_actor(conn).session_owner(),
                     display: channel.to_string(),
                     label,
                 },
@@ -962,10 +962,11 @@ pub(crate) fn channel_drop_result(
     }
     match requester {
         crate::core::ChannelDropRequester::ChanServ {
-            conn,
+            session,
             display,
             label,
         } => {
+            let conn = session.conn();
             if state.sessions.contains_key(&conn) {
                 state.emit_deferred_labeled(conn, label, |state| match result {
                     crate::core::ChannelDropResult::Dropped => state.service_notice(
