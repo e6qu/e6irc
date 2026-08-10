@@ -102,8 +102,8 @@ must name a new directory; it creates one JSON result per client count.
 
 ## Controlled Linux qualification
 
-`qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`
-and `host.txt`. It requires a clean source tree and records the source revision,
+`qualify-linux.sh` runs one explicit-budget campaign and writes `result.json`,
+`qualification.json`, and `host.txt`. It requires a clean source tree and records the source revision,
 the load and server executable hashes, host limits, configured core-worker count,
 and exact workload/budgets.
 It rejects a non-e6ircd PID, insufficient file-descriptor limits, a target
@@ -121,7 +121,8 @@ tools/load/qualify-linux.sh 127.0.0.1:6667 "$SERVER_PID" 2 20000 200 20 results/
 The third value is the configured core-worker count. The final four values are
 minimum connect rate, minimum fan-out rate, maximum P99 milliseconds, and
 maximum incremental server resident bytes per requested connection. The result
-records the SHA-256 digest of `host.txt`; verify it before publishing a claim.
+records the SHA-256 digest of `host.txt`; `qualification.json` adds common
+closed-outcome and phase evidence. Verify both before publishing a claim.
 
 CI runs 64 clients across eight channels with a four-message burst against a
 real debug daemon, requiring exact fan-out, at least 10 connections/second,

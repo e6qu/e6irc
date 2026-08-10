@@ -350,9 +350,9 @@ and host process/memory/CPU telemetry is available.
    budget so the harness samples and enforces daemon memory rather than relying
    on an operator to transcribe it.
 5. Use `qualify-linux.sh` for controlled Linux runs. It validates host budgets
-   and stores a synced versioned JSON result with host provenance. A harness
-   failure still records the requested campaign and its error; a preflight
-   failure creates no evidence.
+   and stores a synced load result, host provenance, and common qualification
+   evidence. A harness failure records a failed outcome; a preflight failure
+   creates no evidence.
 
 **Visible failures and recovery.** The harness has results through 2,000
 local clients. CI runs a real-daemon 64-client/eight-channel smoke and requires

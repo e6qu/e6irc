@@ -10,6 +10,7 @@ members = [
     "crates/e6irc-cli",
     "crates/e6irc-tui",
     "crates/e6irc-load",
+    "crates/e6irc-qualification",
 ]
 
 [workspace.package]

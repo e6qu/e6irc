@@ -22,8 +22,9 @@ jobs:
       - run: tools/check-systemd-unit.sh
       - run: tools/test-docker-entrypoint.sh
       - run: tools/test-backup-restore.sh
-      - run: bash -n tools/load/sweep.sh tools/load/qualify-arguments.sh tools/load/qualify-linux.sh tools/test-load-qualification-arguments.sh
+      - run: bash -n tools/load/sweep.sh tools/load/qualify-arguments.sh tools/load/qualify-linux.sh tools/test-load-qualification-arguments.sh tools/test-qualification.sh tools/qualification/*.sh
       - run: tools/test-load-qualification-arguments.sh
+      - run: tools/test-qualification.sh
       - run: tools/test-check-migration-integrity.sh
       - name: Migration integrity
         run: |
