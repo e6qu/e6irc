@@ -1929,6 +1929,22 @@ fn record_database_error(telemetry: Option<&Telemetry>) {
     }
 }
 
+async fn push_channel_service_persisted(
+    core_tx: &crate::core::CoreIngress,
+    owner: crate::core::ChannelOwner,
+    session: crate::core::SessionOwner,
+    result: crate::core::ChannelServicePersistence,
+) -> bool {
+    core_tx
+        .push(Input::ChannelServicePersisted {
+            owner,
+            session,
+            result,
+        })
+        .await
+        .is_ok()
+}
+
 /// Handle one non-history request; false = core gone, stop the worker.
 async fn handle_request(
     pool: &PgPool,
@@ -2097,14 +2113,7 @@ async fn handle_request(
                     }
                 }
             };
-            core_tx
-                .push(Input::ChannelServicePersisted {
-                    owner,
-                    session,
-                    result,
-                })
-                .await
-                .is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::QueryHistory {
             conn,
@@ -2270,14 +2279,7 @@ async fn handle_request(
                     }
                 }
             };
-            core_tx
-                .push(Input::ChannelServicePersisted {
-                    owner,
-                    session,
-                    result,
-                })
-                .await
-                .is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::SetChannelMlock {
             owner,
@@ -2305,14 +2307,7 @@ async fn handle_request(
                     }
                 }
             };
-            core_tx
-                .push(Input::ChannelServicePersisted {
-                    owner,
-                    session,
-                    result,
-                })
-                .await
-                .is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::SetChannelAccess {
             owner,
@@ -2352,14 +2347,7 @@ async fn handle_request(
                     }
                 }
             };
-            core_tx
-                .push(Input::ChannelServicePersisted {
-                    owner,
-                    session,
-                    result,
-                })
-                .await
-                .is_ok()
+            push_channel_service_persisted(core_tx, owner, session, result).await
         }
         DbRequest::MutateOwnedChannel {
             owner,
