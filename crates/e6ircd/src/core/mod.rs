@@ -32,10 +32,7 @@ use state::{
     ChannelPartResult, ChannelQuit, ChannelTagmsg, ChannelTagmsgResult, ChannelTopic,
     ChannelTopicResult,
 };
-use state::{
-    ChannelOptionsDirectory, FounderDirectory, MembershipDirectory, NickDirectory,
-    RetainedTopicDirectory, ServerState,
-};
+use state::{CoreDirectories, ServerState};
 
 use crate::observability::{LatencyKind, Telemetry};
 
@@ -118,11 +115,7 @@ impl SessionOwner {
 pub struct CoreIngress {
     shards: Arc<[Sender<Input>]>,
     count: CoreShardCount,
-    nicks: NickDirectory,
-    memberships: MembershipDirectory,
-    founders: FounderDirectory,
-    topics: RetainedTopicDirectory,
-    channel_options: ChannelOptionsDirectory,
+    directories: CoreDirectories,
 }
 
 impl CoreIngress {
@@ -130,11 +123,7 @@ impl CoreIngress {
         Self {
             shards: Arc::from([sender]),
             count: CoreShardCount::single(),
-            nicks: NickDirectory::default(),
-            memberships: MembershipDirectory::default(),
-            founders: FounderDirectory::default(),
-            topics: RetainedTopicDirectory::default(),
-            channel_options: ChannelOptionsDirectory::default(),
+            directories: CoreDirectories::default(),
         }
     }
 
@@ -153,11 +142,7 @@ impl CoreIngress {
         Self {
             shards: shards.into(),
             count: CoreShardCount::new(count),
-            nicks: NickDirectory::default(),
-            memberships: MembershipDirectory::default(),
-            founders: FounderDirectory::default(),
-            topics: RetainedTopicDirectory::default(),
-            channel_options: ChannelOptionsDirectory::default(),
+            directories: CoreDirectories::default(),
         }
     }
 
@@ -209,24 +194,8 @@ impl CoreIngress {
         self.shards[0].monitor()
     }
 
-    pub(crate) fn nick_directory(&self) -> NickDirectory {
-        self.nicks.clone()
-    }
-
-    pub(crate) fn membership_directory(&self) -> MembershipDirectory {
-        self.memberships.clone()
-    }
-
-    pub(crate) fn founder_directory(&self) -> FounderDirectory {
-        self.founders.clone()
-    }
-
-    pub(crate) fn retained_topic_directory(&self) -> RetainedTopicDirectory {
-        self.topics.clone()
-    }
-
-    pub(crate) fn channel_options_directory(&self) -> ChannelOptionsDirectory {
-        self.channel_options.clone()
+    pub(crate) fn directories(&self) -> CoreDirectories {
+        self.directories.clone()
     }
 }
 
@@ -1840,69 +1809,35 @@ impl Core {
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
     ) -> Self {
-        Self::with_telemetry_with_nicks(
-            config,
-            db_tx,
-            telemetry,
-            NickDirectory::default(),
-            MembershipDirectory::default(),
-            FounderDirectory::default(),
-            RetainedTopicDirectory::default(),
-            ChannelOptionsDirectory::default(),
-        )
+        Self::with_telemetry_with_directories(config, db_tx, telemetry, CoreDirectories::default())
     }
 
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn with_telemetry_with_nicks(
+    pub(crate) fn with_telemetry_with_directories(
         config: CoreConfig,
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
-        nicks: NickDirectory,
-        memberships: MembershipDirectory,
-        founders: FounderDirectory,
-        topics: RetainedTopicDirectory,
-        channel_options: ChannelOptionsDirectory,
+        directories: CoreDirectories,
     ) -> Self {
-        Self::with_telemetry_on_shard_with_nicks(
+        Self::with_telemetry_on_shard_with_directories(
             config,
             db_tx,
             telemetry,
             CoreShardId(0),
             CoreShardCount::single(),
-            nicks,
-            memberships,
-            founders,
-            topics,
-            channel_options,
+            directories,
         )
     }
 
-    #[expect(clippy::too_many_arguments)]
-    fn with_telemetry_on_shard_with_nicks(
+    fn with_telemetry_on_shard_with_directories(
         config: CoreConfig,
         db_tx: Sender<DbRequest>,
         telemetry: Arc<Telemetry>,
         shard: CoreShardId,
         shards: CoreShardCount,
-        nicks: NickDirectory,
-        memberships: MembershipDirectory,
-        founders: FounderDirectory,
-        topics: RetainedTopicDirectory,
-        channel_options: ChannelOptionsDirectory,
+        directories: CoreDirectories,
     ) -> Self {
         Self {
-            state: ServerState::new(
-                shard,
-                shards,
-                config,
-                db_tx,
-                telemetry,
-                nicks,
-                memberships,
-                founders,
-                topics,
-                channel_options,
-            ),
+            state: ServerState::new(shard, shards, config, db_tx, telemetry, directories),
             shard,
             next_sequence: 0,
         }
@@ -2416,10 +2351,8 @@ mod connection_id_allocator_tests {
 #[cfg(test)]
 mod ingress_tests {
     use super::{
-        ChannelOptionsDirectory, ConnId, ConnectionTransport, Core, CoreConfig, CoreIngress,
-        CoreScheduler, CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, FounderDirectory,
-        Input, MembershipDirectory, NickDirectory, ReplayError, RetainedTopicDirectory,
-        SessionOwner,
+        ConnId, ConnectionTransport, Core, CoreConfig, CoreDirectories, CoreIngress, CoreScheduler,
+        CoreShardCount, CoreShardId, CoreTraceStep, CoreWorker, Input, ReplayError, SessionOwner,
     };
     use crate::core::state::{
         Caps, ChanModes, Channel, ChannelActor, ChannelCommand, ChannelCommandOperation,
@@ -2478,11 +2411,7 @@ mod ingress_tests {
         let (second_tx, second_rx) = queue(config);
         let ingress = CoreIngress::with_shards(first_tx.clone(), vec![second_tx.clone()]);
         let shards = CoreShardCount::new(NonZeroUsize::new(2).expect("two shards"));
-        let nicks = ingress.nick_directory();
-        let memberships = ingress.membership_directory();
-        let founders = ingress.founder_directory();
-        let topics = ingress.retained_topic_directory();
-        let channel_options = ingress.channel_options_directory();
+        let directories = ingress.directories();
         let (first_db, _first_db_rx) = queue(Config {
             name: "two-worker-first-db",
             capacity: 1,
@@ -2493,29 +2422,21 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let first = Core::with_telemetry_on_shard_with_nicks(
+        let first = Core::with_telemetry_on_shard_with_directories(
             core_config(),
             first_db,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(0),
             shards,
-            nicks.clone(),
-            memberships.clone(),
-            founders.clone(),
-            topics.clone(),
-            channel_options.clone(),
+            directories.clone(),
         );
-        let second = Core::with_telemetry_on_shard_with_nicks(
+        let second = Core::with_telemetry_on_shard_with_directories(
             core_config(),
             second_db,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             shards,
-            nicks,
-            memberships,
-            founders,
-            topics,
-            channel_options,
+            directories,
         );
         TwoWorkerHarness {
             first,
@@ -2690,17 +2611,13 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let core = Core::with_telemetry_on_shard_with_nicks(
+        let core = Core::with_telemetry_on_shard_with_directories(
             core_config(),
             db_tx,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(0),
             shards,
-            ingress.nick_directory(),
-            ingress.membership_directory(),
-            ingress.founder_directory(),
-            ingress.retained_topic_directory(),
-            ingress.channel_options_directory(),
+            ingress.directories(),
         );
         let target = ["#alpha", "#beta", "#gamma"]
             .into_iter()
@@ -2734,7 +2651,9 @@ mod ingress_tests {
                 },
             },
             target.into(),
-            ChannelCommandOperation::Knock,
+            ChannelCommandOperation::ChanServOp {
+                target_nick: "target".into(),
+            },
             None,
         );
 
@@ -2744,7 +2663,11 @@ mod ingress_tests {
             .expect("channel command routed");
         assert!(matches!(
             second_rx.pop().await.expect("channel owner event").payload,
-            Input::ChannelCommand { .. }
+            Input::ChannelCommand { command }
+                if matches!(
+                    command.operation(),
+                    ChannelCommandOperation::ChanServOp { .. }
+                )
         ));
     }
 
@@ -3635,17 +3558,13 @@ mod ingress_tests {
             capacity: 1,
             policy: Policy::Fifo,
         });
-        let core = Core::with_telemetry_on_shard_with_nicks(
+        let core = Core::with_telemetry_on_shard_with_directories(
             core_config(),
             db_tx,
             Arc::new(crate::observability::Telemetry::new()),
             CoreShardId(1),
             CoreShardCount::new(NonZeroUsize::new(2).expect("nonzero shard count")),
-            NickDirectory::default(),
-            MembershipDirectory::default(),
-            FounderDirectory::default(),
-            RetainedTopicDirectory::default(),
-            ChannelOptionsDirectory::default(),
+            CoreDirectories::default(),
         );
         let (tx, rx) = queue(Config {
             name: "nonzero-core-shard-input",

@@ -451,6 +451,16 @@ impl ChannelOptionsDirectory {
     }
 }
 
+/// Process-wide directories shared by all core shards.
+#[derive(Clone, Default)]
+pub(crate) struct CoreDirectories {
+    pub(crate) nicks: NickDirectory,
+    pub(crate) memberships: MembershipDirectory,
+    pub(crate) founders: FounderDirectory,
+    pub(crate) topics: RetainedTopicDirectory,
+    pub(crate) channel_options: ChannelOptionsDirectory,
+}
+
 pub struct CoreConfig {
     pub server_name: String,
     pub network_name: String,
@@ -1126,6 +1136,7 @@ pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
 pub enum ChannelCommandOperation {
     Knock,
     Invite(ChannelInvitee),
+    ChanServOp { target_nick: String },
     Names,
     Who(ChannelWhoQuery),
     History(ChannelHistoryRequest),
@@ -1287,6 +1298,7 @@ impl<Operation: Clone> ChannelRequest<Operation> {
 pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
+    ChanServOp(ChanServOpResult),
     Names(ChannelCommandReplies),
     Who(ChannelCommandReplies),
     History(ChannelHistoryResult),
@@ -1324,6 +1336,16 @@ pub enum ChannelInviteResult {
     NotOnChannel { target: String },
     NotOperator { target: String },
     UserOnChannel { invitee: String, channel: String },
+}
+
+#[derive(Debug)]
+pub enum ChanServOpResult {
+    NotRegistered { channel: String },
+    NoAccess { channel: String },
+    TargetOffline { target: String },
+    TargetNotOnChannel { target: String, channel: String },
+    AlreadyOpped { target: String },
+    Opped { target: String, channel: String },
 }
 
 #[derive(Debug)]
@@ -2920,18 +2942,13 @@ impl ServerState {
         std::mem::take(&mut self.effects)
     }
 
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         shard: CoreShardId,
         shards: CoreShardCount,
         config: CoreConfig,
         db_tx: Sender<super::DbRequest>,
         telemetry: Arc<Telemetry>,
-        nicks: NickDirectory,
-        memberships: MembershipDirectory,
-        registered_founders: FounderDirectory,
-        registered_topics: RetainedTopicDirectory,
-        channel_options: ChannelOptionsDirectory,
+        directories: CoreDirectories,
     ) -> Self {
         let started_at = (config.clock)();
         Self {
@@ -2940,8 +2957,8 @@ impl ServerState {
             config,
             casemap: CaseMapping::Rfc1459,
             sessions: SessionStore::new(),
-            nicks,
-            memberships,
+            nicks: directories.nicks,
+            memberships: directories.memberships,
             channels: ChannelDirectory::new(shards),
             doomed: Vec::new(),
             effects: Vec::new(),
@@ -2953,12 +2970,12 @@ impl ServerState {
             monitors: HashMap::new(),
             read_markers: HashMap::new(),
             pending_read_markers: HashMap::new(),
-            registered_founders,
+            registered_founders: directories.founders,
             pending_channel_registrations: HashMap::new(),
-            registered_topics,
+            registered_topics: directories.topics,
             pending_channel_topics: HashMap::new(),
             channel_topic_revision: 0,
-            channel_options,
+            channel_options: directories.channel_options,
             server_bans: Vec::new(),
             pending_server_bans: HashSet::new(),
             whowas: std::collections::VecDeque::new(),
@@ -4426,11 +4443,7 @@ mod session_store_tests {
             },
             db_tx,
             Arc::new(Telemetry::new()),
-            NickDirectory::default(),
-            MembershipDirectory::default(),
-            FounderDirectory::default(),
-            RetainedTopicDirectory::default(),
-            ChannelOptionsDirectory::default(),
+            CoreDirectories::default(),
         )
     }
 

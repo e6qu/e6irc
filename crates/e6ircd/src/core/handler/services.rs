@@ -563,32 +563,21 @@ pub(super) fn chanserv_flags(state: &mut ServerState, conn: ConnId, args: &[&str
     }
 }
 
-/// ChanServ OP: op yourself (or a named nick) on a registered channel you
-/// have op access to (founder or the `o` access flag). The target must be
-/// online and on the channel.
 pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) {
     let Some(&channel) = args.first() else {
         state.service_notice(conn, "ChanServ", "Syntax: OP <#channel> [nick]");
         return;
     };
-    let Some((key, account)) = chanserv_registered_gate(
+    if require_identified(
         state,
         conn,
-        channel,
+        "ChanServ",
         "You must identify to services before using OP.",
-    ) else {
-        return;
-    };
-    if !(state.is_founder(&key, &account) || state.access_modes(&key, &account).0) {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("You do not have op access on \x02{channel}\x02."),
-        );
+    )
+    .is_none()
+    {
         return;
     }
-
-    // Target: the named nick, or the requester's own nick.
     let target_nick = match args.get(1) {
         Some(&n) => n.to_string(),
         None => state.sessions[&conn]
@@ -596,56 +585,119 @@ pub(super) fn chanserv_op(state: &mut ServerState, conn: ConnId, args: &[&str]) 
             .map(String::from)
             .expect("registered"),
     };
-    let nk = state.nick_key(&target_nick);
-    let Some(target_conn) = state.nick_connection(&nk) else {
-        state.service_notice(
-            conn,
-            "ChanServ",
-            &format!("\x02{target_nick}\x02 is not online."),
-        );
-        return;
+    let owner = state.channel_owner(channel);
+    let label = state.channel_reply_label(conn, &owner);
+    let command = crate::core::state::ChannelCommand::new(
+        owner,
+        state.channel_actor(conn),
+        channel.to_string(),
+        crate::core::state::ChannelCommandOperation::ChanServOp { target_nick },
+        label,
+    );
+    if state.owns_channel(command.owner()) {
+        let result = chanserv_op_on_owner(state, command);
+        emit_chanserv_op_result(state, conn, result);
+    } else {
+        state.route_channel_command(command);
+    }
+}
+
+pub(crate) fn chanserv_op_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> crate::core::state::ChanServOpResult {
+    let (owner, actor, target, operation) = command.into_parts();
+    let crate::core::state::ChannelCommandOperation::ChanServOp { target_nick } = operation else {
+        unreachable!("ChanServ OP command operation");
     };
-    match state
-        .channels
-        .get(&key)
-        .and_then(|c| c.member(target_conn))
-        .map(|m| m.op)
-    {
-        None => {
-            state.service_notice(
-                conn,
-                "ChanServ",
-                &format!("\x02{target_nick}\x02 is not on \x02{channel}\x02."),
-            );
-            return;
-        }
-        Some(true) => {
-            state.service_notice(
-                conn,
-                "ChanServ",
-                &format!("\x02{target_nick}\x02 is already opped."),
-            );
-            return;
-        }
-        Some(false) => {}
+    let key = state.chan_key(&target);
+    assert_eq!(owner.key(), &key, "ChanServ OP owner does not match target");
+    let Some(account) = actor.account else {
+        unreachable!("identified ChanServ actor has no account");
+    };
+    let account = state.account_key(&account);
+    if !state.is_registered(&key) {
+        return crate::core::state::ChanServOpResult::NotRegistered { channel: target };
     }
-    if let Some(chan) = state.channels.get_mut(&key)
-        && let Some(member) = chan.member_mut(target_conn)
-    {
-        member.op = true;
+    if !(state.is_founder(&key, account.as_str()) || state.access_modes(&key, account.as_str()).0) {
+        return crate::core::state::ChanServOpResult::NoAccess { channel: target };
     }
-    let display = state.channels[&key].name.clone();
+    let target_key = state.nick_key(&target_nick);
+    let Some(target_owner) = state.nick_reservation(&target_key) else {
+        return crate::core::state::ChanServOpResult::TargetOffline {
+            target: target_nick,
+        };
+    };
+    let target_conn = target_owner.conn();
+    let Some(channel) = state.channels.get_mut(&key) else {
+        return crate::core::state::ChanServOpResult::TargetNotOnChannel {
+            target: target_nick,
+            channel: target,
+        };
+    };
+    let display = channel.name.clone();
+    let Some(member) = channel.member_mut(target_conn) else {
+        return crate::core::state::ChanServOpResult::TargetNotOnChannel {
+            target: target_nick,
+            channel: display,
+        };
+    };
+    if member.op {
+        return crate::core::state::ChanServOpResult::AlreadyOpped {
+            target: target_nick,
+        };
+    }
+    member.op = true;
     let server = state.config.server_name.clone();
     state.broadcast_channel(
         &key,
         &format!(":{server} MODE {display} +o {target_nick}"),
         None,
     );
-    state.service_notice(
-        conn,
-        "ChanServ",
-        &format!("Opped \x02{target_nick}\x02 on \x02{channel}\x02."),
-    );
+    crate::core::state::ChanServOpResult::Opped {
+        target: target_nick,
+        channel: display,
+    }
+}
+
+pub(crate) fn emit_chanserv_op_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChanServOpResult,
+) {
+    match result {
+        crate::core::state::ChanServOpResult::NotRegistered { channel } => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{channel}\x02 is not registered."),
+        ),
+        crate::core::state::ChanServOpResult::NoAccess { channel } => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("You do not have op access on \x02{channel}\x02."),
+        ),
+        crate::core::state::ChanServOpResult::TargetOffline { target } => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{target}\x02 is not online."),
+        ),
+        crate::core::state::ChanServOpResult::TargetNotOnChannel { target, channel } => state
+            .service_notice(
+                conn,
+                "ChanServ",
+                &format!("\x02{target}\x02 is not on \x02{channel}\x02."),
+            ),
+        crate::core::state::ChanServOpResult::AlreadyOpped { target } => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{target}\x02 is already opped."),
+        ),
+        crate::core::state::ChanServOpResult::Opped { target, channel } => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("Opped \x02{target}\x02 on \x02{channel}\x02."),
+        ),
+    }
 }
 
 /// ChanServ SET: founder-only channel options. Currently FOUNDER (transfer
