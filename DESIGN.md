@@ -595,16 +595,13 @@ strip = "symbols"
 
 ### 7.3 Queue-based core: state model at 100k+ connections
 
-**Current implementation and target boundary.** The daemon starts one
-single-threaded core worker (N=1) owning all sessions, nicks, and channels.
-Connection tasks and the database writer communicate through bounded queues;
-the driver/attach layer also uses bounded tokio channels. `e6irc-queue`
-provides the delivered-or-returned, sequence, manual-pop, adaptive-mode, and
-loom-checked contracts below. The core has typed shard ownership and
-cross-shard routing, exercised by deterministic two-worker scheduling and
-replay tests. Runtime N>1 startup wiring and production qualification remain
-unfinished. Current qualification evidence and journey impact are tracked in
-`tools/load/README.md` and `docs/journeys/coverage.md`.
+**Current implementation and qualification boundary.** The daemon starts a
+configured nonzero number of single-threaded core workers (default one).
+Workers own their shard state; shared directories and typed queue events route
+session work and broadcast global commits. Connection tasks and the database
+writer communicate through bounded queues. Runtime N=2/N=3 coverage proves
+the lifecycle, routing, delivery, and shutdown. Tuned-host scale qualification
+remains required before a performance claim.
 
 **Target architecture rule.** The server is a set of **single-threaded event
 loops ("workers") that own their state exclusively**; the *only*
@@ -656,12 +653,12 @@ driver/attach layer of §10 uses tokio `broadcast`/`mpsc`):**
   under all interleavings); property tests pin FIFO-per-producer,
   bounded-memory, and delivered-or-returned invariants.
 
-**Target worker topology (current core uses one worker):**
+**Worker topology:**
 
-- **Core shards** (N ≈ cores): each owns the sessions, nick table
-  partition, and channel table partition for its hash range
-  (casefolded-name hash). A command touching `#chan` is routed to
-  `shard(#chan)`'s queue; nick-scoped commands to `shard(nick)`.
+- **Core shards** (configured N): each owns its sessions and channel
+  partition. Shared directories reserve nicks and durable channel metadata.
+  A channel command is routed to `shard(#chan)`; a session command is routed
+  to its connection owner.
 - **Connection I/O tasks** (per socket): parse inbound lines → enqueue to
   the right shard; drain their **SendQ** (also an `e6irc-queue`, bounded)
   → socket. SendQ full = classic slow-client kill.
@@ -1795,7 +1792,7 @@ The snapshot is the sole source for:
   7-day range; invalid ranges fail with HTTP 400 rather than being clamped;
 - `/api/v1/admin/metrics`, authenticated Prometheus text exposition with only
   fixed `state`/`kind`/`queue`/`mode` labels;
-- `/readyz`, which fails when the single core worker's heartbeat is stale or
+- `/readyz`, which fails when a core heartbeat is stale or
   configured PostgreSQL cannot answer `SELECT 1` within a separate two-second
   query deadline.
 
@@ -1835,7 +1832,7 @@ Layers, bottom to top:
    command streams, and arbitrary server output into the TUI model.
    `e6irc-queue::Receiver::try_pop` supplies a manual-step primitive; fixed
    multi-queue schedules record and replay their shard/sequence steps. A seeded
-   whole-core multi-worker simulation remains part of the N>1 architecture.
+   whole-core multi-worker simulation remains part of the N>1 evidence.
    A separate all-feature coverage job combines the portable workspace suite
    with the real PostgreSQL database and HTTP lifecycle suites, then rejects
    line coverage below 80%; the floor is a regression ratchet. Provider/browser

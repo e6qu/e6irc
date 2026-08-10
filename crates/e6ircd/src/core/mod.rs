@@ -69,17 +69,22 @@ impl CoreShardCount {
         CoreShardId((conn.0 as usize) % self.0.get())
     }
 
-    pub(crate) fn session_owner(self, conn: ConnId) -> SessionOwner {
+    pub fn session_owner(self, conn: ConnId) -> SessionOwner {
         SessionOwner::new(conn, self.shard_for(conn))
     }
 
     pub(crate) fn shard_for_channel(self, key: &state::ChanKey) -> CoreShardId {
-        let hash = key
-            .as_str()
-            .bytes()
-            .fold(0xcbf29ce484222325u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-            });
+        self.shard_for_folded_channel(key.as_str())
+    }
+
+    fn shard_for_channel_name(self, name: &str) -> CoreShardId {
+        self.shard_for_folded_channel(&e6irc_proto::casemap::CaseMapping::Rfc1459.casefold(name))
+    }
+
+    fn shard_for_folded_channel(self, name: &str) -> CoreShardId {
+        let hash = name.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
         CoreShardId((hash as usize) % self.0.get())
     }
 }
@@ -87,6 +92,12 @@ impl CoreShardCount {
 /// Index of one configured core shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CoreShardId(usize);
+
+impl CoreShardId {
+    pub(crate) const fn new(index: usize) -> Self {
+        Self(index)
+    }
+}
 
 /// The connection and worker that own one live session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +112,10 @@ impl SessionOwner {
     }
 
     pub(crate) fn conn(self) -> ConnId {
+        self.conn
+    }
+
+    pub fn connection_id(self) -> ConnId {
         self.conn
     }
 
@@ -126,8 +141,7 @@ impl CoreIngress {
         }
     }
 
-    /// Build an ingress with a mandatory first shard.
-    #[cfg(test)]
+    /// Build ingress for a nonempty set of core shards.
     pub fn with_shards(first: Sender<Input>, mut rest: Vec<Sender<Input>>) -> Self {
         let capacity = rest
             .len()
@@ -181,10 +195,27 @@ impl CoreIngress {
             Input::ChannelMultilineResult { session, .. } => session.shard(),
             Input::ChannelTagmsg { tagmsg } => tagmsg.owner().shard(),
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
-            Input::Tick { .. }
-            | Input::Shutdown
-            | Input::ServerBanResult { .. }
-            | Input::Admin { .. } => CoreShardId(0),
+            Input::Tick { .. } | Input::Shutdown => {
+                panic!("broadcast core event must use its dedicated ingress method")
+            }
+            Input::ServerBanResult { requester, .. } => match requester {
+                ServerBanRequester::Oper { session, .. } => session.shard(),
+                ServerBanRequester::Admin { .. } => CoreShardId(0),
+            },
+            Input::ServerBanApplied { .. } => {
+                panic!("committed server-ban event must be broadcast by a core worker")
+            }
+            Input::AccountSuspensionApplied { .. } => {
+                panic!("account-suspension event must be broadcast by a core worker")
+            }
+            Input::ReadMarkerApplied { .. } => {
+                panic!("read-marker event must be broadcast by a core worker")
+            }
+            Input::AdminConnectionList { .. } => {
+                panic!("connection-list event must be broadcast by a core worker")
+            }
+            Input::AdminConnectionListResult { .. } => CoreShardId(0),
+            Input::Admin { req, .. } => req.shard(self.count),
             Input::ChannelDropResult { owner, .. } => owner.shard(),
             Input::ChannelDropReply { session, .. } => session.shard(),
             Input::ChannelControlResult { owner, .. }
@@ -195,6 +226,39 @@ impl CoreIngress {
 
     pub fn monitor(&self) -> QueueMonitor {
         self.shards[0].monitor()
+    }
+
+    pub(crate) fn monitors(&self) -> Vec<QueueMonitor> {
+        self.shards.iter().map(Sender::monitor).collect()
+    }
+
+    pub(crate) fn shard_count(&self) -> CoreShardCount {
+        self.count
+    }
+
+    pub(crate) async fn broadcast_tick(
+        &self,
+        now: e6irc_proto::time::MonoMillis,
+    ) -> Result<(), ()> {
+        self.broadcast(None, || Input::Tick { now }).await
+    }
+
+    pub(crate) async fn broadcast_shutdown(&self) -> Result<(), ()> {
+        self.broadcast(None, || Input::Shutdown).await
+    }
+
+    async fn broadcast(
+        &self,
+        excluded: Option<CoreShardId>,
+        mut input: impl FnMut() -> Input,
+    ) -> Result<(), ()> {
+        for (index, shard) in self.shards.iter().enumerate() {
+            if excluded.is_some_and(|excluded| index == excluded.0) {
+                continue;
+            }
+            shard.push(input()).await.map_err(|_| ())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn directories(&self) -> CoreDirectories {
@@ -591,6 +655,33 @@ pub enum Input {
         requester: ServerBanRequester,
         result: ServerBanResult,
     },
+    /// A database-confirmed server-ban transition applied on every core shard.
+    ServerBanApplied {
+        mutation: ServerBanMutation,
+    },
+    /// A durable account-suspension transition applied on every core shard.
+    AccountSuspensionApplied {
+        account: String,
+        suspended: bool,
+        reason: String,
+        actor: String,
+    },
+    /// A stored account read marker applied on every non-origin core shard.
+    ReadMarkerApplied {
+        account: String,
+        target: String,
+        display: String,
+        marker_ms: e6irc_proto::time::Millis,
+    },
+    /// One shard's bounded contribution to an administrator connection list.
+    AdminConnectionList {
+        request_id: u64,
+        query: LiveConnectionQuery,
+    },
+    AdminConnectionListResult {
+        request_id: u64,
+        entries: Vec<LiveConnectionInfo>,
+    },
     /// A founder-owned registered-channel mutation verdict. The database
     /// re-checks ownership before writing; only an applied verdict changes the
     /// core's hot founder/topic/mode/access mirrors.
@@ -697,6 +788,18 @@ impl AdminRequest {
             | Self::MutateOwnedChannel { channel, .. }
             | Self::RegisterOwnedChannel { channel, .. } => Some(channel),
             _ => None,
+        }
+    }
+
+    fn shard(&self, shards: CoreShardCount) -> CoreShardId {
+        match self {
+            Self::DisconnectConnection { connection_id, .. }
+            | Self::DisconnectOwnConnection { connection_id, .. } => {
+                shards.session_owner(ConnId(*connection_id)).shard()
+            }
+            _ => self.channel().map_or(CoreShardId(0), |channel| {
+                shards.shard_for_channel_name(channel)
+            }),
         }
     }
 }
@@ -902,8 +1005,14 @@ pub enum ChannelDropResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerBanRequester {
-    Oper { conn: ConnId, label: Option<String> },
-    Admin { request_id: u64, actor: String },
+    Oper {
+        session: SessionOwner,
+        label: Option<String>,
+    },
+    Admin {
+        request_id: u64,
+        actor: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1598,6 +1707,7 @@ pub struct Core {
     state: ServerState,
     shard: CoreShardId,
     next_sequence: u64,
+    reported_gauges: (usize, usize, usize),
 }
 
 pub(crate) enum CoreEffect {
@@ -1605,6 +1715,28 @@ pub(crate) enum CoreEffect {
     Input(Input),
     BroadcastChannelList {
         request: ChannelListRequest,
+    },
+    BroadcastServerBan {
+        source: CoreShardId,
+        mutation: ServerBanMutation,
+    },
+    BroadcastAccountSuspension {
+        source: CoreShardId,
+        account: String,
+        suspended: bool,
+        reason: String,
+        actor: String,
+    },
+    BroadcastReadMarker {
+        source: CoreShardId,
+        account: String,
+        target: String,
+        display: String,
+        marker_ms: e6irc_proto::time::Millis,
+    },
+    BroadcastAdminConnectionList {
+        request_id: u64,
+        query: LiveConnectionQuery,
     },
     Delivery {
         owner: SessionOwner,
@@ -1638,16 +1770,88 @@ impl CoreWorker {
             });
             for effect in self.core.take_effects() {
                 if let CoreEffect::BroadcastChannelList { request } = effect {
-                    for shard in self.ingress.shards.iter() {
-                        if shard
-                            .push(Input::ChannelList {
-                                request: request.clone(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            panic!("cross-shard target closed");
-                        }
+                    if self
+                        .ingress
+                        .broadcast(None, || Input::ChannelList {
+                            request: request.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        panic!("cross-shard target closed");
+                    }
+                    continue;
+                }
+                if let CoreEffect::BroadcastServerBan { source, mutation } = effect {
+                    if self
+                        .ingress
+                        .broadcast(Some(source), || Input::ServerBanApplied {
+                            mutation: mutation.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        panic!("cross-shard target closed");
+                    }
+                    continue;
+                }
+                if let CoreEffect::BroadcastAccountSuspension {
+                    source,
+                    account,
+                    suspended,
+                    reason,
+                    actor,
+                } = effect
+                {
+                    if self
+                        .ingress
+                        .broadcast(Some(source), || Input::AccountSuspensionApplied {
+                            account: account.clone(),
+                            suspended,
+                            reason: reason.clone(),
+                            actor: actor.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        panic!("cross-shard target closed");
+                    }
+                    continue;
+                }
+                if let CoreEffect::BroadcastReadMarker {
+                    source,
+                    account,
+                    target,
+                    display,
+                    marker_ms,
+                } = effect
+                {
+                    if self
+                        .ingress
+                        .broadcast(Some(source), || Input::ReadMarkerApplied {
+                            account: account.clone(),
+                            target: target.clone(),
+                            display: display.clone(),
+                            marker_ms,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        panic!("cross-shard target closed");
+                    }
+                    continue;
+                }
+                if let CoreEffect::BroadcastAdminConnectionList { request_id, query } = effect {
+                    if self
+                        .ingress
+                        .broadcast(None, || Input::AdminConnectionList {
+                            request_id,
+                            query: query.clone(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        panic!("cross-shard target closed");
                     }
                     continue;
                 }
@@ -1657,7 +1861,13 @@ impl CoreWorker {
                         conn: owner.conn(),
                         line,
                     },
-                    CoreEffect::BroadcastChannelList { .. } => unreachable!("handled above"),
+                    CoreEffect::BroadcastChannelList { .. }
+                    | CoreEffect::BroadcastServerBan { .. }
+                    | CoreEffect::BroadcastAccountSuspension { .. }
+                    | CoreEffect::BroadcastReadMarker { .. }
+                    | CoreEffect::BroadcastAdminConnectionList { .. } => {
+                        unreachable!("handled above")
+                    }
                 };
                 if self.ingress.push(input).await.is_err() {
                     panic!("cross-shard target closed");
@@ -1711,7 +1921,26 @@ impl Core {
             state: ServerState::new(shard, shards, config, db_tx, telemetry, directories),
             shard,
             next_sequence: 0,
+            reported_gauges: (0, 0, 0),
         }
+    }
+
+    pub(crate) fn on_shard(
+        config: CoreConfig,
+        db_tx: Sender<DbRequest>,
+        telemetry: Arc<Telemetry>,
+        shard: CoreShardId,
+        shards: CoreShardCount,
+        directories: CoreDirectories,
+    ) -> Self {
+        Self::with_telemetry_on_shard_with_directories(
+            config,
+            db_tx,
+            telemetry,
+            shard,
+            shards,
+            directories,
+        )
     }
 
     /// Process the next event delivered to this worker.
@@ -2145,8 +2374,53 @@ impl Core {
                 requester,
                 result,
             } => {
-                handler::oper::server_ban_result(&mut self.state, mutation, requester, result);
+                if let Some(mutation) =
+                    handler::oper::server_ban_result(&mut self.state, mutation, requester, result)
+                {
+                    handler::oper::apply_committed_server_ban(&mut self.state, mutation.clone());
+                    self.state.broadcast_server_ban_after_local_apply(mutation);
+                }
             }
+            Input::ServerBanApplied { mutation } => {
+                handler::oper::apply_committed_server_ban(&mut self.state, mutation);
+            }
+            Input::AccountSuspensionApplied {
+                account,
+                suspended,
+                reason,
+                actor,
+            } => {
+                handler::admin::apply_account_suspension(
+                    &mut self.state,
+                    &account,
+                    suspended,
+                    &reason,
+                    &actor,
+                );
+            }
+            Input::ReadMarkerApplied {
+                account,
+                target,
+                display,
+                marker_ms,
+            } => handler::apply_stored_marker(
+                &mut self.state,
+                &account,
+                &target,
+                &display,
+                marker_ms,
+            ),
+            Input::AdminConnectionList { request_id, query } => {
+                let entries = handler::admin::connection_list_entries(&self.state, &query);
+                self.state.route_input(Input::AdminConnectionListResult {
+                    request_id,
+                    entries,
+                });
+            }
+            Input::AdminConnectionListResult {
+                request_id,
+                entries,
+            } => handler::admin::connection_list_result(&mut self.state, request_id, entries),
             Input::ChannelControlResult {
                 owner,
                 request_id,
@@ -2197,11 +2471,11 @@ impl Core {
             .values()
             .filter(|session| session.is_registered())
             .count();
-        self.state.telemetry.update_core_gauges(
-            sessions_after,
-            registered,
-            self.state.channels.len(),
-        );
+        let gauges = (sessions_after, registered, self.state.channels.len());
+        self.state
+            .telemetry
+            .adjust_core_gauges(self.reported_gauges, gauges);
+        self.reported_gauges = gauges;
         self.state
             .telemetry
             .observe_latency(LatencyKind::Core, started.elapsed());

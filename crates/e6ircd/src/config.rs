@@ -15,6 +15,9 @@ fn default_sendq() -> usize {
 fn default_core_queue() -> usize {
     65536
 }
+fn default_core_workers() -> usize {
+    1
+}
 fn default_description() -> String {
     "e6irc server".into()
 }
@@ -120,6 +123,10 @@ pub struct Config {
     /// readers stop reading their sockets (backpressure).
     #[serde(default = "default_core_queue")]
     pub core_queue: usize,
+    /// Number of independent core shards. One preserves the single-worker
+    /// deployment; larger values enable hash-sharded runtime ownership.
+    #[serde(default = "default_core_workers")]
+    pub core_workers: usize,
     /// Cap on channels holding an in-memory history ring (LRU eviction
     /// beyond this; evicted channels serve CHATHISTORY from Postgres).
     #[serde(default = "default_max_hot_channels")]
@@ -229,6 +236,8 @@ pub struct ManagedConfig {
     pub nicklen: usize,
     pub sendq: usize,
     pub core_queue: usize,
+    #[serde(default = "default_core_workers")]
+    pub core_workers: usize,
     pub max_hot_channels: usize,
     pub listeners: Vec<ListenerConfig>,
     pub registration: RegistrationConfig,
@@ -297,6 +306,7 @@ impl ManagedConfig {
             nicklen: config.nicklen,
             sendq: config.sendq,
             core_queue: config.core_queue,
+            core_workers: config.core_workers,
             max_hot_channels: config.max_hot_channels,
             listeners: config.listeners.clone(),
             registration: config.registration.clone(),
@@ -329,6 +339,7 @@ impl ManagedConfig {
         config.nicklen = self.nicklen;
         config.sendq = self.sendq;
         config.core_queue = self.core_queue;
+        config.core_workers = self.core_workers;
         config.max_hot_channels = self.max_hot_channels;
         config.listeners.clone_from(&self.listeners);
         config.registration = self.registration.clone();
@@ -601,6 +612,7 @@ impl Default for Config {
             nicklen: default_nicklen(),
             sendq: default_sendq(),
             core_queue: default_core_queue(),
+            core_workers: default_core_workers(),
             max_hot_channels: default_max_hot_channels(),
             database: None,
             http: None,
@@ -884,7 +896,7 @@ impl Config {
                 "network_name must be at most 64 bytes".into(),
             ));
         }
-        if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 {
+        if self.nicklen == 0 || self.sendq == 0 || self.core_queue == 0 || self.core_workers == 0 {
             return Err(ConfigError::Invalid("limits must be nonzero".into()));
         }
         // The advertised NICKLEN rides every relayed line's source prefix, so an
@@ -1858,6 +1870,15 @@ mod tests {
             ..Config::default()
         };
         assert!(cfg.validate().is_err(), "websocket + tls must be rejected");
+    }
+
+    #[test]
+    fn zero_core_workers_is_rejected() {
+        let cfg = Config {
+            core_workers: 0,
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "zero workers must be rejected");
     }
 
     #[test]

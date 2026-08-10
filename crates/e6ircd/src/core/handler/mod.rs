@@ -30,7 +30,7 @@ use message::*;
 pub(crate) use monitor::*;
 use oper::*;
 use query::*;
-use read_marker::*;
+pub(crate) use read_marker::*;
 use registration::*;
 pub(crate) use sasl::*;
 use services::*;

@@ -401,7 +401,9 @@ pub(super) fn cmd_add_ban(
             None,
             &format!("{nick} added {label} for {} ({reason})", mask.as_str()),
         );
-        apply_server_ban_hot(state, mask, kind, &reason, &nick, label);
+        let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick);
+        apply_committed_server_ban(state, mutation.clone());
+        state.broadcast_server_ban_after_local_apply(mutation);
         return;
     }
     let mutation = crate::core::ServerBanMutation::add(&mask, kind, reason, nick);
@@ -453,7 +455,7 @@ fn begin_oper_server_ban(
     };
     let response_label = state.capture.as_ref().and_then(|cap| cap.label.clone());
     let requester = crate::core::ServerBanRequester::Oper {
-        conn,
+        session: state.session_owner(conn),
         label: response_label,
     };
     match queue_server_ban_mutation(state, mutation, requester) {
@@ -564,7 +566,7 @@ pub(crate) fn server_ban_result(
     mutation: crate::core::ServerBanMutation,
     requester: crate::core::ServerBanRequester,
     result: crate::core::ServerBanResult,
-) {
+) -> Option<crate::core::ServerBanMutation> {
     let (kind_token, folded_mask) = mutation.key();
     state
         .pending_server_bans
@@ -572,11 +574,11 @@ pub(crate) fn server_ban_result(
     let Some(kind) = BanKind::from_token(kind_token) else {
         eprintln!("core: database echoed invalid server-ban kind {kind_token:?}");
         finish_server_ban_unavailable(state, requester, "server-ban result was invalid");
-        return;
+        return None;
     };
     if result == crate::core::ServerBanResult::Unavailable {
         finish_server_ban_unavailable(state, requester, "services are temporarily unavailable");
-        return;
+        return None;
     }
     if result == crate::core::ServerBanResult::Missing {
         if let crate::core::ServerBanRequester::Admin { request_id, .. } = requester {
@@ -589,86 +591,76 @@ pub(crate) fn server_ban_result(
                 },
             );
         }
-        return;
+        return None;
     }
 
+    let (mask_display, action) = match &mutation {
+        crate::core::ServerBanMutation::Add { mask_display, .. } => (mask_display, "Added"),
+        crate::core::ServerBanMutation::Remove { mask_display, .. } => (mask_display, "Removed"),
+    };
+    let mask = crate::core::state::MaskKey::new(mask_display, state.casemap);
+    finish_server_ban_success(state, requester, action, kind.label(), &mask);
+    Some(mutation)
+}
+
+fn finish_server_ban_success(
+    state: &mut ServerState,
+    requester: crate::core::ServerBanRequester,
+    action: &str,
+    kind_label: &str,
+    mask: &crate::core::state::MaskKey,
+) {
+    match requester {
+        crate::core::ServerBanRequester::Oper { session, label } => {
+            acknowledge_server_ban_oper(state, session.conn(), label, action, kind_label, mask);
+        }
+        crate::core::ServerBanRequester::Admin { request_id, .. } => {
+            finish_admin_server_ban(
+                state,
+                request_id,
+                crate::core::AdminReply::Ok(format!("{action} {kind_label} for {}", mask.as_str())),
+            );
+        }
+    }
+}
+
+/// Apply a committed server-ban transition on one shard.
+pub(crate) fn apply_committed_server_ban(
+    state: &mut ServerState,
+    mutation: crate::core::ServerBanMutation,
+) {
     match mutation {
         crate::core::ServerBanMutation::Add {
             mask_display,
             reason,
             set_by,
+            kind,
             ..
         } => {
+            let Some(kind) = BanKind::from_token(&kind) else {
+                panic!("validated server-ban mutation has invalid kind");
+            };
             let mask = crate::core::state::MaskKey::new(&mask_display, state.casemap);
             let label = kind.label();
-            match requester {
-                crate::core::ServerBanRequester::Oper {
-                    conn,
-                    label: response_label,
-                } => {
-                    acknowledge_server_ban_oper(state, conn, response_label, "Added", label, &mask);
-                    notify_opers(
-                        state,
-                        None,
-                        &format!("{set_by} added {label} for {} ({reason})", mask.as_str()),
-                    );
-                    apply_server_ban_hot(state, mask, kind, &reason, &set_by, label);
-                }
-                crate::core::ServerBanRequester::Admin { request_id, actor } => {
-                    let disconnected =
-                        apply_server_ban_hot(state, mask.clone(), kind, &reason, &actor, label);
-                    notify_opers(
-                        state,
-                        None,
-                        &format!(
-                            "{actor} (console) added {label} for {} ({reason})",
-                            mask.as_str()
-                        ),
-                    );
-                    finish_admin_server_ban(
-                        state,
-                        request_id,
-                        crate::core::AdminReply::Ok(format!(
-                            "Added {label} for {} — {disconnected} session(s) disconnected",
-                            mask.as_str()
-                        )),
-                    );
-                }
-            }
+            apply_server_ban_hot(state, mask.clone(), kind, &reason, &set_by, label);
+            notify_opers(
+                state,
+                None,
+                &format!("{set_by} added {label} for {} ({reason})", mask.as_str()),
+            );
         }
         crate::core::ServerBanMutation::Remove {
             mask_display,
             actor,
+            kind,
             ..
         } => {
+            let Some(kind) = BanKind::from_token(&kind) else {
+                panic!("validated server-ban mutation has invalid kind");
+            };
             let mask = crate::core::state::MaskKey::new(&mask_display, state.casemap);
-            remove_server_ban_hot(state, &mask, kind);
             let label = kind.label();
-            match requester {
-                crate::core::ServerBanRequester::Oper {
-                    conn,
-                    label: response_label,
-                } => {
-                    acknowledge_server_ban_oper(
-                        state,
-                        conn,
-                        response_label,
-                        "Removed",
-                        label,
-                        &mask,
-                    );
-                }
-                crate::core::ServerBanRequester::Admin { request_id, .. } => {
-                    finish_admin_server_ban(
-                        state,
-                        request_id,
-                        crate::core::AdminReply::Ok(format!(
-                            "Removed {label} for {}",
-                            mask.as_str()
-                        )),
-                    );
-                }
-            }
+            remove_server_ban_hot(state, &mask, kind);
             notify_opers(
                 state,
                 None,
@@ -684,7 +676,8 @@ fn finish_server_ban_unavailable(
     reason: &str,
 ) {
     match requester {
-        crate::core::ServerBanRequester::Oper { conn, label } => {
+        crate::core::ServerBanRequester::Oper { session, label } => {
+            let conn = session.conn();
             if state.sessions.contains_key(&conn) {
                 let server = state.config.server_name.clone();
                 let nick = state.sessions[&conn].nick().unwrap_or("*").to_string();
@@ -767,7 +760,9 @@ pub(super) fn cmd_remove_ban(state: &mut ServerState, conn: ConnId, kind: BanKin
         return;
     }
     if !state.config.sasl_enabled {
-        remove_server_ban_hot(state, &mask, kind);
+        let mutation = crate::core::ServerBanMutation::remove(&mask, kind, nick.clone());
+        apply_committed_server_ban(state, mutation.clone());
+        state.broadcast_server_ban_after_local_apply(mutation);
         state.send(
             conn,
             &format!(

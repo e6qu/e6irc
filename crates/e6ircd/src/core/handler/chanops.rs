@@ -411,7 +411,7 @@ pub(super) fn cmd_list(state: &mut ServerState, conn: ConnId, p: &[&str]) {
         });
     let label = state.defer_channel_reply(conn);
     let request = state.start_channel_list(conn, label, targets);
-    if state.has_single_channel_shard() {
+    if state.has_single_core_shard() {
         channel_list(state, request);
     } else {
         state.route_channel_list(request);
@@ -448,7 +448,7 @@ pub(crate) fn channel_list(
         session: request.session(),
         rows,
     };
-    if state.has_single_channel_shard() {
+    if state.has_single_core_shard() {
         channel_list_result(state, result);
     } else {
         state.route_channel_list_result(result);

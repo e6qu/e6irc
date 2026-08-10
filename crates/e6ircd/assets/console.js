@@ -744,6 +744,7 @@
         nicklen: positiveInteger(fields, "nicklen", "Nickname length"),
         sendq: positiveInteger(fields, "sendq", "Send queue"),
         core_queue: positiveInteger(fields, "core_queue", "Core queue"),
+        core_workers: positiveInteger(fields, "core_workers", "Core workers"),
         max_hot_channels: positiveInteger(fields, "max_hot_channels", "Hot channels"),
         listeners: parseListeners(String(fields.get("listeners") || "")),
         registration: {
@@ -1099,7 +1100,7 @@
     configurationValue(form, "public_url", settings.public_url);
     configurationChecked(form, "secure_cookies", settings.secure_cookies);
     configurationValue(form, "admin_accounts", apiCollection(settings, "admin_accounts", "configuration").join("\n"));
-    for (const name of ["nicklen", "sendq", "core_queue", "max_hot_channels"]) configurationValue(form, name, settings[name]);
+    for (const name of ["nicklen", "sendq", "core_queue", "core_workers", "max_hot_channels"]) configurationValue(form, name, settings[name]);
     for (const name of ["max_connections_per_ip", "command_burst", "auth_rate_burst", "api_rate_burst", "administrator_api_rate_burst", "registration_burst"]) configurationValue(form, name, settings.limits[name]);
     configurationValue(form, "trusted_proxies", apiCollection(settings.limits, "trusted_proxies", "configuration").join("\n"));
     configurationChecked(form, "observability_enabled", settings.observability.enabled);

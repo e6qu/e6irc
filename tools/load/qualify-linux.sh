@@ -5,25 +5,26 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/qualify-arguments.sh"
 
 usage() {
-  echo "usage: $0 ADDR SERVER_PID CLIENTS CHANNELS BURST OUTPUT_DIR MIN_CONNECT_RATE MIN_FANOUT_RATE MAX_P99_MS MAX_RSS_BYTES_PER_CONNECTION" >&2
+  echo "usage: $0 ADDR SERVER_PID CORE_WORKERS CLIENTS CHANNELS BURST OUTPUT_DIR MIN_CONNECT_RATE MIN_FANOUT_RATE MAX_P99_MS MAX_RSS_BYTES_PER_CONNECTION" >&2
   exit 2
 }
 
 [[ "$(uname -s)" == Linux ]] || { echo "Linux is required" >&2; exit 2; }
-[[ $# -eq 10 ]] || usage
+[[ $# -eq 11 ]] || usage
 
 addr="$1"
 server_pid="$2"
-clients="$3"
-channels="$4"
-burst="$5"
-output_dir="$6"
-minimum_connect_rate="$7"
-minimum_fanout_rate="$8"
-maximum_p99_ms="$9"
-maximum_rss_per_connection="${10}"
+core_workers="$3"
+clients="$4"
+channels="$5"
+burst="$6"
+output_dir="$7"
+minimum_connect_rate="$8"
+minimum_fanout_rate="$9"
+maximum_p99_ms="${10}"
+maximum_rss_per_connection="${11}"
 
-for value in "$server_pid" "$maximum_rss_per_connection"; do
+for value in "$server_pid" "$core_workers" "$maximum_rss_per_connection"; do
   positive_integer "$value" || { echo "positive integer required: $value" >&2; exit 2; }
 done
 for value in "$minimum_connect_rate" "$minimum_fanout_rate" "$maximum_p99_ms"; do
@@ -83,7 +84,7 @@ host="$output_dir/host.txt"
   sha256sum "$server_executable"
   printf 'load_nofile=%s\nserver_nofile=%s\nrequired_fds=%s\n' "$load_nofile" "$server_nofile" "$required_fds"
   printf 'ephemeral_port_range=%s %s\nephemeral_port_capacity=%s\nsomaxconn=%s\n' "$port_low" "$port_high" "$port_capacity" "$somaxconn"
-  printf 'addr=%s\nclients=%s\nchannels=%s\nburst=%s\n' "$addr" "$clients" "$channels" "$burst"
+  printf 'addr=%s\ncore_workers=%s\nclients=%s\nchannels=%s\nburst=%s\n' "$addr" "$core_workers" "$clients" "$channels" "$burst"
   printf 'minimum_connect_rate=%s\nminimum_fanout_rate=%s\nmaximum_p99_ms=%s\nmaximum_rss_per_connection=%s\n' \
     "$minimum_connect_rate" "$minimum_fanout_rate" "$maximum_p99_ms" "$maximum_rss_per_connection"
 } > "$host"

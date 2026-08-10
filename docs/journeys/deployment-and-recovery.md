@@ -364,10 +364,9 @@ violation. Linux CI also rejects incremental server RSS above 1 MiB per
 requested connection, and the queue contract proves an empty SendQ does not
 preallocate its maximum envelope count. The shared-runner thresholds catch
 catastrophic regressions without claiming production-host performance. The
-runtime has one core worker (the N=1 form of the target topology). Deterministic
-two-worker simulations cover typed ownership and routing, but runtime N>1
-startup, production performance targets, and a tuned-host 100k run are not
-implemented or qualified.
+runtime supports a configured nonzero core-worker count (default one). Runtime
+N=2/N=3 tests cover typed ownership, routing, delivery, and shutdown.
+Production performance targets and a tuned-host 100k run are not qualified.
 
 **Security and observability.** The harness uses synthetic bounded payloads and
 reports aggregate rates/latency rather than credentials or user content. Exact
