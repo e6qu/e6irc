@@ -110,17 +110,13 @@ async fn discord(_target: &str) -> ProbeReport {
     let Some(base) = safe_url(&base) else {
         return rejected();
     };
-    let Some(channels) = endpoint(&base, "channels/") else {
-        return rejected();
-    };
     let Some(gateway) = endpoint(&base, "gateway") else {
         return rejected();
     };
     let Ok(http) = client() else { return failed() };
     let authorization = format!("Bot {token}");
-    let channel_url = match channels.join(&format!("{channel}/")) {
-        Ok(url) => url,
-        Err(_) => return rejected(),
+    let Some(channel_url) = endpoint(&base, &format!("channels/{channel}")) else {
+        return rejected();
     };
     let auth = match http
         .get(channel_url.clone())
@@ -168,8 +164,12 @@ async fn discord(_target: &str) -> ProbeReport {
         );
     }
     let message = marker("discord");
+    let message_collection = match endpoint(&base, &format!("channels/{channel}/messages")) {
+        Some(url) => url,
+        None => return rejected(),
+    };
     let posted = match http
-        .post(channel_url.join("messages").unwrap_or(channel_url.clone()))
+        .post(message_collection)
         .header("Authorization", &authorization)
         .json(&serde_json::json!({"content": message}))
         .send()
@@ -192,9 +192,8 @@ async fn discord(_target: &str) -> ProbeReport {
     let Some(id) = posted.and_then(|json| json.get("id")?.as_str().map(str::to_owned)) else {
         return failed();
     };
-    let message_url = match channel_url.join(&format!("messages/{id}")) {
-        Ok(url) => url,
-        Err(_) => return failed(),
+    let Some(message_url) = endpoint(&base, &format!("channels/{channel}/messages/{id}")) else {
+        return failed();
     };
     let persistence = match http
         .get(message_url.clone())
@@ -598,6 +597,130 @@ async fn oidc_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+
+    static ENVIRONMENT: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[derive(Clone)]
+    struct DiscordOracle {
+        websocket: String,
+        deletes: Arc<AtomicUsize>,
+    }
+
+    async fn start_discord_oracle() -> DiscordOracle {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oracle");
+        let websocket = format!("ws://{}/socket", listener.local_addr().expect("address"));
+        let state = DiscordOracle {
+            websocket,
+            deletes: Arc::new(AtomicUsize::new(0)),
+        };
+        let router = Router::new()
+            .route("/channels/{id}", get(discord_channel))
+            .route("/channels/{id}/messages", post(discord_post))
+            .route(
+                "/channels/{id}/messages/{message}",
+                get(discord_message).delete(discord_delete),
+            )
+            .route("/gateway", get(discord_gateway))
+            .route("/socket", get(discord_socket))
+            .route("/socket/", get(discord_socket))
+            .with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.expect("serve oracle") });
+        state
+    }
+
+    fn discord_authorized(headers: &HeaderMap) -> bool {
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bot token")
+    }
+
+    async fn discord_channel(
+        State(_): State<DiscordOracle>,
+        Path(id): Path<String>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        if id == "42" && discord_authorized(&headers) {
+            (StatusCode::OK, Json(serde_json::json!({"name":"general"})))
+        } else {
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        }
+    }
+
+    async fn discord_gateway(State(state): State<DiscordOracle>) -> Json<serde_json::Value> {
+        Json(serde_json::json!({"url":state.websocket}))
+    }
+
+    async fn discord_post(
+        Path(id): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        if id == "42" && discord_authorized(&headers) && body.get("content").is_some() {
+            (StatusCode::OK, Json(serde_json::json!({"id":"m1"})))
+        } else {
+            (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+        }
+    }
+
+    async fn discord_message(
+        Path((_id, message)): Path<(String, String)>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        if message == "m1" && discord_authorized(&headers) {
+            (StatusCode::OK, Json(serde_json::json!({"id":"m1"})))
+        } else {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({})))
+        }
+    }
+
+    async fn discord_delete(
+        State(state): State<DiscordOracle>,
+        Path((_id, message)): Path<(String, String)>,
+        headers: HeaderMap,
+    ) -> StatusCode {
+        if message == "m1" && discord_authorized(&headers) {
+            state.deletes.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::NOT_FOUND
+        }
+    }
+
+    async fn discord_socket(websocket: WebSocketUpgrade) -> impl IntoResponse {
+        websocket.on_upgrade(|socket| async move { discord_session(socket).await })
+    }
+
+    async fn discord_session(mut socket: WebSocket) {
+        socket
+            .send(AxumMessage::Text("{\"op\":10,\"d\":{}}".into()))
+            .await
+            .expect("hello");
+        let Some(Ok(AxumMessage::Text(identify))) = socket.next().await else {
+            return;
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&identify)
+                .ok()
+                .and_then(|json| json.get("op").and_then(serde_json::Value::as_i64)),
+            Some(2)
+        );
+        socket
+            .send(AxumMessage::Text("{\"t\":\"READY\"}".into()))
+            .await
+            .expect("ready");
+    }
 
     #[test]
     fn endpoint_urls_cannot_carry_credentials_or_tokens() {
@@ -605,5 +728,53 @@ mod tests {
         assert!(safe_url("https://user:secret@issuer.example/api").is_none());
         assert!(safe_url("https://issuer.example/api?token=secret").is_none());
         assert!(safe_url("https://issuer.example/api#secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn discord_oracle_proves_all_required_phases_and_cleanup() {
+        let _environment = ENVIRONMENT
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("environment lock");
+        let oracle = start_discord_oracle().await;
+        unsafe {
+            std::env::set_var("E6IRC_DISCORD_BOT_TOKEN", "token");
+            std::env::set_var("E6IRC_DISCORD_CHANNEL_ID", "42");
+            std::env::set_var(
+                "E6IRC_DISCORD_API_BASE",
+                format!(
+                    "http://{}/",
+                    oracle
+                        .websocket
+                        .trim_start_matches("ws://")
+                        .trim_end_matches("/socket")
+                ),
+            );
+        }
+        assert_eq!(setting("E6IRC_DISCORD_BOT_TOKEN").as_deref(), Some("token"));
+        assert_eq!(setting("E6IRC_DISCORD_CHANNEL_ID").as_deref(), Some("42"));
+        assert!(safe_url(&setting("E6IRC_DISCORD_API_BASE").expect("base")).is_some());
+        let base = safe_url(&setting("E6IRC_DISCORD_API_BASE").expect("base")).expect("safe base");
+        let status = client()
+            .expect("client")
+            .get(endpoint(&base, "channels/42").expect("channel endpoint"))
+            .header("Authorization", "Bot token")
+            .send()
+            .await
+            .expect("oracle request")
+            .status();
+        assert_eq!(status, StatusCode::OK);
+        let result = discord("oracle").await;
+        unsafe {
+            std::env::remove_var("E6IRC_DISCORD_BOT_TOKEN");
+            std::env::remove_var("E6IRC_DISCORD_CHANNEL_ID");
+            std::env::remove_var("E6IRC_DISCORD_API_BASE");
+        }
+        assert_eq!(
+            result.closed_outcome(TargetKind::Discord),
+            super::super::ClosedOutcome::Passed,
+            "{result:?}"
+        );
+        assert_eq!(oracle.deletes.load(Ordering::SeqCst), 1);
     }
 }

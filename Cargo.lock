@@ -217,6 +217,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -235,6 +236,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -880,6 +882,7 @@ version = "0.1.0"
 name = "e6irc-qualification"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "futures-util",
  "reqwest",
  "serde",
