@@ -1409,8 +1409,9 @@ Matrix rooms likewise. v1 ships the **SPI + a loopback reference driver** (used 
 the **`matrix` driver** (Matrix client-server API, behind the `matrix`
 feature, integration-tested against a pinned Conduit homeserver in
 `vendor/tests/external-oracles/`), plus Discord and Slack drivers with local
-HTTP/WebSocket contract oracles. Commercial-provider qualification requires a
-credential-gated evidence record.
+HTTP/WebSocket contract oracles. Shipped credential-gated campaigns perform
+provider authentication, two sessions, delivery, read-back, and cleanup; a
+commercial-provider claim still requires retained passed evidence.
 
 Design constraints recorded now:
 

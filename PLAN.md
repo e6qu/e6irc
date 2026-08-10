@@ -22,9 +22,9 @@ and integration claims.
 
 ## Remaining qualification
 
-- Run credential-gated external campaigns and retain their evidence for
-  Discord, Slack, additional identity providers, public IRC networks, and a
-  tuned host. Local contracts are not external qualification.
+- Run the shipped credential-gated campaigns and retain passed evidence for
+  Discord, Slack, each required OIDC issuer, public IRC networks, and a tuned
+  host. Local oracle results do not qualify external services.
 
 ## Rules
 
