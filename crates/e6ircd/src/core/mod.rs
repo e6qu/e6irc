@@ -2488,35 +2488,6 @@ mod ingress_tests {
         }
     }
 
-    #[tokio::test]
-    async fn chanserv_drop_result_returns_to_the_session_owner() {
-        let TwoWorkerHarness {
-            mut second_rx,
-            ingress,
-            ..
-        } = two_worker_harness();
-        let session = SessionOwner::new(ConnId(1), CoreShardId(1));
-        ingress
-            .push(Input::ChannelDropResult {
-                channel: "#chat".into(),
-                requester: ChannelDropRequester::ChanServ {
-                    session,
-                    display: "#chat".into(),
-                    label: None,
-                },
-                result: ChannelDropResult::Dropped,
-            })
-            .await
-            .expect("route drop result");
-        assert!(matches!(
-            second_rx.pop().await.expect("session-owner event").payload,
-            Input::ChannelDropResult {
-                requester: ChannelDropRequester::ChanServ { session: owner, .. },
-                ..
-            } if owner == session
-        ));
-    }
-
     #[test]
     fn registered_channel_ownership_is_shared_by_core_shards() {
         let TwoWorkerHarness {
@@ -2611,12 +2582,12 @@ mod ingress_tests {
     async fn connection_events_keep_one_deterministic_owner() {
         let (first, mut first_rx) = queue(Config {
             name: "first-core-shard",
-            capacity: 2,
+            capacity: 3,
             policy: Policy::Fifo,
         });
         let (second, mut second_rx) = queue(Config {
             name: "second-core-shard",
-            capacity: 2,
+            capacity: 3,
             policy: Policy::Fifo,
         });
         let ingress = CoreIngress::with_shards(first, vec![second]);
@@ -2639,6 +2610,18 @@ mod ingress_tests {
             })
             .await
             .expect("second shard delivery routed");
+        ingress
+            .push(Input::ChannelDropResult {
+                channel: "#chat".into(),
+                requester: ChannelDropRequester::ChanServ {
+                    session: SessionOwner::new(ConnId(5), CoreShardId(1)),
+                    display: "#chat".into(),
+                    label: None,
+                },
+                result: ChannelDropResult::Dropped,
+            })
+            .await
+            .expect("second shard drop result routed");
 
         let first = first_rx.pop().await.expect("first routed event");
         let second = second_rx.pop().await.expect("second routed event");
@@ -2660,6 +2643,14 @@ mod ingress_tests {
                 conn: ConnId(5),
                 ..
             }
+        ));
+        let second = second_rx.pop().await.expect("second routed drop result");
+        assert!(matches!(
+            second.payload,
+            Input::ChannelDropResult {
+                requester: ChannelDropRequester::ChanServ { session, .. },
+                ..
+            } if session == SessionOwner::new(ConnId(5), CoreShardId(1))
         ));
     }
 
