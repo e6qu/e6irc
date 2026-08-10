@@ -1963,18 +1963,43 @@ async fn handle_request(
         // A duplicate inline path would silently lose that off-loop decoupling.
         DbRequest::CreateAccount { .. } => unreachable!("offloaded by run_worker"),
         DbRequest::RegisterChannel {
-            conn,
+            owner,
+            session,
             channel,
             founder_account,
             topic,
             label,
         } => {
-            let reply =
-                handle_register_channel(pool, &channel, &founder_account, topic, label).await;
-            if matches!(&reply, DbReply::ChannelRegisterUnavailable { .. }) {
+            let result = match persist_channel_registration(
+                pool,
+                &channel,
+                &founder_account,
+                &topic,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    record_database_error(telemetry);
+                    eprintln!("db: channel registration failed: {error}");
+                    crate::core::ChannelRegistrationResult::Unavailable
+                }
+            };
+            if matches!(result, crate::core::ChannelRegistrationResult::Unavailable) {
                 record_database_error(telemetry);
             }
-            core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
+            core_tx
+                .push(Input::ChannelRegistrationPersisted {
+                    owner,
+                    session,
+                    channel,
+                    founder_account,
+                    topic,
+                    label,
+                    result,
+                })
+                .await
+                .is_ok()
         }
         DbRequest::RegisterOwnedChannel {
             owner,
@@ -3916,47 +3941,6 @@ async fn drop_channel_audited(
     }
     transaction.commit().await.map_err(DbError::Query)?;
     Ok(deleted)
-}
-
-async fn handle_register_channel(
-    pool: &PgPool,
-    channel: &str,
-    founder: &str,
-    topic: Option<(String, String, u64)>,
-    label: Option<String>,
-) -> DbReply {
-    use crate::core::ChannelRegistrationResult;
-
-    match persist_channel_registration(pool, channel, founder, &topic).await {
-        Ok(ChannelRegistrationResult::Registered) => DbReply::ChannelRegistered {
-            channel: channel.to_string(),
-            founder_account: founder.to_string(),
-            topic,
-            label,
-        },
-        Ok(ChannelRegistrationResult::Exists) => DbReply::ChannelExists {
-            channel: channel.to_string(),
-            label,
-        },
-        Ok(ChannelRegistrationResult::AccountMissing) => {
-            eprintln!("db: founder account {founder} missing during channel registration");
-            DbReply::ChannelRegisterUnavailable {
-                channel: channel.to_string(),
-                label,
-            }
-        }
-        Ok(ChannelRegistrationResult::Unavailable) => DbReply::ChannelRegisterUnavailable {
-            channel: channel.to_string(),
-            label,
-        },
-        Err(error) => {
-            eprintln!("db: channel registration failed: {error}");
-            DbReply::ChannelRegisterUnavailable {
-                channel: channel.to_string(),
-                label,
-            }
-        }
-    }
 }
 
 /// Insert one registered channel with its initial retained topic and audit

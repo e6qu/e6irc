@@ -2893,16 +2893,16 @@ fn chanserv_register_flow() {
     s.drain(alice);
     s.line(alice, "PRIVMSG ChanServ :REGISTER #mine");
     let req = s.db_requests();
-    assert_eq!(
-        req,
-        vec![e6ircd::core::DbRequest::RegisterChannel {
-            conn: alice,
-            channel: "#mine".into(),
-            founder_account: "alice".into(),
+    assert!(matches!(
+        req.as_slice(),
+        [e6ircd::core::DbRequest::RegisterChannel {
+            channel,
+            founder_account,
             topic: None,
             label: None,
-        }]
-    );
+            ..
+        }] if channel == "#mine" && founder_account == "alice"
+    ));
     s.core.handle(Input::DbReply {
         conn: alice,
         reply: e6ircd::core::DbReply::ChannelRegistered {

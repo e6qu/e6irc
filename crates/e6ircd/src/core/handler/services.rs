@@ -246,6 +246,153 @@ pub(super) fn nickserv(state: &mut ServerState, conn: ConnId, command: &str, arg
     }
 }
 
+pub(crate) fn chanserv_register_on_owner(
+    state: &mut ServerState,
+    command: crate::core::state::ChannelCommand,
+) -> Option<crate::core::state::ChanServRegisterResult> {
+    let label = command.label();
+    let (owner, actor, target, operation) = command.into_parts();
+    assert!(matches!(
+        operation,
+        crate::core::state::ChannelCommandOperation::ChanServRegister
+    ));
+    let key = state.chan_key(&target);
+    assert_eq!(
+        owner.key(),
+        &key,
+        "ChanServ REGISTER owner does not match target"
+    );
+    let Some(account) = actor.account.clone() else {
+        unreachable!("identified ChanServ actor has no account");
+    };
+    let is_op = state
+        .channels
+        .get(&key)
+        .and_then(|channel| channel.member(actor.recipient.conn()))
+        .is_some_and(|member| member.op);
+    if !is_op {
+        return Some(
+            crate::core::state::ChanServRegisterResult::NotChannelOperator { channel: target },
+        );
+    }
+    if state.channel_registration_pending(&key) {
+        return Some(
+            crate::core::state::ChanServRegisterResult::RegistrationPending { channel: target },
+        );
+    }
+    if !state.is_founder(&key, &account)
+        && state.channels_founded_by(&account)
+            >= crate::core::handler::channel::MAX_CHANNELS_PER_ACCOUNT
+    {
+        return Some(crate::core::state::ChanServRegisterResult::RegistrationLimit);
+    }
+    let channel = &state.channels[&key];
+    let display = channel.name.clone();
+    let topic = channel
+        .topic
+        .as_ref()
+        .map(|topic| (topic.text.clone(), topic.set_by.clone(), topic.set_at_secs));
+    if state
+        .db_tx
+        .try_push(crate::core::DbRequest::RegisterChannel {
+            owner,
+            session: actor.session_owner(),
+            channel: display,
+            founder_account: account.clone(),
+            topic,
+            label,
+        })
+        .is_err()
+    {
+        return Some(crate::core::state::ChanServRegisterResult::Unavailable);
+    }
+    state
+        .pending_channel_registrations
+        .insert(key, state.account_key(&account));
+    None
+}
+
+pub(crate) fn channel_registration_persisted(
+    state: &mut ServerState,
+    session: crate::core::SessionOwner,
+    channel: String,
+    founder_account: String,
+    topic: Option<(String, String, u64)>,
+    label: Option<String>,
+    result: crate::core::ChannelRegistrationResult,
+) {
+    let key = state.chan_key(&channel);
+    state.pending_channel_registrations.remove(&key);
+    let result = match result {
+        crate::core::ChannelRegistrationResult::Registered => {
+            state.set_founder(&channel, &founder_account);
+            if let Some((text, set_by, set_at_secs)) = topic {
+                state.registered_topics.set(
+                    key,
+                    crate::core::state::Topic {
+                        text,
+                        set_by,
+                        set_at_secs,
+                    },
+                );
+            }
+            crate::core::state::ChanServRegisterResult::Registered { channel }
+        }
+        crate::core::ChannelRegistrationResult::Exists => {
+            crate::core::state::ChanServRegisterResult::Exists
+        }
+        crate::core::ChannelRegistrationResult::AccountMissing
+        | crate::core::ChannelRegistrationResult::Unavailable => {
+            crate::core::state::ChanServRegisterResult::Unavailable
+        }
+    };
+    state.route_channel_command_result(
+        session,
+        crate::core::state::ChannelCommandResult::ChanServRegister(result),
+        label,
+    );
+}
+
+pub(crate) fn emit_chanserv_register_result(
+    state: &mut ServerState,
+    conn: ConnId,
+    result: crate::core::state::ChanServRegisterResult,
+    label: Option<String>,
+) {
+    state.emit_deferred_labeled(conn, label, |state| match result {
+        crate::core::state::ChanServRegisterResult::NotChannelOperator { channel } => state
+            .service_notice(
+                conn,
+                "ChanServ",
+                &format!("You must be a channel operator in \x02{channel}\x02 to register it."),
+            ),
+        crate::core::state::ChanServRegisterResult::RegistrationPending { channel } => state
+            .service_notice(
+                conn,
+                "ChanServ",
+                &format!("Registration of \x02{channel}\x02 is already in progress."),
+            ),
+        crate::core::state::ChanServRegisterResult::RegistrationLimit => state.service_notice(
+            conn,
+            "ChanServ",
+            "You have registered too many channels; drop one before registering another.",
+        ),
+        crate::core::state::ChanServRegisterResult::Registered { channel } => state.service_notice(
+            conn,
+            "ChanServ",
+            &format!("\x02{channel}\x02 is now registered to your account."),
+        ),
+        crate::core::state::ChanServRegisterResult::Exists => {
+            state.service_notice(conn, "ChanServ", "That channel is already registered.")
+        }
+        crate::core::state::ChanServRegisterResult::Unavailable => state.service_notice(
+            conn,
+            "ChanServ",
+            "Services are temporarily unavailable. Try again later.",
+        ),
+    });
+}
+
 pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, args: &[&str]) {
     match command {
         "REGISTER" => {
@@ -253,7 +400,7 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
                 state.service_notice(conn, "ChanServ", "Syntax: REGISTER <#channel>");
                 return;
             };
-            let Some(account) = require_identified(
+            let Some(_account) = require_identified(
                 state,
                 conn,
                 "ChanServ",
@@ -261,68 +408,21 @@ pub(super) fn chanserv(state: &mut ServerState, conn: ConnId, command: &str, arg
             ) else {
                 return;
             };
-            let key = state.chan_key(channel);
-            let is_op = state
-                .channels
-                .get(&key)
-                .and_then(|c| c.member(conn))
-                .is_some_and(|m| m.op);
-            if !is_op {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "You must be a channel operator in that channel to register it.",
-                );
-                return;
+            let command = crate::core::state::ChannelCommand::new(
+                state.channel_owner(channel),
+                state.channel_actor(conn),
+                channel.to_string(),
+                crate::core::state::ChannelCommandOperation::ChanServRegister,
+                state
+                    .capture
+                    .as_ref()
+                    .and_then(|capture| capture.label.clone()),
+            );
+            if state.owns_channel(command.owner()) {
+                crate::core::handler::channel_command(state, command);
+            } else {
+                state.route_channel_command(command);
             }
-            if state.channel_registration_pending(&key) {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "Registration of that channel is already in progress.",
-                );
-                return;
-            }
-            // Cap the channels one account may register: each adds a permanent,
-            // restart-surviving founder-map entry and runs no argon2, so the
-            // credential budget can't throttle a REGISTER loop. Re-registering a
-            // channel the account already founds is a harmless no-op (the DB
-            // ON CONFLICT and the ChannelExists reply handle it), so only a
-            // genuinely new registration is gated.
-            if !state.is_founder(&key, &account)
-                && state.channels_founded_by(&account)
-                    >= crate::core::handler::channel::MAX_CHANNELS_PER_ACCOUNT
-            {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "You have registered too many channels; drop one before registering another.",
-                );
-                return;
-            }
-            let display = state.channels[&key].name.clone();
-            let topic = state.channels[&key]
-                .topic
-                .as_ref()
-                .map(|t| (t.text.clone(), t.set_by.clone(), t.set_at_secs));
-            let label = state.capture.as_ref().and_then(|cap| cap.label.clone());
-            let request = crate::core::DbRequest::RegisterChannel {
-                conn,
-                channel: display,
-                founder_account: account.clone(),
-                topic,
-                label,
-            };
-            if state.db_tx.try_push(request).is_err() {
-                state.service_notice(
-                    conn,
-                    "ChanServ",
-                    "Services are temporarily unavailable. Try again later.",
-                );
-                return;
-            }
-            let founder_key = state.account_key(&account);
-            state.pending_channel_registrations.insert(key, founder_key);
             state.defer_captured_reply(conn);
         }
         "DROP" => {

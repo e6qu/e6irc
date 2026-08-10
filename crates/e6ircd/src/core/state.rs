@@ -1136,6 +1136,7 @@ pub type ChannelCommand = ChannelRequest<ChannelCommandOperation>;
 pub enum ChannelCommandOperation {
     Knock,
     Invite(ChannelInvitee),
+    ChanServRegister,
     ChanServOp { target_nick: String },
     Names,
     Who(ChannelWhoQuery),
@@ -1298,6 +1299,7 @@ impl<Operation: Clone> ChannelRequest<Operation> {
 pub enum ChannelCommandResult {
     Knock(ChannelKnockResult),
     Invite(ChannelInviteResult),
+    ChanServRegister(ChanServRegisterResult),
     ChanServOp(ChanServOpResult),
     Names(ChannelCommandReplies),
     Who(ChannelCommandReplies),
@@ -1305,6 +1307,16 @@ pub enum ChannelCommandResult {
     ModeQuery(ChannelModeQueryResult),
     ModeListQuery(ChannelModeListQueryResult),
     ModeChange(ChannelCommandReplies),
+}
+
+#[derive(Debug)]
+pub enum ChanServRegisterResult {
+    NotChannelOperator { channel: String },
+    RegistrationPending { channel: String },
+    RegistrationLimit,
+    Registered { channel: String },
+    Exists,
+    Unavailable,
 }
 
 /// Direct replies produced by the channel owner for the session owner.

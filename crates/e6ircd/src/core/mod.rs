@@ -166,6 +166,7 @@ impl CoreIngress {
             Input::ChannelTopicPersisted { owner, .. } => owner.shard(),
             Input::ChannelCommand { command } => command.owner().shard(),
             Input::ChannelCommandResult { session, .. } => session.shard(),
+            Input::ChannelRegistrationPersisted { owner, .. } => owner.shard(),
             Input::ChannelListResult { result } => result.session.shard(),
             Input::ChannelList { .. } => panic!("whole-network LIST must be broadcast"),
             Input::ChannelSessionEvent { session, .. } => session.shard(),
@@ -438,6 +439,15 @@ pub enum Input {
         session: SessionOwner,
         result: ChannelCommandResult,
         label: Option<String>,
+    },
+    ChannelRegistrationPersisted {
+        owner: ChannelOwner,
+        session: SessionOwner,
+        channel: String,
+        founder_account: String,
+        topic: Option<(String, String, u64)>,
+        label: Option<String>,
+        result: ChannelRegistrationResult,
     },
     /// One shard's answer to a whole-network LIST request.
     ChannelListResult {
@@ -1003,7 +1013,8 @@ pub enum DbRequest {
         origin: AccountOrigin,
     },
     RegisterChannel {
-        conn: ConnId,
+        owner: ChannelOwner,
+        session: SessionOwner,
         channel: String,
         founder_account: String,
         /// The live topic at request time. Registration and its initial retained
@@ -2033,6 +2044,30 @@ impl Core {
                     "channel command result reached wrong session shard"
                 );
                 handler::channel_command_result(&mut self.state, session.conn(), result, label);
+            }
+            Input::ChannelRegistrationPersisted {
+                owner,
+                session,
+                channel,
+                founder_account,
+                topic,
+                label,
+                result,
+            } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "registration reached wrong channel shard"
+                );
+                handler::services::channel_registration_persisted(
+                    &mut self.state,
+                    session,
+                    channel,
+                    founder_account,
+                    topic,
+                    label,
+                    result,
+                );
             }
             Input::ChannelList { request } => {
                 handler::channel_list(&mut self.state, request);

@@ -137,46 +137,60 @@ pub(crate) fn channel_command(
     let label = command.label();
     let result = match command.operation() {
         crate::core::state::ChannelCommandOperation::Knock => {
-            crate::core::state::ChannelCommandResult::Knock(chanops::knock_on_owner(state, command))
-        }
-        crate::core::state::ChannelCommandOperation::Invite(_) => {
-            crate::core::state::ChannelCommandResult::Invite(chanops::invite_on_owner(
-                state, command,
+            Some(crate::core::state::ChannelCommandResult::Knock(
+                chanops::knock_on_owner(state, command),
             ))
         }
+        crate::core::state::ChannelCommandOperation::Invite(_) => {
+            Some(crate::core::state::ChannelCommandResult::Invite(
+                chanops::invite_on_owner(state, command),
+            ))
+        }
+        crate::core::state::ChannelCommandOperation::ChanServRegister => {
+            services::chanserv_register_on_owner(state, command)
+                .map(crate::core::state::ChannelCommandResult::ChanServRegister)
+        }
         crate::core::state::ChannelCommandOperation::ChanServOp { .. } => {
-            crate::core::state::ChannelCommandResult::ChanServOp(services::chanserv_op_on_owner(
-                state, command,
+            Some(crate::core::state::ChannelCommandResult::ChanServOp(
+                services::chanserv_op_on_owner(state, command),
             ))
         }
         crate::core::state::ChannelCommandOperation::Names => {
-            crate::core::state::ChannelCommandResult::Names(channel::names_on_owner(state, command))
+            Some(crate::core::state::ChannelCommandResult::Names(
+                channel::names_on_owner(state, command),
+            ))
         }
-        crate::core::state::ChannelCommandOperation::Who(_) => {
-            crate::core::state::ChannelCommandResult::Who(query::who_on_owner(state, command))
-        }
+        crate::core::state::ChannelCommandOperation::Who(_) => Some(
+            crate::core::state::ChannelCommandResult::Who(query::who_on_owner(state, command)),
+        ),
         crate::core::state::ChannelCommandOperation::History(_) => {
-            crate::core::state::ChannelCommandResult::History(history::history_on_owner(
-                state, command,
+            Some(crate::core::state::ChannelCommandResult::History(
+                history::history_on_owner(state, command),
             ))
         }
         crate::core::state::ChannelCommandOperation::ModeQuery => {
-            crate::core::state::ChannelCommandResult::ModeQuery(channel::mode_query_on_owner(
-                state, command,
+            Some(crate::core::state::ChannelCommandResult::ModeQuery(
+                channel::mode_query_on_owner(state, command),
             ))
         }
         crate::core::state::ChannelCommandOperation::ModeListQuery(_) => {
-            crate::core::state::ChannelCommandResult::ModeListQuery(
+            Some(crate::core::state::ChannelCommandResult::ModeListQuery(
                 channel::mode_list_query_on_owner(state, command),
-            )
+            ))
         }
         crate::core::state::ChannelCommandOperation::ModeChange(_) => {
-            crate::core::state::ChannelCommandResult::ModeChange(channel::mode_change_on_owner(
-                state, command,
+            Some(crate::core::state::ChannelCommandResult::ModeChange(
+                channel::mode_change_on_owner(state, command),
             ))
         }
     };
-    state.route_channel_command_result(session, result, label);
+    if let Some(result) = result {
+        if state.owns_session(session) {
+            channel_command_result(state, session.conn(), result, label);
+        } else {
+            state.route_channel_command_result(session, result, label);
+        }
+    }
 }
 
 pub(crate) fn channel_command_result(
@@ -193,6 +207,9 @@ pub(crate) fn channel_command_result(
             state.emit_deferred_labeled(conn, label, |state| {
                 chanops::emit_invite_result_now(state, conn, result)
             })
+        }
+        crate::core::state::ChannelCommandResult::ChanServRegister(result) => {
+            services::emit_chanserv_register_result(state, conn, result, label)
         }
         crate::core::state::ChannelCommandResult::ChanServOp(result) => state
             .emit_deferred_labeled(conn, label, |state| {
