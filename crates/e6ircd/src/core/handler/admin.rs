@@ -166,6 +166,7 @@ fn begin_owned_channel_registration(
         return;
     }
     let display = channel.name.clone();
+    let owner = state.channel_owner(&display);
     let topic = channel
         .topic
         .as_ref()
@@ -175,6 +176,7 @@ fn begin_owned_channel_registration(
         reply,
         "persistence unavailable; channel was not registered",
         move |request_id| crate::core::DbRequest::RegisterOwnedChannel {
+            owner,
             request_id,
             channel: display,
             founder_account: actor,
@@ -212,11 +214,13 @@ fn begin_owned_channel_mutation(
             return;
         }
     };
+    let owner = state.channel_owner(key.as_str());
     queue_channel_control(
         state,
         reply,
         "persistence unavailable; channel was not changed",
         move |request_id| crate::core::DbRequest::MutateOwnedChannel {
+            owner,
             request_id,
             channel: key.as_str().to_string(),
             actor,

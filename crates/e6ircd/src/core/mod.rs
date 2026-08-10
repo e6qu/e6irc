@@ -196,11 +196,11 @@ impl CoreIngress {
             Input::ChannelTagmsgResult { session, .. } => session.shard(),
             Input::Tick { .. }
             | Input::Shutdown
-            | Input::Admin { .. }
             | Input::ChannelDropResult { .. }
             | Input::ServerBanResult { .. }
-            | Input::ChannelControlResult { .. }
-            | Input::OwnedChannelRegistrationResult { .. } => CoreShardId(0),
+            | Input::Admin { .. } => CoreShardId(0),
+            Input::ChannelControlResult { owner, .. }
+            | Input::OwnedChannelRegistrationResult { owner, .. } => owner.shard(),
         };
         self.shards[shard.0].push(input).await
     }
@@ -595,6 +595,7 @@ pub enum Input {
     /// re-checks ownership before writing; only an applied verdict changes the
     /// core's hot founder/topic/mode/access mirrors.
     ChannelControlResult {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         mutation: PersistedChannelMutation,
@@ -605,6 +606,7 @@ pub enum Input {
     /// the typed verdict applies the same hot founder/topic transition as
     /// ChanServ only after PostgreSQL confirms the insert.
     OwnedChannelRegistrationResult {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         founder_account: String,
@@ -691,6 +693,17 @@ pub enum AdminRequest {
     /// Register a live channel currently operated by an authenticated session
     /// belonging to `actor`.
     RegisterOwnedChannel { channel: String, actor: String },
+}
+
+impl AdminRequest {
+    fn channel(&self) -> Option<&str> {
+        match self {
+            Self::DropChannel { channel, .. }
+            | Self::MutateOwnedChannel { channel, .. }
+            | Self::RegisterOwnedChannel { channel, .. } => Some(channel),
+            _ => None,
+        }
+    }
 }
 
 /// User-facing registered-channel mutations accepted by the HTTP control
@@ -1034,6 +1047,7 @@ pub enum DbRequest {
     /// Register a channel through the owner HTTP control plane. The core has
     /// already verified that an `actor` session operates the live channel.
     RegisterOwnedChannel {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         founder_account: String,
@@ -1153,6 +1167,7 @@ pub enum DbRequest {
     /// id maps the verdict back to a core-owned oneshot sender without putting
     /// the non-clonable sender on this queue.
     MutateOwnedChannel {
+        owner: ChannelOwner,
         request_id: u64,
         channel: String,
         actor: String,
@@ -2232,6 +2247,13 @@ impl Core {
             // DB write path so the buffered history flushes.
             Input::Shutdown => self.state.broadcast_shutdown("Server shutting down"),
             Input::Admin { req, reply } => {
+                if let Some(channel) = req.channel() {
+                    let owner = self.state.channel_owner(channel);
+                    if owner.shard() != self.shard {
+                        self.state.route_input(Input::Admin { req, reply });
+                        return;
+                    }
+                }
                 handler::admin::handle(&mut self.state, req, reply);
             }
             Input::ChannelDropResult {
@@ -2249,11 +2271,17 @@ impl Core {
                 handler::oper::server_ban_result(&mut self.state, mutation, requester, result);
             }
             Input::ChannelControlResult {
+                owner,
                 request_id,
                 channel,
                 mutation,
                 result,
             } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "channel control reached wrong shard"
+                );
                 handler::admin::channel_control_result(
                     &mut self.state,
                     request_id,
@@ -2263,12 +2291,18 @@ impl Core {
                 );
             }
             Input::OwnedChannelRegistrationResult {
+                owner,
                 request_id,
                 channel,
                 founder_account,
                 topic,
                 result,
             } => {
+                assert_eq!(
+                    owner.shard(),
+                    self.shard,
+                    "channel registration reached wrong shard"
+                );
                 handler::admin::owned_channel_registration_result(
                     &mut self.state,
                     request_id,

@@ -2643,6 +2643,10 @@ impl ServerState {
             }));
     }
 
+    pub(crate) fn route_input(&mut self, input: crate::core::Input) {
+        self.effects.push(CoreEffect::Input(input));
+    }
+
     pub fn route_channel_command_result(
         &mut self,
         session: SessionOwner,

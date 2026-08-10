@@ -1977,6 +1977,7 @@ async fn handle_request(
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::RegisterOwnedChannel {
+            owner,
             request_id,
             channel,
             founder_account,
@@ -1999,6 +2000,7 @@ async fn handle_request(
             };
             core_tx
                 .push(Input::OwnedChannelRegistrationResult {
+                    owner,
                     request_id,
                     channel,
                     founder_account,
@@ -2257,6 +2259,7 @@ async fn handle_request(
             core_tx.push(Input::DbReply { conn, reply }).await.is_ok()
         }
         DbRequest::MutateOwnedChannel {
+            owner,
             request_id,
             channel,
             actor,
@@ -2273,6 +2276,7 @@ async fn handle_request(
                 };
             core_tx
                 .push(Input::ChannelControlResult {
+                    owner,
                     request_id,
                     channel,
                     mutation,
