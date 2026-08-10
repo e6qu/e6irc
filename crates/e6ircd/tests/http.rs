@@ -1704,9 +1704,9 @@ async fn console_configuration_enables_and_persists_bnc_listener() {
     );
     assert!(body.contains("e6irc_connections{state=\"registered\"}"));
     assert!(body.contains("e6irc_core_latency_seconds_bucket"));
-    assert!(body.contains("e6irc_queue_depth{queue=\"core\"}"));
+    assert!(body.contains("e6irc_queue_depth{queue=\"core-0\"}"));
     assert!(body.contains("e6irc_queue_capacity{queue=\"db\"} 1024"));
-    assert!(body.contains("e6irc_queue_mode{queue=\"core\",mode=\"fifo\"} 1"));
+    assert!(body.contains("e6irc_queue_mode{queue=\"core-0\",mode=\"fifo\"} 1"));
 
     let configuration = format!(
         "GET /api/v1/admin/configuration HTTP/1.1\r\nHost: t\r\nCookie: e6irc_session={session}\r\nConnection: close\r\n\r\n"
