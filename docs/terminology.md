@@ -164,6 +164,10 @@ relying party of Shauth.
 **Single sign-on / SSO** — one identity-provider session logging a user into
 many relying parties without re-entering credentials.
 
+**Qualification evidence** — immutable JSON from a credential-gated external
+probe. It identifies the source, executable, host, target, workload, budgets,
+phases, timestamps, and closed outcome without credential values.
+
 **Discovery** — the provider's `/.well-known/openid-configuration` document
 listing its endpoints and signing keys, fetched to configure a client.
 

@@ -22,8 +22,9 @@ and integration claims.
 
 ## Remaining qualification
 
-- Run controlled external qualification for Discord, Slack, additional identity
-  providers, and public IRC networks.
+- Run credential-gated external campaigns and retain their evidence for
+  Discord, Slack, additional identity providers, public IRC networks, and a
+  tuned host. Local contracts are not external qualification.
 
 ## Rules
 

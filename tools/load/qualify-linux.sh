@@ -60,6 +60,7 @@ somaxconn="$(cat /proc/sys/net/core/somaxconn)"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 load_bin="$root/target/release/e6irc-load"
+qualification_bin="$root/target/release/e6irc-qualification"
 [[ -z "$(git -C "$root" status --porcelain)" ]] || {
   echo "qualification requires a clean source tree" >&2
   exit 2
@@ -67,10 +68,14 @@ load_bin="$root/target/release/e6irc-load"
 if [[ ! -x "$load_bin" ]]; then
   (cd "$root" && cargo build --release -p e6irc-load >&2)
 fi
+if [[ ! -x "$qualification_bin" ]]; then
+  (cd "$root" && cargo build --release -p e6irc-qualification >&2)
+fi
 
 [[ ! -e "$output_dir" ]] || { echo "OUTPUT_DIR must not already exist: $output_dir" >&2; exit 2; }
 mkdir -p "$output_dir"
 result="$output_dir/result.json"
+evidence="$output_dir/qualification.json"
 host="$output_dir/host.txt"
 {
   date -u +%Y-%m-%dT%H:%M:%SZ
@@ -90,24 +95,40 @@ host="$output_dir/host.txt"
 } > "$host"
 host_sha256="$(sha256sum "$host" | awk '{print $1}')"
 
+qualification_host="$(hostname -f 2>/dev/null || hostname)"
 set +e
-"$load_bin" \
-  --addr "$addr" \
-  --server-pid "$server_pid" \
-  --clients "$clients" \
-  --channels "$channels" \
-  --burst "$burst" \
-  --minimum-connect-rate "$minimum_connect_rate" \
-  --minimum-fanout-rate "$minimum_fanout_rate" \
-  --maximum-p99-ms "$maximum_p99_ms" \
-  --maximum-server-rss-per-connection-bytes "$maximum_rss_per_connection" \
-  --host-provenance-sha256 "$host_sha256" \
-  --report-json "$result"
+"$qualification_bin" scale \
+  --target "$addr" \
+  --source "$(git -C "$root" rev-parse HEAD)" \
+  --host "$qualification_host" \
+  --executable "$server_executable" \
+  --output "$evidence" \
+  --workload "core_workers=$core_workers" \
+  --workload "clients=$clients" \
+  --workload "channels=$channels" \
+  --workload "burst=$burst" \
+  --budget "minimum_connect_rate=$minimum_connect_rate" \
+  --budget "minimum_fanout_rate=$minimum_fanout_rate" \
+  --budget "maximum_p99_ms=$maximum_p99_ms" \
+  --budget "maximum_rss_per_connection=$maximum_rss_per_connection" \
+  --probe "$root/tools/qualification/scale-probe.sh" \
+  -- "$load_bin" "$result" \
+    --addr "$addr" \
+    --server-pid "$server_pid" \
+    --clients "$clients" \
+    --channels "$channels" \
+    --burst "$burst" \
+    --minimum-connect-rate "$minimum_connect_rate" \
+    --minimum-fanout-rate "$minimum_fanout_rate" \
+    --maximum-p99-ms "$maximum_p99_ms" \
+    --maximum-server-rss-per-connection-bytes "$maximum_rss_per_connection" \
+    --host-provenance-sha256 "$host_sha256" \
+    --report-json "$result"
 status=$?
 set -e
 
 if [[ "$status" -ne 0 ]]; then
-  echo "qualification failed; evidence: $result and $host" >&2
+  echo "qualification rejected or failed; evidence: $evidence, $result, and $host" >&2
   exit "$status"
 fi
-echo "qualification evidence: $result and $host"
+echo "qualification evidence: $evidence, $result, and $host"

@@ -23,7 +23,7 @@ capabilities, not the offered list.
 
 The server is tested against the Libera-compatible protocol surface, not against
 every release of every named client. The opt-in probes for Libera, OFTC, and
-Ergo establish that the shared native client can register over public TLS; they
-do not make public services part of CI. Matrix has a self-hosted CI oracle.
-Discord, Slack, other identity providers, and public-network credentials need
-controlled external qualification.
+Ergo establish that the shared native client can register and reconnect over
+public TLS; they do not make public services part of CI. Matrix has a
+self-hosted CI oracle. Discord, Slack, other identity providers, and public
+networks need controlled external qualification evidence.

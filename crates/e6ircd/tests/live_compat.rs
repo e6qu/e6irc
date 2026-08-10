@@ -5,7 +5,7 @@
 //!
 //! These are **opt-in** (`#[ignore]`) — they hit the network and we do
 //! not want to load public services, so they never run in normal CI.
-//! Each test makes exactly one brief connection and QUITs. Run manually:
+//! Each test makes two brief sequential connections and QUITs. Run manually:
 //!
 //!   cargo test -p e6ircd --test live_compat -- --ignored --nocapture
 
@@ -69,6 +69,11 @@ async fn probe(addr: &str, server_name: &str) -> std::io::Result<(bool, HashMap<
 /// The shared contract: our client registers, and the server advertises
 /// the core ISUPPORT tokens our parser and clients rely on.
 async fn assert_interop(addr: &str, server_name: &str) {
+    assert_single_interop(addr, server_name).await;
+    assert_single_interop(addr, server_name).await;
+}
+
+async fn assert_single_interop(addr: &str, server_name: &str) {
     let (welcomed, isupport) = probe(addr, server_name)
         .await
         .unwrap_or_else(|e| panic!("{addr}: connection/registration failed: {e}"));

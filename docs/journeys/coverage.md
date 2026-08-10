@@ -103,7 +103,7 @@ catastrophic-regression thresholds, but there are no production-host acceptance
 thresholds, production-qualified per-connection RSS budget, or 100k result.
 The Linux smoke enforces a deliberately generous incremental RSS/connection
 ceiling. The controlled harness records source, executable, host, workload,
-budget, and outcome evidence for stricter tuned-host campaigns.
+budget, phase, and closed-outcome evidence for stricter tuned-host campaigns.
 
 ### Native-client product parity
 
@@ -120,7 +120,8 @@ attached network; the BNC is the cross-network multiplexer.
 Matrix has a self-hosted CI oracle. Discord and Slack have strict local
 provider oracles that exercise their production HTTP/WebSocket clients in both
 directions, but qualification against the commercial services still requires
-real credentials. Public-network probes must be respectful and opt-in.
+real credentials. Public-network probes are respectful, opt-in, and record
+their evidence. Local oracle success is not provider qualification.
 
 ### Distribution and operations
 

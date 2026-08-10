@@ -1408,8 +1408,9 @@ Slack workspace appears to the user as another network with channels;
 Matrix rooms likewise. v1 ships the **SPI + a loopback reference driver** (used in tests) and
 the **`matrix` driver** (Matrix client-server API, behind the `matrix`
 feature, integration-tested against a pinned Conduit homeserver in
-`vendor/tests/external-oracles/`); Discord then Slack follow as separate
-phases (each needs real service credentials to test).
+`vendor/tests/external-oracles/`), plus Discord and Slack drivers with local
+HTTP/WebSocket contract oracles. Commercial-provider qualification requires a
+credential-gated evidence record.
 
 Design constraints recorded now:
 
